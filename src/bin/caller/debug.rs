@@ -55,8 +55,9 @@ pub fn find_free_debug_display() -> u32 {
 
 /// Returns `~/.intendant/recordings/` for daemon-scoped recordings.
 pub fn daemon_recordings_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    PathBuf::from(home).join(".intendant").join("recordings")
+    crate::platform::home_dir()
+        .join(".intendant")
+        .join("recordings")
 }
 
 /// Set up a debug screen.
@@ -181,13 +182,8 @@ pub fn spawn_debug_screen_handler(
                     match setup_debug_screen(web_port).await {
                         Ok(s) => {
                             let display_id = s.display_id;
-                            eprintln!(
-                                "[debug] Screen ready on :{}",
-                                display_id
-                            );
-                            bus.send(AppEvent::DebugScreenReady {
-                                display_id,
-                            });
+                            eprintln!("[debug] Screen ready on :{}", display_id);
+                            bus.send(AppEvent::DebugScreenReady { display_id });
                             screen = Some(s);
                         }
                         Err(e) => {
@@ -263,6 +259,11 @@ mod tests {
     #[test]
     fn daemon_recordings_dir_exists() {
         let dir = daemon_recordings_dir();
-        assert!(dir.to_str().unwrap().contains(".intendant/recordings"));
+        // Build the expected tail with the platform separator so the
+        // assertion holds on Windows (where `join` yields '\\') as well as
+        // POSIX. `daemon_recordings_dir` itself uses `PathBuf::join`, so it
+        // is already platform-correct; only the literal here was POSIX-only.
+        let tail: PathBuf = [".intendant", "recordings"].iter().collect();
+        assert!(dir.ends_with(&tail), "unexpected recordings dir: {dir:?}");
     }
 }

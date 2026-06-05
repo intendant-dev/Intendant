@@ -8,13 +8,25 @@
 //! light desktop activity, the second to short-circuit the wait entirely
 //! when the bridge knows a peer just attached.
 
+// The real backend is libvpx via `vpx_sys` (env-libvpx-sys), which has no
+// Windows build in Tier-0 (the crate is gated off `cfg(windows)` in
+// Cargo.toml). Everything below is therefore compiled only on non-Windows;
+// Windows gets the `Vp8Encoder` stub at the bottom of this file whose
+// `new()` returns `Err`. The `mod vp8;` decl and `pub use vp8::Vp8Encoder`
+// in `mod.rs` stay unconditional so call sites don't need their own cfgs.
+#[cfg(not(target_os = "windows"))]
 use super::{EncodedPacket, Encoder, PayloadSpec};
+#[cfg(not(target_os = "windows"))]
 use std::ffi::c_int;
+#[cfg(not(target_os = "windows"))]
 use std::mem::MaybeUninit;
+#[cfg(not(target_os = "windows"))]
 use std::ptr;
+#[cfg(not(target_os = "windows"))]
 use vpx_sys::*;
 
 /// VP8 encoder configured for low-latency screen capture.
+#[cfg(not(target_os = "windows"))]
 pub struct Vp8Encoder {
     ctx: vpx_codec_ctx_t,
     width: usize,
@@ -30,8 +42,10 @@ pub struct Vp8Encoder {
 // `ctx` holds raw pointers from libvpx that aren't `Send`.  The encoder
 // runs on a dedicated `std::thread` and is never shared, so transferring
 // ownership across threads at construction time is safe.
+#[cfg(not(target_os = "windows"))]
 unsafe impl Send for Vp8Encoder {}
 
+#[cfg(not(target_os = "windows"))]
 impl Vp8Encoder {
     /// Build a VP8 encoder targeting `bitrate_kbps` at `width`×`height`.
     ///
@@ -70,13 +84,7 @@ impl Vp8Encoder {
 
         let mut ctx: vpx_codec_ctx_t = unsafe { MaybeUninit::zeroed().assume_init() };
         let err = unsafe {
-            vpx_codec_enc_init_ver(
-                &mut ctx,
-                iface,
-                &cfg,
-                0,
-                VPX_ENCODER_ABI_VERSION as i32,
-            )
+            vpx_codec_enc_init_ver(&mut ctx, iface, &cfg, 0, VPX_ENCODER_ABI_VERSION as i32)
         };
         if err != VPX_CODEC_OK {
             return Err(format!("vpx_codec_enc_init_ver: {err:?}"));
@@ -103,6 +111,7 @@ impl Vp8Encoder {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Encoder for Vp8Encoder {
     fn encode(
         &mut self,
@@ -171,10 +180,9 @@ impl Encoder for Vp8Encoder {
                 continue;
             }
             let frame = unsafe { &pkt_ref.data.frame };
-            let data = unsafe {
-                std::slice::from_raw_parts(frame.buf as *const u8, frame.sz as usize)
-            }
-            .to_vec();
+            let data =
+                unsafe { std::slice::from_raw_parts(frame.buf as *const u8, frame.sz as usize) }
+                    .to_vec();
             out.push(EncodedPacket {
                 data,
                 pts_ms: frame.pts as u64,
@@ -195,11 +203,58 @@ impl Encoder for Vp8Encoder {
     }
 }
 
+#[cfg(not(target_os = "windows"))]
 impl Drop for Vp8Encoder {
     fn drop(&mut self) {
         let err = unsafe { vpx_codec_destroy(&mut self.ctx) };
         if err != VPX_CODEC_OK {
             eprintln!("[display/encode/vp8] vpx_codec_destroy: {err:?}");
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Windows stub
+// ---------------------------------------------------------------------------
+
+/// Windows placeholder for the libvpx-backed VP8 encoder.
+///
+/// libvpx (`env-libvpx-sys`) is deferred on Windows (Tier-0), so there is
+/// no software VP8 backend yet. The struct is uninhabitable in practice:
+/// [`Vp8Encoder::new`] always returns `Err`, so the `Encoder` impl below
+/// is never actually invoked. It exists only so `Box<dyn Encoder>` call
+/// sites and `pub use vp8::Vp8Encoder` keep type-checking on Windows.
+#[cfg(target_os = "windows")]
+pub struct Vp8Encoder {
+    payload_spec: super::PayloadSpec,
+}
+
+#[cfg(target_os = "windows")]
+impl Vp8Encoder {
+    /// Always fails on Windows — no libvpx backend in Tier-0.
+    pub fn new(_width: u32, _height: u32, _bitrate_kbps: u32) -> Result<Self, String> {
+        Err("VP8 (libvpx) encoding is not yet implemented on Windows".to_string())
+    }
+}
+
+#[cfg(target_os = "windows")]
+impl super::Encoder for Vp8Encoder {
+    fn encode(
+        &mut self,
+        _i420: &[u8],
+        _duration_ms: u64,
+        _force_keyframe: bool,
+    ) -> Result<Vec<super::EncodedPacket>, String> {
+        // Unreachable: no instance can be constructed (see `new`). Return
+        // an error rather than panicking to honor the no-panic contract.
+        Err("VP8 encoding is not available on Windows".to_string())
+    }
+
+    fn codec_mime(&self) -> &'static str {
+        super::MIME_TYPE_VP8
+    }
+
+    fn payload_spec(&self) -> &super::PayloadSpec {
+        &self.payload_spec
     }
 }

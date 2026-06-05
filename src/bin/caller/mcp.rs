@@ -34,13 +34,16 @@ use uuid::Uuid;
 
 use crate::autonomy::{AutonomyLevel, SharedAutonomy};
 use crate::control;
-use crate::types::OutboundEvent;
+use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg, EventBus};
 use crate::frontend::{
     self, ActionOutcome, ApprovalSnapshot, HumanQuestionSnapshot, LogEntrySnapshot, StateResult,
     StatusSnapshot, UserAction,
 };
-use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg, EventBus};
+use crate::types::OutboundEvent;
 use crate::types::{LogLevel, Phase, Verbosity};
+use crate::FollowUpMessage;
+
+const CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT: f64 = 85.0;
 
 // ---------------------------------------------------------------------------
 // Task launcher: allows MCP to start agent loops on demand
@@ -73,7 +76,11 @@ pub struct McpAppState {
     pub autonomy: SharedAutonomy,
     pub verbosity: Verbosity,
     pub session_tokens: u64,
+    pub session_prompt_tokens: u64,
+    pub session_completion_tokens: u64,
+    pub session_cached_tokens: u64,
     pub context_window: u64,
+    pub hard_context_window: Option<u64>,
     pub session_id: String,
     pub task_description: String,
     pub log_entries: std::collections::VecDeque<LogEntrySnapshot>,
@@ -96,7 +103,7 @@ pub struct McpAppState {
     /// Current round number (for multi-round support).
     pub round: usize,
     /// Sender for follow-up messages (multi-round support).
-    pub follow_up_tx: Option<tokio::sync::mpsc::Sender<String>>,
+    pub follow_up_tx: Option<tokio::sync::mpsc::Sender<FollowUpMessage>>,
     // Presence layer usage tracking
     pub presence_provider_name: Option<String>,
     pub presence_model_name: Option<String>,
@@ -113,6 +120,35 @@ pub struct McpAppState {
     pub screenshot_counter: std::sync::atomic::AtomicU64,
     /// External agent backend selected via web UI (deferred: takes effect on next task).
     pub external_agent: Option<crate::external_agent::AgentBackend>,
+    /// Desired Codex managed-context mode for the next managed Codex task.
+    pub configured_codex_managed_context: bool,
+    /// Whether the active Codex backend supports Intendant's managed-context
+    /// protocol.
+    pub codex_managed_context: bool,
+    /// Managed-context capability latched per Intendant/backend session id.
+    pub session_codex_managed_context: std::collections::HashMap<String, bool>,
+    /// Bidirectional aliases between Intendant wrapper ids and backend thread ids.
+    session_aliases: std::collections::HashMap<String, std::collections::HashSet<String>>,
+    /// Latest backend usage sample by Intendant/backend session id.
+    session_usage: std::collections::HashMap<String, frontend::ModelUsageSnapshot>,
+    /// Source for the currently active session, when it is known.
+    pub active_session_source: Option<String>,
+    /// Map Intendant wrapper session IDs and backend session IDs to their external source.
+    pub session_sources: std::collections::HashMap<String, String>,
+    /// Successful rewind records awaiting the next backend usage sample, keyed
+    /// by Intendant/backend session id.
+    pending_rewind_pressure_checks: std::collections::HashMap<String, String>,
+    /// Last successful rewinds that did not reduce backend-reported pressure
+    /// below the gate, keyed by Intendant/backend session id.
+    insufficient_rewind_notices: std::collections::HashMap<String, InsufficientRewindNotice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InsufficientRewindNotice {
+    record_id: String,
+    used_tokens: u64,
+    rewind_only_limit: u64,
+    context_window: u64,
 }
 
 /// Tracks a pending approval info (responder is in the shared ApprovalRegistry).
@@ -139,7 +175,11 @@ impl McpAppState {
             autonomy,
             verbosity: Verbosity::Normal,
             session_tokens: 0,
+            session_prompt_tokens: 0,
+            session_completion_tokens: 0,
+            session_cached_tokens: 0,
             context_window: 0,
+            hard_context_window: None,
             session_id: String::new(),
             task_description: String::new(),
             log_entries: std::collections::VecDeque::new(),
@@ -165,6 +205,15 @@ impl McpAppState {
             screenshot_dir: None,
             screenshot_counter: std::sync::atomic::AtomicU64::new(0),
             external_agent: None,
+            configured_codex_managed_context: false,
+            codex_managed_context: false,
+            session_codex_managed_context: std::collections::HashMap::new(),
+            session_aliases: std::collections::HashMap::new(),
+            session_usage: std::collections::HashMap::new(),
+            active_session_source: None,
+            session_sources: std::collections::HashMap::new(),
+            pending_rewind_pressure_checks: std::collections::HashMap::new(),
+            insufficient_rewind_notices: std::collections::HashMap::new(),
         }
     }
 
@@ -213,10 +262,11 @@ impl McpAppState {
                 model: self.model_name.clone(),
                 tokens_used: self.session_tokens,
                 context_window: self.context_window,
+                hard_context_window: self.hard_context_window,
                 usage_pct: self.budget_pct,
-                prompt_tokens: 0,
-                completion_tokens: 0,
-                cached_tokens: 0,
+                prompt_tokens: self.session_prompt_tokens,
+                completion_tokens: self.session_completion_tokens,
+                cached_tokens: self.session_cached_tokens,
             },
             presence: self.presence_provider_name.as_ref().map(|p| {
                 crate::frontend::ModelUsageSnapshot {
@@ -224,6 +274,7 @@ impl McpAppState {
                     model: self.presence_model_name.clone().unwrap_or_default(),
                     tokens_used: self.presence_tokens,
                     context_window: self.presence_context_window,
+                    hard_context_window: Some(self.presence_context_window),
                     usage_pct: self.presence_usage_pct,
                     prompt_tokens: 0,
                     completion_tokens: 0,
@@ -231,6 +282,468 @@ impl McpAppState {
                 }
             }),
         }
+    }
+
+    fn usage_snapshot_for(&self, session_id: Option<&str>) -> crate::frontend::UsageSnapshot {
+        let mut usage = self.usage_snapshot();
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            if let Some(main) = self.session_usage_for_id(id) {
+                usage.main = main.clone();
+            } else if id != self.session_id {
+                usage.main.provider.clear();
+                usage.main.model.clear();
+                usage.main.tokens_used = 0;
+                usage.main.context_window = 0;
+                usage.main.hard_context_window = None;
+                usage.main.usage_pct = 0.0;
+                usage.main.prompt_tokens = 0;
+                usage.main.completion_tokens = 0;
+                usage.main.cached_tokens = 0;
+            }
+        }
+        usage
+    }
+
+    fn link_session_aliases(&mut self, session_id: &str, backend_session_id: &str) {
+        let session_id = session_id.trim();
+        let backend_session_id = backend_session_id.trim();
+        if session_id.is_empty()
+            || backend_session_id.is_empty()
+            || session_id == backend_session_id
+        {
+            return;
+        }
+        self.session_aliases
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(backend_session_id.to_string());
+        self.session_aliases
+            .entry(backend_session_id.to_string())
+            .or_default()
+            .insert(session_id.to_string());
+    }
+
+    fn session_related_ids(&self, session_id: &str) -> Vec<String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(session_id.to_string());
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            out.push(id.clone());
+            if let Some(aliases) = self.session_aliases.get(&id) {
+                for alias in aliases {
+                    if !seen.contains(alias) {
+                        queue.push_back(alias.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn session_usage_for_id(&self, session_id: &str) -> Option<&frontend::ModelUsageSnapshot> {
+        for related in self.session_related_ids(session_id) {
+            if let Some(usage) = self.session_usage.get(&related) {
+                return Some(usage);
+            }
+        }
+        None
+    }
+
+    fn normalize_main_usage_snapshot(
+        &self,
+        session_id: Option<&str>,
+        mut usage: frontend::ModelUsageSnapshot,
+    ) -> frontend::ModelUsageSnapshot {
+        let previous_hard = session_id
+            .and_then(|id| {
+                self.session_usage_for_id(id)
+                    .and_then(|previous| previous.hard_context_window)
+            })
+            .or(self.hard_context_window)
+            .filter(|hard| *hard > 0);
+        let Some(previous_hard) = previous_hard else {
+            return usage;
+        };
+        if usage.context_window == 0 {
+            return usage;
+        }
+
+        let should_preserve = match usage.hard_context_window {
+            Some(current_hard) if current_hard > 0 => {
+                current_hard <= usage.context_window && previous_hard > current_hard
+            }
+            _ => previous_hard > usage.context_window,
+        };
+        if should_preserve {
+            usage.hard_context_window = Some(previous_hard);
+        }
+        usage
+    }
+
+    fn apply_main_usage_snapshot(&mut self, usage: frontend::ModelUsageSnapshot) {
+        let usage = self.normalize_main_usage_snapshot(None, usage);
+        if !usage.provider.is_empty() {
+            self.provider_name = usage.provider.clone();
+        }
+        if !usage.model.is_empty() {
+            self.model_name = usage.model.clone();
+        }
+        self.session_tokens = usage.tokens_used;
+        self.context_window = usage.context_window;
+        self.hard_context_window = usage.hard_context_window;
+        self.budget_pct = usage.usage_pct;
+        self.session_prompt_tokens = usage.prompt_tokens;
+        self.session_completion_tokens = usage.completion_tokens;
+        self.session_cached_tokens = usage.cached_tokens;
+        self.complete_pending_rewind_pressure_check();
+    }
+
+    fn rewind_session_key(&self, session_id: Option<&str>) -> Option<String> {
+        session_id
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                let id = self.session_id.trim();
+                if id.is_empty() {
+                    None
+                } else {
+                    Some(id.to_string())
+                }
+            })
+    }
+
+    fn rewind_related_keys(&self, key: &str) -> Vec<String> {
+        let related = self.session_related_ids(key);
+        if related.is_empty() {
+            vec![key.to_string()]
+        } else {
+            related
+        }
+    }
+
+    fn remove_pending_rewind_pressure_check_for_key(&mut self, key: &str) -> Option<String> {
+        let mut record_id = None;
+        for related in self.rewind_related_keys(key) {
+            if let Some(found) = self.pending_rewind_pressure_checks.remove(&related) {
+                record_id.get_or_insert(found);
+            }
+        }
+        record_id
+    }
+
+    fn remove_insufficient_rewind_notice_for_key(&mut self, key: &str) {
+        for related in self.rewind_related_keys(key) {
+            self.insufficient_rewind_notices.remove(&related);
+        }
+    }
+
+    fn insert_insufficient_rewind_notice_for_key(
+        &mut self,
+        key: &str,
+        notice: InsufficientRewindNotice,
+    ) {
+        for related in self.rewind_related_keys(key) {
+            self.insufficient_rewind_notices
+                .insert(related, notice.clone());
+        }
+    }
+
+    fn note_context_rewind_result_for(
+        &mut self,
+        session_id: Option<&str>,
+        success: bool,
+        message: &str,
+    ) {
+        let Some(key) = self.rewind_session_key(session_id) else {
+            return;
+        };
+        if success {
+            if let Some(record_id) = context_rewind_record_id_from_message(message) {
+                for related in self.rewind_related_keys(&key) {
+                    self.pending_rewind_pressure_checks
+                        .insert(related, record_id.clone());
+                }
+                self.remove_insufficient_rewind_notice_for_key(&key);
+            }
+        } else {
+            // A failed rewind must not leave a pending pressure check behind: a
+            // later (possibly stale) usage sample could otherwise resolve it into a
+            // false "insufficient" notice against a record that never committed.
+            self.remove_pending_rewind_pressure_check_for_key(&key);
+        }
+    }
+
+    fn complete_pending_rewind_pressure_check(&mut self) {
+        self.complete_pending_rewind_pressure_check_for(None);
+    }
+
+    fn complete_pending_rewind_pressure_check_for(&mut self, session_id: Option<&str>) {
+        let Some(key) = self.rewind_session_key(session_id) else {
+            return;
+        };
+        let Some(record_id) = self.remove_pending_rewind_pressure_check_for_key(&key) else {
+            return;
+        };
+        if !self.active_codex_managed_context_enabled_for(Some(&key), None) {
+            return;
+        }
+        if let Some((used_tokens, rewind_only_limit, _status)) =
+            self.context_pressure_rewind_only_for(Some(&key))
+        {
+            let context_window = self.session_usage_values(Some(&key)).1;
+            self.insert_insufficient_rewind_notice_for_key(
+                &key,
+                InsufficientRewindNotice {
+                    record_id,
+                    used_tokens,
+                    rewind_only_limit,
+                    context_window,
+                },
+            );
+        } else {
+            self.remove_insufficient_rewind_notice_for_key(&key);
+        }
+    }
+
+    fn insufficient_rewind_notice_for(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<&InsufficientRewindNotice> {
+        let key = self.rewind_session_key(session_id)?;
+        self.rewind_related_keys(&key)
+            .into_iter()
+            .find_map(|related| self.insufficient_rewind_notices.get(&related))
+    }
+
+    fn managed_context_mode(enabled: bool) -> &'static str {
+        if enabled {
+            "managed"
+        } else {
+            "vanilla"
+        }
+    }
+
+    fn session_usage_values(&self, session_id: Option<&str>) -> (u64, u64, Option<u64>) {
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            // A concrete session that has not reported usage yet is *unknown* — do
+            // not borrow the globally-active session's totals. Borrowing would let a
+            // starting session A inherit a saturated session B's pressure and be
+            // wrongly forced into rewind-only mode during the startup race.
+            if let Some(usage) = self.session_usage_for_id(id) {
+                return (
+                    usage.tokens_used,
+                    usage.context_window,
+                    usage.hard_context_window,
+                );
+            }
+
+            if self
+                .session_related_ids(id)
+                .iter()
+                .any(|candidate| candidate == &self.session_id)
+                && self.context_window > 0
+            {
+                return (
+                    self.session_tokens,
+                    self.context_window,
+                    self.hard_context_window,
+                );
+            }
+
+            return (0, 0, None);
+        }
+        (
+            self.session_tokens,
+            self.context_window,
+            self.hard_context_window,
+        )
+    }
+
+    fn context_pressure_snapshot_for(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> serde_json::Value {
+        let (used_tokens, context_window, hard_context_window) =
+            self.session_usage_values(session_id);
+        let managed_context =
+            self.exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
+        if context_window == 0 {
+            return serde_json::json!({
+                "source": "backend_reported",
+                "status": "unknown",
+                "used_tokens": used_tokens,
+                "context_window": null,
+                "effective_context_window": null,
+                "remaining_tokens": null,
+                "remaining_hard_tokens": null,
+                "remaining_percent": null,
+                "recommended_rewind_limit": null,
+                "rewind_only_limit": null,
+                "hard_limit": null,
+                "rewind_only": false,
+                "managed_context": Self::managed_context_mode(managed_context),
+                "last_rewind_insufficient": null,
+            });
+        }
+
+        let recommended_rewind_limit =
+            (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor() as u64;
+        let rewind_only_limit = context_window;
+        let remaining_tokens = context_window.saturating_sub(used_tokens);
+        let remaining_percent = (remaining_tokens as f64 / context_window as f64 * 100.0).max(0.0);
+        let remaining_hard_tokens =
+            hard_context_window.map(|hard| hard.saturating_sub(used_tokens));
+        let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
+            "critical"
+        } else if used_tokens >= rewind_only_limit {
+            "high"
+        } else if used_tokens >= recommended_rewind_limit {
+            "pressure"
+        } else {
+            "ok"
+        };
+
+        serde_json::json!({
+            "source": "backend_reported",
+            "status": status,
+            "used_tokens": used_tokens,
+            "context_window": context_window,
+            "effective_context_window": context_window,
+            "remaining_tokens": remaining_tokens,
+            "remaining_hard_tokens": remaining_hard_tokens,
+            "remaining_percent": remaining_percent,
+            "recommended_rewind_limit": recommended_rewind_limit,
+            "rewind_only_limit": rewind_only_limit,
+            "hard_limit": hard_context_window,
+            "rewind_only": managed_context && (status == "high" || status == "critical"),
+            "managed_context": Self::managed_context_mode(managed_context),
+            "last_rewind_insufficient": self.insufficient_rewind_notice_for(session_id).map(|notice| {
+                serde_json::json!({
+                    "record_id": notice.record_id,
+                    "used_tokens": notice.used_tokens,
+                    "rewind_only_limit": notice.rewind_only_limit,
+                    "context_window": notice.context_window,
+                    "message": "The previous managed-context rewind did not reduce backend-reported pressure enough. Call list_rewind_anchors to inspect recovery candidates; pass include_non_recovery=true only to audit anchors known not to clear recovery. Use inspect_rewind_anchor when the compact row is ambiguous, then choose an earlier exact item_id with a denser carry-forward primer before using ordinary tools.",
+                })
+            }),
+        })
+    }
+
+    fn context_pressure_snapshot(&self) -> serde_json::Value {
+        self.context_pressure_snapshot_for(None, None)
+    }
+
+    fn is_active_codex_session(&self) -> bool {
+        self.active_session_source
+            .as_deref()
+            .is_some_and(|source| source.eq_ignore_ascii_case("codex"))
+    }
+
+    fn active_codex_managed_context_enabled(&self) -> bool {
+        self.is_active_codex_session() && self.codex_managed_context
+    }
+
+    fn exposed_codex_managed_context_enabled(&self) -> bool {
+        if self.is_active_codex_session() {
+            self.codex_managed_context
+        } else {
+            self.configured_codex_managed_context
+        }
+    }
+
+    fn exposed_codex_managed_context_enabled_for(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> bool {
+        if let Some(enabled) = managed_context_override {
+            return enabled;
+        }
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            for related in self.session_related_ids(id) {
+                if let Some(enabled) = self.session_codex_managed_context.get(&related) {
+                    return *enabled;
+                }
+            }
+        }
+        self.exposed_codex_managed_context_enabled()
+    }
+
+    fn active_codex_managed_context_enabled_for(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> bool {
+        if let Some(enabled) = managed_context_override {
+            return enabled;
+        }
+        if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
+            for related in self.session_related_ids(id) {
+                if let Some(enabled) = self.session_codex_managed_context.get(&related) {
+                    return *enabled;
+                }
+            }
+        }
+        self.active_codex_managed_context_enabled()
+    }
+
+    fn context_pressure_rewind_only_for(
+        &self,
+        session_id: Option<&str>,
+    ) -> Option<(u64, u64, &'static str)> {
+        let (used_tokens, context_window, hard_context_window) =
+            self.session_usage_values(session_id);
+        if context_window == 0 {
+            return None;
+        }
+        let rewind_only_limit = context_window;
+        let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
+            "critical"
+        } else if used_tokens >= rewind_only_limit {
+            "high"
+        } else {
+            return None;
+        };
+        Some((used_tokens, rewind_only_limit, status))
+    }
+
+    fn rewind_only_gate_message(&self, tool_name: &str) -> Option<String> {
+        self.rewind_only_gate_message_for(tool_name, None, None)
+    }
+
+    fn rewind_only_gate_message_for(
+        &self,
+        tool_name: &str,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> Option<String> {
+        if !self.active_codex_managed_context_enabled_for(session_id, managed_context_override)
+            || rewind_only_allowed_tool(tool_name)
+        {
+            return None;
+        }
+        let (used_tokens, rewind_only_limit, status) =
+            self.context_pressure_rewind_only_for(session_id)?;
+        let mut message = format!(
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. Call list_rewind_anchors to inspect valid recovery candidates; pass include_non_recovery=true only to audit anchors known not to clear recovery. Inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id and a dense carry-forward primer before using other tools. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls."
+        );
+        if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
+            message.push_str(&format!(
+                " Previous managed-context record {} was insufficient; choose an earlier exact item_id from list_rewind_anchors, using inspect_rewind_anchor if needed, with a denser carry-forward primer.",
+                notice.record_id
+            ));
+        }
+        Some(message)
     }
 
     fn approval_snapshot(&self) -> Option<ApprovalSnapshot> {
@@ -245,6 +758,148 @@ impl McpAppState {
         self.human_question.as_ref().map(|q| HumanQuestionSnapshot {
             question: q.clone(),
         })
+    }
+}
+
+fn rewind_only_allowed_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "get_status"
+            | "list_rewind_anchors"
+            | "inspect_rewind_anchor"
+            | "rewind_context"
+            | "rewind_backout"
+    )
+}
+
+fn managed_context_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "list_rewind_anchors" | "inspect_rewind_anchor" | "rewind_context" | "rewind_backout"
+    )
+}
+
+fn with_default_mcp_session_id(
+    mut args: serde_json::Value,
+    session_id: Option<&str>,
+) -> serde_json::Value {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return args;
+    };
+    let Some(obj) = args.as_object_mut() else {
+        return args;
+    };
+    let has_session_id = obj
+        .get("session_id")
+        .or_else(|| obj.get("sessionId"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .is_some_and(|value| !value.is_empty());
+    if !has_session_id {
+        obj.insert(
+            "session_id".to_string(),
+            serde_json::Value::String(session_id.to_string()),
+        );
+    }
+    args
+}
+
+fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&str>) -> bool {
+    if !managed_context && managed_context_tool(name) {
+        return false;
+    }
+    let Some(profile) = profile
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+        .map(|profile| profile.to_ascii_lowercase())
+    else {
+        return true;
+    };
+    match profile.as_str() {
+        "full" => true,
+        // Codex should learn the broad Intendant surface lazily through
+        // `intendant ctl --help` instead of receiving every MCP schema up front.
+        // Keep the tiny always-useful status/collaboration set first-class.
+        "core" | "codex-core" | "cli" | "minimal" => {
+            matches!(
+                name,
+                "get_status"
+                    | "show_shared_view"
+                    | "focus_shared_view"
+                    | "request_shared_view_input"
+                    | "capture_shared_view_frame"
+                    | "hide_shared_view"
+            ) || (managed_context && managed_context_tool(name))
+        }
+        "screen" | "display" => {
+            matches!(
+                name,
+                "get_status"
+                    | "list_displays"
+                    | "list_browser_workspaces"
+                    | "browser_workspace_providers"
+                    | "create_browser_workspace"
+                    | "close_browser_workspace"
+                    | "acquire_browser_workspace"
+                    | "release_browser_workspace"
+                    | "take_screenshot"
+                    | "execute_cu_actions"
+                    | "list_frames"
+                    | "read_frame"
+                    | "show_shared_view"
+                    | "focus_shared_view"
+                    | "request_shared_view_input"
+                    | "capture_shared_view_frame"
+                    | "hide_shared_view"
+            ) || (managed_context && managed_context_tool(name))
+        }
+        "managed" | "managed-context" => {
+            matches!(name, "get_status") || (managed_context && managed_context_tool(name))
+        }
+        // Unknown profiles fail open so typoed third-party URLs do not silently
+        // hide tools. Intendant-generated URLs use known profile names.
+        _ => true,
+    }
+}
+
+fn apply_session_capabilities_to_mcp_state(
+    s: &mut McpAppState,
+    session_id: &str,
+    capabilities: &crate::types::SessionCapabilities,
+) -> bool {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return false;
+    }
+    let Some(mode) = capabilities.codex_managed_context.as_deref() else {
+        return false;
+    };
+    let enabled = crate::project::codex_managed_context_enabled(mode);
+    s.session_codex_managed_context
+        .insert(session_id.to_string(), enabled);
+    if s.session_id == session_id {
+        s.codex_managed_context = enabled;
+    }
+    true
+}
+
+fn context_rewind_record_id_from_message(message: &str) -> Option<String> {
+    message
+        .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | '('))
+        .map(|part| {
+            part.trim_matches(|ch: char| !(ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_')))
+        })
+        .find(|part| part.starts_with("rewind-") && part.len() > "rewind-".len())
+        .map(str::to_string)
+}
+
+fn codex_thread_action_result_targets_session(
+    requested_session_id: &Option<String>,
+    result_session_id: &Option<String>,
+) -> bool {
+    match requested_session_id {
+        Some(requested) => result_session_id.as_deref() == Some(requested.as_str()),
+        None => true,
     }
 }
 
@@ -492,7 +1147,7 @@ async fn start_task_with_state(
                     format!("Follow-up submitted via {}: {}", source, task),
                 );
                 drop(s);
-                tx.send(task_clone)
+                tx.send(FollowUpMessage::text(task_clone))
                     .await
                     .map_err(|_| "follow-up channel closed".to_string())?;
                 return Ok(());
@@ -512,6 +1167,9 @@ async fn start_task_with_state(
     s.turn = 0;
     s.budget_pct = 0.0;
     s.session_tokens = 0;
+    s.session_prompt_tokens = 0;
+    s.session_completion_tokens = 0;
+    s.session_cached_tokens = 0;
     s.set_phase(Phase::Thinking);
     s.pending_approval = None;
     s.human_question = None;
@@ -645,7 +1303,9 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
 
     let lock_dir = loop_dir.join("active.lock");
     let lock_owner_pid = parse_pid_file(&lock_dir.join("pid"));
-    let lock_owner_alive = lock_owner_pid.map(super::platform::process_alive).unwrap_or(false);
+    let lock_owner_alive = lock_owner_pid
+        .map(super::platform::process_alive)
+        .unwrap_or(false);
 
     let mut active_wrappers = Vec::new();
     let mut active_codex = Vec::new();
@@ -771,41 +1431,9 @@ fn request_loop_intervention_marker(
 }
 
 async fn spawn_detached_restart_command(cmd: &str) -> Result<u32, String> {
-    use std::process::Stdio;
-    use tokio::process::Command;
-
-    // Use setsid when available to separate process group/session so parent
-    // shutdown doesn't tear down the restarted controller process.
-    let wrapper = r#"
-if command -v setsid >/dev/null 2>&1; then
-  nohup setsid bash -lc "$INTENDANT_RESTART_COMMAND" </dev/null >/dev/null 2>&1 &
-else
-  nohup bash -lc "$INTENDANT_RESTART_COMMAND" </dev/null >/dev/null 2>&1 &
-fi
-echo $!
-"#;
-
-    let output = Command::new("bash")
-        .args(["-lc", wrapper])
-        .env("INTENDANT_RESTART_COMMAND", cmd)
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .output()
-        .await
-        .map_err(|e| format!("Failed to launch detached restart command: {}", e))?;
-
-    if !output.status.success() {
-        return Err(format!(
-            "Failed to launch detached restart command (exit={})",
-            output.status
-        ));
-    }
-
-    let pid_text = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    pid_text
-        .parse::<u32>()
-        .map_err(|e| format!("Failed to parse detached restart pid '{}': {}", pid_text, e))
+    // Delegate to the platform helper: `nohup setsid bash -lc` on Unix
+    // (unchanged), a detached window-less `cmd.exe /C` child on Windows.
+    super::platform::spawn_detached_restart(cmd).await
 }
 
 async fn run_scheduled_controller_restart_with_state(
@@ -985,7 +1613,7 @@ async fn handle_control_command_mcp(
     msg: ControlMsg,
 ) -> Option<&'static str> {
     match msg {
-        ControlMsg::Status => {
+        ControlMsg::Status { .. } => {
             emit_control_status(state, control_tx).await;
             None
         }
@@ -993,6 +1621,7 @@ async fn handle_control_command_mcp(
             if let Some(tx) = control_tx {
                 let s = state.read().await;
                 let event = OutboundEvent::Usage {
+                    session_id: None,
                     main: s.usage_snapshot().main,
                     presence: s.usage_snapshot().presence,
                 };
@@ -1000,11 +1629,15 @@ async fn handle_control_command_mcp(
             }
             None
         }
-        ControlMsg::Approve { id } => {
+        ControlMsg::Approve { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Approve { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "approve".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "approve".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1015,11 +1648,15 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_APPROVAL_URI)
         }
-        ControlMsg::Deny { id } => {
+        ControlMsg::Deny { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Deny { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "deny".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "deny".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1042,11 +1679,15 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_INPUT_URI)
         }
-        ControlMsg::Skip { id } => {
+        ControlMsg::Skip { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::Skip { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "skip".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "skip".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1057,11 +1698,15 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_APPROVAL_URI)
         }
-        ControlMsg::ApproveAll { id } => {
+        ControlMsg::ApproveAll { id, .. } => {
             let mut s = state.write().await;
             let outcome = process_action_sync(&mut s, UserAction::ApproveAll { id });
             if matches!(outcome, ActionOutcome::Ok) {
-                bus.send(AppEvent::ApprovalResolved { id, action: "approve_all".to_string() });
+                bus.send(AppEvent::ApprovalResolved {
+                    session_id: None,
+                    id,
+                    action: "approve_all".to_string(),
+                });
             }
             emit_control_result(
                 control_tx,
@@ -1084,20 +1729,50 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetApprovalRule { category, rule } => {
+            // Live shared-state update + intendant.toml persistence are
+            // handled by the control plane; MCP only surfaces the ack.
+            emit_control_result(
+                control_tx,
+                "set_approval_rule",
+                true,
+                format!("Approval rule {} set to {}", category, rule),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetExternalAgent { agent } => {
-            let parsed = agent.as_deref()
+            let parsed = agent
+                .as_deref()
                 .filter(|s| !s.is_empty())
                 .and_then(crate::external_agent::AgentBackend::from_str_loose);
             {
                 let mut s = state.write().await;
                 s.external_agent = parsed.clone();
             }
-            let label = parsed.as_ref().map(|b| b.to_string()).unwrap_or_else(|| "none".to_string());
+            let label = parsed
+                .as_ref()
+                .map(|b| b.to_string())
+                .unwrap_or_else(|| "none".to_string());
             emit_control_result(
                 control_tx,
                 "set_external_agent",
                 true,
                 format!("External agent set to {}", label),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexCommand { command } => {
+            let label = command
+                .as_deref()
+                .filter(|s| !s.trim().is_empty())
+                .unwrap_or("codex");
+            emit_control_result(
+                control_tx,
+                "set_codex_command",
+                true,
+                format!("Codex command set to {} (applies on next task)", label),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1119,7 +1794,10 @@ async fn handle_control_command_mcp(
                 control_tx,
                 "set_codex_approval_policy",
                 true,
-                format!("Codex approval policy set to {} (applies on next task)", policy),
+                format!(
+                    "Codex approval policy set to {} (applies on next task)",
+                    policy
+                ),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1147,7 +1825,22 @@ async fn handle_control_command_mcp(
                 control_tx,
                 "set_codex_reasoning_effort",
                 true,
-                format!("Codex reasoning effort set to {} (applies on next task)", label),
+                format!(
+                    "Codex reasoning effort set to {} (applies on next task)",
+                    label
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexServiceTier { service_tier } => {
+            let label = crate::project::normalize_codex_service_tier(service_tier.as_deref())
+                .unwrap_or_else(|| "<inherit>".to_string());
+            emit_control_result(
+                control_tx,
+                "set_codex_service_tier",
+                true,
+                format!("Codex service tier set to {} (applies on next task)", label),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1191,6 +1884,34 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetCodexManagedContext { mode } => {
+            let normalized = crate::project::normalize_codex_managed_context(&mode);
+            emit_control_result(
+                control_tx,
+                "set_codex_managed_context",
+                true,
+                format!(
+                    "Codex managed context set to {} (applies on next task)",
+                    normalized
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::SetCodexContextArchive { mode } => {
+            let normalized = crate::project::normalize_codex_context_archive(&mode);
+            emit_control_result(
+                control_tx,
+                "set_codex_context_archive",
+                true,
+                format!(
+                    "Codex context replay set to {} (applies on next task)",
+                    normalized
+                ),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::CodexThreadAction { op, .. } => {
             // The actual RPC round-trip happens on the daemon-side action
             // watcher. Acknowledge dispatch here; the result will surface
@@ -1200,6 +1921,28 @@ async fn handle_control_command_mcp(
                 "codex_thread_action",
                 true,
                 format!("Codex thread action dispatched: /{}", op),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::RenameSession {
+            session_id, name, ..
+        } => {
+            emit_control_result(
+                control_tx,
+                "rename_session",
+                true,
+                format!("Session rename requested: {} → {}", session_id, name),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::ConfigureSessionAgent { session_id, .. } => {
+            emit_control_result(
+                control_tx,
+                "configure_session_agent",
+                true,
+                format!("Session launch config save requested: {}", session_id),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1223,7 +1966,10 @@ async fn handle_control_command_mcp(
                 control_tx,
                 "set_gemini_approval_mode",
                 true,
-                format!("Gemini approval mode set to {} (applies on next task)", mode),
+                format!(
+                    "Gemini approval mode set to {} (applies on next task)",
+                    mode
+                ),
                 None,
             );
             Some(RESOURCE_STATUS_URI)
@@ -1750,7 +2496,9 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_LOOP_URI)
         }
-        ControlMsg::StartTask { task, orchestrate, .. } => {
+        ControlMsg::StartTask {
+            task, orchestrate, ..
+        } => {
             match start_task_with_state(state, bus, task, "voice", orchestrate).await {
                 Ok(()) => {
                     emit_control_result(control_tx, "start_task", true, "ok".to_string(), None);
@@ -1761,7 +2509,69 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::FollowUp { text, direct: _ } => {
+        ControlMsg::CreateSession {
+            task, orchestrate, ..
+        } => {
+            match start_task_with_state(state, bus, task, "mcp", orchestrate).await {
+                Ok(()) => {
+                    emit_control_result(control_tx, "create_session", true, "ok".to_string(), None);
+                }
+                Err(e) => {
+                    emit_control_result(control_tx, "create_session", false, e, None);
+                }
+            }
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::ResumeSession {
+            source,
+            session_id,
+            task,
+            ..
+        } => {
+            let action = if task
+                .as_ref()
+                .map(|t| t.trim())
+                .filter(|t| !t.is_empty())
+                .is_some()
+            {
+                "resume dispatched"
+            } else {
+                "session attach requested"
+            };
+            emit_control_result(
+                control_tx,
+                "resume_session",
+                true,
+                format!("{}: {} {}", action, source, session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::StopSession { session_id } => {
+            emit_control_result(
+                control_tx,
+                "stop_session",
+                true,
+                format!("Stop session requested: {}", session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::RestartSession {
+            source, session_id, ..
+        } => {
+            emit_control_result(
+                control_tx,
+                "restart_session",
+                true,
+                format!("Restart session requested: {} {}", source, session_id),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
+        ControlMsg::FollowUp {
+            text, direct: _, ..
+        } => {
             // MCP has a single follow-up channel and no presence layer,
             // so the `direct` bit is a no-op here — follow-ups already
             // go straight to the agent loop in this mode.
@@ -1784,7 +2594,7 @@ async fn handle_control_command_mcp(
                 s.set_phase(Phase::Thinking);
                 s.push_log(LogLevel::Info, format!("Follow-up via socket: {}", text));
                 drop(s);
-                if tx.send(text).await.is_err() {
+                if tx.send(FollowUpMessage::text(text)).await.is_err() {
                     emit_control_result(
                         control_tx,
                         "follow_up",
@@ -1793,13 +2603,7 @@ async fn handle_control_command_mcp(
                         None,
                     );
                 } else {
-                    emit_control_result(
-                        control_tx,
-                        "follow_up",
-                        true,
-                        "ok".to_string(),
-                        None,
-                    );
+                    emit_control_result(control_tx, "follow_up", true, "ok".to_string(), None);
                 }
             } else {
                 emit_control_result(
@@ -1812,40 +2616,80 @@ async fn handle_control_command_mcp(
             }
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::EditUserMessage {
+            session_id,
+            source,
+            resume_id,
+            project_root,
+            direct,
+            user_turn_index,
+            user_turn_revision,
+            original_text,
+            text,
+            attachments,
+        } => {
+            bus.send(AppEvent::ControlCommand(ControlMsg::EditUserMessage {
+                session_id,
+                source,
+                resume_id,
+                project_root,
+                direct,
+                user_turn_index,
+                user_turn_revision,
+                original_text,
+                text,
+                attachments,
+            }));
+            emit_control_result(
+                control_tx,
+                "edit_user_message",
+                true,
+                "edit requested".to_string(),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::QueryDetail { scope, target } => {
             // Log query detail requests; full handling via presence layer
             let msg = format!("query_detail: scope={}, target={:?}", scope, target);
-            emit_control_result(
-                control_tx,
-                "query_detail",
-                true,
-                msg,
-                None,
-            );
+            emit_control_result(control_tx, "query_detail", true, msg, None);
             None
         }
-        ControlMsg::RecallMemory { keywords, tags, channel } => {
+        ControlMsg::RecallMemory {
+            keywords,
+            tags,
+            channel,
+        } => {
             let msg = format!(
                 "recall_memory: keywords={:?}, tags={:?}, channel={:?}",
                 keywords, tags, channel
             );
-            emit_control_result(
-                control_tx,
-                "recall_memory",
-                true,
-                msg,
-                None,
-            );
+            emit_control_result(control_tx, "recall_memory", true, msg, None);
             None
         }
         ControlMsg::TakeDisplay { display_id } => {
             bus.send(AppEvent::DisplayTaken { display_id });
-            emit_control_result(control_tx, "take_display", true, format!("Took control of :{}", display_id), None);
+            emit_control_result(
+                control_tx,
+                "take_display",
+                true,
+                format!("Took control of :{}", display_id),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::ReleaseDisplay { display_id, note } => {
-            bus.send(AppEvent::DisplayReleased { display_id, note: note.clone() });
-            emit_control_result(control_tx, "release_display", true, format!("Released control of :{}", display_id), None);
+            bus.send(AppEvent::DisplayReleased {
+                display_id,
+                note: note.clone(),
+            });
+            emit_control_result(
+                control_tx,
+                "release_display",
+                true,
+                format!("Released control of :{}", display_id),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::GrantUserDisplay { display_id } => {
@@ -1859,7 +2703,13 @@ async fn handle_control_command_mcp(
             }
             std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
             bus.send(AppEvent::UserDisplayGranted { display_id: did });
-            emit_control_result(control_tx, "grant_user_display", true, format!("User display access granted (display_id: {})", did), None);
+            emit_control_result(
+                control_tx,
+                "grant_user_display",
+                true,
+                format!("User display access granted (display_id: {})", did),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
         ControlMsg::ListDisplays => {
@@ -1880,25 +2730,45 @@ async fn handle_control_command_mcp(
                 a.user_display_granted = false;
             }
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-            bus.send(AppEvent::UserDisplayRevoked { display_id: did, note: note.clone() });
-            emit_control_result(control_tx, "revoke_user_display", true, format!("User display access revoked (display_id: {})", did), None);
+            bus.send(AppEvent::UserDisplayRevoked {
+                display_id: did,
+                note: note.clone(),
+            });
+            emit_control_result(
+                control_tx,
+                "revoke_user_display",
+                true,
+                format!("User display access revoked (display_id: {})", did),
+                None,
+            );
             Some(RESOURCE_LOGS_URI)
         }
-        ControlMsg::InvokeSkill { skill_name, arguments } => {
+        ControlMsg::InvokeSkill {
+            skill_name,
+            arguments,
+        } => {
             // In MCP mode, convert skill invocation to a StartTask
             let discovered = crate::skills::discover_skills(None);
             let args = arguments.as_deref().unwrap_or("");
             match crate::skills::resolve_skill_as_task(&discovered, &skill_name, args) {
                 Ok(task_text) => {
                     bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                        session_id: None,
                         task: task_text,
                         orchestrate: Some(false),
                         direct: None,
                         reference_frame_ids: vec![],
                         display_target: None,
                         attachments: vec![],
+                        follow_up_id: None,
                     }));
-                    emit_control_result(control_tx, "invoke_skill", true, format!("Skill '{}' dispatched", skill_name), None);
+                    emit_control_result(
+                        control_tx,
+                        "invoke_skill",
+                        true,
+                        format!("Skill '{}' dispatched", skill_name),
+                        None,
+                    );
                 }
                 Err(e) => {
                     emit_control_result(control_tx, "invoke_skill", false, e, None);
@@ -1924,36 +2794,81 @@ async fn handle_control_command_mcp(
         | ControlMsg::TeardownDebugScreen
         | ControlMsg::StartDebugRecording
         | ControlMsg::StopDebugRecording => {
-            emit_control_result(control_tx, "debug_screen", true, "Dispatched".to_string(), None);
+            emit_control_result(
+                control_tx,
+                "debug_screen",
+                true,
+                "Dispatched".to_string(),
+                None,
+            );
             None
         }
         ControlMsg::StartRecording { ref stream_name } => {
-            emit_control_result(control_tx, "start_recording", true, format!("Starting {}", stream_name), None);
+            emit_control_result(
+                control_tx,
+                "start_recording",
+                true,
+                format!("Starting {}", stream_name),
+                None,
+            );
             None
         }
         ControlMsg::StopRecording { ref stream_name } => {
-            emit_control_result(control_tx, "stop_recording", true, format!("Stopping {}", stream_name), None);
+            emit_control_result(
+                control_tx,
+                "stop_recording",
+                true,
+                format!("Stopping {}", stream_name),
+                None,
+            );
             None
         }
         ControlMsg::DeleteRecording { ref stream_name } => {
-            emit_control_result(control_tx, "delete_recording", true, format!("Deleting {}", stream_name), None);
+            emit_control_result(
+                control_tx,
+                "delete_recording",
+                true,
+                format!("Deleting {}", stream_name),
+                None,
+            );
             None
         }
-        ControlMsg::Interrupt { expected_turn: _ } => {
+        ControlMsg::Interrupt {
+            session_id,
+            expected_turn: _,
+        } => {
             // Re-broadcast as an AppEvent so the dispatcher / agent loops pick it up.
-            bus.send(AppEvent::InterruptRequested);
-            emit_control_result(control_tx, "interrupt", true, "Interrupt requested".to_string(), None);
+            bus.send(AppEvent::InterruptRequested { session_id });
+            emit_control_result(
+                control_tx,
+                "interrupt",
+                true,
+                "Interrupt requested".to_string(),
+                None,
+            );
             Some(RESOURCE_STATUS_URI)
         }
-        ControlMsg::Steer { text, id } => {
+        ControlMsg::Steer {
+            session_id,
+            text,
+            id,
+            attachments: _,
+        } => {
             // Mid-turn steering from an MCP client. Re-broadcast as an
             // `AppEvent::SteerRequested` so the running agent loop (if any)
             // decides whether to call `steer_turn` or fall back to queuing.
             bus.send(AppEvent::SteerRequested {
+                session_id,
                 text,
                 id: id.unwrap_or_default(),
             });
-            emit_control_result(control_tx, "steer", true, "Steer requested".to_string(), None);
+            emit_control_result(
+                control_tx,
+                "steer",
+                true,
+                "Steer requested".to_string(),
+                None,
+            );
             Some(RESOURCE_STATUS_URI)
         }
         ControlMsg::WebRtcSignal { .. } => {
@@ -1971,6 +2886,15 @@ async fn handle_control_command_mcp(
             // a per-client connection identity in the same sense, so
             // there's no coherent way to grant authority to an MCP
             // caller here. Ignored.
+            None
+        }
+        ControlMsg::CreateBrowserWorkspace { .. }
+        | ControlMsg::CloseBrowserWorkspace { .. }
+        | ControlMsg::AcquireBrowserWorkspace { .. }
+        | ControlMsg::ReleaseBrowserWorkspace { .. } => {
+            // Browser workspace commands are handled by the control plane and
+            // by dedicated MCP tools. Replaying ControlCommand events here
+            // would duplicate launch/lease side effects.
             None
         }
         ControlMsg::SetDiagnosticsVisualMarker { .. } => {
@@ -2054,7 +2978,127 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::ExternalAgentChanged { .. } | AppEvent::CodexConfigChanged { .. } | AppEvent::CodexThreadActionRequested { .. } | AppEvent::CodexThreadActionResult { .. } | AppEvent::GeminiConfigChanged { .. } | AppEvent::GeminiThreadActionRequested { .. } | AppEvent::GeminiThreadActionResult { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::ContextSnapshot { .. }
+                    | AppEvent::StatusUpdate { .. }
+                    | AppEvent::LogEntry { .. }
+                    | AppEvent::UserMessageRewind { .. }
+                    | AppEvent::UserMessageLog { .. }
+                    | AppEvent::ExternalAgentChanged { .. }
+                    | AppEvent::AutonomyChanged { .. }
+                    | AppEvent::CodexThreadActionRequested { .. }
+                    | AppEvent::ExternalFollowUpRequested { .. }
+                    | AppEvent::SessionStopRequested { .. }
+                    | AppEvent::SessionRelationship { .. }
+                    | AppEvent::SessionGoal { .. }
+                    | AppEvent::SessionRenameResult { .. }
+                    | AppEvent::SessionAgentConfigResult { .. }
+                    | AppEvent::GeminiConfigChanged { .. }
+                    | AppEvent::GeminiThreadActionRequested { .. }
+                    | AppEvent::GeminiThreadActionResult { .. }
+                    | AppEvent::SharedView { .. }
+                    | AppEvent::BrowserWorkspaceChanged { .. } => {} // Derived events — handled by outbound broadcaster
+                    AppEvent::CodexConfigChanged {
+                        managed_context, ..
+                    } => {
+                        if let Some(mode) = managed_context {
+                            s.configured_codex_managed_context =
+                                crate::project::codex_managed_context_enabled(&mode);
+                            if !s.is_active_codex_session() {
+                                s.codex_managed_context = s.configured_codex_managed_context;
+                            }
+                            resource_changed = Some("intendant://status");
+                        }
+                    }
+                    AppEvent::SessionCapabilities {
+                        ref session_id,
+                        ref capabilities,
+                    } => {
+                        if apply_session_capabilities_to_mcp_state(&mut s, session_id, capabilities)
+                        {
+                            resource_changed = Some("intendant://status");
+                        }
+                    }
+                    AppEvent::SessionIdentity {
+                        ref session_id,
+                        ref source,
+                        ref backend_session_id,
+                    } => {
+                        s.link_session_aliases(session_id, backend_session_id);
+                        if !session_id.is_empty() {
+                            s.session_sources.insert(session_id.clone(), source.clone());
+                        }
+                        if !backend_session_id.is_empty() {
+                            s.session_sources
+                                .insert(backend_session_id.clone(), source.clone());
+                        }
+                        if source.eq_ignore_ascii_case("codex") {
+                            if let Some(enabled) =
+                                s.session_codex_managed_context.get(session_id).copied()
+                            {
+                                s.session_codex_managed_context
+                                    .insert(backend_session_id.clone(), enabled);
+                            } else if let Some(enabled) = s
+                                .session_codex_managed_context
+                                .get(backend_session_id)
+                                .copied()
+                            {
+                                s.session_codex_managed_context
+                                    .insert(session_id.clone(), enabled);
+                            }
+                        }
+                        if s.session_id.is_empty()
+                            || s.session_id == session_id.as_str()
+                            || s.session_id == backend_session_id.as_str()
+                        {
+                            s.active_session_source = Some(source.clone());
+                        }
+                        resource_changed = Some("intendant://status");
+                    }
+                    AppEvent::CodexThreadActionResult {
+                        session_id,
+                        action,
+                        success,
+                        message,
+                    } => {
+                        if action == "rewind_context" {
+                            s.note_context_rewind_result_for(
+                                session_id.as_deref(),
+                                success,
+                                &message,
+                            );
+                            resource_changed = Some("intendant://status");
+                        }
+                    }
+                    AppEvent::UsageSnapshot {
+                        session_id,
+                        main,
+                        presence,
+                    } => {
+                        let main =
+                            s.normalize_main_usage_snapshot(session_id.as_deref(), main.clone());
+                        if let Some(id) = session_id
+                            .as_deref()
+                            .map(str::trim)
+                            .filter(|id| !id.is_empty())
+                        {
+                            s.session_usage.insert(id.to_string(), main.clone());
+                        }
+                        let applies_to_current_session = session_id
+                            .as_deref()
+                            .is_none_or(|id| s.session_id.is_empty() || id == s.session_id);
+                        if applies_to_current_session {
+                            s.apply_main_usage_snapshot(main);
+                            if let Some(presence) = presence {
+                                s.presence_provider_name = Some(presence.provider);
+                                s.presence_model_name = Some(presence.model);
+                                s.presence_tokens = presence.tokens_used;
+                                s.presence_context_window = presence.context_window;
+                                s.presence_usage_pct = presence.usage_pct;
+                            }
+                        }
+                        s.complete_pending_rewind_pressure_check_for(session_id.as_deref());
+                        resource_changed = Some("intendant://status");
+                    }
                     AppEvent::Tick => {
                         // Detect stuck phases — warn every 30s after 120s
                         if matches!(
@@ -2084,6 +3128,7 @@ pub fn spawn_event_listener(
                         turn,
                         budget_pct,
                         remaining: _,
+                        ..
                     } => {
                         s.turn = turn;
                         s.budget_pct = budget_pct;
@@ -2126,7 +3171,7 @@ pub fn spawn_event_listener(
                         s.push_log(LogLevel::Debug, format!("JSON: {}", preview));
                     }
 
-                    AppEvent::DoneSignal { message } => {
+                    AppEvent::DoneSignal { message, .. } => {
                         s.set_phase(Phase::Done);
                         s.push_log(
                             LogLevel::Info,
@@ -2146,9 +3191,14 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::AgentOutput { stdout, stderr, .. } => {
-                        let formatted = crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
+                        let formatted =
+                            crate::tui::app::format_agent_output_for_tui(&stdout, &stderr);
                         if !formatted.is_empty() {
-                            let level = if !stderr.is_empty() { LogLevel::Warn } else { LogLevel::Agent };
+                            let level = if !stderr.is_empty() {
+                                LogLevel::Warn
+                            } else {
+                                LogLevel::Agent
+                            };
                             s.push_log(level, formatted);
                         }
                         resource_changed = Some("intendant://logs");
@@ -2238,6 +3288,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::ApprovalRequired {
+                        session_id: _,
                         id,
                         command_preview,
                         category,
@@ -2255,10 +3306,7 @@ pub fn spawn_event_listener(
                         resource_changed = Some("intendant://pending-approval");
                     }
 
-                    AppEvent::DisplayReady {
-                        display_id,
-                        ..
-                    } => {
+                    AppEvent::DisplayReady { display_id, .. } => {
                         s.push_log(LogLevel::Detail, format!("Display :{}", display_id));
                         resource_changed = Some("intendant://logs");
                     }
@@ -2270,10 +3318,7 @@ pub fn spawn_event_listener(
                     } => {
                         s.push_log(
                             LogLevel::Detail,
-                            format!(
-                                "Display :{} resized to {}x{}",
-                                display_id, width, height
-                            ),
+                            format!("Display :{} resized to {}x{}", display_id, width, height),
                         );
                         resource_changed = Some("intendant://logs");
                     }
@@ -2302,11 +3347,17 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::UserDisplayGranted { display_id } => {
-                        s.push_log(LogLevel::Warn, format!("User display access granted (display_id: {})", display_id));
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("User display access granted (display_id: {})", display_id),
+                        );
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::UserDisplayRevoked { display_id, ref note } => {
+                    AppEvent::UserDisplayRevoked {
+                        display_id,
+                        ref note,
+                    } => {
                         let msg = format!(
                             "User display access revoked (display_id: {}){}",
                             display_id,
@@ -2330,24 +3381,18 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::AutoApproved { ref preview } => {
-                        s.push_log(
-                            LogLevel::Detail,
-                            format!("auto-approved: {}", preview),
-                        );
+                        s.push_log(LogLevel::Detail, format!("auto-approved: {}", preview));
                         resource_changed = Some("intendant://logs");
                     }
 
-                    AppEvent::ApprovalResolved { id, ref action } => {
+                    AppEvent::ApprovalResolved { id, ref action, .. } => {
                         s.pending_approval = None;
                         if action == "deny" {
                             s.set_phase(Phase::Done);
                         } else {
                             s.set_phase(Phase::RunningAgent);
                         }
-                        s.push_log(
-                            LogLevel::Info,
-                            format!("Approval {} (turn {})", action, id),
-                        );
+                        s.push_log(LogLevel::Info, format!("Approval {} (turn {})", action, id));
                         resource_changed = Some(RESOURCE_APPROVAL_URI);
                     }
 
@@ -2386,7 +3431,10 @@ pub fn spawn_event_listener(
                         }
                     }
                     AppEvent::PresenceLog { message, level, .. } => {
-                        s.push_log(level.unwrap_or(LogLevel::Info), format!("[presence] {}", message));
+                        s.push_log(
+                            level.unwrap_or(LogLevel::Info),
+                            format!("[presence] {}", message),
+                        );
                     }
                     AppEvent::PresenceReady => {
                         if !matches!(s.phase, Phase::WaitingApproval) {
@@ -2394,13 +3442,22 @@ pub fn spawn_event_listener(
                         }
                     }
                     AppEvent::PresenceConnected { .. } => {
-                        s.push_log(LogLevel::Detail, "Browser presence connected — server presence paused".to_string());
+                        s.push_log(
+                            LogLevel::Detail,
+                            "Browser presence connected — server presence paused".to_string(),
+                        );
                     }
                     AppEvent::PresenceDisconnected => {
-                        s.push_log(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string());
+                        s.push_log(
+                            LogLevel::Detail,
+                            "Browser presence disconnected — server presence resumed".to_string(),
+                        );
                     }
                     AppEvent::VoiceLog { ref text, seq, .. } => {
-                        s.push_log(LogLevel::Detail, format!("[presence voice #{}] {}", seq, text));
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("[presence voice #{}] {}", seq, text),
+                        );
                     }
                     AppEvent::PresenceCheckpointReceived { .. } => {
                         // Detail-level, no user-visible log
@@ -2415,38 +3472,132 @@ pub fn spawn_event_listener(
                         // Broadcast-only — handled by outbound event converter.
                     }
                     AppEvent::RecordingStarted { ref stream_name } => {
-                        s.push_log(LogLevel::Detail, format!("Recording started: {}", stream_name));
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("Recording started: {}", stream_name),
+                        );
                     }
                     AppEvent::RecordingStopped { ref stream_name } => {
-                        s.push_log(LogLevel::Detail, format!("Recording stopped: {}", stream_name));
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("Recording stopped: {}", stream_name),
+                        );
                     }
-                    AppEvent::RecordingError { ref stream_name, ref message } => {
-                        s.push_log(LogLevel::Warn, format!("Recording error ({}): {}", stream_name, message));
+                    AppEvent::RecordingError {
+                        ref stream_name,
+                        ref message,
+                    } => {
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("Recording error ({}): {}", stream_name, message),
+                        );
                     }
                     AppEvent::RecordingDeleted { ref stream_name } => {
-                        s.push_log(LogLevel::Info, format!("Recording deleted: {}", stream_name));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Recording deleted: {}", stream_name),
+                        );
                     }
-                    AppEvent::SessionStarted { ref session_id, ref task } => {
-                        s.push_log(LogLevel::Info, format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(no task)")));
+                    AppEvent::SessionStarted {
+                        ref session_id,
+                        ref task,
+                    } => {
+                        s.session_id = session_id.clone();
+                        s.task_description = task.clone().unwrap_or_default();
+                        s.turn = 0;
+                        s.session_tokens = 0;
+                        s.session_prompt_tokens = 0;
+                        s.session_completion_tokens = 0;
+                        s.session_cached_tokens = 0;
+                        s.active_session_source = s.session_sources.get(session_id).cloned();
+                        if s.is_active_codex_session() {
+                            let enabled = s
+                                .session_codex_managed_context
+                                .get(session_id)
+                                .copied()
+                                .unwrap_or(s.configured_codex_managed_context);
+                            s.session_codex_managed_context
+                                .insert(session_id.clone(), enabled);
+                            s.codex_managed_context = enabled;
+                        }
+                        s.set_phase(Phase::Thinking);
+                        s.push_log(
+                            LogLevel::Info,
+                            format!(
+                                "Session started: {} — {}",
+                                session_id,
+                                task.as_deref().unwrap_or("(no task)")
+                            ),
+                        );
                     }
-                    AppEvent::SessionEnded { ref session_id, ref reason } => {
-                        s.push_log(LogLevel::Info, format!("Session ended: {} — {}", session_id, reason));
+                    AppEvent::SessionAttached {
+                        ref session_id,
+                        ref source,
+                    } => {
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Session attached: {} ({})", session_id, source),
+                        );
+                    }
+                    AppEvent::SessionEnded {
+                        ref session_id,
+                        ref reason,
+                    } => {
+                        if s.session_id == session_id.as_str() {
+                            s.set_phase(Phase::Done);
+                            s.active_session_source = None;
+                            s.codex_managed_context = s.configured_codex_managed_context;
+                        }
+                        s.pending_rewind_pressure_checks.remove(session_id);
+                        s.insufficient_rewind_notices.remove(session_id);
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Session ended: {} — {}", session_id, reason),
+                        );
                     }
                     AppEvent::DebugScreenReady { display_id } => {
-                        s.push_log(LogLevel::Info, format!("Debug screen ready on :{}", display_id));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Debug screen ready on :{}", display_id),
+                        );
                     }
                     AppEvent::DebugScreenTornDown { display_id } => {
-                        s.push_log(LogLevel::Info, format!("Debug screen :{} torn down", display_id));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Debug screen :{} torn down", display_id),
+                        );
                     }
                     AppEvent::LiveAudioStarted { id, provider } => {
-                        s.push_log(LogLevel::Info, format!("Live audio '{}' started ({})", id, provider));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Live audio '{}' started ({})", id, provider),
+                        );
                     }
-                    AppEvent::LiveAudioProgress { id, state, elapsed_secs, .. } => {
-                        s.push_log(LogLevel::Detail, format!("Live audio '{}': {} ({:.0}s)", id, state, elapsed_secs));
+                    AppEvent::LiveAudioProgress {
+                        id,
+                        state,
+                        elapsed_secs,
+                        ..
+                    } => {
+                        s.push_log(
+                            LogLevel::Detail,
+                            format!("Live audio '{}': {} ({:.0}s)", id, state, elapsed_secs),
+                        );
                     }
-                    AppEvent::LiveAudioCompleted { id, status, quarantine_count } => {
-                        let q_note = if quarantine_count > 0 { format!(" ({} quarantined)", quarantine_count) } else { String::new() };
-                        s.push_log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
+                    AppEvent::LiveAudioCompleted {
+                        id,
+                        status,
+                        quarantine_count,
+                    } => {
+                        let q_note = if quarantine_count > 0 {
+                            format!(" ({} quarantined)", quarantine_count)
+                        } else {
+                            String::new()
+                        };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Live audio '{}': {}{}", id, status, q_note),
+                        );
                     }
                     AppEvent::DisplayMetrics { .. }
                     | AppEvent::FileChanged { .. }
@@ -2460,23 +3611,34 @@ pub fn spawn_event_listener(
                     | AppEvent::ConversationRolledBack { .. } => {
                         // Broadcast-only — handled by outbound event converter.
                     }
-                    AppEvent::DisplayCaptureLost { display_id, ref reason } => {
-                        s.push_log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
+                    AppEvent::DisplayCaptureLost {
+                        display_id,
+                        ref reason,
+                    } => {
+                        s.push_log(
+                            LogLevel::Warn,
+                            format!("Display :{} capture lost: {}", display_id, reason),
+                        );
                     }
-                    AppEvent::DisplayApprovalPending { display_id, backend } => {
+                    AppEvent::DisplayApprovalPending {
+                        display_id,
+                        backend,
+                    } => {
                         s.push_log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
                     }
-                    AppEvent::InterruptRequested => {
+                    AppEvent::InterruptRequested { .. } => {
                         s.set_phase(Phase::Interrupting);
                         s.push_log(LogLevel::Info, "Interrupt requested".to_string());
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::Interrupted { ref reason } => {
+                    AppEvent::Interrupted { ref reason, .. } => {
                         s.set_phase(Phase::Interrupted);
                         s.push_log(LogLevel::Info, format!("Interrupted: {}", reason));
                         resource_changed = Some("intendant://status");
                     }
-                    AppEvent::SteerRequested { ref text, ref id } => {
+                    AppEvent::SteerRequested {
+                        ref text, ref id, ..
+                    } => {
                         let preview: String = text.chars().take(80).collect();
                         let suffix = if text.chars().count() > 80 { "..." } else { "" };
                         let id_part = if id.is_empty() {
@@ -2490,7 +3652,9 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
-                    AppEvent::SteerQueued { ref id, ref reason } => {
+                    AppEvent::SteerQueued {
+                        ref id, ref reason, ..
+                    } => {
                         let id_part = if id.is_empty() {
                             String::new()
                         } else {
@@ -2502,16 +3666,58 @@ pub fn spawn_event_listener(
                         );
                         resource_changed = Some("intendant://logs");
                     }
-                    AppEvent::SteerDelivered { ref id, mid_turn } => {
+                    AppEvent::SteerAccepted {
+                        ref id, ref reason, ..
+                    } => {
                         let id_part = if id.is_empty() {
                             String::new()
                         } else {
                             format!(" [{}]", id)
                         };
-                        let mode = if mid_turn { "mid-turn" } else { "follow-up" };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Steer accepted{}: {}", id_part, reason),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+                    AppEvent::SteerDelivered {
+                        ref id, mid_turn, ..
+                    } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        let mode = if mid_turn {
+                            "mid-turn"
+                        } else {
+                            "turn boundary"
+                        };
                         s.push_log(
                             LogLevel::Info,
                             format!("Steer delivered{} ({})", id_part, mode),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+                    AppEvent::FollowUpStatus {
+                        ref id,
+                        ref status,
+                        ref reason,
+                        ..
+                    } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        let suffix = reason
+                            .as_deref()
+                            .filter(|s| !s.is_empty())
+                            .map(|s| format!(": {}", s))
+                            .unwrap_or_default();
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Follow-up {}{}{}", status, id_part, suffix),
                         );
                         resource_changed = Some("intendant://logs");
                     }
@@ -2536,6 +3742,202 @@ pub fn spawn_event_listener(
                         .await;
                 }
             }
+        }
+    })
+}
+
+fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> bool {
+    match event {
+        AppEvent::ExternalAgentChanged { agent } => {
+            s.external_agent = agent
+                .as_deref()
+                .and_then(crate::external_agent::AgentBackend::from_str_loose);
+            true
+        }
+        AppEvent::CodexConfigChanged {
+            managed_context, ..
+        } => {
+            if let Some(mode) = managed_context {
+                s.configured_codex_managed_context =
+                    crate::project::codex_managed_context_enabled(mode);
+                if !s.is_active_codex_session() {
+                    s.codex_managed_context = s.configured_codex_managed_context;
+                }
+                return true;
+            }
+            false
+        }
+        AppEvent::SessionIdentity {
+            session_id,
+            source,
+            backend_session_id,
+        } => {
+            s.link_session_aliases(session_id, backend_session_id);
+            if !session_id.is_empty() {
+                s.session_sources.insert(session_id.clone(), source.clone());
+            }
+            if !backend_session_id.is_empty() {
+                s.session_sources
+                    .insert(backend_session_id.clone(), source.clone());
+            }
+            if source.eq_ignore_ascii_case("codex") {
+                if let Some(enabled) = s.session_codex_managed_context.get(session_id).copied() {
+                    s.session_codex_managed_context
+                        .insert(backend_session_id.clone(), enabled);
+                } else if let Some(enabled) = s
+                    .session_codex_managed_context
+                    .get(backend_session_id)
+                    .copied()
+                {
+                    s.session_codex_managed_context
+                        .insert(session_id.clone(), enabled);
+                }
+            }
+            if s.session_id.is_empty()
+                || s.session_id == session_id.as_str()
+                || s.session_id == backend_session_id.as_str()
+            {
+                s.active_session_source = Some(source.clone());
+            }
+            true
+        }
+        AppEvent::SessionCapabilities {
+            session_id,
+            capabilities,
+        } => apply_session_capabilities_to_mcp_state(s, session_id, capabilities),
+        AppEvent::SessionStarted { session_id, task } => {
+            s.session_id = session_id.clone();
+            s.task_description = task.clone().unwrap_or_default();
+            s.turn = 0;
+            s.session_tokens = 0;
+            s.session_prompt_tokens = 0;
+            s.session_completion_tokens = 0;
+            s.session_cached_tokens = 0;
+            s.active_session_source = s.session_sources.get(session_id).cloned();
+            if s.is_active_codex_session() {
+                let enabled = s
+                    .session_codex_managed_context
+                    .get(session_id)
+                    .copied()
+                    .unwrap_or(s.configured_codex_managed_context);
+                s.session_codex_managed_context
+                    .insert(session_id.clone(), enabled);
+                s.codex_managed_context = enabled;
+            }
+            s.set_phase(Phase::Thinking);
+            true
+        }
+        AppEvent::UsageSnapshot {
+            session_id,
+            main,
+            presence,
+        } => {
+            let main = s.normalize_main_usage_snapshot(session_id.as_deref(), main.clone());
+            if let Some(id) = session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                s.session_usage.insert(id.to_string(), main.clone());
+                if s.session_id.is_empty() {
+                    s.session_id = id.to_string();
+                }
+                if let Some(source) = s.session_sources.get(id).cloned() {
+                    s.active_session_source = Some(source);
+                }
+            }
+            let applies_to_current_session = session_id
+                .as_deref()
+                .is_none_or(|id| s.session_id.is_empty() || id == s.session_id);
+            if applies_to_current_session {
+                s.apply_main_usage_snapshot(main.clone());
+                if let Some(presence) = presence {
+                    s.presence_provider_name = Some(presence.provider.clone());
+                    s.presence_model_name = Some(presence.model.clone());
+                    s.presence_tokens = presence.tokens_used;
+                    s.presence_context_window = presence.context_window;
+                    s.presence_usage_pct = presence.usage_pct;
+                }
+                s.complete_pending_rewind_pressure_check_for(session_id.as_deref());
+                return true;
+            }
+            s.complete_pending_rewind_pressure_check_for(session_id.as_deref());
+            session_id.is_some()
+        }
+        AppEvent::CodexThreadActionResult {
+            session_id,
+            action,
+            success,
+            message,
+        } => {
+            if action == "rewind_context" {
+                s.note_context_rewind_result_for(session_id.as_deref(), *success, message);
+            }
+            true
+        }
+        AppEvent::SessionEnded { session_id, .. } => {
+            if s.session_id == session_id.as_str() {
+                s.set_phase(Phase::Done);
+                s.active_session_source = None;
+                s.codex_managed_context = s.configured_codex_managed_context;
+            }
+            s.pending_rewind_pressure_checks.remove(session_id);
+            s.insufficient_rewind_notices.remove(session_id);
+            true
+        }
+        AppEvent::SessionDirChanged { path } => {
+            s.log_dir = path.clone();
+            true
+        }
+        AppEvent::TurnStarted {
+            turn, budget_pct, ..
+        } => {
+            s.turn = *turn;
+            s.budget_pct = *budget_pct;
+            s.set_phase(Phase::Thinking);
+            true
+        }
+        AppEvent::DoneSignal { .. } | AppEvent::TaskComplete { .. } => {
+            s.set_phase(Phase::Done);
+            true
+        }
+        AppEvent::RoundComplete { round, .. } => {
+            s.round = *round;
+            s.set_phase(Phase::WaitingFollowUp);
+            true
+        }
+        AppEvent::InterruptRequested { .. } => {
+            s.set_phase(Phase::Interrupting);
+            true
+        }
+        AppEvent::Interrupted { .. } => {
+            s.set_phase(Phase::Interrupted);
+            true
+        }
+        AppEvent::LoopError(_) => {
+            s.set_phase(Phase::Done);
+            true
+        }
+        _ => false,
+    }
+}
+
+/// Lightweight event mirror for the stateless HTTP MCP endpoint used by
+/// external agents. It intentionally observes state only; it does not dispatch
+/// `ControlMsg`s, because the normal control plane remains the single writer.
+pub fn spawn_http_observation_listener(
+    state: SharedMcpState,
+    mut event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            let event = match event_rx.recv().await {
+                Ok(event) => event,
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            };
+            let mut s = state.write().await;
+            apply_observed_event_to_mcp_state(&mut s, &event);
         }
     })
 }
@@ -2600,14 +4002,118 @@ pub struct StartTaskParams {
     /// CU-capable model instead of the regular agent loop.
     #[serde(default)]
     pub reference_frame_ids: Vec<String>,
-    /// Explicit display target for CU tasks: "user_session", ":99", etc.
+    /// Explicit display target for CU tasks: "user_session", "display_99", etc.
     #[serde(default)]
     pub display_target: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RewindContextAnchorParams {
+    /// Exact Codex thread item/tool-call id to roll back to. Use list_rewind_anchors first when the id is not already known.
+    pub item_id: String,
+    /// Whether the anchored item itself should survive rollback: "before" or "after".
+    pub position: String,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RewindContextParams {
+    /// Optional Intendant or backend session id. Omit for the active Codex session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Exact item anchor for the rollback target.
+    pub anchor: RewindContextAnchorParams,
+    /// Why the current branch should be rewound.
+    pub reason: String,
+    /// Carry-forward context for the resumed branch. Include only useful facts from the pruned span.
+    pub primer: String,
+    /// Optional facts, decisions, or artifacts to preserve.
+    #[serde(default)]
+    pub preserve: Vec<String>,
+    /// Optional dead ends, assumptions, or work to discard.
+    #[serde(default)]
+    pub discard: Vec<String>,
+    /// Optional files, commits, logs, or outputs created before the rewind.
+    #[serde(default)]
+    pub artifacts: Vec<String>,
+    /// Optional recommended next actions for the resumed branch.
+    #[serde(default)]
+    pub next_steps: Vec<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ListRewindAnchorsParams {
+    /// Optional Intendant or backend session id. Omit for the active Codex session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Zero-based offset into the matching anchor catalog.
+    #[serde(default)]
+    pub offset: Option<usize>,
+    /// Maximum anchors to return. The backend caps this to a safe page size.
+    #[serde(default)]
+    pub limit: Option<usize>,
+    /// Optional case-insensitive search over anchor ids, item types, tool names, roles, and summaries.
+    #[serde(default)]
+    pub query: Option<String>,
+    /// Return anchors from newest to oldest when true.
+    #[serde(default)]
+    pub reverse: bool,
+    /// Include managed-context maintenance calls such as list_rewind_anchors or rewind_context.
+    /// Omit this during ordinary recovery so discovery does not target its own tool calls.
+    #[serde(default, alias = "includeManagementTools")]
+    pub include_management_tools: bool,
+    /// During recovery, prefer anchors whose nearby backend usage is below the rewind-only limit.
+    /// Omit to let Intendant enable this automatically while the session is in rewind-only pressure.
+    #[serde(default, alias = "recoveryCandidatesOnly")]
+    pub recovery_candidates_only: Option<bool>,
+    /// Include anchors known to still be at/above the rewind-only limit.
+    #[serde(default, alias = "includeNonRecovery")]
+    pub include_non_recovery: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct InspectRewindAnchorParams {
+    /// Optional Intendant or backend session id. Omit for the active Codex session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Exact Codex thread item/tool-call id to inspect.
+    pub item_id: String,
+    /// Number of neighboring response items to include on each side. The backend caps this.
+    #[serde(default)]
+    pub radius: Option<usize>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RewindBackoutParams {
+    /// Optional Intendant or backend session id. Omit for the active Codex session.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
+    /// Context rewind record id returned by rewind_context.
+    pub record_id: String,
+    /// Backout mode: "inspect" (default) returns the saved rollout path; "restore" restores the active Codex thread in place; "fork"/"backout" create a new Codex thread that inherits the lineage prompt-cache key when the patched Codex binary is used.
+    #[serde(default)]
+    pub mode: Option<String>,
+    /// Optional display name for the recovery fork.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// Legacy compatibility flag. Fork/backout no longer require this with the patched Codex lineage-cache-key support.
+    #[serde(default)]
+    pub allow_cache_reset: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ClaimFissionCanonicalParams {
+    /// Fission group id from get_status().fission_ledger.groups[].group_id.
+    pub group_id: String,
+    /// Branch/session id to claim as the canonical continuation for this group.
+    pub branch_session_id: String,
+    /// Optional compare-and-swap guard. Omit for first-writer-wins behavior; provide the current canonical id to reassign deliberately.
+    #[serde(default)]
+    pub expected_canonical_session_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeDisplayParams {
-    /// Display ID to claim (e.g. 99 for virtual display :99).
+    /// Display ID to claim (e.g. 99 for virtual display 99).
     pub display_id: u32,
 }
 
@@ -2715,13 +4221,65 @@ pub enum McpArrayElement {
     Boolean,
 }
 
-fn default_timeout() -> u64 { 300 }
+fn default_timeout() -> u64 {
+    300
+}
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct TakeScreenshotParams {
-    /// Display target: "user_session", ":99", etc. Auto-detects if omitted.
+    /// Display target: "user_session", "display_99", etc. Auto-detects if omitted.
     #[serde(default)]
     pub display_target: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CreateBrowserWorkspaceParams {
+    /// URL to open in the browser workspace. Omit for about:blank.
+    #[serde(default)]
+    pub url: Option<String>,
+    /// Human label shown in the dashboard.
+    #[serde(default)]
+    pub label: Option<String>,
+    /// Provider: auto, cdp, system_cdp, playwright, agent_browser, or stream. The default cdp backend uses managed Chromium; system_cdp deliberately launches the user's installed browser.
+    #[serde(default)]
+    pub provider: Option<String>,
+    /// Optional federation peer id. Remote placement is part of the contract but not wired yet.
+    #[serde(default)]
+    pub peer_id: Option<String>,
+    /// Session or agent that owns this workspace.
+    #[serde(default)]
+    pub owner_session_id: Option<String>,
+    /// Explicit browser profile directory. If omitted, Intendant creates one under its data dir.
+    #[serde(default)]
+    pub profile_dir: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CloseBrowserWorkspaceParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct AcquireBrowserWorkspaceParams {
+    pub workspace_id: String,
+    pub holder_id: String,
+    #[serde(default)]
+    pub holder_kind: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
+    #[serde(default)]
+    pub force: bool,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReleaseBrowserWorkspaceParams {
+    pub workspace_id: String,
+    #[serde(default)]
+    pub holder_id: Option<String>,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2757,6 +4315,82 @@ pub struct ReadFrameParams {
     /// Stream filter (used when frame_id is "latest").
     #[serde(default)]
     pub stream: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, schemars::JsonSchema)]
+pub struct SharedViewRegionParams {
+    /// Normalized left coordinate, from 0.0 to 1.0.
+    pub x: f64,
+    /// Normalized top coordinate, from 0.0 to 1.0.
+    pub y: f64,
+    /// Normalized width, from 0.0 to 1.0.
+    pub width: f64,
+    /// Normalized height, from 0.0 to 1.0.
+    pub height: f64,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ShowSharedViewParams {
+    /// Display target to foreground, such as "user_session" or "display_99".
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Why the agent wants the user to watch or collaborate.
+    #[serde(default)]
+    pub reason: Option<String>,
+    /// Optional normalized region to highlight after the view opens.
+    #[serde(default)]
+    pub focus_region: Option<SharedViewRegionParams>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct HideSharedViewParams {
+    /// Optional reason for dismissing the collaboration view.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct FocusSharedViewParams {
+    /// Display target to focus, such as "user_session" or "display_99".
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Normalized region to highlight.
+    pub region: SharedViewRegionParams,
+    /// Short label for what the user should look at.
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct RequestSharedViewInputParams {
+    /// Display target where user input is useful, such as "user_session" or "display_99".
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Why the agent wants input authority or human interaction.
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct CaptureSharedViewFrameParams {
+    /// Display target to capture, such as "user_session" or "display_99". Auto-detects if omitted.
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// Numeric display id. Prefer this when known.
+    #[serde(default)]
+    pub display_id: Option<u32>,
+    /// Optional note that appears in the dashboard shared-view banner.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
@@ -2855,6 +4489,11 @@ impl IntendantServer {
         }
     }
 
+    pub fn new_http(state: SharedMcpState, bus: EventBus) -> Self {
+        spawn_http_observation_listener(state.clone(), bus.subscribe());
+        Self::new(state, bus)
+    }
+
     async fn start_task_internal(
         &self,
         task: String,
@@ -2868,12 +4507,80 @@ impl IntendantServer {
         run_scheduled_controller_restart_with_state(&self.state, &self.bus).await
     }
 
+    async fn dispatch_codex_thread_action_and_wait(
+        &self,
+        session_id: Option<String>,
+        op: String,
+        params: serde_json::Value,
+        timeout_message: String,
+    ) -> String {
+        let mut result_rx = self.bus.subscribe();
+        self.bus
+            .send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                session_id: session_id.clone(),
+                op: op.clone(),
+                params,
+            }));
+
+        match tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            loop {
+                match result_rx.recv().await {
+                    Ok(AppEvent::CodexThreadActionResult {
+                        session_id: result_session_id,
+                        action,
+                        success,
+                        message,
+                    }) if action == op
+                        && codex_thread_action_result_targets_session(
+                            &session_id,
+                            &result_session_id,
+                        ) =>
+                    {
+                        if success {
+                            return message;
+                        }
+                        return format!("{op} failed: {message}");
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return format!("{timeout_message}; event bus closed before result");
+                    }
+                }
+            }
+        })
+        .await
+        {
+            Ok(message) => message,
+            Err(_) => format!("{timeout_message}; timed out waiting for result"),
+        }
+    }
+
     /// Return MCP tool definitions as JSON for the HTTP transport.
     /// Schemas are flattened (all `$ref`/`$defs` inlined) for compatibility
     /// with clients that don't resolve JSON Schema references (e.g. Codex).
-    pub fn list_tools_json(&self) -> serde_json::Value {
-        let tools: Vec<serde_json::Value> = self.tool_router.list_all()
+    pub async fn list_tools_json(&self) -> serde_json::Value {
+        self.list_tools_json_for_session(None, None, None).await
+    }
+
+    pub async fn list_tools_json_for_session(
+        &self,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+        tool_profile: Option<&str>,
+    ) -> serde_json::Value {
+        let managed_context = self
+            .state
+            .read()
+            .await
+            .exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
+        let tools: Vec<serde_json::Value> = self
+            .tool_router
+            .list_all()
             .iter()
+            .filter(|tool| {
+                tool_allowed_for_profile(tool.name.as_ref(), managed_context, tool_profile)
+            })
             .map(|tool| {
                 let mut schema = serde_json::to_value(&*tool.input_schema).unwrap_or_default();
                 inline_schema_refs(&mut schema);
@@ -2893,6 +4600,17 @@ impl IntendantServer {
         name: &str,
         args: serde_json::Value,
     ) -> Result<CallToolResult, String> {
+        self.call_tool_by_name_for_session(name, args, None, None)
+            .await
+    }
+
+    pub async fn call_tool_by_name_for_session(
+        &self,
+        name: &str,
+        args: serde_json::Value,
+        session_id: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> Result<CallToolResult, String> {
         fn parse_params<T: serde::de::DeserializeOwned>(
             args: serde_json::Value,
         ) -> Result<Parameters<T>, String> {
@@ -2901,8 +4619,30 @@ impl IntendantServer {
                 .map_err(|e| e.to_string())
         }
 
+        if let Some(message) = self.state.read().await.rewind_only_gate_message_for(
+            name,
+            session_id,
+            managed_context_override,
+        ) {
+            return Ok(text_tool_error(message));
+        }
+        if managed_context_tool(name)
+            && !self
+                .state
+                .read()
+                .await
+                .exposed_codex_managed_context_enabled_for(session_id, managed_context_override)
+        {
+            return Ok(text_tool_error(
+                "Codex managed context is disabled for this session. Set `[agent.codex] managed_context = \"managed\"` before starting the task, or choose Managed context = managed in the dashboard, to enable list_rewind_anchors/inspect_rewind_anchor/rewind_context/rewind_backout.".to_string(),
+            ));
+        }
+
         match name {
-            "get_status" => Ok(text_tool_result(self.get_status().await)),
+            "get_status" => Ok(text_tool_result(
+                self.get_status_for_session(session_id, managed_context_override)
+                    .await,
+            )),
             "get_logs" => {
                 let params = parse_params::<GetLogsParams>(args)?;
                 Ok(text_tool_result(self.get_logs(params).await))
@@ -2942,6 +4682,34 @@ impl IntendantServer {
                 let params = parse_params::<StartTaskParams>(args)?;
                 Ok(text_tool_result(self.start_task(params).await))
             }
+            "rewind_context" => {
+                let params = parse_params::<RewindContextParams>(with_default_mcp_session_id(
+                    args, session_id,
+                ))?;
+                Ok(text_tool_result(self.rewind_context(params).await))
+            }
+            "list_rewind_anchors" => {
+                let params = parse_params::<ListRewindAnchorsParams>(with_default_mcp_session_id(
+                    args, session_id,
+                ))?;
+                Ok(text_tool_result(self.list_rewind_anchors(params).await))
+            }
+            "inspect_rewind_anchor" => {
+                let params = parse_params::<InspectRewindAnchorParams>(
+                    with_default_mcp_session_id(args, session_id),
+                )?;
+                Ok(text_tool_result(self.inspect_rewind_anchor(params).await))
+            }
+            "rewind_backout" => {
+                let params = parse_params::<RewindBackoutParams>(with_default_mcp_session_id(
+                    args, session_id,
+                ))?;
+                Ok(text_tool_result(self.rewind_backout(params).await))
+            }
+            "claim_fission_canonical" => {
+                let params = parse_params::<ClaimFissionCanonicalParams>(args)?;
+                Ok(text_tool_result(self.claim_fission_canonical(params).await))
+            }
             "schedule_controller_restart" => {
                 let params = parse_params::<ScheduleControllerRestartParams>(args)?;
                 Ok(text_tool_result(
@@ -2950,12 +4718,16 @@ impl IntendantServer {
             }
             "controller_turn_complete" => {
                 let params = parse_params::<ControllerTurnCompleteParams>(args)?;
-                Ok(text_tool_result(self.controller_turn_complete(params).await))
+                Ok(text_tool_result(
+                    self.controller_turn_complete(params).await,
+                ))
             }
             "get_restart_status" => Ok(text_tool_result(self.get_restart_status().await)),
             "cancel_controller_restart" => {
                 let params = parse_params::<CancelControllerRestartParams>(args)?;
-                Ok(text_tool_result(self.cancel_controller_restart(params).await))
+                Ok(text_tool_result(
+                    self.cancel_controller_restart(params).await,
+                ))
             }
             "request_controller_loop_halt" => {
                 let params = parse_params::<RequestControllerLoopHaltParams>(args)?;
@@ -2968,12 +4740,39 @@ impl IntendantServer {
             }
             "intervene_controller_loop" => {
                 let params = parse_params::<InterveneControllerLoopParams>(args)?;
-                Ok(text_tool_result(self.intervene_controller_loop(params).await))
+                Ok(text_tool_result(
+                    self.intervene_controller_loop(params).await,
+                ))
             }
             "get_controller_loop_status" => {
                 Ok(text_tool_result(self.get_controller_loop_status().await))
             }
-            "reload" => Ok(text_tool_result(self.reload().await)),
+            "browser_workspace_providers" => {
+                Ok(text_tool_result(self.browser_workspace_providers().await))
+            }
+            "list_browser_workspaces" => Ok(text_tool_result(self.list_browser_workspaces().await)),
+            "create_browser_workspace" => {
+                let params = parse_params::<CreateBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(
+                    self.create_browser_workspace(params).await,
+                ))
+            }
+            "close_browser_workspace" => {
+                let params = parse_params::<CloseBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(self.close_browser_workspace(params).await))
+            }
+            "acquire_browser_workspace" => {
+                let params = parse_params::<AcquireBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(
+                    self.acquire_browser_workspace(params).await,
+                ))
+            }
+            "release_browser_workspace" => {
+                let params = parse_params::<ReleaseBrowserWorkspaceParams>(args)?;
+                Ok(text_tool_result(
+                    self.release_browser_workspace(params).await,
+                ))
+            }
             "list_displays" => Ok(text_tool_result(self.list_displays().await)),
             "take_display" => {
                 let params = parse_params::<TakeDisplayParams>(args)?;
@@ -2983,9 +4782,42 @@ impl IntendantServer {
                 let params = parse_params::<ReleaseDisplayParams>(args)?;
                 Ok(text_tool_result(self.release_display(params).await))
             }
+            "show_shared_view" => {
+                let Parameters(params) = parse_params::<ShowSharedViewParams>(args)?;
+                Ok(text_tool_result(
+                    self.show_shared_view_for_session(params, session_id).await,
+                ))
+            }
+            "hide_shared_view" => {
+                let Parameters(params) = parse_params::<HideSharedViewParams>(args)?;
+                Ok(text_tool_result(
+                    self.hide_shared_view_for_session(params, session_id).await,
+                ))
+            }
+            "focus_shared_view" => {
+                let Parameters(params) = parse_params::<FocusSharedViewParams>(args)?;
+                Ok(text_tool_result(
+                    self.focus_shared_view_for_session(params, session_id).await,
+                ))
+            }
+            "request_shared_view_input" => {
+                let Parameters(params) = parse_params::<RequestSharedViewInputParams>(args)?;
+                Ok(text_tool_result(
+                    self.request_shared_view_input_for_session(params, session_id)
+                        .await,
+                ))
+            }
+            "capture_shared_view_frame" => {
+                let Parameters(params) = parse_params::<CaptureSharedViewFrameParams>(args)?;
+                self.capture_shared_view_frame_for_session(params, session_id)
+                    .await
+                    .map_err(|e| e.to_string())
+            }
             "take_screenshot" => {
                 let params = parse_params::<TakeScreenshotParams>(args)?;
-                self.take_screenshot(params).await.map_err(|e| e.to_string())
+                self.take_screenshot(params)
+                    .await
+                    .map_err(|e| e.to_string())
             }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
@@ -3029,7 +4861,11 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
     match action {
         UserAction::Approve { id: _ } => {
             if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::Approve);
+                resolve_approval(
+                    &state.approval_registry,
+                    pending.id,
+                    ApprovalResponse::Approve,
+                );
                 state.set_phase(Phase::RunningAgent);
                 state.push_log(LogLevel::Info, "Approved by MCP agent".to_string());
                 ActionOutcome::Ok
@@ -3065,7 +4901,11 @@ fn process_action_sync(state: &mut McpAppState, action: UserAction) -> ActionOut
         }
         UserAction::ApproveAll { id: _ } => {
             if let Some(pending) = state.pending_approval.take() {
-                resolve_approval(&state.approval_registry, pending.id, ApprovalResponse::ApproveAll);
+                resolve_approval(
+                    &state.approval_registry,
+                    pending.id,
+                    ApprovalResponse::ApproveAll,
+                );
                 state.set_phase(Phase::RunningAgent);
                 state.push_log(
                     LogLevel::Info,
@@ -3143,20 +4983,193 @@ fn image_tool_result(text: impl Into<String>, base64_png: impl Into<String>) -> 
     ])
 }
 
+fn clamp_shared_view_unit(value: f64) -> f64 {
+    if value.is_finite() {
+        value.clamp(0.0, 1.0)
+    } else {
+        0.0
+    }
+}
+
+fn normalize_shared_view_region(region: SharedViewRegionParams) -> crate::types::SharedViewRegion {
+    let x = clamp_shared_view_unit(region.x);
+    let y = clamp_shared_view_unit(region.y);
+    let width = clamp_shared_view_unit(region.width).min(1.0 - x);
+    let height = clamp_shared_view_unit(region.height).min(1.0 - y);
+    crate::types::SharedViewRegion {
+        x,
+        y,
+        width,
+        height,
+    }
+}
+
+fn shared_view_display_target(
+    display_target: Option<String>,
+    display_id: Option<u32>,
+) -> Option<String> {
+    display_target
+        .map(|target| target.trim().to_string())
+        .filter(|target| !target.is_empty())
+        .or_else(|| display_id.map(|id| format!(":{}", id)))
+}
+
+fn shared_view_display_id(display_target: Option<&str>, display_id: Option<u32>) -> Option<u32> {
+    if display_id.is_some() {
+        return display_id;
+    }
+    let target = display_target?.trim();
+    if target.eq_ignore_ascii_case("user_session") || target.eq_ignore_ascii_case("primary") {
+        return Some(0);
+    }
+    target
+        .strip_prefix(':')
+        .or_else(|| target.strip_prefix("display_"))
+        .unwrap_or(target)
+        .parse::<u32>()
+        .ok()
+}
+
+fn shared_view_target_label(display_id: Option<u32>, display_target: Option<&str>) -> String {
+    if let Some(id) = display_id {
+        return if id == 0 {
+            "primary display".to_string()
+        } else {
+            format!("display {}", id)
+        };
+    }
+    let Some(target) = display_target
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return "default display".to_string();
+    };
+    if target.eq_ignore_ascii_case("user_session")
+        || target.eq_ignore_ascii_case("user")
+        || target.eq_ignore_ascii_case("primary")
+    {
+        return "primary display".to_string();
+    }
+    let parsed = target
+        .strip_prefix(':')
+        .or_else(|| target.strip_prefix("display_"))
+        .unwrap_or(target)
+        .parse::<u32>()
+        .ok();
+    match parsed {
+        Some(0) => "primary display".to_string(),
+        Some(id) => format!("display {}", id),
+        None => target.to_string(),
+    }
+}
+
+fn shared_view_user_display_id(
+    display_target: Option<&str>,
+    display_id: Option<u32>,
+) -> Option<u32> {
+    if let Some(display_id) = display_id {
+        return Some(display_id);
+    }
+    let Some(target) = display_target
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return Some(0);
+    };
+    if target.eq_ignore_ascii_case("user_session")
+        || target.eq_ignore_ascii_case("user")
+        || target.eq_ignore_ascii_case("primary")
+        || target == ":0"
+        || target == "0"
+        || target.eq_ignore_ascii_case("display_0")
+    {
+        return Some(0);
+    }
+    None
+}
+
 #[tool_router]
 impl IntendantServer {
     #[tool(
-        description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens."
+        description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens, and any compact lineage/fission ledger derived from the session log."
     )]
     async fn get_status(&self) -> String {
+        self.get_status_for_session(None, None).await
+    }
+
+    async fn get_status_for_session(
+        &self,
+        session_id_override: Option<&str>,
+        managed_context_override: Option<bool>,
+    ) -> String {
         let s = self.state.read().await;
         let mut snap = s.status_snapshot();
+        let log_dir = s.log_dir.clone();
+        let session_id = session_id_override
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string)
+            .unwrap_or_else(|| s.session_id.clone());
+        let autonomy = s.autonomy.clone();
         // Fill autonomy from shared state
         drop(s);
-        let state = self.state.read().await;
-        let autonomy_level = state.autonomy.read().await.level;
+        let autonomy_level = autonomy.read().await.level;
         snap.autonomy = autonomy_level.to_string().to_lowercase();
-        serde_json::to_string_pretty(&snap).unwrap_or_else(|_| "{}".to_string())
+        let mut value = serde_json::to_value(&snap).unwrap_or_else(|_| serde_json::json!({}));
+        if let Some(obj) = value.as_object_mut() {
+            let s = self.state.read().await;
+            let usage = s.usage_snapshot_for(Some(&session_id));
+            obj.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.clone()),
+            );
+            obj.insert(
+                "provider".to_string(),
+                serde_json::Value::String(usage.main.provider.clone()),
+            );
+            obj.insert(
+                "model".to_string(),
+                serde_json::Value::String(usage.main.model.clone()),
+            );
+            obj.insert(
+                "session_tokens".to_string(),
+                serde_json::Value::Number(usage.main.tokens_used.into()),
+            );
+            obj.insert(
+                "budget_pct".to_string(),
+                serde_json::Number::from_f64(usage.main.usage_pct)
+                    .map(serde_json::Value::Number)
+                    .unwrap_or(serde_json::Value::Null),
+            );
+            obj.insert(
+                "usage".to_string(),
+                serde_json::to_value(usage).unwrap_or_else(|_| serde_json::json!({})),
+            );
+            obj.insert(
+                "context_pressure".to_string(),
+                s.context_pressure_snapshot_for(Some(&session_id), managed_context_override),
+            );
+        }
+        if let Ok(Some(ledger)) = crate::lineage_ledger::read_lineage_ledger(&log_dir, &session_id)
+        {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "lineage_ledger".to_string(),
+                    serde_json::to_value(ledger).unwrap_or_else(|_| serde_json::json!({})),
+                );
+            }
+        }
+        if let Ok(Some(ledger)) =
+            crate::fission_ledger::read_fission_ledger_for_session(&log_dir, &session_id)
+        {
+            if let Some(obj) = value.as_object_mut() {
+                obj.insert(
+                    "fission_ledger".to_string(),
+                    serde_json::to_value(ledger).unwrap_or_else(|_| serde_json::json!({})),
+                );
+            }
+        }
+        serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string())
     }
 
     #[tool(
@@ -3220,7 +5233,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "approve".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "approve".to_string(),
+            });
         }
         format_outcome(outcome)
     }
@@ -3233,7 +5250,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "deny".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "deny".to_string(),
+            });
         }
         format_outcome(outcome)
     }
@@ -3246,7 +5267,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "skip".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "skip".to_string(),
+            });
         }
         format_outcome(outcome)
     }
@@ -3259,7 +5284,11 @@ impl IntendantServer {
         let mut s = self.state.write().await;
         let outcome = process_action_sync(&mut s, action);
         if outcome == ActionOutcome::Ok {
-            self.bus.send(AppEvent::ApprovalResolved { id: params.id, action: "approve_all".to_string() });
+            self.bus.send(AppEvent::ApprovalResolved {
+                session_id: None,
+                id: params.id,
+                action: "approve_all".to_string(),
+            });
             let autonomy = s.autonomy.clone();
             drop(s);
             let mut a = autonomy.write().await;
@@ -3334,14 +5363,17 @@ impl IntendantServer {
         // If reference_frame_ids are present, dispatch as a CU task via ControlMsg
         // so the main loop can route it to the ephemeral CU runner.
         if !params.reference_frame_ids.is_empty() || params.display_target.is_some() {
-            self.bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
-                task: params.task,
-                orchestrate: params.orchestrate,
-                direct: None,
-                reference_frame_ids: params.reference_frame_ids,
-                display_target: params.display_target,
-                attachments: vec![],
-            }));
+            self.bus
+                .send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id: None,
+                    task: params.task,
+                    orchestrate: params.orchestrate,
+                    direct: None,
+                    reference_frame_ids: params.reference_frame_ids,
+                    display_target: params.display_target,
+                    attachments: vec![],
+                    follow_up_id: None,
+                }));
             return "ok (CU task dispatched)".to_string();
         }
         match self
@@ -3350,6 +5382,212 @@ impl IntendantServer {
         {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("Cannot start task: {}", e),
+        }
+    }
+
+    #[tool(
+        description = "Schedule a Codex context rewind to an exact item/tool-call anchor. First call list_rewind_anchors and choose one returned item_id; call inspect_rewind_anchor when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
+    )]
+    async fn rewind_context(&self, Parameters(params): Parameters<RewindContextParams>) -> String {
+        let reason = params.reason.trim();
+        if reason.is_empty() {
+            return "rewind_context requires a non-empty reason".to_string();
+        }
+        let primer = params.primer.trim();
+        if primer.is_empty() {
+            return "rewind_context requires a non-empty primer".to_string();
+        }
+        let item_id = params.anchor.item_id.trim();
+        if item_id.is_empty() {
+            return "rewind_context anchor.item_id must not be empty".to_string();
+        }
+        // Normalize case to match the action layer (RollbackAnchorPosition::from_str
+        // lowercases), so `After`/`BEFORE` are accepted consistently end-to-end.
+        let position = params.anchor.position.trim().to_ascii_lowercase();
+        if !matches!(position.as_str(), "before" | "after") {
+            return "rewind_context anchor.position must be `before` or `after`".to_string();
+        }
+
+        self.dispatch_codex_thread_action_and_wait(
+            params.session_id.clone(),
+            "rewind_context".to_string(),
+            serde_json::json!({
+                "anchor": {
+                    "item_id": item_id,
+                    "position": position,
+                },
+                "reason": reason,
+                "primer": primer,
+                "preserve": params.preserve,
+                "discard": params.discard,
+                "artifacts": params.artifacts,
+                "next_steps": params.next_steps,
+            }),
+            "rewind_context dispatched but no validation result was observed".to_string(),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "List valid exact Codex rewind anchors for the current managed session. Supports pagination and query so the model can choose any valid non-management anchor from the rollout, from start to finish. The default catalog hides managed-context maintenance calls such as list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout so recovery does not target its own tool calls; pass include_management_tools=true only when intentionally targeting those internals. During rewind-only recovery, Intendant defaults recovery_candidates_only=true, hiding anchors known to remain at/above the rewind-only limit unless include_non_recovery=true. Use inspect_rewind_anchor on a candidate when the compact summary is ambiguous, then copy the chosen item_id into rewind_context."
+    )]
+    async fn list_rewind_anchors(
+        &self,
+        Parameters(params): Parameters<ListRewindAnchorsParams>,
+    ) -> String {
+        let recovery_candidates_only = params.recovery_candidates_only.unwrap_or(true);
+        let mut payload = serde_json::json!({
+            "offset": params.offset.unwrap_or(0),
+            "limit": params.limit.unwrap_or(100),
+            "reverse": params.reverse,
+            "include_management_tools": params.include_management_tools,
+            "recovery_candidates_only": recovery_candidates_only,
+            "include_non_recovery": params.include_non_recovery,
+        });
+        if let Some(query) = params
+            .query
+            .as_deref()
+            .map(str::trim)
+            .filter(|query| !query.is_empty())
+        {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "query".to_string(),
+                    serde_json::Value::String(query.to_string()),
+                );
+            }
+        }
+        self.dispatch_codex_thread_action_and_wait(
+            params.session_id.clone(),
+            "list_rewind_anchors".to_string(),
+            payload,
+            "ok (managed-context rewind anchor listing dispatched)".to_string(),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Inspect a single exact Codex rewind anchor with a compact before/after context window. Use this before rewind_context when the list_rewind_anchors row is too lossy to choose safely."
+    )]
+    async fn inspect_rewind_anchor(
+        &self,
+        Parameters(params): Parameters<InspectRewindAnchorParams>,
+    ) -> String {
+        let item_id = params.item_id.trim();
+        if item_id.is_empty() {
+            return "inspect_rewind_anchor item_id must not be empty".to_string();
+        }
+        let mut payload = serde_json::json!({
+            "anchor": {
+                "item_id": item_id,
+            },
+            "radius": params.radius.unwrap_or(2),
+        });
+        if let Some(obj) = payload.as_object_mut() {
+            if let Some(session_id) = params
+                .session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+            {
+                obj.insert(
+                    "session_id".to_string(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+        }
+        self.dispatch_codex_thread_action_and_wait(
+            params.session_id.clone(),
+            "inspect_rewind_anchor".to_string(),
+            payload,
+            "ok (managed-context rewind anchor inspection dispatched)".to_string(),
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Recover a prior context rewind record. mode=\"inspect\" reports the saved pre-rewind rollout path. mode=\"restore\" restores the active Codex thread in place. mode=\"fork\"/\"backout\" creates a new Codex thread that inherits the lineage prompt-cache key when using the patched managed Codex binary."
+    )]
+    async fn rewind_backout(&self, Parameters(params): Parameters<RewindBackoutParams>) -> String {
+        let record_id = params.record_id.trim();
+        if record_id.is_empty() {
+            return "rewind_backout requires a non-empty record_id".to_string();
+        }
+        let mode = params
+            .mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+            .unwrap_or("inspect");
+        if !matches!(mode, "inspect" | "fork" | "backout" | "restore") {
+            return "rewind_backout mode must be `inspect`, `fork`, `backout`, or `restore`"
+                .to_string();
+        }
+        let name = params
+            .name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty());
+        let mut payload = serde_json::json!({
+            "record_id": record_id,
+            "mode": mode,
+            "allow_cache_reset": params.allow_cache_reset,
+        });
+        if let Some(name) = name {
+            if let Some(obj) = payload.as_object_mut() {
+                obj.insert(
+                    "name".to_string(),
+                    serde_json::Value::String(name.to_string()),
+                );
+            }
+        }
+
+        let timeout_message = if mode == "inspect" {
+            "ok (managed-context rewind record inspection dispatched)".to_string()
+        } else if mode == "restore" {
+            "ok (same-thread managed-context restore dispatched)".to_string()
+        } else {
+            "ok (managed-context lineage fork dispatched)".to_string()
+        };
+        self.dispatch_codex_thread_action_and_wait(
+            params.session_id.clone(),
+            "rewind_backout".to_string(),
+            payload,
+            timeout_message,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Claim a fission group's canonical branch. Omit expected_canonical_session_id for first-writer-wins; provide it to deliberately compare-and-swap from the current canonical branch."
+    )]
+    async fn claim_fission_canonical(
+        &self,
+        Parameters(params): Parameters<ClaimFissionCanonicalParams>,
+    ) -> String {
+        let group_id = params.group_id.trim();
+        if group_id.is_empty() {
+            return "claim_fission_canonical requires a non-empty group_id".to_string();
+        }
+        let branch_session_id = params.branch_session_id.trim();
+        if branch_session_id.is_empty() {
+            return "claim_fission_canonical requires a non-empty branch_session_id".to_string();
+        }
+        let expected = params
+            .expected_canonical_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty());
+        let log_dir = self.state.read().await.log_dir.clone();
+        match crate::fission_ledger::claim_canonical(
+            &log_dir,
+            group_id,
+            branch_session_id,
+            expected,
+        ) {
+            Ok(group) => serde_json::to_string_pretty(&group)
+                .unwrap_or_else(|_| "ok (canonical branch claimed)".to_string()),
+            Err(err) => format!("claim_fission_canonical failed: {err}"),
         }
     }
 
@@ -3650,102 +5888,152 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Rebuild the intendant binary from source and hot-reload the MCP server. The server process is replaced in-place via exec() — the MCP connection survives seamlessly. Use this after making code changes so the running server picks them up without restarting Claude Code."
+        description = "List browser workspace provider availability for local semantic browser control and streamed fallback."
     )]
-    async fn reload(&self) -> String {
-        // Find the project root (where Cargo.toml lives)
-        let exe = match std::env::current_exe() {
-            Ok(e) => e,
-            Err(e) => return format!("Failed to determine executable path: {}", e),
+    async fn browser_workspace_providers(&self) -> String {
+        let providers = crate::browser_workspace::provider_statuses().await;
+        serde_json::to_string_pretty(&providers).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    #[tool(
+        description = "List active browser workspaces. Browser workspaces are addressable CDP/Playwright/Agent Browser surfaces with per-workspace leases."
+    )]
+    async fn list_browser_workspaces(&self) -> String {
+        let workspaces = crate::browser_workspace::list_workspaces().await;
+        serde_json::to_string_pretty(&workspaces).unwrap_or_else(|_| "[]".to_string())
+    }
+
+    #[tool(
+        description = "Create a browser workspace. provider=cdp launches a managed local Chromium-family browser with an isolated profile and CDP endpoint; provider=system_cdp deliberately uses the installed system browser."
+    )]
+    async fn create_browser_workspace(
+        &self,
+        Parameters(params): Parameters<CreateBrowserWorkspaceParams>,
+    ) -> String {
+        let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
+            url: params.url,
+            label: params.label,
+            provider: params.provider,
+            peer_id: params.peer_id,
+            owner_session_id: params.owner_session_id,
+            profile_dir: params.profile_dir,
         };
-
-        // Find project root by looking for Cargo.toml relative to the exe
-        // or via the INTENDANT_PROJECT_ROOT env var
-        let project_root = std::env::var("INTENDANT_PROJECT_ROOT")
-            .map(std::path::PathBuf::from)
-            .ok()
-            .or_else(|| {
-                // Walk up from exe to find Cargo.toml
-                let mut dir = exe.parent()?;
-                for _ in 0..10 {
-                    if dir.join("Cargo.toml").exists() {
-                        return Some(dir.to_path_buf());
-                    }
-                    dir = dir.parent()?;
-                }
-                None
-            });
-
-        // Build the binary
-        if let Some(root) = &project_root {
-            let output = std::process::Command::new("cargo")
-                .args(["build", "--release"])
-                .current_dir(root)
-                .output();
-
-            match output {
-                Ok(o) if o.status.success() => {
-                    let mut s = self.state.write().await;
-                    s.push_log(
-                        LogLevel::Info,
-                        "Binary rebuilt successfully, exec'ing...".to_string(),
-                    );
-                }
-                Ok(o) => {
-                    let stderr = String::from_utf8_lossy(&o.stderr);
-                    return format!("Build failed:\n{}", stderr);
-                }
-                Err(e) => {
-                    return format!("Failed to run cargo build: {}", e);
-                }
+        match crate::browser_workspace::create_workspace(request).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "created".to_string(),
+                    workspace: Some(workspace.clone()),
+                    workspace_id: Some(workspace.id.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: None,
+                    message: Some(message.clone()),
+                });
+                serde_json::json!({ "ok": false, "error": message }).to_string()
             }
         }
+    }
 
-        // Schedule the exec() after a brief delay so the JSON-RPC response
-        // can be flushed to stdout before the process is replaced.
-        let args: Vec<String> = std::env::args().collect();
-        tokio::spawn(async move {
-            // Give rmcp time to write the response
-            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    #[tool(
+        description = "Close a browser workspace and terminate its owned browser process tree when Intendant launched it."
+    )]
+    async fn close_browser_workspace(
+        &self,
+        Parameters(params): Parameters<CloseBrowserWorkspaceParams>,
+    ) -> String {
+        match crate::browser_workspace::close_workspace(&params.workspace_id, params.reason).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "closed".to_string(),
+                    workspace_id: Some(workspace.id.clone()),
+                    workspace: Some(workspace.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => {
+                let message = err.to_string();
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: Some(params.workspace_id),
+                    message: Some(message.clone()),
+                });
+                serde_json::json!({ "ok": false, "error": message }).to_string()
+            }
+        }
+    }
 
-            // Flush stdout to ensure the response is delivered
-            use std::io::Write;
-            let _ = std::io::stdout().flush();
+    #[tool(
+        description = "Acquire the exclusive control lease for a browser workspace. Use force=true only when intentionally taking over from another holder."
+    )]
+    async fn acquire_browser_workspace(
+        &self,
+        Parameters(params): Parameters<AcquireBrowserWorkspaceParams>,
+    ) -> String {
+        let request = crate::browser_workspace::AcquireBrowserWorkspaceRequest {
+            workspace_id: params.workspace_id,
+            holder_id: params.holder_id,
+            holder_kind: params.holder_kind,
+            note: params.note,
+            force: params.force,
+        };
+        match crate::browser_workspace::acquire_workspace(request).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_acquired".to_string(),
+                    workspace_id: Some(workspace.id.clone()),
+                    workspace: Some(workspace.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
+        }
+    }
 
-            // exec() replaces the process image. stdin/stdout fds survive.
-            use std::os::unix::process::CommandExt;
-            let exe = match std::env::current_exe() {
-                Ok(p) => p,
-                Err(e) => {
-                    eprintln!("reload failed: cannot determine current exe: {}", e);
-                    return;
-                }
-            };
-            let err = std::process::Command::new(exe)
-                .args(&args[1..])
-                .env("INTENDANT_MCP_RELOAD", "1")
-                .exec();
-            // exec only returns on error
-            eprintln!("reload exec failed: {}", err);
-            std::process::exit(1);
-        });
-
-        "ok - reloading in-place (MCP connection preserved)".to_string()
+    #[tool(description = "Release a browser workspace control lease.")]
+    async fn release_browser_workspace(
+        &self,
+        Parameters(params): Parameters<ReleaseBrowserWorkspaceParams>,
+    ) -> String {
+        let request = crate::browser_workspace::ReleaseBrowserWorkspaceRequest {
+            workspace_id: params.workspace_id,
+            holder_id: params.holder_id,
+            note: params.note,
+        };
+        match crate::browser_workspace::release_workspace(request).await {
+            Ok(workspace) => {
+                self.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_released".to_string(),
+                    workspace_id: Some(workspace.id.clone()),
+                    workspace: Some(workspace.clone()),
+                    message: None,
+                });
+                serde_json::to_string_pretty(&workspace).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(err) => serde_json::json!({ "ok": false, "error": err.to_string() }).to_string(),
+        }
     }
 
     #[tool(description = "Enumerate available displays with their IDs, names, and resolutions.")]
     async fn list_displays(&self) -> String {
         let session_registry = self.state.read().await.session_registry.clone();
-        let displays =
-            crate::display::enumerate_displays_with_sessions(&session_registry).await;
+        let displays = crate::display::enumerate_displays_with_sessions(&session_registry).await;
         serde_json::to_string_pretty(&displays).unwrap_or_else(|_| "[]".to_string())
     }
 
-    #[tool(description = "Signal that you are using a display. Optional — notifies the dashboard UI but is NOT required before taking screenshots or executing CU actions.")]
-    async fn take_display(
-        &self,
-        Parameters(params): Parameters<TakeDisplayParams>,
-    ) -> String {
+    #[tool(
+        description = "Signal that you are using a display. Optional — notifies the dashboard UI but is NOT required before taking screenshots or executing CU actions."
+    )]
+    async fn take_display(&self, Parameters(params): Parameters<TakeDisplayParams>) -> String {
         self.bus.send(AppEvent::DisplayTaken {
             display_id: params.display_id,
         });
@@ -3764,12 +6052,216 @@ impl IntendantServer {
         format!("Released control of :{}", params.display_id)
     }
 
+    async fn emit_shared_view(
+        &self,
+        session_id: Option<&str>,
+        action: &str,
+        display_target: Option<String>,
+        display_id: Option<u32>,
+        reason: Option<String>,
+        region: Option<crate::types::SharedViewRegion>,
+        note: Option<String>,
+    ) -> String {
+        self.bus.send(AppEvent::SharedView {
+            session_id: session_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string),
+            action: action.to_string(),
+            display_target: display_target.clone(),
+            display_id,
+            reason: reason.clone(),
+            region,
+            note: note.clone(),
+        });
+        let target = shared_view_target_label(display_id, display_target.as_deref());
+        let detail = reason
+            .or(note)
+            .filter(|s| !s.trim().is_empty())
+            .map(|s| format!(" ({})", s))
+            .unwrap_or_default();
+        format!("shared view {} requested for {}{}", action, target, detail)
+    }
+
+    async fn ensure_shared_view_display_active(
+        &self,
+        display_target: Option<&str>,
+        display_id: Option<u32>,
+    ) {
+        let Some(display_id) = shared_view_user_display_id(display_target, display_id) else {
+            return;
+        };
+
+        let (autonomy, session_registry) = {
+            let state = self.state.read().await;
+            (state.autonomy.clone(), state.session_registry.clone())
+        };
+        if let Some(registry) = session_registry {
+            if registry.read().await.get(display_id).is_some() {
+                return;
+            }
+        }
+
+        {
+            let mut guard = autonomy.write().await;
+            guard.user_display_granted = true;
+        }
+        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+        self.bus.send(AppEvent::UserDisplayGranted { display_id });
+    }
+
+    async fn show_shared_view_for_session(
+        &self,
+        params: ShowSharedViewParams,
+        session_id: Option<&str>,
+    ) -> String {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        let region = params.focus_region.map(normalize_shared_view_region);
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
+        self.emit_shared_view(
+            session_id,
+            "show",
+            display_target,
+            display_id,
+            params.reason,
+            region,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Open the dashboard shared display view for agent-human collaboration. For user_session / primary-display targets, this also requests display-stream activation. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
+    )]
+    async fn show_shared_view(
+        &self,
+        Parameters(params): Parameters<ShowSharedViewParams>,
+    ) -> String {
+        self.show_shared_view_for_session(params, None).await
+    }
+
+    async fn hide_shared_view_for_session(
+        &self,
+        params: HideSharedViewParams,
+        session_id: Option<&str>,
+    ) -> String {
+        self.emit_shared_view(session_id, "hide", None, None, params.reason, None, None)
+            .await
+    }
+
+    #[tool(description = "Dismiss the dashboard shared display view banner and focus overlay.")]
+    async fn hide_shared_view(
+        &self,
+        Parameters(params): Parameters<HideSharedViewParams>,
+    ) -> String {
+        self.hide_shared_view_for_session(params, None).await
+    }
+
+    async fn focus_shared_view_for_session(
+        &self,
+        params: FocusSharedViewParams,
+        session_id: Option<&str>,
+    ) -> String {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
+        self.emit_shared_view(
+            session_id,
+            "focus",
+            display_target,
+            display_id,
+            None,
+            Some(normalize_shared_view_region(params.region)),
+            params.note,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Highlight a normalized region in the dashboard shared display view. For user_session / primary-display targets, this also requests display-stream activation. Use this to point the user at a specific UI element or area."
+    )]
+    async fn focus_shared_view(
+        &self,
+        Parameters(params): Parameters<FocusSharedViewParams>,
+    ) -> String {
+        self.focus_shared_view_for_session(params, None).await
+    }
+
+    async fn request_shared_view_input_for_session(
+        &self,
+        params: RequestSharedViewInputParams,
+        session_id: Option<&str>,
+    ) -> String {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
+        self.emit_shared_view(
+            session_id,
+            "input_request",
+            display_target,
+            display_id,
+            params.reason,
+            None,
+            None,
+        )
+        .await
+    }
+
+    #[tool(
+        description = "Ask the dashboard user to take input authority for the shared display. For user_session / primary-display targets, this also requests display-stream activation. This is advisory: the user must click the dashboard control before keyboard/mouse input is granted."
+    )]
+    async fn request_shared_view_input(
+        &self,
+        Parameters(params): Parameters<RequestSharedViewInputParams>,
+    ) -> String {
+        self.request_shared_view_input_for_session(params, None)
+            .await
+    }
+
+    async fn capture_shared_view_frame_for_session(
+        &self,
+        params: CaptureSharedViewFrameParams,
+        session_id: Option<&str>,
+    ) -> Result<CallToolResult, McpError> {
+        let display_target = shared_view_display_target(params.display_target, params.display_id);
+        let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
+        self.ensure_shared_view_display_active(display_target.as_deref(), display_id)
+            .await;
+        self.emit_shared_view(
+            session_id,
+            "capture",
+            display_target.clone(),
+            display_id,
+            params.reason,
+            None,
+            None,
+        )
+        .await;
+        self.take_screenshot(Parameters(TakeScreenshotParams { display_target }))
+            .await
+    }
+
+    #[tool(
+        description = "Capture the currently shared display as an MCP image. Also foregrounds the dashboard shared view so the user can see what was captured."
+    )]
+    async fn capture_shared_view_frame(
+        &self,
+        Parameters(params): Parameters<CaptureSharedViewFrameParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.capture_shared_view_frame_for_session(params, None)
+            .await
+    }
+
     #[tool(description = "Take a screenshot of a display. Returns an MCP image content block.")]
     async fn take_screenshot(
         &self,
         Parameters(params): Parameters<TakeScreenshotParams>,
     ) -> Result<CallToolResult, McpError> {
-        use crate::computer_use::{CuAction, DisplayBackend, execute_actions};
+        use crate::computer_use::{execute_actions, CuAction, DisplayBackend};
 
         let target = resolve_display_target(params.display_target.as_deref());
         let backend = DisplayBackend::detect();
@@ -3815,12 +6307,14 @@ impl IntendantServer {
         Ok(text_tool_error("No screenshot result"))
     }
 
-    #[tool(description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid.")]
+    #[tool(
+        description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
+    )]
     async fn execute_cu_actions(
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
     ) -> Result<CallToolResult, McpError> {
-        use crate::computer_use::{DisplayBackend, execute_actions};
+        use crate::computer_use::{execute_actions, DisplayBackend};
 
         let mut actions = params.actions;
 
@@ -3879,13 +6373,20 @@ impl IntendantServer {
         // Format results with action details (type, coordinates) for debugging.
         let mut summaries = Vec::new();
         for (i, (action, result)) in actions.iter().zip(results.iter()).enumerate() {
-            let status = if result.error.is_some() { "failed" } else { "ok" };
+            let status = if result.error.is_some() {
+                "failed"
+            } else {
+                "ok"
+            };
             let action_desc = format_cu_action_brief(action);
             let detail = result.error.as_deref().unwrap_or("");
             if detail.is_empty() {
                 summaries.push(format!("action[{}] {}: {}", i, action_desc, status));
             } else {
-                summaries.push(format!("action[{}] {}: {}: {}", i, action_desc, status, detail));
+                summaries.push(format!(
+                    "action[{}] {}: {}: {}",
+                    i, action_desc, status, detail
+                ));
             }
         }
 
@@ -3896,10 +6397,9 @@ impl IntendantServer {
         if let Some(ss) = last_screenshot {
             let annotated = annotate_screenshot_with_clicks(&ss.base64_png, &actions);
             // Save annotated screenshot to disk (overwrite the raw one)
-            if let Ok(bytes) = base64::Engine::decode(
-                &base64::engine::general_purpose::STANDARD,
-                &annotated,
-            ) {
+            if let Ok(bytes) =
+                base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &annotated)
+            {
                 let _ = std::fs::write(&ss.path, &bytes);
             }
             summaries.push("post-action screenshot captured".to_string());
@@ -3909,11 +6409,10 @@ impl IntendantServer {
         Ok(text_tool_result(summaries.join("\n")))
     }
 
-    #[tool(description = "List available display frames with metadata. Frames are captured from display streams.")]
-    async fn list_frames(
-        &self,
-        Parameters(params): Parameters<ListFramesParams>,
-    ) -> String {
+    #[tool(
+        description = "List available display frames with metadata. Frames are captured from display streams."
+    )]
+    async fn list_frames(&self, Parameters(params): Parameters<ListFramesParams>) -> String {
         let state = self.state.read().await;
         let registry = match &state.frame_registry {
             Some(r) => r.clone(),
@@ -3930,17 +6429,19 @@ impl IntendantServer {
             if streams.is_empty() {
                 return "No frames available. No active display streams.".to_string();
             }
-            return format!("No frames matching filter. Active streams: {}", streams.join(", "));
+            return format!(
+                "No frames matching filter. Active streams: {}",
+                streams.join(", ")
+            );
         }
 
         crate::frames::FrameRegistry::format_frame_list(&frames)
     }
 
-    #[tool(description = "Read a specific frame's image data as base64-encoded JPEG. Use frame_id='latest' for the most recent.")]
-    async fn read_frame(
-        &self,
-        Parameters(params): Parameters<ReadFrameParams>,
-    ) -> String {
+    #[tool(
+        description = "Read a specific frame's image data as base64-encoded JPEG. Use frame_id='latest' for the most recent."
+    )]
+    async fn read_frame(&self, Parameters(params): Parameters<ReadFrameParams>) -> String {
         use base64::Engine;
 
         let state = self.state.read().await;
@@ -3970,12 +6471,14 @@ impl IntendantServer {
         }
     }
 
-    #[tool(description = "Spawn a live audio voice conversation. Connects to OpenAI Realtime or Gemini Live via WebSocket and routes audio through the virtual audio bridge (Vortex/PulseAudio). The voice model follows a playbook and returns structured data matching the response_schema. Blocks until the conversation completes or times out. The voice model has two functions: submit_response (with schema fields) and end_call.")]
+    #[tool(
+        description = "Spawn a live audio voice conversation. Connects to OpenAI Realtime or Gemini Live via WebSocket and routes audio through the virtual audio bridge (Vortex/PulseAudio). The voice model follows a playbook and returns structured data matching the response_schema. Blocks until the conversation completes or times out. The voice model has two functions: submit_response (with schema fields) and end_call."
+    )]
     async fn spawn_live_audio(
         &self,
         Parameters(params): Parameters<SpawnLiveAudioParams>,
     ) -> String {
-        use crate::{live_audio, live_audio_types, audio_routing, prompts};
+        use crate::{audio_routing, live_audio, live_audio_types, prompts};
 
         let spec_json = serde_json::to_value(&params).unwrap_or_default();
         let spec_result = serde_json::from_value::<live_audio_types::LiveAudioSpec>(spec_json);
@@ -4006,14 +6509,25 @@ impl IntendantServer {
         };
 
         // Create audio bridge
+        // Vortex shared-memory probe is POSIX-only (`shm_open`). On
+        // Windows the Vortex bridge isn't available, so the probe is
+        // compiled out and we fall through to the regular audio bridge.
+        #[cfg(unix)]
         let vortex_shm_available = unsafe {
             let fd = libc::shm_open(
                 b"/vortex-audio\0".as_ptr() as *const libc::c_char,
                 libc::O_RDONLY,
                 0,
             );
-            if fd >= 0 { libc::close(fd); true } else { false }
+            if fd >= 0 {
+                libc::close(fd);
+                true
+            } else {
+                false
+            }
         };
+        #[cfg(not(unix))]
+        let vortex_shm_available = false;
         let mut bridge = if vortex_shm_available {
             audio_routing::create_vortex_bridge("shm")
         } else {
@@ -4032,13 +6546,16 @@ impl IntendantServer {
         };
 
         self.bus.send(crate::event::AppEvent::PresenceLog {
-            message: format!("Live audio session '{}' starting ({:?})", spec.id, spec.provider),
-            level: None, turn: None,
+            message: format!(
+                "Live audio session '{}' starting ({:?})",
+                spec.id, spec.provider
+            ),
+            level: None,
+            turn: None,
         });
 
-        let result = live_audio::run_session(
-            &spec, &api_key, &bridge, &log_dir, Some(&self.bus),
-        ).await;
+        let result =
+            live_audio::run_session(&spec, &api_key, &bridge, &log_dir, Some(&self.bus)).await;
 
         drop(bridge);
 
@@ -4053,11 +6570,14 @@ impl IntendantServer {
 fn resolve_display_target(target: Option<&str>) -> crate::computer_use::DisplayTarget {
     use crate::computer_use::DisplayTarget;
     match target {
-        Some("user_session") | Some("user") | Some(":0") | Some("0") => {
-            DisplayTarget::UserSession
-        }
+        Some("user_session") | Some("user") | Some("primary") | Some(":0") | Some("0")
+        | Some("display_0") => DisplayTarget::UserSession,
         Some(s) if s.starts_with(':') => {
             let id: u32 = s[1..].parse().unwrap_or(99);
+            DisplayTarget::Virtual { id }
+        }
+        Some(s) if s.starts_with("display_") => {
+            let id: u32 = s["display_".len()..].parse().unwrap_or(99);
             DisplayTarget::Virtual { id }
         }
         Some(s) => {
@@ -4287,190 +6807,25 @@ impl ServerHandler for IntendantServer {
 }
 
 // ---------------------------------------------------------------------------
-// Reload transport: wraps stdio with fake initialization for post-exec reload
-// ---------------------------------------------------------------------------
-
-/// After an exec() reload, the MCP client (Claude Code) still considers the
-/// connection initialized. But rmcp's `serve()` requires the full init handshake.
-///
-/// `ReloadTransport` solves this by injecting a synthetic `initialize` request
-/// and `notifications/initialized` notification into the receive stream, and
-/// swallowing the server's init response on the send side. After this two-message
-/// preamble, all messages pass through to real stdio transparently.
-mod reload_transport {
-    use rmcp::model::{
-        ClientJsonRpcMessage, ClientNotification, ClientRequest, Implementation,
-        InitializeRequestParams, ProtocolVersion, ServerJsonRpcMessage,
-    };
-    use rmcp::service::RoleServer;
-    use rmcp::transport::Transport;
-    use std::borrow::Cow;
-    use std::future::Future;
-    use std::pin::Pin;
-
-    /// Phases of the reload handshake injection.
-    enum Phase {
-        /// Next `receive()` returns a fake Initialize request.
-        InjectInit,
-        /// Next `send()` swallows the Initialize response, then transitions.
-        SwallowInitResp,
-        /// Next `receive()` returns a fake Initialized notification.
-        InjectInitialized,
-        /// All subsequent messages pass through to the inner transport.
-        Normal,
-    }
-
-    pub struct ReloadTransport<T> {
-        inner: T,
-        phase: Phase,
-    }
-
-    impl<T> ReloadTransport<T> {
-        pub fn new(inner: T) -> Self {
-            Self {
-                inner,
-                phase: Phase::InjectInit,
-            }
-        }
-    }
-
-    fn fake_init_request() -> ClientJsonRpcMessage {
-        let params = InitializeRequestParams {
-            meta: None,
-            protocol_version: ProtocolVersion::V_2025_03_26,
-            capabilities: Default::default(),
-            client_info: Implementation {
-                name: "claude-code".to_string(),
-                title: None,
-                version: "1.0.0-reload".to_string(),
-                description: None,
-                icons: None,
-                website_url: None,
-            },
-        };
-        let request = ClientRequest::InitializeRequest(rmcp::model::InitializeRequest {
-            method: Default::default(),
-            params,
-            extensions: Default::default(),
-        });
-        ClientJsonRpcMessage::request(request, rmcp::model::RequestId::Number(0))
-    }
-
-    fn fake_initialized_notification() -> ClientJsonRpcMessage {
-        let notification =
-            ClientNotification::InitializedNotification(rmcp::model::InitializedNotification {
-                method: Default::default(),
-                extensions: Default::default(),
-            });
-        ClientJsonRpcMessage::notification(notification)
-    }
-
-    impl<T: Transport<RoleServer>> Transport<RoleServer> for ReloadTransport<T> {
-        type Error = T::Error;
-
-        fn name() -> Cow<'static, str> {
-            "ReloadTransport".into()
-        }
-
-        fn send(
-            &mut self,
-            item: ServerJsonRpcMessage,
-        ) -> impl Future<Output = Result<(), Self::Error>> + Send + 'static {
-            match self.phase {
-                Phase::SwallowInitResp => {
-                    // Swallow the init response, advance to next phase
-                    self.phase = Phase::InjectInitialized;
-                    // Return a no-op future that succeeds
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> =
-                        Box::pin(async { Ok(()) });
-                    fut
-                }
-                _ => {
-                    // Normal passthrough
-                    let inner_fut = self.inner.send(item);
-                    let fut: Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send>> =
-                        Box::pin(inner_fut);
-                    fut
-                }
-            }
-        }
-
-        fn receive(&mut self) -> impl Future<Output = Option<ClientJsonRpcMessage>> + Send {
-            match self.phase {
-                Phase::InjectInit => {
-                    self.phase = Phase::SwallowInitResp;
-                    let msg = fake_init_request();
-                    let fut: Pin<Box<dyn Future<Output = Option<ClientJsonRpcMessage>> + Send>> =
-                        Box::pin(async move { Some(msg) });
-                    fut
-                }
-                Phase::InjectInitialized => {
-                    self.phase = Phase::Normal;
-                    let msg = fake_initialized_notification();
-                    let fut: Pin<Box<dyn Future<Output = Option<ClientJsonRpcMessage>> + Send>> =
-                        Box::pin(async move { Some(msg) });
-                    fut
-                }
-                _ => {
-                    // Normal passthrough
-                    let inner_fut = self.inner.receive();
-                    let fut: Pin<Box<dyn Future<Output = Option<ClientJsonRpcMessage>> + Send>> =
-                        Box::pin(inner_fut);
-                    fut
-                }
-            }
-        }
-
-        fn close(&mut self) -> impl Future<Output = Result<(), Self::Error>> + Send {
-            self.inner.close()
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Public API: start the MCP server on stdio
 // ---------------------------------------------------------------------------
-
-/// Exit code used to signal a reload request to a parent wrapper script.
-#[allow(dead_code)]
-pub const RELOAD_EXIT_CODE: i32 = 42;
 
 /// Run the MCP server on stdio. This replaces the TUI — the external agent
 /// communicates via MCP over stdin/stdout.
 ///
 /// The server consumes AppEvents from the bus and exposes them as tools and
 /// resources.
-///
-/// When `reloaded` is true, the server wraps stdio in a [`ReloadTransport`]
-/// that injects a synthetic MCP initialization handshake, allowing seamless
-/// operation after an exec() reload.
 pub async fn run_mcp_server(
     state: SharedMcpState,
     bus: EventBus,
     event_rx: tokio::sync::broadcast::Receiver<AppEvent>,
-    reloaded: bool,
     human_question_path: Option<crate::event::SharedQuestionPath>,
     control_tx: Option<broadcast::Sender<String>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let server = IntendantServer::new(state.clone(), bus.clone());
 
-    // Start serving on stdio, using ReloadTransport if this is a post-exec reload
-    let running = if reloaded {
-        use rmcp::transport::IntoTransport;
-        let inner = rmcp::transport::io::stdio().into_transport();
-        let transport = reload_transport::ReloadTransport::new(inner);
-        server.serve(transport).await?
-    } else {
-        let transport = rmcp::transport::io::stdio();
-        server.serve(transport).await?
-    };
-
-    // After a reload, notify the client that tools may have changed so it
-    // re-fetches the tool list.  This is the MCP-standard mechanism for
-    // telling a client that server capabilities have been updated.
-    if reloaded {
-        let _ = running.peer().notify_tool_list_changed().await;
-    }
+    let transport = rmcp::transport::io::stdio();
+    let running = server.serve(transport).await?;
 
     // Store the peer for sending notifications
     let peer = Arc::new(Mutex::new(Some(running.peer().clone())));
@@ -4502,17 +6857,27 @@ fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32,
     let dn_y = |y: &mut i32| *y = (*y as f64 * screen_h as f64 / 1000.0) as i32;
     match action {
         CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => {
-            dn_x(x); dn_y(y);
+            dn_x(x);
+            dn_y(y);
         }
         CuAction::Scroll { x, y, .. } => {
-            dn_x(x); dn_y(y);
+            dn_x(x);
+            dn_y(y);
         }
         CuAction::MoveMouse { x, y } => {
-            dn_x(x); dn_y(y);
+            dn_x(x);
+            dn_y(y);
         }
-        CuAction::Drag { start_x, start_y, end_x, end_y } => {
-            dn_x(start_x); dn_y(start_y);
-            dn_x(end_x); dn_y(end_y);
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => {
+            dn_x(start_x);
+            dn_y(start_y);
+            dn_x(end_x);
+            dn_y(end_y);
         }
         _ => {} // Type, Key, Screenshot, Wait — no coordinates
     }
@@ -4529,11 +6894,21 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
             format!("(type \"{}\")", preview)
         }
         CuAction::Key { key } => format!("(key {})", key),
-        CuAction::Scroll { x, y, direction, amount } => {
+        CuAction::Scroll {
+            x,
+            y,
+            direction,
+            amount,
+        } => {
             format!("(scroll {},{} {:?} {})", x, y, direction, amount)
         }
         CuAction::MoveMouse { x, y } => format!("(move {},{})", x, y),
-        CuAction::Drag { start_x, start_y, end_x, end_y } => {
+        CuAction::Drag {
+            start_x,
+            start_y,
+            end_x,
+            end_y,
+        } => {
             format!("(drag {},{}->{},{})", start_x, start_y, end_x, end_y)
         }
         CuAction::Screenshot => "(screenshot)".to_string(),
@@ -4563,13 +6938,11 @@ fn annotate_screenshot_with_clicks(
     }
 
     // Decode PNG
-    let png_bytes = match base64::Engine::decode(
-        &base64::engine::general_purpose::STANDARD,
-        base64_png,
-    ) {
-        Ok(b) => b,
-        Err(_) => return base64_png.to_string(),
-    };
+    let png_bytes =
+        match base64::Engine::decode(&base64::engine::general_purpose::STANDARD, base64_png) {
+            Ok(b) => b,
+            Err(_) => return base64_png.to_string(),
+        };
 
     let mut img = match image::load_from_memory_with_format(&png_bytes, image::ImageFormat::Png) {
         Ok(i) => i.to_rgba8(),
@@ -4657,10 +7030,7 @@ fn inline_schema_refs(schema: &mut serde_json::Value) {
     // Extract $defs / definitions from the top level
     let defs = schema
         .as_object_mut()
-        .and_then(|obj| {
-            obj.remove("$defs")
-                .or_else(|| obj.remove("definitions"))
-        })
+        .and_then(|obj| obj.remove("$defs").or_else(|| obj.remove("definitions")))
         .and_then(|v| match v {
             serde_json::Value::Object(map) => Some(map),
             _ => None,
@@ -4727,6 +7097,36 @@ mod tests {
         )))
     }
 
+    fn spawn_codex_thread_action_result(
+        bus: EventBus,
+        expected_action: &'static str,
+        message: &'static str,
+    ) -> tokio::task::JoinHandle<()> {
+        let mut rx = bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                        session_id,
+                        op,
+                        ..
+                    })) if op == expected_action => {
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id,
+                            action: op,
+                            success: true,
+                            message: message.to_string(),
+                        });
+                        break;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+                }
+            }
+        })
+    }
+
     #[test]
     fn mcp_state_initial_values() {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -4766,6 +7166,1804 @@ mod tests {
             assert_eq!(snap.budget_pct, 42.0);
             assert_eq!(snap.phase, "thinking");
             assert_eq!(snap.session_tokens, 1234);
+        });
+    }
+
+    #[test]
+    fn shared_view_tool_activates_target_and_emits_dashboard_event() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(test_state(), bus.clone());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "show_shared_view",
+                    serde_json::json!({
+                        "display_target": ":99",
+                        "reason": "show the failing login screen",
+                        "focus_region": { "x": 0.9, "y": 0.9, "width": 0.4, "height": 0.4 }
+                    }),
+                    Some("session-a"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            assert!(!result.is_error.unwrap_or(false));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                    assert_eq!(display_id, 99);
+                }
+                other => panic!("expected UserDisplayGranted event, got {other:?}"),
+            }
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::SharedView {
+                    session_id,
+                    action,
+                    display_target,
+                    display_id,
+                    reason,
+                    region: Some(region),
+                    ..
+                })) => {
+                    assert_eq!(session_id.as_deref(), Some("session-a"));
+                    assert_eq!(action, "show");
+                    assert_eq!(display_target.as_deref(), Some(":99"));
+                    assert_eq!(display_id, Some(99));
+                    assert_eq!(reason.as_deref(), Some("show the failing login screen"));
+                    assert_eq!(region.x, 0.9);
+                    assert_eq!(region.y, 0.9);
+                    assert!((region.width - 0.1).abs() < f64::EPSILON);
+                    assert!((region.height - 0.1).abs() < f64::EPSILON);
+                }
+                other => panic!("expected SharedView event, got {other:?}"),
+            }
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+        });
+    }
+
+    #[test]
+    fn shared_view_user_session_requests_display_activation() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(test_state(), bus.clone());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "show_shared_view",
+                    serde_json::json!({
+                        "display_target": "user_session",
+                        "reason": "show the user's screen"
+                    }),
+                    Some("session-a"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            assert!(!result.is_error.unwrap_or(false));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::UserDisplayGranted { display_id })) => {
+                    assert_eq!(display_id, 0);
+                }
+                other => panic!("expected UserDisplayGranted event, got {other:?}"),
+            }
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::SharedView {
+                    session_id,
+                    action,
+                    display_target,
+                    display_id,
+                    ..
+                })) => {
+                    assert_eq!(session_id.as_deref(), Some("session-a"));
+                    assert_eq!(action, "show");
+                    assert_eq!(display_target.as_deref(), Some("user_session"));
+                    assert_eq!(display_id, Some(0));
+                }
+                other => panic!("expected SharedView event, got {other:?}"),
+            }
+            assert_eq!(
+                std::env::var("INTENDANT_USER_DISPLAY_GRANTED").as_deref(),
+                Ok("1")
+            );
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+        });
+    }
+
+    #[test]
+    fn shared_view_labels_are_platform_neutral() {
+        assert_eq!(
+            shared_view_target_label(Some(0), Some(":0")),
+            "primary display"
+        );
+        assert_eq!(
+            shared_view_target_label(None, Some("user_session")),
+            "primary display"
+        );
+        assert_eq!(
+            shared_view_target_label(None, Some("display_99")),
+            "display 99"
+        );
+        assert_eq!(
+            shared_view_target_label(Some(99), Some(":99")),
+            "display 99"
+        );
+    }
+
+    #[test]
+    fn usage_snapshot_updates_real_context_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 86_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 86.0,
+                prompt_tokens: 80_000,
+                completion_tokens: 6_000,
+                cached_tokens: 10_000,
+            });
+            let usage = s.usage_snapshot();
+            assert_eq!(usage.main.tokens_used, 86_000);
+            assert_eq!(usage.main.prompt_tokens, 80_000);
+            assert_eq!(usage.main.completion_tokens, 6_000);
+            assert_eq!(usage.main.cached_tokens, 10_000);
+
+            let pressure = s.context_pressure_snapshot();
+            assert_eq!(pressure["source"], "backend_reported");
+            assert_eq!(pressure["status"], "pressure");
+            assert_eq!(pressure["used_tokens"], 86_000);
+            assert_eq!(pressure["context_window"], 100_000);
+            assert_eq!(pressure["effective_context_window"], 100_000);
+            assert_eq!(pressure["hard_limit"], 120_000);
+            assert_eq!(pressure["recommended_rewind_limit"], 85_000);
+            assert_eq!(pressure["rewind_only_limit"], 100_000);
+            assert_eq!(pressure["rewind_only"], false);
+            assert_eq!(pressure["managed_context"], "vanilla");
+        });
+    }
+
+    #[test]
+    fn usage_snapshot_preserves_known_hard_limit_when_backend_collapses_to_soft_limit() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "codex".to_string(),
+                tokens_used: 245_915,
+                context_window: 258_400,
+                hard_context_window: Some(272_000),
+                usage_pct: 95.2,
+                prompt_tokens: 245_915,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            });
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "codex".to_string(),
+                tokens_used: 258_400,
+                context_window: 258_400,
+                hard_context_window: Some(258_400),
+                usage_pct: 100.0,
+                prompt_tokens: 258_400,
+                completion_tokens: 0,
+                cached_tokens: 0,
+            });
+
+            let pressure = s.context_pressure_snapshot();
+            assert_eq!(pressure["status"], "high");
+            assert_eq!(pressure["used_tokens"], 258_400);
+            assert_eq!(pressure["context_window"], 258_400);
+            assert_eq!(pressure["hard_limit"], 272_000);
+            assert_eq!(pressure["remaining_hard_tokens"], 13_600);
+            assert_eq!(pressure["rewind_only"], true);
+        });
+    }
+
+    #[test]
+    fn context_pressure_marks_rewind_only_only_when_managed_context_enabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 100_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 100.0,
+                prompt_tokens: 80_000,
+                completion_tokens: 20_000,
+                cached_tokens: 10_000,
+            });
+            let pressure = s.context_pressure_snapshot();
+            assert_eq!(pressure["rewind_only"], true);
+            assert_eq!(pressure["managed_context"], "managed");
+        });
+    }
+
+    #[test]
+    fn rewind_only_gate_blocks_non_rewind_tools_for_active_codex_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 100_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 100.0,
+                prompt_tokens: 80_000,
+                completion_tokens: 20_000,
+                cached_tokens: 0,
+            });
+
+            let message = s
+                .rewind_only_gate_message("take_screenshot")
+                .expect("Codex action tool should be gated");
+            assert!(message.contains(
+                "only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout"
+            ));
+            assert!(s.rewind_only_gate_message("get_status").is_none());
+            assert!(s.rewind_only_gate_message("list_rewind_anchors").is_none());
+            assert!(s.rewind_only_gate_message("inspect_rewind_anchor").is_none());
+            assert!(s.rewind_only_gate_message("rewind_context").is_none());
+            assert!(s.rewind_only_gate_message("rewind_backout").is_none());
+        });
+    }
+
+    #[test]
+    fn rewind_only_gate_does_not_block_internal_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("internal".to_string());
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2".to_string(),
+                tokens_used: 95_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 95.0,
+                prompt_tokens: 90_000,
+                completion_tokens: 5_000,
+                cached_tokens: 0,
+            });
+
+            assert!(s.rewind_only_gate_message("take_screenshot").is_none());
+        });
+    }
+
+    #[test]
+    fn rewind_only_gate_does_not_block_vanilla_codex_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 95_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 95.0,
+                prompt_tokens: 90_000,
+                completion_tokens: 5_000,
+                cached_tokens: 0,
+            });
+
+            assert!(s.rewind_only_gate_message("take_screenshot").is_none());
+        });
+    }
+
+    #[test]
+    fn list_tools_hides_rewind_tools_until_managed_context_is_enabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let server = IntendantServer::new(state.clone(), EventBus::new());
+
+            let tools = server.list_tools_json().await;
+            let names: Vec<_> = tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(names.contains(&"get_status"));
+            assert!(!names.contains(&"list_rewind_anchors"));
+            assert!(!names.contains(&"rewind_context"));
+            assert!(!names.contains(&"rewind_backout"));
+
+            {
+                let mut s = state.write().await;
+                s.configured_codex_managed_context = true;
+                s.codex_managed_context = true;
+            }
+            let tools = server.list_tools_json().await;
+            let names: Vec<_> = tools["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(names.contains(&"list_rewind_anchors"));
+            assert!(names.contains(&"rewind_context"));
+            assert!(names.contains(&"rewind_backout"));
+        });
+    }
+
+    #[test]
+    fn list_tools_uses_session_scoped_managed_context_override() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.configured_codex_managed_context = false;
+                s.session_codex_managed_context
+                    .insert("vanilla-session".to_string(), false);
+                s.session_codex_managed_context
+                    .insert("managed-session".to_string(), true);
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let vanilla = server
+                .list_tools_json_for_session(Some("vanilla-session"), None, None)
+                .await;
+            let vanilla_names: Vec<_> = vanilla["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(!vanilla_names.contains(&"list_rewind_anchors"));
+            assert!(!vanilla_names.contains(&"rewind_context"));
+            assert!(!vanilla_names.contains(&"rewind_backout"));
+
+            let managed = server
+                .list_tools_json_for_session(Some("managed-session"), None, None)
+                .await;
+            let managed_names: Vec<_> = managed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(managed_names.contains(&"list_rewind_anchors"));
+            assert!(managed_names.contains(&"rewind_context"));
+            assert!(managed_names.contains(&"rewind_backout"));
+
+            let managed_by_url = server
+                .list_tools_json_for_session(Some("vanilla-session"), Some(true), None)
+                .await;
+            let managed_by_url_names: Vec<_> = managed_by_url["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(managed_by_url_names.contains(&"list_rewind_anchors"));
+            assert!(managed_by_url_names.contains(&"rewind_context"));
+        });
+    }
+
+    #[test]
+    fn list_tools_core_profile_keeps_only_bootstrap_tools() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            state
+                .write()
+                .await
+                .session_codex_managed_context
+                .insert("managed-session".to_string(), true);
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let vanilla = server
+                .list_tools_json_for_session(None, Some(false), Some("core"))
+                .await;
+            let vanilla_names: Vec<_> = vanilla["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(vanilla_names.contains(&"get_status"));
+            assert!(vanilla_names.contains(&"show_shared_view"));
+            assert!(vanilla_names.contains(&"focus_shared_view"));
+            assert!(vanilla_names.contains(&"request_shared_view_input"));
+            assert!(vanilla_names.contains(&"capture_shared_view_frame"));
+            assert!(vanilla_names.contains(&"hide_shared_view"));
+            assert!(!vanilla_names.contains(&"execute_cu_actions"));
+            assert!(!vanilla_names.contains(&"spawn_live_audio"));
+            assert!(!vanilla_names.contains(&"list_rewind_anchors"));
+            assert!(!vanilla_names.contains(&"rewind_context"));
+
+            let managed = server
+                .list_tools_json_for_session(Some("managed-session"), None, Some("core"))
+                .await;
+            let managed_names: Vec<_> = managed["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|tool| tool["name"].as_str())
+                .collect();
+            assert!(managed_names.contains(&"list_rewind_anchors"));
+            assert!(managed_names.contains(&"rewind_context"));
+            assert!(managed_names.contains(&"rewind_backout"));
+            assert!(!managed_names.contains(&"execute_cu_actions"));
+        });
+    }
+
+    #[test]
+    fn call_tool_rejects_rewind_tools_when_managed_context_is_disabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = IntendantServer::new(test_state(), EventBus::new());
+            let result = server
+                .call_tool_by_name(
+                    "rewind_context",
+                    serde_json::json!({
+                        "item_id": "call-1",
+                        "primer": "carry forward enough state"
+                    }),
+                )
+                .await
+                .unwrap();
+            let rendered = format!("{result:?}");
+            assert!(rendered.contains("managed context is disabled"));
+        });
+    }
+
+    #[test]
+    fn call_tool_respects_session_scoped_managed_context_override() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.configured_codex_managed_context = true;
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let result = server
+                .call_tool_by_name_for_session(
+                    "rewind_context",
+                    serde_json::json!({}),
+                    Some("vanilla-session"),
+                    Some(false),
+                )
+                .await
+                .unwrap();
+            let rendered = format!("{result:?}");
+            assert!(rendered.contains("managed context is disabled"));
+        });
+    }
+
+    #[test]
+    fn rewind_context_defaults_to_http_session_id() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus.clone());
+
+            let event_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                        })) if op == "rewind_context" => {
+                            let event = (session_id.clone(), op.clone(), params);
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: true,
+                                message: "context rewind scheduled".to_string(),
+                            });
+                            break event;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "rewind_context",
+                    serde_json::json!({
+                        "anchor": {"item_id": "call-1", "position": "after"},
+                        "reason": "trim noisy branch",
+                        "primer": "carry forward the durable facts"
+                    }),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                result_json
+                    .pointer("/content/0/text")
+                    .and_then(|value| value.as_str()),
+                Some("context rewind scheduled")
+            );
+
+            let event = timeout(Duration::from_secs(1), event_task)
+                .await
+                .expect("expected CodexThreadAction control command")
+                .unwrap();
+
+            assert_eq!(event.0.as_deref(), Some("backend-session-1"));
+            assert_eq!(event.1, "rewind_context");
+            assert_eq!(event.2["anchor"]["item_id"], "call-1");
+        });
+    }
+
+    #[test]
+    fn rewind_context_surfaces_validation_failure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus);
+
+            let result_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            ..
+                        })) if op == "rewind_context" => {
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: false,
+                                message:
+                                    "rollback anchor item_id `rewind_context-call_6` was not found; call list_rewind_anchors"
+                                        .to_string(),
+                            });
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "rewind_context",
+                    serde_json::json!({
+                        "anchor": {"item_id": "rewind_context-call_6", "position": "after"},
+                        "reason": "recover pressure",
+                        "primer": "dense continuation"
+                    }),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+
+            let result_json = serde_json::to_value(&result).unwrap();
+            let text = result_json
+                .pointer("/content/0/text")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            assert!(text.contains("rewind_context failed"), "got: {text}");
+            assert!(text.contains("call list_rewind_anchors"), "got: {text}");
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn list_rewind_anchors_defaults_to_http_session_id_and_returns_result() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus);
+
+            let result_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                        })) if op == "list_rewind_anchors" => {
+                            assert_eq!(session_id.as_deref(), Some("backend-session-1"));
+                            assert_eq!(params["offset"], 25);
+                            assert_eq!(params["limit"], 50);
+                            assert_eq!(params["query"], "tool");
+                            assert_eq!(params["reverse"], true);
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: true,
+                                message: "{\"anchors\":[]}".to_string(),
+                            });
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "list_rewind_anchors",
+                    serde_json::json!({
+                        "offset": 25,
+                        "limit": 50,
+                        "query": "tool",
+                        "reverse": true
+                    }),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                result_json
+                    .pointer("/content/0/text")
+                    .and_then(|value| value.as_str()),
+                Some("{\"anchors\":[]}")
+            );
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn inspect_rewind_anchor_defaults_to_http_session_id_and_returns_result() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let responder_bus = bus.clone();
+            let server = IntendantServer::new(state, bus);
+
+            let result_task = tokio::spawn(async move {
+                loop {
+                    match rx.recv().await {
+                        Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                            session_id,
+                            op,
+                            params,
+                        })) if op == "inspect_rewind_anchor" => {
+                            assert_eq!(session_id.as_deref(), Some("backend-session-1"));
+                            assert_eq!(params["anchor"]["item_id"], "call-1");
+                            assert_eq!(params["radius"], 3);
+                            responder_bus.send(AppEvent::CodexThreadActionResult {
+                                session_id,
+                                action: op,
+                                success: true,
+                                message: "{\"anchor\":{\"item_id\":\"call-1\"}}".to_string(),
+                            });
+                            break;
+                        }
+                        Ok(_) => continue,
+                        Err(e) => panic!("event bus closed: {e}"),
+                    }
+                }
+            });
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "inspect_rewind_anchor",
+                    serde_json::json!({
+                        "item_id": "call-1",
+                        "radius": 3
+                    }),
+                    Some("backend-session-1"),
+                    Some(true),
+                )
+                .await
+                .unwrap();
+
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            assert_eq!(
+                result_json
+                    .pointer("/content/0/text")
+                    .and_then(|value| value.as_str()),
+                Some("{\"anchor\":{\"item_id\":\"call-1\"}}")
+            );
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn observed_codex_config_change_toggles_managed_context() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+
+        assert!(!s.codex_managed_context);
+        assert!(apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexConfigChanged {
+                command: None,
+                sandbox: None,
+                approval_policy: None,
+                model: None,
+                model_cleared: false,
+                reasoning_effort: None,
+                reasoning_effort_cleared: false,
+                service_tier: None,
+                service_tier_cleared: false,
+                web_search: None,
+                network_access: None,
+                writable_roots: None,
+                managed_context: Some("managed".to_string()),
+                context_archive: None,
+            },
+        ));
+        assert!(s.codex_managed_context);
+    }
+
+    #[test]
+    fn observed_codex_config_change_does_not_mutate_active_session_capability() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.active_session_source = Some("codex".to_string());
+
+        assert!(apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexConfigChanged {
+                command: None,
+                sandbox: None,
+                approval_policy: None,
+                model: None,
+                model_cleared: false,
+                reasoning_effort: None,
+                reasoning_effort_cleared: false,
+                service_tier: None,
+                service_tier_cleared: false,
+                web_search: None,
+                network_access: None,
+                writable_roots: None,
+                managed_context: Some("managed".to_string()),
+                context_archive: None,
+            },
+        ));
+        assert!(s.configured_codex_managed_context);
+        assert!(
+            !s.codex_managed_context,
+            "active Codex session capability should not flip until next task"
+        );
+    }
+
+    #[test]
+    fn context_rewind_record_id_from_message_extracts_rewind_id() {
+        assert_eq!(
+            context_rewind_record_id_from_message(
+                "Rewound Codex thread to item call-old and saved record rewind-abc_123.",
+            )
+            .as_deref(),
+            Some("rewind-abc_123")
+        );
+        assert_eq!(
+            context_rewind_record_id_from_message("rewind completed without a durable record"),
+            None
+        );
+    }
+
+    #[test]
+    fn observed_successful_rewind_then_high_usage_marks_rewind_insufficient() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.session_id = "codex-thread".to_string();
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = true;
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexThreadActionResult {
+                session_id: Some("codex-thread".to_string()),
+                action: "rewind_context".to_string(),
+                success: true,
+                message: "Rewound Codex thread to item call-old and saved record rewind-high."
+                    .to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 101_000,
+                    context_window: 100_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 101.0,
+                    prompt_tokens: 96_000,
+                    completion_tokens: 5_000,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+
+        let notice = s
+            .insufficient_rewind_notices
+            .get("codex-thread")
+            .expect("high pressure after rewind should be remembered");
+        assert_eq!(notice.record_id, "rewind-high");
+        assert_eq!(notice.used_tokens, 101_000);
+        assert_eq!(notice.rewind_only_limit, 100_000);
+        assert!(s
+            .pending_rewind_pressure_checks
+            .get("codex-thread")
+            .is_none());
+
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(
+            pressure.pointer("/last_rewind_insufficient/record_id"),
+            Some(&serde_json::Value::String("rewind-high".to_string()))
+        );
+        let gate = s
+            .rewind_only_gate_message("execute_cu_actions")
+            .expect("high Codex pressure should gate non-rewind tools");
+        assert!(gate.contains("was insufficient"));
+        assert!(gate.contains("rewind-high"));
+        assert!(
+            !gate.contains("call-old"),
+            "gate should not prescribe the stale insufficient anchor"
+        );
+    }
+
+    #[test]
+    fn successful_rewind_then_low_usage_clears_pending_insufficient_notice() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.session_id = "codex-thread".to_string();
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = true;
+        s.insufficient_rewind_notices.insert(
+            "codex-thread".to_string(),
+            InsufficientRewindNotice {
+                record_id: "rewind-old".to_string(),
+                used_tokens: 95_000,
+                rewind_only_limit: 100_000,
+                context_window: 100_000,
+            },
+        );
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexThreadActionResult {
+                session_id: Some("codex-thread".to_string()),
+                action: "rewind_context".to_string(),
+                success: true,
+                message: "Rewound Codex thread and saved record rewind-ok.".to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 70_000,
+                    context_window: 100_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 70.0,
+                    prompt_tokens: 68_000,
+                    completion_tokens: 2_000,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+
+        assert!(s
+            .pending_rewind_pressure_checks
+            .get("codex-thread")
+            .is_none());
+        assert!(s.insufficient_rewind_notices.get("codex-thread").is_none());
+        assert_eq!(
+            s.context_pressure_snapshot()["last_rewind_insufficient"],
+            serde_json::Value::Null
+        );
+    }
+
+    #[test]
+    fn insufficient_rewind_notice_is_session_scoped() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.session_id = "session-a".to_string();
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = true;
+        s.session_codex_managed_context
+            .insert("session-a".to_string(), true);
+        s.session_codex_managed_context
+            .insert("session-b".to_string(), true);
+        s.session_usage.insert(
+            "session-b".to_string(),
+            frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 101_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 101.0,
+                prompt_tokens: 97_000,
+                completion_tokens: 4_000,
+                cached_tokens: 0,
+            },
+        );
+
+        s.note_context_rewind_result_for(
+            Some("session-b"),
+            true,
+            "Rewound Codex thread and saved record rewind-b.",
+        );
+        s.complete_pending_rewind_pressure_check_for(Some("session-b"));
+
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("session-a"), None)
+                .pointer("/last_rewind_insufficient"),
+            Some(&serde_json::Value::Null)
+        );
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("session-b"), None)
+                .pointer("/last_rewind_insufficient/record_id"),
+            Some(&serde_json::Value::String("rewind-b".to_string()))
+        );
+    }
+
+    #[test]
+    fn insufficient_rewind_notice_resolves_through_session_identity_alias() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionCapabilities {
+                session_id: "wrapper-session".to_string(),
+                capabilities: crate::types::SessionCapabilities {
+                    follow_up: true,
+                    steer: true,
+                    interrupt: true,
+                    codex_thread_actions: vec!["rewind_context".to_string()],
+                    codex_managed_context: Some("managed".to_string()),
+                    codex_context_archive: None,
+                    codex_command: Some("/tmp/codex".to_string()),
+                    codex_fast_mode: None,
+                    codex_service_tier: None,
+                },
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionIdentity {
+                session_id: "wrapper-session".to_string(),
+                source: "codex".to_string(),
+                backend_session_id: "codex-thread".to_string(),
+            },
+        );
+        s.session_usage.insert(
+            "codex-thread".to_string(),
+            frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 101_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 101.0,
+                prompt_tokens: 97_000,
+                completion_tokens: 4_000,
+                cached_tokens: 0,
+            },
+        );
+
+        s.note_context_rewind_result_for(
+            Some("wrapper-session"),
+            true,
+            "Rewound Codex thread and saved record rewind-alias.",
+        );
+        s.complete_pending_rewind_pressure_check_for(Some("codex-thread"));
+
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("wrapper-session"), None)
+                .pointer("/last_rewind_insufficient/record_id"),
+            Some(&serde_json::Value::String("rewind-alias".to_string()))
+        );
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("codex-thread"), None)
+                .pointer("/last_rewind_insufficient/record_id"),
+            Some(&serde_json::Value::String("rewind-alias".to_string()))
+        );
+    }
+
+    #[test]
+    fn spawn_event_listener_tracks_rewind_result_for_stdio_mcp_state() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "codex-thread".to_string();
+                s.active_session_source = Some("codex".to_string());
+                s.codex_managed_context = true;
+            }
+            let bus = EventBus::new();
+            let listener = spawn_event_listener(
+                state.clone(),
+                bus.subscribe(),
+                Arc::new(Mutex::new(None)),
+                bus.clone(),
+                None,
+                None,
+            );
+
+            bus.send(AppEvent::CodexThreadActionResult {
+                session_id: Some("codex-thread".to_string()),
+                action: "rewind_context".to_string(),
+                success: true,
+                message: "Rewound Codex thread and saved record rewind-listener.".to_string(),
+            });
+            bus.send(AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 101_000,
+                    context_window: 100_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 101.0,
+                    prompt_tokens: 96_000,
+                    completion_tokens: 5_000,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            });
+
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    if state
+                        .read()
+                        .await
+                        .insufficient_rewind_notices
+                        .get("codex-thread")
+                        .is_some_and(|notice| notice.record_id == "rewind-listener")
+                    {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener should mirror rewind pressure state");
+
+            listener.abort();
+        });
+    }
+
+    #[test]
+    fn observed_session_identity_and_usage_enable_codex_gate() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.configured_codex_managed_context = true;
+        s.codex_managed_context = true;
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionIdentity {
+                session_id: "wrapper-session".to_string(),
+                source: "codex".to_string(),
+                backend_session_id: "codex-thread".to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionStarted {
+                session_id: "codex-thread".to_string(),
+                task: Some("audit".to_string()),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 100_000,
+                    context_window: 100_000,
+                    hard_context_window: Some(120_000),
+                    usage_pct: 100.0,
+                    prompt_tokens: 95_000,
+                    completion_tokens: 5_000,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+
+        assert_eq!(s.active_session_source.as_deref(), Some("codex"));
+        assert!(s.rewind_only_gate_message("execute_cu_actions").is_some());
+    }
+
+    #[test]
+    fn observed_session_capabilities_follow_codex_backend_identity() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionCapabilities {
+                session_id: "intendant-session".to_string(),
+                capabilities: crate::types::SessionCapabilities {
+                    follow_up: true,
+                    steer: true,
+                    interrupt: true,
+                    codex_thread_actions: vec!["undo".to_string()],
+                    codex_managed_context: Some("managed".to_string()),
+                    codex_context_archive: None,
+                    codex_command: Some("/opt/codex/bin/codex".to_string()),
+                    codex_fast_mode: Some(true),
+                    codex_service_tier: Some("priority".to_string()),
+                },
+            },
+        );
+        assert_eq!(
+            s.session_codex_managed_context
+                .get("intendant-session")
+                .copied(),
+            Some(true)
+        );
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionIdentity {
+                session_id: "intendant-session".to_string(),
+                source: "codex".to_string(),
+                backend_session_id: "codex-thread".to_string(),
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionStarted {
+                session_id: "codex-thread".to_string(),
+                task: Some("managed dashboard e2e".to_string()),
+            },
+        );
+
+        assert_eq!(s.session_id, "codex-thread");
+        assert_eq!(s.active_session_source.as_deref(), Some("codex"));
+        assert!(s.codex_managed_context);
+        assert_eq!(
+            s.context_pressure_snapshot()
+                .pointer("/managed_context")
+                .and_then(serde_json::Value::as_str),
+            Some("managed")
+        );
+    }
+
+    #[test]
+    fn get_status_includes_usage_and_context_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 125,
+                    context_window: 1_000,
+                    hard_context_window: Some(1_200),
+                    usage_pct: 12.5,
+                    prompt_tokens: 100,
+                    completion_tokens: 25,
+                    cached_tokens: 50,
+                });
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server.get_status().await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&125.into()));
+            assert_eq!(
+                value.pointer("/usage/main/context_window"),
+                Some(&1000.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"ok".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/source"),
+                Some(&"backend_reported".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_uses_session_scoped_usage_and_managed_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "global-session".to_string();
+                s.session_tokens = 10;
+                s.context_window = 1_000;
+                s.session_usage.insert(
+                    "managed-session".to_string(),
+                    frontend::ModelUsageSnapshot {
+                        provider: "openai".to_string(),
+                        model: "gpt-5.2-codex".to_string(),
+                        tokens_used: 1_000,
+                        context_window: 1_000,
+                        hard_context_window: Some(1_200),
+                        usage_pct: 100.0,
+                        prompt_tokens: 900,
+                        completion_tokens: 100,
+                        cached_tokens: 250,
+                    },
+                );
+                s.session_codex_managed_context
+                    .insert("managed-session".to_string(), true);
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("managed-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(
+                value.pointer("/session_id"),
+                Some(&"managed-session".into())
+            );
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&1000.into()));
+            assert_eq!(value.pointer("/session_tokens"), Some(&1000.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"high".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_for_active_session_uses_global_usage_for_context_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "active-managed-session".to_string();
+                s.active_session_source = Some("codex".to_string());
+                s.codex_managed_context = true;
+                s.session_codex_managed_context
+                    .insert("active-managed-session".to_string(), true);
+                s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 950,
+                    context_window: 1_000,
+                    hard_context_window: Some(1_200),
+                    usage_pct: 95.0,
+                    prompt_tokens: 900,
+                    completion_tokens: 50,
+                    cached_tokens: 400,
+                });
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("active-managed-session"), Some(true))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&950.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&950.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"pressure".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_resolves_backend_usage_through_session_identity_alias() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionCapabilities {
+                        session_id: "wrapper-session".to_string(),
+                        capabilities: crate::types::SessionCapabilities {
+                            follow_up: true,
+                            steer: true,
+                            interrupt: true,
+                            codex_thread_actions: vec!["rewind_context".to_string()],
+                            codex_managed_context: Some("managed".to_string()),
+                            codex_context_archive: None,
+                            codex_command: Some("/tmp/codex".to_string()),
+                            codex_fast_mode: None,
+                            codex_service_tier: None,
+                        },
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: "wrapper-session".to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: "codex-thread".to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::UsageSnapshot {
+                        session_id: Some("codex-thread".to_string()),
+                        main: frontend::ModelUsageSnapshot {
+                            provider: "openai".to_string(),
+                            model: "gpt-5.2-codex".to_string(),
+                            tokens_used: 990,
+                            context_window: 1_000,
+                            hard_context_window: Some(1_200),
+                            usage_pct: 99.0,
+                            prompt_tokens: 950,
+                            completion_tokens: 40,
+                            cached_tokens: 500,
+                        },
+                        presence: None,
+                    },
+                );
+            }
+
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("wrapper-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&990.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&990.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"pressure".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_for_unknown_session_does_not_inherit_active_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "active-managed-session".to_string();
+                s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 1_000,
+                    context_window: 1_000,
+                    hard_context_window: Some(1_200),
+                    usage_pct: 100.0,
+                    prompt_tokens: 900,
+                    completion_tokens: 100,
+                    cached_tokens: 400,
+                });
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("new-session-without-usage"), Some(true))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/provider"), Some(&"".into()));
+            assert_eq!(value.pointer("/usage/main/model"), Some(&"".into()));
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&0.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"unknown".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&0.into())
+            );
+        });
+    }
+
+    #[test]
+    fn observed_usage_retains_non_active_session_snapshot() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "active-session".to_string();
+                s.session_sources
+                    .insert("managed-session".to_string(), "codex".to_string());
+                s.session_codex_managed_context
+                    .insert("managed-session".to_string(), true);
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::UsageSnapshot {
+                        session_id: Some("managed-session".to_string()),
+                        main: frontend::ModelUsageSnapshot {
+                            provider: "openai".to_string(),
+                            model: "gpt-5.2-codex".to_string(),
+                            tokens_used: 850,
+                            context_window: 1_000,
+                            hard_context_window: Some(1_200),
+                            usage_pct: 85.0,
+                            prompt_tokens: 800,
+                            completion_tokens: 50,
+                            cached_tokens: 200,
+                        },
+                        presence: None,
+                    },
+                );
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("managed-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&850.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn rewind_backout_fork_dispatches_without_cache_reset_opt_in() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let server = IntendantServer::new(test_state(), bus.clone());
+            let result_task = spawn_codex_thread_action_result(
+                bus,
+                "rewind_backout",
+                "forked context rewind record rewind-1 with inherited lineage prompt-cache key into thread thread-2",
+            );
+            let forked = server
+                .rewind_backout(Parameters(RewindBackoutParams {
+                    session_id: None,
+                    record_id: "rewind-1".to_string(),
+                    mode: Some("fork".to_string()),
+                    name: None,
+                    allow_cache_reset: false,
+                }))
+                .await;
+            assert_eq!(
+                forked,
+                "forked context rewind record rewind-1 with inherited lineage prompt-cache key into thread thread-2"
+            );
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn rewind_backout_returns_thread_action_result_to_caller() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let server = IntendantServer::new(test_state(), bus.clone());
+            let result_task = spawn_codex_thread_action_result(
+                bus,
+                "rewind_backout",
+                "context rewind record rewind-1: pre-rewind rollout copied from source to recovery; restore uses same-thread Codex thread/restore when available",
+            );
+
+            let inspected = server
+                .rewind_backout(Parameters(RewindBackoutParams {
+                    session_id: None,
+                    record_id: "rewind-1".to_string(),
+                    mode: Some("inspect".to_string()),
+                    name: None,
+                    allow_cache_reset: false,
+                }))
+                .await;
+
+            assert!(inspected.contains("same-thread Codex thread/restore"));
+            assert!(!inspected.contains("dispatched"));
+            result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn get_status_includes_lineage_ledger_when_sessions_are_related() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            std::fs::write(
+                dir.path().join("session.jsonl"),
+                concat!(
+                    r#"{"event":"session_identity","data":{"session_id":"child","source":"codex","backend_session_id":"thread-child"}}"#,
+                    "\n",
+                    r#"{"event":"session_relationship","data":{"parent_session_id":"parent","child_session_id":"child","relationship":"subagent","ephemeral":false}}"#,
+                    "\n",
+                ),
+            )
+            .unwrap();
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            {
+                let mut s = state.write().await;
+                s.session_id = "parent".to_string();
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server.get_status().await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(
+                value.pointer("/lineage_ledger/groups/0/branches/0/session_id"),
+                Some(&serde_json::Value::String("child".to_string()))
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_includes_fission_ledger_when_sessions_are_related() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            crate::fission_ledger::record_fission_observation(
+                dir.path(),
+                crate::fission_ledger::FissionObservation {
+                    parent_session_id: "parent".to_string(),
+                    anchor_item_id: "call-1".to_string(),
+                    tool: "spawn_agent".to_string(),
+                    status: "running".to_string(),
+                    prompt: Some("inspect parser".to_string()),
+                    model: None,
+                    reasoning_effort: None,
+                    branches: vec![crate::fission_ledger::FissionBranchObservation {
+                        session_id: "child".to_string(),
+                        status: "running".to_string(),
+                        summary: None,
+                    }],
+                },
+            )
+            .unwrap();
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            {
+                let mut s = state.write().await;
+                s.session_id = "child".to_string();
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server.get_status().await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(
+                value.pointer("/fission_ledger/groups/0/anchor_item_id"),
+                Some(&serde_json::Value::String("call-1".to_string()))
+            );
+            assert_eq!(
+                value.pointer("/fission_ledger/groups/0/branches/0/session_id"),
+                Some(&serde_json::Value::String("child".to_string()))
+            );
+        });
+    }
+
+    #[test]
+    fn claim_fission_canonical_tool_updates_ledger() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            crate::fission_ledger::record_fission_observation(
+                dir.path(),
+                crate::fission_ledger::FissionObservation {
+                    parent_session_id: "parent".to_string(),
+                    anchor_item_id: "call-1".to_string(),
+                    tool: "spawn_agent".to_string(),
+                    status: "running".to_string(),
+                    prompt: None,
+                    model: None,
+                    reasoning_effort: None,
+                    branches: vec![crate::fission_ledger::FissionBranchObservation {
+                        session_id: "child".to_string(),
+                        status: "running".to_string(),
+                        summary: None,
+                    }],
+                },
+            )
+            .unwrap();
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            let server = IntendantServer::new(state, EventBus::new());
+            let group_id = crate::fission_ledger::group_id("parent", "call-1");
+
+            let result = server
+                .claim_fission_canonical(Parameters(ClaimFissionCanonicalParams {
+                    group_id: group_id.clone(),
+                    branch_session_id: "child".to_string(),
+                    expected_canonical_session_id: None,
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(
+                value.pointer("/canonical_session_id"),
+                Some(&serde_json::Value::String("child".to_string()))
+            );
+
+            let status = server.get_status().await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(
+                value.pointer("/fission_ledger/groups/0/canonical_session_id"),
+                Some(&serde_json::Value::String("child".to_string()))
+            );
         });
     }
 
@@ -5908,20 +10106,40 @@ mod tests {
 
     #[tokio::test]
     async fn spawn_detached_restart_command_returns_live_pid() {
-        let pid = spawn_detached_restart_command("sleep 30")
+        // A long-lived command per platform: `sleep` on Unix, a long `timeout`
+        // on Windows (the cmd.exe-resolvable form, /T seconds, /NOBREAK so it
+        // doesn't consume our detached stdin).
+        #[cfg(windows)]
+        let long_running = "timeout /T 30 /NOBREAK";
+        #[cfg(not(windows))]
+        let long_running = "sleep 30";
+
+        let pid = spawn_detached_restart_command(long_running)
             .await
             .expect("detached spawn should succeed");
         assert!(pid > 1);
 
-        let probe = std::process::Command::new("bash")
-            .args(["-lc", &format!("kill -0 {}", pid)])
-            .status()
-            .expect("kill -0 should run");
-        assert!(probe.success(), "spawned pid should be alive");
+        // Liveness via the platform helper (kill(pid,0) on Unix,
+        // OpenProcess/GetExitCodeProcess on Windows) rather than shelling to
+        // bash, which doesn't exist on a stock Windows host.
+        assert!(
+            crate::platform::process_alive(pid),
+            "spawned pid should be alive"
+        );
 
-        let _ = std::process::Command::new("bash")
-            .args(["-lc", &format!("kill -TERM {}", pid)])
-            .status();
+        // Best-effort cleanup of the detached child.
+        #[cfg(windows)]
+        {
+            let _ = std::process::Command::new("taskkill")
+                .args(["/PID", &pid.to_string(), "/F", "/T"])
+                .status();
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::process::Command::new("kill")
+                .args(["-TERM", &pid.to_string()])
+                .status();
+        }
     }
 
     #[tokio::test]

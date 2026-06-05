@@ -1,0 +1,34 @@
+name: AGENTS.md sync
+
+# AGENTS.md is a tracked, byte-for-byte copy of CLAUDE.md (so every checkout and
+# worktree gets the same agent guidance, including on Windows where symlinks are
+# unreliable). This guard fails the build if the two ever drift. To resync:
+#   cp CLAUDE.md AGENTS.md && git add AGENTS.md
+on:
+  push:
+    paths:
+      - "CLAUDE.md"
+      - "AGENTS.md"
+      - ".github/workflows/agents-md-sync.yml"
+  pull_request:
+    paths:
+      - "CLAUDE.md"
+      - "AGENTS.md"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: AGENTS.md must be byte-identical to CLAUDE.md
+        run: |
+          if ! cmp -s CLAUDE.md AGENTS.md; then
+            echo "::error::AGENTS.md is out of sync with CLAUDE.md. Resync with: cp CLAUDE.md AGENTS.md && git add AGENTS.md"
+            diff CLAUDE.md AGENTS.md || true
+            exit 1
+          fi
+          echo "AGENTS.md matches CLAUDE.md"

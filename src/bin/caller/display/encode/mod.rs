@@ -4,6 +4,8 @@ use super::EncodedFrame;
 pub mod h264_linux;
 #[cfg(target_os = "macos")]
 pub mod h264_macos;
+#[cfg(target_os = "windows")]
+pub mod h264_windows;
 pub mod pool;
 pub mod vp8;
 
@@ -243,9 +245,8 @@ pub fn parse_h264_fmtp(sdp: &str) -> Vec<H264FmtpProfile> {
     h264_pts
         .into_iter()
         .map(|pt| {
-            let (profile_level_id, packetization_mode) = fmtp_map
-                .remove(&pt)
-                .unwrap_or_else(|| (String::new(), 0));
+            let (profile_level_id, packetization_mode) =
+                fmtp_map.remove(&pt).unwrap_or_else(|| (String::new(), 0));
             H264FmtpProfile {
                 payload_type: pt,
                 profile_level_id,
@@ -375,22 +376,16 @@ pub fn offer_variant_matches_encoder_payload_spec(profile: &H264FmtpProfile) -> 
 
     // Parse the three bytes of profile-level-id.
     let bytes = profile.profile_level_id.as_bytes();
-    let Ok(profile_idc) = u8::from_str_radix(
-        std::str::from_utf8(&bytes[0..2]).unwrap_or(""),
-        16,
-    ) else {
+    let Ok(profile_idc) = u8::from_str_radix(std::str::from_utf8(&bytes[0..2]).unwrap_or(""), 16)
+    else {
         return false;
     };
-    let Ok(profile_iop) = u8::from_str_radix(
-        std::str::from_utf8(&bytes[2..4]).unwrap_or(""),
-        16,
-    ) else {
+    let Ok(profile_iop) = u8::from_str_radix(std::str::from_utf8(&bytes[2..4]).unwrap_or(""), 16)
+    else {
         return false;
     };
-    let Ok(level_idc) = u8::from_str_radix(
-        std::str::from_utf8(&bytes[4..6]).unwrap_or(""),
-        16,
-    ) else {
+    let Ok(level_idc) = u8::from_str_radix(std::str::from_utf8(&bytes[4..6]).unwrap_or(""), 16)
+    else {
         return false;
     };
 
@@ -468,8 +463,8 @@ pub fn select_codec(
         );
     }
 
-    let enc = Vp8Encoder::new(width, height, bitrate_kbps)
-        .expect("VP8 encoder creation must not fail");
+    let enc =
+        Vp8Encoder::new(width, height, bitrate_kbps).expect("VP8 encoder creation must not fail");
     (Box::new(enc), CodecChoice::Vp8)
 }
 
@@ -529,6 +524,61 @@ fn create_h264_encoder(
     Ok((Box::new(enc), CodecChoice::H264))
 }
 
+/// Windows H264 encoder via Media Foundation (the in-box software H.264
+/// encoder MFT, Constrained Baseline). This is the always-on baseline codec on
+/// Windows since VP8/libvpx is gated off there — see [`pool`].
+#[cfg(target_os = "windows")]
+fn create_h264_encoder(
+    width: u32,
+    height: u32,
+    bitrate_kbps: u32,
+) -> Result<(Box<dyn Encoder>, CodecChoice), String> {
+    let enc = h264_windows::MediaFoundationEncoder::new(width, height, bitrate_kbps)?;
+    eprintln!(
+        "[display/encoder] Using H264 (Media Foundation) for {}x{}",
+        width, height,
+    );
+    Ok((Box::new(enc), CodecChoice::H264))
+}
+
+// ---------------------------------------------------------------------------
+// Black-frame diagnostic
+// ---------------------------------------------------------------------------
+
+/// Average byte value of a pixel buffer over a bounded sample (≤4096 bytes),
+/// stepped across the whole buffer so the sample spans top-to-bottom rather
+/// than just the first rows. Cheap enough for the encode hot path when gated to
+/// the first few frames.
+///
+/// Used by the Windows display port's black-frame diagnostic to pin the exact
+/// pipeline hop where bright captured pixels (`avg ~= 189`) turn into an
+/// all-black buffer (`avg ~= 0`): the bridge logs BGRA-in / I420-out, the pool
+/// encoder thread logs the I420 it hands the codec, and the Media Foundation
+/// H.264 encoder logs the I420 it received, the NV12 it converted to, and the
+/// encoded sample size. An all-black BGRA/I420/NV12 buffer averages ~0; real
+/// desktop content averages well above 0, so the first `avg = 0` in that chain
+/// is the offending hop. Mirrors `display::windows::sampled_avg_byte`, hoisted
+/// here so the bridge (`mod.rs`) and both encode modules share one
+/// implementation. `#[allow(dead_code)]` because only the Windows-gated
+/// diagnostic call sites use it.
+#[allow(dead_code)]
+pub fn sampled_avg_byte(data: &[u8]) -> u32 {
+    if data.is_empty() {
+        return 0;
+    }
+    const MAX_SAMPLES: usize = 4096;
+    let step = (data.len() / MAX_SAMPLES).max(1);
+    let mut sum: u64 = 0;
+    let mut n: u64 = 0;
+    let mut i = 0;
+    while i < data.len() {
+        sum += data[i] as u64;
+        n += 1;
+        i += step;
+    }
+    (sum / n.max(1)) as u32
+}
+
 // ---------------------------------------------------------------------------
 // Color space conversion
 // ---------------------------------------------------------------------------
@@ -561,11 +611,8 @@ pub fn bgra_to_i420(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8
         let y_row_start = row * w;
         for col in 0..w {
             let px = row_start + col * 4;
-            y_plane[y_row_start + col] = rgb_to_y(
-                bgra[px + 2] as i32,
-                bgra[px + 1] as i32,
-                bgra[px] as i32,
-            );
+            y_plane[y_row_start + col] =
+                rgb_to_y(bgra[px + 2] as i32, bgra[px + 1] as i32, bgra[px] as i32);
         }
     }
 
@@ -618,16 +665,14 @@ fn rgb_to_y(r: i32, g: i32, b: i32) -> u8 {
 #[inline]
 fn rgb_sum_to_u(sum_r: i32, sum_g: i32, sum_b: i32, count: i32) -> u8 {
     // -0.169, -0.331, 0.500 + 128 in 16.16 fixed point.
-    let n = -11_076 * sum_r - 21_692 * sum_g + 32_768 * sum_b
-        + 8_388_608 * count;
+    let n = -11_076 * sum_r - 21_692 * sum_g + 32_768 * sum_b + 8_388_608 * count;
     rounded_fixed_avg_clamped_u8(n, count)
 }
 
 #[inline]
 fn rgb_sum_to_v(sum_r: i32, sum_g: i32, sum_b: i32, count: i32) -> u8 {
     // 0.500, -0.419, -0.081 + 128 in 16.16 fixed point.
-    let n = 32_768 * sum_r - 27_460 * sum_g - 5_308 * sum_b
-        + 8_388_608 * count;
+    let n = 32_768 * sum_r - 27_460 * sum_g - 5_308 * sum_b + 8_388_608 * count;
     rounded_fixed_avg_clamped_u8(n, count)
 }
 
@@ -656,13 +701,7 @@ fn rounded_fixed_avg_clamped_u8(n: i32, count: i32) -> u8 {
 /// `setup-linux.sh` and `setup-macos.sh` for any new sys dep). When/if the
 /// CPU budget actually binds, swapping the per-plane loop to a libyuv call
 /// is local — the function signature and output shape don't change.
-pub fn downscale_i420(
-    src: &[u8],
-    src_w: u32,
-    src_h: u32,
-    dst_w: u32,
-    dst_h: u32,
-) -> Vec<u8> {
+pub fn downscale_i420(src: &[u8], src_w: u32, src_h: u32, dst_w: u32, dst_h: u32) -> Vec<u8> {
     debug_assert!(
         src_w % 2 == 0 && src_h % 2 == 0,
         "downscale_i420: src dims must be even, got {src_w}x{src_h}"
@@ -698,10 +737,20 @@ pub fn downscale_i420(
 
     downscale_plane_bilinear(src_y, src_w, src_h, dst_y_plane, dst_w, dst_h);
     downscale_plane_bilinear(
-        src_u, src_w / 2, src_h / 2, dst_u_plane, dst_w / 2, dst_h / 2,
+        src_u,
+        src_w / 2,
+        src_h / 2,
+        dst_u_plane,
+        dst_w / 2,
+        dst_h / 2,
     );
     downscale_plane_bilinear(
-        src_v, src_w / 2, src_h / 2, dst_v_plane, dst_w / 2, dst_h / 2,
+        src_v,
+        src_w / 2,
+        src_h / 2,
+        dst_v_plane,
+        dst_w / 2,
+        dst_h / 2,
     );
 
     out
@@ -888,6 +937,23 @@ mod tests {
     }
 
     #[test]
+    fn sampled_avg_byte_black_is_zero_real_is_nonzero() {
+        // The black-frame diagnostic contract: an all-zero buffer averages 0,
+        // a uniform buffer reports its value, and any real content reads > 0.
+        // This is the signal the Windows hop-by-hop instrumentation relies on.
+        assert_eq!(sampled_avg_byte(&[]), 0);
+        assert_eq!(sampled_avg_byte(&vec![0u8; 800 * 600 * 4]), 0);
+        assert_eq!(sampled_avg_byte(&vec![128u8; 800 * 600 * 4]), 128);
+        let mut content = vec![0u8; 800 * 600 * 4];
+        for (i, b) in content.iter_mut().enumerate() {
+            if i % 2 == 0 {
+                *b = 64;
+            }
+        }
+        assert!(sampled_avg_byte(&content) > 0);
+    }
+
+    #[test]
     fn bgra_to_i420_y_values() {
         let bgra = make_2x2_bgra();
         let i420 = bgra_to_i420(&bgra, 2, 2, 8);
@@ -907,7 +973,7 @@ mod tests {
     fn bgra_to_i420_stride_padding() {
         // 2x2 image with stride=12 (4 bytes padding per row)
         let mut bgra = vec![0u8; 24]; // 2 rows * 12 bytes
-        // Row 0: white, white
+                                      // Row 0: white, white
         bgra[0..4].copy_from_slice(&[255, 255, 255, 255]);
         bgra[4..8].copy_from_slice(&[255, 255, 255, 255]);
         // Row 1: black, black
@@ -1010,6 +1076,11 @@ a=rtpmap:97 VP8/90000\r\n";
         assert!(codecs.is_empty());
     }
 
+    // VP8/libvpx encoder tests — gated off Windows, where the libvpx
+    // backend is unavailable (Tier-0) and `Vp8Encoder::new` always
+    // returns `Err`. The Windows H.264 baseline is covered by the
+    // `h264_windows` encoder tests and the H.264 pool tests.
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn vp8_encoder_produces_output() {
         let mut enc = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
@@ -1026,9 +1097,13 @@ a=rtpmap:97 VP8/90000\r\n";
         // VP8 typically emits at least one packet for the first frame (keyframe).
         assert!(!packets.is_empty(), "expected at least one packet");
         assert!(packets[0].is_keyframe, "first frame should be keyframe");
-        assert!(!packets[0].data.is_empty(), "packet data should not be empty");
+        assert!(
+            !packets[0].data.is_empty(),
+            "packet data should not be empty"
+        );
     }
 
+    #[cfg(not(target_os = "windows"))]
     #[test]
     fn vp8_encoder_force_keyframe_on_demand() {
         let mut enc = Vp8Encoder::new(320, 240, 500).expect("encoder creation");
@@ -1040,14 +1115,20 @@ a=rtpmap:97 VP8/90000\r\n";
         // then feed identical frames without forcing; expect P-frames.
         let _ = enc.encode(&i420, 33, false).expect("encode 1");
         let packets = enc.encode(&i420, 33, false).expect("encode 2");
-        assert!(packets.iter().all(|p| !p.is_keyframe), "identical frame without force should be a P-frame");
+        assert!(
+            packets.iter().all(|p| !p.is_keyframe),
+            "identical frame without force should be a P-frame"
+        );
 
         // Now force. Tweak one byte so libvpx produces some output; the
         // flag should make whatever it produces a keyframe.
         i420[0] = 200;
         let forced = enc.encode(&i420, 33, true).expect("encode 3");
         assert!(!forced.is_empty(), "forced encode should produce output");
-        assert!(forced.iter().any(|p| p.is_keyframe), "force_keyframe=true must produce a keyframe");
+        assert!(
+            forced.iter().any(|p| p.is_keyframe),
+            "force_keyframe=true must produce a keyframe"
+        );
     }
 
     // -----------------------------------------------------------------------
@@ -1279,11 +1360,19 @@ a=fmtp:97 profile-level-id=640032;packetization-mode=1\r\n";
         let src = make_constant_i420(64, 64, 100, 50, 200);
         let out = downscale_i420(&src, 64, 64, 32, 32);
         // 32*32 (Y) + 2*16*16 (UV) = 1024 + 512 = 1536
-        assert_eq!(out.len(), 1536, "downscale 64x64 → 32x32 must yield I420 of len 1536");
+        assert_eq!(
+            out.len(),
+            1536,
+            "downscale 64x64 → 32x32 must yield I420 of len 1536"
+        );
 
         let out = downscale_i420(&src, 64, 64, 16, 16);
         // 16*16 (Y) + 2*8*8 (UV) = 256 + 128 = 384
-        assert_eq!(out.len(), 384, "downscale 64x64 → 16x16 must yield I420 of len 384");
+        assert_eq!(
+            out.len(),
+            384,
+            "downscale 64x64 → 16x16 must yield I420 of len 384"
+        );
     }
 
     /// A constant-color I420 must downscale to the same constant color.
@@ -1299,9 +1388,15 @@ a=fmtp:97 profile-level-id=640032;packetization-mode=1\r\n";
         let (y, uv) = out.split_at(y_size);
         let (u, v) = uv.split_at(uv_size);
 
-        assert!(y.iter().all(|&p| p == 137), "Y plane must stay constant 137");
+        assert!(
+            y.iter().all(|&p| p == 137),
+            "Y plane must stay constant 137"
+        );
         assert!(u.iter().all(|&p| p == 64), "U plane must stay constant 64");
-        assert!(v.iter().all(|&p| p == 192), "V plane must stay constant 192");
+        assert!(
+            v.iter().all(|&p| p == 192),
+            "V plane must stay constant 192"
+        );
     }
 
     /// A 1:1 "downscale" (dst_dims == src_dims) must round-trip the data

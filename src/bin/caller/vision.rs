@@ -72,9 +72,13 @@ pub(crate) fn remove_stale_lock(id: u32) {
 
 // Non-Linux stubs — these are called from debug.rs and XvfbGuard::Drop.
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn is_lock_stale(_lock_path: &str) -> bool { false }
+pub(crate) fn is_lock_stale(_lock_path: &str) -> bool {
+    false
+}
 #[cfg(not(target_os = "linux"))]
-pub(crate) fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool { false }
+pub(crate) fn is_our_xvfb(_lock_path: &str, _display_id: u32) -> bool {
+    false
+}
 #[cfg(not(target_os = "linux"))]
 pub(crate) fn kill_and_reclaim(_lock_path: &str, _display_id: u32) {}
 #[cfg(not(target_os = "linux"))]
@@ -95,7 +99,9 @@ pub fn display_config_for_provider(provider_name: &str) -> DisplayConfig {
         _ => (1024, 768),           // safe default
     };
     DisplayConfig {
-        target: DisplayTarget::Virtual { id: find_free_display() },
+        target: DisplayTarget::Virtual {
+            id: find_free_display(),
+        },
         width,
         height,
     }
@@ -217,10 +223,7 @@ pub async fn launch_display(config: &DisplayConfig) -> Result<XvfbGuard, CallerE
     // Set DISPLAY env var so the runtime subprocess inherits it
     std::env::set_var("DISPLAY", &display_arg);
 
-    Ok(XvfbGuard {
-        child,
-        display_id,
-    })
+    Ok(XvfbGuard { child, display_id })
 }
 
 /// Virtual display launch is not available on non-Linux platforms.
@@ -245,7 +248,7 @@ pub fn is_display_accessible() -> bool {
 /// sockets (handles tty/ssh sessions where env vars aren't inherited from
 /// the graphical session). If a socket is found, sets `DISPLAY` so
 /// downstream code (xdotool, ImageMagick, etc.) can use it.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub fn is_display_accessible() -> bool {
     let display = match std::env::var("DISPLAY") {
         Ok(d) if !d.is_empty() => d,
@@ -270,10 +273,18 @@ pub fn is_display_accessible() -> bool {
         .unwrap_or(false)
 }
 
+/// Windows has no X11 display server, so there's nothing to probe.
+/// Tier-1 will report accessibility based on a DXGI/desktop backend; for
+/// now report inaccessible so the X11/xdotool code paths stay dormant.
+#[cfg(target_os = "windows")]
+pub fn is_display_accessible() -> bool {
+    false
+}
+
 /// Detect an X11 display by scanning `/tmp/.X11-unix/` for sockets.
 /// Returns the display string (e.g. ":0") for the lowest-numbered socket,
 /// skipping Xvfb instances in the agent range (99+).
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub fn detect_x11_display() -> Option<String> {
     let entries = std::fs::read_dir("/tmp/.X11-unix").ok()?;
     let mut displays: Vec<u32> = Vec::new();
@@ -292,6 +303,12 @@ pub fn detect_x11_display() -> Option<String> {
     }
     displays.sort();
     displays.first().map(|n| format!(":{}", n))
+}
+
+/// No X11 sockets on Windows — there is nothing to detect.
+#[cfg(target_os = "windows")]
+pub fn detect_x11_display() -> Option<String> {
+    None
 }
 
 // ── Tests ───────────────────────────────────────────────────────────────────

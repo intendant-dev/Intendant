@@ -3,7 +3,9 @@ use crate::types::OutboundEvent;
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
+#[cfg(unix)]
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+#[cfg(unix)]
 use tokio::net::UnixListener;
 use tokio::sync::broadcast;
 
@@ -14,6 +16,13 @@ pub fn socket_path() -> PathBuf {
 
 /// Spawn the Unix control socket server.
 /// Returns a broadcast sender for pushing events to connected clients.
+///
+/// The control socket is a Unix-domain socket (`--control-socket`). On
+/// non-Unix targets (Windows) there is no `UnixListener`, so this is a
+/// no-op: it returns the same `(JoinHandle, Sender)` shape with a task
+/// that exits immediately. A Tier-1 Windows port could back this with a
+/// named pipe or a localhost TCP socket.
+#[cfg(unix)]
 pub fn spawn_control_server(
     bus: EventBus,
 ) -> (tokio::task::JoinHandle<()>, broadcast::Sender<String>) {
@@ -74,8 +83,7 @@ pub fn spawn_control_server(
                                         if !trimmed.is_empty() {
                                             match serde_json::from_str::<ControlMsg>(trimmed) {
                                                 Ok(msg) => {
-                                                    bus_inbound
-                                                        .send(AppEvent::ControlCommand(msg));
+                                                    bus_inbound.send(AppEvent::ControlCommand(msg));
                                                 }
                                                 Err(e) => {
                                                     let err_json = serde_json::json!({
@@ -83,8 +91,7 @@ pub fn spawn_control_server(
                                                         "ok": false,
                                                         "message": format!("Invalid message: {}", e),
                                                     });
-                                                    let _ = error_tx
-                                                        .send(err_json.to_string());
+                                                    let _ = error_tx.send(err_json.to_string());
                                                 }
                                             }
                                         }
@@ -133,6 +140,19 @@ pub fn spawn_control_server(
     (handle, outbound_tx)
 }
 
+/// Non-Unix stub: no Unix-domain control socket. Returns an
+/// immediately-completing task and a live (but unused) broadcast sender
+/// so callers behind `--control-socket` keep the same shape.
+#[cfg(not(unix))]
+pub fn spawn_control_server(
+    _bus: EventBus,
+) -> (tokio::task::JoinHandle<()>, broadcast::Sender<String>) {
+    let (outbound_tx, _) = broadcast::channel::<String>(256);
+    eprintln!("Control socket is not available on this platform (Unix-only)");
+    let handle = tokio::spawn(async {});
+    (handle, outbound_tx)
+}
+
 /// Clean up the socket file.
 pub fn cleanup() {
     let _ = std::fs::remove_file(socket_path());
@@ -162,6 +182,7 @@ mod tests {
     #[test]
     fn outbound_event_turn_started_serialize() {
         let event = OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 12.3,
         };
@@ -173,9 +194,11 @@ mod tests {
     #[test]
     fn outbound_event_agent_output_serialize() {
         let event = OutboundEvent::AgentOutput {
+            session_id: None,
             stdout: "hello".to_string(),
             stderr: "".to_string(),
             source: None,
+            output_id: None,
         };
         let json = serde_json::to_string(&event).unwrap();
         assert!(json.contains("\"event\":\"agent_output\""));
@@ -184,6 +207,7 @@ mod tests {
     #[test]
     fn outbound_event_approval_required_serialize() {
         let event = OutboundEvent::ApprovalRequired {
+            session_id: None,
             id: 42,
             command: "rm -rf /tmp".to_string(),
         };
@@ -204,6 +228,7 @@ mod tests {
     #[test]
     fn outbound_event_task_complete_serialize() {
         let event = OutboundEvent::TaskComplete {
+            session_id: None,
             reason: "done signal".to_string(),
             summary: Some("files listed".to_string()),
         };
@@ -245,6 +270,7 @@ mod tests {
     fn broadcast_event_to_sender() {
         let (tx, mut rx) = broadcast::channel::<String>(16);
         let event = OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 1,
             budget_pct: 5.0,
         };

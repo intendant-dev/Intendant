@@ -99,10 +99,11 @@ ensure_sudo() {
 APT_PACKAGES=(
     # Build essentials
     build-essential
+    binutils
     pkg-config
     git
     curl
-    mold
+    ca-certificates
 
     # ripgrep — used by external agents (Codex, Claude Code) for code search.
     # Missing `rg` causes agents to fall back to slower paths (targeted reads
@@ -151,6 +152,19 @@ APT_PACKAGES=(
     # Audio routing (PulseAudio tools for virtual audio bridge)
     pulseaudio-utils
 
+    # Chrome for Testing / managed browser workspace runtime libraries.
+    libnss3
+    libatk-bridge2.0-0
+    libgtk-3-0
+    libxcomposite1
+    libxdamage1
+    libxrandr2
+    libxss1
+    libgbm1
+    libdrm2
+    libxkbcommon0
+    libcups2
+
     # AT-SPI accessibility (optional, used by test automation)
     libatspi2.0-dev
 )
@@ -169,6 +183,29 @@ check_apt_packages() {
             all_ok=false
         fi
     done
+
+    $all_ok
+}
+
+check_linker_tools() {
+    local all_ok=true
+
+    echo ""
+    info "native linker tools:"
+
+    if has_cmd cc; then
+        ok "$(cc --version 2>/dev/null | head -1)"
+    else
+        miss "cc" "apt install build-essential"
+        all_ok=false
+    fi
+
+    if has_cmd ld; then
+        ok "$(ld --version 2>/dev/null | head -1)"
+    else
+        miss "ld" "apt install binutils"
+        all_ok=false
+    fi
 
     $all_ok
 }
@@ -254,6 +291,51 @@ install_wasm_pack() {
     info "installing wasm-pack (this may take a minute)..."
     cargo install wasm-pack
     ok "wasm-pack installed"
+}
+
+# ── Managed browser for CDP browser workspaces ────────────────────────────
+
+check_managed_browser() {
+    echo ""
+    info "managed browser workspace dependency:"
+
+    local intendant_bin="$REPO_ROOT/target/release/intendant"
+    if [[ -x "$intendant_bin" ]]; then
+        if "$intendant_bin" setup browsers --check --print-path >/dev/null 2>&1; then
+            ok "Chrome for Testing / managed Chromium"
+            return 0
+        fi
+        miss "Chrome for Testing / managed Chromium" "$intendant_bin setup browsers"
+        return 1
+    fi
+
+    local cache_root="${XDG_CACHE_HOME:-$HOME/.cache}/intendant/browser-workspaces"
+    if [[ -d "$cache_root" ]] && find "$cache_root" -type f \( -name "chrome" -o -name "chromium" -o -name "chromium-browser" -o -name "google-chrome" \) -print -quit 2>/dev/null | grep -q .; then
+        ok "Chrome for Testing / managed Chromium"
+        return 0
+    fi
+
+    miss "Chrome for Testing / managed Chromium" "build first, then run target/release/intendant setup browsers"
+    return 1
+}
+
+install_managed_browser() {
+    local intendant_bin="$REPO_ROOT/target/release/intendant"
+    if [[ ! -x "$intendant_bin" ]]; then
+        warn "cannot install managed browser; missing $intendant_bin"
+        warn "after building, run: target/release/intendant setup browsers"
+        return
+    fi
+
+    info "installing managed Chrome for Testing browser..."
+    if "$intendant_bin" setup browsers; then
+        ok "managed browser ready"
+    else
+        warn "managed browser install failed; browser workspaces need one of:"
+        warn "  target/release/intendant setup browsers"
+        warn "  INTENDANT_BROWSER_WORKSPACE_EXECUTABLE=/path/to/chrome"
+        warn "  provider=system_cdp for an explicit system-browser launch"
+    fi
 }
 
 # ── Display session detection ─────────────────────────────────────────────
@@ -540,11 +622,13 @@ run_check() {
 
     detect_distro
 
-    local apt_ok rust_ok wasm_ok env_ok
+    local apt_ok linker_ok rust_ok wasm_ok env_ok browser_ok
 
     check_apt_packages && apt_ok=true || apt_ok=false
+    check_linker_tools && linker_ok=true || linker_ok=false
     check_rust         && rust_ok=true || rust_ok=false
     check_wasm_pack    && wasm_ok=true || wasm_ok=false
+    check_managed_browser && browser_ok=true || browser_ok=false
     check_dotenv       && env_ok=true || env_ok=false
 
     detect_display
@@ -558,6 +642,12 @@ run_check() {
         echo "  System packages:  missing (run without --check to install)"
     fi
 
+    if $linker_ok; then
+        echo "  Native linker:    ready"
+    else
+        echo "  Native linker:    missing (install build-essential binutils)"
+    fi
+
     if $rust_ok; then
         echo "  Rust toolchain:   ready"
     else
@@ -568,6 +658,12 @@ run_check() {
         echo "  WASM tools:       ready"
     else
         echo "  WASM tools:       missing"
+    fi
+
+    if $browser_ok; then
+        echo "  Browser workspace: ready"
+    else
+        echo "  Browser workspace: missing managed browser"
     fi
 
     if $env_ok; then
@@ -600,6 +696,10 @@ run_install() {
     install_apt_packages
     ok "system packages ready"
 
+    # Fail here with an actionable package name instead of a later rustc
+    # "could not find `ld`" error.
+    check_linker_tools || die "native linker tools missing after apt install -- run: sudo apt install build-essential binutils"
+
     # Phase 3: Rust
     echo ""
     install_rust
@@ -627,6 +727,8 @@ run_install() {
         build_wasm
         echo ""
         build_intendant
+        echo ""
+        install_managed_browser
     fi
 
     # Done

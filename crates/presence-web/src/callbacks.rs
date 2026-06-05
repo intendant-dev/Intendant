@@ -13,6 +13,10 @@ use wasm_bindgen::prelude::*;
 pub struct Callbacks {
     /// Terminal ANSI data from server (base64-encoded).
     pub on_term: RefCell<Option<Function>>,
+    /// Standalone shell output from server (host_id, terminal_id, base64 data).
+    pub on_terminal_output: RefCell<Option<Function>>,
+    /// Standalone shell exit notification (host_id, terminal_id, status).
+    pub on_terminal_exited: RefCell<Option<Function>>,
     /// Server connection state changed (boolean: connected/disconnected).
     pub on_server_state: RefCell<Option<Function>>,
     /// Bootstrap state_snapshot from server (JsValue with state object).
@@ -68,6 +72,28 @@ impl Callbacks {
     pub fn invoke_term(&self, base64_data: &str) {
         if let Some(ref f) = *self.on_term.borrow() {
             let _ = f.call1(&JsValue::NULL, &JsValue::from_str(base64_data));
+        }
+    }
+
+    pub fn invoke_terminal_output(&self, host_id: &str, terminal_id: &str, base64_data: &str) {
+        if let Some(ref f) = *self.on_terminal_output.borrow() {
+            let _ = f.call3(
+                &JsValue::NULL,
+                &JsValue::from_str(host_id),
+                &JsValue::from_str(terminal_id),
+                &JsValue::from_str(base64_data),
+            );
+        }
+    }
+
+    pub fn invoke_terminal_exited(&self, host_id: &str, terminal_id: &str, status: i32) {
+        if let Some(ref f) = *self.on_terminal_exited.borrow() {
+            let _ = f.call3(
+                &JsValue::NULL,
+                &JsValue::from_str(host_id),
+                &JsValue::from_str(terminal_id),
+                &JsValue::from_f64(status as f64),
+            );
         }
     }
 

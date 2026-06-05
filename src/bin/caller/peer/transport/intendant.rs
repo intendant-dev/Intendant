@@ -67,12 +67,8 @@
 
 use crate::event::ControlMsg;
 use crate::peer::card::{AgentCard, TransportSpec};
-use crate::peer::event::{
-    ApprovalDecision, MessageContent, MessageId, PeerEvent, TaskId,
-};
-use crate::peer::traits::{
-    check_feature, PeerOp, PeerOpAck, PeerTransport, TransportFeatures,
-};
+use crate::peer::event::{ApprovalDecision, MessageContent, MessageId, PeerEvent, TaskId};
+use crate::peer::traits::{check_feature, PeerOp, PeerOpAck, PeerTransport, TransportFeatures};
 use crate::peer::upcast::WireEventUpcaster;
 use crate::peer::PeerError;
 use crate::types::OutboundEvent;
@@ -183,10 +179,7 @@ impl IntendantWsTransport {
     async fn write_control_msg(&mut self, ctrl: &ControlMsg) -> Result<(), PeerError> {
         let json = serde_json::to_string(ctrl)
             .map_err(|e| PeerError::Transport(format!("serialize ControlMsg: {e}")))?;
-        let write = self
-            .ws_write
-            .as_mut()
-            .ok_or(PeerError::NotConnected)?;
+        let write = self.ws_write.as_mut().ok_or(PeerError::NotConnected)?;
         write
             .send(Message::Text(json.into()))
             .await
@@ -292,9 +285,7 @@ impl IntendantWsTransport {
         let mut request = ws_url
             .as_str()
             .into_client_request()
-            .map_err(|e| {
-                PeerError::Transport(format!("build ws request {ws_url}: {e}"))
-            })?;
+            .map_err(|e| PeerError::Transport(format!("build ws request {ws_url}: {e}")))?;
 
         if let Some(token) = &self.creds.bearer_token {
             let value = format!("Bearer {token}").parse().map_err(|e| {
@@ -305,22 +296,20 @@ impl IntendantWsTransport {
             request.headers_mut().insert("Authorization", value);
         }
 
-        let connector: Option<Connector> =
-            if !self.creds.pinned_fingerprints.is_empty() {
-                let verifier = super::pinning::PinnedFingerprintVerifier::new(
-                    self.creds.pinned_fingerprints.clone(),
-                );
-                let config = super::pinning::pinned_client_config(verifier);
-                Some(Connector::Rustls(std::sync::Arc::new(config)))
-            } else {
-                None
-            };
+        let connector: Option<Connector> = if !self.creds.pinned_fingerprints.is_empty() {
+            let verifier = super::pinning::PinnedFingerprintVerifier::new(
+                self.creds.pinned_fingerprints.clone(),
+            );
+            let config = super::pinning::pinned_client_config(verifier);
+            Some(Connector::Rustls(std::sync::Arc::new(config)))
+        } else {
+            None
+        };
 
-        let (ws_stream, _response) = tokio_tungstenite::connect_async_tls_with_config(
-            request, None, false, connector,
-        )
-        .await
-        .map_err(|e| PeerError::Transport(format!("ws connect {ws_url}: {e}")))?;
+        let (ws_stream, _response) =
+            tokio_tungstenite::connect_async_tls_with_config(request, None, false, connector)
+                .await
+                .map_err(|e| PeerError::Transport(format!("ws connect {ws_url}: {e}")))?;
 
         let (write, read) = ws_stream.split();
         let events_tx = self.events_tx.clone();
@@ -337,9 +326,7 @@ impl IntendantWsTransport {
 /// payload.
 fn message_text(content: &MessageContent) -> Result<String, PeerError> {
     match content {
-        MessageContent::Text { text } | MessageContent::Reasoning { text } => {
-            Ok(text.clone())
-        }
+        MessageContent::Text { text } | MessageContent::Reasoning { text } => Ok(text.clone()),
         MessageContent::Image { .. } => Err(PeerError::Transport(
             "IntendantWsTransport: image message content is not supported \
              — Intendant's ControlMsg::FollowUp / StartTask carry text only"
@@ -409,8 +396,10 @@ async fn drain_ws(
                     .map(|f| format!("peer closed: {} {}", f.code, f.reason))
                     .unwrap_or_else(|| "peer closed without reason".to_string());
             }
-            Some(Ok(Message::Binary(_))) | Some(Ok(Message::Ping(_)))
-            | Some(Ok(Message::Pong(_))) | Some(Ok(Message::Frame(_))) => {
+            Some(Ok(Message::Binary(_)))
+            | Some(Ok(Message::Ping(_)))
+            | Some(Ok(Message::Pong(_)))
+            | Some(Ok(Message::Frame(_))) => {
                 // Intendant's /ws doesn't speak binary; ping/pong is
                 // handled by tungstenite under the hood.
                 continue;
@@ -506,8 +495,10 @@ impl PeerTransport for IntendantWsTransport {
             PeerOp::SendMessage { message } => {
                 let text = message_text(&message.content)?;
                 self.write_control_msg(&ControlMsg::FollowUp {
+                    session_id: None,
                     text,
                     direct: None,
+                    follow_up_id: None,
                 })
                 .await?;
                 let seq = self.next_out_seq();
@@ -515,12 +506,14 @@ impl PeerTransport for IntendantWsTransport {
             }
             PeerOp::DelegateTask { task } => {
                 self.write_control_msg(&ControlMsg::StartTask {
+                    session_id: None,
                     task: task.instructions,
                     orchestrate: None,
                     direct: None,
                     reference_frame_ids: Vec::new(),
                     display_target: None,
                     attachments: Vec::new(),
+                    follow_up_id: None,
                 })
                 .await?;
                 let seq = self.next_out_seq();
@@ -532,12 +525,22 @@ impl PeerTransport for IntendantWsTransport {
             } => {
                 let id = parse_request_id(&request_id)?;
                 let ctrl = match decision {
-                    ApprovalDecision::Accept => ControlMsg::Approve { id },
-                    ApprovalDecision::AcceptForSession => {
-                        ControlMsg::ApproveAll { id }
-                    }
-                    ApprovalDecision::Decline => ControlMsg::Deny { id },
-                    ApprovalDecision::Cancel => ControlMsg::Skip { id },
+                    ApprovalDecision::Accept => ControlMsg::Approve {
+                        session_id: None,
+                        id,
+                    },
+                    ApprovalDecision::AcceptForSession => ControlMsg::ApproveAll {
+                        session_id: None,
+                        id,
+                    },
+                    ApprovalDecision::Decline => ControlMsg::Deny {
+                        session_id: None,
+                        id,
+                    },
+                    ApprovalDecision::Cancel => ControlMsg::Skip {
+                        session_id: None,
+                        id,
+                    },
                 };
                 self.write_control_msg(&ctrl).await?;
                 Ok(PeerOpAck::Ok)
@@ -621,6 +624,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;
         (port, handle, bus_rx)
@@ -633,10 +637,7 @@ mod tests {
     /// the moment the transport's send lands and the matching
     /// `ControlCommand` — the predicate filter keeps tests robust
     /// against that noise.
-    async fn wait_for_event<F>(
-        rx: &mut broadcast::Receiver<AppEvent>,
-        pred: F,
-    ) -> Option<AppEvent>
+    async fn wait_for_event<F>(rx: &mut broadcast::Receiver<AppEvent>, pred: F) -> Option<AppEvent>
     where
         F: Fn(&AppEvent) -> bool,
     {
@@ -689,7 +690,10 @@ mod tests {
 
         let _card1 = transport.connect().await.expect("first connect");
         assert!(transport.is_connected());
-        let _card2 = transport.connect().await.expect("second connect (reconnect)");
+        let _card2 = transport
+            .connect()
+            .await
+            .expect("second connect (reconnect)");
         assert!(transport.is_connected());
 
         transport.disconnect().await.unwrap();
@@ -707,8 +711,7 @@ mod tests {
     #[test]
     fn features_advertise_three_outbound_verbs() {
         let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
-        let transport =
-            IntendantWsTransport::new("ws://127.0.0.1:0/ws".to_string(), tx);
+        let transport = IntendantWsTransport::new("ws://127.0.0.1:0/ws".to_string(), tx);
         let features = transport.features();
         assert!(features.bidirectional);
         assert!(features.streaming_events);
@@ -749,11 +752,7 @@ mod tests {
             .expect("send_message succeeds");
         match ack {
             PeerOpAck::MessageId(id) => {
-                assert!(
-                    id.0.starts_with("msg-out-"),
-                    "synthetic id shape: {}",
-                    id.0
-                );
+                assert!(id.0.starts_with("msg-out-"), "synthetic id shape: {}", id.0);
             }
             other => panic!("expected MessageId ack, got {other:?}"),
         }
@@ -868,7 +867,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::Approve { id: 1 })
+            AppEvent::ControlCommand(ControlMsg::Approve { id: 1, .. })
         ))
         .await
         .is_some());
@@ -883,7 +882,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::ApproveAll { id: 2 })
+            AppEvent::ControlCommand(ControlMsg::ApproveAll { id: 2, .. })
         ))
         .await
         .is_some());
@@ -898,7 +897,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::Deny { id: 3 })
+            AppEvent::ControlCommand(ControlMsg::Deny { id: 3, .. })
         ))
         .await
         .is_some());
@@ -913,7 +912,7 @@ mod tests {
             .unwrap();
         assert!(wait_for_event(&mut bus_rx, |e| matches!(
             e,
-            AppEvent::ControlCommand(ControlMsg::Skip { id: 4 })
+            AppEvent::ControlCommand(ControlMsg::Skip { id: 4, .. })
         ))
         .await
         .is_some());
@@ -993,10 +992,7 @@ mod tests {
     #[tokio::test]
     async fn send_before_connect_returns_not_connected() {
         let (tx, _rx) = mpsc::channel::<PeerEvent>(1);
-        let mut transport = IntendantWsTransport::new(
-            "ws://127.0.0.1:1/ws".to_string(),
-            tx,
-        );
+        let mut transport = IntendantWsTransport::new("ws://127.0.0.1:1/ws".to_string(), tx);
 
         let result = transport
             .send(PeerOp::SendMessage {

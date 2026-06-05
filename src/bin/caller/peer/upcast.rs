@@ -46,6 +46,7 @@
 //!   stream, not an event, and the federation layer doesn't need
 //!   per-peer display metrics visible in the aggregate feed.
 
+use crate::app_state_pricing::{estimate_live_usage_cost, estimate_session_cost, LiveUsageTokens};
 use crate::event::AppEvent;
 use crate::peer::{
     ActivityId, ActivityKind, ActivityOutcome, ApprovalDecision, ApprovalRequest, Capability,
@@ -127,6 +128,7 @@ pub(crate) fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> Str
         C::HumanInput => "human_input",
         C::LiveAudioSpawn => "live_audio_spawn",
         C::DisplayControl => "display_control",
+        C::ToolCall => "tool_call",
     }
     .to_string()
 }
@@ -137,9 +139,7 @@ pub(crate) fn action_category_wire(cat: &crate::autonomy::ActionCategory) -> Str
 pub(crate) fn approval_decision_from_action(action: &str) -> ApprovalDecision {
     match action {
         "approve" | "accept" => ApprovalDecision::Accept,
-        "approve_all" | "accept_for_session" | "approveall" => {
-            ApprovalDecision::AcceptForSession
-        }
+        "approve_all" | "accept_for_session" | "approveall" => ApprovalDecision::AcceptForSession,
         "deny" | "decline" => ApprovalDecision::Decline,
         "skip" | "cancel" => ApprovalDecision::Cancel,
         _ => ApprovalDecision::Decline,
@@ -224,23 +224,23 @@ impl AppEventUpcaster {
     /// task means the in-flight agent is failing too, so we don't
     /// want to stamp it Success alongside a failed turn.
     fn close_pending_agent(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_agent_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_agent_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("agent-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     /// Drain any in-flight turn activity. Called from `DoneSignal`,
     /// `TaskComplete`, and the next `TurnStarted` (defensive).
     fn close_pending_turn(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("turn-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     fn next_seq(&mut self) -> u64 {
@@ -272,8 +272,20 @@ impl AppEventUpcaster {
             | AppEvent::Tick
             | AppEvent::ControlCommand(_)
             | AppEvent::DisplayMetrics { .. }
+            | AppEvent::ContextSnapshot { .. }
             | AppEvent::CodexThreadActionRequested { .. }
+            | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
+            | AppEvent::SessionStopRequested { .. }
+            | AppEvent::SessionIdentity { .. }
+            | AppEvent::SessionRelationship { .. }
+            | AppEvent::SessionCapabilities { .. }
+            | AppEvent::SessionGoal { .. }
+            | AppEvent::FollowUpStatus { .. }
+            | AppEvent::SharedView { .. }
+            | AppEvent::BrowserWorkspaceChanged { .. }
+            | AppEvent::SessionRenameResult { .. }
+            | AppEvent::SessionAgentConfigResult { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }
@@ -284,8 +296,17 @@ impl AppEventUpcaster {
             | AppEvent::ConversationRollbackRequested { .. }
             | AppEvent::ConversationRolledBack { .. } => vec![],
 
-            AppEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            AppEvent::CodexThreadActionResult {
+                action,
+                success,
+                message,
+                ..
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "codex-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -294,8 +315,16 @@ impl AppEventUpcaster {
                 },
             )],
 
-            AppEvent::GeminiThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            AppEvent::GeminiThreadActionResult {
+                action,
+                success,
+                message,
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "gemini-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -316,8 +345,7 @@ impl AppEventUpcaster {
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 // Seed the shared message ID for this turn so subsequent
@@ -332,7 +360,7 @@ impl AppEventUpcaster {
                 out
             }
 
-            AppEvent::ModelResponseDelta { text } => {
+            AppEvent::ModelResponseDelta { text, .. } => {
                 let id = self.current_or_new_message_id();
                 vec![PeerEvent::Message {
                     id,
@@ -348,6 +376,7 @@ impl AppEventUpcaster {
                 usage,
                 reasoning,
                 source: _,
+                ..
             } => {
                 let msg_id = self.current_or_new_message_id();
                 let mut out = vec![PeerEvent::Message {
@@ -384,7 +413,7 @@ impl AppEventUpcaster {
                 out
             }
 
-            AppEvent::DoneSignal { message } => {
+            AppEvent::DoneSignal { message, .. } => {
                 self.current_message_id = None;
                 let mut out = vec![];
                 // Close the in-flight agent first (if any), then the
@@ -393,8 +422,7 @@ impl AppEventUpcaster {
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 } else {
                     // No turn tracked — DoneSignal arrived without a
@@ -428,6 +456,7 @@ impl AppEventUpcaster {
                 turn,
                 commands_preview,
                 source,
+                ..
             } => {
                 let label = source.clone().unwrap_or_else(|| "agent".to_string());
                 // Close any previous agent activity (defensive: if the
@@ -451,6 +480,7 @@ impl AppEventUpcaster {
                 stdout,
                 stderr,
                 source: _,
+                ..
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
@@ -510,7 +540,9 @@ impl AppEventUpcaster {
                 format!("context management turn {turn}"),
             )],
 
-            AppEvent::TaskComplete { reason, summary } => {
+            AppEvent::TaskComplete {
+                reason, summary, ..
+            } => {
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
                     "cancelled" | "canceled" => ActivityOutcome::Cancelled,
@@ -559,6 +591,12 @@ impl AppEventUpcaster {
                 }]
             }
 
+            AppEvent::SessionAttached { session_id, source } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                format!("session attached: {} ({})", session_id, source),
+            )],
+
             AppEvent::SessionEnded { session_id, reason } => vec![PeerEvent::SessionEnded {
                 session_id: session_id.clone(),
                 reason: reason.clone(),
@@ -575,6 +613,7 @@ impl AppEventUpcaster {
                 id,
                 command_preview,
                 category,
+                ..
             } => vec![PeerEvent::ApprovalRequested {
                 request: ApprovalRequest {
                     request_id: id.to_string(),
@@ -584,7 +623,7 @@ impl AppEventUpcaster {
                 },
             }],
 
-            AppEvent::ApprovalResolved { id, action } => vec![PeerEvent::ApprovalResolved {
+            AppEvent::ApprovalResolved { id, action, .. } => vec![PeerEvent::ApprovalResolved {
                 request_id: id.to_string(),
                 decision: approval_decision_from_action(action),
             }],
@@ -654,7 +693,10 @@ impl AppEventUpcaster {
                 detail: serde_json::json!({ "display_id": display_id, "state": "taken" }),
             }],
 
-            AppEvent::DisplayReleased { display_id: _, note } => vec![PeerEvent::CapabilityReleased {
+            AppEvent::DisplayReleased {
+                display_id: _,
+                note,
+            } => vec![PeerEvent::CapabilityReleased {
                 capability: Capability::Display,
                 reason: note.clone(),
             }],
@@ -831,20 +873,35 @@ impl AppEventUpcaster {
                 total_tokens: _,
                 context_window: _,
                 usage_pct: _,
-                provider: _,
-                model: _,
+                provider,
+                model,
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *prompt_tokens,
-                    tokens_out: *completion_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![],
-                },
-            }],
+            } => {
+                let cost_usd = estimate_session_cost(
+                    model,
+                    *prompt_tokens,
+                    *completion_tokens,
+                    *cached_tokens,
+                    0,
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
+                        tokens_in: *prompt_tokens,
+                        tokens_out: *completion_tokens,
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *prompt_tokens,
+                            tokens_out: *completion_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             AppEvent::LiveUsageUpdate {
                 provider,
@@ -853,38 +910,74 @@ impl AppEventUpcaster {
                 output_tokens,
                 cached_tokens,
                 total_tokens: _,
-                thinking_tokens: _,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *input_tokens,
-                    tokens_out: *output_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: provider.clone(),
-                        model: model.clone(),
+                thinking_tokens,
+                input_text_tokens,
+                input_audio_tokens,
+                input_image_tokens,
+                cached_text_tokens,
+                cached_audio_tokens,
+                cached_image_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+            } => {
+                let cost_usd = estimate_live_usage_cost(
+                    model,
+                    LiveUsageTokens {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cached_tokens: *cached_tokens,
+                        thinking_tokens: *thinking_tokens,
+                        input_text_tokens: *input_text_tokens,
+                        input_audio_tokens: *input_audio_tokens,
+                        input_image_tokens: *input_image_tokens,
+                        cached_text_tokens: *cached_text_tokens,
+                        cached_audio_tokens: *cached_audio_tokens,
+                        cached_image_tokens: *cached_image_tokens,
+                        output_text_tokens: *output_text_tokens,
+                        output_audio_tokens: *output_audio_tokens,
+                    },
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: *input_tokens,
                         tokens_out: *output_tokens,
-                        cost_usd: None,
-                    }],
-                },
-            }],
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *input_tokens,
+                            tokens_out: *output_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
-            AppEvent::UsageSnapshot { main, presence: _ } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: main.prompt_tokens,
-                    tokens_out: main.completion_tokens,
-                    tokens_cached: main.cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: main.provider.clone(),
-                        model: main.model.clone(),
+            AppEvent::UsageSnapshot { main, .. } => {
+                let cost_usd = estimate_session_cost(
+                    &main.model,
+                    main.prompt_tokens,
+                    main.completion_tokens,
+                    main.cached_tokens,
+                    0,
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: main.prompt_tokens,
                         tokens_out: main.completion_tokens,
-                        cost_usd: None,
-                    }],
-                },
-            }],
+                        tokens_cached: main.cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: main.provider.clone(),
+                            model: main.model.clone(),
+                            tokens_in: main.prompt_tokens,
+                            tokens_out: main.completion_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             // ---- Status ----
             AppEvent::StatusUpdate { phase, .. } => {
@@ -901,18 +994,32 @@ impl AppEventUpcaster {
                 ),
             )],
 
+            AppEvent::AutonomyChanged { autonomy } => vec![log_event(
+                LogLevel::Info,
+                "config",
+                format!("autonomy changed → {autonomy}"),
+            )],
+
             AppEvent::CodexConfigChanged {
+                command,
                 sandbox,
                 approval_policy,
                 model,
                 model_cleared,
                 reasoning_effort,
                 reasoning_effort_cleared,
+                service_tier,
+                service_tier_cleared,
                 web_search,
                 network_access,
                 writable_roots,
+                managed_context,
+                context_archive,
             } => {
                 let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = command {
+                    parts.push(format!("command={v}"));
+                }
                 if let Some(v) = sandbox {
                     parts.push(format!("sandbox={v}"));
                 }
@@ -929,6 +1036,11 @@ impl AppEventUpcaster {
                 } else if *reasoning_effort_cleared {
                     parts.push("reasoning_effort=<default>".to_string());
                 }
+                if let Some(v) = service_tier {
+                    parts.push(format!("service_tier={v}"));
+                } else if *service_tier_cleared {
+                    parts.push("service_tier=<inherit>".to_string());
+                }
                 if let Some(v) = web_search {
                     parts.push(format!("web_search={v}"));
                 }
@@ -937,6 +1049,12 @@ impl AppEventUpcaster {
                 }
                 if let Some(v) = writable_roots {
                     parts.push(format!("writable_roots=[{} path(s)]", v.len()));
+                }
+                if let Some(v) = managed_context {
+                    parts.push(format!("managed_context={v}"));
+                }
+                if let Some(v) = context_archive {
+                    parts.push(format!("context_archive={v}"));
                 }
                 if parts.is_empty() {
                     vec![]
@@ -1027,6 +1145,7 @@ impl AppEventUpcaster {
                 source,
                 content,
                 turn: _,
+                ..
             } => {
                 let log_level = match level.as_str() {
                     "trace" => LogLevel::Trace,
@@ -1038,6 +1157,25 @@ impl AppEventUpcaster {
                 };
                 vec![log_event(log_level, source, content.clone())]
             }
+            AppEvent::UserMessageRewind {
+                user_turn_index,
+                turns_removed,
+                ..
+            } => vec![log_event(
+                LogLevel::Warn,
+                "system",
+                if *turns_removed == 1 {
+                    format!("Rewound user turn {user_turn_index}")
+                } else {
+                    format!(
+                        "Rewound user turn {user_turn_index} and {} later turns",
+                        turns_removed.saturating_sub(1)
+                    )
+                },
+            )],
+            AppEvent::UserMessageLog { content, .. } => {
+                vec![log_event(LogLevel::Info, "User", content.clone())]
+            }
 
             // ---- Terminal ----
             AppEvent::Quit => vec![PeerEvent::Disconnected {
@@ -1045,19 +1183,19 @@ impl AppEventUpcaster {
             }],
 
             // ---- Interruption ----
-            AppEvent::InterruptRequested => vec![log_event(
+            AppEvent::InterruptRequested { .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 "interrupt requested".to_string(),
             )],
-            AppEvent::Interrupted { reason } => vec![log_event(
+            AppEvent::Interrupted { reason, .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 format!("interrupted: {reason}"),
             )],
 
             // ---- Mid-turn steering ----
-            AppEvent::SteerRequested { text, id } => {
+            AppEvent::SteerRequested { text, id, .. } => {
                 let preview: String = text.chars().take(80).collect();
                 let suffix = if text.chars().count() > 80 { "..." } else { "" };
                 let id_part = if id.is_empty() {
@@ -1071,7 +1209,7 @@ impl AppEventUpcaster {
                     format!("steer requested{id_part}: {preview}{suffix}"),
                 )]
             }
-            AppEvent::SteerQueued { id, reason } => {
+            AppEvent::SteerQueued { id, reason, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -1083,13 +1221,29 @@ impl AppEventUpcaster {
                     format!("steer queued{id_part}: {reason}"),
                 )]
             }
-            AppEvent::SteerDelivered { id, mid_turn } => {
+            AppEvent::SteerAccepted { id, reason, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
                     format!(" [{id}]")
                 };
-                let mode = if *mid_turn { "mid-turn" } else { "follow-up" };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer accepted{id_part}: {reason}"),
+                )]
+            }
+            AppEvent::SteerDelivered { id, mid_turn, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                let mode = if *mid_turn {
+                    "mid-turn"
+                } else {
+                    "turn boundary"
+                };
                 vec![log_event(
                     LogLevel::Info,
                     "agent",
@@ -1174,21 +1328,21 @@ impl WireEventUpcaster {
     /// failure down to the in-flight agent instead of contradicting
     /// it with Success.
     fn close_pending_agent(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_agent_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_agent_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("agent-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     fn close_pending_turn(&mut self, outcome: ActivityOutcome) -> Option<PeerEvent> {
-        self.current_turn.take().map(|turn| {
-            PeerEvent::ActivityCompleted {
+        self.current_turn
+            .take()
+            .map(|turn| PeerEvent::ActivityCompleted {
                 id: ActivityId(format!("turn-{turn}")),
                 outcome,
-            }
-        })
+            })
     }
 
     /// Map a wire-format [`OutboundEvent`] to zero or more
@@ -1212,6 +1366,7 @@ impl WireEventUpcaster {
             // so they're intentionally absent from the peer event vocabulary.
             OutboundEvent::Unknown
             | OutboundEvent::DisplayMetrics { .. }
+            | OutboundEvent::ContextSnapshot { .. }
             | OutboundEvent::FileChanged { .. }
             | OutboundEvent::UploadReady { .. }
             | OutboundEvent::UploadDeleted { .. }
@@ -1220,6 +1375,15 @@ impl WireEventUpcaster {
             | OutboundEvent::Redone { .. }
             | OutboundEvent::HistoryPruned { .. }
             | OutboundEvent::ConversationRolledBack { .. }
+            | OutboundEvent::SessionIdentity { .. }
+            | OutboundEvent::SessionRelationship { .. }
+            | OutboundEvent::SessionCapabilities { .. }
+            | OutboundEvent::SessionGoal { .. }
+            | OutboundEvent::FollowUpStatus { .. }
+            | OutboundEvent::SharedView { .. }
+            | OutboundEvent::BrowserWorkspaceChanged { .. }
+            | OutboundEvent::SessionRenameResult { .. }
+            | OutboundEvent::SessionAgentConfigResult { .. }
             | OutboundEvent::PeerAdded { .. }
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. }
@@ -1245,8 +1409,17 @@ impl WireEventUpcaster {
                 signal: signal.clone(),
             }],
 
-            OutboundEvent::CodexThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            OutboundEvent::CodexThreadActionResult {
+                action,
+                success,
+                message,
+                ..
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "codex-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -1255,8 +1428,16 @@ impl WireEventUpcaster {
                 },
             )],
 
-            OutboundEvent::GeminiThreadActionResult { action, success, message } => vec![log_event(
-                if *success { LogLevel::Info } else { LogLevel::Warn },
+            OutboundEvent::GeminiThreadActionResult {
+                action,
+                success,
+                message,
+            } => vec![log_event(
+                if *success {
+                    LogLevel::Info
+                } else {
+                    LogLevel::Warn
+                },
                 "gemini-action",
                 if *success {
                     format!("/{}: {}", action, message)
@@ -1271,8 +1452,7 @@ impl WireEventUpcaster {
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 }
                 self.current_message_id = Some(MessageId(format!("msg-turn-{turn}")));
@@ -1285,7 +1465,7 @@ impl WireEventUpcaster {
                 out
             }
 
-            OutboundEvent::ModelResponseDelta { text } => {
+            OutboundEvent::ModelResponseDelta { text, .. } => {
                 let id = self.current_or_new_message_id();
                 vec![PeerEvent::Message {
                     id,
@@ -1309,6 +1489,7 @@ impl WireEventUpcaster {
                 summary,
                 reasoning_summary,
                 source: _,
+                ..
             } => {
                 let msg_id = self.current_or_new_message_id();
                 let mut out = vec![PeerEvent::Message {
@@ -1364,14 +1545,13 @@ impl WireEventUpcaster {
                 out
             }
 
-            OutboundEvent::DoneSignal { message } => {
+            OutboundEvent::DoneSignal { message, .. } => {
                 self.current_message_id = None;
                 let mut out = vec![];
                 if let Some(closed) = self.close_pending_agent(ActivityOutcome::Success) {
                     out.push(closed);
                 }
-                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success)
-                {
+                if let Some(closed) = self.close_pending_turn(ActivityOutcome::Success) {
                     out.push(closed);
                 } else {
                     let seq = self.next_seq();
@@ -1389,6 +1569,7 @@ impl WireEventUpcaster {
             OutboundEvent::RoundComplete {
                 round,
                 turns_in_round,
+                ..
             } => vec![log_event(
                 LogLevel::Info,
                 "agent",
@@ -1400,6 +1581,7 @@ impl WireEventUpcaster {
                 turn,
                 commands_preview,
                 source,
+                ..
             } => {
                 let label = source.clone().unwrap_or_else(|| "agent".to_string());
                 let mut out = vec![];
@@ -1419,6 +1601,7 @@ impl WireEventUpcaster {
                 stdout,
                 stderr,
                 source: _,
+                ..
             } => {
                 let mut out = vec![];
                 if !stdout.is_empty() {
@@ -1468,7 +1651,9 @@ impl WireEventUpcaster {
                 format!("context management turn {turn}"),
             )],
 
-            OutboundEvent::TaskComplete { reason, summary } => {
+            OutboundEvent::TaskComplete {
+                reason, summary, ..
+            } => {
                 let outcome = match reason.as_str() {
                     "success" | "done" | "completed" => ActivityOutcome::Success,
                     "cancelled" | "canceled" => ActivityOutcome::Cancelled,
@@ -1510,6 +1695,12 @@ impl WireEventUpcaster {
                 }]
             }
 
+            OutboundEvent::SessionAttached { session_id, source } => vec![log_event(
+                LogLevel::Info,
+                "session",
+                format!("session attached: {} ({})", session_id, source),
+            )],
+
             OutboundEvent::SessionEnded { session_id, reason } => {
                 vec![PeerEvent::SessionEnded {
                     session_id: session_id.clone(),
@@ -1526,7 +1717,7 @@ impl WireEventUpcaster {
             // this as intentional loss — non-command-exec categories
             // (file_write, destructive, etc.) lose their specific
             // category name on the wire path.
-            OutboundEvent::ApprovalRequired { id, command } => {
+            OutboundEvent::ApprovalRequired { id, command, .. } => {
                 vec![PeerEvent::ApprovalRequested {
                     request: ApprovalRequest {
                         request_id: id.to_string(),
@@ -1537,7 +1728,7 @@ impl WireEventUpcaster {
                 }]
             }
 
-            OutboundEvent::ApprovalResolved { id, action } => {
+            OutboundEvent::ApprovalResolved { id, action, .. } => {
                 vec![PeerEvent::ApprovalResolved {
                     request_id: id.to_string(),
                     decision: approval_decision_from_action(action),
@@ -1609,7 +1800,10 @@ impl WireEventUpcaster {
                 detail: serde_json::json!({ "display_id": display_id, "state": "taken" }),
             }],
 
-            OutboundEvent::DisplayReleased { display_id: _, note } => {
+            OutboundEvent::DisplayReleased {
+                display_id: _,
+                note,
+            } => {
                 vec![PeerEvent::CapabilityReleased {
                     capability: Capability::Display,
                     reason: note.clone(),
@@ -1724,20 +1918,35 @@ impl WireEventUpcaster {
                 total_tokens: _,
                 context_window: _,
                 usage_pct: _,
-                provider: _,
-                model: _,
+                provider,
+                model,
                 prompt_tokens,
                 completion_tokens,
                 cached_tokens,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *prompt_tokens,
-                    tokens_out: *completion_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![],
-                },
-            }],
+            } => {
+                let cost_usd = estimate_session_cost(
+                    model,
+                    *prompt_tokens,
+                    *completion_tokens,
+                    *cached_tokens,
+                    0,
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
+                        tokens_in: *prompt_tokens,
+                        tokens_out: *completion_tokens,
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *prompt_tokens,
+                            tokens_out: *completion_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             OutboundEvent::LiveUsageUpdate {
                 provider,
@@ -1746,39 +1955,74 @@ impl WireEventUpcaster {
                 output_tokens,
                 cached_tokens,
                 total_tokens: _,
-                thinking_tokens: _,
-            } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: *input_tokens,
-                    tokens_out: *output_tokens,
-                    tokens_cached: *cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: provider.clone(),
-                        model: model.clone(),
+                thinking_tokens,
+                input_text_tokens,
+                input_audio_tokens,
+                input_image_tokens,
+                cached_text_tokens,
+                cached_audio_tokens,
+                cached_image_tokens,
+                output_text_tokens,
+                output_audio_tokens,
+            } => {
+                let cost_usd = estimate_live_usage_cost(
+                    model,
+                    LiveUsageTokens {
+                        input_tokens: *input_tokens,
+                        output_tokens: *output_tokens,
+                        cached_tokens: *cached_tokens,
+                        thinking_tokens: *thinking_tokens,
+                        input_text_tokens: *input_text_tokens,
+                        input_audio_tokens: *input_audio_tokens,
+                        input_image_tokens: *input_image_tokens,
+                        cached_text_tokens: *cached_text_tokens,
+                        cached_audio_tokens: *cached_audio_tokens,
+                        cached_image_tokens: *cached_image_tokens,
+                        output_text_tokens: *output_text_tokens,
+                        output_audio_tokens: *output_audio_tokens,
+                    },
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: *input_tokens,
                         tokens_out: *output_tokens,
-                        cost_usd: None,
-                    }],
-                },
-            }],
+                        tokens_cached: *cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: provider.clone(),
+                            model: model.clone(),
+                            tokens_in: *input_tokens,
+                            tokens_out: *output_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
-            OutboundEvent::Usage { main, presence: _ }
-            | OutboundEvent::UsageUpdate { main, presence: _ } => vec![PeerEvent::Usage {
-                snapshot: UsageSnapshot {
-                    tokens_in: main.prompt_tokens,
-                    tokens_out: main.completion_tokens,
-                    tokens_cached: main.cached_tokens,
-                    cost_usd: None,
-                    by_model: vec![ModelUsage {
-                        provider: main.provider.clone(),
-                        model: main.model.clone(),
+            OutboundEvent::Usage { main, .. } | OutboundEvent::UsageUpdate { main, .. } => {
+                let cost_usd = estimate_session_cost(
+                    &main.model,
+                    main.prompt_tokens,
+                    main.completion_tokens,
+                    main.cached_tokens,
+                    0,
+                );
+                vec![PeerEvent::Usage {
+                    snapshot: UsageSnapshot {
                         tokens_in: main.prompt_tokens,
                         tokens_out: main.completion_tokens,
-                        cost_usd: None,
-                    }],
-                },
-            }],
+                        tokens_cached: main.cached_tokens,
+                        cost_usd,
+                        by_model: vec![ModelUsage {
+                            provider: main.provider.clone(),
+                            model: main.model.clone(),
+                            tokens_in: main.prompt_tokens,
+                            tokens_out: main.completion_tokens,
+                            cost_usd,
+                        }],
+                    },
+                }]
+            }
 
             // ---- Status ----
             OutboundEvent::Status { phase, .. } => {
@@ -1795,18 +2039,32 @@ impl WireEventUpcaster {
                 ),
             )],
 
+            OutboundEvent::AutonomyChanged { autonomy } => vec![log_event(
+                LogLevel::Info,
+                "config",
+                format!("autonomy changed → {autonomy}"),
+            )],
+
             OutboundEvent::CodexConfigChanged {
+                command,
                 sandbox,
                 approval_policy,
                 model,
                 model_cleared,
                 reasoning_effort,
                 reasoning_effort_cleared,
+                service_tier,
+                service_tier_cleared,
                 web_search,
                 network_access,
                 writable_roots,
+                managed_context,
+                context_archive,
             } => {
                 let mut parts: Vec<String> = Vec::new();
+                if let Some(v) = command {
+                    parts.push(format!("command={v}"));
+                }
                 if let Some(v) = sandbox {
                     parts.push(format!("sandbox={v}"));
                 }
@@ -1823,6 +2081,11 @@ impl WireEventUpcaster {
                 } else if *reasoning_effort_cleared {
                     parts.push("reasoning_effort=<default>".to_string());
                 }
+                if let Some(v) = service_tier {
+                    parts.push(format!("service_tier={v}"));
+                } else if *service_tier_cleared {
+                    parts.push("service_tier=<inherit>".to_string());
+                }
                 if let Some(v) = web_search {
                     parts.push(format!("web_search={v}"));
                 }
@@ -1831,6 +2094,12 @@ impl WireEventUpcaster {
                 }
                 if let Some(v) = writable_roots {
                     parts.push(format!("writable_roots=[{} path(s)]", v.len()));
+                }
+                if let Some(v) = managed_context {
+                    parts.push(format!("managed_context={v}"));
+                }
+                if let Some(v) = context_archive {
+                    parts.push(format!("context_archive={v}"));
                 }
                 if parts.is_empty() {
                     vec![]
@@ -1917,9 +2186,29 @@ impl WireEventUpcaster {
                 source,
                 content,
                 turn: _,
+                session_id: _,
+                user_turn_index: _,
+                user_turn_revision: _,
+                replacement_for_user_turn_index: _,
             } => {
                 vec![log_event(wire_log_level(level), source, content.clone())]
             }
+            OutboundEvent::UserMessageRewind {
+                user_turn_index,
+                turns_removed,
+                ..
+            } => vec![log_event(
+                LogLevel::Warn,
+                "system",
+                if *turns_removed == 1 {
+                    format!("Rewound user turn {user_turn_index}")
+                } else {
+                    format!(
+                        "Rewound user turn {user_turn_index} and {} later turns",
+                        turns_removed.saturating_sub(1)
+                    )
+                },
+            )],
 
             // ---- CommandResult: control-plane meta-event ----
             //
@@ -1937,27 +2226,23 @@ impl WireEventUpcaster {
                 data: _,
             } => {
                 let level = if *ok { LogLevel::Info } else { LogLevel::Warn };
-                vec![log_event(
-                    level,
-                    "control",
-                    format!("{action}: {message}"),
-                )]
+                vec![log_event(level, "control", format!("{action}: {message}"))]
             }
 
             // ---- Interruption ----
-            OutboundEvent::InterruptRequested => vec![log_event(
+            OutboundEvent::InterruptRequested { .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 "interrupt requested".to_string(),
             )],
-            OutboundEvent::Interrupted { reason } => vec![log_event(
+            OutboundEvent::Interrupted { reason, .. } => vec![log_event(
                 LogLevel::Info,
                 "agent",
                 format!("interrupted: {reason}"),
             )],
 
             // ---- Mid-turn steering ----
-            OutboundEvent::SteerRequested { text, id } => {
+            OutboundEvent::SteerRequested { text, id, .. } => {
                 let preview: String = text.chars().take(80).collect();
                 let suffix = if text.chars().count() > 80 { "..." } else { "" };
                 let id_part = if id.is_empty() {
@@ -1971,7 +2256,7 @@ impl WireEventUpcaster {
                     format!("steer requested{id_part}: {preview}{suffix}"),
                 )]
             }
-            OutboundEvent::SteerQueued { id, reason } => {
+            OutboundEvent::SteerQueued { id, reason, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -1983,13 +2268,29 @@ impl WireEventUpcaster {
                     format!("steer queued{id_part}: {reason}"),
                 )]
             }
-            OutboundEvent::SteerDelivered { id, mid_turn } => {
+            OutboundEvent::SteerAccepted { id, reason, .. } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
                     format!(" [{id}]")
                 };
-                let mode = if *mid_turn { "mid-turn" } else { "follow-up" };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer accepted{id_part}: {reason}"),
+                )]
+            }
+            OutboundEvent::SteerDelivered { id, mid_turn, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                let mode = if *mid_turn {
+                    "mid-turn"
+                } else {
+                    "turn boundary"
+                };
                 vec![log_event(
                     LogLevel::Info,
                     "agent",
@@ -2020,6 +2321,7 @@ mod tests {
     fn turn_started_emits_activity_started() {
         let mut u = AppEventUpcaster::new();
         let out = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
             remaining: 1000,
@@ -2042,6 +2344,7 @@ mod tests {
         let mut u = AppEventUpcaster::new();
         // Open turn 5.
         let _ = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
             remaining: 100,
@@ -2051,9 +2354,11 @@ mod tests {
         // prior ModelResponse synthesize a fresh ID that's stable
         // across subsequent deltas in the same conversation-turn.
         let a = u.upcast(&AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "Hello ".into(),
         });
         let b = u.upcast(&AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "world".into(),
         });
         let id_a = match &a[0] {
@@ -2080,11 +2385,13 @@ mod tests {
         let mut u = AppEventUpcaster::new();
         // Prime current_turn_message via a delta-first path.
         let _ = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
             remaining: 100,
         });
         let delta = u.upcast(&AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "Hello ".into(),
         });
         let delta_id = match &delta[0] {
@@ -2093,6 +2400,7 @@ mod tests {
         };
         // Now close the turn.
         let out = u.upcast(&AppEvent::ModelResponse {
+            session_id: None,
             turn: 7,
             content: "Hello world".into(),
             usage: token_usage(10, 20),
@@ -2122,6 +2430,7 @@ mod tests {
     fn model_response_with_reasoning_adds_reasoning_message() {
         let mut u = AppEventUpcaster::new();
         let out = u.upcast(&AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: "final".into(),
             usage: token_usage(5, 5),
@@ -2149,7 +2458,7 @@ mod tests {
         // a trivially-constructable one.
         assert!(u
             .upcast(&AppEvent::ControlCommand(
-                crate::event::ControlMsg::Status
+                crate::event::ControlMsg::Status { session_id: None }
             ))
             .is_empty());
     }
@@ -2166,10 +2475,7 @@ mod tests {
         });
         assert_eq!(engaged.len(), 1);
         match &engaged[0] {
-            PeerEvent::CapabilityEngaged {
-                capability,
-                detail,
-            } => {
+            PeerEvent::CapabilityEngaged { capability, detail } => {
                 assert_eq!(*capability, Capability::Display);
                 assert_eq!(detail["width"], 1920);
                 assert_eq!(detail["height"], 1080);
@@ -2181,10 +2487,7 @@ mod tests {
             note: Some("user revoked".into()),
         });
         match &released[0] {
-            PeerEvent::CapabilityReleased {
-                capability,
-                reason,
-            } => {
+            PeerEvent::CapabilityReleased { capability, reason } => {
                 assert_eq!(*capability, Capability::Display);
                 assert_eq!(reason.as_deref(), Some("user revoked"));
             }
@@ -2250,6 +2553,7 @@ mod tests {
     fn approval_flow_maps_cleanly() {
         let mut u = AppEventUpcaster::new();
         let req = u.upcast(&AppEvent::ApprovalRequired {
+            session_id: None,
             id: 42,
             command_preview: "rm -rf /tmp/foo".into(),
             category: crate::autonomy::ActionCategory::FileDelete,
@@ -2263,6 +2567,7 @@ mod tests {
             _ => panic!("expected ApprovalRequested"),
         }
         let res = u.upcast(&AppEvent::ApprovalResolved {
+            session_id: None,
             id: 42,
             action: "approve".into(),
         });
@@ -2329,9 +2634,7 @@ mod tests {
             reason: "done".into(),
         });
         match &end[0] {
-            PeerEvent::SessionEnded {
-                session_id, reason,
-            } => {
+            PeerEvent::SessionEnded { session_id, reason } => {
                 assert_eq!(session_id, "sess-1");
                 assert_eq!(reason, "done");
             }
@@ -2349,6 +2652,7 @@ mod tests {
     fn model_turn_activity_ids_match_start_to_complete() {
         let mut u = AppEventUpcaster::new();
         let started = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
             remaining: 100,
@@ -2359,7 +2663,10 @@ mod tests {
         };
         assert_eq!(start_id.0, "turn-7");
 
-        let done = u.upcast(&AppEvent::DoneSignal { message: None });
+        let done = u.upcast(&AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         let complete_id = done
             .iter()
             .find_map(|e| match e {
@@ -2382,22 +2689,23 @@ mod tests {
         // Open a turn so the agent has a parent context (matches
         // typical usage; not strictly required).
         let _ = u.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
             remaining: 100,
         });
         // Start an agent activity.
         let started = u.upcast(&AppEvent::AgentStarted {
+            session_id: None,
             turn: 3,
             commands_preview: "ls -la".into(),
+            item_id: None,
             source: None,
         });
         let start_id = started
             .iter()
             .find_map(|e| match e {
-                PeerEvent::ActivityStarted { id, kind, .. }
-                    if *kind == ActivityKind::ToolCall =>
-                {
+                PeerEvent::ActivityStarted { id, kind, .. } if *kind == ActivityKind::ToolCall => {
                     Some(id.clone())
                 }
                 _ => None,
@@ -2407,9 +2715,11 @@ mod tests {
 
         // Stream some output.
         let output = u.upcast(&AppEvent::AgentOutput {
+            session_id: None,
             stdout: "file1\nfile2".into(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         });
         let progress_id = output
             .iter()
@@ -2418,13 +2728,13 @@ mod tests {
                 _ => None,
             })
             .expect("AgentOutput with stdout must emit an ActivityProgress");
-        assert_eq!(
-            progress_id, start_id,
-            "progress id must match started id"
-        );
+        assert_eq!(progress_id, start_id, "progress id must match started id");
 
         // Close the turn → agent activity should close with the same id.
-        let done = u.upcast(&AppEvent::DoneSignal { message: None });
+        let done = u.upcast(&AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         let completed_ids: Vec<_> = done
             .iter()
             .filter_map(|e| match e {
@@ -2448,6 +2758,7 @@ mod tests {
     fn wire_model_turn_activity_ids_match_start_to_complete() {
         let mut u = WireEventUpcaster::new();
         let started = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
         });
@@ -2460,7 +2771,10 @@ mod tests {
             .expect("expected ActivityStarted");
         assert_eq!(start_id.0, "turn-7");
 
-        let done = u.upcast(&OutboundEvent::DoneSignal { message: None });
+        let done = u.upcast(&OutboundEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         let complete_id = done
             .iter()
             .find_map(|e| match e {
@@ -2475,12 +2789,15 @@ mod tests {
     fn wire_agent_activity_ids_match_start_progress_complete() {
         let mut u = WireEventUpcaster::new();
         let _ = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
         });
         let started = u.upcast(&OutboundEvent::AgentStarted {
+            session_id: None,
             turn: 3,
             commands_preview: "ls -la".into(),
+            item_id: None,
             source: None,
         });
         let start_id = started
@@ -2493,9 +2810,11 @@ mod tests {
         assert_eq!(start_id.0, "agent-3");
 
         let output = u.upcast(&OutboundEvent::AgentOutput {
+            session_id: None,
             stdout: "file1".into(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         });
         let progress_id = output
             .iter()
@@ -2518,23 +2837,24 @@ mod tests {
     /// upcasters behave consistently on both failure and cancel.
     #[test]
     fn task_complete_failure_propagates_to_agent_and_turn() {
-        for (reason, expected) in &[
-            ("failed", "failed"),
-            ("cancelled", "cancelled"),
-        ] {
+        for (reason, expected) in &[("failed", "failed"), ("cancelled", "cancelled")] {
             let mut u = AppEventUpcaster::new();
             // Open turn + agent, then fail.
             let _ = u.upcast(&AppEvent::TurnStarted {
+                session_id: None,
                 turn: 4,
                 budget_pct: 0.5,
                 remaining: 100,
             });
             let _ = u.upcast(&AppEvent::AgentStarted {
+                session_id: None,
                 turn: 4,
                 commands_preview: "risky".into(),
+                item_id: None,
                 source: None,
             });
             let out = u.upcast(&AppEvent::TaskComplete {
+                session_id: None,
                 reason: (*reason).to_string(),
                 summary: None,
             });
@@ -2573,24 +2893,26 @@ mod tests {
     fn wire_task_complete_failure_propagates_to_agent_and_turn() {
         let mut u = WireEventUpcaster::new();
         let _ = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 4,
             budget_pct: 0.5,
         });
         let _ = u.upcast(&OutboundEvent::AgentStarted {
+            session_id: None,
             turn: 4,
             commands_preview: "risky".into(),
+            item_id: None,
             source: None,
         });
         let out = u.upcast(&OutboundEvent::TaskComplete {
+            session_id: None,
             reason: "failed".to_string(),
             summary: None,
         });
         let completions: Vec<_> = out
             .iter()
             .filter_map(|e| match e {
-                PeerEvent::ActivityCompleted { id, outcome } => {
-                    Some((id.clone(), outcome.clone()))
-                }
+                PeerEvent::ActivityCompleted { id, outcome } => Some((id.clone(), outcome.clone())),
                 _ => None,
             })
             .collect();
@@ -2620,18 +2942,26 @@ mod tests {
 
         // Seed both with TurnStarted turn=5.
         let _ = app.upcast(&AppEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
             remaining: 100,
         });
         let _ = wire.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
         });
 
         // Both see DoneSignal.
-        let app_out = app.upcast(&AppEvent::DoneSignal { message: None });
-        let wire_out = wire.upcast(&OutboundEvent::DoneSignal { message: None });
+        let app_out = app.upcast(&AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
+        let wire_out = wire.upcast(&OutboundEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
 
         let app_completed_ids: Vec<_> = app_out
             .iter()
@@ -2660,6 +2990,7 @@ mod tests {
     fn log_entry_passthrough() {
         let mut u = AppEventUpcaster::new();
         let out = u.upcast(&AppEvent::LogEntry {
+            session_id: None,
             level: "warn".into(),
             source: "presence".into(),
             content: "something funny".into(),
@@ -2703,6 +3034,7 @@ mod tests {
     fn wire_turn_started_emits_activity_started() {
         let mut u = WireEventUpcaster::new();
         let out = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 0.5,
         });
@@ -2725,13 +3057,16 @@ mod tests {
     fn wire_streaming_deltas_share_id_with_final_response() {
         let mut u = WireEventUpcaster::new();
         let _ = u.upcast(&OutboundEvent::TurnStarted {
+            session_id: None,
             turn: 5,
             budget_pct: 0.5,
         });
         let delta = u.upcast(&OutboundEvent::ModelResponseDelta {
+            session_id: None,
             text: "Hel".into(),
         });
         let final_ = u.upcast(&OutboundEvent::ModelResponse {
+            session_id: None,
             turn: 5,
             summary: "Hello".into(),
             reasoning_summary: None,
@@ -2893,6 +3228,7 @@ mod tests {
     #[test]
     fn parity_turn_started() {
         assert_parity(AppEvent::TurnStarted {
+            session_id: None,
             turn: 7,
             budget_pct: 0.5,
             remaining: 100,
@@ -2965,6 +3301,7 @@ mod tests {
     #[test]
     fn parity_round_complete() {
         assert_parity(AppEvent::RoundComplete {
+            session_id: None,
             round: 3,
             turns_in_round: 7,
             native_message_count: None,
@@ -3007,8 +3344,16 @@ mod tests {
     }
 
     #[test]
+    fn parity_autonomy_changed() {
+        assert_parity(AppEvent::AutonomyChanged {
+            autonomy: "High".into(),
+        });
+    }
+
+    #[test]
     fn parity_log_entry() {
         assert_parity(AppEvent::LogEntry {
+            session_id: None,
             level: "warn".into(),
             source: "presence".into(),
             content: "something funny".into(),
@@ -3024,6 +3369,7 @@ mod tests {
     #[test]
     fn parity_steer_requested() {
         assert_parity(AppEvent::SteerRequested {
+            session_id: None,
             text: "look at tests/e2e/ first".into(),
             id: "steer-42".into(),
         });
@@ -3034,6 +3380,7 @@ mod tests {
         // Empty id is a valid "no correlation" sentinel; the log line
         // should simply omit the [id] part on both paths.
         assert_parity(AppEvent::SteerRequested {
+            session_id: None,
             text: "never mind".into(),
             id: String::new(),
         });
@@ -3042,14 +3389,25 @@ mod tests {
     #[test]
     fn parity_steer_queued() {
         assert_parity(AppEvent::SteerQueued {
+            session_id: None,
             id: "steer-7".into(),
             reason: "Claude Code doesn't support mid-turn steering".into(),
         });
     }
 
     #[test]
+    fn parity_steer_accepted() {
+        assert_parity(AppEvent::SteerAccepted {
+            session_id: None,
+            id: "steer-8".into(),
+            reason: "Codex accepted the steer".into(),
+        });
+    }
+
+    #[test]
     fn parity_steer_delivered_mid_turn() {
         assert_parity(AppEvent::SteerDelivered {
+            session_id: None,
             id: "steer-3".into(),
             mid_turn: true,
         });
@@ -3058,6 +3416,7 @@ mod tests {
     #[test]
     fn parity_steer_delivered_followup() {
         assert_parity(AppEvent::SteerDelivered {
+            session_id: None,
             id: "steer-3".into(),
             mid_turn: false,
         });
@@ -3078,6 +3437,7 @@ mod tests {
     #[test]
     fn drift_model_response_usage_is_separated_on_wire() {
         let app_event = AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: "Hello world".into(),
             usage: crate::provider::TokenUsage {
@@ -3096,8 +3456,7 @@ mod tests {
         assert!(matches!(&path_a[0], PeerEvent::Message { .. }));
         assert!(matches!(&path_a[1], PeerEvent::Usage { .. }));
 
-        let outbound =
-            crate::event::app_event_to_outbound(&app_event).expect("ModelResponse maps");
+        let outbound = crate::event::app_event_to_outbound(&app_event).expect("ModelResponse maps");
         let mut wire_upcaster = WireEventUpcaster::new();
         let path_b = wire_upcaster.upcast(&outbound);
         // Path B: just Message — usage arrives in a separate event.
@@ -3119,6 +3478,7 @@ mod tests {
     #[test]
     fn drift_approval_required_category_is_dropped_on_wire() {
         let app_event = AppEvent::ApprovalRequired {
+            session_id: None,
             id: 42,
             command_preview: "rm -rf /tmp/foo".into(),
             category: crate::autonomy::ActionCategory::FileDelete,
@@ -3192,8 +3552,8 @@ mod tests {
         };
         assert!(text_a.contains("analyzing") && text_a.contains("parsed response"));
 
-        let outbound = crate::event::app_event_to_outbound(&app_event)
-            .expect("OrchestratorProgress maps");
+        let outbound =
+            crate::event::app_event_to_outbound(&app_event).expect("OrchestratorProgress maps");
         let mut wire_upcaster = WireEventUpcaster::new();
         let path_b = wire_upcaster.upcast(&outbound);
         let text_b = match &path_b[0] {

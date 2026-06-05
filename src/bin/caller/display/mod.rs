@@ -38,16 +38,20 @@ pub mod clipboard;
 pub mod encode;
 pub mod forward;
 pub mod keymap;
-pub mod tile;
 #[cfg(target_os = "macos")]
 pub mod macos;
 #[cfg(target_os = "macos")]
 pub mod macos_keymap;
+pub mod tile;
 pub mod twcc_tap;
 pub mod visual_marker;
-pub mod webrtc;
 #[cfg(target_os = "linux")]
 pub mod wayland;
+pub mod webrtc;
+#[cfg(windows)]
+pub mod windows;
+#[cfg(windows)]
+pub mod windows_keymap;
 #[cfg(target_os = "linux")]
 pub mod x11;
 
@@ -159,6 +163,14 @@ async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
     Vec::new()
 }
 
+/// Enumerate Windows displays via DXGI output enumeration (the same DXGI
+/// objects the Desktop Duplication capture backend uses). Returns an empty
+/// `Vec` on failure; [`enumerate_displays`] then supplies a fallback entry.
+#[cfg(target_os = "windows")]
+async fn enumerate_displays_platform() -> Vec<DisplayInfo> {
+    windows::enumerate_displays().await
+}
+
 // ---------------------------------------------------------------------------
 // Core types
 // ---------------------------------------------------------------------------
@@ -231,7 +243,12 @@ pub enum InputEvent {
     #[serde(rename = "mu")]
     MouseUp { x: f64, y: f64, b: u8 },
     #[serde(rename = "mm")]
-    MouseMove { x: f64, y: f64, #[serde(default)] buttons: u8 },
+    MouseMove {
+        x: f64,
+        y: f64,
+        #[serde(default)]
+        buttons: u8,
+    },
     #[serde(rename = "sc")]
     Scroll { x: f64, y: f64, dx: f64, dy: f64 },
 }
@@ -353,12 +370,7 @@ impl DisplayMetricsCounters {
         }
     }
 
-    fn record_tile_damage_sample(
-        &self,
-        rect_count: usize,
-        tile_count: usize,
-        dirty_fraction: f32,
-    ) {
+    fn record_tile_damage_sample(&self, rect_count: usize, tile_count: usize, dirty_fraction: f32) {
         self.tile_damage_samples.fetch_add(1, Ordering::Relaxed);
         self.tile_dirty_rects
             .fetch_add(rect_count as u64, Ordering::Relaxed);
@@ -441,13 +453,11 @@ impl DisplayMetricsSnapshot {
         let tile_dirty_fraction_ppm_sum = counters
             .tile_dirty_fraction_ppm_sum
             .swap(0, Ordering::Relaxed);
-        let tile_delta_cadence_skips =
-            counters.tile_delta_cadence_skips.swap(0, Ordering::Relaxed);
+        let tile_delta_cadence_skips = counters.tile_delta_cadence_skips.swap(0, Ordering::Relaxed);
         let tile_delta_records = counters.tile_delta_records.swap(0, Ordering::Relaxed);
         let tile_delta_frames = counters.tile_delta_frames.swap(0, Ordering::Relaxed);
         let tile_delta_bytes = counters.tile_delta_bytes.swap(0, Ordering::Relaxed);
-        let tile_snapshot_records =
-            counters.tile_snapshot_records.swap(0, Ordering::Relaxed);
+        let tile_snapshot_records = counters.tile_snapshot_records.swap(0, Ordering::Relaxed);
         let tile_snapshot_frames = counters.tile_snapshot_frames.swap(0, Ordering::Relaxed);
         let tile_snapshot_bytes = counters.tile_snapshot_bytes.swap(0, Ordering::Relaxed);
 
@@ -498,10 +508,7 @@ impl DisplayMetricsSnapshot {
 pub trait DisplayBackend: Send + Sync + 'static {
     /// Begin capturing frames at the target framerate.
     /// Returns a receiver for raw frames (bounded channel, backend drops on full).
-    async fn start_capture(
-        &self,
-        fps: u32,
-    ) -> Result<mpsc::Receiver<Frame>, CallerError>;
+    async fn start_capture(&self, fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError>;
 
     /// Stop capturing. Blocks until the capture thread/task has exited.
     async fn stop_capture(&self);
@@ -651,13 +658,37 @@ pub struct DisplaySession {
 /// time, so heartbeat re-sends of a static desktop still carry a fresh marker
 /// timestamp and downscaled layers get a marker in their final output
 /// resolution.
-fn convert_for_pool_feed(
-    bgra: &[u8],
-    width: u32,
-    height: u32,
-    stride: u32,
-) -> Vec<u8> {
-    encode::bgra_to_i420(bgra, width, height, stride)
+fn convert_for_pool_feed(bgra: &[u8], width: u32, height: u32, stride: u32) -> Vec<u8> {
+    let i420 = encode::bgra_to_i420(bgra, width, height, stride);
+
+    // Windows black-frame diagnostic (hop A of the capture → encoder chain):
+    // log the average byte of the BGRA going INTO bgra_to_i420 and the I420
+    // coming OUT, for the first few converted frames. The capture thread logs
+    // the same BGRA buffer as `avg_byte` (~189 on a live desktop); if the
+    // value here differs, the buffer changed between capture and the bridge.
+    // If BGRA-in is bright but I420-out is ~0, the conversion (or its
+    // dimensions/stride) is the offending hop.
+    #[cfg(target_os = "windows")]
+    {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static BRIDGE_FRAME_COUNT: AtomicU64 = AtomicU64::new(0);
+        let n = BRIDGE_FRAME_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 5 {
+            eprintln!(
+                "[display/pool-feed] frame #{} convert {}x{} stride={} \
+                 bgra avg={} -> i420 avg={} (i420 len={})",
+                n + 1,
+                width,
+                height,
+                stride,
+                encode::sampled_avg_byte(bgra),
+                encode::sampled_avg_byte(&i420),
+                i420.len(),
+            );
+        }
+    }
+
+    i420
 }
 
 const TILE_STREAM_TILE_SIZE_PX: u16 = 64;
@@ -831,9 +862,7 @@ fn make_damage_backend(
                 }
             }
         } else {
-            eprintln!(
-                "[display/tile] backend={backend_kind} uses frame-diff tile damage fallback"
-            );
+            eprintln!("[display/tile] backend={backend_kind} uses frame-diff tile damage fallback");
         }
     }
 
@@ -1060,11 +1089,20 @@ impl DisplaySession {
         // failure is the leak class to avoid (X11's capture thread, in
         // particular, ignores send-on-dropped-rx and only exits on
         // explicit `stop_capture`).
-        if encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty() {
+        // On Windows the always-on baseline is a single H.264 layer (VP8 is
+        // gated off — see `encode::pool::BASELINE_CODEC`), so the guard checks
+        // that the single full-resolution layer clears MIN_LAYER_DIM rather
+        // than the VP8 simulcast set.
+        #[cfg(not(target_os = "windows"))]
+        let baseline_empty = encode::pool::LayerSpec::vp8_simulcast(width, height, fps).is_empty();
+        #[cfg(target_os = "windows")]
+        let baseline_empty =
+            width < encode::pool::MIN_LAYER_DIM || height < encode::pool::MIN_LAYER_DIM;
+        if baseline_empty {
             self.backend.stop_capture().await;
             return Err(CallerError::Display(format!(
-                "source too small for VP8 simulcast: {raw_width}x{raw_height} \
-                 (normalized to {width}x{height}, each candidate layer falls \
+                "source too small for the always-on encoder baseline: \
+                 {raw_width}x{raw_height} (normalized to {width}x{height}, \
                  below MIN_LAYER_DIM={})",
                 encode::pool::MIN_LAYER_DIM,
             )));
@@ -1139,31 +1177,44 @@ impl DisplaySession {
         //
         // `get_or_init` swallows concurrent initializations cheaply;
         // in practice `start()` is called at most once per session.
+        // Always-on layer factory. The factory receives the (possibly
+        // resized) source dims and re-derives the layout from them — so a
+        // runtime resize regenerates the layer set at the new dims rather
+        // than rescaling (and accumulating rounding drift on) the previous
+        // epoch's handles. This is the contract from 4a-fix-#3: every
+        // construction site (initial spawn AND on_resize) goes through the
+        // factory's `normalize_layer_dims` filter.
+        //
+        // macOS/Linux: VP8 simulcast (up to full / half / quarter). The
+        // multi-RID end-to-end machinery (answer SDP carrying
+        // `a=simulcast:send f;h;q` + per-rid lines, multi-forwarder intake,
+        // TWCC-driven per-layer pick) lights up only when a peer offers the
+        // matching `a=simulcast:recv f;h;q` hint; the default DisplaySlot and
+        // federated paths leave it dormant.
+        //
+        // Windows: a single full-resolution H.264 layer (`BASELINE_CODEC` is
+        // H.264 there because VP8/libvpx is gated off). H.264 isn't
+        // simulcast in this pool — matching the existing `LayerSpec::single`
+        // rationale — so the always-on bank is one layer the Media
+        // Foundation encoder serves.
+        #[cfg(not(target_os = "windows"))]
+        let layer_factory = move |w: u32, h: u32| encode::pool::LayerSpec::vp8_simulcast(w, h, fps);
+        #[cfg(target_os = "windows")]
+        let layer_factory = move |w: u32, h: u32| {
+            vec![encode::pool::LayerSpec::single(
+                encode::pool::CodecKind::H264,
+                w,
+                h,
+                fps,
+            )]
+        };
+
         let pool_arc = Arc::clone(self.pool.get_or_init(|| {
             Arc::new(encode::pool::EncoderPool::new(
                 width,
                 height,
                 fps,
-                // VP8 layer factory (up to full / half / quarter). The
-                // factory receives the (possibly resized) source dims
-                // and re-derives the layout from them — so a runtime
-                // resize regenerates the layer set at the new dims
-                // rather than rescaling (and accumulating rounding
-                // drift on) the previous epoch's handles. This is the
-                // contract from 4a-fix-#3: every construction site
-                // (initial spawn AND on_resize) goes through
-                // `vp8_simulcast`'s `normalize_layer_dims` filter, so
-                // resize-down dropping the quarter layer and resize-up
-                // restoring it both work cleanly.
-                //
-                // The multi-RID end-to-end machinery (answer SDP
-                // carrying `a=simulcast:send f;h;q` + per-rid lines,
-                // multi-forwarder intake feeding each rid's frames to
-                // a per-rid SSRC packetizer, TWCC-driven per-layer
-                // pick) lights up only when a peer offers the matching
-                // `a=simulcast:recv f;h;q` hint. The default DisplaySlot
-                // and federated paths leave it dormant.
-                move |w, h| encode::pool::LayerSpec::vp8_simulcast(w, h, fps),
+                layer_factory,
                 // Pool encoders feed the same metrics counters as the
                 // capture bridge so DisplayMetricsSnapshot continues to
                 // reflect total throughput. Pool is the sole producer
@@ -1218,16 +1269,15 @@ impl DisplaySession {
         // thresholds all live inside the coordinator and are
         // configured via `CapacityPolicyConfig::default()`.
         let pool_for_rids = Arc::clone(&pool_arc);
-        let get_current_rids: Box<
-            dyn Fn() -> Vec<encode::pool::SimulcastRid> + Send + Sync,
-        > = Box::new(move || {
-            pool_for_rids
-                .always_on_ids()
-                .into_iter()
-                .filter(|id| id.codec == encode::pool::CodecKind::Vp8)
-                .map(|id| id.rid)
-                .collect()
-        });
+        let get_current_rids: Box<dyn Fn() -> Vec<encode::pool::SimulcastRid> + Send + Sync> =
+            Box::new(move || {
+                pool_for_rids
+                    .always_on_ids()
+                    .into_iter()
+                    .filter(|id| id.codec == encode::pool::CodecKind::Vp8)
+                    .map(|id| id.rid)
+                    .collect()
+            });
         let pool_for_query = Arc::clone(&pool_arc);
         let is_layer_paused: Box<
             dyn Fn(&encode::pool::SimulcastRid) -> Option<bool> + Send + Sync,
@@ -1235,32 +1285,31 @@ impl DisplaySession {
             pool_for_query.is_layer_paused(encode::pool::CodecKind::Vp8, rid.clone())
         });
         let pool_for_action = Arc::clone(&pool_arc);
-        let on_action: Box<
-            dyn Fn(aggregator::CapacityAction) + Send + Sync,
-        > = Box::new(move |action| {
-            // Operational observability: one line per layer-policy
-            // action. Volume is bounded by the cascade (max 4
-            // events per drop+recover cycle: pause top, pause mid,
-            // resume mid, resume top) plus presence transitions.
-            // Format mirrors the action variant for grep-ability:
-            // `[layer-policy] PauseLayer(<rid>)` / `ResumeLayer(<rid>)`.
-            match &action {
-                aggregator::CapacityAction::PauseLayer(rid) => {
-                    eprintln!("[layer-policy] PauseLayer({rid:?})");
+        let on_action: Box<dyn Fn(aggregator::CapacityAction) + Send + Sync> =
+            Box::new(move |action| {
+                // Operational observability: one line per layer-policy
+                // action. Volume is bounded by the cascade (max 4
+                // events per drop+recover cycle: pause top, pause mid,
+                // resume mid, resume top) plus presence transitions.
+                // Format mirrors the action variant for grep-ability:
+                // `[layer-policy] PauseLayer(<rid>)` / `ResumeLayer(<rid>)`.
+                match &action {
+                    aggregator::CapacityAction::PauseLayer(rid) => {
+                        eprintln!("[layer-policy] PauseLayer({rid:?})");
+                    }
+                    aggregator::CapacityAction::ResumeLayer(rid) => {
+                        eprintln!("[layer-policy] ResumeLayer({rid:?})");
+                    }
                 }
-                aggregator::CapacityAction::ResumeLayer(rid) => {
-                    eprintln!("[layer-policy] ResumeLayer({rid:?})");
+                match action {
+                    aggregator::CapacityAction::PauseLayer(rid) => {
+                        pool_for_action.pause_layer(encode::pool::CodecKind::Vp8, rid);
+                    }
+                    aggregator::CapacityAction::ResumeLayer(rid) => {
+                        pool_for_action.resume_layer(encode::pool::CodecKind::Vp8, rid);
+                    }
                 }
-            }
-            match action {
-                aggregator::CapacityAction::PauseLayer(rid) => {
-                    pool_for_action.pause_layer(encode::pool::CodecKind::Vp8, rid);
-                }
-                aggregator::CapacityAction::ResumeLayer(rid) => {
-                    pool_for_action.resume_layer(encode::pool::CodecKind::Vp8, rid);
-                }
-            }
-        });
+            });
         let layer_policy_task = aggregator::spawn_layer_policy_coordinator(
             Arc::clone(&self.peers),
             get_current_rids,
@@ -1377,8 +1426,7 @@ impl DisplaySession {
         let session = Arc::clone(self);
         let shutdown = self.shutdown.clone();
         tokio::spawn(async move {
-            let mut interval =
-                tokio::time::interval(std::time::Duration::from_secs(30));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             // Skip the immediate first tick.
             interval.tick().await;
             loop {
@@ -1562,12 +1610,7 @@ impl DisplaySession {
                     } => {
                         let decision = {
                             let mut replay = tile_replay.write().await;
-                            replay.replay_gap(
-                                epoch,
-                                last_seen_seq,
-                                expected_seq,
-                                Instant::now(),
-                            )
+                            replay.replay_gap(epoch, last_seen_seq, expected_seq, Instant::now())
                         };
                         match decision {
                             tile::recovery::ReplayDecision::Frames(frames) => {
@@ -1576,12 +1619,8 @@ impl DisplaySession {
                                     return;
                                 };
                                 for frame in frames {
-                                    if let Err(e) =
-                                        peer.send_tile_delta_frame(frame.bytes).await
-                                    {
-                                        eprintln!(
-                                            "[display/tile] gap replay send failed: {e}"
-                                        );
+                                    if let Err(e) = peer.send_tile_delta_frame(frame.bytes).await {
+                                        eprintln!("[display/tile] gap replay send failed: {e}");
                                     }
                                 }
                             }
@@ -1640,7 +1679,7 @@ impl DisplaySession {
                         // Swap B <-> R while copying
                         tight.push(frame.data[px + 2]); // R
                         tight.push(frame.data[px + 1]); // G
-                        tight.push(frame.data[px]);      // B
+                        tight.push(frame.data[px]); // B
                         tight.push(frame.data[px + 3]); // A
                     }
                 }
@@ -1658,7 +1697,6 @@ impl DisplaySession {
 
         Ok(png_buf.into_inner())
     }
-
 
     /// Handle a WebRTC SDP offer from a browser peer.
     ///
@@ -1767,13 +1805,21 @@ impl DisplaySession {
         // encoder can produce, so an incompatible H.264 variant is
         // excluded here rather than producing a black stream after the
         // driver drops mismatched frames downstream.
-        let prefs = forward::codec_preferences_from_offer(sdp);
+        let mut prefs = forward::codec_preferences_from_offer(sdp);
         if prefs.is_empty() {
             return Err(CallerError::WebRtc(format!(
                 "pool-mode: peer offer has no compatible codecs (offered: {:?})",
                 encode::parse_offered_codecs(sdp),
             )));
         }
+        // Mark federated viewers (offer without `a=simulcast:recv`, the
+        // `PeerDisplayConnection`-over-TURN signature) so the pool spawns
+        // the loss-resilient quarter-resolution / capped-bitrate on-demand
+        // H.264 layer instead of the full-resolution one. Local
+        // `DisplaySlot` offers inject `a=simulcast:recv f;h;q` and stay
+        // non-federated. The same discriminator drives the single-RID vs
+        // multi-RID answer path in `WebRtcPeer::new`.
+        prefs.federated = self::webrtc::offer_is_federated(sdp);
 
         let (subs, lease) = pool.subscribe(&prefs).map_err(|e| {
             CallerError::WebRtc(format!(
@@ -1782,10 +1828,8 @@ impl DisplaySession {
             ))
         })?;
 
-        let input_handler = gated_input_handler(
-            Arc::clone(&self.backend),
-            input_authorized.clone(),
-        );
+        let input_handler =
+            gated_input_handler(Arc::clone(&self.backend), input_authorized.clone());
 
         let clipboard_monitor = Arc::clone(&self.clipboard_monitor);
         let clipboard_handler: Arc<dyn Fn(clipboard::ClipboardContent) + Send + Sync> =
@@ -2292,9 +2336,8 @@ impl DisplaySession {
         // existing Y-plane construction cost from `bgra_to_i420`.
         let marker_flag = Arc::clone(&self.diagnostics_visual_marker);
         let session_epoch = self.session_epoch;
-        let frame_interval = std::time::Duration::from_millis(
-            if fps > 0 { 1000 / fps as u64 } else { 33 },
-        );
+        let frame_interval =
+            std::time::Duration::from_millis(if fps > 0 { 1000 / fps as u64 } else { 33 });
         // Snapshot the most recent BGRA the capture has already
         // produced so the bridge can seed its `latest_i420` cache
         // before entering the select loop. Without this, a pool
@@ -2325,14 +2368,12 @@ impl DisplaySession {
             // Smaller would re-encode more often; larger would let
             // GOP boundaries drift past a peer-join window on
             // truly static desktops.
-            const IDLE_HEARTBEAT: std::time::Duration =
-                std::time::Duration::from_secs(1);
+            const IDLE_HEARTBEAT: std::time::Duration = std::time::Duration::from_secs(1);
             // Peer-join burst window. Sized to comfortably exceed
             // one Linux ffmpeg H.264 GOP at 30fps (`-g 30` → ~1s) so
             // the natural keyframe lands inside the window even
             // though `force_keyframe` is ignored on the rawvideo pipe.
-            const PEER_JOIN_BURST: std::time::Duration =
-                std::time::Duration::from_millis(1500);
+            const PEER_JOIN_BURST: std::time::Duration = std::time::Duration::from_millis(1500);
 
             let mut enc_w = initial_w & !1;
             let mut enc_h = initial_h & !1;
@@ -2394,7 +2435,10 @@ impl DisplaySession {
                         eprintln!(
                             "[display/pool-feed] display {} seed \
                              resolution {:?} -> {}x{}",
-                            display_id, pool.dimensions(), frame_w, frame_h,
+                            display_id,
+                            pool.dimensions(),
+                            frame_w,
+                            frame_h,
                         );
                         pool.on_resize(frame_w, frame_h);
                         if let Some(ref bus) = event_bus {
@@ -2420,12 +2464,14 @@ impl DisplaySession {
                     // Cropping the rightmost column / bottom row at
                     // this stage is invisible at display.
                     let i420_result = tokio::task::spawn_blocking({
-                        move || convert_for_pool_feed(
-                            &frame_arc.data,
-                            frame_w,
-                            frame_h,
-                            frame_arc.stride,
-                        )
+                        move || {
+                            convert_for_pool_feed(
+                                &frame_arc.data,
+                                frame_w,
+                                frame_h,
+                                frame_arc.stride,
+                            )
+                        }
                     })
                     .await;
                     if let Ok(i420) = i420_result {
@@ -2436,9 +2482,7 @@ impl DisplaySession {
             }
 
             let mut tick = tokio::time::interval(frame_interval);
-            tick.set_missed_tick_behavior(
-                tokio::time::MissedTickBehavior::Skip,
-            );
+            tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
             loop {
                 tokio::select! {
@@ -2653,10 +2697,7 @@ impl DisplaySession {
     /// `Arc` clone is cheap; callers should not hold the returned
     /// handle across awaits in latency-sensitive paths because it
     /// keeps the peer alive past `remove_peer`.
-    pub async fn get_peer(
-        &self,
-        peer_id: PeerId,
-    ) -> Option<Arc<self::webrtc::WebRtcPeer>> {
+    pub async fn get_peer(&self, peer_id: PeerId) -> Option<Arc<self::webrtc::WebRtcPeer>> {
         self.peers.read().await.get(&peer_id).cloned()
     }
 
@@ -2669,12 +2710,10 @@ impl DisplaySession {
     pub fn resolution(&self) -> (u32, u32) {
         self.backend.resolution()
     }
-
 }
 
 // ---------------------------------------------------------------------------
 // Encoder thread helper
-
 
 // ---------------------------------------------------------------------------
 // SessionRegistry
@@ -2804,7 +2843,14 @@ mod tests {
         let json = r#"{"t":"kd","code":"KeyA","key":"a","shift":false,"ctrl":false,"alt":false,"meta":false}"#;
         let evt: InputEvent = serde_json::from_str(json).unwrap();
         match evt {
-            InputEvent::KeyDown { code, key, shift, ctrl, alt, meta } => {
+            InputEvent::KeyDown {
+                code,
+                key,
+                shift,
+                ctrl,
+                alt,
+                meta,
+            } => {
                 assert_eq!(code, "KeyA");
                 assert_eq!(key, "a");
                 assert!(!shift);
@@ -2951,7 +2997,10 @@ mod tests {
         let json = r#"{"ice_servers":[{"urls":["stun:stun.l.google.com:19302"],"username":null,"credential":null}]}"#;
         let config: IceConfig = serde_json::from_str(json).unwrap();
         assert_eq!(config.ice_servers.len(), 1);
-        assert_eq!(config.ice_servers[0].urls[0], "stun:stun.l.google.com:19302");
+        assert_eq!(
+            config.ice_servers[0].urls[0],
+            "stun:stun.l.google.com:19302"
+        );
         assert!(config.ice_servers[0].username.is_none());
     }
 
@@ -3104,10 +3153,7 @@ mod tests {
 
     #[async_trait]
     impl DisplayBackend for StubBackend {
-        async fn start_capture(
-            &self,
-            _fps: u32,
-        ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+        async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
         }
@@ -3150,12 +3196,7 @@ mod tests {
         let mut tile0 = vec![0u8; tile_size * tile_size * 4];
         let value = 1u32 << 0;
         let tile0_id = tile::grid::TileId::new(0, 0);
-        stamp_visual_marker_bgra_tile(
-            &mut tile0,
-            tile0_id,
-            TILE_STREAM_TILE_SIZE_PX,
-            value,
-        );
+        stamp_visual_marker_bgra_tile(&mut tile0, tile0_id, TILE_STREAM_TILE_SIZE_PX, value);
         let (bit0_x, bit0_y) = bit_center(tile0_id, 0).expect("bit 0 in tile 0");
         assert_eq!(
             sample(&tile0, bit0_x, bit0_y),
@@ -3303,10 +3344,7 @@ mod tests {
 
     #[async_trait]
     impl DisplayBackend for CleanupTrackingBackend {
-        async fn start_capture(
-            &self,
-            _fps: u32,
-        ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+        async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
         }
@@ -3341,6 +3379,10 @@ mod tests {
     ///
     /// Insert the peer BEFORE `session.start()` so the layer-policy's
     /// first tick (immediate after spawn) sees the peer.
+    ///
+    /// Only used by the VP8-simulcast bridge tests, which are gated off
+    /// Windows; gate the helper too so it isn't dead code there.
+    #[cfg(not(target_os = "windows"))]
     async fn register_test_peer_demanding_all_layers(session: &DisplaySession) {
         use crate::display::encode::pool::SimulcastRid;
         use crate::display::webrtc::WebRtcPeer;
@@ -3360,7 +3402,10 @@ mod tests {
     /// session is hot (bridge running, pool ready) or still cold.
     #[test]
     fn display_session_pool_uninitialized_before_start() {
-        let backend = Arc::new(StubBackend { width: 640, height: 480 });
+        let backend = Arc::new(StubBackend {
+            width: 640,
+            height: 480,
+        });
         let session = DisplaySession::new(0, backend);
         assert!(
             session.pool.get().is_none(),
@@ -3387,11 +3432,23 @@ mod tests {
     /// this test confirms construction lifetime only — not frame flow.
     /// (See `pool_always_on_layers_all_subscribe_to_i420_after_start`
     /// for the end-to-end frame-flow test.)
+    ///
+    /// VP8-specific (gated off Windows): the layer set, codec identity,
+    /// and three-layer ordering are the VP8-simulcast baseline. On
+    /// Windows the baseline is a single H.264 layer — see
+    /// `display_session_start_initializes_pool_with_single_h264_layer`.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn display_session_start_initializes_pool_with_vp8_simulcast() {
-        let backend = Arc::new(StubBackend { width: 640, height: 480 });
+        let backend = Arc::new(StubBackend {
+            width: 640,
+            height: 480,
+        });
         let session = DisplaySession::new(0, backend);
-        session.start(30, None, None).await.expect("start() must succeed");
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
         let pool = session
             .pool
             .get()
@@ -3415,19 +3472,75 @@ mod tests {
             encode::pool::SimulcastRid::full(),
             "layer 0 is the full-resolution RID"
         );
-        assert_eq!((always_on[0].layer.width, always_on[0].layer.height), (640, 480));
+        assert_eq!(
+            (always_on[0].layer.width, always_on[0].layer.height),
+            (640, 480)
+        );
         assert_eq!(
             always_on[1].id.rid,
             encode::pool::SimulcastRid::half(),
             "layer 1 is the half-resolution RID"
         );
-        assert_eq!((always_on[1].layer.width, always_on[1].layer.height), (320, 240));
+        assert_eq!(
+            (always_on[1].layer.width, always_on[1].layer.height),
+            (320, 240)
+        );
         assert_eq!(
             always_on[2].id.rid,
             encode::pool::SimulcastRid::quarter(),
             "layer 2 is the quarter-resolution RID"
         );
-        assert_eq!((always_on[2].layer.width, always_on[2].layer.height), (160, 120));
+        assert_eq!(
+            (always_on[2].layer.width, always_on[2].layer.height),
+            (160, 120)
+        );
+    }
+
+    /// Windows counterpart to
+    /// `display_session_start_initializes_pool_with_vp8_simulcast`. On
+    /// Windows the always-on baseline is a **single full-resolution
+    /// H.264 layer** (VP8/libvpx is gated off — see
+    /// `encode::pool::BASELINE_CODEC`), not VP8 simulcast. A 640×480
+    /// source (well above MIN_LAYER_DIM, comfortably within the MS H.264
+    /// software MFT's accepted range) yields exactly one always-on
+    /// encoder at the full RID and full source dims.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn display_session_start_initializes_pool_with_single_h264_layer() {
+        let backend = Arc::new(StubBackend {
+            width: 640,
+            height: 480,
+        });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
+        let pool = session
+            .pool
+            .get()
+            .expect("pool must be initialized after start()");
+        let always_on = pool.always_on();
+        assert_eq!(
+            always_on.len(),
+            1,
+            "Windows baseline spawns a single H.264 always-on layer for a 640×480 source"
+        );
+        assert_eq!(
+            always_on[0].id.codec,
+            encode::pool::CodecKind::H264,
+            "the Windows always-on baseline codec is H.264"
+        );
+        assert_eq!(
+            always_on[0].id.rid,
+            encode::pool::SimulcastRid::full(),
+            "the single H.264 layer uses the full-resolution RID"
+        );
+        assert_eq!(
+            (always_on[0].layer.width, always_on[0].layer.height),
+            (640, 480),
+            "the single layer covers the full source resolution"
+        );
     }
 
     /// **Phase 4b** (post-review fix): `start()` must reject source
@@ -3517,12 +3630,25 @@ mod tests {
     /// (16×480 after normalization) and exactly one surviving
     /// always-on simulcast layer (the full layer at 16×480, since
     /// half/quarter at 8/4 width drop below MIN_LAYER_DIM).
+    ///
+    /// VP8-specific (gated off Windows): the "only the full layer
+    /// survives" outcome is a property of `vp8_simulcast`'s per-layer
+    /// MIN_LAYER_DIM filter, which the Windows single-H.264-layer
+    /// factory doesn't have. The 16-px-wide H.264 case would also stress
+    /// the MS MFT's minimum frame size, which is orthogonal to the
+    /// odd-dim-normalization behavior under test. The source-dim
+    /// even-normalization itself is platform-agnostic and already
+    /// exercised by the pool-level dimension tests.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn display_session_start_normalizes_odd_source_dims_in_pool() {
         // 17×480 — width is odd, so `& !1` rounds to 16. Half would
         // be 8×240 (width below MIN_LAYER_DIM → drop). Quarter would
         // be 4×120 (drop). So only the full layer at 16×480 survives.
-        let backend = Arc::new(StubBackend { width: 17, height: 480 });
+        let backend = Arc::new(StubBackend {
+            width: 17,
+            height: 480,
+        });
         let session = DisplaySession::new(0, backend);
         session
             .start(30, None, None)
@@ -3561,11 +3687,24 @@ mod tests {
     /// and any one of them being unsubscribed is a silent-black-screen
     /// regression for the peers that pick that RID. Tightening the
     /// assertion to require exactly the always-on count.
+    ///
+    /// VP8-specific (gated off Windows): only the hardcoded
+    /// three-layer precondition is VP8-simulcast. The underlying
+    /// invariant — `push_i420_frame` reaches *every* always-on encoder
+    /// — is platform-agnostic and asserted on Windows by
+    /// `pool_single_h264_layer_subscribes_to_i420_after_start`.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_always_on_layers_all_subscribe_to_i420_after_start() {
-        let backend = Arc::new(StubBackend { width: 640, height: 480 });
+        let backend = Arc::new(StubBackend {
+            width: 640,
+            height: 480,
+        });
         let session = DisplaySession::new(0, backend);
-        session.start(30, None, None).await.expect("start() must succeed");
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
         let pool = session.pool.get().expect("pool initialized after start()");
         let expected_count = pool.always_on().len();
         assert_eq!(
@@ -3591,6 +3730,42 @@ mod tests {
         );
     }
 
+    /// Windows counterpart to
+    /// `pool_always_on_layers_all_subscribe_to_i420_after_start`. The
+    /// single H.264 always-on layer must be subscribed to the pool's
+    /// I420 broadcast the moment `start()` returns, so the bridge's
+    /// first `push_i420_frame` reaches it. Same "every always-on encoder
+    /// is wired" invariant, single-layer shape: exactly one subscriber.
+    #[cfg(target_os = "windows")]
+    #[tokio::test]
+    async fn pool_single_h264_layer_subscribes_to_i420_after_start() {
+        let backend = Arc::new(StubBackend {
+            width: 640,
+            height: 480,
+        });
+        let session = DisplaySession::new(0, backend);
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
+        let pool = session.pool.get().expect("pool initialized after start()");
+        let expected_count = pool.always_on().len();
+        assert_eq!(
+            expected_count, 1,
+            "precondition: 640×480 source spawns one H.264 always-on layer on Windows"
+        );
+
+        let i420 = Arc::new(vec![0u8; 640 * 480 * 3 / 2]);
+        let subscriber_count = pool.push_i420_frame(i420, Instant::now());
+        assert_eq!(
+            subscriber_count, expected_count,
+            "pool.push_i420_frame must deliver to the single always-on \
+             H.264 encoder ({expected_count} subscriber expected); got \
+             {subscriber_count}. If 0, the always-on layer is not wired \
+             to the i420 broadcast — silent-black-screen regression."
+        );
+    }
+
     /// **Phase 4b**: real-dim resize through 1366×768 must regenerate
     /// the simulcast layer set via the pool's stored factory, NOT by
     /// rescaling the previous epoch's handles. The pool-level
@@ -3607,20 +3782,36 @@ mod tests {
     /// stored-then-rescaled the previous layout would land here as
     /// "half/quarter dims drift by one pixel after a series of
     /// odd-dim resizes."
+    ///
+    /// VP8-specific (gated off Windows): the half/quarter drift this
+    /// pins only exists for VP8 simulcast. The Windows factory produces
+    /// a single full-res H.264 layer with no derived dims to drift, and
+    /// the factory-regenerates-on-resize contract itself is already
+    /// covered platform-agnostically by the `pool::tests` `on_resize`
+    /// suite.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_resize_through_1366x768_yields_canonical_layout_at_every_step() {
-        let backend = Arc::new(StubBackend { width: 1280, height: 720 });
+        let backend = Arc::new(StubBackend {
+            width: 1280,
+            height: 720,
+        });
         let session = DisplaySession::new(0, backend);
-        session.start(30, None, None).await.expect("start() must succeed");
+        session
+            .start(30, None, None)
+            .await
+            .expect("start() must succeed");
         let pool = session.pool.get().expect("pool initialized after start()");
 
         // Step 1: starting dims 1280×720 — even on every divisor,
         // canonical layout is the trivial case.
         let layers = pool.always_on();
         assert_eq!(
-            [(layers[0].layer.width, layers[0].layer.height),
-             (layers[1].layer.width, layers[1].layer.height),
-             (layers[2].layer.width, layers[2].layer.height)],
+            [
+                (layers[0].layer.width, layers[0].layer.height),
+                (layers[1].layer.width, layers[1].layer.height),
+                (layers[2].layer.width, layers[2].layer.height)
+            ],
             [(1280, 720), (640, 360), (320, 180)],
             "1280×720 source produces canonical even-dim simulcast"
         );
@@ -3633,9 +3824,11 @@ mod tests {
         pool.on_resize(1366, 768);
         let layers = pool.always_on();
         assert_eq!(
-            [(layers[0].layer.width, layers[0].layer.height),
-             (layers[1].layer.width, layers[1].layer.height),
-             (layers[2].layer.width, layers[2].layer.height)],
+            [
+                (layers[0].layer.width, layers[0].layer.height),
+                (layers[1].layer.width, layers[1].layer.height),
+                (layers[2].layer.width, layers[2].layer.height)
+            ],
             [(1366, 768), (682, 384), (340, 192)],
             "1366×768 resize must re-derive layout from canonical inputs \
              (half=682×384 NOT drift-derived 682-or-some-other-value)"
@@ -3650,9 +3843,11 @@ mod tests {
         pool.on_resize(1280, 720);
         let layers = pool.always_on();
         assert_eq!(
-            [(layers[0].layer.width, layers[0].layer.height),
-             (layers[1].layer.width, layers[1].layer.height),
-             (layers[2].layer.width, layers[2].layer.height)],
+            [
+                (layers[0].layer.width, layers[0].layer.height),
+                (layers[1].layer.width, layers[1].layer.height),
+                (layers[2].layer.width, layers[2].layer.height)
+            ],
             [(1280, 720), (640, 360), (320, 180)],
             "resize back to 1280×720 must restore canonical layout, not \
              accumulate drift from the intermediate 1366×768 epoch"
@@ -3669,7 +3864,6 @@ mod tests {
     // Phase 3c.3b.3a: pool-feed bridge — does NOT lock legacy codec
     // -----------------------------------------------------------------------
 
-
     /// 3c.4d: `start()` spawns the pool-feed bridge eagerly, before
     /// any offer is served. Pre-3c.4d the bridge was lazy and only
     /// appeared after the first `handle_offer_pool_mode` call —
@@ -3682,7 +3876,10 @@ mod tests {
     /// not fail any other test.
     #[tokio::test]
     async fn pool_feed_bridge_spawned_eagerly_in_start() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(0, backend);
         session
             .start(30, None, None)
@@ -3692,22 +3889,14 @@ mod tests {
         // Bridge handle must be Some — start() owns the spawn; no
         // offer has been served.
         assert!(
-            session
-                .pool_feed_bridge_handle
-                .lock()
-                .await
-                .is_some(),
+            session.pool_feed_bridge_handle.lock().await.is_some(),
             "start() must spawn pool-feed bridge eagerly (3c.4d)"
         );
 
         // Keyframe channel must be installed — peer-join burst
         // signaling depends on it.
         assert!(
-            session
-                .pool_feed_keyframe_tx
-                .lock()
-                .await
-                .is_some(),
+            session.pool_feed_keyframe_tx.lock().await.is_some(),
             "start() must install pool_feed_keyframe_tx so the \
              peer-join burst signal at the tail of \
              handle_offer_pool_mode reaches the bridge (3c.4d)"
@@ -3715,7 +3904,6 @@ mod tests {
 
         session.shutdown.cancel();
     }
-
 
     /// Build a synthetic BGRA frame for tests. Contents are
     /// uninteresting (all zeros) — we only care that the bridge
@@ -3739,7 +3927,10 @@ mod tests {
     /// legacy bridge was running.
     #[tokio::test]
     async fn pool_feed_bridge_emits_display_resize_on_dimension_change() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(7, backend);
         let bus = crate::event::EventBus::new();
         let mut bus_rx = bus.subscribe();
@@ -3751,38 +3942,31 @@ mod tests {
         // Push the FIRST frame at the initial size; this seeds the
         // bridge's enc_w/enc_h tracking but does NOT cross the
         // resize threshold (initial==initial).
-        let _ = session
-            .frame_tx
-            .send(Arc::new(make_test_bgra(64, 64)));
+        let _ = session.frame_tx.send(Arc::new(make_test_bgra(64, 64)));
 
         // Push a frame at a NEW size. This must trigger both
         // `pool.on_resize` (covered by the existing pool tests) AND
         // the AppEvent::DisplayResize emission (the regression
         // surface this test pins).
-        let _ = session
-            .frame_tx
-            .send(Arc::new(make_test_bgra(128, 96)));
+        let _ = session.frame_tx.send(Arc::new(make_test_bgra(128, 96)));
 
         // Drain events looking for our DisplayResize. Other events
         // (capture-side, etc.) might land first; bounded loop with
         // a generous timeout to give the spawn_blocking BGRA→I420
         // conversion + tick time to fire.
-        let saw_resize = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
-                loop {
-                    match bus_rx.recv().await {
-                        Ok(crate::event::AppEvent::DisplayResize {
-                            display_id: 7,
-                            width: 128,
-                            height: 96,
-                        }) => return true,
-                        Ok(_) => continue,
-                        Err(_) => return false,
-                    }
+        let saw_resize = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(crate::event::AppEvent::DisplayResize {
+                        display_id: 7,
+                        width: 128,
+                        height: 96,
+                    }) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
                 }
-            },
-        )
+            }
+        })
         .await
         .unwrap_or(false);
 
@@ -3811,9 +3995,20 @@ mod tests {
     /// frames arrive at a pool subscriber. Without heartbeat we'd
     /// see ≤1 (the initial encode); with heartbeat we see ≥2 (initial
     /// + at least one heartbeat re-push).
+    ///
+    /// VP8-specific (gated off Windows): subscribes to the pool with a
+    /// VP8 preference and counts VP8-encoded frames at 64×64. Windows
+    /// has no VP8 backend (the subscribe would fail), and the MS H.264
+    /// MFT's minimum frame size makes a 64×64 H.264 rewrite unreliable.
+    /// The heartbeat re-push mechanism itself is codec-agnostic bridge
+    /// logic, fully exercised here on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_feed_bridge_heartbeats_on_idle_capture() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(0, backend);
         register_test_peer_demanding_all_layers(&session).await;
         session
@@ -3823,16 +4018,9 @@ mod tests {
 
         // Subscribe to the pool's encoder before pushing the BGRA so
         // we don't miss the first frame.
-        let pool = session
-            .pool
-            .get()
-            .expect("pool initialized after start");
-        let prefs = encode::pool::PeerCodecPreferences::new(vec![
-            encode::pool::CodecKind::Vp8,
-        ]);
-        let (subs, _lease) = pool
-            .subscribe(&prefs)
-            .expect("VP8 always-on subscribe");
+        let pool = session.pool.get().expect("pool initialized after start");
+        let prefs = encode::pool::PeerCodecPreferences::new(vec![encode::pool::CodecKind::Vp8]);
+        let (subs, _lease) = pool.subscribe(&prefs).expect("VP8 always-on subscribe");
         let mut frame_rx = subs
             .into_iter()
             .next()
@@ -3841,9 +4029,7 @@ mod tests {
 
         // Push EXACTLY ONE BGRA frame. After this, no more capture
         // activity — simulating a fully idle damage-driven backend.
-        let _ = session
-            .frame_tx
-            .send(Arc::new(make_test_bgra(64, 64)));
+        let _ = session.frame_tx.send(Arc::new(make_test_bgra(64, 64)));
 
         // Count encoded frames over a window > IDLE_HEARTBEAT (1s)
         // + buffer for VP8 encoder startup. The bridge ticks at
@@ -3852,18 +4038,15 @@ mod tests {
         // ~30 ticks (~1s), heartbeat is due → re-push → encoder
         // produces another frame.
         let mut count: u32 = 0;
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(1800),
-            async {
-                while let Ok(frame) = frame_rx.recv().await {
-                    let _ = frame;
-                    count += 1;
-                    if count >= 2 {
-                        return;
-                    }
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(1800), async {
+            while let Ok(frame) = frame_rx.recv().await {
+                let _ = frame;
+                count += 1;
+                if count >= 2 {
+                    return;
                 }
-            },
-        )
+            }
+        })
         .await;
 
         assert!(
@@ -3895,9 +4078,18 @@ mod tests {
     /// fires, sometimes doesn't.) Then never push anything via
     /// `frame_tx` and assert encoded frames flow to a pool
     /// subscriber, proving the seed branch alone fed the encoder.
+    ///
+    /// VP8-specific (gated off Windows): subscribes with a VP8
+    /// preference and asserts VP8-encoded frame flow at 64×64. Windows
+    /// has no VP8 backend; the seed-snapshot bridge logic it exercises
+    /// is codec-agnostic and covered here on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_feed_bridge_seeds_latest_i420_from_capture_snapshot() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(0, backend);
         register_test_peer_demanding_all_layers(&session).await;
 
@@ -3906,8 +4098,7 @@ mod tests {
         // closed channel the capture task exits without writing
         // latest_frame organically, so the only frame the bridge
         // can ever see is this pre-seed.
-        *session.latest_frame.write().await =
-            Some(Arc::new(make_test_bgra(64, 64)));
+        *session.latest_frame.write().await = Some(Arc::new(make_test_bgra(64, 64)));
 
         session
             .start(30, None, None)
@@ -3918,16 +4109,9 @@ mod tests {
         // queued by start() but may not have run yet — that's fine,
         // its snapshot will read the pre-seeded latest_frame
         // whenever it gets scheduled.
-        let pool = session
-            .pool
-            .get()
-            .expect("pool initialized after start");
-        let prefs = encode::pool::PeerCodecPreferences::new(vec![
-            encode::pool::CodecKind::Vp8,
-        ]);
-        let (subs, _lease) = pool
-            .subscribe(&prefs)
-            .expect("VP8 always-on subscribe");
+        let pool = session.pool.get().expect("pool initialized after start");
+        let prefs = encode::pool::PeerCodecPreferences::new(vec![encode::pool::CodecKind::Vp8]);
+        let (subs, _lease) = pool.subscribe(&prefs).expect("VP8 always-on subscribe");
         let mut frame_rx = subs
             .into_iter()
             .next()
@@ -3938,11 +4122,7 @@ mod tests {
         // be forwarded. Generous timeout for VP8 encoder warmup
         // (cold-start can take a few hundred ms before the first
         // packet emerges). Pre-fix would never produce ANY frame.
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            frame_rx.recv(),
-        )
-        .await;
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), frame_rx.recv()).await;
 
         assert!(
             result.is_ok() && result.as_ref().unwrap().is_ok(),
@@ -3972,7 +4152,10 @@ mod tests {
     /// (mirroring the in-loop resize branch's two-effect contract).
     #[tokio::test]
     async fn pool_feed_bridge_seed_resizes_pool_when_snapshot_dims_differ() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(11, backend);
         let bus = crate::event::EventBus::new();
         let mut bus_rx = bus.subscribe();
@@ -3985,8 +4168,7 @@ mod tests {
         // pre-write order matters with eager spawn — writing after
         // start() would race the bridge task's read lock against the
         // test's write lock and produce flaky on_resize firing.
-        *session.latest_frame.write().await =
-            Some(Arc::new(make_test_bgra(128, 96)));
+        *session.latest_frame.write().await = Some(Arc::new(make_test_bgra(128, 96)));
 
         session
             .start(30, None, Some(bus))
@@ -4000,10 +4182,7 @@ mod tests {
         // bridge's seed branch races against this assertion only on
         // outcome — the assertion checks the pre-resize state from
         // pool init, not what the bridge has done yet.)
-        let pool = session
-            .pool
-            .get()
-            .expect("pool initialized after start");
+        let pool = session.pool.get().expect("pool initialized after start");
         // Note: this dimension check is racy with the bridge's seed
         // branch — if the bridge already ran and called on_resize,
         // pool.dimensions() will already be (128, 96). That's fine:
@@ -4023,22 +4202,19 @@ mod tests {
         // complete the spawn_blocking BGRA→I420 conversion. Drain
         // events looking for our DisplayResize; other events
         // (capture-side, etc.) might land first.
-        let saw_resize = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            async {
-                loop {
-                    match bus_rx.recv().await {
-                        Ok(crate::event::AppEvent::DisplayResize {
-                            display_id: 11,
-                            width: 128,
-                            height: 96,
-                        }) => return true,
-                        Ok(_) => continue,
-                        Err(_) => return false,
-                    }
+        let saw_resize = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match bus_rx.recv().await {
+                    Ok(crate::event::AppEvent::DisplayResize {
+                        display_id: 11,
+                        width: 128,
+                        height: 96,
+                    }) => return true,
+                    Ok(_) => continue,
+                    Err(_) => return false,
                 }
-            },
-        )
+            }
+        })
         .await
         .unwrap_or(false);
 
@@ -4079,9 +4255,18 @@ mod tests {
     /// received by a pool subscriber over the burst window; without
     /// burst the count would be ≤2 (initial encode + at most one
     /// heartbeat), with burst it should be at tick rate (~30fps).
+    ///
+    /// VP8-specific (gated off Windows): subscribes with a VP8
+    /// preference and counts VP8-encoded frames over the burst window at
+    /// 64×64. Windows has no VP8 backend; the burst-clocking bridge
+    /// logic is codec-agnostic and exercised here on macOS/Linux.
+    #[cfg(not(target_os = "windows"))]
     #[tokio::test]
     async fn pool_feed_bridge_burst_clocks_encoder_at_tick_rate() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(0, backend);
         register_test_peer_demanding_all_layers(&session).await;
 
@@ -4093,39 +4278,26 @@ mod tests {
         // matters with eager spawn (3c.4d): writing after start()
         // races the bridge's snapshot read against the test's
         // write lock.
-        *session.latest_frame.write().await =
-            Some(Arc::new(make_test_bgra(64, 64)));
+        *session.latest_frame.write().await = Some(Arc::new(make_test_bgra(64, 64)));
 
         session
             .start(30, None, None)
             .await
             .expect("start must succeed");
 
-        let pool = session
-            .pool
-            .get()
-            .expect("pool initialized after start");
-        let prefs = encode::pool::PeerCodecPreferences::new(vec![
-            encode::pool::CodecKind::Vp8,
-        ]);
-        let (subs, _lease) = pool
-            .subscribe(&prefs)
-            .expect("VP8 always-on subscribe");
+        let pool = session.pool.get().expect("pool initialized after start");
+        let prefs = encode::pool::PeerCodecPreferences::new(vec![encode::pool::CodecKind::Vp8]);
+        let (subs, _lease) = pool.subscribe(&prefs).expect("VP8 always-on subscribe");
         let mut frame_rx = subs
             .into_iter()
             .next()
             .expect("at least one subscription")
             .frames;
 
-
         // Drain the seeded frame's initial encode before measuring;
         // we want to count what the BURST produces, not the cold-
         // start encode that happens regardless.
-        let _ = tokio::time::timeout(
-            std::time::Duration::from_millis(500),
-            frame_rx.recv(),
-        )
-        .await;
+        let _ = tokio::time::timeout(std::time::Duration::from_millis(500), frame_rx.recv()).await;
 
         // Signal peer-join burst.
         session
@@ -4147,11 +4319,7 @@ mod tests {
         let start = Instant::now();
         let mut count = 0u32;
         while start.elapsed() < std::time::Duration::from_millis(1200) {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(200),
-                frame_rx.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(200), frame_rx.recv()).await
             {
                 Ok(Ok(_)) => count += 1,
                 _ => break,
@@ -4169,8 +4337,6 @@ mod tests {
         session.shutdown.cancel();
     }
 
-
-
     /// `signal_peer_join_burst` must send `()` on
     /// `pool_feed_keyframe_tx` whenever the channel is installed.
     /// Pins the contract that `handle_offer_pool_mode`'s tail relies
@@ -4179,9 +4345,11 @@ mod tests {
     /// H.264) sit on a P-frame stream past `request_keyframe_all`
     /// for many seconds on idle desktops.
     #[tokio::test]
-    async fn signal_peer_join_burst_wakes_pool_feed_bridge_in_pool_only_session(
-    ) {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+    async fn signal_peer_join_burst_wakes_pool_feed_bridge_in_pool_only_session() {
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(0, backend);
 
         let (pool_tx, mut pool_rx) = mpsc::unbounded_channel::<()>();
@@ -4189,11 +4357,8 @@ mod tests {
 
         session.signal_peer_join_burst().await;
 
-        let recv = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            pool_rx.recv(),
-        )
-        .await;
+        let recv =
+            tokio::time::timeout(std::time::Duration::from_millis(100), pool_rx.recv()).await;
         assert!(
             matches!(recv, Ok(Some(()))),
             "pool_feed_keyframe_tx must receive burst signal in \
@@ -4210,7 +4375,10 @@ mod tests {
     /// session fully stopped" non-observable.
     #[tokio::test]
     async fn stop_takes_and_awaits_pool_feed_bridge_handle() {
-        let backend = Arc::new(StubBackend { width: 64, height: 64 });
+        let backend = Arc::new(StubBackend {
+            width: 64,
+            height: 64,
+        });
         let session = DisplaySession::new(0, backend);
         session
             .start(30, None, None)
@@ -4251,10 +4419,7 @@ mod tests {
 
     #[async_trait]
     impl DisplayBackend for InjectCountingBackend {
-        async fn start_capture(
-            &self,
-            _fps: u32,
-        ) -> Result<mpsc::Receiver<Frame>, CallerError> {
+        async fn start_capture(&self, _fps: u32) -> Result<mpsc::Receiver<Frame>, CallerError> {
             let (_tx, rx) = mpsc::channel(1);
             Ok(rx)
         }

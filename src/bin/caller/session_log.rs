@@ -1,8 +1,10 @@
 use chrono::Local;
 use serde::{Deserialize, Serialize};
+use std::collections::HashSet;
 use std::fs::{self, File, OpenOptions};
-use std::io::{BufWriter, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use uuid::Uuid;
 
 /// Structured event written as one JSON line in session.jsonl.
@@ -26,6 +28,22 @@ struct LogEvent {
     file2: Option<String>,
 }
 
+#[derive(Debug, Clone)]
+struct TurnFileSpan {
+    relative: String,
+    offset: u64,
+    len: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct AgentOutputChunk {
+    pub output_id: String,
+    pub stdout: String,
+    pub stderr: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+}
+
 /// Metadata persisted in `session_meta.json` inside each session directory.
 #[derive(Serialize, Deserialize, Debug)]
 pub struct SessionMeta {
@@ -33,6 +51,8 @@ pub struct SessionMeta {
     pub created_at: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub project_root: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub task: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -43,6 +63,85 @@ pub struct SessionMeta {
     pub role: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rounds: Option<usize>,
+}
+
+static OPEN_SESSION_LOG_DIRS: OnceLock<StdMutex<HashSet<PathBuf>>> = OnceLock::new();
+
+fn open_session_log_dirs() -> &'static StdMutex<HashSet<PathBuf>> {
+    OPEN_SESSION_LOG_DIRS.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn lock_open_session_log_dirs() -> StdMutexGuard<'static, HashSet<PathBuf>> {
+    match open_session_log_dirs().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+fn register_open_session_log_dir(dir: &Path) {
+    lock_open_session_log_dirs().insert(dir.to_path_buf());
+}
+
+fn unregister_open_session_log_dir(dir: &Path) {
+    lock_open_session_log_dirs().remove(dir);
+}
+
+fn mark_session_meta_interrupted(dir: &Path, last_turn: Option<usize>) -> bool {
+    let meta_path = dir.join("session_meta.json");
+    if let Ok(meta_str) = fs::read_to_string(&meta_path) {
+        if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
+            if meta.status.as_deref() == Some("running") {
+                meta.status = Some("interrupted".to_string());
+                meta.last_turn = Some(last_turn.or(meta.last_turn).unwrap_or(0));
+                if let Ok(json) = serde_json::to_string_pretty(&meta) {
+                    let _ = fs::write(&meta_path, &json);
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+fn update_session_meta_after_round_complete(
+    dir: &Path,
+    last_turn: Option<usize>,
+    rounds: Option<usize>,
+) {
+    let meta_path = dir.join("session_meta.json");
+    let Ok(meta_str) = fs::read_to_string(&meta_path) else {
+        return;
+    };
+    let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) else {
+        return;
+    };
+    match meta.status.as_deref() {
+        Some("completed" | "interrupted") => return,
+        _ => {}
+    }
+    meta.status = Some("idle".to_string());
+    if let Some(turn) = last_turn {
+        meta.last_turn = Some(meta.last_turn.unwrap_or(0).max(turn));
+    }
+    if let Some(rounds) = rounds {
+        meta.rounds = Some(meta.rounds.unwrap_or(0).max(rounds));
+    }
+    if let Ok(json) = serde_json::to_string_pretty(&meta) {
+        if let Err(e) = fs::write(&meta_path, &json) {
+            eprintln!("session_log: failed to update session_meta.json: {}", e);
+        }
+    }
+}
+
+pub fn mark_registered_session_logs_interrupted_now() -> Vec<PathBuf> {
+    let dirs: Vec<PathBuf> = lock_open_session_log_dirs().iter().cloned().collect();
+    let mut updated = Vec::new();
+    for dir in dirs {
+        if mark_session_meta_interrupted(&dir, None) {
+            updated.push(dir);
+        }
+    }
+    updated
 }
 
 /// Comprehensive structured session logger.
@@ -68,6 +167,7 @@ pub struct SessionLog {
     /// Buffer for accumulating voice_log tokens into full utterances.
     /// Flushed to transcript on turnComplete or user_transcript.
     voice_utterance_buf: String,
+    last_approval_resolved: Option<(u64, String)>,
 }
 
 /// Accumulates session statistics as events are logged.
@@ -135,6 +235,7 @@ impl SessionLog {
     pub fn open(dir: PathBuf) -> std::io::Result<Self> {
         fs::create_dir_all(&dir)?;
         fs::create_dir_all(dir.join("turns"))?;
+        let log_dir = dir.clone();
 
         // Try to read existing session_id from meta, or derive from directory name
         let session_id = if let Ok(meta_str) = fs::read_to_string(dir.join("session_meta.json")) {
@@ -172,6 +273,7 @@ impl SessionLog {
                 ..Default::default()
             },
             voice_utterance_buf: String::new(),
+            last_approval_resolved: None,
         };
         log.emit(LogEvent {
             ts: Self::ts(),
@@ -186,13 +288,24 @@ impl SessionLog {
             file: None,
             file2: None,
         });
+        register_open_session_log_dir(&log_dir);
         Ok(log)
     }
 
     /// Write session metadata to `session_meta.json`.
     /// Call after open() to persist session identity and context.
     pub fn write_meta(&self, project_root: Option<&Path>, task: Option<&str>) {
-        self.write_meta_with_role(project_root, task, None);
+        self.write_meta_with_name_and_role(project_root, task, None, None);
+    }
+
+    /// Write session metadata with an optional user-facing session name.
+    pub fn write_meta_with_name(
+        &self,
+        project_root: Option<&Path>,
+        task: Option<&str>,
+        name: Option<&str>,
+    ) {
+        self.write_meta_with_name_and_role(project_root, task, name, None);
     }
 
     /// Write session metadata with an optional role field.
@@ -202,10 +315,25 @@ impl SessionLog {
         task: Option<&str>,
         role: Option<&str>,
     ) {
+        self.write_meta_with_name_and_role(project_root, task, None, role);
+    }
+
+    fn write_meta_with_name_and_role(
+        &self,
+        project_root: Option<&Path>,
+        task: Option<&str>,
+        name: Option<&str>,
+        role: Option<&str>,
+    ) {
+        let existing_name = fs::read_to_string(self.dir.join("session_meta.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<SessionMeta>(&raw).ok())
+            .and_then(|meta| meta.name);
         let meta = SessionMeta {
             session_id: self.session_id.clone(),
             created_at: Local::now().format("%Y-%m-%dT%H:%M:%S").to_string(),
             project_root: project_root.map(|p| p.to_string_lossy().to_string()),
+            name: name.map(|n| n.to_string()).or(existing_name),
             task: task.map(|t| t.to_string()),
             status: Some("running".to_string()),
             last_turn: None,
@@ -231,8 +359,10 @@ impl SessionLog {
 
         // Create a new session directory with UUID for each top-level caller invocation.
         let session_id = Uuid::new_v4().to_string();
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let dir = PathBuf::from(format!("{}/.intendant/logs/{}", home, session_id));
+        let dir = crate::platform::home_dir()
+            .join(".intendant")
+            .join("logs")
+            .join(&session_id);
         let _ = fs::create_dir_all(&dir);
         dir
     }
@@ -241,8 +371,7 @@ impl SessionLog {
     /// Scans `~/.intendant/logs/*/session_meta.json`, filters by project_root,
     /// and returns the most recently created session.
     pub fn find_latest_session(project_root: &Path) -> Option<(String, PathBuf)> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+        let logs_dir = crate::platform::home_dir().join(".intendant").join("logs");
         if !logs_dir.is_dir() {
             return None;
         }
@@ -287,8 +416,7 @@ impl SessionLog {
     /// Find a session by its ID (UUID prefix or full UUID).
     /// Checks `~/.intendant/logs/{id}/` directly, then scans for prefix matches.
     pub fn find_session_by_id(session_id: &str) -> Option<PathBuf> {
-        let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-        let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+        let logs_dir = crate::platform::home_dir().join(".intendant").join("logs");
 
         // Direct match (dir name == session_id)
         let direct = logs_dir.join(session_id);
@@ -296,8 +424,19 @@ impl SessionLog {
             return Some(direct);
         }
 
-        // Backward compat: if session_id contains '/', treat as direct path
-        if session_id.contains('/') {
+        // Backward compat: if session_id looks like a path (absolute, or
+        // containing any path separator on this platform), treat it as a
+        // direct path. A bare UUID prefix has no separators and is not
+        // absolute, so it falls through to the prefix scan below. Checking
+        // for both '/' and the platform separator keeps Windows absolute
+        // paths (`C:\...`, which use '\\') from being misclassified.
+        let looks_like_path = {
+            let p = Path::new(session_id);
+            p.is_absolute()
+                || session_id.contains('/')
+                || session_id.contains(std::path::MAIN_SEPARATOR)
+        };
+        if looks_like_path {
             let dir = PathBuf::from(session_id);
             if dir.is_dir() {
                 return Some(dir);
@@ -603,10 +742,7 @@ impl SessionLog {
             voice_provider: self.summary_builder.voice_provider.clone(),
             voice_model: self.summary_builder.voice_model.clone(),
             voice_connections: self.summary_builder.voice_connections,
-            voice_reconnects: self
-                .summary_builder
-                .voice_connections
-                .saturating_sub(1),
+            voice_reconnects: self.summary_builder.voice_connections.saturating_sub(1),
             model_turns,
             cu_tasks,
             frames_sent: self.summary_builder.frames_sent,
@@ -646,6 +782,11 @@ impl SessionLog {
     /// reference from the session-log event so downstream readers don't chase
     /// a phantom path.
     fn append_turn_file(&self, suffix: &str, content: &str) -> Option<String> {
+        self.append_turn_file_span(suffix, content)
+            .map(|span| span.relative)
+    }
+
+    fn append_turn_file_span(&self, suffix: &str, content: &str) -> Option<TurnFileSpan> {
         let relative = format!("turns/turn_{:03}_{}", self.current_turn, suffix);
         let path = self.dir.join(&relative);
         let already_has_content = fs::metadata(&path).map(|m| m.len() > 0).unwrap_or(false);
@@ -657,8 +798,13 @@ impl SessionLog {
         if already_has_content {
             let _ = file.write_all(b"\n");
         }
+        let offset = file.metadata().ok()?.len();
         if file.write_all(content.as_bytes()).is_ok() {
-            Some(relative)
+            Some(TurnFileSpan {
+                relative,
+                offset,
+                len: content.len() as u64,
+            })
         } else {
             None
         }
@@ -823,7 +969,9 @@ impl SessionLog {
     /// Protocol lifecycle: setupComplete, turnComplete, connected, interrupted, etc.
     pub fn voice_protocol(&mut self, kind: &str, detail: &str) {
         // Flush buffered voice tokens to transcript on turnComplete
-        if detail.starts_with("turnComplete") || kind == "gemini_msg" && detail.contains("turnComplete") {
+        if detail.starts_with("turnComplete")
+            || kind == "gemini_msg" && detail.contains("turnComplete")
+        {
             self.flush_voice_utterance();
         }
         self.emit_voice("voice_protocol", "debug", kind, detail);
@@ -1028,31 +1176,48 @@ impl SessionLog {
     // through the AppEvent bus but were not previously persisted to disk.
 
     /// Log a done signal from the agent.
-    pub fn done_signal(&mut self, message: Option<&str>) {
+    pub fn done_signal_for_session(&mut self, session_id: Option<&str>, message: Option<&str>) {
+        let data = session_id
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(|session_id| serde_json::json!({ "session_id": session_id }));
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "done_signal".to_string(),
             level: Some("info".to_string()),
             message: Some(message.unwrap_or("Agent signalled done").to_string()),
-            data: None,
+            data,
             file: None,
             file2: None,
         });
     }
 
     /// Log task completion.
-    pub fn task_complete(&mut self, reason: &str, summary: Option<&str>) {
+    pub fn task_complete_for_session(
+        &mut self,
+        session_id: Option<&str>,
+        reason: &str,
+        summary: Option<&str>,
+    ) {
+        let mut data = serde_json::json!({
+            "reason": reason,
+            "summary": summary,
+        });
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data["session_id"] = serde_json::Value::String(session_id.to_string());
+        }
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
             event: "task_complete".to_string(),
             level: Some("info".to_string()),
             message: Some(format!("Task complete: {}", reason)),
-            data: Some(serde_json::json!({
-                "reason": reason,
-                "summary": summary,
-            })),
+            data: Some(data),
             file: None,
             file2: None,
         });
@@ -1069,6 +1234,119 @@ impl SessionLog {
             data: Some(serde_json::json!({
                 "session_id": session_id,
                 "task": task,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Link an Intendant-visible session id to a backend-native id.
+    pub fn session_identity(&mut self, session_id: &str, source: &str, backend_session_id: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_identity".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Session identity: {} -> {}:{}",
+                session_id, source, backend_session_id
+            )),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "source": source,
+                "backend_session_id": backend_session_id,
+            })),
+            file: None,
+            file2: None,
+        });
+        let _ = crate::external_wrapper_index::upsert_from_log_dir(
+            source,
+            backend_session_id,
+            session_id,
+            &self.dir,
+        );
+    }
+
+    /// Log that a frontend-visible session is attached to an external agent.
+    pub fn session_attached(&mut self, session_id: &str, source: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_attached".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Session attached: {} ({})", session_id, source)),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "source": source,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Persist a visible parent/child session relationship.
+    pub fn session_relationship(
+        &mut self,
+        parent_session_id: &str,
+        child_session_id: &str,
+        relationship: &str,
+        ephemeral: bool,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_relationship".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!(
+                "Session relationship: {} -> {} ({})",
+                parent_session_id, child_session_id, relationship
+            )),
+            data: Some(serde_json::json!({
+                "parent_session_id": parent_session_id,
+                "child_session_id": child_session_id,
+                "relationship": relationship,
+                "ephemeral": ephemeral,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Persist per-session frontend affordances.
+    pub fn session_capabilities(
+        &mut self,
+        session_id: &str,
+        capabilities: &crate::types::SessionCapabilities,
+    ) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_capabilities".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Session capabilities: {}", session_id)),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "capabilities": capabilities,
+            })),
+            file: None,
+            file2: None,
+        });
+    }
+
+    /// Persist the latest visible Codex `/goal` state for a session.
+    pub fn session_goal(&mut self, session_id: &str, goal: Option<&crate::types::SessionGoal>) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "session_goal".to_string(),
+            level: Some("info".to_string()),
+            message: Some(match goal {
+                Some(goal) => format!("Session goal: {} ({})", session_id, goal.objective),
+                None => format!("Session goal cleared: {}", session_id),
+            }),
+            data: Some(serde_json::json!({
+                "session_id": session_id,
+                "goal": goal,
             })),
             file: None,
             file2: None,
@@ -1093,14 +1371,44 @@ impl SessionLog {
     }
 
     /// Log agent execution starting.
-    pub fn agent_started(&mut self, turn: usize, commands_preview: &str) {
+    pub fn agent_started_with_session_id(
+        &mut self,
+        session_id: Option<&str>,
+        turn: usize,
+        commands_preview: &str,
+        item_id: Option<&str>,
+        source: Option<&str>,
+    ) {
+        let mut data = serde_json::Map::new();
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        if let Some(item_id) = item_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "item_id".to_string(),
+                serde_json::Value::String(item_id.to_string()),
+            );
+        }
+        if let Some(source) = source.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "source".to_string(),
+                serde_json::Value::String(source.to_string()),
+            );
+        }
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(turn),
             event: "agent_started".to_string(),
             level: Some("info".to_string()),
             message: Some(commands_preview.to_string()),
-            data: None,
+            data: if data.is_empty() {
+                None
+            } else {
+                Some(serde_json::Value::Object(data))
+            },
             file: None,
             file2: None,
         });
@@ -1110,7 +1418,11 @@ impl SessionLog {
     pub fn auto_approved(&mut self, preview: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "auto_approved".to_string(),
             level: Some("info".to_string()),
             message: Some(preview.to_string()),
@@ -1122,6 +1434,14 @@ impl SessionLog {
 
     /// Log a resolved approval decision.
     pub fn approval_resolved(&mut self, id: u64, action: &str) {
+        if self
+            .last_approval_resolved
+            .as_ref()
+            .is_some_and(|(last_id, last_action)| *last_id == id && last_action == action)
+        {
+            return;
+        }
+        self.last_approval_resolved = Some((id, action.to_string()));
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: Some(id as usize),
@@ -1138,7 +1458,11 @@ impl SessionLog {
     pub fn human_question(&mut self, question: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "human_question".to_string(),
             level: Some("info".to_string()),
             message: Some(question.to_string()),
@@ -1152,7 +1476,11 @@ impl SessionLog {
     pub fn human_response_sent(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "human_response_sent".to_string(),
             level: Some("info".to_string()),
             message: Some("Human response sent".to_string()),
@@ -1169,7 +1497,10 @@ impl SessionLog {
             turn: None,
             event: "round_complete".to_string(),
             level: Some("info".to_string()),
-            message: Some(format!("Round {} complete ({} turns)", round, turns_in_round)),
+            message: Some(format!(
+                "Round {} complete ({} turns)",
+                round, turns_in_round
+            )),
             data: Some(serde_json::json!({
                 "round": round,
                 "turns_in_round": turns_in_round,
@@ -1177,6 +1508,7 @@ impl SessionLog {
             file: None,
             file2: None,
         });
+        update_session_meta_after_round_complete(&self.dir, Some(self.current_turn), Some(round));
     }
 
     /// Log creation of a per-round file snapshot.
@@ -1277,12 +1609,7 @@ impl SessionLog {
     }
 
     /// Log display ready.
-    pub fn display_ready(
-        &mut self,
-        display_id: u32,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn display_ready(&mut self, display_id: u32, width: u32, height: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1303,12 +1630,7 @@ impl SessionLog {
     }
 
     /// Log display resolution change.
-    pub fn display_resize(
-        &mut self,
-        display_id: u32,
-        width: u32,
-        height: u32,
-    ) {
+    pub fn display_resize(&mut self, display_id: u32, width: u32, height: u32) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1397,7 +1719,11 @@ impl SessionLog {
     pub fn safety_cap_reached(&mut self) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "safety_cap_reached".to_string(),
             level: Some("warn".to_string()),
             message: Some("Safety cap reached".to_string()),
@@ -1452,11 +1778,29 @@ impl SessionLog {
         });
     }
 
+    /// Log recording deleted.
+    pub fn recording_deleted(&mut self, stream_name: &str) {
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: None,
+            event: "recording_deleted".to_string(),
+            level: Some("info".to_string()),
+            message: Some(format!("Recording deleted: {}", stream_name)),
+            data: Some(serde_json::json!({ "stream_name": stream_name })),
+            file: None,
+            file2: None,
+        });
+    }
+
     /// Log sub-agent result.
     pub fn sub_agent_result(&mut self, summary: &str) {
         self.emit(LogEvent {
             ts: Self::ts(),
-            turn: if self.current_turn > 0 { Some(self.current_turn) } else { None },
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
             event: "sub_agent_result".to_string(),
             level: Some("info".to_string()),
             message: Some(summary.to_string()),
@@ -1528,12 +1872,7 @@ impl SessionLog {
     }
 
     /// Log live model (Gemini Live / OpenAI Realtime) usage update.
-    pub fn live_usage_update(
-        &mut self,
-        provider: &str,
-        model: &str,
-        total_tokens: u64,
-    ) {
+    pub fn live_usage_update(&mut self, provider: &str, model: &str, total_tokens: u64) {
         // Track cumulative live model tokens
         if total_tokens > self.summary_builder.total_tokens {
             self.summary_builder.total_tokens = total_tokens;
@@ -1602,12 +1941,7 @@ impl SessionLog {
     }
 
     /// Log live audio sub-agent completed.
-    pub fn live_audio_completed(
-        &mut self,
-        id: &str,
-        status: &str,
-        quarantine_count: usize,
-    ) {
+    pub fn live_audio_completed(&mut self, id: &str, status: &str, quarantine_count: usize) {
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1634,7 +1968,11 @@ impl SessionLog {
             turn: None,
             event: "tool_request".to_string(),
             level: Some("debug".to_string()),
-            message: Some(format!("{}({})", tool, serde_json::to_string(args).unwrap_or_default())),
+            message: Some(format!(
+                "{}({})",
+                tool,
+                serde_json::to_string(args).unwrap_or_default()
+            )),
             data: Some(serde_json::json!({
                 "tool": tool,
                 "args": args,
@@ -1646,7 +1984,11 @@ impl SessionLog {
 
     /// Log a tool response sent back to the browser presence model.
     pub fn tool_response(&mut self, tool: &str, result: &str) {
-        let preview = if result.len() > 200 { &result[..200] } else { result };
+        let preview = if result.len() > 200 {
+            &result[..200]
+        } else {
+            result
+        };
         self.emit(LogEvent {
             ts: Self::ts(),
             turn: None,
@@ -1728,9 +2070,128 @@ impl SessionLog {
         });
     }
 
+    /// Log a parsed raw model-context snapshot for dashboard inspection.
+    pub fn context_snapshot(
+        &mut self,
+        source: &str,
+        label: &str,
+        turn: Option<usize>,
+        format: &str,
+        token_count: Option<u64>,
+        token_count_kind: Option<&str>,
+        context_window: Option<u64>,
+        hard_context_window: Option<u64>,
+        item_count: Option<usize>,
+        raw: &serde_json::Value,
+    ) {
+        self.context_snapshot_for_session(
+            None,
+            source,
+            label,
+            None,
+            None,
+            turn,
+            format,
+            token_count,
+            token_count_kind,
+            context_window,
+            hard_context_window,
+            item_count,
+            raw,
+        );
+    }
+
+    pub fn context_snapshot_for_session(
+        &mut self,
+        session_id: Option<&str>,
+        source: &str,
+        label: &str,
+        request_id: Option<&str>,
+        request_index: Option<u64>,
+        turn: Option<usize>,
+        format: &str,
+        token_count: Option<u64>,
+        token_count_kind: Option<&str>,
+        context_window: Option<u64>,
+        hard_context_window: Option<u64>,
+        item_count: Option<usize>,
+        raw: &serde_json::Value,
+    ) {
+        let rendered = serde_json::to_string_pretty(raw).unwrap_or_else(|_| raw.to_string());
+        let effective_turn = turn.or_else(|| {
+            if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            }
+        });
+        let snapshot_id = Uuid::new_v4();
+        let relative = if let Some(file_turn) = effective_turn {
+            format!("turns/turn_{:03}_context_{}.json", file_turn, snapshot_id)
+        } else {
+            format!("turns/context_{}.json", snapshot_id)
+        };
+        let file = if fs::write(self.dir.join(&relative), &rendered).is_ok() {
+            Some(relative)
+        } else {
+            None
+        };
+        let item_suffix = item_count
+            .map(|n| format!(" ({} items)", n))
+            .unwrap_or_default();
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: effective_turn,
+            event: "context_snapshot".to_string(),
+            level: Some("debug".to_string()),
+            message: Some(format!("Context snapshot: {}{}", label, item_suffix)),
+            data: Some({
+                let mut data = serde_json::json!({
+                    "source": source,
+                    "label": label,
+                    "request_id": request_id,
+                    "request_index": request_index,
+                    "format": format,
+                    "token_count": token_count,
+                    "token_count_kind": token_count_kind,
+                    "context_window": context_window,
+                    "hard_context_window": hard_context_window,
+                    "item_count": item_count,
+                });
+                if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+                    data["session_id"] = serde_json::Value::String(session_id.to_string());
+                }
+                data
+            }),
+            file,
+            file2: None,
+        });
+    }
+
     /// Log the full model response. Content is written to a per-turn file.
     pub fn model_response(
         &mut self,
+        content: &str,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+        cached_tokens: u64,
+        source: Option<&str>,
+    ) {
+        self.model_response_for_session(
+            None,
+            content,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
+            cached_tokens,
+            source,
+        );
+    }
+
+    pub fn model_response_for_session(
+        &mut self,
+        session_id: Option<&str>,
         content: &str,
         prompt_tokens: u64,
         completion_tokens: u64,
@@ -1756,6 +2217,9 @@ impl SessionLog {
         });
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());
+        }
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data["session_id"] = serde_json::Value::String(session_id.to_string());
         }
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -1813,13 +2277,34 @@ impl SessionLog {
     /// chunk; we append so the file reflects the full turn history rather
     /// than only the last chunk.
     pub fn agent_output(&mut self, stdout: &str, stderr: &str, source: Option<&str>) {
-        let file = if !stdout.is_empty() {
-            self.append_turn_file("stdout.txt", stdout)
+        self.agent_output_with_id(stdout, stderr, source, None);
+    }
+
+    pub fn agent_output_with_id(
+        &mut self,
+        stdout: &str,
+        stderr: &str,
+        source: Option<&str>,
+        output_id: Option<&str>,
+    ) {
+        self.agent_output_with_session_id(None, stdout, stderr, source, output_id);
+    }
+
+    pub fn agent_output_with_session_id(
+        &mut self,
+        session_id: Option<&str>,
+        stdout: &str,
+        stderr: &str,
+        source: Option<&str>,
+        output_id: Option<&str>,
+    ) {
+        let stdout_span = if !stdout.is_empty() {
+            self.append_turn_file_span("stdout.txt", stdout)
         } else {
             None
         };
-        let file2 = if !stderr.is_empty() {
-            self.append_turn_file("stderr.txt", stderr)
+        let stderr_span = if !stderr.is_empty() {
+            self.append_turn_file_span("stderr.txt", stderr)
         } else {
             None
         };
@@ -1829,8 +2314,22 @@ impl SessionLog {
             "stdout_length": stdout.len(),
             "stderr_length": stderr.len(),
         });
+        if let Some(id) = output_id {
+            data["output_id"] = serde_json::Value::String(id.to_string());
+        }
         if let Some(src) = source {
             data["source"] = serde_json::Value::String(src.to_string());
+        }
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data["session_id"] = serde_json::Value::String(session_id.to_string());
+        }
+        if let Some(span) = stdout_span.as_ref() {
+            data["stdout_offset"] = serde_json::Value::from(span.offset);
+            data["stdout_bytes"] = serde_json::Value::from(span.len);
+        }
+        if let Some(span) = stderr_span.as_ref() {
+            data["stderr_offset"] = serde_json::Value::from(span.offset);
+            data["stderr_bytes"] = serde_json::Value::from(span.len);
         }
         self.emit(LogEvent {
             ts: Self::ts(),
@@ -1847,8 +2346,8 @@ impl SessionLog {
                 Some(preview)
             },
             data: Some(data),
-            file,
-            file2,
+            file: stdout_span.map(|span| span.relative),
+            file2: stderr_span.map(|span| span.relative),
         });
     }
 
@@ -2003,18 +2502,7 @@ impl SessionLog {
     pub fn mark_interrupted(&mut self) {
         self.flush_voice_utterance();
         let _ = self.writer.flush();
-        let meta_path = self.dir.join("session_meta.json");
-        if let Ok(meta_str) = fs::read_to_string(&meta_path) {
-            if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                if meta.status.as_deref() == Some("running") {
-                    meta.status = Some("interrupted".to_string());
-                    meta.last_turn = Some(self.current_turn);
-                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                        let _ = fs::write(&meta_path, &json);
-                    }
-                }
-            }
-        }
+        mark_session_meta_interrupted(&self.dir, Some(self.current_turn));
         // Write partial session summary even on interrupt
         self.write_session_summary();
     }
@@ -2026,18 +2514,8 @@ impl Drop for SessionLog {
         let _ = self.writer.flush();
 
         // If the session is still "running", mark it as "interrupted"
-        let meta_path = self.dir.join("session_meta.json");
-        if let Ok(meta_str) = fs::read_to_string(&meta_path) {
-            if let Ok(mut meta) = serde_json::from_str::<SessionMeta>(&meta_str) {
-                if meta.status.as_deref() == Some("running") {
-                    meta.status = Some("interrupted".to_string());
-                    meta.last_turn = Some(self.current_turn);
-                    if let Ok(json) = serde_json::to_string_pretty(&meta) {
-                        let _ = fs::write(&meta_path, &json);
-                    }
-                }
-            }
-        }
+        mark_session_meta_interrupted(&self.dir, Some(self.current_turn));
+        unregister_open_session_log_dir(&self.dir);
     }
 }
 
@@ -2048,6 +2526,93 @@ impl Drop for SessionLog {
 /// Helper: parse a `u32` numeric field from the `data` block.
 fn u32_from_data(data: Option<&serde_json::Value>, key: &str) -> Option<u32> {
     data?.get(key)?.as_u64().map(|v| v as u32)
+}
+
+fn read_event_file_span(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    file_key: &str,
+    offset_key: Option<&str>,
+    len_key: Option<&str>,
+) -> Option<String> {
+    let rel = entry.get(file_key)?.as_str()?;
+    let path = log_dir.join(rel);
+    let data = entry.get("data");
+    let offset = offset_key.and_then(|key| data?.get(key)?.as_u64());
+    let len = len_key.and_then(|key| data?.get(key)?.as_u64());
+
+    match (offset, len) {
+        (Some(offset), Some(len)) => {
+            let mut file = File::open(path).ok()?;
+            file.seek(SeekFrom::Start(offset)).ok()?;
+            let mut buf = vec![0_u8; len as usize];
+            file.read_exact(&mut buf).ok()?;
+            String::from_utf8(buf).ok()
+        }
+        _ => fs::read_to_string(path).ok(),
+    }
+}
+
+pub fn agent_output_chunks_by_id(log_dir: &Path, ids: &[String]) -> Vec<AgentOutputChunk> {
+    let wanted: std::collections::HashSet<&str> = ids.iter().map(String::as_str).collect();
+    if wanted.is_empty() {
+        return Vec::new();
+    }
+
+    let Ok(contents) = fs::read_to_string(log_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+    let mut found: std::collections::HashMap<String, AgentOutputChunk> =
+        std::collections::HashMap::new();
+
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        if entry.get("event").and_then(|v| v.as_str()) != Some("agent_output") {
+            continue;
+        }
+        let Some(data) = entry.get("data") else {
+            continue;
+        };
+        let Some(output_id) = data.get("output_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if !wanted.contains(output_id) || found.contains_key(output_id) {
+            continue;
+        }
+        let stdout = read_event_file_span(
+            &entry,
+            log_dir,
+            "file",
+            Some("stdout_offset"),
+            Some("stdout_bytes"),
+        )
+        .unwrap_or_default();
+        let stderr = read_event_file_span(
+            &entry,
+            log_dir,
+            "file2",
+            Some("stderr_offset"),
+            Some("stderr_bytes"),
+        )
+        .unwrap_or_default();
+        let source = data
+            .get("source")
+            .and_then(|v| v.as_str())
+            .map(String::from);
+        found.insert(
+            output_id.to_string(),
+            AgentOutputChunk {
+                output_id: output_id.to_string(),
+                stdout,
+                stderr,
+                source,
+            },
+        );
+    }
+
+    ids.iter().filter_map(|id| found.remove(id)).collect()
 }
 
 /// Reconstruct an `AppEvent` from a parsed `session.jsonl` entry.
@@ -2070,13 +2635,24 @@ fn u32_from_data(data: Option<&serde_json::Value>, key: &str) -> Option<u32> {
 /// For events with a `file` field (`model_response`, `agent_output`,
 /// `reasoning`), reads the full content from the turn file under `log_dir`
 /// and substitutes it for the 200-char `message` preview.
+fn parse_session_attached_message(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("Session attached: ")?;
+    let (session_id, source) = rest.rsplit_once(" (")?;
+    let session_id = session_id.trim();
+    let source = source.trim().strip_suffix(')')?.trim();
+    if session_id.is_empty() || source.is_empty() {
+        return None;
+    }
+    Some((session_id.to_string(), source.to_string()))
+}
+
 pub fn session_log_entry_to_app_event(
     entry: &serde_json::Value,
     log_dir: &Path,
 ) -> Option<crate::event::AppEvent> {
     use crate::event::AppEvent;
     use crate::provider::TokenUsage;
-    use crate::types::LogLevel;
+    use crate::types::{LogLevel, SessionCapabilities, SessionGoal};
 
     let event_type = entry.get("event").and_then(|v| v.as_str())?;
     let message = entry.get("message").and_then(|v| v.as_str()).unwrap_or("");
@@ -2086,13 +2662,12 @@ pub fn session_log_entry_to_app_event(
         .map(|t| t as usize);
     let data = entry.get("data");
 
-    // Helper: read full content from a file-reference field, relative to log_dir.
-    let read_file = |key: &str| -> Option<String> {
-        entry
-            .get(key)
-            .and_then(|f| f.as_str())
-            .and_then(|f| fs::read_to_string(log_dir.join(f)).ok())
-    };
+    // Helper: read content from a file-reference field, relative to log_dir.
+    // Newer agent_output events include byte spans so replay can recover the
+    // exact chunk from the aggregate per-turn stdout/stderr files. Older logs
+    // do not, so they fall back to the historical full-file read.
+    let read_file =
+        |key: &str| -> Option<String> { read_event_file_span(entry, log_dir, key, None, None) };
 
     // Helper: parse LogLevel from persisted string.
     let parse_log_level = |s: &str| -> Option<LogLevel> {
@@ -2148,9 +2723,73 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0);
             Some(AppEvent::TurnStarted {
+                session_id: None,
                 turn: turn?,
                 budget_pct,
                 remaining,
+            })
+        }
+        "context_snapshot" => {
+            let raw = read_file("file")
+                .and_then(|s| serde_json::from_str::<serde_json::Value>(&s).ok())
+                .unwrap_or_else(|| serde_json::json!({}));
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("model")
+                .to_string();
+            let label = data
+                .and_then(|d| d.get("label"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("Model context")
+                .to_string();
+            let format = data
+                .and_then(|d| d.get("format"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("unknown")
+                .to_string();
+            let request_id = data
+                .and_then(|d| d.get("request_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let request_index = data
+                .and_then(|d| d.get("request_index"))
+                .and_then(|v| v.as_u64());
+            let token_count = data
+                .and_then(|d| d.get("token_count"))
+                .and_then(|v| v.as_u64());
+            let token_count_kind = data
+                .and_then(|d| d.get("token_count_kind"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let context_window = data
+                .and_then(|d| d.get("context_window"))
+                .and_then(|v| v.as_u64());
+            let hard_context_window = data
+                .and_then(|d| d.get("hard_context_window"))
+                .and_then(|v| v.as_u64());
+            let item_count = data
+                .and_then(|d| d.get("item_count"))
+                .and_then(|v| v.as_u64())
+                .map(|v| v as usize);
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Some(AppEvent::ContextSnapshot {
+                session_id,
+                source,
+                label,
+                request_id,
+                request_index,
+                turn,
+                format,
+                token_count,
+                token_count_kind,
+                context_window,
+                hard_context_window,
+                item_count,
+                raw,
             })
         }
 
@@ -2180,7 +2819,12 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("source"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::ModelResponse {
+                session_id,
                 turn: turn.unwrap_or(0),
                 content,
                 usage,
@@ -2205,6 +2849,7 @@ pub fn session_log_entry_to_app_event(
                 return None;
             }
             Some(AppEvent::ModelResponse {
+                session_id: None,
                 turn: turn.unwrap_or(0),
                 content: String::new(),
                 usage: TokenUsage::default(),
@@ -2222,29 +2867,74 @@ pub fn session_log_entry_to_app_event(
             } else {
                 message.to_string()
             };
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            let item_id = data
+                .and_then(|d| d.get("item_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
             Some(AppEvent::AgentStarted {
+                session_id,
                 turn: turn.unwrap_or(0),
                 commands_preview,
-                source: None,
+                item_id,
+                source,
             })
         }
         "agent_output" => {
-            let stdout = read_file("file").unwrap_or_else(|| message.to_string());
-            let stderr = read_file("file2").unwrap_or_default();
+            let stdout = read_event_file_span(
+                entry,
+                log_dir,
+                "file",
+                Some("stdout_offset"),
+                Some("stdout_bytes"),
+            )
+            .unwrap_or_else(|| message.to_string());
+            let stderr = read_event_file_span(
+                entry,
+                log_dir,
+                "file2",
+                Some("stderr_offset"),
+                Some("stderr_bytes"),
+            )
+            .unwrap_or_default();
             let source = data
                 .and_then(|d| d.get("source"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
+            let output_id = data
+                .and_then(|d| d.get("output_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
             Some(AppEvent::AgentOutput {
+                session_id,
                 stdout,
                 stderr,
                 source,
+                output_id,
             })
         }
 
-        "done_signal" => Some(AppEvent::DoneSignal {
-            message: Some(message.to_string()).filter(|m| !m.is_empty()),
-        }),
+        "done_signal" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Some(AppEvent::DoneSignal {
+                session_id,
+                message: Some(message.to_string()).filter(|m| !m.is_empty()),
+            })
+        }
         "task_complete" => {
             let reason = data
                 .and_then(|d| d.get("reason"))
@@ -2255,7 +2945,15 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|d| d.get("summary"))
                 .and_then(|v| v.as_str())
                 .map(String::from);
-            Some(AppEvent::TaskComplete { reason, summary })
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            Some(AppEvent::TaskComplete {
+                session_id,
+                reason,
+                summary,
+            })
         }
         "session_started" => {
             let session_id = data
@@ -2268,6 +2966,98 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_str())
                 .map(String::from);
             Some(AppEvent::SessionStarted { session_id, task })
+        }
+        "session_identity" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let backend_session_id = data
+                .and_then(|d| d.get("backend_session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::SessionIdentity {
+                session_id,
+                source,
+                backend_session_id,
+            })
+        }
+        "session_attached" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::SessionAttached { session_id, source })
+        }
+        "session_relationship" => {
+            let parent_session_id = data
+                .and_then(|d| d.get("parent_session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let child_session_id = data
+                .and_then(|d| d.get("child_session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let relationship = data
+                .and_then(|d| d.get("relationship"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let ephemeral = data
+                .and_then(|d| d.get("ephemeral"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some(AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            })
+        }
+        "session_capabilities" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let capabilities = data
+                .and_then(|d| d.get("capabilities"))
+                .and_then(|v| serde_json::from_value::<SessionCapabilities>(v.clone()).ok())
+                .unwrap_or_default();
+            Some(AppEvent::SessionCapabilities {
+                session_id,
+                capabilities,
+            })
+        }
+        "session_goal" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let goal = data.and_then(|d| d.get("goal")).and_then(|v| {
+                if v.is_null() {
+                    None
+                } else {
+                    serde_json::from_value::<SessionGoal>(v.clone()).ok()
+                }
+            });
+            Some(AppEvent::SessionGoal { session_id, goal })
         }
         "session_ended" => {
             let session_id = data
@@ -2312,29 +3102,35 @@ pub fn session_log_entry_to_app_event(
                     let category = crate::autonomy::ActionCategory::from_str(category_str)
                         .unwrap_or(crate::autonomy::ActionCategory::CommandExec);
                     Some(AppEvent::ApprovalRequired {
+                        session_id: None,
                         id,
                         command_preview: preview,
                         category,
                     })
                 }
                 "approved" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "approve".to_string(),
                 }),
                 "approve-all" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "approve_all".to_string(),
                 }),
                 "skipped" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "skip".to_string(),
                 }),
                 "denied" => Some(AppEvent::ApprovalResolved {
+                    session_id: None,
                     id,
                     action: "deny".to_string(),
                 }),
                 "dedup-auto-approved" => Some(AppEvent::AutoApproved { preview }),
                 "denied-policy" | "denied-no-approver" => Some(AppEvent::LogEntry {
+                    session_id: None,
                     level: "warn".to_string(),
                     source: "system".to_string(),
                     content: format!("Denied ({}): {}", decision, preview),
@@ -2346,12 +3142,9 @@ pub fn session_log_entry_to_app_event(
         "approval_resolved" => {
             // The writer formats the message as "Approval {action} (turn {id})".
             // Split on whitespace to recover the action; the id is `turn`.
-            let action = message
-                .split_whitespace()
-                .nth(1)
-                .unwrap_or("")
-                .to_string();
+            let action = message.split_whitespace().nth(1).unwrap_or("").to_string();
             Some(AppEvent::ApprovalResolved {
+                session_id: None,
                 id: turn.unwrap_or(0) as u64,
                 action,
             })
@@ -2372,6 +3165,7 @@ pub fn session_log_entry_to_app_event(
                 .and_then(|v| v.as_u64())
                 .unwrap_or(0) as usize;
             Some(AppEvent::RoundComplete {
+                session_id: None,
                 round,
                 turns_in_round,
                 native_message_count: None,
@@ -2416,6 +3210,13 @@ pub fn session_log_entry_to_app_event(
                 .to_string(),
         }),
         "recording_stopped" => Some(AppEvent::RecordingStopped {
+            stream_name: data
+                .and_then(|d| d.get("stream_name"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+        }),
+        "recording_deleted" => Some(AppEvent::RecordingDeleted {
             stream_name: data
                 .and_then(|d| d.get("stream_name"))
                 .and_then(|v| v.as_str())
@@ -2509,6 +3310,14 @@ pub fn session_log_entry_to_app_event(
             output_tokens: 0,
             cached_tokens: 0,
             thinking_tokens: 0,
+            input_text_tokens: 0,
+            input_audio_tokens: 0,
+            input_image_tokens: 0,
+            cached_text_tokens: 0,
+            cached_audio_tokens: 0,
+            cached_image_tokens: 0,
+            output_text_tokens: 0,
+            output_audio_tokens: 0,
         }),
 
         // ── User transcript ──
@@ -2531,14 +3340,21 @@ pub fn session_log_entry_to_app_event(
         // "system".  `[model] Thinking` / `[model] Tool call:` are demoted
         // to "detail" so they only show under verbose verbosity.
         "info" | "warn" | "error" | "debug" => {
-            let source = if message.starts_with("[presence]")
+            if event_type == "info" {
+                if let Some((session_id, source)) = parse_session_attached_message(message) {
+                    return Some(AppEvent::SessionAttached { session_id, source });
+                }
+            }
+            let (source, content) = if let Some(rest) = message.strip_prefix("[user] ") {
+                ("User", rest.to_string())
+            } else if message.starts_with("[presence]")
                 || message.starts_with("[model]")
                 || message.starts_with("Presence")
                 || message.starts_with("[ws]")
             {
-                "server"
+                ("server", message.to_string())
             } else {
-                "system"
+                ("system", message.to_string())
             };
             let level = if event_type == "info"
                 && (message.starts_with("[model] Thinking")
@@ -2549,9 +3365,10 @@ pub fn session_log_entry_to_app_event(
                 event_type
             };
             Some(AppEvent::LogEntry {
+                session_id: None,
                 level: level.to_string(),
                 source: source.to_string(),
-                content: message.to_string(),
+                content,
                 turn,
             })
         }
@@ -2605,6 +3422,7 @@ pub fn session_log_entry_to_app_event(
                 _ => unreachable!(),
             };
             Some(AppEvent::LogEntry {
+                session_id: None,
                 level: level.to_string(),
                 source: "worker".to_string(),
                 content,
@@ -2612,6 +3430,7 @@ pub fn session_log_entry_to_app_event(
             })
         }
         "session_end" => Some(AppEvent::LogEntry {
+            session_id: None,
             level: "info".to_string(),
             source: "system".to_string(),
             content: message.to_string(),
@@ -2795,7 +3614,11 @@ mod tests {
         log.agent_output("only\n", "", None);
         let body = fs::read_to_string(log_dir.join("turns/turn_002_stdout.txt")).unwrap();
         // No leading blank line before the first chunk.
-        assert!(!body.starts_with('\n'), "unexpected leading newline: {:?}", body);
+        assert!(
+            !body.starts_with('\n'),
+            "unexpected leading newline: {:?}",
+            body
+        );
     }
 
     #[test]
@@ -2835,6 +3658,7 @@ mod tests {
             session_id: "test-session-123".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
             project_root: None,
+            name: None,
             task: None,
             status: None,
             last_turn: None,
@@ -2866,6 +3690,25 @@ mod tests {
         assert_eq!(meta.project_root.as_deref(), Some("/tmp/project"));
         assert_eq!(meta.task.as_deref(), Some("test task"));
         assert_eq!(meta.status.as_deref(), Some("running"));
+    }
+
+    #[test]
+    fn write_meta_with_name_persists_and_preserves_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta_with_name(
+            Some(Path::new("/tmp/project")),
+            Some("test task"),
+            Some("Named session"),
+        );
+        log.write_meta(Some(Path::new("/tmp/project")), Some("follow-up task"));
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.name.as_deref(), Some("Named session"));
+        assert_eq!(meta.task.as_deref(), Some("follow-up task"));
     }
 
     #[test]
@@ -2909,7 +3752,14 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.turn_start(1, 0.0, 200_000);
-        log.model_response("Hello, I will help you.\nHere is my plan.", 100, 50, 150, 0, None);
+        log.model_response(
+            "Hello, I will help you.\nHere is my plan.",
+            100,
+            50,
+            150,
+            0,
+            None,
+        );
         drop(log);
 
         let model_file = log_dir.join("turns/turn_001_model.txt");
@@ -3055,6 +3905,7 @@ mod tests {
             session_id: "session-1".to_string(),
             created_at: "2026-01-01T00:00:00".to_string(),
             project_root: Some("/tmp/project".to_string()),
+            name: None,
             task: Some("task 1".to_string()),
             status: Some("completed".to_string()),
             last_turn: Some(5),
@@ -3073,6 +3924,7 @@ mod tests {
             session_id: "session-2".to_string(),
             created_at: "2026-01-02T00:00:00".to_string(),
             project_root: Some("/tmp/project".to_string()),
+            name: None,
             task: Some("task 2".to_string()),
             status: Some("completed".to_string()),
             last_turn: Some(3),
@@ -3153,6 +4005,76 @@ mod tests {
     }
 
     #[test]
+    fn context_snapshot_preserves_session_id_and_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(2, 0.0, 200_000);
+        log.context_snapshot_for_session(
+            Some("session-1"),
+            "codex",
+            "Codex thread",
+            Some("req-42"),
+            Some(42),
+            Some(2),
+            "codex.thread.read.v2",
+            Some(42),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(128_000),
+            Some(1),
+            &serde_json::json!({"thread": {"turns": [{"items": [{"type": "userMessage"}]}]}}),
+        );
+        drop(log);
+
+        let contents = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entry: serde_json::Value = contents
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("context_snapshot"))
+            .unwrap();
+        let context_file = entry.get("file").and_then(|v| v.as_str()).unwrap();
+        assert!(log_dir.join(context_file).exists());
+
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            crate::event::AppEvent::ContextSnapshot {
+                session_id,
+                source,
+                label,
+                request_id,
+                request_index,
+                turn,
+                format,
+                token_count,
+                token_count_kind,
+                context_window,
+                hard_context_window,
+                item_count,
+                raw,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-1"));
+                assert_eq!(source, "codex");
+                assert_eq!(label, "Codex thread");
+                assert_eq!(request_id.as_deref(), Some("req-42"));
+                assert_eq!(request_index, Some(42));
+                assert_eq!(turn, Some(2));
+                assert_eq!(format, "codex.thread.read.v2");
+                assert_eq!(token_count, Some(42));
+                assert_eq!(token_count_kind.as_deref(), Some("backend_reported"));
+                assert_eq!(context_window, Some(128_000));
+                assert_eq!(hard_context_window, Some(128_000));
+                assert_eq!(item_count, Some(1));
+                assert_eq!(
+                    raw.pointer("/thread/turns/0/items/0/type")
+                        .and_then(|v| v.as_str()),
+                    Some("userMessage")
+                );
+            }
+            other => panic!("expected ContextSnapshot, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn reasoning_content_writes_turn_file() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
@@ -3220,6 +4142,24 @@ mod tests {
     }
 
     #[test]
+    fn round_complete_marks_running_session_idle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.write_meta(Some(Path::new("/tmp")), Some("task"));
+        log.turn_start(3, 0.0, 100000);
+        log.round_complete(2, 1);
+        drop(log);
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("idle"));
+        assert_eq!(meta.last_turn, Some(3));
+        assert_eq!(meta.rounds, Some(2));
+    }
+
+    #[test]
     fn mark_interrupted_updates_running_session() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
@@ -3252,6 +4192,37 @@ mod tests {
             serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
                 .unwrap();
         assert_eq!(meta.status.as_deref(), Some("completed"));
+    }
+
+    #[test]
+    fn mark_session_meta_interrupted_updates_running_meta_without_log_handle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        fs::create_dir_all(&log_dir).unwrap();
+        let meta = SessionMeta {
+            session_id: "session".to_string(),
+            created_at: "2026-05-29T00:00:00".to_string(),
+            project_root: Some("/tmp".to_string()),
+            name: None,
+            task: Some("task".to_string()),
+            status: Some("running".to_string()),
+            last_turn: None,
+            role: None,
+            rounds: None,
+        };
+        fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::to_string_pretty(&meta).unwrap(),
+        )
+        .unwrap();
+
+        assert!(mark_session_meta_interrupted(&log_dir, None));
+
+        let meta: SessionMeta =
+            serde_json::from_str(&fs::read_to_string(log_dir.join("session_meta.json")).unwrap())
+                .unwrap();
+        assert_eq!(meta.status.as_deref(), Some("interrupted"));
+        assert_eq!(meta.last_turn, Some(0));
     }
 
     #[test]
@@ -3470,11 +4441,7 @@ mod tests {
         log.user_transcript("also check the database", 3);
         log.voice_log("[tool] check_status({})", 4, Some("check_status"));
 
-        let results = search_voice_entries(
-            &log_dir,
-            &["auth".to_string()],
-            10,
-        );
+        let results = search_voice_entries(&log_dir, &["auth".to_string()], 10);
         assert_eq!(results.len(), 2);
         assert!(results[0].starts_with("[User]"));
         assert!(results[1].starts_with("[Model]"));
@@ -3490,11 +4457,7 @@ mod tests {
             log.user_transcript(&format!("test message {}", i), i);
         }
 
-        let results = search_voice_entries(
-            &log_dir,
-            &["test".to_string()],
-            3,
-        );
+        let results = search_voice_entries(&log_dir, &["test".to_string()], 3);
         assert_eq!(results.len(), 3);
     }
 
@@ -3506,11 +4469,7 @@ mod tests {
 
         log.user_transcript("hello world", 1);
 
-        let results = search_voice_entries(
-            &log_dir,
-            &["nonexistent".to_string()],
-            10,
-        );
+        let results = search_voice_entries(&log_dir, &["nonexistent".to_string()], 10);
         assert!(results.is_empty());
     }
 
@@ -3525,10 +4484,7 @@ mod tests {
 
     /// Helper: drop `log`, read session.jsonl, and return the last entry
     /// whose `event` field matches `event_type`.
-    fn read_last_event(
-        log_dir: &std::path::Path,
-        event_type: &str,
-    ) -> serde_json::Value {
+    fn read_last_event(log_dir: &std::path::Path, event_type: &str) -> serde_json::Value {
         let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         content
             .lines()
@@ -3563,6 +4519,7 @@ mod tests {
                 usage,
                 reasoning,
                 source,
+                ..
             } => {
                 assert_eq!(turn, 5);
                 // Verifies the full content was read from the turn file,
@@ -3576,6 +4533,73 @@ mod tests {
                 assert_eq!(source.as_deref(), Some("Codex"));
             }
             other => panic!("expected ModelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_model_response_preserves_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(3, 0.5, 100_000);
+        log.model_response_for_session(
+            Some("child-thread"),
+            "child response",
+            1,
+            2,
+            3,
+            0,
+            Some("Codex"),
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "model_response");
+        let evt = session_log_entry_to_app_event(&entry, &log_dir).unwrap();
+        match evt {
+            AppEvent::ModelResponse {
+                session_id,
+                content,
+                source,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(content, "child response");
+                assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected ModelResponse, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_agent_output_preserves_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(2, 0.5, 100_000);
+        log.agent_output_with_session_id(
+            Some("child-thread"),
+            "child stdout",
+            "",
+            Some("Codex"),
+            Some("out-1"),
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "agent_output");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::AgentOutput {
+                session_id,
+                stdout,
+                source,
+                output_id,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(stdout, "child stdout");
+                assert_eq!(source.as_deref(), Some("Codex"));
+                assert_eq!(output_id.as_deref(), Some("out-1"));
+            }
+            other => panic!("expected AgentOutput, got {:?}", other),
         }
     }
 
@@ -3619,6 +4643,139 @@ mod tests {
     }
 
     #[test]
+    fn rt_session_metadata_events() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.session_identity("child", "codex", "thread-child");
+        log.session_attached("child", "codex");
+        log.session_relationship("parent", "child", "subagent", false);
+        log.session_capabilities(
+            "child",
+            &crate::types::SessionCapabilities {
+                follow_up: true,
+                steer: false,
+                interrupt: false,
+                codex_thread_actions: vec![],
+                codex_managed_context: Some("managed".to_string()),
+                codex_context_archive: Some("summary".to_string()),
+                codex_command: Some("/opt/codex/bin/codex".to_string()),
+                codex_fast_mode: Some(false),
+                codex_service_tier: None,
+            },
+        );
+        log.session_goal(
+            "child",
+            Some(&crate::types::SessionGoal {
+                objective: "Ship feature parity".to_string(),
+                status: Some("active".to_string()),
+                elapsed_seconds: Some(42),
+                tokens_used: Some(10),
+                token_budget: Some(1000),
+            }),
+        );
+        drop(log);
+
+        let identity = read_last_event(&log_dir, "session_identity");
+        match session_log_entry_to_app_event(&identity, &log_dir).unwrap() {
+            AppEvent::SessionIdentity {
+                session_id,
+                source,
+                backend_session_id,
+            } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(source, "codex");
+                assert_eq!(backend_session_id, "thread-child");
+            }
+            other => panic!("expected SessionIdentity, got {:?}", other),
+        }
+
+        let attached = read_last_event(&log_dir, "session_attached");
+        match session_log_entry_to_app_event(&attached, &log_dir).unwrap() {
+            AppEvent::SessionAttached { session_id, source } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(source, "codex");
+            }
+            other => panic!("expected SessionAttached, got {:?}", other),
+        }
+
+        let relationship = read_last_event(&log_dir, "session_relationship");
+        match session_log_entry_to_app_event(&relationship, &log_dir).unwrap() {
+            AppEvent::SessionRelationship {
+                parent_session_id,
+                child_session_id,
+                relationship,
+                ephemeral,
+            } => {
+                assert_eq!(parent_session_id, "parent");
+                assert_eq!(child_session_id, "child");
+                assert_eq!(relationship, "subagent");
+                assert!(!ephemeral);
+            }
+            other => panic!("expected SessionRelationship, got {:?}", other),
+        }
+
+        let capabilities = read_last_event(&log_dir, "session_capabilities");
+        match session_log_entry_to_app_event(&capabilities, &log_dir).unwrap() {
+            AppEvent::SessionCapabilities {
+                session_id,
+                capabilities,
+            } => {
+                assert_eq!(session_id, "child");
+                assert!(capabilities.follow_up);
+                assert!(!capabilities.steer);
+                assert!(!capabilities.interrupt);
+                assert!(capabilities.codex_thread_actions.is_empty());
+                assert_eq!(
+                    capabilities.codex_managed_context.as_deref(),
+                    Some("managed")
+                );
+                assert_eq!(
+                    capabilities.codex_context_archive.as_deref(),
+                    Some("summary")
+                );
+                assert_eq!(
+                    capabilities.codex_command.as_deref(),
+                    Some("/opt/codex/bin/codex")
+                );
+                assert_eq!(capabilities.codex_fast_mode, Some(false));
+                assert_eq!(capabilities.codex_service_tier, None);
+            }
+            other => panic!("expected SessionCapabilities, got {:?}", other),
+        }
+
+        let goal = read_last_event(&log_dir, "session_goal");
+        match session_log_entry_to_app_event(&goal, &log_dir).unwrap() {
+            AppEvent::SessionGoal { session_id, goal } => {
+                let goal = goal.expect("goal should be present");
+                assert_eq!(session_id, "child");
+                assert_eq!(goal.objective, "Ship feature parity");
+                assert_eq!(goal.status.as_deref(), Some("active"));
+                assert_eq!(goal.elapsed_seconds, Some(42));
+            }
+            other => panic!("expected SessionGoal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_legacy_session_attached_info_replays_structured() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.info("Session attached: child (codex)");
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "info");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::SessionAttached { session_id, source } => {
+                assert_eq!(session_id, "child");
+                assert_eq!(source, "codex");
+            }
+            other => panic!("expected SessionAttached, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn rt_approval_waiting_to_approval_required() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
@@ -3633,6 +4790,7 @@ mod tests {
                 id,
                 command_preview,
                 category,
+                ..
             } => {
                 assert_eq!(id, 7, "id should be synthesized from turn");
                 assert_eq!(command_preview, "exec: rm -rf /tmp/x");
@@ -3653,12 +4811,41 @@ mod tests {
 
         let entry = read_last_event(&log_dir, "approval");
         match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
-            AppEvent::ApprovalResolved { id, action } => {
+            AppEvent::ApprovalResolved { id, action, .. } => {
                 assert_eq!(id, 3);
                 assert_eq!(action, "approve");
             }
             other => panic!("expected ApprovalResolved, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn approval_resolved_dedupes_repeated_resolution() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.approval_resolved(7, "approve");
+        log.approval_resolved(7, "approve");
+        log.approval_resolved(7, "reject");
+        log.approval_resolved(8, "approve");
+        drop(log);
+
+        let content = fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries: Vec<serde_json::Value> = content
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|entry| {
+                entry.get("event").and_then(|event| event.as_str()) == Some("approval_resolved")
+            })
+            .collect();
+
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[0]["turn"], 7);
+        assert_eq!(entries[0]["message"], "Approval approve (turn 7)");
+        assert_eq!(entries[1]["turn"], 7);
+        assert_eq!(entries[1]["message"], "Approval reject (turn 7)");
+        assert_eq!(entries[2]["turn"], 8);
+        assert_eq!(entries[2]["message"], "Approval approve (turn 8)");
     }
 
     #[test]
@@ -3695,6 +4882,7 @@ mod tests {
                 source,
                 content,
                 turn,
+                ..
             } => {
                 assert_eq!(level, "warn");
                 assert_eq!(source, "system");
@@ -3726,6 +4914,7 @@ mod tests {
                 stdout,
                 stderr,
                 source,
+                ..
             } => {
                 // Full content read from turn file, not truncated preview.
                 assert_eq!(stdout.len(), 600);
@@ -3735,6 +4924,27 @@ mod tests {
             }
             other => panic!("expected AgentOutput, got {:?}", other),
         }
+    }
+
+    #[test]
+    fn agent_output_chunks_by_id_reads_spans_not_full_turn_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.agent_output_with_id("first", "", Some("Codex"), Some("out-1"));
+        log.agent_output_with_id("second", "warn", Some("Codex"), Some("out-2"));
+        drop(log);
+
+        let chunks =
+            agent_output_chunks_by_id(&log_dir, &["out-2".to_string(), "out-1".to_string()]);
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].output_id, "out-2");
+        assert_eq!(chunks[0].stdout, "second");
+        assert_eq!(chunks[0].stderr, "warn");
+        assert_eq!(chunks[1].output_id, "out-1");
+        assert_eq!(chunks[1].stdout, "first");
+        assert_eq!(chunks[1].stderr, "");
     }
 
     #[test]
@@ -3755,6 +4965,7 @@ mod tests {
                 turn,
                 commands_preview,
                 source,
+                ..
             } => {
                 assert_eq!(turn, 1);
                 // format_commands_preview normalized it.
@@ -3762,6 +4973,101 @@ mod tests {
                 assert!(source.is_none());
             }
             other => panic!("expected AgentStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_agent_started_preserves_session_id_and_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.agent_started_with_session_id(
+            Some("session-1"),
+            7,
+            "exec: echo hi",
+            Some("call-1"),
+            Some("Codex"),
+        );
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "agent_started");
+        let data = entry.get("data").and_then(|v| v.as_object()).unwrap();
+        assert_eq!(
+            data.get("session_id").and_then(|v| v.as_str()),
+            Some("session-1")
+        );
+        assert_eq!(data.get("item_id").and_then(|v| v.as_str()), Some("call-1"));
+        assert_eq!(data.get("source").and_then(|v| v.as_str()), Some("Codex"));
+
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::AgentStarted {
+                session_id,
+                turn,
+                commands_preview,
+                item_id,
+                source,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-1"));
+                assert_eq!(turn, 7);
+                assert_eq!(commands_preview, "exec: echo hi");
+                assert_eq!(item_id.as_deref(), Some("call-1"));
+                assert_eq!(source.as_deref(), Some("Codex"));
+            }
+            other => panic!("expected AgentStarted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_done_signal_preserves_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.done_signal_for_session(Some("session-1"), Some("done"));
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "done_signal");
+        assert_eq!(
+            entry.pointer("/data/session_id").and_then(|v| v.as_str()),
+            Some("session-1")
+        );
+
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::DoneSignal {
+                session_id,
+                message,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-1"));
+                assert_eq!(message.as_deref(), Some("done"));
+            }
+            other => panic!("expected DoneSignal, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn rt_task_complete_preserves_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        log.task_complete_for_session(Some("session-1"), "done", Some("summary"));
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "task_complete");
+        assert_eq!(
+            entry.pointer("/data/session_id").and_then(|v| v.as_str()),
+            Some("session-1")
+        );
+
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::TaskComplete {
+                session_id,
+                reason,
+                summary,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-1"));
+                assert_eq!(reason, "done");
+                assert_eq!(summary.as_deref(), Some("summary"));
+            }
+            other => panic!("expected TaskComplete, got {:?}", other),
         }
     }
 
@@ -3864,6 +5170,7 @@ mod tests {
         log.recording_started("rec-1");
         log.recording_error("rec-1", "encoder crashed");
         log.recording_stopped("rec-1");
+        log.recording_deleted("rec-1");
         drop(log);
 
         let started = read_last_event(&log_dir, "recording_started");
@@ -3893,6 +5200,14 @@ mod tests {
             }
             other => panic!("expected RecordingStopped, got {:?}", other),
         }
+
+        let deleted = read_last_event(&log_dir, "recording_deleted");
+        match session_log_entry_to_app_event(&deleted, &log_dir).unwrap() {
+            AppEvent::RecordingDeleted { stream_name } => {
+                assert_eq!(stream_name, "rec-1")
+            }
+            other => panic!("expected RecordingDeleted, got {:?}", other),
+        }
     }
 
     #[test]
@@ -3901,7 +5216,15 @@ mod tests {
         let log_dir = dir.path().join("session");
         let mut log = SessionLog::open(log_dir.clone()).unwrap();
         log.cu_task_start("click send button", "openai", "gpt-5-cu", true, None, 0);
-        log.cu_turn(1, 0, 2, 1, 50, 30, &["click(100,200)".to_string(), "type(hi)".to_string()]);
+        log.cu_turn(
+            1,
+            0,
+            2,
+            1,
+            50,
+            30,
+            &["click(100,200)".to_string(), "type(hi)".to_string()],
+        );
         log.cu_task_complete(3, true, "done");
         log.cu_task_error("display lost", None);
         drop(log);
@@ -3948,9 +5271,7 @@ mod tests {
 
         let err = read_last_event(&log_dir, "cu_task_error");
         match session_log_entry_to_app_event(&err, &log_dir).unwrap() {
-            AppEvent::LogEntry {
-                level, content, ..
-            } => {
+            AppEvent::LogEntry { level, content, .. } => {
                 assert_eq!(level, "warn");
                 assert!(content.contains("display lost"));
             }
@@ -4008,6 +5329,27 @@ mod tests {
         });
         match session_log_entry_to_app_event(&presence, dir.path()).unwrap() {
             AppEvent::LogEntry { source, .. } => assert_eq!(source, "server"),
+            other => panic!("expected LogEntry, got {:?}", other),
+        }
+
+        // "[user] ..." → user source with the storage prefix stripped.
+        let user = serde_json::json!({
+            "ts": "01:00:00.000",
+            "event": "info",
+            "level": "info",
+            "message": "[user] Continue fixing the activity log",
+        });
+        match session_log_entry_to_app_event(&user, dir.path()).unwrap() {
+            AppEvent::LogEntry {
+                level,
+                source,
+                content,
+                ..
+            } => {
+                assert_eq!(level, "info");
+                assert_eq!(source, "User");
+                assert_eq!(content, "Continue fixing the activity log");
+            }
             other => panic!("expected LogEntry, got {:?}", other),
         }
     }

@@ -207,6 +207,37 @@ check_recording() {
     $all_ok
 }
 
+check_managed_browser() {
+    local all_ok=true
+
+    echo ""
+    echo "Managed browser workspace dependency:"
+
+    local script_dir repo_root intendant_bin
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    repo_root="$script_dir/.."
+    intendant_bin="$repo_root/target/release/intendant"
+
+    if [[ -x "$intendant_bin" ]]; then
+        if "$intendant_bin" setup browsers --check --print-path >/dev/null 2>&1; then
+            ok "Chrome for Testing / managed Chromium"
+        else
+            miss "Chrome for Testing / managed Chromium" "$intendant_bin setup browsers"
+            all_ok=false
+        fi
+    else
+        local cache_root="${XDG_CACHE_HOME:-$HOME/Library/Caches}/intendant/browser-workspaces"
+        if [[ -d "$cache_root" ]] && find "$cache_root" -type f \( -name "Google Chrome for Testing" -o -name "Chromium" -o -name "chrome" \) -print -quit 2>/dev/null | grep -q .; then
+            ok "Chrome for Testing / managed Chromium"
+        else
+            miss "Chrome for Testing / managed Chromium" "build first, then run target/release/intendant setup browsers"
+            all_ok=false
+        fi
+    fi
+
+    $all_ok
+}
+
 # WASM build deps (required — build.rs auto-rebuilds WASM when source changes)
 check_wasm() {
     echo ""
@@ -255,16 +286,40 @@ install_vortex_audio() {
     script_dir="$(cd "$(dirname "$0")" && pwd)"
     local vortex_tools="$script_dir/../vendor/vortex-guest-tools"
     local pkg="$vortex_tools/VortexGuestTools.pkg"
+    local manifest="$vortex_tools/VortexGuestTools.pkg.manifest"
 
-    if [[ -f "$pkg" ]]; then
-        info "installing Vortex guest tools..."
-        sudo installer -pkg "$pkg" -target /
-        NEEDS_REBOOT=true
-    else
+    if [[ ! -f "$pkg" ]]; then
         warn "Vortex guest tools not found at $pkg"
         warn "Audio routing will fall back to BlackHole."
-        warn "To install Vortex: place VortexGuestTools.pkg in vendor/vortex-guest-tools/"
+        warn "To install Vortex: run scripts/update-vortex-pkg.sh"
+        return
     fi
+
+    # Verify the vendored pkg matches its committed integrity manifest before
+    # we hand it to `sudo installer`. The pkg installs a LaunchDaemon and a
+    # CoreAudio HAL plugin that run as root — any tamper here is full machine
+    # compromise. Manifest is refreshed atomically by update-vortex-pkg.sh.
+    if [[ ! -f "$manifest" ]]; then
+        die "Vortex pkg present but manifest missing: $manifest"
+    fi
+
+    local expected actual
+    expected="$(awk -F': ' '$1 == "pkg_sha256" { print $2; exit }' "$manifest")"
+    [[ -n "$expected" ]] || die "manifest is missing pkg_sha256: $manifest"
+
+    actual="$(shasum -a 256 "$pkg" | awk '{print $1}')"
+    if [[ "$actual" != "$expected" ]]; then
+        warn "Vortex pkg sha256 mismatch — refusing to install."
+        warn "  expected: $expected"
+        warn "  actual:   $actual"
+        warn "  manifest: $manifest"
+        die "Refresh via scripts/update-vortex-pkg.sh or verify the pkg manually."
+    fi
+    ok "Vortex pkg integrity verified ($expected)"
+
+    info "installing Vortex guest tools..."
+    sudo installer -pkg "$pkg" -target /
+    NEEDS_REBOOT=true
 }
 
 set_vortex_defaults() {
@@ -330,6 +385,29 @@ install_blackhole() {
     NEEDS_REBOOT=true
 }
 
+install_managed_browser() {
+    local script_dir repo_root intendant_bin
+    script_dir="$(cd "$(dirname "$0")" && pwd)"
+    repo_root="$script_dir/.."
+    intendant_bin="$repo_root/target/release/intendant"
+
+    if [[ ! -x "$intendant_bin" ]]; then
+        warn "cannot install managed browser; missing $intendant_bin"
+        warn "after building, run: target/release/intendant setup browsers"
+        return
+    fi
+
+    info "installing managed Chrome for Testing browser..."
+    if "$intendant_bin" setup browsers; then
+        ok "managed browser ready"
+    else
+        warn "managed browser install failed; browser workspaces need one of:"
+        warn "  target/release/intendant setup browsers"
+        warn "  INTENDANT_BROWSER_WORKSPACE_EXECUTABLE=/path/to/chrome"
+        warn "  provider=system_cdp for an explicit system-browser launch"
+    fi
+}
+
 build_intendant() {
     info "building intendant (release)..."
     local script_dir
@@ -353,11 +431,12 @@ run_check() {
     echo "  Intendant macOS Dependency Check"
     echo "════════════════════════════════════════════════════════"
 
-    local core_ok cu_ok audio_ok rec_ok
+    local core_ok cu_ok audio_ok rec_ok browser_ok
     check_core         && core_ok=true  || core_ok=false
     check_computer_use && cu_ok=true    || cu_ok=false
     check_audio        && audio_ok=true || audio_ok=false
     check_recording    && rec_ok=true   || rec_ok=false
+    check_managed_browser && browser_ok=true || browser_ok=false
 
     check_wasm
 
@@ -380,6 +459,12 @@ run_check() {
         echo "  Recording: ready"
     else
         echo "  Recording: missing dependencies"
+    fi
+
+    if $browser_ok; then
+        echo "  Browser workspaces: ready"
+    else
+        echo "  Browser workspaces: missing managed browser"
     fi
 
     echo ""
@@ -414,20 +499,23 @@ run_install() {
     echo ""
     build_intendant
 
-    # Phase 5: Set audio defaults
+    # Phase 5: Managed browser for CDP browser workspaces
+    install_managed_browser
+
+    # Phase 6: Set audio defaults
     set_vortex_defaults
 
-    # Phase 6: Disable screensaver so the agent isn't interrupted
+    # Phase 7: Disable screensaver so the agent isn't interrupted
     disable_screen_lock
 
-    # Phase 7: App bundle
+    # Phase 8: App bundle
     echo ""
     info "building macOS app bundle..."
     if [ -f scripts/bundle-macos.sh ]; then
         bash scripts/bundle-macos.sh
     fi
 
-    # Phase 8: Final status
+    # Phase 9: Final status
     echo ""
     echo "════════════════════════════════════════════════════════"
     echo "  Setup complete!"

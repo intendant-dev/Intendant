@@ -6,6 +6,10 @@
 
 use serde::{Deserialize, Serialize};
 
+fn is_false(value: &bool) -> bool {
+    !*value
+}
+
 // ── UiCommand ──────────────────────────────────────────────────────
 
 /// Commands sent from WASM to JS for DOM updates.
@@ -18,14 +22,36 @@ pub enum UiCommand {
         level: String,
         source: String,
         content: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        kind: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
         #[serde(default)]
         collapsible: bool,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         turn: Option<u64>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_turn_index: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_turn_revision: Option<u32>,
+        #[serde(default, skip_serializing_if = "is_false")]
+        superseded: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        replacement_for_user_turn_index: Option<u32>,
         /// Base64-encoded images (screenshots) associated with this entry.
         /// Sent separately from content so JS can lazy-load them on expand.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         images: Vec<String>,
+    },
+    MarkActivityContextRewind {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        user_turn_index: u32,
+        turns_removed: u32,
     },
     ClearLogs,
     AddTurnSeparator {
@@ -54,6 +80,8 @@ pub enum UiCommand {
         id: u64,
         command: String,
         category: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
     },
     HideApproval,
     ShowHumanInput {
@@ -62,6 +90,8 @@ pub enum UiCommand {
     HideHumanInput,
     HideAllPanels,
     UpdateUsage {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         main_json: Option<String>,
         presence_json: Option<String>,
         live_json: Option<String>,
@@ -81,6 +111,9 @@ pub enum UiCommand {
     RemoveRecording {
         stream_name: String,
     },
+    DeleteRecording {
+        stream_name: String,
+    },
     RecordingError {
         stream_name: String,
         message: String,
@@ -89,6 +122,10 @@ pub enum UiCommand {
         session_id: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         task: Option<String>,
+    },
+    SessionAttached {
+        session_id: String,
+        source: String,
     },
     SessionEnded {
         session_id: String,
@@ -219,7 +256,19 @@ pub enum UiCommand {
     /// /memory-reset, /new) finished. `success` + `message` drive a
     /// dashboard toast and the Activity log entry.
     CodexThreadActionResult {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         action: String,
+        success: bool,
+        message: String,
+    },
+    /// A generic session rename finished after being persisted by the daemon.
+    SessionRenameResult {
+        session_id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
         success: bool,
         message: String,
     },
@@ -228,6 +277,8 @@ pub enum UiCommand {
     /// false) from "override removed" (field None, bool true) so the
     /// Control sub-tab can zero the corresponding input.
     CodexConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -281,10 +332,10 @@ pub enum UiCommand {
     HistoryChanged,
     /// Status update for an in-flight mid-turn steer. Emitted when the
     /// browser sends a steer (pending), when the backend reports it
-    /// queued, or when the backend reports it delivered. The JS layer
+    /// accepted, queued, or when the backend reports it delivered. The JS layer
     /// maintains an "in-flight steers" strip above the activity log and
     /// updates the row keyed by `id`. `status` is one of
-    /// `"pending"` | `"queued"` | `"delivered"`.
+    /// `"pending"` | `"accepted"` | `"queued"` | `"delivered"`.
     SteerStatusUpdate {
         id: String,
         text: String,
@@ -311,6 +362,9 @@ pub struct FileChangeEntry {
 pub enum SteerStatus {
     /// Sent by the browser, awaiting backend acknowledgement.
     Pending,
+    /// Backend/runtime accepted the steer. The model may not see it until the
+    /// backend reaches a checkpoint.
+    Accepted,
     /// Backend acknowledged but can't deliver mid-turn — message
     /// is queued and will be delivered at the next turn boundary.
     Queued,
@@ -339,49 +393,254 @@ pub struct ModelPricing {
     pub output: f64,
 }
 
-/// Static pricing table. Searched by exact match then prefix/contains.
+/// Static pricing table. Searched by exact match then longest version-prefix match.
 const PRICING_TABLE: &[(&str, ModelPricing)] = &[
     // OpenAI
-    ("gpt-5.4", ModelPricing { input: 2.5e-6, cached: 1.25e-6, output: 15.0e-6 }),
-    ("gpt-5.4-mini", ModelPricing { input: 0.5e-6, cached: 0.25e-6, output: 3.0e-6 }),
-    ("gpt-5.4-nano", ModelPricing { input: 0.15e-6, cached: 0.075e-6, output: 0.6e-6 }),
-    ("gpt-5.2-codex", ModelPricing { input: 1.75e-6, cached: 0.175e-6, output: 7.0e-6 }),
-    ("gpt-5", ModelPricing { input: 1.25e-6, cached: 0.625e-6, output: 10.0e-6 }),
-    ("gpt-5-mini", ModelPricing { input: 0.25e-6, cached: 0.125e-6, output: 2.0e-6 }),
-    ("gpt-4.1", ModelPricing { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 }),
-    ("gpt-4.1-mini", ModelPricing { input: 0.4e-6, cached: 0.2e-6, output: 1.6e-6 }),
-    ("gpt-4.1-nano", ModelPricing { input: 0.1e-6, cached: 0.05e-6, output: 0.4e-6 }),
-    ("o3", ModelPricing { input: 2.0e-6, cached: 1.0e-6, output: 8.0e-6 }),
-    ("o3-pro", ModelPricing { input: 150.0e-6, cached: 75.0e-6, output: 600.0e-6 }),
-    ("o4-mini", ModelPricing { input: 1.1e-6, cached: 0.55e-6, output: 4.4e-6 }),
+    (
+        "gpt-5.5",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 30.0e-6,
+        },
+    ),
+    (
+        "gpt-5.4",
+        ModelPricing {
+            input: 2.5e-6,
+            cached: 0.25e-6,
+            output: 15.0e-6,
+        },
+    ),
+    (
+        "gpt-5.4-mini",
+        ModelPricing {
+            input: 0.75e-6,
+            cached: 0.075e-6,
+            output: 4.5e-6,
+        },
+    ),
+    (
+        "gpt-5.4-nano",
+        ModelPricing {
+            input: 0.2e-6,
+            cached: 0.02e-6,
+            output: 1.25e-6,
+        },
+    ),
+    (
+        "gpt-5.2",
+        ModelPricing {
+            input: 1.75e-6,
+            cached: 0.175e-6,
+            output: 14.0e-6,
+        },
+    ),
+    (
+        "gpt-5.2-codex",
+        ModelPricing {
+            input: 1.75e-6,
+            cached: 0.175e-6,
+            output: 14.0e-6,
+        },
+    ),
+    (
+        "gpt-5.3-codex",
+        ModelPricing {
+            input: 1.75e-6,
+            cached: 0.175e-6,
+            output: 14.0e-6,
+        },
+    ),
+    (
+        "gpt-5",
+        ModelPricing {
+            input: 1.25e-6,
+            cached: 0.125e-6,
+            output: 10.0e-6,
+        },
+    ),
+    (
+        "gpt-5-mini",
+        ModelPricing {
+            input: 0.25e-6,
+            cached: 0.025e-6,
+            output: 2.0e-6,
+        },
+    ),
+    (
+        "gpt-4.1",
+        ModelPricing {
+            input: 2.0e-6,
+            cached: 0.5e-6,
+            output: 8.0e-6,
+        },
+    ),
+    (
+        "gpt-4.1-mini",
+        ModelPricing {
+            input: 0.4e-6,
+            cached: 0.1e-6,
+            output: 1.6e-6,
+        },
+    ),
+    (
+        "gpt-4.1-nano",
+        ModelPricing {
+            input: 0.1e-6,
+            cached: 0.025e-6,
+            output: 0.4e-6,
+        },
+    ),
+    (
+        "o3",
+        ModelPricing {
+            input: 2.0e-6,
+            cached: 1.0e-6,
+            output: 8.0e-6,
+        },
+    ),
+    (
+        "o3-pro",
+        ModelPricing {
+            input: 150.0e-6,
+            cached: 75.0e-6,
+            output: 600.0e-6,
+        },
+    ),
+    (
+        "o4-mini",
+        ModelPricing {
+            input: 1.1e-6,
+            cached: 0.55e-6,
+            output: 4.4e-6,
+        },
+    ),
     // Anthropic
-    ("claude-opus-4-6", ModelPricing { input: 5.0e-6, cached: 0.5e-6, output: 25.0e-6 }),
-    ("claude-sonnet-4-6", ModelPricing { input: 3.0e-6, cached: 0.3e-6, output: 15.0e-6 }),
-    ("claude-sonnet-4-5-20250929", ModelPricing { input: 3.0e-6, cached: 0.3e-6, output: 15.0e-6 }),
-    ("claude-opus-4-5-20250929", ModelPricing { input: 15.0e-6, cached: 1.5e-6, output: 75.0e-6 }),
-    ("claude-haiku-4-5", ModelPricing { input: 0.25e-6, cached: 0.025e-6, output: 1.25e-6 }),
+    (
+        "claude-opus-4-8",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
+        "claude-opus-4-6",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
+        "claude-opus-4-7",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
+        "claude-sonnet-4-6",
+        ModelPricing {
+            input: 3.0e-6,
+            cached: 0.3e-6,
+            output: 15.0e-6,
+        },
+    ),
+    (
+        "claude-sonnet-4-5-20250929",
+        ModelPricing {
+            input: 3.0e-6,
+            cached: 0.3e-6,
+            output: 15.0e-6,
+        },
+    ),
+    (
+        "claude-opus-4-5-20250929",
+        ModelPricing {
+            input: 5.0e-6,
+            cached: 0.5e-6,
+            output: 25.0e-6,
+        },
+    ),
+    (
+        "claude-haiku-4-5",
+        ModelPricing {
+            input: 1.0e-6,
+            cached: 0.1e-6,
+            output: 5.0e-6,
+        },
+    ),
     // Gemini
-    ("gemini-2.5-pro", ModelPricing { input: 1.25e-6, cached: 0.125e-6, output: 10.0e-6 }),
-    ("gemini-2.5-flash", ModelPricing { input: 0.3e-6, cached: 0.03e-6, output: 2.5e-6 }),
-    ("gemini-2.5-flash-lite", ModelPricing { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 }),
-    ("gemini-2.0-flash", ModelPricing { input: 0.1e-6, cached: 0.01e-6, output: 0.4e-6 }),
+    (
+        "gemini-3-flash",
+        ModelPricing {
+            input: 0.5e-6,
+            cached: 0.05e-6,
+            output: 3.0e-6,
+        },
+    ),
+    (
+        "gemini-3.1-flash",
+        ModelPricing {
+            input: 0.5e-6,
+            cached: 0.05e-6,
+            output: 3.0e-6,
+        },
+    ),
+    (
+        "gemini-2.5-pro",
+        ModelPricing {
+            input: 1.25e-6,
+            cached: 0.125e-6,
+            output: 10.0e-6,
+        },
+    ),
+    (
+        "gemini-2.5-flash",
+        ModelPricing {
+            input: 0.3e-6,
+            cached: 0.03e-6,
+            output: 2.5e-6,
+        },
+    ),
+    (
+        "gemini-2.5-flash-lite",
+        ModelPricing {
+            input: 0.1e-6,
+            cached: 0.01e-6,
+            output: 0.4e-6,
+        },
+    ),
+    (
+        "gemini-2.0-flash",
+        ModelPricing {
+            input: 0.1e-6,
+            cached: 0.01e-6,
+            output: 0.4e-6,
+        },
+    ),
 ];
 
-/// Find pricing for a model by exact match, then prefix/contains.
+fn model_key_matches(model: &str, key: &str) -> bool {
+    model == key || model.starts_with(&format!("{key}-"))
+}
+
+/// Find pricing for a model by exact match, then longest version-prefix match.
 pub fn find_pricing(model: &str) -> Option<ModelPricing> {
-    // Exact match
+    let model = model.rsplit('/').next().unwrap_or(model);
     for &(key, pricing) in PRICING_TABLE {
         if model == key {
             return Some(pricing);
         }
     }
-    // Prefix/contains match
-    for &(key, pricing) in PRICING_TABLE {
-        if model.starts_with(key) || model.contains(key) {
-            return Some(pricing);
-        }
-    }
-    None
+    PRICING_TABLE
+        .iter()
+        .filter(|(key, _)| model_key_matches(model, key))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, pricing)| *pricing)
 }
 
 /// Calculate cost from token counts and pricing.
@@ -401,6 +660,179 @@ pub fn calculate_cost(
     }
 }
 
+/// Per-token pricing in USD for realtime/live multimodal models.
+#[derive(Debug, Clone, Copy)]
+pub struct LiveModelPricing {
+    pub text_input: f64,
+    pub text_cached: f64,
+    pub text_output: f64,
+    pub audio_input: f64,
+    pub audio_cached: f64,
+    pub audio_output: f64,
+    pub image_input: f64,
+    pub image_cached: f64,
+}
+
+const LIVE_PRICING_TABLE: &[(&str, LiveModelPricing)] = &[
+    (
+        "gpt-realtime-1.5",
+        LiveModelPricing {
+            text_input: 4.0e-6,
+            text_cached: 0.4e-6,
+            text_output: 16.0e-6,
+            audio_input: 32.0e-6,
+            audio_cached: 0.4e-6,
+            audio_output: 64.0e-6,
+            image_input: 5.0e-6,
+            image_cached: 0.5e-6,
+        },
+    ),
+    (
+        "gpt-realtime",
+        LiveModelPricing {
+            text_input: 4.0e-6,
+            text_cached: 0.4e-6,
+            text_output: 16.0e-6,
+            audio_input: 32.0e-6,
+            audio_cached: 0.4e-6,
+            audio_output: 64.0e-6,
+            image_input: 5.0e-6,
+            image_cached: 0.5e-6,
+        },
+    ),
+    (
+        "gpt-realtime-mini",
+        LiveModelPricing {
+            text_input: 0.6e-6,
+            text_cached: 0.06e-6,
+            text_output: 2.4e-6,
+            audio_input: 10.0e-6,
+            audio_cached: 0.3e-6,
+            audio_output: 20.0e-6,
+            image_input: 0.6e-6,
+            image_cached: 0.06e-6,
+        },
+    ),
+    (
+        "gpt-4o-realtime-preview",
+        LiveModelPricing {
+            text_input: 5.0e-6,
+            text_cached: 2.5e-6,
+            text_output: 20.0e-6,
+            audio_input: 40.0e-6,
+            audio_cached: 2.5e-6,
+            audio_output: 80.0e-6,
+            image_input: 5.0e-6,
+            image_cached: 2.5e-6,
+        },
+    ),
+    (
+        "gemini-3.1-flash-live-preview",
+        LiveModelPricing {
+            text_input: 0.75e-6,
+            text_cached: 0.75e-6,
+            text_output: 4.5e-6,
+            audio_input: 3.0e-6,
+            audio_cached: 3.0e-6,
+            audio_output: 12.0e-6,
+            image_input: 1.0e-6,
+            image_cached: 1.0e-6,
+        },
+    ),
+    (
+        "gemini-2.5-flash-native-audio-preview-12-2025",
+        LiveModelPricing {
+            text_input: 0.5e-6,
+            text_cached: 0.5e-6,
+            text_output: 3.0e-6,
+            audio_input: 3.0e-6,
+            audio_cached: 3.0e-6,
+            audio_output: 12.0e-6,
+            image_input: 1.0e-6,
+            image_cached: 1.0e-6,
+        },
+    ),
+];
+
+fn find_live_pricing(model: &str) -> Option<LiveModelPricing> {
+    let model = model.rsplit('/').next().unwrap_or(model);
+    for &(key, pricing) in LIVE_PRICING_TABLE {
+        if model == key {
+            return Some(pricing);
+        }
+    }
+    LIVE_PRICING_TABLE
+        .iter()
+        .filter(|(key, _)| model_key_matches(model, key))
+        .max_by_key(|(key, _)| key.len())
+        .map(|(_, pricing)| *pricing)
+}
+
+fn billed_input_cost(tokens: u64, cached: u64, input_rate: f64, cached_rate: f64) -> f64 {
+    let cached = cached.min(tokens);
+    tokens.saturating_sub(cached) as f64 * input_rate + cached as f64 * cached_rate
+}
+
+pub fn calculate_live_cost(usage: &LiveUsageSnapshot) -> Option<CostBreakdown> {
+    if let Some(pricing) = find_live_pricing(&usage.model) {
+        let has_details = usage.input_text_tokens
+            + usage.input_audio_tokens
+            + usage.input_image_tokens
+            + usage.cached_text_tokens
+            + usage.cached_audio_tokens
+            + usage.cached_image_tokens
+            + usage.output_text_tokens
+            + usage.output_audio_tokens
+            > 0;
+        if has_details {
+            let input_cost = billed_input_cost(
+                usage.input_text_tokens,
+                usage.cached_text_tokens,
+                pricing.text_input,
+                pricing.text_cached,
+            ) + billed_input_cost(
+                usage.input_audio_tokens,
+                usage.cached_audio_tokens,
+                pricing.audio_input,
+                pricing.audio_cached,
+            ) + billed_input_cost(
+                usage.input_image_tokens,
+                usage.cached_image_tokens,
+                pricing.image_input,
+                pricing.image_cached,
+            );
+            let output_cost = (usage.output_text_tokens + usage.thinking_tokens) as f64
+                * pricing.text_output
+                + usage.output_audio_tokens as f64 * pricing.audio_output;
+            return Some(CostBreakdown {
+                input_cost,
+                output_cost,
+                total: input_cost + output_cost,
+            });
+        }
+
+        let cached = usage.cached_tokens.min(usage.input_tokens);
+        let input_cost = usage.input_tokens.saturating_sub(cached) as f64 * pricing.audio_input
+            + cached as f64 * pricing.audio_cached;
+        let output_cost =
+            (usage.output_tokens + usage.thinking_tokens) as f64 * pricing.audio_output;
+        return Some(CostBreakdown {
+            input_cost,
+            output_cost,
+            total: input_cost + output_cost,
+        });
+    }
+
+    find_pricing(&usage.model).map(|pricing| {
+        calculate_cost(
+            usage.input_tokens,
+            usage.output_tokens + usage.thinking_tokens,
+            usage.cached_tokens,
+            &pricing,
+        )
+    })
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CostBreakdown {
     pub input_cost: f64,
@@ -416,6 +848,8 @@ pub struct UsageSnapshot {
     pub model: String,
     pub tokens_used: u64,
     pub context_window: u64,
+    #[serde(default)]
+    pub hard_context_window: Option<u64>,
     pub usage_pct: f64,
     #[serde(default)]
     pub prompt_tokens: u64,
@@ -454,6 +888,22 @@ pub struct LiveUsageSnapshot {
     pub cached_tokens: u64,
     pub total_tokens: u64,
     pub thinking_tokens: u64,
+    #[serde(default)]
+    pub input_text_tokens: u64,
+    #[serde(default)]
+    pub input_audio_tokens: u64,
+    #[serde(default)]
+    pub input_image_tokens: u64,
+    #[serde(default)]
+    pub cached_text_tokens: u64,
+    #[serde(default)]
+    pub cached_audio_tokens: u64,
+    #[serde(default)]
+    pub cached_image_tokens: u64,
+    #[serde(default)]
+    pub output_text_tokens: u64,
+    #[serde(default)]
+    pub output_audio_tokens: u64,
 }
 
 // ── Token history entry ────────────────────────────────────────────
@@ -468,7 +918,7 @@ pub struct TokenHistoryEntry {
 
 fn source_label(source: &str) -> &str {
     match source {
-        "system" => "\u{2139}",  // ℹ
+        "system" => "\u{2139}", // ℹ
         "worker" => "Model",
         "agent" => "Run",
         "server" => "Servr",
@@ -486,9 +936,15 @@ fn source_label(source: &str) -> &str {
 
 fn visible_levels(verbosity: &str) -> &'static [&'static str] {
     match verbosity {
-        "verbose" => &["info", "model", "agent", "error", "warn", "subagent", "detail", "presence"],
-        "debug" => &["info", "model", "agent", "error", "warn", "subagent", "detail", "debug", "presence"],
-        _ => &["info", "model", "agent", "error", "warn", "subagent", "presence"], // normal
+        "verbose" => &[
+            "info", "model", "agent", "error", "warn", "subagent", "detail", "presence",
+        ],
+        "debug" => &[
+            "info", "model", "agent", "error", "warn", "subagent", "detail", "debug", "presence",
+        ],
+        _ => &[
+            "info", "model", "agent", "error", "warn", "subagent", "presence",
+        ], // normal
     }
 }
 
@@ -504,8 +960,16 @@ struct LogEntry {
     level: String,
     source: String,
     content: String,
+    session_id: Option<String>,
+    kind: Option<String>,
+    output_id: Option<String>,
+    item_id: Option<String>,
     collapsible: bool,
     turn: Option<u64>,
+    user_turn_index: Option<u32>,
+    user_turn_revision: Option<u32>,
+    superseded: bool,
+    replacement_for_user_turn_index: Option<u32>,
 }
 
 // ── AppState ───────────────────────────────────────────────────────
@@ -532,11 +996,14 @@ pub struct AppState {
     /// path.  Live callers pass `None` and wallclock is used as before.
     ///
     /// Set at the top of `handle_event` when the inbound message carries
-    /// a `ts` field; cleared by the guard returned from `begin_replay_ts`.
+    /// a `ts` field; cleared before `handle_event` returns.
     replay_ts: Option<String>,
+    event_session_id: Option<String>,
 
     // Usage
     main_usage: Option<UsageSnapshot>,
+    session_main_usage: std::collections::HashMap<String, UsageSnapshot>,
+    usage_log_bands: std::collections::HashMap<String, u8>,
     presence_usage: Option<UsageSnapshot>,
     live_usage: Option<LiveUsageSnapshot>,
     token_history: Vec<TokenHistoryEntry>,
@@ -556,7 +1023,7 @@ pub struct AppState {
 
     /// In-flight mid-turn steer messages keyed by client-generated id.
     /// Populated when the browser sees `steer_requested`, updated on
-    /// `steer_queued`, and removed on `steer_delivered`. The UI renders
+    /// `steer_accepted` / `steer_queued`, and removed on `steer_delivered`. The UI renders
     /// the remaining entries as a strip above the activity log so the
     /// user can see which interjections are still pending.
     pub queued_steers: std::collections::HashMap<String, QueuedSteer>,
@@ -576,7 +1043,10 @@ impl AppState {
             log_buffer: Vec::new(),
             verbosity: "normal".to_string(),
             replay_ts: None,
+            event_session_id: None,
             main_usage: None,
+            session_main_usage: std::collections::HashMap::new(),
+            usage_log_bands: std::collections::HashMap::new(),
             presence_usage: None,
             live_usage: None,
             token_history: Vec::new(),
@@ -594,8 +1064,31 @@ impl AppState {
         self.active_tab = tab.to_string();
         let mut cmds = Vec::new();
         if tab == "activity" {
-            cmds.push(UiCommand::HideBadge { tab: "activity".into() });
+            cmds.push(UiCommand::HideBadge {
+                tab: "activity".into(),
+            });
         }
+        cmds
+    }
+
+    /// Select which agent session should drive session-scoped UI updates.
+    pub fn select_session(&mut self, session_id: &str) -> Vec<UiCommand> {
+        self.session_id = session_id.to_string();
+        let mut cmds = Vec::new();
+        if let Some(usage) = self.session_main_usage.get(session_id).cloned() {
+            self.budget_pct = usage.usage_pct;
+            self.main_usage = Some(usage.clone());
+            cmds.push(UiCommand::UpdateStatusBar {
+                provider: None,
+                model: None,
+                turn: None,
+                budget_pct: Some(usage.usage_pct),
+                autonomy: None,
+                session_id: None,
+                external_agent: None,
+            });
+        }
+        cmds.push(self.build_usage_command_for_session(Some(session_id)));
         cmds
     }
 
@@ -623,8 +1116,16 @@ impl AppState {
                 level: entry.level.clone(),
                 source: entry.source.clone(),
                 content: entry.content.clone(),
+                session_id: entry.session_id.clone(),
+                kind: entry.kind.clone(),
+                output_id: entry.output_id.clone(),
+                item_id: entry.item_id.clone(),
                 collapsible: entry.collapsible,
                 turn: None, // separator already handled
+                user_turn_index: entry.user_turn_index,
+                user_turn_revision: entry.user_turn_revision,
+                superseded: entry.superseded,
+                replacement_for_user_turn_index: entry.replacement_for_user_turn_index,
                 images: vec![],
             });
         }
@@ -638,7 +1139,9 @@ impl AppState {
         match t {
             Some("term") => {
                 if let Some(d) = msg["d"].as_str() {
-                    vec![UiCommand::TermData { base64: d.to_string() }]
+                    vec![UiCommand::TermData {
+                        base64: d.to_string(),
+                    }]
                 } else {
                     vec![]
                 }
@@ -694,7 +1197,12 @@ impl AppState {
                 self.provider = p.to_string();
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: Some(p.to_string()),
-                    model: None, turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
+                    model: None,
+                    turn: None,
+                    budget_pct: None,
+                    autonomy: None,
+                    session_id: None,
+                    external_agent: None,
                 });
             }
             if let Some(m) = cfg["model"].as_str() {
@@ -702,7 +1210,11 @@ impl AppState {
                 cmds.push(UiCommand::UpdateStatusBar {
                     provider: None,
                     model: Some(m.to_string()),
-                    turn: None, budget_pct: None, autonomy: None, session_id: None, external_agent: None,
+                    turn: None,
+                    budget_pct: None,
+                    autonomy: None,
+                    session_id: None,
+                    external_agent: None,
                 });
             }
         }
@@ -711,12 +1223,19 @@ impl AppState {
         if let Some(sid) = msg["session_id"].as_str() {
             self.session_id = sid.to_string();
             cmds.push(UiCommand::UpdateStatusBar {
-                provider: None, model: None, turn: None, budget_pct: None,
-                autonomy: None, session_id: Some(sid.to_string()), external_agent: None,
+                provider: None,
+                model: None,
+                turn: None,
+                budget_pct: None,
+                autonomy: None,
+                session_id: Some(sid.to_string()),
+                external_agent: None,
             });
         }
 
-        cmds.push(UiCommand::SetPhase { phase: phase.to_string() });
+        cmds.push(UiCommand::SetPhase {
+            phase: phase.to_string(),
+        });
 
         // Restore pending approval
         if let Some(pa) = s.get("pending_approval") {
@@ -725,8 +1244,18 @@ impl AppState {
                     self.pending_approval_id = Some(id);
                     let command = pa["command_preview"].as_str().unwrap_or("").to_string();
                     let category = pa["category"].as_str().unwrap_or("").to_string();
-                    cmds.push(UiCommand::ShowApproval { id, command: command.clone(), category });
-                    cmds.extend(self.add_log("warn", &format!("Approval required: {}", command), None, "worker"));
+                    cmds.push(UiCommand::ShowApproval {
+                        id,
+                        command: command.clone(),
+                        category,
+                        session_id: None,
+                    });
+                    cmds.extend(self.add_log(
+                        "warn",
+                        &format!("Approval required: {}", command),
+                        None,
+                        "worker",
+                    ));
                 }
             }
         }
@@ -803,38 +1332,53 @@ impl AppState {
         let event = msg["event"].as_str().unwrap_or("");
         // Replay-path timestamp override: set for the duration of this call
         // so every add_log_with_images emission picks up the historical ts.
-        self.replay_ts = msg
-            .get("ts")
+        self.replay_ts = msg.get("ts").and_then(|v| v.as_str()).map(String::from);
+        self.event_session_id = msg
+            .get("session_id")
             .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
             .map(String::from);
+        let current_session_event = self.current_event_matches_selected_session();
         let mut cmds = Vec::new();
 
         match event {
             "turn_started" => {
                 let turn = msg["turn"].as_u64().unwrap_or(0);
                 let budget = msg["budget_pct"].as_f64().unwrap_or(0.0);
-                self.turn = turn;
-                self.budget_pct = budget;
 
-                cmds.extend(self.add_log("info", &format!("Turn {} started", turn), Some(turn), "system"));
-                cmds.push(UiCommand::UpdateStatusBar {
-                    provider: None, model: None,
-                    turn: Some(turn),
-                    budget_pct: Some(budget),
-                    autonomy: None, session_id: None, external_agent: None,
-                });
-                cmds.push(UiCommand::SetPhase { phase: "thinking".into() });
-                self.phase = "thinking".to_string();
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Turn {} started", turn),
+                    Some(turn),
+                    "system",
+                ));
+                if current_session_event {
+                    self.turn = turn;
+                    self.budget_pct = budget;
+                    cmds.push(UiCommand::UpdateStatusBar {
+                        provider: None,
+                        model: None,
+                        turn: Some(turn),
+                        budget_pct: Some(budget),
+                        autonomy: None,
+                        session_id: self.event_session_id.clone(),
+                        external_agent: None,
+                    });
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "thinking".into(),
+                    });
+                    self.phase = "thinking".to_string();
 
-                // Token history delta
-                if let Some(ref usage) = self.main_usage {
-                    if turn > 1 {
-                        let delta = usage.tokens_used.saturating_sub(self.last_total_tokens);
-                        self.token_history.push(TokenHistoryEntry {
-                            turn: turn - 1,
-                            tokens: delta,
-                        });
-                        self.last_total_tokens = usage.tokens_used;
+                    // Token history delta
+                    if let Some(ref usage) = self.main_usage {
+                        if turn > 1 {
+                            let delta = usage.tokens_used.saturating_sub(self.last_total_tokens);
+                            self.token_history.push(TokenHistoryEntry {
+                                turn: turn - 1,
+                                tokens: delta,
+                            });
+                            self.last_total_tokens = usage.tokens_used;
+                        }
                     }
                 }
             }
@@ -857,7 +1401,12 @@ impl AppState {
                 }
                 if let Some(rs) = reasoning {
                     if !rs.is_empty() {
-                        cmds.extend(self.add_log("detail", &format!("Reasoning: {}", rs), None, source));
+                        cmds.extend(self.add_log(
+                            "detail",
+                            &format!("Reasoning: {}", rs),
+                            None,
+                            source,
+                        ));
                     }
                 }
             }
@@ -869,38 +1418,90 @@ impl AppState {
             "agent_started" => {
                 let preview = msg["commands_preview"].as_str().unwrap_or("");
                 let source = msg["source"].as_str().unwrap_or("agent");
+                let item_id = msg["item_id"].as_str().map(str::to_string);
                 if !self.known_displays.is_empty() {
                     cmds.extend(self.add_log("detail", "Running on display", None, source));
                 }
-                cmds.extend(self.add_log("agent", preview, None, source));
-                cmds.push(UiCommand::SetPhase { phase: "running".into() });
-                self.phase = "running".to_string();
+                cmds.extend(self.add_log_with_metadata(
+                    "agent",
+                    preview,
+                    None,
+                    source,
+                    Vec::new(),
+                    None,
+                    None,
+                    item_id,
+                    None,
+                    None,
+                    false,
+                    None,
+                ));
+                if current_session_event {
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "running".into(),
+                    });
+                    self.phase = "running".to_string();
+                }
             }
 
             "agent_output" => {
                 let source = msg["source"].as_str().unwrap_or("agent");
+                let output_id = msg["output_id"].as_str().map(str::to_string);
                 if let Some(stdout) = msg["stdout"].as_str() {
                     if !stdout.is_empty() {
                         let out = format_agent_output(stdout);
                         if !out.text.is_empty() || !out.images.is_empty() {
-                            cmds.extend(self.add_log_with_images(
-                                "agent", &out.text, None, source, out.images,
+                            cmds.extend(self.add_log_with_metadata(
+                                "agent",
+                                &out.text,
+                                None,
+                                source,
+                                out.images,
+                                Some("agent_output"),
+                                output_id.clone(),
+                                None,
+                                None,
+                                None,
+                                false,
+                                None,
                             ));
                         }
                     }
                 }
                 if let Some(stderr) = msg["stderr"].as_str() {
                     if !stderr.is_empty() {
-                        cmds.extend(self.add_log("warn", stderr, None, "agent"));
+                        cmds.extend(self.add_log_with_metadata(
+                            "warn",
+                            stderr,
+                            None,
+                            source,
+                            Vec::new(),
+                            Some("agent_output"),
+                            output_id.clone(),
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
+                        ));
                     }
                 }
-                cmds.push(UiCommand::SetPhase { phase: "running".into() });
-                self.phase = "running".to_string();
+                if current_session_event {
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "running".into(),
+                    });
+                    self.phase = "running".to_string();
+                }
             }
 
             "auto_approved" => {
                 let preview = msg["preview"].as_str().unwrap_or("");
-                cmds.extend(self.add_log("info", &format!("Auto-approved: {}", preview), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Auto-approved: {}", preview),
+                    None,
+                    "system",
+                ));
             }
 
             "done_signal" => {
@@ -915,17 +1516,32 @@ impl AppState {
 
             "context_management" => {
                 let turn = msg["turn"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("info", &format!("Context compacted at turn {}", turn), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Context compacted at turn {}", turn),
+                    None,
+                    "system",
+                ));
             }
 
             "budget_warning" => {
                 let pct = msg["pct"].as_f64().unwrap_or(0.0);
-                cmds.extend(self.add_log("warn", &format!("Budget warning: {:.1}% used", pct), None, "system"));
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("Budget warning: {:.1}% used", pct),
+                    None,
+                    "system",
+                ));
             }
 
             "budget_exhausted" => {
                 let remaining = msg["remaining"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("error", &format!("Budget exhausted ({} tokens remaining)", remaining), None, "system"));
+                cmds.extend(self.add_log(
+                    "error",
+                    &format!("Budget exhausted ({} tokens remaining)", remaining),
+                    None,
+                    "system",
+                ));
             }
 
             "loop_error" => {
@@ -950,12 +1566,27 @@ impl AppState {
                 self.pending_approval_id = Some(id);
                 self.phase = "waiting".to_string();
 
-                cmds.push(UiCommand::ShowApproval { id, command: command.clone(), category });
-                cmds.push(UiCommand::SetPhase { phase: "waiting".into() });
-                cmds.extend(self.add_log("warn", &format!("Approval required: {}", command), None, "worker"));
+                cmds.push(UiCommand::ShowApproval {
+                    id,
+                    command: command.clone(),
+                    category,
+                    session_id: self.event_session_id.clone(),
+                });
+                cmds.push(UiCommand::SetPhase {
+                    phase: "waiting".into(),
+                });
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("Approval required: {}", command),
+                    None,
+                    "worker",
+                ));
 
                 if self.active_tab != "activity" {
-                    cmds.push(UiCommand::ShowBadge { tab: "activity".into(), text: "!".into() });
+                    cmds.push(UiCommand::ShowBadge {
+                        tab: "activity".into(),
+                        text: "!".into(),
+                    });
                 }
             }
 
@@ -963,51 +1594,74 @@ impl AppState {
                 let question = msg["question"].as_str().unwrap_or("").to_string();
                 self.phase = "waiting".to_string();
 
-                cmds.push(UiCommand::ShowHumanInput { question: question.clone() });
-                cmds.push(UiCommand::SetPhase { phase: "waiting".into() });
-                cmds.extend(self.add_log("info", &format!("Question: {}", question), None, "worker"));
+                cmds.push(UiCommand::ShowHumanInput {
+                    question: question.clone(),
+                });
+                cmds.push(UiCommand::SetPhase {
+                    phase: "waiting".into(),
+                });
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Question: {}", question),
+                    None,
+                    "worker",
+                ));
 
                 if self.active_tab != "activity" {
-                    cmds.push(UiCommand::ShowBadge { tab: "activity".into(), text: "?".into() });
+                    cmds.push(UiCommand::ShowBadge {
+                        tab: "activity".into(),
+                        text: "?".into(),
+                    });
                 }
             }
 
             "task_complete" => {
                 let reason = msg["reason"].as_str().unwrap_or("");
                 let summary = msg["summary"].as_str();
-                self.phase = "done".to_string();
-                self.pending_approval_id = None;
-
-                cmds.push(UiCommand::HideAllPanels);
-                cmds.push(UiCommand::SetPhase { phase: "done".into() });
-
                 let text = match summary {
                     Some(s) if !s.is_empty() => format!("Task complete: {} \u{2014} {}", reason, s),
                     _ => format!("Task complete: {}", reason),
                 };
                 cmds.extend(self.add_log("info", &text, None, "worker"));
+                if current_session_event {
+                    self.phase = "done".to_string();
+                    self.pending_approval_id = None;
+                    cmds.push(UiCommand::HideAllPanels);
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "done".into(),
+                    });
+                }
             }
 
             "interrupt_requested" => {
-                // Log entry only — the `status` event carrying phase="interrupting"
-                // drives the UI state transition. Keeping the log entry visible at
-                // normal verbosity so users see their click was received.
                 cmds.extend(self.add_log("info", "Interrupt requested", None, "system"));
+                if current_session_event {
+                    self.phase = "interrupting".to_string();
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "interrupting".into(),
+                    });
+                }
             }
 
             "interrupted" => {
-                let reason = msg["reason"].as_str().unwrap_or("user requested").to_string();
-                self.phase = "interrupted".to_string();
-                self.pending_approval_id = None;
-
-                cmds.push(UiCommand::HideAllPanels);
-                cmds.push(UiCommand::SetPhase { phase: "interrupted".into() });
+                let reason = msg["reason"]
+                    .as_str()
+                    .unwrap_or("user requested")
+                    .to_string();
                 cmds.extend(self.add_log(
                     "warn",
                     &format!("Agent interrupted: {}", reason),
                     None,
                     "system",
                 ));
+                if current_session_event {
+                    self.phase = "interrupted".to_string();
+                    self.pending_approval_id = None;
+                    cmds.push(UiCommand::HideAllPanels);
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "interrupted".into(),
+                    });
+                }
             }
 
             // ---- Mid-turn steering (interjection) ----
@@ -1017,8 +1671,9 @@ impl AppState {
             // server. The backend dispatcher echoes three events back:
             //
             //   steer_requested  → we saw the request (matches what we sent)
+            //   steer_accepted   → backend/runtime accepted it; waiting for checkpoint
             //   steer_queued     → backend can't deliver mid-turn, queued for turn boundary
-            //   steer_delivered  → agent actually received it (mid_turn or as follow-up)
+            //   steer_delivered  → agent actually received it (mid_turn or at turn boundary)
             //
             // For each event we update `queued_steers[id]` and emit a
             // `SteerStatusUpdate` UiCommand so the JS layer can refresh
@@ -1076,12 +1731,42 @@ impl AppState {
                 });
             }
 
+            "steer_accepted" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                if let Some(q) = self.queued_steers.get_mut(&id) {
+                    q.status = SteerStatus::Accepted;
+                    q.reason = Some(reason.clone());
+                }
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("\u{21AA} Steer accepted: {}", reason),
+                    None,
+                    "user",
+                ));
+                let text = self
+                    .queued_steers
+                    .get(&id)
+                    .map(|q| q.text.clone())
+                    .unwrap_or_default();
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "accepted".into(),
+                    reason: Some(reason),
+                });
+            }
+
             "steer_delivered" => {
                 let id = msg["id"].as_str().unwrap_or("").to_string();
                 let mid_turn = msg["mid_turn"].as_bool().unwrap_or(false);
                 let entry = self.queued_steers.remove(&id);
                 let text = entry.as_ref().map(|q| q.text.clone()).unwrap_or_default();
-                let where_ = if mid_turn { "mid-turn" } else { "as follow-up" };
+                let where_ = if mid_turn {
+                    "mid-turn"
+                } else {
+                    "at turn boundary"
+                };
                 cmds.extend(self.add_log(
                     "info",
                     &format!(
@@ -1103,13 +1788,26 @@ impl AppState {
             "round_complete" => {
                 let round = msg["round"].as_u64().unwrap_or(0);
                 let turns = msg["turns_in_round"].as_u64().unwrap_or(0);
-                self.phase = "idle".to_string();
-
-                cmds.push(UiCommand::SetPhase { phase: "idle".into() });
-                cmds.extend(self.add_log("info", &format!("Round {} complete ({} turns)", round, turns), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Round {} complete ({} turns)", round, turns),
+                    None,
+                    "system",
+                ));
+                if current_session_event {
+                    self.phase = "idle".to_string();
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "idle".into(),
+                    });
+                }
             }
 
             "status" => {
+                if !current_session_event {
+                    self.replay_ts = None;
+                    self.event_session_id = None;
+                    return cmds;
+                }
                 let sb = UiCommand::UpdateStatusBar {
                     provider: msg["provider"].as_str().map(String::from),
                     model: msg["model"].as_str().map(String::from),
@@ -1119,28 +1817,48 @@ impl AppState {
                     session_id: msg["session_id"].as_str().map(String::from),
                     external_agent: msg["external_agent"].as_str().map(String::from),
                 };
-                if let Some(p) = msg["provider"].as_str() { self.provider = p.to_string(); }
-                if let Some(m) = msg["model"].as_str() { self.model = m.to_string(); }
-                if let Some(t) = msg["turn"].as_u64() { self.turn = t; }
-                if let Some(a) = msg["autonomy"].as_str() { self.autonomy = a.to_string(); }
-                if let Some(s) = msg["session_id"].as_str() { self.session_id = s.to_string(); }
+                if let Some(p) = msg["provider"].as_str() {
+                    self.provider = p.to_string();
+                }
+                if let Some(m) = msg["model"].as_str() {
+                    self.model = m.to_string();
+                }
+                if let Some(t) = msg["turn"].as_u64() {
+                    self.turn = t;
+                }
+                if let Some(a) = msg["autonomy"].as_str() {
+                    self.autonomy = a.to_string();
+                }
+                if let Some(s) = msg["session_id"].as_str() {
+                    self.session_id = s.to_string();
+                }
                 // Drop the binding and push
                 cmds.push(sb);
                 if let Some(phase) = msg["phase"].as_str() {
                     self.phase = phase.to_string();
-                    cmds.push(UiCommand::SetPhase { phase: phase.to_string() });
+                    cmds.push(UiCommand::SetPhase {
+                        phase: phase.to_string(),
+                    });
                 }
             }
 
             "external_agent_changed" => {
                 cmds.push(UiCommand::UpdateStatusBar {
-                    provider: None, model: None, turn: None, budget_pct: None,
-                    autonomy: None, session_id: None,
+                    provider: None,
+                    model: None,
+                    turn: None,
+                    budget_pct: None,
+                    autonomy: None,
+                    session_id: None,
                     external_agent: Some(msg["agent"].as_str().unwrap_or("").to_string()),
                 });
             }
 
             "codex_thread_action_result" => {
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let action = msg
                     .get("action")
                     .and_then(|v| v.as_str())
@@ -1156,6 +1874,7 @@ impl AppState {
                     .unwrap_or("")
                     .to_string();
                 cmds.push(UiCommand::CodexThreadActionResult {
+                    session_id,
                     action: action.clone(),
                     success,
                     message: message.clone(),
@@ -1171,8 +1890,41 @@ impl AppState {
                 cmds.extend(self.add_log(level, &line, None, "server"));
             }
 
+            "session_rename_result" => {
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let source = msg.get("source").and_then(|v| v.as_str()).map(String::from);
+                let name = msg.get("name").and_then(|v| v.as_str()).map(String::from);
+                let success = msg
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let message = msg
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                cmds.push(UiCommand::SessionRenameResult {
+                    session_id,
+                    source,
+                    name,
+                    success,
+                    message,
+                });
+            }
+
             "codex_config_changed" => {
-                let sandbox = msg.get("sandbox").and_then(|v| v.as_str()).map(String::from);
+                let command = msg
+                    .get("command")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let sandbox = msg
+                    .get("sandbox")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 let approval_policy = msg
                     .get("approval_policy")
                     .and_then(|v| v.as_str())
@@ -1192,10 +1944,16 @@ impl AppState {
                     .unwrap_or(false);
                 let web_search = msg.get("web_search").and_then(|v| v.as_bool());
                 let network_access = msg.get("network_access").and_then(|v| v.as_bool());
-                let writable_roots = msg.get("writable_roots").and_then(|v| v.as_array()).map(
-                    |arr| arr.iter().filter_map(|v| v.as_str().map(String::from)).collect(),
-                );
+                let writable_roots =
+                    msg.get("writable_roots")
+                        .and_then(|v| v.as_array())
+                        .map(|arr| {
+                            arr.iter()
+                                .filter_map(|v| v.as_str().map(String::from))
+                                .collect()
+                        });
                 cmds.push(UiCommand::CodexConfigChanged {
+                    command,
                     sandbox,
                     approval_policy,
                     model,
@@ -1209,9 +1967,20 @@ impl AppState {
             }
 
             "gemini_thread_action_result" => {
-                let action = msg.get("action").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                let success = msg.get("success").and_then(|v| v.as_bool()).unwrap_or(false);
-                let message = msg.get("message").and_then(|v| v.as_str()).unwrap_or("").to_string();
+                let action = msg
+                    .get("action")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                let success = msg
+                    .get("success")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let message = msg
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string();
                 cmds.push(UiCommand::GeminiThreadActionResult {
                     action: action.clone(),
                     success,
@@ -1274,21 +2043,23 @@ impl AppState {
             "usage" | "usage_update" => {
                 if let Some(main) = msg.get("main") {
                     if let Ok(u) = serde_json::from_value::<UsageSnapshot>(main.clone()) {
-                        self.budget_pct = u.usage_pct;
-                        cmds.push(UiCommand::UpdateStatusBar {
-                            provider: None, model: None, turn: None,
-                            budget_pct: Some(u.usage_pct),
-                            autonomy: None, session_id: None, external_agent: None,
-                        });
-                        cmds.extend(self.add_log(
-                            "detail",
-                            &format!("tokens: {} / {} ({:.1}%)",
-                                format_number(u.tokens_used),
-                                format_number(u.context_window),
-                                u.usage_pct),
-                            None, "system",
-                        ));
-                        self.main_usage = Some(u);
+                        if let Some(sid) = self.event_session_id.clone() {
+                            self.session_main_usage.insert(sid, u.clone());
+                        }
+                        cmds.extend(self.add_usage_log_if_milestone(&u));
+                        if current_session_event {
+                            self.budget_pct = u.usage_pct;
+                            cmds.push(UiCommand::UpdateStatusBar {
+                                provider: None,
+                                model: None,
+                                turn: None,
+                                budget_pct: Some(u.usage_pct),
+                                autonomy: None,
+                                session_id: self.event_session_id.clone(),
+                                external_agent: None,
+                            });
+                            self.main_usage = Some(u);
+                        }
                     }
                 }
                 if let Some(presence) = msg.get("presence") {
@@ -1296,23 +2067,37 @@ impl AppState {
                         self.presence_usage = Some(u);
                     }
                 }
-                cmds.push(self.build_usage_command());
+                cmds.push(self.build_usage_command_for_session(self.event_session_id.as_deref()));
             }
 
             "display_ready" => {
                 let display_id = msg["display_id"].as_u64().unwrap_or(0);
                 let width = msg["width"].as_u64().unwrap_or(0);
                 let height = msg["height"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("info", &format!("Display :{} ready", display_id), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Display :{} ready", display_id),
+                    None,
+                    "system",
+                ));
                 if !self.known_displays.iter().any(|&id| id == display_id) {
                     self.known_displays.push(display_id);
                 }
-                cmds.push(UiCommand::AddDisplay { display_id, width, height });
+                cmds.push(UiCommand::AddDisplay {
+                    display_id,
+                    width,
+                    height,
+                });
             }
 
             "display_taken" => {
                 let id = msg["display_id"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("info", &format!("Display :{} in use", id), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Display :{} in use", id),
+                    None,
+                    "system",
+                ));
             }
 
             "display_released" => {
@@ -1328,50 +2113,135 @@ impl AppState {
 
             "recording_started" => {
                 let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
-                cmds.extend(self.add_log("info", &format!("Recording started: {}", stream), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Recording started: {}", stream),
+                    None,
+                    "system",
+                ));
                 if !self.known_recordings.contains(&stream) {
                     self.known_recordings.push(stream.clone());
                 }
-                cmds.push(UiCommand::AddRecording { stream_name: stream });
+                cmds.push(UiCommand::AddRecording {
+                    stream_name: stream,
+                });
             }
 
             "recording_stopped" => {
                 let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
-                cmds.extend(self.add_log("info", &format!("Recording stopped: {}", stream), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Recording stopped: {}", stream),
+                    None,
+                    "system",
+                ));
                 self.known_recordings.retain(|s| s != &stream);
-                cmds.push(UiCommand::RemoveRecording { stream_name: stream });
+                cmds.push(UiCommand::RemoveRecording {
+                    stream_name: stream,
+                });
+            }
+
+            "recording_deleted" => {
+                let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Recording deleted: {}", stream),
+                    None,
+                    "system",
+                ));
+                self.known_recordings.retain(|s| s != &stream);
+                cmds.push(UiCommand::DeleteRecording {
+                    stream_name: stream,
+                });
             }
 
             "recording_error" => {
                 let stream = msg["stream_name"].as_str().unwrap_or("").to_string();
                 let message = msg["message"].as_str().unwrap_or("").to_string();
-                cmds.extend(self.add_log("warn", &format!("Recording error ({}): {}", stream, message), None, "system"));
-                cmds.push(UiCommand::RecordingError { stream_name: stream, message });
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!("Recording error ({}): {}", stream, message),
+                    None,
+                    "system",
+                ));
+                cmds.push(UiCommand::RecordingError {
+                    stream_name: stream,
+                    message,
+                });
             }
 
             "session_started" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let task = msg["task"].as_str().map(|s| s.to_string());
-                cmds.extend(self.add_log("info", &format!("Session started: {}", session_id), None, "system"));
+                self.session_id = session_id.clone();
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Session started: {}", session_id),
+                    None,
+                    "system",
+                ));
                 cmds.push(UiCommand::SessionStarted { session_id, task });
+            }
+
+            "session_identity" => {
+                // Browser JS keeps the richer wrapper ↔ backend-native id map.
+                // The Rust dashboard reducer intentionally treats this as
+                // metadata so it does not create activity noise.
+            }
+
+            "session_attached" => {
+                let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
+                let source = msg["source"].as_str().unwrap_or("").to_string();
+                self.session_id = session_id.clone();
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Session attached: {} ({})", session_id, source),
+                    None,
+                    "system",
+                ));
+                cmds.push(UiCommand::SessionAttached { session_id, source });
             }
 
             "session_ended" => {
                 let session_id = msg["session_id"].as_str().unwrap_or("").to_string();
                 let reason = msg["reason"].as_str().unwrap_or("").to_string();
-                cmds.extend(self.add_log("info", &format!("Session ended: {} — {}", session_id, reason), None, "system"));
+                if current_session_event {
+                    self.phase = "idle".to_string();
+                    cmds.push(UiCommand::SetPhase {
+                        phase: "idle".into(),
+                    });
+                }
+                if self.session_id == session_id {
+                    self.session_id.clear();
+                }
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Session ended: {} — {}", session_id, reason),
+                    None,
+                    "system",
+                ));
                 cmds.push(UiCommand::SessionEnded { session_id, reason });
             }
 
             "debug_screen_ready" => {
                 let display_id = msg["display_id"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("info", &format!("Debug screen ready on :{}", display_id), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Debug screen ready on :{}", display_id),
+                    None,
+                    "system",
+                ));
                 cmds.push(UiCommand::DebugScreenReady { display_id });
             }
 
             "debug_screen_torn_down" => {
                 let display_id = msg["display_id"].as_u64().unwrap_or(0);
-                cmds.extend(self.add_log("info", &format!("Debug screen :{} torn down", display_id), None, "system"));
+                cmds.extend(self.add_log(
+                    "info",
+                    &format!("Debug screen :{} torn down", display_id),
+                    None,
+                    "system",
+                ));
                 cmds.push(UiCommand::DebugScreenTornDown);
             }
 
@@ -1380,7 +2250,12 @@ impl AppState {
                 let action = msg["action"].as_str().unwrap_or("");
                 let message = msg["message"].as_str().unwrap_or("");
                 let level = if ok { "detail" } else { "error" };
-                cmds.extend(self.add_log(level, &format!("[{}] {}", action, message), None, "system"));
+                cmds.extend(self.add_log(
+                    level,
+                    &format!("[{}] {}", action, message),
+                    None,
+                    "system",
+                ));
             }
 
             "presence_log" => {
@@ -1395,6 +2270,7 @@ impl AppState {
                     model: msg["model"].as_str().unwrap_or("").to_string(),
                     tokens_used: msg["total_tokens"].as_u64().unwrap_or(0),
                     context_window: msg["context_window"].as_u64().unwrap_or(0),
+                    hard_context_window: msg["hard_context_window"].as_u64(),
                     usage_pct: msg["usage_pct"].as_f64().unwrap_or(0.0),
                     prompt_tokens: msg["prompt_tokens"].as_u64().unwrap_or(0),
                     completion_tokens: msg["completion_tokens"].as_u64().unwrap_or(0),
@@ -1413,6 +2289,14 @@ impl AppState {
                     cached_tokens: msg["cached_tokens"].as_u64().unwrap_or(0),
                     total_tokens: msg["total_tokens"].as_u64().unwrap_or(0),
                     thinking_tokens: msg["thinking_tokens"].as_u64().unwrap_or(0),
+                    input_text_tokens: msg["input_text_tokens"].as_u64().unwrap_or(0),
+                    input_audio_tokens: msg["input_audio_tokens"].as_u64().unwrap_or(0),
+                    input_image_tokens: msg["input_image_tokens"].as_u64().unwrap_or(0),
+                    cached_text_tokens: msg["cached_text_tokens"].as_u64().unwrap_or(0),
+                    cached_audio_tokens: msg["cached_audio_tokens"].as_u64().unwrap_or(0),
+                    cached_image_tokens: msg["cached_image_tokens"].as_u64().unwrap_or(0),
+                    output_text_tokens: msg["output_text_tokens"].as_u64().unwrap_or(0),
+                    output_audio_tokens: msg["output_audio_tokens"].as_u64().unwrap_or(0),
                 });
                 cmds.push(self.build_usage_command());
             }
@@ -1428,7 +2312,9 @@ impl AppState {
 
             "safety_cap_reached" => {
                 cmds.extend(self.add_log("error", "Safety cap reached", None, "system"));
-                cmds.push(UiCommand::SetPhase { phase: "done".into() });
+                cmds.push(UiCommand::SetPhase {
+                    phase: "done".into(),
+                });
                 self.phase = "done".to_string();
             }
 
@@ -1437,7 +2323,81 @@ impl AppState {
                 let source = msg["source"].as_str().unwrap_or("system");
                 let content = msg["content"].as_str().unwrap_or("");
                 let turn = msg["turn"].as_u64();
-                cmds.extend(self.add_log(level, content, turn, source));
+                let user_turn_index = msg["user_turn_index"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok());
+                let user_turn_revision = msg["user_turn_revision"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok());
+                let superseded = msg["superseded"].as_bool().unwrap_or(false);
+                let replacement_for_user_turn_index = msg["replacement_for_user_turn_index"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok());
+                let kind = msg["kind"].as_str();
+                cmds.extend(self.add_log_with_metadata(
+                    level,
+                    content,
+                    turn,
+                    source,
+                    Vec::new(),
+                    kind,
+                    None,
+                    None,
+                    user_turn_index,
+                    user_turn_revision,
+                    superseded,
+                    replacement_for_user_turn_index,
+                ));
+            }
+
+            "user_message_rewind" => {
+                let session_id = msg
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string);
+                let user_turn_index = msg["user_turn_index"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                let turns_removed = msg["turns_removed"]
+                    .as_u64()
+                    .and_then(|v| u32::try_from(v).ok())
+                    .unwrap_or(0);
+                if user_turn_index > 0 && turns_removed > 0 {
+                    self.mark_log_buffer_rewound(
+                        session_id.as_deref(),
+                        user_turn_index,
+                        turns_removed,
+                    );
+                    cmds.push(UiCommand::MarkActivityContextRewind {
+                        session_id: session_id.clone(),
+                        user_turn_index,
+                        turns_removed,
+                    });
+                }
+                let content = if turns_removed == 1 {
+                    "Rewound 1 user turn; overwritten entries are no longer active context."
+                        .to_string()
+                } else {
+                    format!(
+                        "Rewound {turns_removed} user turns; overwritten entries are no longer active context."
+                    )
+                };
+                cmds.extend(self.add_log_with_metadata(
+                    "warn",
+                    &content,
+                    None,
+                    "system",
+                    Vec::new(),
+                    Some("rollback_marker"),
+                    None,
+                    None,
+                    None,
+                    None,
+                    false,
+                    None,
+                ));
             }
 
             "file_changed" => {
@@ -1446,17 +2406,31 @@ impl AppState {
                 let added = msg["lines_added"].as_u64().unwrap_or(0);
                 let removed = msg["lines_removed"].as_u64().unwrap_or(0);
 
-                self.changed_files.insert(path.clone(), FileChangeEntry {
-                    kind: kind.clone(),
-                    lines_added: added,
-                    lines_removed: removed,
-                });
+                self.changed_files.insert(
+                    path.clone(),
+                    FileChangeEntry {
+                        kind: kind.clone(),
+                        lines_added: added,
+                        lines_removed: removed,
+                    },
+                );
 
-                cmds.extend(self.add_log("detail",
-                    &format!("{} {} (+{}/-{})",
-                        match kind.as_str() { "created" => "+", "deleted" => "-", _ => "*" },
-                        path, added, removed),
-                    None, "fs"));
+                cmds.extend(self.add_log(
+                    "detail",
+                    &format!(
+                        "{} {} (+{}/-{})",
+                        match kind.as_str() {
+                            "created" => "+",
+                            "deleted" => "-",
+                            _ => "*",
+                        },
+                        path,
+                        added,
+                        removed
+                    ),
+                    None,
+                    "fs",
+                ));
 
                 cmds.push(UiCommand::FileChanged {
                     path,
@@ -1500,12 +2474,7 @@ impl AppState {
                     .and_then(|v| v.as_str())
                     .unwrap_or("")
                     .to_string();
-                cmds.extend(self.add_log(
-                    "detail",
-                    &format!("upload deleted: {}", id),
-                    None,
-                    "fs",
-                ));
+                cmds.extend(self.add_log("detail", &format!("upload deleted: {}", id), None, "fs"));
                 cmds.push(UiCommand::UploadDeleted { id });
             }
 
@@ -1570,12 +2539,7 @@ impl AppState {
             "redone" => {
                 let to = msg["to_id"].as_u64().unwrap_or(0);
                 cmds.push(UiCommand::HistoryChanged);
-                cmds.extend(self.add_log(
-                    "info",
-                    &format!("Redone to round {}", to),
-                    None,
-                    "fs",
-                ));
+                cmds.extend(self.add_log("info", &format!("Redone to round {}", to), None, "fs"));
             }
             "history_pruned" => {
                 let removed = msg["branches_removed"].as_u64().unwrap_or(0);
@@ -1634,7 +2598,11 @@ impl AppState {
 
             _ => {
                 // Unknown events at debug level
-                let text = format!("[{}] {}", event, serde_json::to_string(msg).unwrap_or_default());
+                let text = format!(
+                    "[{}] {}",
+                    event,
+                    serde_json::to_string(msg).unwrap_or_default()
+                );
                 cmds.extend(self.add_log("debug", &text, None, "system"));
             }
         }
@@ -1642,11 +2610,57 @@ impl AppState {
         // Clear replay timestamp override so subsequent live calls revert
         // to wallclock.
         self.replay_ts = None;
+        self.event_session_id = None;
         cmds
     }
 
+    fn mark_log_buffer_rewound(
+        &mut self,
+        session_id: Option<&str>,
+        user_turn_index: u32,
+        turns_removed: u32,
+    ) {
+        let end_turn = user_turn_index
+            .saturating_add(turns_removed)
+            .saturating_sub(1);
+        let mut in_rewound_region = false;
+        for entry in &mut self.log_buffer {
+            if let Some(sid) = session_id {
+                if entry.session_id.as_deref() != Some(sid) {
+                    continue;
+                }
+            }
+            if entry.kind.as_deref() == Some("rollback_marker") {
+                continue;
+            }
+            if let Some(turn) = entry.user_turn_index {
+                if !in_rewound_region && turn >= user_turn_index && turn <= end_turn {
+                    in_rewound_region = true;
+                } else if in_rewound_region && turn > end_turn {
+                    break;
+                }
+            }
+            if in_rewound_region {
+                entry.superseded = true;
+            }
+        }
+    }
+
+    fn current_event_matches_selected_session(&self) -> bool {
+        match self.event_session_id.as_deref() {
+            Some(sid) if !self.session_id.is_empty() => sid == self.session_id,
+            _ => true,
+        }
+    }
+
     /// Add a log entry, respecting verbosity. Returns AddLogEntry command if visible.
-    fn add_log(&mut self, level: &str, content: &str, turn: Option<u64>, source: &str) -> Vec<UiCommand> {
+    fn add_log(
+        &mut self,
+        level: &str,
+        content: &str,
+        turn: Option<u64>,
+        source: &str,
+    ) -> Vec<UiCommand> {
         self.add_log_with_images(level, content, turn, source, Vec::new())
     }
 
@@ -1663,27 +2677,56 @@ impl AppState {
         source: &str,
         images: Vec<String>,
     ) -> Vec<UiCommand> {
-        // Trim replay timestamps to HH:MM:SS so they render identically to
-        // the old replay path (which truncated via `ts[..8.min(ts.len())]`).
-        let ts = match &self.replay_ts {
-            Some(t) => {
-                let end = 8.min(t.len());
-                t[..end].to_string()
-            }
-            None => current_time_str(),
-        };
+        self.add_log_with_metadata(
+            level, content, turn, source, images, None, None, None, None, None, false, None,
+        )
+    }
+
+    fn add_log_with_metadata(
+        &mut self,
+        level: &str,
+        content: &str,
+        turn: Option<u64>,
+        source: &str,
+        images: Vec<String>,
+        kind: Option<&str>,
+        output_id: Option<String>,
+        item_id: Option<String>,
+        user_turn_index: Option<u32>,
+        user_turn_revision: Option<u32>,
+        superseded: bool,
+        replacement_for_user_turn_index: Option<u32>,
+    ) -> Vec<UiCommand> {
+        // Preserve replay timestamps verbatim. The browser owns compact label
+        // formatting; this value also backs the timestamp tooltip.
+        let ts = self.replay_ts.clone().unwrap_or_else(current_time_str);
         let source_str = source_label(source).to_string();
         let is_collapsible = !images.is_empty()
             || content.split('\n').count() > COLLAPSE_LINE_THRESHOLD
             || content.len() > COLLAPSE_CHAR_THRESHOLD;
+        let kind_string = kind.map(str::to_string);
+        let discardable_output = kind == Some("agent_output") && output_id.is_some();
+        let buffered_content = if discardable_output {
+            String::new()
+        } else {
+            content.to_string()
+        };
 
         let entry = LogEntry {
             ts: ts.clone(),
             level: level.to_string(),
             source: source_str.clone(),
-            content: content.to_string(),
+            session_id: self.event_session_id.clone(),
+            content: buffered_content,
+            kind: kind_string.clone(),
+            output_id: output_id.clone(),
+            item_id: item_id.clone(),
             collapsible: is_collapsible,
             turn,
+            user_turn_index,
+            user_turn_revision,
+            superseded,
+            replacement_for_user_turn_index,
         };
         self.log_buffer.push(entry);
 
@@ -1706,51 +2749,91 @@ impl AppState {
             level: level.to_string(),
             source: source_str,
             content: content.to_string(),
+            session_id: self.event_session_id.clone(),
+            kind: kind_string,
+            output_id,
+            item_id,
             collapsible: is_collapsible,
             turn: None, // separator already emitted
+            user_turn_index,
+            user_turn_revision,
+            superseded,
+            replacement_for_user_turn_index,
             images,
         });
         cmds
     }
 
+    fn add_usage_log_if_milestone(&mut self, usage: &UsageSnapshot) -> Vec<UiCommand> {
+        let Some(band) = usage_log_band(usage) else {
+            return Vec::new();
+        };
+        let key = self
+            .event_session_id
+            .as_deref()
+            .filter(|sid| !sid.is_empty())
+            .unwrap_or("__global__")
+            .to_string();
+        let previous = self.usage_log_bands.get(&key).copied();
+        let should_log = match previous {
+            None => true,
+            Some(prev) => band > prev || band.saturating_add(10) <= prev,
+        };
+        if !should_log {
+            return Vec::new();
+        }
+
+        self.usage_log_bands.insert(key, band);
+        self.add_log(
+            "detail",
+            &format!(
+                "tokens: {} / {} ({:.1}%)",
+                format_number(usage.tokens_used),
+                format_number(usage.context_window),
+                usage.usage_pct
+            ),
+            None,
+            "system",
+        )
+    }
+
     /// Update live model usage and return commands to re-render the Usage tab.
-    pub fn update_live_usage(
-        &mut self,
-        provider: &str,
-        model: &str,
-        input_tokens: u64,
-        output_tokens: u64,
-        cached_tokens: u64,
-        total_tokens: u64,
-        thinking_tokens: u64,
-    ) -> Vec<UiCommand> {
-        self.live_usage = Some(LiveUsageSnapshot {
-            provider: provider.to_string(),
-            model: model.to_string(),
-            input_tokens,
-            output_tokens,
-            cached_tokens,
-            total_tokens,
-            thinking_tokens,
-        });
+    pub fn update_live_usage(&mut self, usage: LiveUsageSnapshot) -> Vec<UiCommand> {
+        self.live_usage = Some(usage);
         vec![self.build_usage_command()]
     }
 
     /// Build an UpdateUsage command from current state.
     fn build_usage_command(&self) -> UiCommand {
-        let main_json = self.main_usage.as_ref()
+        let selected_session = (!self.session_id.is_empty()).then_some(self.session_id.as_str());
+        self.build_usage_command_for_session(selected_session)
+    }
+
+    fn build_usage_command_for_session(&self, session_id: Option<&str>) -> UiCommand {
+        let selected_main = session_id
+            .and_then(|sid| self.session_main_usage.get(sid))
+            .or(self.main_usage.as_ref());
+        let main_json = selected_main.and_then(|u| serde_json::to_string(u).ok());
+        let presence_json = self
+            .presence_usage
+            .as_ref()
             .and_then(|u| serde_json::to_string(u).ok());
-        let presence_json = self.presence_usage.as_ref()
-            .and_then(|u| serde_json::to_string(u).ok());
-        let live_json = self.live_usage.as_ref()
+        let live_json = self
+            .live_usage
+            .as_ref()
             .and_then(|u| serde_json::to_string(u).ok());
 
         // Cost calculation
         let cost_json = {
             let mut summary = CostSummary::default();
-            if let Some(ref u) = self.main_usage {
+            if let Some(u) = selected_main {
                 if let Some(pricing) = find_pricing(&u.model) {
-                    let cost = calculate_cost(u.prompt_tokens, u.completion_tokens, u.cached_tokens, &pricing);
+                    let cost = calculate_cost(
+                        u.prompt_tokens,
+                        u.completion_tokens,
+                        u.cached_tokens,
+                        &pricing,
+                    );
                     summary.total += cost.total;
                     summary.lines.push(CostLine {
                         label: "Main Model".into(),
@@ -1763,7 +2846,12 @@ impl AppState {
             }
             if let Some(ref u) = self.presence_usage {
                 if let Some(pricing) = find_pricing(&u.model) {
-                    let cost = calculate_cost(u.prompt_tokens, u.completion_tokens, u.cached_tokens, &pricing);
+                    let cost = calculate_cost(
+                        u.prompt_tokens,
+                        u.completion_tokens,
+                        u.cached_tokens,
+                        &pricing,
+                    );
                     summary.total += cost.total;
                     summary.lines.push(CostLine {
                         label: "Presence Model".into(),
@@ -1775,8 +2863,7 @@ impl AppState {
                 }
             }
             if let Some(ref u) = self.live_usage {
-                if let Some(pricing) = find_pricing(&u.model) {
-                    let cost = calculate_cost(u.input_tokens, u.output_tokens, u.cached_tokens, &pricing);
+                if let Some(cost) = calculate_live_cost(u) {
                     summary.total += cost.total;
                     summary.lines.push(CostLine {
                         label: "Live Model".into(),
@@ -1787,7 +2874,11 @@ impl AppState {
                     });
                 }
             }
-            if summary.lines.is_empty() { None } else { serde_json::to_string(&summary).ok() }
+            if summary.lines.is_empty() {
+                None
+            } else {
+                serde_json::to_string(&summary).ok()
+            }
         };
 
         let history_json = if self.token_history.is_empty() {
@@ -1796,7 +2887,14 @@ impl AppState {
             serde_json::to_string(&self.token_history).ok()
         };
 
-        UiCommand::UpdateUsage { main_json, presence_json, live_json, cost_json, history_json }
+        UiCommand::UpdateUsage {
+            session_id: session_id.map(str::to_string),
+            main_json,
+            presence_json,
+            live_json,
+            cost_json,
+            history_json,
+        }
     }
 
     /// Process an approval action. Returns commands to send to server + update UI.
@@ -1804,7 +2902,9 @@ impl AppState {
         let id = self.pending_approval_id.take()?;
         let mut cmds = vec![
             UiCommand::HideAllPanels,
-            UiCommand::SetPhase { phase: "running".into() },
+            UiCommand::SetPhase {
+                phase: "running".into(),
+            },
         ];
         cmds.extend(self.add_log("info", &format!("Action: {}", action), None, "system"));
         self.phase = "running".to_string();
@@ -1815,7 +2915,9 @@ impl AppState {
     pub fn human_response(&mut self, text: &str) -> Vec<UiCommand> {
         let mut cmds = vec![
             UiCommand::HideAllPanels,
-            UiCommand::SetPhase { phase: "thinking".into() },
+            UiCommand::SetPhase {
+                phase: "thinking".into(),
+            },
         ];
         cmds.extend(self.add_log("info", &format!("Response: {}", text), None, "system"));
         self.phase = "thinking".to_string();
@@ -1826,7 +2928,9 @@ impl AppState {
     pub fn follow_up(&mut self, text: &str) -> Vec<UiCommand> {
         let mut cmds = vec![
             UiCommand::HideAllPanels,
-            UiCommand::SetPhase { phase: "thinking".into() },
+            UiCommand::SetPhase {
+                phase: "thinking".into(),
+            },
         ];
         cmds.extend(self.add_log("info", &format!("Follow-up: {}", text), None, "system"));
         self.phase = "thinking".to_string();
@@ -2078,9 +3182,7 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
                     ts: now,
                     level: "warn".to_string(),
                     source: "webrtc".to_string(),
-                    content: format!(
-                        "WebRTC signal missing session_id: {payload}"
-                    ),
+                    content: format!("WebRTC signal missing session_id: {payload}"),
                 }];
             }
             vec![UiCommand::PeerWebRtcSignal {
@@ -2148,6 +3250,22 @@ fn format_number(n: u64) -> String {
     result.chars().rev().collect()
 }
 
+fn usage_log_band(usage: &UsageSnapshot) -> Option<u8> {
+    if usage.context_window == 0 || !usage.usage_pct.is_finite() || usage.usage_pct < 10.0 {
+        return None;
+    }
+    let pct = usage.usage_pct.clamp(0.0, 100.0);
+    if pct >= 95.0 {
+        Some(95)
+    } else if pct >= 90.0 {
+        Some(90)
+    } else if pct >= 75.0 {
+        Some(75)
+    } else {
+        Some(((pct / 10.0).floor() as u8) * 10)
+    }
+}
+
 /// Get current time as HH:MM:SS string.
 /// In WASM, uses js_sys::Date. In tests, returns a fixed string.
 #[cfg(target_arch = "wasm32")]
@@ -2175,8 +3293,9 @@ mod tests {
 
     #[test]
     fn pricing_exact_match() {
-        let p = find_pricing("claude-opus-4-6").unwrap();
+        let p = find_pricing("claude-opus-4-8").unwrap();
         assert!((p.input - 5.0e-6).abs() < 1e-12);
+        assert!((p.cached - 0.5e-6).abs() < 1e-12);
         assert!((p.output - 25.0e-6).abs() < 1e-12);
     }
 
@@ -2194,7 +3313,11 @@ mod tests {
 
     #[test]
     fn cost_calculation() {
-        let pricing = ModelPricing { input: 1.0e-6, cached: 0.1e-6, output: 2.0e-6 };
+        let pricing = ModelPricing {
+            input: 1.0e-6,
+            cached: 0.1e-6,
+            output: 2.0e-6,
+        };
         let cost = calculate_cost(1000, 500, 200, &pricing);
         // uncached = 800, input_cost = 800*1e-6 + 200*0.1e-6 = 0.00082
         // output_cost = 500*2e-6 = 0.001
@@ -2209,6 +3332,26 @@ mod tests {
         assert_eq!(format_number(999), "999");
         assert_eq!(format_number(1000), "1,000");
         assert_eq!(format_number(1234567), "1,234,567");
+    }
+
+    #[test]
+    fn usage_log_band_uses_coarse_context_milestones() {
+        let mut u = UsageSnapshot {
+            tokens_used: 9_000,
+            context_window: 100_000,
+            usage_pct: 9.0,
+            ..Default::default()
+        };
+        assert_eq!(usage_log_band(&u), None);
+
+        u.usage_pct = 31.8;
+        assert_eq!(usage_log_band(&u), Some(30));
+
+        u.usage_pct = 75.1;
+        assert_eq!(usage_log_band(&u), Some(75));
+
+        u.usage_pct = 96.0;
+        assert_eq!(usage_log_band(&u), Some(95));
     }
 
     #[test]
@@ -2268,7 +3411,9 @@ mod tests {
         assert_eq!(s.model, "gpt-5");
         assert!(!cmds.is_empty());
         // Should contain SetPhase
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
     }
 
     #[test]
@@ -2285,7 +3430,9 @@ mod tests {
         });
         let cmds = s.handle_message(&msg);
         assert_eq!(s.pending_approval_id, Some(42));
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowApproval { id: 42, .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::ShowApproval { id: 42, .. })));
     }
 
     #[test]
@@ -2294,7 +3441,138 @@ mod tests {
         let msg = json!({"event": "turn_started", "turn": 3, "budget_pct": 15.5});
         let cmds = s.handle_message(&msg);
         assert_eq!(s.turn, 3);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
+    }
+
+    #[test]
+    fn session_scoped_turn_started_tags_log_and_updates_matching_session() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        let msg =
+            json!({"event": "turn_started", "turn": 4, "budget_pct": 22.5, "session_id": "sess-a"});
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.turn, 4);
+        assert_eq!(s.phase, "thinking");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateStatusBar { session_id, .. }
+                if session_id.as_deref() == Some("sess-a")
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { session_id, content, .. }
+                if session_id.as_deref() == Some("sess-a")
+                    && content == "Turn 4 started"
+        )));
+    }
+
+    #[test]
+    fn session_scoped_background_turn_logs_without_switching_selected_session() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        s.turn = 2;
+        s.phase = "running".to_string();
+        let msg =
+            json!({"event": "turn_started", "turn": 8, "budget_pct": 40.0, "session_id": "sess-b"});
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.session_id, "sess-a");
+        assert_eq!(s.turn, 2);
+        assert_eq!(s.phase, "running");
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::UpdateStatusBar { turn: Some(8), .. })));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { session_id, content, .. }
+                if session_id.as_deref() == Some("sess-b")
+                    && content == "Turn 8 started"
+        )));
+    }
+
+    #[test]
+    fn session_scoped_usage_updates_selected_session_status_only() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        let msg = json!({
+            "event": "usage_update",
+            "session_id": "sess-a",
+            "main": {
+                "provider": "openai",
+                "model": "gpt-5",
+                "tokens_used": 1250,
+                "context_window": 10000,
+                "usage_pct": 12.5,
+                "prompt_tokens": 1000,
+                "completion_tokens": 250,
+                "cached_tokens": 100
+            }
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.budget_pct, 12.5);
+        assert_eq!(s.main_usage.as_ref().unwrap().tokens_used, 1250);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateStatusBar { budget_pct: Some(pct), session_id, .. }
+                if (*pct - 12.5).abs() < f64::EPSILON
+                    && session_id.as_deref() == Some("sess-a")
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateUsage { session_id, main_json: Some(_), .. }
+                if session_id.as_deref() == Some("sess-a")
+        )));
+    }
+
+    #[test]
+    fn session_scoped_background_usage_is_cached_without_overwriting_status() {
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        s.main_usage = Some(UsageSnapshot {
+            tokens_used: 500,
+            usage_pct: 5.0,
+            ..Default::default()
+        });
+        s.budget_pct = 5.0;
+        let msg = json!({
+            "event": "usage_update",
+            "session_id": "sess-b",
+            "main": {
+                "provider": "openai",
+                "model": "gpt-5",
+                "tokens_used": 4000,
+                "context_window": 10000,
+                "usage_pct": 40.0,
+                "prompt_tokens": 3000,
+                "completion_tokens": 1000,
+                "cached_tokens": 0
+            }
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.session_id, "sess-a");
+        assert_eq!(s.budget_pct, 5.0);
+        assert_eq!(s.main_usage.as_ref().unwrap().tokens_used, 500);
+        assert_eq!(s.session_main_usage["sess-b"].tokens_used, 4000);
+        assert!(!cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::UpdateStatusBar { budget_pct: Some(pct), .. }
+                    if (*pct - 40.0).abs() < f64::EPSILON
+            )
+        }));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::UpdateUsage { session_id, main_json: Some(_), .. }
+                if session_id.as_deref() == Some("sess-b")
+        )));
     }
 
     #[test]
@@ -2303,7 +3581,28 @@ mod tests {
         let msg = json!({"event": "approval_required", "id": 7, "command": "echo hi", "category": "CommandExec"});
         let cmds = s.handle_message(&msg);
         assert_eq!(s.pending_approval_id, Some(7));
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowApproval { id: 7, .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::ShowApproval { id: 7, .. })));
+    }
+
+    #[test]
+    fn session_scoped_approval_carries_target_session() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "approval_required",
+            "id": 9,
+            "command": "echo scoped",
+            "category": "CommandExec",
+            "session_id": "sess-b"
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::ShowApproval { id: 9, session_id, .. }
+                if session_id.as_deref() == Some("sess-b")
+        )));
     }
 
     #[test]
@@ -2331,7 +3630,12 @@ mod tests {
         let mut saw_log = false;
         for c in &cmds {
             match c {
-                UiCommand::CodexThreadActionResult { action, success: true, message } => {
+                UiCommand::CodexThreadActionResult {
+                    action,
+                    success: true,
+                    message,
+                    ..
+                } => {
                     assert_eq!(action, "compact");
                     assert!(message.contains("compaction"));
                     saw_result = true;
@@ -2363,7 +3667,12 @@ mod tests {
         let mut saw_log = false;
         for c in &cmds {
             match c {
-                UiCommand::CodexThreadActionResult { action, success: false, message } => {
+                UiCommand::CodexThreadActionResult {
+                    action,
+                    success: false,
+                    message,
+                    ..
+                } => {
                     assert_eq!(action, "fork");
                     assert!(message.contains("no active"));
                     saw_result = true;
@@ -2382,10 +3691,38 @@ mod tests {
     }
 
     #[test]
+    fn handle_session_rename_result_emits_command() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "session_rename_result",
+            "session_id": "codex-session-1",
+            "source": "codex",
+            "name": "Renamed session",
+            "success": true,
+            "message": "Renamed session to Renamed session"
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SessionRenameResult {
+                session_id,
+                source: Some(source),
+                name: Some(name),
+                success: true,
+                message,
+            } if session_id == "codex-session-1"
+                && source == "codex"
+                && name == "Renamed session"
+                && message.contains("Renamed session")
+        )));
+    }
+
+    #[test]
     fn handle_codex_config_changed_full() {
         let mut s = AppState::new();
         let msg = json!({
             "event": "codex_config_changed",
+            "command": "/opt/bin/codex",
             "sandbox": "danger-full-access",
             "approval_policy": "never",
             "model": "gpt-5",
@@ -2395,26 +3732,34 @@ mod tests {
             "writable_roots": ["/tmp/extra"]
         });
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::CodexConfigChanged {
-                sandbox: Some(sand),
-                approval_policy: Some(p),
-                model: Some(m),
-                model_cleared: false,
-                reasoning_effort: Some(re),
-                reasoning_effort_cleared: false,
-                web_search: Some(true),
-                network_access: Some(true),
-                writable_roots: Some(roots),
-            } if sand == "danger-full-access"
-                && p == "never"
-                && m == "gpt-5"
-                && re == "high"
-                && roots.len() == 1
-                && roots[0] == "/tmp/extra"
-        ));
-        assert!(matched, "expected full CodexConfigChanged command, got {:?}", cmds);
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::CodexConfigChanged {
+                    command: Some(cmd),
+                    sandbox: Some(sand),
+                    approval_policy: Some(p),
+                    model: Some(m),
+                    model_cleared: false,
+                    reasoning_effort: Some(re),
+                    reasoning_effort_cleared: false,
+                    web_search: Some(true),
+                    network_access: Some(true),
+                    writable_roots: Some(roots),
+                } if cmd == "/opt/bin/codex"
+                    && sand == "danger-full-access"
+                    && p == "never"
+                    && m == "gpt-5"
+                    && re == "high"
+                    && roots.len() == 1
+                    && roots[0] == "/tmp/extra"
+            )
+        });
+        assert!(
+            matched,
+            "expected full CodexConfigChanged command, got {:?}",
+            cmds
+        );
     }
 
     #[test]
@@ -2425,21 +3770,28 @@ mod tests {
             "model_cleared": true
         });
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::CodexConfigChanged {
-                sandbox: None,
-                approval_policy: None,
-                model: None,
-                model_cleared: true,
-                reasoning_effort: None,
-                reasoning_effort_cleared: false,
-                web_search: None,
-                network_access: None,
-                writable_roots: None,
-            }
-        ));
-        assert!(matched, "expected model-cleared CodexConfigChanged, got {:?}", cmds);
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::CodexConfigChanged {
+                    command: None,
+                    sandbox: None,
+                    approval_policy: None,
+                    model: None,
+                    model_cleared: true,
+                    reasoning_effort: None,
+                    reasoning_effort_cleared: false,
+                    web_search: None,
+                    network_access: None,
+                    writable_roots: None,
+                }
+            )
+        });
+        assert!(
+            matched,
+            "expected model-cleared CodexConfigChanged, got {:?}",
+            cmds
+        );
     }
 
     #[test]
@@ -2450,15 +3802,21 @@ mod tests {
             "reasoning_effort_cleared": true
         });
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::CodexConfigChanged {
-                reasoning_effort: None,
-                reasoning_effort_cleared: true,
-                ..
-            }
-        ));
-        assert!(matched, "expected reasoning-cleared CodexConfigChanged, got {:?}", cmds);
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::CodexConfigChanged {
+                    reasoning_effort: None,
+                    reasoning_effort_cleared: true,
+                    ..
+                }
+            )
+        });
+        assert!(
+            matched,
+            "expected reasoning-cleared CodexConfigChanged, got {:?}",
+            cmds
+        );
     }
 
     #[test]
@@ -2470,17 +3828,23 @@ mod tests {
             "network_access": true
         });
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::CodexConfigChanged {
-                web_search: Some(false),
-                network_access: Some(true),
-                sandbox: None,
-                approval_policy: None,
-                ..
-            }
-        ));
-        assert!(matched, "expected toggles-only CodexConfigChanged, got {:?}", cmds);
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::CodexConfigChanged {
+                    web_search: Some(false),
+                    network_access: Some(true),
+                    sandbox: None,
+                    approval_policy: None,
+                    ..
+                }
+            )
+        });
+        assert!(
+            matched,
+            "expected toggles-only CodexConfigChanged, got {:?}",
+            cmds
+        );
     }
 
     #[test]
@@ -2500,13 +3864,19 @@ mod tests {
             }
         });
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::UploadReady { descriptor } if
-                descriptor.get("id").and_then(|v| v.as_str()) == Some("abc-123") &&
-                descriptor.get("name").and_then(|v| v.as_str()) == Some("report.pdf")
-        ));
-        assert!(matched, "expected UploadReady with descriptor, got {:?}", cmds);
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::UploadReady { descriptor } if
+                    descriptor.get("id").and_then(|v| v.as_str()) == Some("abc-123") &&
+                    descriptor.get("name").and_then(|v| v.as_str()) == Some("report.pdf")
+            )
+        });
+        assert!(
+            matched,
+            "expected UploadReady with descriptor, got {:?}",
+            cmds
+        );
     }
 
     #[test]
@@ -2514,10 +3884,12 @@ mod tests {
         let mut s = AppState::new();
         let msg = json!({"event": "upload_deleted", "id": "gone-1"});
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::UploadDeleted { id } if id == "gone-1"
-        ));
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::UploadDeleted { id } if id == "gone-1"
+            )
+        });
         assert!(matched, "expected UploadDeleted, got {:?}", cmds);
     }
 
@@ -2535,23 +3907,25 @@ mod tests {
             "debug": false
         });
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::GeminiConfigChanged {
-                model: Some(m),
-                model_cleared: false,
-                approval_mode: Some(am),
-                sandbox: Some(true),
-                extensions: Some(exts),
-                allowed_mcp_servers: Some(servers),
-                include_directories: Some(dirs),
-                debug: Some(false),
-            } if m == "gemini-2.5-pro"
-                && am == "auto_edit"
-                && exts.len() == 2
-                && servers == &vec!["intendant".to_string()]
-                && dirs == &vec!["/tmp/extra".to_string()]
-        ));
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::GeminiConfigChanged {
+                    model: Some(m),
+                    model_cleared: false,
+                    approval_mode: Some(am),
+                    sandbox: Some(true),
+                    extensions: Some(exts),
+                    allowed_mcp_servers: Some(servers),
+                    include_directories: Some(dirs),
+                    debug: Some(false),
+                } if m == "gemini-2.5-pro"
+                    && am == "auto_edit"
+                    && exts.len() == 2
+                    && servers == &vec!["intendant".to_string()]
+                    && dirs == &vec!["/tmp/extra".to_string()]
+            )
+        });
         assert!(matched, "expected full GeminiConfigChanged, got {:?}", cmds);
     }
 
@@ -2563,20 +3937,26 @@ mod tests {
             "model_cleared": true
         });
         let cmds = s.handle_message(&msg);
-        let matched = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::GeminiConfigChanged {
-                model: None,
-                model_cleared: true,
-                approval_mode: None,
-                sandbox: None,
-                extensions: None,
-                allowed_mcp_servers: None,
-                include_directories: None,
-                debug: None,
-            }
-        ));
-        assert!(matched, "expected model-cleared GeminiConfigChanged, got {:?}", cmds);
+        let matched = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::GeminiConfigChanged {
+                    model: None,
+                    model_cleared: true,
+                    approval_mode: None,
+                    sandbox: None,
+                    extensions: None,
+                    allowed_mcp_servers: None,
+                    include_directories: None,
+                    debug: None,
+                }
+            )
+        });
+        assert!(
+            matched,
+            "expected model-cleared GeminiConfigChanged, got {:?}",
+            cmds
+        );
     }
 
     #[test]
@@ -2589,17 +3969,25 @@ mod tests {
             "message": "agent torn down; next task will spawn a fresh Gemini process"
         });
         let cmds = s.handle_message(&msg);
-        let saw_result = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::GeminiThreadActionResult { action, success: true, message }
-                if action == "new"
-                    && message == "agent torn down; next task will spawn a fresh Gemini process"
-        ));
-        assert!(saw_result, "expected GeminiThreadActionResult, got {:?}", cmds);
-        let saw_log = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::AddLogEntry { content, .. } if content.starts_with("Gemini /new:")
-        ));
+        let saw_result = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::GeminiThreadActionResult { action, success: true, message }
+                    if action == "new"
+                        && message == "agent torn down; next task will spawn a fresh Gemini process"
+            )
+        });
+        assert!(
+            saw_result,
+            "expected GeminiThreadActionResult, got {:?}",
+            cmds
+        );
+        let saw_log = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::AddLogEntry { content, .. } if content.starts_with("Gemini /new:")
+            )
+        });
         assert!(saw_log, "expected Gemini log entry, got {:?}", cmds);
     }
 
@@ -2608,7 +3996,9 @@ mod tests {
         let mut s = AppState::new();
         let msg = json!({"event": "agent_output", "stdout": "hello world", "stderr": ""});
         let cmds = s.handle_message(&msg);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddLogEntry { content, .. } if content == "hello world")));
+        assert!(cmds.iter().any(
+            |c| matches!(c, UiCommand::AddLogEntry { content, .. } if content == "hello world")
+        ));
     }
 
     #[test]
@@ -2627,7 +4017,57 @@ mod tests {
         assert!(s.main_usage.is_some());
         let u = s.main_usage.as_ref().unwrap();
         assert_eq!(u.tokens_used, 5000);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::UpdateUsage { .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::UpdateUsage { .. })));
+    }
+
+    #[test]
+    fn usage_update_logs_only_new_context_milestones() {
+        fn usage_msg(tokens_used: u64, usage_pct: f64) -> serde_json::Value {
+            json!({
+                "event": "usage_update",
+                "session_id": "sess-a",
+                "main": {
+                    "provider": "openai",
+                    "model": "gpt-5",
+                    "tokens_used": tokens_used,
+                    "context_window": 10000,
+                    "usage_pct": usage_pct,
+                    "prompt_tokens": tokens_used,
+                    "completion_tokens": 0,
+                    "cached_tokens": 0
+                }
+            })
+        }
+
+        fn token_log_count(cmds: &[UiCommand]) -> usize {
+            cmds.iter()
+                .filter(|cmd| {
+                    matches!(
+                        cmd,
+                        UiCommand::AddLogEntry { content, .. }
+                            if content.starts_with("tokens: ")
+                    )
+                })
+                .count()
+        }
+
+        let mut s = AppState::new();
+        s.session_id = "sess-a".to_string();
+        s.verbosity = "verbose".to_string();
+
+        let first = s.handle_message(&usage_msg(3_130, 31.3));
+        assert_eq!(token_log_count(&first), 1);
+
+        let same_band = s.handle_message(&usage_msg(3_350, 33.5));
+        assert_eq!(token_log_count(&same_band), 0);
+        assert!(same_band
+            .iter()
+            .any(|cmd| matches!(cmd, UiCommand::UpdateUsage { .. })));
+
+        let next_band = s.handle_message(&usage_msg(4_000, 40.0));
+        assert_eq!(token_log_count(&next_band), 1);
     }
 
     #[test]
@@ -2637,7 +4077,31 @@ mod tests {
         let cmds = s.handle_message(&msg);
         assert_eq!(s.known_displays.len(), 1);
         assert_eq!(s.known_displays[0], 99);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddDisplay { display_id: 99, .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::AddDisplay { display_id: 99, .. })));
+    }
+
+    #[test]
+    fn handle_event_session_attached() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "session_attached",
+            "session_id": "session-1",
+            "source": "codex"
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SessionAttached { session_id, source }
+                if session_id == "session-1" && source == "codex"
+        )));
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, .. }
+                if content == "Session attached: session-1 (codex)"
+        )));
     }
 
     #[test]
@@ -2663,7 +4127,10 @@ mod tests {
         assert_eq!(s.model, "gpt-5");
         // Debug entry hidden at normal verbosity → 2 visible entries
         // (turn started + agent output).
-        let visible_entries: Vec<_> = cmds.iter().filter(|c| matches!(c, UiCommand::AddLogEntry { .. })).collect();
+        let visible_entries: Vec<_> = cmds
+            .iter()
+            .filter(|c| matches!(c, UiCommand::AddLogEntry { .. }))
+            .collect();
         assert_eq!(visible_entries.len(), 2);
     }
 
@@ -2697,7 +4164,7 @@ mod tests {
             "turn": 1,
             "summary": "hello",
             "source": "worker",
-            "ts": "12:34:56.789",
+            "ts": "2026-05-30T03:29:25.821Z",
         });
         let cmds = s.handle_event(&msg);
         let ts = cmds
@@ -2709,8 +4176,7 @@ mod tests {
                 _ => None,
             })
             .expect("model_response should emit an AddLogEntry for 'hello'");
-        // Trimmed to HH:MM:SS.
-        assert_eq!(ts, "12:34:56");
+        assert_eq!(ts, "2026-05-30T03:29:25.821Z");
         // After the call, replay_ts must be cleared so subsequent live calls
         // revert to wallclock.
         assert!(s.replay_ts.is_none());
@@ -2727,11 +4193,9 @@ mod tests {
         let source = cmds
             .iter()
             .find_map(|c| match c {
-                UiCommand::AddLogEntry { source, content, .. }
-                    if content.contains("Round 2 complete") =>
-                {
-                    Some(source.clone())
-                }
+                UiCommand::AddLogEntry {
+                    source, content, ..
+                } if content.contains("Round 2 complete") => Some(source.clone()),
                 _ => None,
             })
             .expect("round_complete should emit an AddLogEntry");
@@ -2748,7 +4212,9 @@ mod tests {
         ];
         let cmds = s.handle_log_replay(&entries);
         let entry = cmds.iter().find_map(|c| match c {
-            UiCommand::AddLogEntry { content, source, .. } => {
+            UiCommand::AddLogEntry {
+                content, source, ..
+            } => {
                 if content.starts_with("Auto-approved: ") {
                     Some((content.clone(), source.clone()))
                 } else {
@@ -2757,8 +4223,8 @@ mod tests {
             }
             _ => None,
         });
-        let (content, source) = entry
-            .expect("auto_approved should emit an entry with the Auto-approved: prefix");
+        let (content, source) =
+            entry.expect("auto_approved should emit an entry with the Auto-approved: prefix");
         assert_eq!(content, "Auto-approved: exec: ls /tmp");
         // Source label for "system" is the ℹ glyph.
         assert_eq!(source, "\u{2139}");
@@ -2822,7 +4288,10 @@ mod tests {
         let cmds = s.set_verbosity("debug");
         // Should clear and re-add both
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::ClearLogs)));
-        let entries: Vec<_> = cmds.iter().filter(|c| matches!(c, UiCommand::AddLogEntry { .. })).collect();
+        let entries: Vec<_> = cmds
+            .iter()
+            .filter(|c| matches!(c, UiCommand::AddLogEntry { .. }))
+            .collect();
         assert_eq!(entries.len(), 2);
     }
 
@@ -2848,7 +4317,9 @@ mod tests {
     fn follow_up_and_human_response() {
         let mut s = AppState::new();
         let cmds = s.follow_up("do more");
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "thinking")));
 
         let cmds = s.human_response("yes");
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideAllPanels)));
@@ -2874,18 +4345,24 @@ mod tests {
     fn badge_on_approval_when_not_activity_tab() {
         let mut s = AppState::new();
         s.active_tab = "stats".to_string();
-        let msg = json!({"event": "approval_required", "id": 1, "command": "test", "category": "exec"});
+        let msg =
+            json!({"event": "approval_required", "id": 1, "command": "test", "category": "exec"});
         let cmds = s.handle_message(&msg);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::ShowBadge { tab, .. } if tab == "activity")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::ShowBadge { tab, .. } if tab == "activity")));
     }
 
     #[test]
     fn no_badge_when_on_activity_tab() {
         let mut s = AppState::new();
         s.active_tab = "activity".to_string();
-        let msg = json!({"event": "approval_required", "id": 1, "command": "test", "category": "exec"});
+        let msg =
+            json!({"event": "approval_required", "id": 1, "command": "test", "category": "exec"});
         let cmds = s.handle_message(&msg);
-        assert!(!cmds.iter().any(|c| matches!(c, UiCommand::ShowBadge { .. })));
+        assert!(!cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::ShowBadge { .. })));
     }
 
     #[test]
@@ -2894,7 +4371,28 @@ mod tests {
         let msg = json!({"event": "round_complete", "round": 2, "turns_in_round": 5});
         let cmds = s.handle_message(&msg);
         assert_eq!(s.phase, "idle");
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "idle")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "idle")));
+    }
+
+    #[test]
+    fn handle_event_session_ended_resets_current_phase() {
+        let mut s = AppState::new();
+        s.session_id = "failed-session".to_string();
+        s.phase = "running".to_string();
+
+        let msg = json!({
+            "event": "session_ended",
+            "session_id": "failed-session",
+            "reason": "error: failed to spawn"
+        });
+        let cmds = s.handle_message(&msg);
+
+        assert_eq!(s.phase, "idle");
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "idle")));
     }
 
     #[test]
@@ -2903,7 +4401,126 @@ mod tests {
         s.verbosity = "debug".to_string(); // enable debug to see unknown events
         let msg = json!({"event": "some_new_event", "foo": "bar"});
         let cmds = s.handle_message(&msg);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::AddLogEntry { level, .. } if level == "debug")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::AddLogEntry { level, .. } if level == "debug")));
+    }
+
+    #[test]
+    fn log_entry_preserves_superseded_metadata() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "log_entry",
+            "level": "info",
+            "source": "user",
+            "content": "Old prompt",
+            "session_id": "session-1",
+            "user_turn_index": 3,
+            "user_turn_revision": 2,
+            "superseded": true,
+            "kind": "rollback_marker",
+            "replacement_for_user_turn_index": 3
+        });
+
+        let cmds = s.handle_message(&msg);
+        let entry = cmds
+            .iter()
+            .find_map(|cmd| match cmd {
+                UiCommand::AddLogEntry {
+                    content,
+                    kind,
+                    user_turn_index,
+                    user_turn_revision,
+                    superseded,
+                    replacement_for_user_turn_index,
+                    ..
+                } => Some((
+                    content,
+                    kind,
+                    user_turn_index,
+                    user_turn_revision,
+                    superseded,
+                    replacement_for_user_turn_index,
+                )),
+                _ => None,
+            })
+            .expect("log_entry should emit an AddLogEntry");
+
+        assert_eq!(entry.0, "Old prompt");
+        assert_eq!(entry.1.as_deref(), Some("rollback_marker"));
+        assert_eq!(*entry.2, Some(3));
+        assert_eq!(*entry.3, Some(2));
+        assert!(*entry.4);
+        assert_eq!(*entry.5, Some(3));
+    }
+
+    #[test]
+    fn live_user_message_rewind_marks_buffer_and_emits_marker() {
+        let mut s = AppState::new();
+        for msg in [
+            json!({
+                "event": "log_entry",
+                "level": "info",
+                "source": "user",
+                "content": "Old prompt",
+                "session_id": "session-1",
+                "user_turn_index": 1
+            }),
+            json!({
+                "event": "log_entry",
+                "level": "model",
+                "source": "codex",
+                "content": "Old answer",
+                "session_id": "session-1"
+            }),
+        ] {
+            s.handle_message(&msg);
+        }
+
+        let cmds = s.handle_message(&json!({
+            "event": "user_message_rewind",
+            "session_id": "session-1",
+            "user_turn_index": 1,
+            "turns_removed": 1
+        }));
+
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::MarkActivityContextRewind {
+                session_id,
+                user_turn_index: 1,
+                turns_removed: 1,
+            } if session_id.as_deref() == Some("session-1")
+        )));
+        assert!(cmds.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::AddLogEntry {
+                kind,
+                content,
+                session_id,
+                ..
+            } if kind.as_deref() == Some("rollback_marker")
+                && content.contains("Rewound 1 user turn")
+                && session_id.as_deref() == Some("session-1")
+        )));
+
+        let refiltered = s.set_verbosity("normal");
+        assert!(refiltered.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::AddLogEntry {
+                content,
+                superseded: true,
+                ..
+            } if content == "Old prompt"
+        )));
+        assert!(refiltered.iter().any(|cmd| matches!(
+            cmd,
+            UiCommand::AddLogEntry {
+                content,
+                superseded: true,
+                ..
+            } if content == "Old answer"
+        )));
     }
 
     #[test]
@@ -2913,15 +4530,25 @@ mod tests {
             level: "info".into(),
             source: "Agent".into(),
             content: "hello".into(),
+            session_id: None,
+            kind: None,
+            output_id: None,
+            item_id: None,
             collapsible: false,
             turn: None,
+            user_turn_index: None,
+            user_turn_revision: None,
+            superseded: false,
+            replacement_for_user_turn_index: None,
             images: vec![],
         };
         let json = serde_json::to_string(&cmd).unwrap();
         assert!(json.contains("\"cmd\":\"add_log_entry\""));
         assert!(json.contains("\"content\":\"hello\""));
 
-        let cmd2 = UiCommand::SetPhase { phase: "thinking".into() };
+        let cmd2 = UiCommand::SetPhase {
+            phase: "thinking".into(),
+        };
         let json2 = serde_json::to_string(&cmd2).unwrap();
         assert!(json2.contains("\"cmd\":\"set_phase\""));
     }
@@ -2951,14 +4578,17 @@ mod tests {
             model: "gpt-5".into(),
             tokens_used: 5000,
             context_window: 128000,
+            hard_context_window: Some(272000),
             usage_pct: 3.9,
             prompt_tokens: 4000,
             completion_tokens: 1000,
             cached_tokens: 500,
         };
         let json = serde_json::to_string(&u).unwrap();
+        assert!(json.contains("hard_context_window"));
         let back: UsageSnapshot = serde_json::from_str(&json).unwrap();
         assert_eq!(back.tokens_used, 5000);
+        assert_eq!(back.hard_context_window, Some(272000));
     }
 
     #[test]
@@ -2973,7 +4603,9 @@ mod tests {
         });
         let cmds = s.handle_message(&msg);
         assert!(s.presence_usage.is_some());
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::UpdateUsage { .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::UpdateUsage { .. })));
     }
 
     #[test]
@@ -2992,15 +4624,28 @@ mod tests {
         assert_eq!(lu.input_tokens, 1000);
         assert_eq!(lu.output_tokens, 500);
         assert_eq!(lu.provider, "gemini");
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::UpdateUsage { live_json, .. } if live_json.is_some())));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::UpdateUsage { live_json, .. } if live_json.is_some())));
     }
 
     #[test]
     fn update_live_usage_returns_commands() {
         let mut s = AppState::new();
-        let cmds = s.update_live_usage("gemini", "gemini-2.5-flash", 100, 50, 10, 150, 0);
+        let cmds = s.update_live_usage(LiveUsageSnapshot {
+            provider: "gemini".into(),
+            model: "gemini-2.5-flash".into(),
+            input_tokens: 100,
+            output_tokens: 50,
+            cached_tokens: 10,
+            total_tokens: 150,
+            thinking_tokens: 0,
+            ..Default::default()
+        });
         assert!(s.live_usage.is_some());
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::UpdateUsage { live_json, .. } if live_json.is_some())));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::UpdateUsage { live_json, .. } if live_json.is_some())));
     }
 
     #[test]
@@ -3018,17 +4663,39 @@ mod tests {
         });
         s.handle_message(&main_msg);
 
-        // Set live usage with a known-priced model
-        s.update_live_usage("gemini", "gemini-2.0-flash", 1000, 500, 0, 1500, 0);
+        // Set live usage with a known-priced realtime model and audio tokens.
+        s.update_live_usage(LiveUsageSnapshot {
+            provider: "openai".into(),
+            model: "gpt-realtime-1.5".into(),
+            input_tokens: 1000,
+            output_tokens: 500,
+            cached_tokens: 100,
+            total_tokens: 1500,
+            thinking_tokens: 0,
+            input_audio_tokens: 1000,
+            cached_audio_tokens: 100,
+            output_audio_tokens: 500,
+            ..Default::default()
+        });
 
         let cmd = s.build_usage_command();
-        if let UiCommand::UpdateUsage { cost_json, live_json, .. } = cmd {
+        if let UiCommand::UpdateUsage {
+            cost_json,
+            live_json,
+            ..
+        } = cmd
+        {
             assert!(live_json.is_some());
             assert!(cost_json.is_some());
             let cost: CostSummary = serde_json::from_str(&cost_json.unwrap()).unwrap();
             // Should have both main and live cost lines
             assert_eq!(cost.lines.len(), 2);
-            assert!(cost.lines.iter().any(|l| l.label == "Live Model"));
+            let live = cost
+                .lines
+                .iter()
+                .find(|l| l.label == "Live Model")
+                .expect("live cost line");
+            assert!((live.cost - 0.06084).abs() < 1e-12);
         } else {
             panic!("Expected UpdateUsage");
         }
@@ -3042,7 +4709,9 @@ mod tests {
         assert_eq!(s.active_tab, "stats");
 
         let cmds = s.set_active_tab("activity");
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::HideBadge { tab } if tab == "activity")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::HideBadge { tab } if tab == "activity")));
     }
 
     #[test]
@@ -3063,7 +4732,9 @@ mod tests {
         assert_eq!(s.turn, 10);
         assert_eq!(s.autonomy, "High");
         assert_eq!(s.phase, "orchestrating");
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "orchestrating")));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::SetPhase { phase } if phase == "orchestrating")));
     }
 
     #[test]
@@ -3076,7 +4747,9 @@ mod tests {
         assert_eq!(entry.kind, "modified");
         assert_eq!(entry.lines_added, 5);
         assert_eq!(entry.lines_removed, 2);
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::FileChanged { .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::FileChanged { .. })));
     }
 
     #[test]
@@ -3088,7 +4761,9 @@ mod tests {
         ];
         let cmds = s.handle_log_replay(&entries);
         assert!(s.changed_files.contains_key("src/lib.rs"));
-        assert!(cmds.iter().any(|c| matches!(c, UiCommand::FileChanged { .. })));
+        assert!(cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::FileChanged { .. })));
     }
 
     #[test]
@@ -3115,15 +4790,17 @@ mod tests {
         });
         let cmds = s.handle_message(&msg);
         assert!(cmds.iter().any(|c| matches!(c, UiCommand::HistoryChanged)));
-        let saw_log = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::AddLogEntry { content, level, .. }
-                if level == "info"
-                    && content.contains("Rolled back")
-                    && content.contains("round 5")
-                    && content.contains("round 2")
-                    && content.contains("7 files")
-        ));
+        let saw_log = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::AddLogEntry { content, level, .. }
+                    if level == "info"
+                        && content.contains("Rolled back")
+                        && content.contains("round 5")
+                        && content.contains("round 2")
+                        && content.contains("7 files")
+            )
+        });
         assert!(saw_log, "expected rollback log entry, got {:?}", cmds);
     }
 
@@ -3138,14 +4815,20 @@ mod tests {
             "method": "truncated"
         });
         let cmds = s.handle_message(&msg);
-        let saw_log = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::AddLogEntry { content, level, .. }
-                if level == "warn"
-                    && content.contains("Conversation rolled back")
-                    && content.contains("3 turns")
-        ));
-        assert!(saw_log, "expected warn log for truncated rollback, got {:?}", cmds);
+        let saw_log = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::AddLogEntry { content, level, .. }
+                    if level == "warn"
+                        && content.contains("Conversation rolled back")
+                        && content.contains("3 turns")
+            )
+        });
+        assert!(
+            saw_log,
+            "expected warn log for truncated rollback, got {:?}",
+            cmds
+        );
     }
 
     #[test]
@@ -3159,14 +4842,16 @@ mod tests {
             "method": "session-reset"
         });
         let cmds = s.handle_message(&msg);
-        let saw_log = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::AddLogEntry { content, level, .. }
-                if level == "warn"
-                    && content.contains("Session reset")
-                    && content.contains("claude-code")
-                    && content.contains("7 turns")
-        ));
+        let saw_log = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::AddLogEntry { content, level, .. }
+                    if level == "warn"
+                        && content.contains("Session reset")
+                        && content.contains("claude-code")
+                        && content.contains("7 turns")
+            )
+        });
         assert!(saw_log, "expected session-reset warn log, got {:?}", cmds);
     }
 
@@ -3182,11 +4867,13 @@ mod tests {
             "backend": "openai"
         });
         let cmds = s.handle_message(&msg);
-        let saw_log = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::AddLogEntry { content, level, .. }
-                if level == "warn" && content.contains("Conversation rolled back")
-        ));
+        let saw_log = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::AddLogEntry { content, level, .. }
+                    if level == "warn" && content.contains("Conversation rolled back")
+            )
+        });
         assert!(saw_log, "expected default-method warn log, got {:?}", cmds);
     }
 
@@ -3226,7 +4913,11 @@ mod tests {
     fn history_changed_serializes_as_snake_case_cmd() {
         let cmd = UiCommand::HistoryChanged;
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"cmd\":\"history_changed\""), "got: {}", json);
+        assert!(
+            json.contains("\"cmd\":\"history_changed\""),
+            "got: {}",
+            json
+        );
     }
 
     #[test]
@@ -3249,6 +4940,11 @@ mod tests {
         let mut s = AppState::new();
         let msg = json!({"event": "interrupt_requested"});
         let cmds = s.handle_message(&msg);
+        assert_eq!(s.phase, "interrupting");
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::SetPhase { phase } if phase == "interrupting"
+        )));
         assert!(cmds.iter().any(|c| matches!(
             c,
             UiCommand::AddLogEntry { content, .. } if content == "Interrupt requested"
@@ -3331,14 +5027,16 @@ mod tests {
         assert_eq!(entry.text, "please check the logs");
         assert!(entry.reason.is_none());
         // SteerStatusUpdate command emitted with status=pending
-        let saw_update = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::SteerStatusUpdate { id, status, reason, text }
-                if id == "steer-123-1"
-                    && status == "pending"
-                    && reason.is_none()
-                    && text == "please check the logs"
-        ));
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, reason, text }
+                    if id == "steer-123-1"
+                        && status == "pending"
+                        && reason.is_none()
+                        && text == "please check the logs"
+            )
+        });
         assert!(saw_update, "expected SteerStatusUpdate, got {:?}", cmds);
         // Log entry surfaced so the user sees their send
         assert!(cmds.iter().any(|c| matches!(
@@ -3373,20 +5071,72 @@ mod tests {
             Some("agent does not support mid-turn steering")
         );
         // UiCommand carries status=queued and echoes the backend reason
-        let saw_update = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::SteerStatusUpdate { id, status, reason, text }
-                if id == "abc"
-                    && status == "queued"
-                    && reason.as_deref() == Some("agent does not support mid-turn steering")
-                    && text == "retry the build"
-        ));
-        assert!(saw_update, "expected queued SteerStatusUpdate, got {:?}", cmds);
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, reason, text }
+                    if id == "abc"
+                        && status == "queued"
+                        && reason.as_deref() == Some("agent does not support mid-turn steering")
+                        && text == "retry the build"
+            )
+        });
+        assert!(
+            saw_update,
+            "expected queued SteerStatusUpdate, got {:?}",
+            cmds
+        );
         // Queued uses warn level so the user notices the delay
         assert!(cmds.iter().any(|c| matches!(
             c,
             UiCommand::AddLogEntry { content, level, .. }
                 if level == "warn" && content.contains("Steer queued")
+        )));
+    }
+
+    #[test]
+    fn handle_event_steer_accepted_updates_status() {
+        let mut s = AppState::new();
+        s.queued_steers.insert(
+            "codex".into(),
+            QueuedSteer {
+                text: "wait for windows VM".into(),
+                status: SteerStatus::Pending,
+                reason: None,
+            },
+        );
+        let msg = json!({
+            "event": "steer_accepted",
+            "id": "codex",
+            "reason": "Codex accepted the steer; waiting for the next runtime checkpoint"
+        });
+        let cmds = s.handle_message(&msg);
+        let entry = s.queued_steers.get("codex").expect("still tracked");
+        assert_eq!(entry.status, SteerStatus::Accepted);
+        assert_eq!(
+            entry.reason.as_deref(),
+            Some("Codex accepted the steer; waiting for the next runtime checkpoint")
+        );
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, reason, text }
+                    if id == "codex"
+                        && status == "accepted"
+                        && reason.as_deref()
+                            == Some("Codex accepted the steer; waiting for the next runtime checkpoint")
+                        && text == "wait for windows VM"
+            )
+        });
+        assert!(
+            saw_update,
+            "expected accepted SteerStatusUpdate, got {:?}",
+            cmds
+        );
+        assert!(cmds.iter().any(|c| matches!(
+            c,
+            UiCommand::AddLogEntry { content, level, .. }
+                if level == "info" && content.contains("Steer accepted")
         )));
     }
 
@@ -3409,15 +5159,21 @@ mod tests {
         let cmds = s.handle_message(&msg);
         // Entry removed from the in-flight map
         assert!(s.queued_steers.get("xyz").is_none());
-        let saw_update = cmds.iter().any(|c| matches!(
-            c,
-            UiCommand::SteerStatusUpdate { id, status, reason, text }
-                if id == "xyz"
-                    && status == "delivered"
-                    && reason.is_none()
-                    && text == "stop and summarize"
-        ));
-        assert!(saw_update, "expected delivered SteerStatusUpdate, got {:?}", cmds);
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, reason, text }
+                    if id == "xyz"
+                        && status == "delivered"
+                        && reason.is_none()
+                        && text == "stop and summarize"
+            )
+        });
+        assert!(
+            saw_update,
+            "expected delivered SteerStatusUpdate, got {:?}",
+            cmds
+        );
         // Log contains "mid-turn" for mid_turn=true deliveries
         assert!(cmds.iter().any(|c| matches!(
             c,
@@ -3431,7 +5187,7 @@ mod tests {
     #[test]
     fn steer_delivered_followup_log_variant() {
         // When mid_turn=false (queued delivery at turn boundary), the log
-        // line calls it out as "as follow-up" rather than mid-turn so the
+        // line calls it out as "at turn boundary" rather than mid-turn so the
         // user understands the interjection wasn't real-time.
         let mut s = AppState::new();
         s.queued_steers.insert(
@@ -3451,7 +5207,7 @@ mod tests {
         assert!(cmds.iter().any(|c| matches!(
             c,
             UiCommand::AddLogEntry { content, .. }
-                if content.contains("as follow-up")
+                if content.contains("at turn boundary")
         )));
     }
 
@@ -3466,7 +5222,11 @@ mod tests {
             reason: None,
         };
         let json = serde_json::to_string(&cmd).unwrap();
-        assert!(json.contains("\"cmd\":\"steer_status_update\""), "got: {}", json);
+        assert!(
+            json.contains("\"cmd\":\"steer_status_update\""),
+            "got: {}",
+            json
+        );
         assert!(json.contains("\"id\":\"s1\""));
         assert!(json.contains("\"status\":\"pending\""));
         // reason omitted when None
@@ -3618,11 +5378,12 @@ mod tests {
             });
             let cmds = s.handle_message(&msg);
             assert!(
-                !cmds.iter().any(|c| matches!(c,
+                !cmds.iter().any(|c| matches!(
+                    c,
                     UiCommand::PeerLog { .. }
-                    | UiCommand::PeerApprovalRequested { .. }
-                    | UiCommand::PeerApprovalResolved { .. }
-                    | UiCommand::PeerUsage { .. }
+                        | UiCommand::PeerApprovalRequested { .. }
+                        | UiCommand::PeerApprovalResolved { .. }
+                        | UiCommand::PeerUsage { .. }
                 )),
                 "expected no peer-* UiCommand for connection lifecycle event"
             );
@@ -3645,9 +5406,12 @@ mod tests {
         });
         let cmds = s.handle_message(&msg);
         let log = cmds.iter().find_map(|c| match c {
-            UiCommand::PeerLog { host_id, level, content, .. } => {
-                Some((host_id, level, content))
-            }
+            UiCommand::PeerLog {
+                host_id,
+                level,
+                content,
+                ..
+            } => Some((host_id, level, content)),
             _ => None,
         });
         let (host_id, level, content) = log.expect("PeerLog emitted");
@@ -3683,8 +5447,7 @@ mod tests {
             } => Some((host_id, display_id, session_id, signal)),
             _ => None,
         });
-        let (host_id, display_id, session_id, signal) =
-            sig.expect("PeerWebRtcSignal emitted");
+        let (host_id, display_id, session_id, signal) = sig.expect("PeerWebRtcSignal emitted");
         assert_eq!(host_id, "intendant:alpha");
         assert_eq!(*display_id, 0);
         assert_eq!(session_id, "sess-uuid");
@@ -3738,20 +5501,21 @@ mod tests {
         });
         let cmds = s.handle_message(&msg);
         // No PeerWebRtcSignal should be emitted.
-        let any_signal = cmds.iter().any(|c| {
-            matches!(c, UiCommand::PeerWebRtcSignal { .. })
-        });
+        let any_signal = cmds
+            .iter()
+            .any(|c| matches!(c, UiCommand::PeerWebRtcSignal { .. }));
         assert!(
             !any_signal,
             "missing session_id must not produce a PeerWebRtcSignal"
         );
         // A warn-level log entry should explain the drop.
         let warn = cmds.iter().find_map(|c| match c {
-            UiCommand::PeerLog { level, source, content, .. }
-                if level == "warn" && source == "webrtc" =>
-            {
-                Some(content)
-            }
+            UiCommand::PeerLog {
+                level,
+                source,
+                content,
+                ..
+            } if level == "warn" && source == "webrtc" => Some(content),
             _ => None,
         });
         let content = warn.expect("warn log entry for missing session_id");

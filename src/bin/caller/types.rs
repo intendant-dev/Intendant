@@ -105,6 +105,60 @@ impl Verbosity {
 // Outbound events (control socket / web gateway / MCP)
 // ---------------------------------------------------------------------------
 
+/// Per-session frontend affordances advertised by the controller.
+/// Missing capabilities mean the frontend should keep its legacy defaults.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionCapabilities {
+    #[serde(default)]
+    pub follow_up: bool,
+    #[serde(default)]
+    pub steer: bool,
+    #[serde(default)]
+    pub interrupt: bool,
+    #[serde(default)]
+    pub codex_thread_actions: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_managed_context: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_context_archive: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_command: Option<String>,
+    /// Session-scoped Codex service-tier state. `Some(false)` is serialized so
+    /// frontends can distinguish a known normal tier from unknown old replay
+    /// data.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_fast_mode: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_service_tier: Option<String>,
+}
+
+/// Per-session Codex `/goal` state shown by the dashboard.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct SessionGoal {
+    pub objective: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub elapsed_seconds: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tokens_used: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_budget: Option<u64>,
+}
+
+/// Normalized region in a shared display view.
+///
+/// Coordinates are fractions of the visible display frame, where `(0, 0)` is
+/// the top-left and `(1, 1)` is the bottom-right. The dashboard renders this as
+/// a focus box over the video stream.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SharedViewRegion {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
 /// Events sent to connected control socket clients, web gateway, and MCP.
 ///
 /// Also deserialized by `crate::peer::upcast::OutboundEventUpcaster`
@@ -120,16 +174,24 @@ impl Verbosity {
 #[allow(dead_code)]
 pub enum OutboundEvent {
     TurnStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         turn: usize,
         budget_pct: f64,
     },
     AgentOutput {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         stdout: String,
         stderr: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        output_id: Option<String>,
     },
     ApprovalRequired {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
         command: String,
     },
@@ -137,6 +199,8 @@ pub enum OutboundEvent {
         question: String,
     },
     TaskComplete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         reason: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         summary: Option<String>,
@@ -146,11 +210,37 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         task: Option<String>,
     },
+    SessionIdentity {
+        session_id: String,
+        source: String,
+        backend_session_id: String,
+    },
+    SessionRelationship {
+        parent_session_id: String,
+        child_session_id: String,
+        relationship: String,
+        ephemeral: bool,
+    },
+    SessionCapabilities {
+        session_id: String,
+        capabilities: SessionCapabilities,
+    },
+    SessionGoal {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        goal: Option<SessionGoal>,
+    },
+    SessionAttached {
+        session_id: String,
+        source: String,
+    },
     SessionEnded {
         session_id: String,
         reason: String,
     },
     RoundComplete {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         round: usize,
         turns_in_round: usize,
     },
@@ -192,6 +282,30 @@ pub enum OutboundEvent {
         display_id: u32,
         backend: String,
     },
+    SharedView {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        action: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_target: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        display_id: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        region: Option<SharedViewRegion>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        note: Option<String>,
+    },
+    BrowserWorkspaceChanged {
+        kind: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace: Option<crate::browser_workspace::BrowserWorkspace>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        workspace_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        message: Option<String>,
+    },
     RecordingStarted {
         stream_name: String,
     },
@@ -218,15 +332,43 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         agent: Option<String>,
     },
+    AutonomyChanged {
+        autonomy: String,
+    },
     /// Delivered to browsers when a Codex thread-level action finishes
-    /// (compact, fork, rollback, review, rename, goal, init, memory-reset).
+    /// (compact, fork, side, side-close, rollback, review, rename, goal, init, memory-reset).
     /// `success` + `message` are surfaced as a dashboard toast and logged.
     CodexThreadActionResult {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         action: String,
         success: bool,
         message: String,
     },
+    SessionRenameResult {
+        session_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        source: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        name: Option<String>,
+        success: bool,
+        message: String,
+    },
+    SessionAgentConfigResult {
+        session_id: String,
+        source: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        backend_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        intendant_session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        persisted_session_ids: Vec<String>,
+        success: bool,
+        message: String,
+    },
     CodexConfigChanged {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -243,11 +385,19 @@ pub enum OutboundEvent {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         reasoning_effort_cleared: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        service_tier: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        service_tier_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
         web_search: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         network_access: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         writable_roots: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none", alias = "context_recovery")]
+        managed_context: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_archive: Option<String>,
     },
     /// Mirror of `CodexConfigChanged` for the Gemini CLI backend. Fields
     /// omitted (or `Option::None`) mean "no change since the last emission".
@@ -279,14 +429,42 @@ pub enum OutboundEvent {
         message: String,
     },
     Usage {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         main: crate::frontend::ModelUsageSnapshot,
         #[serde(skip_serializing_if = "Option::is_none")]
         presence: Option<crate::frontend::ModelUsageSnapshot>,
     },
     UsageUpdate {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         main: crate::frontend::ModelUsageSnapshot,
         #[serde(skip_serializing_if = "Option::is_none")]
         presence: Option<crate::frontend::ModelUsageSnapshot>,
+    },
+    ContextSnapshot {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        source: String,
+        label: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_index: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn: Option<usize>,
+        format: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_count: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        token_count_kind: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_window: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        hard_context_window: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        item_count: Option<usize>,
+        raw: serde_json::Value,
     },
     CommandResult {
         action: String,
@@ -307,16 +485,24 @@ pub enum OutboundEvent {
     },
     // --- New variants for broadcast decoupling ---
     ModelResponseDelta {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         text: String,
     },
     AgentStarted {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         turn: usize,
         commands_preview: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        item_id: Option<String>,
         /// When set, overrides the default "agent"/"Run" source label (e.g. "Codex").
         #[serde(skip_serializing_if = "Option::is_none")]
         source: Option<String>,
     },
     DoneSignal {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         message: Option<String>,
     },
@@ -324,6 +510,8 @@ pub enum OutboundEvent {
         preview: String,
     },
     ApprovalResolved {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: u64,
         action: String,
     },
@@ -347,6 +535,8 @@ pub enum OutboundEvent {
         status: String,
     },
     ModelResponse {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         turn: usize,
         summary: String,
         #[serde(skip_serializing_if = "Option::is_none")]
@@ -383,6 +573,22 @@ pub enum OutboundEvent {
         cached_tokens: u64,
         total_tokens: u64,
         thinking_tokens: u64,
+        #[serde(default)]
+        input_text_tokens: u64,
+        #[serde(default)]
+        input_audio_tokens: u64,
+        #[serde(default)]
+        input_image_tokens: u64,
+        #[serde(default)]
+        cached_text_tokens: u64,
+        #[serde(default)]
+        cached_audio_tokens: u64,
+        #[serde(default)]
+        cached_image_tokens: u64,
+        #[serde(default)]
+        output_text_tokens: u64,
+        #[serde(default)]
+        output_audio_tokens: u64,
     },
     /// App-originated log entry broadcast to external consumers.
     LogEntry {
@@ -391,6 +597,21 @@ pub enum OutboundEvent {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         turn: Option<usize>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_turn_index: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        user_turn_revision: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        replacement_for_user_turn_index: Option<u32>,
+    },
+    /// Live user-message edit rewound an active external-agent session.
+    UserMessageRewind {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        user_turn_index: u32,
+        turns_removed: u32,
     },
     /// Display transport pipeline metrics snapshot.
     DisplayMetrics {
@@ -462,28 +683,59 @@ pub enum OutboundEvent {
         backend: String,
         method: String,
     },
-    InterruptRequested,
+    InterruptRequested {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+    },
     Interrupted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         reason: String,
     },
     /// Mid-turn steering was requested by a user; surfaced so external
     /// consumers (dashboard) can show a pending steer row or toast.
     SteerRequested {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         text: String,
         id: String,
+    },
+    /// Native steering was accepted by the backend/runtime, but may still be
+    /// waiting for the backend's next checkpoint before the model sees it.
+    SteerAccepted {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        reason: String,
     },
     /// The active backend doesn't support mid-turn steering and the steer
     /// text was queued for the next turn instead. Paired with a later
     /// `SteerDelivered { mid_turn: false }` once the queue drains.
     SteerQueued {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: String,
         reason: String,
     },
-    /// Steer reached the agent — either mid-turn (native `turn/steer`) or
-    /// as a follow-up injection at turn boundary.
+    /// Steer was observed in the agent conversation — either through a native
+    /// backend echo or as a follow-up injection at turn boundary.
     SteerDelivered {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
         id: String,
         mid_turn: bool,
+    },
+    /// Status for an ordinary follow-up that was queued because the target
+    /// session was active but does not support native mid-turn steering.
+    FollowUpStatus {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        text: Option<String>,
+        status: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
     // --- Peer registry push events ---
     //
@@ -497,7 +749,9 @@ pub enum OutboundEvent {
     },
     /// A peer was removed from the registry. Carries only the id;
     /// the browser drops the matching row from its local list.
-    PeerRemoved { id: String },
+    PeerRemoved {
+        id: String,
+    },
     /// A peer's connection state, status, or card changed. Carries a
     /// fresh snapshot reflecting the new values; the browser replaces
     /// the matching row.

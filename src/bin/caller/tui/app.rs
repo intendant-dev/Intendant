@@ -1,10 +1,10 @@
 use crate::autonomy::SharedAutonomy;
 use crate::control;
 use crate::event::{AppEvent, ApprovalRegistry, ApprovalResponse, ControlMsg};
-pub use crate::types::{LogLevel, Phase, Verbosity};
-use crate::types::{format_model_summary, truncate_str, OutboundEvent};
-use crate::{knowledge, session_log, skills};
 use crate::tui::layout::PanelConfig;
+use crate::types::{format_model_summary, truncate_str, OutboundEvent};
+pub use crate::types::{LogLevel, Phase, Verbosity};
+use crate::{knowledge, session_log, skills};
 use chrono::Local;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::collections::{HashSet, VecDeque};
@@ -138,15 +138,11 @@ impl ViewState {
                 // unless it's the first entry of that turn (the summary line).
                 if let Some(t) = entry.turn {
                     if !self.expanded_turns.contains(&t) {
-                        let dominated = app
-                            .log_entries
-                            .iter()
-                            .take(idx)
-                            .any(|e| {
-                                e.turn == Some(t)
-                                    && self.verbosity.includes(&e.level)
-                                    && self.log_tab.includes(e.source)
-                            });
+                        let dominated = app.log_entries.iter().take(idx).any(|e| {
+                            e.turn == Some(t)
+                                && self.verbosity.includes(&e.level)
+                                && self.log_tab.includes(e.source)
+                        });
                         if dominated {
                             return None;
                         }
@@ -333,9 +329,7 @@ impl ViewState {
                 self.clamp_view_to_filtered(app);
                 true
             }
-            KeyCode::Char('i') => {
-                self.open_inspect_mode(app)
-            }
+            KeyCode::Char('i') => self.open_inspect_mode(app),
             KeyCode::Char('?') => {
                 self.show_help = true;
                 true
@@ -468,7 +462,7 @@ pub struct App {
 
     // askHuman
     pub human_question: Option<String>,
-    pub human_textarea: Option<tui_textarea::TextArea<'static>>,
+    pub human_textarea: Option<ratatui_textarea::TextArea<'static>>,
 
     // Approval queue (FIFO)
     pub pending_approvals: VecDeque<PendingApproval>,
@@ -512,7 +506,7 @@ pub struct App {
 
     // Multi-round follow-up
     pub round: usize,
-    pub follow_up_textarea: Option<tui_textarea::TextArea<'static>>,
+    pub follow_up_textarea: Option<ratatui_textarea::TextArea<'static>>,
 
     // Vision display info (shown in status bar when active)
     pub display_info: Option<String>,
@@ -532,7 +526,8 @@ pub struct App {
     // Stateful phase tracking for presence event dedup (used by filter_event)
     pub last_presence_phase: String,
     // Shared agent state snapshot for presence layer status queries (check_status, query_detail)
-    pub presence_agent_state: Option<std::sync::Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>>,
+    pub presence_agent_state:
+        Option<std::sync::Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>>,
     /// Shared flag to pause/resume server-side presence (voice mutual exclusion).
     pub presence_paused: Option<std::sync::Arc<std::sync::atomic::AtomicUsize>>,
 
@@ -547,7 +542,8 @@ pub struct App {
     pub session_log: Option<std::sync::Arc<std::sync::Mutex<crate::session_log::SessionLog>>>,
 
     // Shared presence session for event window population
-    pub presence_session: Option<std::sync::Arc<std::sync::Mutex<crate::presence::PresenceSession>>>,
+    pub presence_session:
+        Option<std::sync::Arc<std::sync::Mutex<crate::presence::PresenceSession>>>,
 
     // Voice turn counter — increments on each voice model response (thinking block).
     // Used to group voice logs per response for collapse in the TUI.
@@ -636,7 +632,10 @@ impl App {
         self.presence_agent_state = Some(state);
     }
 
-    pub fn set_presence_paused_flag(&mut self, flag: std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    pub fn set_presence_paused_flag(
+        &mut self,
+        flag: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
         self.presence_paused = Some(flag);
     }
 
@@ -647,6 +646,7 @@ impl App {
             model: self.model_name.clone(),
             tokens_used: self.session_tokens,
             context_window: self.context_window,
+            hard_context_window: Some(self.context_window),
             usage_pct: self.budget_pct,
             prompt_tokens: self.session_prompt_tokens,
             completion_tokens: self.session_completion_tokens,
@@ -656,18 +656,19 @@ impl App {
 
     /// Build a usage snapshot for the presence model, if active.
     fn presence_usage_snapshot(&self) -> Option<crate::frontend::ModelUsageSnapshot> {
-        self.presence_provider_name.as_ref().map(|provider| {
-            crate::frontend::ModelUsageSnapshot {
+        self.presence_provider_name
+            .as_ref()
+            .map(|provider| crate::frontend::ModelUsageSnapshot {
                 provider: provider.clone(),
                 model: self.presence_model_name.clone().unwrap_or_default(),
                 tokens_used: self.presence_tokens,
                 context_window: self.presence_context_window,
+                hard_context_window: Some(self.presence_context_window),
                 usage_pct: self.presence_usage_pct,
                 prompt_tokens: self.presence_prompt_tokens,
                 completion_tokens: self.presence_completion_tokens,
                 cached_tokens: self.presence_cached_tokens,
-            }
-        })
+            })
     }
 
     /// Forward a filtered event to the presence layer (non-blocking).
@@ -755,8 +756,10 @@ impl App {
             LogSource::Agent => "agent",
             LogSource::Presence => "server",
             LogSource::Live => "live",
-        }.to_string();
+        }
+        .to_string();
         self.pending_derived.push(AppEvent::LogEntry {
+            session_id: None,
             level: level_str,
             source: source_str,
             content: content.clone(),
@@ -770,8 +773,17 @@ impl App {
         if !self.voice_transcript_buffer.is_empty() {
             let text = self.voice_transcript_buffer.trim().to_string();
             if !text.is_empty() {
-                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
-                self.log_sourced(LogLevel::Info, format!("[Presence] {}", text), LogSource::Live, vt);
+                let vt = if self.voice_turn > 0 {
+                    Some(self.voice_turn)
+                } else {
+                    None
+                };
+                self.log_sourced(
+                    LogLevel::Info,
+                    format!("[Presence] {}", text),
+                    LogSource::Live,
+                    vt,
+                );
             }
             self.voice_transcript_buffer.clear();
             self.voice_transcript_idle_ticks = 0;
@@ -795,8 +807,7 @@ impl App {
             AppMode::FollowUp => 5,
             _ => {
                 // Show a slim reminder bar when browsing during follow-up or after task done
-                if self.is_follow_up_browsing()
-                {
+                if self.is_follow_up_browsing() {
                     3
                 } else {
                     0
@@ -847,7 +858,9 @@ impl App {
                     }
                     KeyCode::Char('d') => {
                         // Toggle user display access
-                        let granted = self.autonomy.try_read()
+                        let granted = self
+                            .autonomy
+                            .try_read()
                             .map(|s| s.user_display_granted)
                             .unwrap_or(false);
                         if granted {
@@ -856,7 +869,9 @@ impl App {
                                 note: None,
                             });
                         } else {
-                            self.handle_control_command(ControlMsg::GrantUserDisplay { display_id: None });
+                            self.handle_control_command(ControlMsg::GrantUserDisplay {
+                                display_id: None,
+                            });
                         }
                         true
                     }
@@ -880,8 +895,7 @@ impl App {
     /// Whether we're browsing the log but a follow-up is still pending.
     pub fn is_follow_up_browsing(&self) -> bool {
         self.mode != AppMode::FollowUp
-            && (self.current_phase == Phase::WaitingFollowUp
-                || self.current_phase == Phase::Done)
+            && (self.current_phase == Phase::WaitingFollowUp || self.current_phase == Phase::Done)
             && self.follow_up_textarea.is_some()
     }
 
@@ -917,6 +931,7 @@ impl App {
             ApprovalResponse::ApproveAll => "approve_all",
         };
         self.pending_derived.push(AppEvent::ApprovalResolved {
+            session_id: Some(self.session_id.clone()).filter(|id| !id.is_empty()),
             id,
             action: action.to_string(),
         });
@@ -1014,10 +1029,17 @@ impl App {
                         return true;
                     }
 
-                    self.pending_derived.push(AppEvent::ControlCommand(
-                        ControlMsg::FollowUp { text: text.clone(), direct: None },
-                    ));
-                    self.log(LogLevel::Info, format!("Follow-up: {}", truncate_str(&text, 80)));
+                    self.pending_derived
+                        .push(AppEvent::ControlCommand(ControlMsg::FollowUp {
+                            session_id: None,
+                            text: text.clone(),
+                            direct: None,
+                            follow_up_id: None,
+                        }));
+                    self.log(
+                        LogLevel::Info,
+                        format!("Follow-up: {}", truncate_str(&text, 80)),
+                    );
                 }
                 self.follow_up_textarea = None;
                 self.mode = AppMode::Normal;
@@ -1079,7 +1101,7 @@ impl App {
 
     fn handle_control_command(&mut self, msg: ControlMsg) {
         match msg {
-            ControlMsg::Status => {
+            ControlMsg::Status { .. } => {
                 self.broadcast_control(OutboundEvent::Status {
                     turn: self.turn,
                     phase: format!("{:?}", self.current_phase).to_lowercase(),
@@ -1091,15 +1113,19 @@ impl App {
             }
             ControlMsg::Usage => {
                 self.broadcast_control(OutboundEvent::Usage {
+                    session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
                     main: self.main_usage_snapshot(),
                     presence: self.presence_usage_snapshot(),
                 });
             }
-            ControlMsg::Approve { id } => {
+            ControlMsg::Approve { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
-                    self.log(LogLevel::Info, format!("Approved via {} (turn {})", via, id));
+                    self.log(
+                        LogLevel::Info,
+                        format!("Approved via {} (turn {})", via, id),
+                    );
                     self.resolve_approval(id, ApprovalResponse::Approve);
                     if self.pending_approvals.is_empty() {
                         self.mode = AppMode::Normal;
@@ -1107,7 +1133,7 @@ impl App {
                     }
                 }
             }
-            ControlMsg::Deny { id } => {
+            ControlMsg::Deny { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
@@ -1119,7 +1145,7 @@ impl App {
                     }
                 }
             }
-            ControlMsg::Skip { id } => {
+            ControlMsg::Skip { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
@@ -1131,11 +1157,14 @@ impl App {
                     }
                 }
             }
-            ControlMsg::ApproveAll { id } => {
+            ControlMsg::ApproveAll { id, .. } => {
                 if let Some(pos) = self.pending_approvals.iter().position(|p| p.id == id) {
                     self.pending_approvals.remove(pos);
                     let via = self.approval_source();
-                    self.log(LogLevel::Info, format!("Approve-all via {} (turn {})", via, id));
+                    self.log(
+                        LogLevel::Info,
+                        format!("Approve-all via {} (turn {})", via, id),
+                    );
                     self.resolve_approval(id, ApprovalResponse::ApproveAll);
                     self.set_autonomy_level("full");
                     if self.pending_approvals.is_empty() {
@@ -1156,11 +1185,35 @@ impl App {
             ControlMsg::SetAutonomy { level } => {
                 self.set_autonomy_level(&level);
             }
+            ControlMsg::SetApprovalRule {
+                ref category,
+                ref rule,
+            } => {
+                // Live shared-state update + intendant.toml persistence are
+                // handled by the control plane; the TUI just surfaces it.
+                self.log(
+                    LogLevel::Info,
+                    format!("Approval rule {} → {}", category, rule),
+                );
+            }
             ControlMsg::SetExternalAgent { agent } => {
                 let label = agent.as_deref().unwrap_or("none");
                 self.log(
                     LogLevel::Info,
-                    format!("External agent set to {} (takes effect on next task)", label),
+                    format!(
+                        "External agent set to {} (takes effect on next task)",
+                        label
+                    ),
+                );
+            }
+            ControlMsg::SetCodexCommand { ref command } => {
+                let label = command
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("codex");
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex command → {} (applies on next task)", label),
                 );
             }
             ControlMsg::SetCodexSandbox { ref mode } => {
@@ -1195,6 +1248,14 @@ impl App {
                     format!("Codex reasoning effort → {} (applies on next task)", label),
                 );
             }
+            ControlMsg::SetCodexServiceTier { ref service_tier } => {
+                let label = crate::project::normalize_codex_service_tier(service_tier.as_deref())
+                    .unwrap_or_else(|| "<inherit>".to_string());
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex service tier → {} (applies on next task)", label),
+                );
+            }
             ControlMsg::SetCodexWebSearch { enabled } => {
                 self.log(
                     LogLevel::Info,
@@ -1224,14 +1285,41 @@ impl App {
                     format!("Codex writable roots → {} (applies on next task)", summary),
                 );
             }
+            ControlMsg::SetCodexManagedContext { ref mode } => {
+                let normalized = crate::project::normalize_codex_managed_context(mode);
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Codex managed context → {} (applies on next task)",
+                        normalized
+                    ),
+                );
+            }
+            ControlMsg::SetCodexContextArchive { ref mode } => {
+                let normalized = crate::project::normalize_codex_context_archive(mode);
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Codex context replay → {} (applies on next task)",
+                        normalized
+                    ),
+                );
+            }
             ControlMsg::CodexThreadAction { ref op, .. } => {
                 // The daemon-side watcher logs the result; here we just
                 // acknowledge that the user triggered the action so the TUI
                 // log bar reflects it immediately (the result may take a
                 // few hundred ms depending on the RPC).
+                self.log(LogLevel::Info, format!("Codex thread action: {}", op));
+            }
+            ControlMsg::RenameSession {
+                ref session_id,
+                ref name,
+                ..
+            } => {
                 self.log(
                     LogLevel::Info,
-                    format!("Codex thread action: {}", op),
+                    format!("Rename session {} → {}", session_id, name),
                 );
             }
             ControlMsg::SetGeminiModel { ref model } => {
@@ -1289,7 +1377,10 @@ impl App {
                 };
                 self.log(
                     LogLevel::Info,
-                    format!("Gemini include-directories → {} (applies on next task)", summary),
+                    format!(
+                        "Gemini include-directories → {} (applies on next task)",
+                        summary
+                    ),
                 );
             }
             ControlMsg::SetGeminiDebug { enabled } => {
@@ -1302,10 +1393,7 @@ impl App {
                 );
             }
             ControlMsg::GeminiThreadAction { ref op, .. } => {
-                self.log(
-                    LogLevel::Info,
-                    format!("Gemini thread action: {}", op),
-                );
+                self.log(LogLevel::Info, format!("Gemini thread action: {}", op));
             }
             ControlMsg::SetVerbosity { level } => {
                 let new_verbosity = match level.to_lowercase().as_str() {
@@ -1344,6 +1432,87 @@ impl App {
                 self.current_phase = Phase::Thinking;
                 self.round += 1;
             }
+            ControlMsg::CreateSession { ref task, .. } => {
+                // Routing is handled by `session_supervisor::SessionSupervisor`.
+                // The TUI only reflects that a new managed session was requested.
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Thinking;
+                self.round += 1;
+                self.log(
+                    LogLevel::Info,
+                    format!("New session requested: {}", truncate_str(task, 80)),
+                );
+            }
+            ControlMsg::ResumeSession {
+                ref source,
+                ref session_id,
+                ref task,
+                ..
+            } => {
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                if task
+                    .as_ref()
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .is_some()
+                {
+                    self.current_phase = Phase::Thinking;
+                    self.round += 1;
+                }
+                let verb = if task
+                    .as_ref()
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .is_some()
+                {
+                    "Resume"
+                } else {
+                    "Open"
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "{} {} session {}",
+                        verb,
+                        source,
+                        truncate_str(session_id, 12)
+                    ),
+                );
+            }
+            ControlMsg::ConfigureSessionAgent { ref session_id, .. } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Session launch config requested for {}",
+                        truncate_str(session_id, 12)
+                    ),
+                );
+            }
+            ControlMsg::StopSession { ref session_id } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Stop session requested for {}",
+                        truncate_str(session_id, 12)
+                    ),
+                );
+            }
+            ControlMsg::RestartSession {
+                ref source,
+                ref session_id,
+                ..
+            } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Restart {} session requested for {}",
+                        source,
+                        truncate_str(session_id, 12)
+                    ),
+                );
+            }
             ControlMsg::ScheduleControllerRestart { .. }
             | ControlMsg::ControllerTurnComplete { .. }
             | ControlMsg::GetRestartStatus
@@ -1357,30 +1526,59 @@ impl App {
                     "Controller control commands are only supported in MCP mode".to_string(),
                 );
             }
-            ControlMsg::FollowUp { text, direct } => {
+            ControlMsg::FollowUp { text, direct, .. } => {
                 // Routing handled by `task_dispatch::Dispatcher`. The TUI
                 // observes the ControlCommand for display purposes only.
-                if self.current_phase == Phase::WaitingFollowUp
-                    || self.current_phase == Phase::Done
+                if self.current_phase == Phase::WaitingFollowUp || self.current_phase == Phase::Done
                 {
                     self.follow_up_textarea = None;
                     self.mode = AppMode::Normal;
                     self.current_phase = Phase::Thinking;
                     self.round += 1;
-                    let tag = if direct.unwrap_or(false) { " (direct)" } else { "" };
-                    self.log(LogLevel::Info, format!("Follow-up{}: {}", tag, truncate_str(&text, 80)));
+                    let tag = if direct.unwrap_or(false) {
+                        " (direct)"
+                    } else {
+                        ""
+                    };
+                    self.log(
+                        LogLevel::Info,
+                        format!("Follow-up{}: {}", tag, truncate_str(&text, 80)),
+                    );
                 }
             }
-            ControlMsg::QueryDetail { scope, target } => {
+            ControlMsg::EditUserMessage {
+                user_turn_index,
+                ref text,
+                user_turn_revision: _,
+                ..
+            } => {
+                self.follow_up_textarea = None;
+                self.mode = AppMode::Normal;
+                self.current_phase = Phase::Thinking;
+                self.round += 1;
                 self.log(
                     LogLevel::Info,
-                    format!("Query detail request: {}", scope),
+                    format!(
+                        "Edit user turn {}: {}",
+                        user_turn_index,
+                        truncate_str(text, 80)
+                    ),
                 );
+            }
+            ControlMsg::QueryDetail { scope, target } => {
+                self.log(LogLevel::Info, format!("Query detail request: {}", scope));
                 let result = match scope.as_str() {
-                    "current_turn" => format!("Turn: {}\nPhase: {:?}\nBudget: {:.0}%", self.turn, self.current_phase, self.budget_pct),
+                    "current_turn" => format!(
+                        "Turn: {}\nPhase: {:?}\nBudget: {:.0}%",
+                        self.turn, self.current_phase, self.budget_pct
+                    ),
                     "logs" => {
                         let entries = session_log::recent_entries(&self.log_dir, 20);
-                        if entries.is_empty() { "No log entries yet.".to_string() } else { entries.join("\n") }
+                        if entries.is_empty() {
+                            "No log entries yet.".to_string()
+                        } else {
+                            entries.join("\n")
+                        }
                     }
                     "diff" => {
                         if let Some(ref root) = self.project_root {
@@ -1391,7 +1589,11 @@ impl App {
                             {
                                 Ok(o) => {
                                     let stdout = String::from_utf8_lossy(&o.stdout);
-                                    if stdout.trim().is_empty() { "No changes.".to_string() } else { stdout.to_string() }
+                                    if stdout.trim().is_empty() {
+                                        "No changes.".to_string()
+                                    } else {
+                                        stdout.to_string()
+                                    }
                                 }
                                 Err(e) => format!("Failed to run git diff: {}", e),
                             }
@@ -1399,15 +1601,13 @@ impl App {
                             "No project root available.".to_string()
                         }
                     }
-                    "file" => {
-                        match target.as_deref() {
-                            Some(path) => match std::fs::read_to_string(path) {
-                                Ok(content) => content.lines().take(200).collect::<Vec<_>>().join("\n"),
-                                Err(e) => format!("Failed to read file: {}", e),
-                            },
-                            None => "Error: target file path is required".to_string(),
-                        }
-                    }
+                    "file" => match target.as_deref() {
+                        Some(path) => match std::fs::read_to_string(path) {
+                            Ok(content) => content.lines().take(200).collect::<Vec<_>>().join("\n"),
+                            Err(e) => format!("Failed to read file: {}", e),
+                        },
+                        None => "Error: target file path is required".to_string(),
+                    },
                     other => format!("Unknown scope: {}", other),
                 };
                 self.broadcast_control(OutboundEvent::CommandResult {
@@ -1417,15 +1617,20 @@ impl App {
                     data: None,
                 });
             }
-            ControlMsg::RecallMemory { keywords, tags, channel } => {
+            ControlMsg::RecallMemory {
+                keywords,
+                tags,
+                channel,
+            } => {
                 let kws = keywords.as_deref().unwrap_or(&[]);
-                self.log(
-                    LogLevel::Info,
-                    format!("Memory recall request: {:?}", kws),
-                );
+                self.log(LogLevel::Info, format!("Memory recall request: {:?}", kws));
                 let result = if let Some(ref kp) = self.knowledge_path {
                     let query = knowledge::KnowledgeQuery {
-                        keywords: if kws.is_empty() { None } else { Some(kws.to_vec()) },
+                        keywords: if kws.is_empty() {
+                            None
+                        } else {
+                            Some(kws.to_vec())
+                        },
                         tags,
                         channel,
                         ..Default::default()
@@ -1437,22 +1642,31 @@ impl App {
                                 // Fall back to session log search
                                 let entries = session_log::recent_entries(&self.log_dir, 100);
                                 if let Some(ref kw_list) = query.keywords {
-                                    let matched: Vec<&String> = entries.iter()
+                                    let matched: Vec<&String> = entries
+                                        .iter()
                                         .filter(|e| {
                                             let lower = e.to_lowercase();
-                                            kw_list.iter().any(|kw| lower.contains(&kw.to_lowercase()))
+                                            kw_list
+                                                .iter()
+                                                .any(|kw| lower.contains(&kw.to_lowercase()))
                                         })
                                         .collect();
                                     if matched.is_empty() {
                                         "No matching memories found.".to_string()
                                     } else {
-                                        matched.into_iter().take(10).cloned().collect::<Vec<_>>().join("\n")
+                                        matched
+                                            .into_iter()
+                                            .take(10)
+                                            .cloned()
+                                            .collect::<Vec<_>>()
+                                            .join("\n")
                                     }
                                 } else {
                                     "No matching memories found.".to_string()
                                 }
                             } else {
-                                results.iter()
+                                results
+                                    .iter()
                                     .map(|e| format!("[{}] {}: {}", e.channel, e.key, e.summary))
                                     .collect::<Vec<_>>()
                                     .join("\n")
@@ -1480,12 +1694,14 @@ impl App {
                 // duplicate entries in the browser — one synthetic LogEntry
                 // with "User has taken manual control of display :N" from the
                 // log broadcast, and one from the OutboundEvent rendering.
-                self.pending_derived.push(AppEvent::DisplayTaken { display_id });
+                self.pending_derived
+                    .push(AppEvent::DisplayTaken { display_id });
             }
             ControlMsg::ReleaseDisplay { display_id, note } => {
                 // Same pattern as TakeDisplay — emit AppEvent via pending_derived
                 // instead of double-broadcasting via self.log() + broadcast_control().
-                self.pending_derived.push(AppEvent::DisplayReleased { display_id, note });
+                self.pending_derived
+                    .push(AppEvent::DisplayReleased { display_id, note });
             }
             ControlMsg::GrantUserDisplay { .. } => {
                 // Handled by `control_plane::handle_control_msg`. The TUI
@@ -1503,7 +1719,10 @@ impl App {
             }
             ControlMsg::ListDisplays => {
                 // ListDisplays is async — handled at the caller level, not in the TUI.
-                self.log(LogLevel::Info, "ListDisplays: use the control socket or web API".to_string());
+                self.log(
+                    LogLevel::Info,
+                    "ListDisplays: use the control socket or web API".to_string(),
+                );
             }
             ControlMsg::RevokeUserDisplay { .. } => {
                 // Handled by `control_plane::handle_control_msg` — see
@@ -1522,12 +1741,14 @@ impl App {
                     Ok(task_text) => {
                         // Dispatch as a StartTask
                         self.handle_control_command(ControlMsg::StartTask {
+                            session_id: None,
                             task: task_text,
                             orchestrate: Some(false),
                             direct: None,
                             reference_frame_ids: vec![],
                             display_target: None,
                             attachments: vec![],
+                            follow_up_id: None,
                         });
                     }
                     Err(e) => {
@@ -1565,6 +1786,13 @@ impl App {
                 // (handled in the gateway's /ws dispatcher using the
                 // connection id as the authority holder). The TUI
                 // has no analogous notion; no-op.
+            }
+            ControlMsg::CreateBrowserWorkspace { .. }
+            | ControlMsg::CloseBrowserWorkspace { .. }
+            | ControlMsg::AcquireBrowserWorkspace { .. }
+            | ControlMsg::ReleaseBrowserWorkspace { .. } => {
+                // Browser workspaces are owned by the control plane / MCP
+                // tool path; the TUI observes the resulting outbound events.
             }
             ControlMsg::SetDiagnosticsVisualMarker { .. } => {
                 // Phase 0 visual-freshness diagnostic toggle (task #83).
@@ -1622,6 +1850,7 @@ impl App {
                 self.session_cached_tokens += usage.cached_tokens;
                 // Emit usage snapshot so external consumers (web UI) get updated
                 derived.push(AppEvent::UsageSnapshot {
+                    session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
                     main: self.main_usage_snapshot(),
                     presence: self.presence_usage_snapshot(),
                 });
@@ -1660,7 +1889,7 @@ impl App {
                     turn_opt,
                 );
             }
-            AppEvent::ModelResponseDelta { text } => {
+            AppEvent::ModelResponseDelta { text, .. } => {
                 // Accumulate streaming text; shown at Debug level to avoid noise
                 self.streaming_buffer.push_str(&text);
             }
@@ -1673,7 +1902,7 @@ impl App {
                     if t > 0 { Some(t) } else { None },
                 );
             }
-            AppEvent::DoneSignal { message } => {
+            AppEvent::DoneSignal { message, .. } => {
                 if let Some(msg) = message {
                     let t = self.turn;
                     // Local-only: OutboundEvent::DoneSignal already reaches
@@ -1712,7 +1941,11 @@ impl App {
                 let turn_opt = if t > 0 { Some(t) } else { None };
                 let formatted = format_agent_output_for_tui(&stdout, &stderr);
                 if !formatted.is_empty() {
-                    let level = if !stderr.is_empty() { LogLevel::Warn } else { LogLevel::Agent };
+                    let level = if !stderr.is_empty() {
+                        LogLevel::Warn
+                    } else {
+                        LogLevel::Agent
+                    };
                     self.log_local_only(level, formatted, LogSource::Agent, turn_opt);
                 }
             }
@@ -1720,7 +1953,12 @@ impl App {
                 self.turn += 1;
                 // Local-only: OutboundEvent::SubAgentResult already reaches
                 // external consumers.
-                self.log_local_only(LogLevel::SubAgent, formatted, LogSource::Agent, Some(self.turn));
+                self.log_local_only(
+                    LogLevel::SubAgent,
+                    formatted,
+                    LogSource::Agent,
+                    Some(self.turn),
+                );
             }
             AppEvent::OrchestratorProgress {
                 turn,
@@ -1751,7 +1989,9 @@ impl App {
                     Some(turn),
                 );
             }
-            AppEvent::TaskComplete { reason, summary } => {
+            AppEvent::TaskComplete {
+                reason, summary, ..
+            } => {
                 self.current_phase = Phase::Done;
                 // Local-only: OutboundEvent::TaskComplete already reaches
                 // external consumers.
@@ -1774,7 +2014,7 @@ impl App {
                 // dispatcher is always running, so no channel-availability
                 // check is needed.
                 if self.follow_up_textarea.is_none() {
-                    let mut textarea = tui_textarea::TextArea::default();
+                    let mut textarea = ratatui_textarea::TextArea::default();
                     textarea.set_cursor_line_style(ratatui::style::Style::default());
                     self.follow_up_textarea = Some(textarea);
                 }
@@ -1819,7 +2059,11 @@ impl App {
                 self.log_local_only(LogLevel::Error, msg, LogSource::System, None);
                 self.current_phase = Phase::Done;
             }
-            AppEvent::PresenceLog { message, level, turn } => {
+            AppEvent::PresenceLog {
+                message,
+                level,
+                turn,
+            } => {
                 let lvl = level.unwrap_or(LogLevel::Info);
                 // Persistence to session.jsonl happens in
                 // event.rs::spawn_session_log_writer via log.presence_log(...).
@@ -1831,7 +2075,7 @@ impl App {
                 self.human_question = Some(question.clone());
                 self.current_phase = Phase::WaitingHuman;
                 self.mode = AppMode::AskHuman;
-                let mut textarea = tui_textarea::TextArea::default();
+                let mut textarea = ratatui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.human_textarea = Some(textarea);
                 // Local-only: OutboundEvent::AskHuman already reaches
@@ -1854,6 +2098,7 @@ impl App {
                 );
             }
             AppEvent::ApprovalRequired {
+                session_id: _,
                 id,
                 command_preview,
                 category,
@@ -1901,7 +2146,7 @@ impl App {
                 self.round = round;
                 self.current_phase = Phase::WaitingFollowUp;
                 self.mode = AppMode::FollowUp;
-                let mut textarea = tui_textarea::TextArea::default();
+                let mut textarea = ratatui_textarea::TextArea::default();
                 textarea.set_cursor_line_style(ratatui::style::Style::default());
                 self.follow_up_textarea = Some(textarea);
                 // Local-only: OutboundEvent::RoundComplete already reaches
@@ -1916,10 +2161,7 @@ impl App {
                     None,
                 );
             }
-            AppEvent::DisplayReady {
-                display_id,
-                ..
-            } => {
+            AppEvent::DisplayReady { display_id, .. } => {
                 let info = format!(":{}", display_id);
                 self.display_info = Some(info.clone());
                 // Local-only: OutboundEvent::DisplayReady already reaches
@@ -1966,11 +2208,20 @@ impl App {
                 // UserDisplayGranted has an outbound variant but the browser
                 // WASM handler has no dedicated path — the TUI's synthetic
                 // LogEntry is the primary visible source.
-                self.log(LogLevel::Warn, format!("User display access granted (display_id: {})", display_id));
+                self.log(
+                    LogLevel::Warn,
+                    format!("User display access granted (display_id: {})", display_id),
+                );
             }
-            AppEvent::UserDisplayRevoked { display_id, ref note } => {
+            AppEvent::UserDisplayRevoked {
+                display_id,
+                ref note,
+            } => {
                 let msg = if let Some(n) = note {
-                    format!("User display access revoked (display_id: {}): {}", display_id, n)
+                    format!(
+                        "User display access revoked (display_id: {}): {}",
+                        display_id, n
+                    )
                 } else {
                     format!("User display access revoked (display_id: {})", display_id)
                 };
@@ -2003,6 +2254,7 @@ impl App {
                     self.presence_model_name = Some(model);
                 }
                 derived.push(AppEvent::UsageSnapshot {
+                    session_id: Some(self.session_id.clone()).filter(|s| !s.is_empty()),
                     main: self.main_usage_snapshot(),
                     presence: self.presence_usage_snapshot(),
                 });
@@ -2014,28 +2266,39 @@ impl App {
                     self.current_phase = Phase::WaitingFollowUp;
                     self.mode = AppMode::FollowUp;
                     if self.follow_up_textarea.is_none() {
-                        let mut textarea = tui_textarea::TextArea::default();
+                        let mut textarea = ratatui_textarea::TextArea::default();
                         textarea.set_cursor_line_style(ratatui::style::Style::default());
                         self.follow_up_textarea = Some(textarea);
                     }
                 }
             }
-            AppEvent::PresenceConnected { live_provider, live_model, .. } => {
+            AppEvent::PresenceConnected {
+                live_provider,
+                live_model,
+                ..
+            } => {
                 // New voice session — increment turn for collapsing
                 self.voice_turn += 1;
                 let p_display = live_provider.as_deref().unwrap_or("unknown");
                 let m_display = live_model.as_deref().unwrap_or("unknown");
                 if let Some(ref flag) = self.presence_paused {
                     let count = flag.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                    self.log_sourced(LogLevel::Detail, format!(
-                        "Browser presence connected ({}:{}) — server presence paused ({})",
-                        p_display, m_display, count
-                    ), LogSource::Live, Some(self.voice_turn));
+                    self.log_sourced(
+                        LogLevel::Detail,
+                        format!(
+                            "Browser presence connected ({}:{}) — server presence paused ({})",
+                            p_display, m_display, count
+                        ),
+                        LogSource::Live,
+                        Some(self.voice_turn),
+                    );
                 } else {
-                    self.log_sourced(LogLevel::Detail, format!(
-                        "Browser presence connected ({}:{})",
-                        p_display, m_display
-                    ), LogSource::Live, Some(self.voice_turn));
+                    self.log_sourced(
+                        LogLevel::Detail,
+                        format!("Browser presence connected ({}:{})", p_display, m_display),
+                        LogSource::Live,
+                        Some(self.voice_turn),
+                    );
                 }
                 // Note: we no longer overwrite presence_model_name with the live model.
                 // The live model now has its own dedicated card in the Usage tab
@@ -2044,7 +2307,11 @@ impl App {
             }
             AppEvent::PresenceDisconnected => {
                 self.flush_voice_transcript();
-                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                let vt = if self.voice_turn > 0 {
+                    Some(self.voice_turn)
+                } else {
+                    None
+                };
                 if let Some(ref flag) = self.presence_paused {
                     let _ = flag.fetch_update(
                         std::sync::atomic::Ordering::Relaxed,
@@ -2053,15 +2320,34 @@ impl App {
                     );
                     let count = flag.load(std::sync::atomic::Ordering::Relaxed);
                     if count == 0 {
-                        self.log_sourced(LogLevel::Detail, "Browser presence disconnected — server presence resumed".to_string(), LogSource::Live, vt);
+                        self.log_sourced(
+                            LogLevel::Detail,
+                            "Browser presence disconnected — server presence resumed".to_string(),
+                            LogSource::Live,
+                            vt,
+                        );
                     } else {
-                        self.log_sourced(LogLevel::Detail, format!("Browser presence disconnected ({} still connected)", count), LogSource::Live, vt);
+                        self.log_sourced(
+                            LogLevel::Detail,
+                            format!("Browser presence disconnected ({} still connected)", count),
+                            LogSource::Live,
+                            vt,
+                        );
                     }
                 } else {
-                    self.log_sourced(LogLevel::Detail, "Browser presence disconnected".to_string(), LogSource::Live, vt);
+                    self.log_sourced(
+                        LogLevel::Detail,
+                        "Browser presence disconnected".to_string(),
+                        LogSource::Live,
+                        vt,
+                    );
                 }
             }
-            AppEvent::VoiceLog { ref text, ref tool_context, .. } => {
+            AppEvent::VoiceLog {
+                ref text,
+                ref tool_context,
+                ..
+            } => {
                 let ctx = tool_context.as_deref().unwrap_or("");
                 match ctx {
                     "transcript" => {
@@ -2087,7 +2373,11 @@ impl App {
                     _ => {
                         // Tool call — flush pending transcript, log at Detail.
                         self.flush_voice_transcript();
-                        let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                        let vt = if self.voice_turn > 0 {
+                            Some(self.voice_turn)
+                        } else {
+                            None
+                        };
                         self.log_sourced(
                             LogLevel::Detail,
                             format!("[voice] {}", text),
@@ -2097,7 +2387,10 @@ impl App {
                     }
                 }
             }
-            AppEvent::PresenceCheckpointReceived { ref summary, last_event_seq } => {
+            AppEvent::PresenceCheckpointReceived {
+                ref summary,
+                last_event_seq,
+            } => {
                 self.log_sourced(
                     LogLevel::Detail,
                     format!("Presence checkpoint at seq {}: {}", last_event_seq, summary),
@@ -2105,14 +2398,21 @@ impl App {
                     None,
                 );
             }
-            AppEvent::VoiceDiagnostic { ref kind, ref detail } => {
+            AppEvent::VoiceDiagnostic {
+                ref kind,
+                ref detail,
+            } => {
                 let msg = format!("[voice:{}] {}", kind, detail);
                 // Errors/disconnects at Warn (always visible), routine at Debug
                 let lvl = match kind.as_str() {
                     "error" | "gemini_close" => LogLevel::Warn,
                     _ => LogLevel::Debug,
                 };
-                let vt = if self.voice_turn > 0 { Some(self.voice_turn) } else { None };
+                let vt = if self.voice_turn > 0 {
+                    Some(self.voice_turn)
+                } else {
+                    None
+                };
                 self.log_sourced(lvl, msg, LogSource::Live, vt);
             }
             AppEvent::UserTranscript { ref text, .. } => {
@@ -2145,16 +2445,33 @@ impl App {
             AppEvent::Key(key) => {
                 self.handle_key(key);
             }
+            AppEvent::AutonomyChanged { autonomy } => {
+                self.autonomy_display = autonomy;
+            }
             AppEvent::ApprovalResolved { .. }
-            | AppEvent::UsageSnapshot { .. } | AppEvent::StatusUpdate { .. } | AppEvent::LogEntry { .. } | AppEvent::LiveUsageUpdate { .. }
-            | AppEvent::DisplayMetrics { .. } | AppEvent::DisplayResize { .. }
+            | AppEvent::UsageSnapshot { .. }
+            | AppEvent::ContextSnapshot { .. }
+            | AppEvent::StatusUpdate { .. }
+            | AppEvent::LogEntry { .. }
+            | AppEvent::UserMessageRewind { .. }
+            | AppEvent::UserMessageLog { .. }
+            | AppEvent::FollowUpStatus { .. }
+            | AppEvent::LiveUsageUpdate { .. }
+            | AppEvent::DisplayMetrics { .. }
+            | AppEvent::DisplayResize { .. }
             | AppEvent::ExternalAgentChanged { .. }
             | AppEvent::CodexConfigChanged { .. }
             | AppEvent::CodexThreadActionRequested { .. }
+            | AppEvent::ExternalFollowUpRequested { .. }
             | AppEvent::CodexThreadActionResult { .. }
+            | AppEvent::SessionRelationship { .. }
+            | AppEvent::SessionRenameResult { .. }
+            | AppEvent::SessionAgentConfigResult { .. }
             | AppEvent::GeminiConfigChanged { .. }
             | AppEvent::GeminiThreadActionRequested { .. }
             | AppEvent::GeminiThreadActionResult { .. }
+            | AppEvent::SharedView { .. }
+            | AppEvent::BrowserWorkspaceChanged { .. }
             | AppEvent::FileChanged { .. }
             | AppEvent::UploadReady { .. }
             | AppEvent::UploadDeleted { .. }
@@ -2191,7 +2508,10 @@ impl App {
                     None,
                 );
             }
-            AppEvent::RecordingError { ref stream_name, ref message } => {
+            AppEvent::RecordingError {
+                ref stream_name,
+                ref message,
+            } => {
                 // Local-only: OutboundEvent::RecordingError already reaches
                 // external consumers.
                 self.log_local_only(
@@ -2205,19 +2525,80 @@ impl App {
                 // RecordingDeleted has an outbound variant but the browser
                 // WASM handler has no dedicated path — the TUI's synthetic
                 // LogEntry is the primary visible source.
-                self.log(LogLevel::Info, format!("Recording deleted: {}", stream_name));
+                self.log(
+                    LogLevel::Info,
+                    format!("Recording deleted: {}", stream_name),
+                );
             }
-            AppEvent::SessionStarted { ref session_id, ref task } => {
+            AppEvent::SessionStarted {
+                ref session_id,
+                ref task,
+            } => {
+                self.session_id = session_id.clone();
+                if let Some(task) = task {
+                    self.task_description = task.clone();
+                }
+                self.current_phase = Phase::Thinking;
+                derived.push(AppEvent::StatusUpdate {
+                    turn: self.turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.clone(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
                 // Local-only: OutboundEvent::SessionStarted already reaches
                 // external consumers.
                 self.log_local_only(
                     LogLevel::Info,
-                    format!("Session started: {} — {}", session_id, task.as_deref().unwrap_or("(idle)")),
+                    format!(
+                        "Session started: {} — {}",
+                        session_id,
+                        task.as_deref().unwrap_or("(idle)")
+                    ),
                     LogSource::System,
                     None,
                 );
             }
-            AppEvent::SessionEnded { ref session_id, ref reason } => {
+            AppEvent::SessionIdentity { .. } => {
+                // Frontend-neutral metadata: the web dashboard uses this to
+                // map Intendant wrapper sessions to backend-native thread ids.
+                // The terminal TUI has no separate rendering for it.
+            }
+            AppEvent::SessionCapabilities { .. } => {
+                // Frontend-neutral metadata for dashboard controls.
+            }
+            AppEvent::SessionGoal { .. } => {
+                // Frontend-neutral metadata for dashboard goal indicators.
+            }
+            AppEvent::SessionAttached {
+                ref session_id,
+                ref source,
+            } => {
+                self.session_id = session_id.clone();
+                let short_id: String = session_id.chars().take(8).collect();
+                self.task_description = format!("Open {} session {}", source, short_id);
+                self.current_phase = Phase::WaitingFollowUp;
+                derived.push(AppEvent::StatusUpdate {
+                    turn: self.turn,
+                    phase: format!("{:?}", self.current_phase).to_lowercase(),
+                    autonomy: self.autonomy_display.clone(),
+                    session_id: self.session_id.clone(),
+                    task: self.task_description.clone(),
+                });
+                self.log_local_only(
+                    LogLevel::Info,
+                    format!("Session attached: {} ({})", session_id, source),
+                    LogSource::System,
+                    None,
+                );
+            }
+            AppEvent::SessionStopRequested { .. } => {
+                // Internal lifecycle signal consumed by agent loops.
+            }
+            AppEvent::SessionEnded {
+                ref session_id,
+                ref reason,
+            } => {
                 // Local-only: OutboundEvent::SessionEnded already reaches
                 // external consumers.
                 self.log_local_only(
@@ -2250,25 +2631,42 @@ impl App {
             AppEvent::LiveAudioStarted { id, provider } => {
                 // LiveAudio* events have no outbound variant — the TUI's
                 // synthetic LogEntry is the only path to external consumers.
-                self.log(LogLevel::Info, format!("Live audio session '{}' started ({})", id, provider));
+                self.log(
+                    LogLevel::Info,
+                    format!("Live audio session '{}' started ({})", id, provider),
+                );
             }
-            AppEvent::LiveAudioProgress { id, state, elapsed_secs, transcript_preview } => {
+            AppEvent::LiveAudioProgress {
+                id,
+                state,
+                elapsed_secs,
+                transcript_preview,
+            } => {
                 // LiveAudio* events have no outbound variant — the TUI's
                 // synthetic LogEntry is the only path to external consumers.
-                self.log(LogLevel::Detail, format!(
-                    "Live audio '{}': {} ({:.0}s) - {}",
-                    id, state, elapsed_secs,
-                    if transcript_preview.len() > 80 {
-                        // Find a valid char boundary near the desired offset
-                        let start = transcript_preview.len() - 80;
-                        let start = transcript_preview.ceil_char_boundary(start);
-                        format!("...{}", &transcript_preview[start..])
-                    } else {
-                        transcript_preview.clone()
-                    }
-                ));
+                self.log(
+                    LogLevel::Detail,
+                    format!(
+                        "Live audio '{}': {} ({:.0}s) - {}",
+                        id,
+                        state,
+                        elapsed_secs,
+                        if transcript_preview.len() > 80 {
+                            // Find a valid char boundary near the desired offset
+                            let start = transcript_preview.len() - 80;
+                            let start = transcript_preview.ceil_char_boundary(start);
+                            format!("...{}", &transcript_preview[start..])
+                        } else {
+                            transcript_preview.clone()
+                        }
+                    ),
+                );
             }
-            AppEvent::LiveAudioCompleted { id, status, quarantine_count } => {
+            AppEvent::LiveAudioCompleted {
+                id,
+                status,
+                quarantine_count,
+            } => {
                 let q_note = if quarantine_count > 0 {
                     format!(" ({} quarantined)", quarantine_count)
                 } else {
@@ -2276,18 +2674,33 @@ impl App {
                 };
                 // LiveAudio* events have no outbound variant — the TUI's
                 // synthetic LogEntry is the only path to external consumers.
-                self.log(LogLevel::Info, format!("Live audio '{}': {}{}", id, status, q_note));
+                self.log(
+                    LogLevel::Info,
+                    format!("Live audio '{}': {}{}", id, status, q_note),
+                );
             }
             AppEvent::DisplayCaptureLost { display_id, reason } => {
                 // DisplayCaptureLost has an outbound variant but the browser
                 // WASM handler has no dedicated path — the TUI's synthetic
                 // LogEntry is the primary visible source.
-                self.log(LogLevel::Warn, format!("Display :{} capture lost: {}", display_id, reason));
+                self.log(
+                    LogLevel::Warn,
+                    format!("Display :{} capture lost: {}", display_id, reason),
+                );
             }
-            AppEvent::DisplayApprovalPending { display_id, backend } => {
-                self.log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
+            AppEvent::DisplayApprovalPending {
+                display_id,
+                backend,
+            } => {
+                self.log(
+                    LogLevel::Info,
+                    format!(
+                        "Display :{} waiting for OS screen-share approval ({backend} portal)",
+                        display_id
+                    ),
+                );
             }
-            AppEvent::InterruptRequested => {
+            AppEvent::InterruptRequested { .. } => {
                 self.current_phase = Phase::Interrupting;
                 self.log(LogLevel::Info, "Interrupt requested".to_string());
                 derived.push(AppEvent::StatusUpdate {
@@ -2298,7 +2711,7 @@ impl App {
                     task: self.task_description.clone(),
                 });
             }
-            AppEvent::Interrupted { ref reason } => {
+            AppEvent::Interrupted { ref reason, .. } => {
                 self.current_phase = Phase::Interrupted;
                 self.log(LogLevel::Info, format!("Interrupted: {}", reason));
                 derived.push(AppEvent::StatusUpdate {
@@ -2309,7 +2722,9 @@ impl App {
                     task: self.task_description.clone(),
                 });
             }
-            AppEvent::SteerRequested { ref text, ref id } => {
+            AppEvent::SteerRequested {
+                ref text, ref id, ..
+            } => {
                 let preview: String = text.chars().take(80).collect();
                 let suffix = if text.chars().count() > 80 { "..." } else { "" };
                 let id_part = if id.is_empty() {
@@ -2322,7 +2737,9 @@ impl App {
                     format!("Steer requested{}: {}{}", id_part, preview, suffix),
                 );
             }
-            AppEvent::SteerQueued { ref id, ref reason } => {
+            AppEvent::SteerQueued {
+                ref id, ref reason, ..
+            } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
@@ -2333,13 +2750,32 @@ impl App {
                     format!("Steer queued{}: {}", id_part, reason),
                 );
             }
-            AppEvent::SteerDelivered { ref id, mid_turn } => {
+            AppEvent::SteerAccepted {
+                ref id, ref reason, ..
+            } => {
                 let id_part = if id.is_empty() {
                     String::new()
                 } else {
                     format!(" [{}]", id)
                 };
-                let mode = if mid_turn { "mid-turn" } else { "follow-up" };
+                self.log(
+                    LogLevel::Info,
+                    format!("Steer accepted{}: {}", id_part, reason),
+                );
+            }
+            AppEvent::SteerDelivered {
+                ref id, mid_turn, ..
+            } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", id)
+                };
+                let mode = if mid_turn {
+                    "mid-turn"
+                } else {
+                    "turn boundary"
+                };
                 self.log(
                     LogLevel::Info,
                     format!("Steer delivered{} ({})", id_part, mode),
@@ -2535,6 +2971,7 @@ mod tests {
     fn handle_event_turn_started() {
         let mut app = test_app();
         app.handle_event(AppEvent::TurnStarted {
+            session_id: None,
             turn: 3,
             budget_pct: 25.0,
             remaining: 150_000,
@@ -2548,9 +2985,11 @@ mod tests {
     fn handle_event_agent_output() {
         let mut app = test_app();
         app.handle_event(AppEvent::AgentOutput {
+            session_id: None,
             stdout: "line1\nline2".to_string(),
             stderr: "warn".to_string(),
             source: None,
+            output_id: None,
         });
         // format_agent_output_for_tui produces one combined entry
         assert_eq!(app.log_entries.len(), 1);
@@ -2563,6 +3002,7 @@ mod tests {
     fn handle_event_task_complete() {
         let mut app = test_app();
         app.handle_event(AppEvent::TaskComplete {
+            session_id: None,
             reason: "Task complete".to_string(),
             summary: None,
         });
@@ -2629,6 +3069,7 @@ mod tests {
     fn handle_event_done_signal_with_message() {
         let mut app = test_app();
         app.handle_event(AppEvent::DoneSignal {
+            session_id: None,
             message: Some("All done!".to_string()),
         });
         assert_eq!(app.current_phase, Phase::Done);
@@ -2639,7 +3080,10 @@ mod tests {
     #[test]
     fn handle_event_done_signal_without_message() {
         let mut app = test_app();
-        app.handle_event(AppEvent::DoneSignal { message: None });
+        app.handle_event(AppEvent::DoneSignal {
+            session_id: None,
+            message: None,
+        });
         assert_eq!(app.current_phase, Phase::Done);
         assert!(app.log_entries.is_empty());
     }
@@ -2695,7 +3139,10 @@ mod tests {
     fn bottom_panel_height_approval_clamped() {
         let mut app = test_app();
         app.mode = AppMode::Approval;
-        let long_cmd = (0..30).map(|i| format!("echo {}", i)).collect::<Vec<_>>().join("\n");
+        let long_cmd = (0..30)
+            .map(|i| format!("echo {}", i))
+            .collect::<Vec<_>>()
+            .join("\n");
         app.pending_approvals.push_back(PendingApproval {
             id: 1,
             command_preview: long_cmd,
@@ -2897,9 +3344,11 @@ mod tests {
     fn handle_event_streaming_delta_accumulates() {
         let mut app = test_app();
         app.handle_event(AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "Hello ".to_string(),
         });
         app.handle_event(AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "world".to_string(),
         });
         assert_eq!(app.streaming_buffer, "Hello world");
@@ -2910,13 +3359,14 @@ mod tests {
         let mut app = test_app();
         app.streaming_buffer = "partial text".to_string();
         app.handle_event(AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: r#"{"commands":[]}"#.to_string(),
             usage: crate::provider::TokenUsage {
                 prompt_tokens: 10,
                 completion_tokens: 5,
                 total_tokens: 15,
-            ..Default::default()
+                ..Default::default()
             },
             reasoning: None,
             source: None,
@@ -3098,6 +3548,7 @@ mod tests {
     fn model_response_tagged_as_agent_source() {
         let mut app = test_app();
         app.handle_event(AppEvent::ModelResponse {
+            session_id: None,
             turn: 2,
             content: r#"{"commands":[{"function":"execAsAgent","nonce":1,"command":"ls"}]}"#
                 .to_string(),
@@ -3105,7 +3556,7 @@ mod tests {
                 prompt_tokens: 100,
                 completion_tokens: 20,
                 total_tokens: 120,
-            ..Default::default()
+                ..Default::default()
             },
             reasoning: None,
             source: None,
@@ -3170,29 +3621,45 @@ mod tests {
 
         // TurnStarted: outbound OutboundEvent::TurnStarted → no LogEntry
         let derived = app.handle_event(AppEvent::TurnStarted {
+            session_id: None,
             turn: 1,
             budget_pct: 5.0,
             remaining: 100,
         });
-        assert_eq!(count_log_entries(&derived), 0, "TurnStarted rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "TurnStarted rebroadcast LogEntry"
+        );
 
         // ModelResponse: outbound OutboundEvent::ModelResponse → no LogEntry
         let derived = app.handle_event(AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: r#"{"commands":[]}"#.to_string(),
             usage: crate::provider::TokenUsage::default(),
             reasoning: None,
             source: None,
         });
-        assert_eq!(count_log_entries(&derived), 0, "ModelResponse rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "ModelResponse rebroadcast LogEntry"
+        );
 
         // AgentOutput: outbound OutboundEvent::AgentOutput → no LogEntry
         let derived = app.handle_event(AppEvent::AgentOutput {
+            session_id: None,
             stdout: "hello".to_string(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         });
-        assert_eq!(count_log_entries(&derived), 0, "AgentOutput rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "AgentOutput rebroadcast LogEntry"
+        );
 
         // PresenceLog: outbound OutboundEvent::PresenceLog → no LogEntry
         let derived = app.handle_event(AppEvent::PresenceLog {
@@ -3200,51 +3667,84 @@ mod tests {
             level: None,
             turn: Some(1),
         });
-        assert_eq!(count_log_entries(&derived), 0, "PresenceLog rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "PresenceLog rebroadcast LogEntry"
+        );
 
         // TaskComplete: outbound OutboundEvent::TaskComplete → no LogEntry
         let derived = app.handle_event(AppEvent::TaskComplete {
+            session_id: None,
             reason: "done".to_string(),
             summary: Some("ok".to_string()),
         });
-        assert_eq!(count_log_entries(&derived), 0, "TaskComplete rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "TaskComplete rebroadcast LogEntry"
+        );
 
         // BudgetWarning: outbound OutboundEvent::BudgetWarning → no LogEntry
         let derived = app.handle_event(AppEvent::BudgetWarning {
             pct: 85.0,
             remaining: 1000,
         });
-        assert_eq!(count_log_entries(&derived), 0, "BudgetWarning rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "BudgetWarning rebroadcast LogEntry"
+        );
 
         // RoundComplete: outbound OutboundEvent::RoundComplete → no LogEntry
         let derived = app.handle_event(AppEvent::RoundComplete {
+            session_id: None,
             round: 1,
             turns_in_round: 3,
             native_message_count: None,
         });
-        assert_eq!(count_log_entries(&derived), 0, "RoundComplete rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "RoundComplete rebroadcast LogEntry"
+        );
 
         // ApprovalRequired: outbound OutboundEvent::ApprovalRequired → no LogEntry
         let derived = app.handle_event(AppEvent::ApprovalRequired {
+            session_id: None,
             id: 1,
             command_preview: "ls".to_string(),
             category: crate::autonomy::ActionCategory::CommandExec,
         });
-        assert_eq!(count_log_entries(&derived), 0, "ApprovalRequired rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "ApprovalRequired rebroadcast LogEntry"
+        );
 
         // AutoApproved: outbound OutboundEvent::AutoApproved → no LogEntry
         let derived = app.handle_event(AppEvent::AutoApproved {
             preview: "ls".to_string(),
         });
-        assert_eq!(count_log_entries(&derived), 0, "AutoApproved rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "AutoApproved rebroadcast LogEntry"
+        );
 
         // AgentStarted: outbound OutboundEvent::AgentStarted → no LogEntry
         let derived = app.handle_event(AppEvent::AgentStarted {
+            session_id: None,
             turn: 1,
             commands_preview: "ls".to_string(),
+            item_id: None,
             source: None,
         });
-        assert_eq!(count_log_entries(&derived), 0, "AgentStarted rebroadcast LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            0,
+            "AgentStarted rebroadcast LogEntry"
+        );
     }
 
     /// Complement to `handle_event_no_duplicate_log_entry_broadcast`: events
@@ -3266,21 +3766,33 @@ mod tests {
         let derived = app.handle_event(AppEvent::JsonExtracted {
             preview: "{ \"foo\": 1 }".to_string(),
         });
-        assert_eq!(count_log_entries(&derived), 1, "JsonExtracted missing LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            1,
+            "JsonExtracted missing LogEntry"
+        );
 
         // OrchestratorLog: no OutboundEvent → TUI log_sourced is the only path
         let derived = app.handle_event(AppEvent::OrchestratorLog {
             message: "hello".to_string(),
             level: LogLevel::Info,
         });
-        assert_eq!(count_log_entries(&derived), 1, "OrchestratorLog missing LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            1,
+            "OrchestratorLog missing LogEntry"
+        );
 
         // LiveAudioStarted: no OutboundEvent → TUI log is the only path
         let derived = app.handle_event(AppEvent::LiveAudioStarted {
             id: "abc".to_string(),
             provider: "gemini".to_string(),
         });
-        assert_eq!(count_log_entries(&derived), 1, "LiveAudioStarted missing LogEntry");
+        assert_eq!(
+            count_log_entries(&derived),
+            1,
+            "LiveAudioStarted missing LogEntry"
+        );
     }
 
     /// Ensures `log_local_only` pushes to the local buffer WITHOUT queuing a
@@ -3296,8 +3808,10 @@ mod tests {
         );
         assert_eq!(app.log_entries.len(), 1);
         assert_eq!(app.log_entries[0].content, "local only");
-        assert!(app.pending_derived.is_empty(),
-            "log_local_only must not queue a LogEntry for broadcast");
+        assert!(
+            app.pending_derived.is_empty(),
+            "log_local_only must not queue a LogEntry for broadcast"
+        );
     }
 
     /// Ensures `log_sourced` pushes to the local buffer AND queues a

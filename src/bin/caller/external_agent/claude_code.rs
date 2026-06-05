@@ -5,7 +5,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
-use tokio::process::{Child, ChildStdin, Command};
+use tokio::process::{Child, ChildStdin};
 use tokio::sync::{mpsc, Mutex};
 
 use crate::error::CallerError;
@@ -14,8 +14,6 @@ use super::{
     AgentConfig, AgentEvent, AgentThread, ApprovalCategory, ApprovalDecision, ExternalAgent,
     ToolCompletionStatus,
 };
-
-use super::codex::DISPLAY_TOOLS_PROMPT;
 
 // ---------------------------------------------------------------------------
 // Claude Code JSONL protocol types (stdin/stdout)
@@ -113,7 +111,6 @@ pub struct ClaudeCodeAgent {
     permission_mode: String,
     allowed_tools: Vec<String>,
     web_port: Option<u16>,
-    prompt_sent: bool,
     working_dir: Option<std::path::PathBuf>,
     child: Option<Child>,
     writer: Option<SharedWriter>,
@@ -138,7 +135,6 @@ impl ClaudeCodeAgent {
             permission_mode,
             allowed_tools,
             web_port,
-            prompt_sent: false,
             working_dir: None,
             child: None,
             writer: None,
@@ -183,7 +179,11 @@ async fn reader_task(
             }
         };
 
-        let msg: CcMessage = match serde_json::from_str(&line) {
+        let raw_msg: serde_json::Value = match serde_json::from_str(&line) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let msg: CcMessage = match serde_json::from_value(raw_msg) {
             Ok(m) => m,
             Err(_) => continue,
         };
@@ -194,7 +194,8 @@ async fn reader_task(
                 if let Some(ref message) = msg.message {
                     if let Some(content) = message.get("content").and_then(|c| c.as_array()) {
                         for block in content {
-                            let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            let block_type =
+                                block.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             match block_type {
                                 "text" => {
                                     if let Some(text) = block.get("text").and_then(|t| t.as_str()) {
@@ -204,15 +205,24 @@ async fn reader_task(
                                     }
                                 }
                                 "tool_use" => {
-                                    let tool_id = block.get("id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                    let tool_name = block.get("name").and_then(|v| v.as_str()).unwrap_or("unknown").to_string();
+                                    let tool_id = block
+                                        .get("id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let tool_name = block
+                                        .get("name")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("unknown")
+                                        .to_string();
                                     let input = block.get("input").cloned().unwrap_or_default();
-                                    let preview: String = if let serde_json::Value::String(s) = &input {
-                                        s.chars().take(200).collect()
-                                    } else {
-                                        let s = input.to_string();
-                                        s.chars().take(200).collect()
-                                    };
+                                    let preview: String =
+                                        if let serde_json::Value::String(s) = &input {
+                                            s.chars().take(200).collect()
+                                        } else {
+                                            let s = input.to_string();
+                                            s.chars().take(200).collect()
+                                        };
                                     let _ = event_tx.send(AgentEvent::ToolStarted {
                                         item_id: tool_id,
                                         tool_name,
@@ -220,14 +230,32 @@ async fn reader_task(
                                     });
                                 }
                                 "tool_result" => {
-                                    let tool_id = block.get("tool_use_id").and_then(|v| v.as_str()).unwrap_or("").to_string();
-                                    let is_error = block.get("is_error").and_then(|v| v.as_bool()).unwrap_or(false);
-                                    let content_text = block.get("content")
+                                    let tool_id = block
+                                        .get("tool_use_id")
+                                        .and_then(|v| v.as_str())
+                                        .unwrap_or("")
+                                        .to_string();
+                                    let is_error = block
+                                        .get("is_error")
+                                        .and_then(|v| v.as_bool())
+                                        .unwrap_or(false);
+                                    let content_text = block
+                                        .get("content")
                                         .and_then(|c| {
-                                            if let serde_json::Value::String(s) = c { Some(s.clone()) }
-                                            else if let Some(arr) = c.as_array() {
-                                                Some(arr.iter().filter_map(|b| b.get("text").and_then(|t| t.as_str())).collect::<Vec<_>>().join("\n"))
-                                            } else { None }
+                                            if let serde_json::Value::String(s) = c {
+                                                Some(s.clone())
+                                            } else if let Some(arr) = c.as_array() {
+                                                Some(
+                                                    arr.iter()
+                                                        .filter_map(|b| {
+                                                            b.get("text").and_then(|t| t.as_str())
+                                                        })
+                                                        .collect::<Vec<_>>()
+                                                        .join("\n"),
+                                                )
+                                            } else {
+                                                None
+                                            }
                                         })
                                         .unwrap_or_default();
 
@@ -239,7 +267,9 @@ async fn reader_task(
                                     }
 
                                     let status = if is_error {
-                                        ToolCompletionStatus::Failed { message: "tool error".into() }
+                                        ToolCompletionStatus::Failed {
+                                            message: "tool error".into(),
+                                        }
                                     } else {
                                         ToolCompletionStatus::Success
                                     };
@@ -261,7 +291,8 @@ async fn reader_task(
                     let event_type = event.get("type").and_then(|t| t.as_str()).unwrap_or("");
                     if event_type == "content_block_delta" {
                         if let Some(delta) = event.get("delta") {
-                            let delta_type = delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                            let delta_type =
+                                delta.get("type").and_then(|t| t.as_str()).unwrap_or("");
                             if delta_type == "text_delta" {
                                 if let Some(text) = delta.get("text").and_then(|t| t.as_str()) {
                                     let _ = event_tx.send(AgentEvent::MessageDelta {
@@ -282,32 +313,46 @@ async fn reader_task(
 
             "control_request" => {
                 if let Some(ref request) = msg.request {
-                    let subtype = request.get("subtype").and_then(|s| s.as_str()).unwrap_or("");
+                    let subtype = request
+                        .get("subtype")
+                        .and_then(|s| s.as_str())
+                        .unwrap_or("");
                     let cc_request_id = msg.request_id.clone().unwrap_or_default();
 
                     if subtype == "can_use_tool" {
-                        let tool_name = request.get("tool_name")
+                        let tool_name = request
+                            .get("tool_name")
                             .and_then(|v| v.as_str())
                             .unwrap_or("unknown")
                             .to_string();
                         let input = request.get("input").cloned().unwrap_or_default();
-                        let preview: String = if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
-                            cmd.chars().take(200).collect()
-                        } else {
-                            let s = input.to_string();
-                            s.chars().take(200).collect()
-                        };
+                        let preview: String =
+                            if let Some(cmd) = input.get("command").and_then(|c| c.as_str()) {
+                                cmd.chars().take(200).collect()
+                            } else {
+                                let s = input.to_string();
+                                s.chars().take(200).collect()
+                            };
 
-                        let our_id = format!("cc-approval-{}", approval_counter.fetch_add(1, Ordering::Relaxed));
+                        let our_id = format!(
+                            "cc-approval-{}",
+                            approval_counter.fetch_add(1, Ordering::Relaxed)
+                        );
 
                         // Determine category from tool name
-                        let category = if tool_name == "Edit" || tool_name == "Write" || tool_name == "NotebookEdit" {
+                        let category = if tool_name == "Edit"
+                            || tool_name == "Write"
+                            || tool_name == "NotebookEdit"
+                        {
                             ApprovalCategory::FileChange
                         } else {
                             ApprovalCategory::CommandExecution
                         };
 
-                        pending_approvals.lock().await.insert(our_id.clone(), cc_request_id);
+                        pending_approvals
+                            .lock()
+                            .await
+                            .insert(our_id.clone(), cc_request_id);
 
                         let _ = event_tx.send(AgentEvent::ApprovalRequest {
                             request_id: our_id,
@@ -361,20 +406,29 @@ impl ExternalAgent for ClaudeCodeAgent {
         config: AgentConfig,
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
         self.working_dir = Some(config.working_dir.clone());
+        self.session_id = config.resume_session;
 
         // Build command args
         let mut args = vec![
             "-p".to_string(),
-            "--output-format".into(), "stream-json".into(),
-            "--input-format".into(), "stream-json".into(),
+            "--output-format".into(),
+            "stream-json".into(),
+            "--input-format".into(),
+            "stream-json".into(),
             "--verbose".into(),
             "--include-partial-messages".into(),
-            "--permission-prompt-tool".into(), "stdio".into(),
+            "--permission-prompt-tool".into(),
+            "stdio".into(),
         ];
 
         if let Some(ref model) = self.model.as_ref().or(config.model.as_ref()) {
             args.push("--model".into());
             args.push(model.to_string());
+        }
+
+        if let Some(ref session_id) = self.session_id {
+            args.push("--resume".into());
+            args.push(session_id.clone());
         }
 
         if !self.permission_mode.is_empty() && self.permission_mode != "default" {
@@ -403,7 +457,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         }
 
         // Spawn the process
-        let mut child = Command::new(&self.command)
+        let mut child = crate::platform::spawn_command(&self.command)
             .args(&args)
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
@@ -411,19 +465,22 @@ impl ExternalAgent for ClaudeCodeAgent {
             .stderr(std::process::Stdio::inherit())
             .spawn()
             .map_err(|e| {
-                CallerError::ExternalAgent(format!(
-                    "Failed to spawn '{}': {}",
-                    self.command, e
-                ))
+                CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
             })?;
+        let child_pid = child.id();
 
-        let stdin = child.stdin.take().ok_or_else(|| {
-            CallerError::ExternalAgent("Failed to capture child stdin".into())
-        })?;
-        let stdout = child.stdout.take().ok_or_else(|| {
-            CallerError::ExternalAgent("Failed to capture child stdout".into())
-        })?;
+        let stdin = child
+            .stdin
+            .take()
+            .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdin".into()))?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdout".into()))?;
 
+        if let Some(pid) = child_pid {
+            super::register_child_process(pid);
+        }
         self.child = Some(child);
         let writer = Arc::new(Mutex::new(BufWriter::new(stdin)));
         self.writer = Some(writer.clone());
@@ -455,20 +512,13 @@ impl ExternalAgent for ClaudeCodeAgent {
         _thread: &AgentThread,
         message: &str,
     ) -> Result<(), CallerError> {
-        let augmented = if self.web_port.is_some() && !self.prompt_sent {
-            self.prompt_sent = true;
-            format!("{}{}", message, DISPLAY_TOOLS_PROMPT)
-        } else {
-            message.to_string()
-        };
-
         let user_msg = CcUserMessage {
             msg_type: "user".into(),
             message: CcMessageContent {
                 role: "user".into(),
                 content: vec![CcContentBlock {
                     block_type: "text".into(),
-                    text: augmented,
+                    text: message.to_string(),
                 }],
             },
             session_id: self.session_id.clone(),
@@ -476,9 +526,10 @@ impl ExternalAgent for ClaudeCodeAgent {
         };
 
         let line = serde_json::to_string(&user_msg)?;
-        let writer = self.writer.as_ref().ok_or_else(|| {
-            CallerError::ExternalAgent("Not initialized".into())
-        })?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
 
         let mut w = writer.lock().await;
         w.write_all(line.as_bytes()).await?;
@@ -527,9 +578,10 @@ impl ExternalAgent for ClaudeCodeAgent {
         };
 
         let line = serde_json::to_string(&response)?;
-        let writer = self.writer.as_ref().ok_or_else(|| {
-            CallerError::ExternalAgent("Not initialized".into())
-        })?;
+        let writer = self
+            .writer
+            .as_ref()
+            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
 
         let mut w = writer.lock().await;
         w.write_all(line.as_bytes()).await?;
@@ -545,7 +597,11 @@ impl ExternalAgent for ClaudeCodeAgent {
         }
 
         if let Some(ref mut child) = self.child {
+            let child_pid = child.id();
             let _ = child.kill().await;
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
 
         self.writer = None;
@@ -559,7 +615,11 @@ impl ExternalAgent for ClaudeCodeAgent {
 impl Drop for ClaudeCodeAgent {
     fn drop(&mut self) {
         if let Some(ref mut child) = self.child {
+            let child_pid = child.id();
             let _ = child.start_kill();
+            if let Some(pid) = child_pid {
+                super::unregister_child_process(pid);
+            }
         }
         if let Some(handle) = self.reader_handle.take() {
             handle.abort();
@@ -577,19 +637,12 @@ mod tests {
 
     #[test]
     fn claude_code_agent_defaults() {
-        let agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "auto".into(),
-            vec![],
-            None,
-        );
+        let agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
         assert_eq!(agent.command, "claude");
         assert!(agent.model.is_none());
         assert_eq!(agent.permission_mode, "auto");
         assert!(agent.allowed_tools.is_empty());
         assert!(agent.web_port.is_none());
-        assert!(!agent.prompt_sent);
     }
 
     #[tokio::test]
@@ -597,13 +650,7 @@ mod tests {
         // Claude Code inherits the default `rollback_turns` from the
         // trait, which returns the "not supported" typed error the
         // outer loop keys on to fall back to a session reset.
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "auto".into(),
-            vec![],
-            None,
-        );
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
         let err = agent.rollback_turns(3).await.unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {
@@ -615,6 +662,14 @@ mod tests {
             }
             other => panic!("expected ExternalAgent error, got {:?}", other),
         }
+    }
+
+    #[tokio::test]
+    async fn context_snapshot_has_no_transcript_fallback() {
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "auto".into(), vec![], None);
+
+        let snapshot = agent.context_snapshot().await.unwrap();
+        assert!(snapshot.is_none());
     }
 
     #[test]
@@ -740,13 +795,7 @@ mod tests {
         // today. We keep the trait default so the caller sees a typed error
         // and can log/escalate without triggering unsafe shutdowns.
         use crate::external_agent::ExternalAgent;
-        let mut agent = ClaudeCodeAgent::new(
-            "claude".into(),
-            None,
-            "default".into(),
-            vec![],
-            None,
-        );
+        let mut agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
         let err = agent.interrupt_turn().await.unwrap_err();
         match err {
             CallerError::ExternalAgent(msg) => {

@@ -53,6 +53,14 @@ pub struct WebRtcConfig {
     /// Empty by default (local-only, no STUN/TURN).
     #[serde(default)]
     pub ice_servers: Vec<WebRtcIceServerConfig>,
+    /// Whether the federated (peer-to-peer) display path may negotiate
+    /// H.264. Default false ⇒ federation pins VP8 in the browser (the safe
+    /// default for lossy TURN-relayed paths). Set true to let federation
+    /// negotiate the peer's intra-refresh H.264 (libx264 / NVENC). Threaded
+    /// into the `/config` payload alongside `ice_servers`; the local
+    /// (same-machine) display path is unaffected.
+    #[serde(default)]
+    pub federation_allow_h264: bool,
 }
 
 /// A single ICE server entry in intendant.toml `[webrtc]` configuration.
@@ -139,6 +147,13 @@ pub struct CodexConfig {
     /// `"minimal" | "low" | "medium" | "high" | "xhigh"`. Empty = Codex default.
     #[serde(default)]
     pub reasoning_effort: Option<String>,
+    /// Optional Codex service-tier default for Intendant-managed Codex
+    /// sessions. Empty / omitted inherits Codex's own config and account
+    /// defaults. `"priority"` enables Fast, `"flex"` requests Flex, and
+    /// `"standard"` sends an explicit `serviceTier: null` to opt out of Fast
+    /// for managed sessions.
+    #[serde(default)]
+    pub service_tier: Option<String>,
     /// Whether to enable the Responses API `web_search` tool for this
     /// session. Maps to `codex --search` / `-c tool_suggest.web_search=true`.
     #[serde(default)]
@@ -153,6 +168,22 @@ pub struct CodexConfig {
     /// are resolved against the project root at dispatch time.
     #[serde(default)]
     pub writable_roots: Vec<String>,
+    /// Managed Codex context capability. `vanilla` is vanilla/fork-safe:
+    /// Codex keeps its normal compaction behavior and Intendant does not
+    /// advertise or enforce same-thread context rewinds. `managed` enables
+    /// Intendant's managed Codex protocol: proactive rewinds/fissions,
+    /// disabled auto-compaction, item-anchor rollback, developer-primer
+    /// injection, and same-thread restore/backout. This currently requires
+    /// the Intendant-aware Codex fork.
+    #[serde(default = "default_codex_managed_context", alias = "context_recovery")]
+    pub managed_context: String,
+    /// Context snapshot archive mode for the Activity -> Context tab.
+    /// `summary` records compact per-request visualization data and uses
+    /// temporary provider traces while the session is live. `exact` persists
+    /// full provider request payloads for exact raw replay. `off` disables
+    /// context snapshot capture.
+    #[serde(default = "default_codex_context_archive")]
+    pub context_archive: String,
 }
 
 fn default_codex_command() -> String {
@@ -165,6 +196,14 @@ fn default_codex_approval_policy() -> String {
 
 fn default_codex_sandbox() -> String {
     "workspace-write".to_string()
+}
+
+fn default_codex_managed_context() -> String {
+    "vanilla".to_string()
+}
+
+fn default_codex_context_archive() -> String {
+    "summary".to_string()
 }
 
 /// Valid Codex sandbox modes, in the order we present them in the UI.
@@ -182,8 +221,8 @@ pub const CODEX_APPROVAL_POLICIES: &[&str] = &["untrusted", "on-request", "never
 /// "default" as a menu choice without introducing a separate Option<String>
 /// juggling layer. All other values map straight to
 /// `-c model_reasoning_effort=...`.
-pub const CODEX_REASONING_EFFORTS: &[&str] =
-    &["", "minimal", "low", "medium", "high", "xhigh"];
+pub const CODEX_REASONING_EFFORTS: &[&str] = &["", "minimal", "low", "medium", "high", "xhigh"];
+pub const CODEX_STANDARD_SERVICE_TIER: &str = "standard";
 
 /// Normalize a user-supplied sandbox value to one of `CODEX_SANDBOX_MODES`.
 /// Unknown or empty values fall back to the safest real policy
@@ -217,11 +256,57 @@ pub fn normalize_reasoning_effort(input: Option<&str>) -> Option<String> {
     if s.is_empty() {
         return None;
     }
-    if CODEX_REASONING_EFFORTS.iter().any(|e| !e.is_empty() && *e == s) {
+    if CODEX_REASONING_EFFORTS
+        .iter()
+        .any(|e| !e.is_empty() && *e == s)
+    {
         Some(s.to_string())
     } else {
         None
     }
+}
+
+pub fn normalize_codex_service_tier(input: Option<&str>) -> Option<String> {
+    let s = input.map(str::trim).unwrap_or("");
+    if s.is_empty() {
+        return None;
+    }
+    match s.to_ascii_lowercase().as_str() {
+        "inherit" | "default" | "auto" | "codex" => None,
+        "fast" | "priority" => Some("priority".to_string()),
+        "standard" | "normal" | "none" | "off" | "clear" | "disabled" | "false" | "0" => {
+            Some(CODEX_STANDARD_SERVICE_TIER.to_string())
+        }
+        "flex" => Some("flex".to_string()),
+        _ => Some(s.to_string()),
+    }
+}
+
+pub fn codex_service_tier_is_standard_clear(tier: &str) -> bool {
+    normalize_codex_service_tier(Some(tier)).as_deref() == Some(CODEX_STANDARD_SERVICE_TIER)
+}
+
+pub fn normalize_codex_managed_context(input: &str) -> String {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "managed" | "patched" | "intendant" | "on" | "true" | "enabled" => "managed".to_string(),
+        _ => "vanilla".to_string(),
+    }
+}
+
+pub fn codex_managed_context_enabled(mode: &str) -> bool {
+    normalize_codex_managed_context(mode) == "managed"
+}
+
+pub fn normalize_codex_context_archive(input: &str) -> String {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "exact" | "full" | "raw" | "on" | "true" | "1" => "exact".to_string(),
+        "off" | "none" | "disabled" | "false" | "0" => "off".to_string(),
+        _ => "summary".to_string(),
+    }
+}
+
+pub fn codex_context_archive_exact(mode: &str) -> bool {
+    normalize_codex_context_archive(mode) == "exact"
 }
 
 impl Default for CodexConfig {
@@ -232,9 +317,12 @@ impl Default for CodexConfig {
             approval_policy: default_codex_approval_policy(),
             sandbox: default_codex_sandbox(),
             reasoning_effort: None,
+            service_tier: None,
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
+            managed_context: default_codex_managed_context(),
+            context_archive: default_codex_context_archive(),
         }
     }
 }
@@ -435,6 +523,63 @@ pub struct ServerConfig {
     /// this daemon. See [`ServerAuthConfig`].
     #[serde(default)]
     pub auth: ServerAuthConfig,
+
+    /// Native TLS for the `--web` dashboard. See [`ServerTlsConfig`].
+    /// Off by default — the gateway serves plain HTTP unless `tls = true`
+    /// here or `--tls` is passed on the CLI.
+    #[serde(default)]
+    pub tls: ServerTlsConfig,
+}
+
+/// Native HTTPS/WSS for the `--web` dashboard, lives under `[server.tls]`
+/// in intendant.toml.
+///
+/// When enabled, the gateway's per-connection demux gains a TLS branch:
+/// an accepted connection whose first bytes are a TLS ClientHello
+/// (record type `0x16`) is wrapped in a `tokio_rustls::TlsAcceptor`, and
+/// the decrypted stream then flows through the existing HTTP/WebSocket
+/// handling. Raw ICE-TCP (STUN-framed, RFC 4571 length-prefixed) and UDP
+/// media are untouched — the first-byte check distinguishes `0x16` (TLS)
+/// from the STUN length-prefix/magic-cookie pattern.
+///
+/// This is the pure-Rust (`rustls` + `rcgen`) path to encrypted serving,
+/// available on every platform including Windows — no `intendant lan
+/// setup` / nginx / OpenSSL dependency. It is independent of
+/// [`ServerAuthConfig::advertised_transport`]'s mTLS pinning, which
+/// concerns federation peer auth at a proxy layer.
+///
+/// Example:
+/// ```toml
+/// [server.tls]
+/// enabled = true
+/// # optional explicit cert/key (PEM); omit for an auto self-signed cert
+/// # cert = "/etc/intendant/server.crt"
+/// # key  = "/etc/intendant/server.key"
+/// # extra SAN hostname beyond the bind IP + localhost
+/// # hostname = "intendant.local"
+/// ```
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServerTlsConfig {
+    /// Master switch. `false` (default) keeps the current plain-HTTP
+    /// behavior. The CLI `--tls` flag ORs into this at runtime.
+    #[serde(default)]
+    pub enabled: bool,
+
+    /// Optional path to a PEM-encoded certificate (chain) overriding the
+    /// auto-generated self-signed cert. Must be paired with `key`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cert: Option<String>,
+
+    /// Optional path to the PEM-encoded private key matching `cert`.
+    /// PKCS#8, PKCS#1 (RSA), or SEC1 (EC) are all accepted.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
+
+    /// Optional extra hostname to add to the self-signed cert's SAN list
+    /// (in addition to the bind IP and `localhost`). Ignored when an
+    /// explicit `cert`/`key` pair is supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
 }
 
 /// Auth requirements this daemon enforces on inbound peer connections.
@@ -851,9 +996,7 @@ card_url = "http://127.0.0.1:9000/.well-known/agent-card.json"
                     pinned_fingerprints: vec![
                         "aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899".into(),
                     ],
-                    browser_tcp_via_url: Some(
-                        "ws://192.168.1.42:8766/ws".into(),
-                    ),
+                    browser_tcp_via_url: Some("ws://192.168.1.42:8766/ws".into()),
                 },
             ],
             ..ProjectConfig::default()
@@ -1007,6 +1150,7 @@ file_delete = "deny"
 command_exec = "auto"
 network = "ask"
 destructive = "deny"
+tool_call = "ask"
 "#;
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert_eq!(
@@ -1024,6 +1168,10 @@ destructive = "deny"
         assert_eq!(
             config.approval.destructive,
             crate::autonomy::ApprovalRule::Deny
+        );
+        assert_eq!(
+            config.approval.tool_call,
+            crate::autonomy::ApprovalRule::Ask
         );
     }
 
@@ -1090,6 +1238,10 @@ args = ["mcp-server-sqlite", "--db-path", "/tmp/test.db"]
             config.approval.command_exec,
             crate::autonomy::ApprovalRule::Auto
         );
+        assert_eq!(
+            config.approval.tool_call,
+            crate::autonomy::ApprovalRule::Auto
+        );
     }
 
     #[test]
@@ -1150,7 +1302,10 @@ live_context_window = 65536
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         assert!(!config.presence.enabled);
         assert_eq!(config.presence.provider.as_deref(), Some("gemini"));
-        assert_eq!(config.presence.model.as_deref(), Some("gemini-3-flash-preview"));
+        assert_eq!(
+            config.presence.model.as_deref(),
+            Some("gemini-3-flash-preview")
+        );
         assert_eq!(config.presence.context_window, 1_048_576);
         assert_eq!(config.presence.live_provider.as_deref(), Some("openai"));
         assert_eq!(
@@ -1254,7 +1409,10 @@ ice_servers = [
         let config: ProjectConfig = toml::from_str(toml_str).unwrap();
         let ice = config.webrtc.to_ice_config();
         assert_eq!(ice.ice_servers.len(), 2);
-        assert_eq!(ice.ice_servers[0].urls, vec!["stun:stun.l.google.com:19302"]);
+        assert_eq!(
+            ice.ice_servers[0].urls,
+            vec!["stun:stun.l.google.com:19302"]
+        );
         assert!(ice.ice_servers[0].username.is_none());
         assert_eq!(ice.ice_servers[1].username.as_deref(), Some("u"));
         assert_eq!(ice.ice_servers[1].credential.as_deref(), Some("p"));
@@ -1305,6 +1463,7 @@ allowed_tools = ["Read", "Edit", "Bash"]
         assert_eq!(config.agent.codex.model.as_deref(), Some("o4-mini"));
         assert_eq!(config.agent.codex.approval_policy, "never");
         assert_eq!(config.agent.codex.sandbox, "workspace-write");
+        assert!(config.agent.codex.service_tier.is_none());
         assert_eq!(config.agent.claude_code.command, "/usr/local/bin/claude");
         assert_eq!(
             config.agent.claude_code.model.as_deref(),
@@ -1329,6 +1488,7 @@ default_backend = "codex"
         assert!(config.agent.codex.model.is_none());
         assert_eq!(config.agent.codex.approval_policy, "on-request");
         assert_eq!(config.agent.codex.sandbox, "workspace-write");
+        assert_eq!(config.agent.codex.context_archive, "summary");
         assert_eq!(config.agent.claude_code.command, "claude");
         assert!(config.agent.claude_code.model.is_none());
         assert_eq!(config.agent.claude_code.permission_mode, "auto");
@@ -1342,5 +1502,18 @@ default_backend = "codex"
         assert!(config.model.is_none());
         assert_eq!(config.approval_policy, "on-request");
         assert_eq!(config.sandbox, "workspace-write");
+        assert_eq!(config.context_archive, "summary");
+        assert!(config.service_tier.is_none());
+        assert_eq!(normalize_codex_context_archive("raw"), "exact");
+        assert_eq!(normalize_codex_context_archive("disabled"), "off");
+        assert_eq!(
+            normalize_codex_service_tier(Some("fast")).as_deref(),
+            Some("priority")
+        );
+        assert_eq!(
+            normalize_codex_service_tier(Some("normal")).as_deref(),
+            Some(CODEX_STANDARD_SERVICE_TIER)
+        );
+        assert_eq!(normalize_codex_service_tier(Some("inherit")), None);
     }
 }

@@ -1,9 +1,9 @@
 use crate::conversation::Conversation;
 use crate::error::CallerError;
+use crate::event::{AppEvent, ControlMsg, EventBus};
 use crate::knowledge::{self, KnowledgeQuery};
 use crate::provider::ChatProvider;
 use crate::session_log;
-use crate::event::{AppEvent, ControlMsg, EventBus};
 use serde_json::{json, Value};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -13,13 +13,11 @@ use tokio::sync::mpsc;
 // Re-export types from presence-core so existing callers don't break.
 #[allow(unused_imports)]
 pub use presence_core::{
-    AgentStateSnapshot, PresenceConfig, PresenceEvent, PresenceUsage,
-    TaskEnvelope, DEFAULT_TEXT_MODEL, NARRATION_DEBOUNCE_MS, PRESENCE_TURN_OFFSET,
-    PREFERRED_TEXT_MODEL, DEFAULT_TEXT_PROVIDER,
-    format_event, truncate,
-    PresenceAction, dispatch_tool_call,
-    PresenceConnect, PresenceWelcome, PresenceCheckpoint, PresenceCheckpointAck,
-    PresenceEventWindow, SequencedPresenceEvent, VoiceLog,
+    dispatch_tool_call, format_event, truncate, AgentStateSnapshot, PresenceAction,
+    PresenceCheckpoint, PresenceCheckpointAck, PresenceConfig, PresenceConnect, PresenceEvent,
+    PresenceEventWindow, PresenceUsage, PresenceWelcome, SequencedPresenceEvent, TaskEnvelope,
+    VoiceLog, DEFAULT_TEXT_MODEL, DEFAULT_TEXT_PROVIDER, NARRATION_DEBOUNCE_MS,
+    PREFERRED_TEXT_MODEL, PRESENCE_TURN_OFFSET,
 };
 
 /// Convert a `PresenceAction` to a `(ControlMsg, confirmation_text)` pair.
@@ -28,34 +26,59 @@ pub fn action_to_control_msg(action: &PresenceAction) -> Option<(ControlMsg, Str
     let confirmation = presence_core::action_confirmation(action);
     match action {
         PresenceAction::SubmitTask(envelope) => {
-            let orchestrate = if envelope.force_direct { Some(false) } else { None };
+            let orchestrate = if envelope.force_direct {
+                Some(false)
+            } else {
+                None
+            };
             Some((
                 ControlMsg::StartTask {
+                    session_id: None,
                     task: envelope.task.clone(),
                     orchestrate,
-                    direct: if envelope.force_direct { Some(true) } else { None },
+                    direct: if envelope.force_direct {
+                        Some(true)
+                    } else {
+                        None
+                    },
                     reference_frame_ids: envelope.reference_frame_ids.clone(),
                     display_target: envelope.display_target.clone(),
                     attachments: envelope.attachment_frame_ids.clone(),
+                    follow_up_id: None,
                 },
                 confirmation,
             ))
         }
-        PresenceAction::Approve { id } => {
-            Some((ControlMsg::Approve { id: *id }, confirmation))
-        }
-        PresenceAction::Deny { id } => {
-            Some((ControlMsg::Deny { id: *id }, confirmation))
-        }
-        PresenceAction::Skip { id } => {
-            Some((ControlMsg::Skip { id: *id }, confirmation))
-        }
+        PresenceAction::Approve { id } => Some((
+            ControlMsg::Approve {
+                session_id: None,
+                id: *id,
+            },
+            confirmation,
+        )),
+        PresenceAction::Deny { id } => Some((
+            ControlMsg::Deny {
+                session_id: None,
+                id: *id,
+            },
+            confirmation,
+        )),
+        PresenceAction::Skip { id } => Some((
+            ControlMsg::Skip {
+                session_id: None,
+                id: *id,
+            },
+            confirmation,
+        )),
         PresenceAction::Respond { text } => {
             Some((ControlMsg::Input { text: text.clone() }, confirmation))
         }
-        PresenceAction::SetAutonomy { level } => {
-            Some((ControlMsg::SetAutonomy { level: level.clone() }, confirmation))
-        }
+        PresenceAction::SetAutonomy { level } => Some((
+            ControlMsg::SetAutonomy {
+                level: level.clone(),
+            },
+            confirmation,
+        )),
         PresenceAction::TextResult(_) | PresenceAction::NeedsIO { .. } => None,
     }
 }
@@ -209,7 +232,10 @@ impl PresenceLayer {
     }
 
     /// Inject a PresenceEvent into the conversation and let the model narrate.
-    pub async fn handle_event(&mut self, event: PresenceEvent) -> Result<Option<String>, CallerError> {
+    pub async fn handle_event(
+        &mut self,
+        event: PresenceEvent,
+    ) -> Result<Option<String>, CallerError> {
         // When paused (browser voice model active), skip narration
         if self.is_paused() {
             return Ok(None);
@@ -224,7 +250,8 @@ impl PresenceLayer {
         }
         self.turn += 1;
         let event_text = format_event(&event);
-        self.conversation.add_user(format!("[Event] {}", event_text));
+        self.conversation
+            .add_user(format!("[Event] {}", event_text));
         let response = self.run_model_loop().await?;
         if response.trim().is_empty() {
             Ok(None)
@@ -275,15 +302,28 @@ impl PresenceLayer {
             }
 
             // Has tool calls — process them
-            let tool_names: Vec<&str> = response.tool_calls.iter().map(|tc| tc.name.as_str()).collect();
-            self.plog(format!("Tool call: {}", tool_names.join(", ")), Some(crate::types::LogLevel::Detail));
+            let tool_names: Vec<&str> = response
+                .tool_calls
+                .iter()
+                .map(|tc| tc.name.as_str())
+                .collect();
+            self.plog(
+                format!("Tool call: {}", tool_names.join(", ")),
+                Some(crate::types::LogLevel::Detail),
+            );
 
             if !response.content.is_empty() {
-                self.plog(format!("Model text: {}", response.content), Some(LogLevel::Agent));
+                self.plog(
+                    format!("Model text: {}", response.content),
+                    Some(LogLevel::Agent),
+                );
             }
 
             for tc in &response.tool_calls {
-                self.plog(format!("{}({})", tc.name, tc.arguments), Some(LogLevel::Debug));
+                self.plog(
+                    format!("{}({})", tc.name, tc.arguments),
+                    Some(LogLevel::Debug),
+                );
             }
 
             let tool_call_refs: Vec<crate::conversation::ToolCallRef> = response
@@ -304,18 +344,20 @@ impl PresenceLayer {
             );
 
             for tc in &response.tool_calls {
-                let result = self.handle_presence_tool_call(&tc.name, &tc.arguments).await;
+                let result = self
+                    .handle_presence_tool_call(&tc.name, &tc.arguments)
+                    .await;
                 let result_preview = if result.len() > 200 {
                     format!("{}...", &result[..200])
                 } else {
                     result.clone()
                 };
-                self.plog(format!("{} → {}", tc.name, result_preview), Some(LogLevel::Debug));
-                self.conversation.add_tool_result(
-                    &tc.call_id,
-                    &tc.name,
-                    &result,
+                self.plog(
+                    format!("{} → {}", tc.name, result_preview),
+                    Some(LogLevel::Debug),
                 );
+                self.conversation
+                    .add_tool_result(&tc.call_id, &tc.name, &result);
             }
         }
 
@@ -327,11 +369,18 @@ impl PresenceLayer {
         let args: Value = serde_json::from_str(args_json).unwrap_or(json!({}));
         if name == "submit_task" {
             self.plog(
-                format!("[debug] submit_task args: {}", &args_json[..args_json.len().min(500)]),
+                format!(
+                    "[debug] submit_task args: {}",
+                    &args_json[..args_json.len().min(500)]
+                ),
                 None,
             );
         }
-        let state_snapshot = self.agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let state_snapshot = self
+            .agent_state
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
 
         let action = dispatch_tool_call(name, &args, &state_snapshot);
 
@@ -354,7 +403,10 @@ impl PresenceLayer {
 
             if is_busy {
                 self.plog(
-                    format!("Rejected submit_task while agent is busy: {}", &envelope.task[..envelope.task.len().min(100)]),
+                    format!(
+                        "Rejected submit_task while agent is busy: {}",
+                        &envelope.task[..envelope.task.len().min(100)]
+                    ),
                     None,
                 );
                 return "Error: a task is already running. Wait for it to complete before submitting a new one.".to_string();
@@ -379,29 +431,28 @@ impl PresenceLayer {
         // Remaining: TextResult, NeedsIO.
         match action {
             PresenceAction::TextResult(text) => text,
-            PresenceAction::NeedsIO { tool_name, args } => {
-                match tool_name.as_str() {
-                    "query_detail" => self.handle_query_detail(&args).await,
-                    "recall_memory" => self.handle_recall_memory(&args),
-                    "send_message" => {
-                        let msg = args["message"].as_str().unwrap_or("").to_string();
-                        if msg.is_empty() {
-                            "Error: message is required".to_string()
-                        } else {
-                            if let Ok(mut q) = self.context_injection.lock() {
-                                q.push(crate::event::ContextInjection::text(
-                                    format!("[Presence] {}", msg),
-                                ));
-                            }
-                            format!("Message injected: {}", msg)
+            PresenceAction::NeedsIO { tool_name, args } => match tool_name.as_str() {
+                "query_detail" => self.handle_query_detail(&args).await,
+                "recall_memory" => self.handle_recall_memory(&args),
+                "send_message" => {
+                    let msg = args["message"].as_str().unwrap_or("").to_string();
+                    if msg.is_empty() {
+                        "Error: message is required".to_string()
+                    } else {
+                        if let Ok(mut q) = self.context_injection.lock() {
+                            q.push(crate::event::ContextInjection::text(format!(
+                                "[Presence] {}",
+                                msg
+                            )));
                         }
+                        format!("Message injected: {}", msg)
                     }
-                    "inspect_frame" | "inspect_frames" => {
-                        "Frame inspection is only available in live video mode (browser).".to_string()
-                    }
-                    _ => format!("Unknown IO tool: {}", tool_name),
                 }
-            }
+                "inspect_frame" | "inspect_frames" => {
+                    "Frame inspection is only available in live video mode (browser).".to_string()
+                }
+                _ => format!("Unknown IO tool: {}", tool_name),
+            },
             _ => unreachable!(), // SubmitTask and action variants handled above
         }
     }
@@ -466,7 +517,9 @@ pub async fn query_detail(
             let state = agent_state.lock().unwrap_or_else(|e| e.into_inner());
             format!(
                 "Turn: {}\nPhase: {}\nBudget: {:.0}%",
-                state.turn, state.phase, state.budget_pct * 100.0
+                state.turn,
+                state.phase,
+                state.budget_pct * 100.0
             )
         }
         "last_output" => {
@@ -548,12 +601,16 @@ pub fn recall_memory(
     log_dir: &std::path::Path,
     args: &Value,
 ) -> String {
-    let keywords: Option<Vec<String>> = args["keywords"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
-    let tags = args["tags"]
-        .as_array()
-        .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect());
+    let keywords: Option<Vec<String>> = args["keywords"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
+    let tags = args["tags"].as_array().map(|a| {
+        a.iter()
+            .filter_map(|v| v.as_str().map(String::from))
+            .collect()
+    });
     let channel = args["channel"].as_str().map(String::from);
 
     let query = KnowledgeQuery {
@@ -606,7 +663,11 @@ pub fn recall_memory(
                 .collect();
             if !matched.is_empty() {
                 sections.push(
-                    matched.iter().map(|s| s.as_str()).collect::<Vec<_>>().join("\n"),
+                    matched
+                        .iter()
+                        .map(|s| s.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n"),
                 );
             }
         }
@@ -644,7 +705,10 @@ pub struct ToolQueryResult {
 
 impl ToolQueryResult {
     pub fn text(s: String) -> Self {
-        Self { text: s, images: vec![] }
+        Self {
+            text: s,
+            images: vec![],
+        }
     }
 }
 
@@ -665,23 +729,30 @@ pub async fn handle_tool_query(
 ) -> Option<ToolQueryResult> {
     match tool_name {
         "check_status" => {
-            let state = agent_state.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let state = agent_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
             let action = dispatch_tool_call("check_status", args, &state);
             match action {
                 PresenceAction::TextResult(text) => Some(ToolQueryResult::text(text)),
                 _ => None,
             }
         }
-        "query_detail" => {
-            Some(ToolQueryResult::text(query_detail(agent_state, project_root, log_dir, args).await))
-        }
-        "recall_memory" => {
-            Some(ToolQueryResult::text(recall_memory(knowledge_path, log_dir, args)))
-        }
+        "query_detail" => Some(ToolQueryResult::text(
+            query_detail(agent_state, project_root, log_dir, args).await,
+        )),
+        "recall_memory" => Some(ToolQueryResult::text(recall_memory(
+            knowledge_path,
+            log_dir,
+            args,
+        ))),
         "send_message" => {
             let msg = args["message"].as_str().unwrap_or("").to_string();
             if msg.is_empty() {
-                return Some(ToolQueryResult::text("Error: message is required".to_string()));
+                return Some(ToolQueryResult::text(
+                    "Error: message is required".to_string(),
+                ));
             }
             // Resolve optional frame_ids to HQ images
             let mut images = Vec::new();
@@ -707,6 +778,7 @@ pub async fn handle_tool_query(
                         text: format!("[Presence] {}", msg),
                         images,
                         source: crate::event::InjectionSource::User,
+                        target_session_id: None,
                         steer_id: None,
                     });
                 }
@@ -714,12 +786,14 @@ pub async fn handle_tool_query(
             Some(ToolQueryResult::text(format!("Message injected: {}", msg)))
         }
         "inspect_frame" => {
-            let reg = match frame_registry {
-                Some(r) => r,
-                None => return Some(ToolQueryResult::text(
-                    "Frame registry not available. No display frames have been captured yet.".to_string()
-                )),
-            };
+            let reg =
+                match frame_registry {
+                    Some(r) => r,
+                    None => return Some(ToolQueryResult::text(
+                        "Frame registry not available. No display frames have been captured yet."
+                            .to_string(),
+                    )),
+                };
             let reg = reg.read().await;
             let frame_id = args["frame_id"].as_str();
             let fid = match frame_id {
@@ -752,29 +826,39 @@ pub async fn handle_tool_query(
                     images,
                 })
             } else {
-                Some(ToolQueryResult::text(format!("Frame {} not found in registry.", fid)))
+                Some(ToolQueryResult::text(format!(
+                    "Frame {} not found in registry.",
+                    fid
+                )))
             }
         }
         "inspect_frames" => {
-            let reg = match frame_registry {
-                Some(r) => r,
-                None => return Some(ToolQueryResult::text(
-                    "Frame registry not available. No display frames have been captured yet.".to_string()
-                )),
-            };
+            let reg =
+                match frame_registry {
+                    Some(r) => r,
+                    None => return Some(ToolQueryResult::text(
+                        "Frame registry not available. No display frames have been captured yet."
+                            .to_string(),
+                    )),
+                };
             let reg = reg.read().await;
             let query = args["query"].as_str().unwrap_or("");
             let count = args["count"].as_u64().unwrap_or(10) as usize;
 
             // Parse query: if it matches a stream name, filter by stream; otherwise return recent frames.
-            let stream_filter = if query.starts_with("cam") || query.starts_with("display:") || query.starts_with("d") {
+            let stream_filter = if query.starts_with("cam")
+                || query.starts_with("display:")
+                || query.starts_with("d")
+            {
                 Some(query)
             } else {
                 None
             };
 
             let frames = reg.query(stream_filter, count);
-            Some(ToolQueryResult::text(crate::frames::FrameRegistry::format_frame_list(&frames)))
+            Some(ToolQueryResult::text(
+                crate::frames::FrameRegistry::format_frame_list(&frames),
+            ))
         }
         _ => None,
     }
@@ -806,7 +890,9 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 None
             }
         }
-        AppEvent::TaskComplete { reason, summary } => {
+        AppEvent::TaskComplete {
+            reason, summary, ..
+        } => {
             *last_phase = "done".to_string();
             Some(PresenceEvent::TaskComplete {
                 reason: reason.clone(),
@@ -826,7 +912,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 category: format!("{:?}", category),
             })
         }
-        AppEvent::ApprovalResolved { id, action } => {
+        AppEvent::ApprovalResolved { id, action, .. } => {
             if action == "deny" {
                 *last_phase = "done".to_string();
             } else {
@@ -870,7 +956,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
                 message: "Safety cap reached (500 turns)".to_string(),
             })
         }
-        AppEvent::InterruptRequested => {
+        AppEvent::InterruptRequested { .. } => {
             let new_phase = "interrupting".to_string();
             let changed = *last_phase != new_phase;
             *last_phase = new_phase.clone();
@@ -897,6 +983,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::DisplayResize { .. }
         | AppEvent::UserDisplayGranted { .. }
         | AppEvent::UserDisplayRevoked { .. }
+        | AppEvent::SharedView { .. }
+        | AppEvent::BrowserWorkspaceChanged { .. }
 
         // Pull-only events — not pushed to presence
         | AppEvent::AgentOutput { .. }
@@ -923,13 +1011,25 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::VoiceDiagnostic { .. }
         | AppEvent::UserTranscript { .. }
         | AppEvent::UsageSnapshot { .. }
+        | AppEvent::ContextSnapshot { .. }
         | AppEvent::LiveUsageUpdate { .. }
         | AppEvent::StatusUpdate { .. }
         | AppEvent::LogEntry { .. }
+        | AppEvent::UserMessageRewind { .. }
+        | AppEvent::UserMessageLog { .. }
+        | AppEvent::FollowUpStatus { .. }
+        | AppEvent::ExternalFollowUpRequested { .. }
         | AppEvent::ExternalAgentChanged { .. }
+        | AppEvent::AutonomyChanged { .. }
         | AppEvent::CodexConfigChanged { .. }
         | AppEvent::CodexThreadActionRequested { .. }
         | AppEvent::CodexThreadActionResult { .. }
+        | AppEvent::SessionIdentity { .. }
+        | AppEvent::SessionRelationship { .. }
+        | AppEvent::SessionCapabilities { .. }
+        | AppEvent::SessionGoal { .. }
+        | AppEvent::SessionRenameResult { .. }
+        | AppEvent::SessionAgentConfigResult { .. }
         | AppEvent::GeminiConfigChanged { .. }
         | AppEvent::GeminiThreadActionRequested { .. }
         | AppEvent::GeminiThreadActionResult { .. }
@@ -943,6 +1043,8 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         | AppEvent::RecordingError { .. }
         | AppEvent::RecordingDeleted { .. }
         | AppEvent::SessionStarted { .. }
+        | AppEvent::SessionAttached { .. }
+        | AppEvent::SessionStopRequested { .. }
         | AppEvent::SessionEnded { .. }
         | AppEvent::DebugScreenReady { .. }
         | AppEvent::DebugScreenTornDown { .. }
@@ -965,6 +1067,7 @@ pub fn filter_event(event: &AppEvent, last_phase: &mut String) -> Option<Presenc
         // narrate these (the worker's next model response will reflect
         // the effect of the steer, which we already surface).
         | AppEvent::SteerRequested { .. }
+        | AppEvent::SteerAccepted { .. }
         | AppEvent::SteerQueued { .. }
         | AppEvent::SteerDelivered { .. } => None,
     }
@@ -1091,7 +1194,9 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             };
             s.last_output_summary = truncate(&combined, 500);
         }
-        AppEvent::TaskComplete { reason, summary } => {
+        AppEvent::TaskComplete {
+            reason, summary, ..
+        } => {
             s.phase = format!("done: {}", reason);
             if let Some(text) = summary {
                 s.last_task_result = Some(text.clone());
@@ -1135,7 +1240,10 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             s.phase = format!("error: {}", msg);
         }
         AppEvent::DisplayReady {
-            display_id, width, height, ..
+            display_id,
+            width,
+            height,
+            ..
         } => {
             let prefix = if *display_id == 0 {
                 "user_session".to_string()
@@ -1152,7 +1260,10 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
             }
         }
         AppEvent::DisplayResize {
-            display_id, width, height, ..
+            display_id,
+            width,
+            height,
+            ..
         } => {
             let prefix = if *display_id == 0 {
                 "user_session".to_string()
@@ -1165,12 +1276,17 @@ pub fn update_agent_state(event: &AppEvent, state: &Arc<Mutex<AgentStateSnapshot
                 format!(":{} ({}x{}, virtual)", display_id, width, height)
             };
             // Replace the existing entry with updated dimensions.
-            if let Some(entry) = s.available_displays.iter_mut().find(|d| d.starts_with(&prefix)) {
+            if let Some(entry) = s
+                .available_displays
+                .iter_mut()
+                .find(|d| d.starts_with(&prefix))
+            {
                 *entry = label;
             }
         }
         AppEvent::UserDisplayRevoked { .. } => {
-            s.available_displays.retain(|d| !d.starts_with("user_session"));
+            s.available_displays
+                .retain(|d| !d.starts_with("user_session"));
         }
         _ => {}
     }
@@ -1248,6 +1364,7 @@ mod tests {
             reference_frame_ids: vec!["cam0-f00005".to_string()],
             display_target: Some("user_session".to_string()),
             attachment_frame_ids: vec![],
+            steer_id: None,
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let parsed: TaskEnvelope = serde_json::from_str(&json).unwrap();
@@ -1262,6 +1379,7 @@ mod tests {
         let mut last_phase = String::new();
 
         let event = AppEvent::TaskComplete {
+            session_id: None,
             reason: "done".to_string(),
             summary: None,
         };
@@ -1274,6 +1392,7 @@ mod tests {
         assert!(filter_event(&event, &mut last_phase).is_some());
 
         let event = AppEvent::RoundComplete {
+            session_id: None,
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
@@ -1289,15 +1408,18 @@ mod tests {
         let mut last_phase = String::new();
 
         let event = AppEvent::AgentOutput {
+            session_id: None,
             stdout: "hello".to_string(),
             stderr: String::new(),
             source: None,
+            output_id: None,
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
 
         assert!(filter_event(&AppEvent::Tick, &mut last_phase).is_none());
 
         let event = AppEvent::ModelResponseDelta {
+            session_id: None,
             text: "hi".to_string(),
         };
         assert!(filter_event(&event, &mut last_phase).is_none());
@@ -1310,6 +1432,7 @@ mod tests {
         assert!(filter_event(&AppEvent::PresenceReady, &mut last_phase).is_none());
 
         let event = AppEvent::RoundComplete {
+            session_id: None,
             round: 1,
             turns_in_round: 5,
             native_message_count: None,
@@ -1322,6 +1445,7 @@ mod tests {
         let mut last_phase = String::new();
 
         let event = AppEvent::ModelResponse {
+            session_id: None,
             turn: 1,
             content: "hi".to_string(),
             usage: provider::TokenUsage::default(),
@@ -1352,6 +1476,7 @@ mod tests {
 
         update_agent_state(
             &AppEvent::TurnStarted {
+                session_id: None,
                 turn: 5,
                 budget_pct: 0.42,
                 remaining: 50_000,
@@ -1367,8 +1492,10 @@ mod tests {
 
         update_agent_state(
             &AppEvent::AgentStarted {
+                session_id: None,
                 turn: 5,
                 commands_preview: "echo hello".to_string(),
+                item_id: None,
                 source: None,
             },
             &state,
@@ -1381,9 +1508,11 @@ mod tests {
 
         update_agent_state(
             &AppEvent::AgentOutput {
+                session_id: None,
                 stdout: "hello world".to_string(),
                 stderr: String::new(),
                 source: None,
+                output_id: None,
             },
             &state,
         );
@@ -1408,6 +1537,7 @@ mod tests {
 
         update_agent_state(
             &AppEvent::TaskComplete {
+                session_id: None,
                 reason: "done_signal".to_string(),
                 summary: None,
             },
@@ -1462,18 +1592,33 @@ mod tests {
     fn filter_event_presence_connected_is_pull_only() {
         let mut last_phase = String::new();
         assert!(filter_event(
-            &AppEvent::PresenceConnected { server_session_id: None, last_event_seq: 0, live_provider: None, live_model: None },
+            &AppEvent::PresenceConnected {
+                server_session_id: None,
+                last_event_seq: 0,
+                live_provider: None,
+                live_model: None
+            },
             &mut last_phase
-        ).is_none());
+        )
+        .is_none());
         assert!(filter_event(&AppEvent::PresenceDisconnected, &mut last_phase).is_none());
         assert!(filter_event(
-            &AppEvent::VoiceLog { text: "hi".to_string(), seq: 1, tool_context: None },
+            &AppEvent::VoiceLog {
+                text: "hi".to_string(),
+                seq: 1,
+                tool_context: None
+            },
             &mut last_phase
-        ).is_none());
+        )
+        .is_none());
         assert!(filter_event(
-            &AppEvent::PresenceCheckpointReceived { summary: "test".to_string(), last_event_seq: 1 },
+            &AppEvent::PresenceCheckpointReceived {
+                summary: "test".to_string(),
+                last_event_seq: 1
+            },
             &mut last_phase
-        ).is_none());
+        )
+        .is_none());
     }
 
     #[test]

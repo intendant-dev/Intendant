@@ -1,10 +1,27 @@
-//! H264 hardware encoder using ffmpeg as a subprocess with VA-API acceleration.
+//! H264 hardware encoder using ffmpeg as a subprocess with GPU acceleration.
 //!
 //! Pipes raw I420 frames into ffmpeg's stdin and reads Annex-B H264 NAL units
-//! from stdout.  Falls back to software x264 if VA-API is unavailable.
+//! from stdout.  Selection order is `h264_nvenc` (NVIDIA) → `h264_vaapi`
+//! (VA-API) → software `libx264`, each arm falling through on failure.
 //!
-//! This approach avoids complex FFI bindings to libva while still getting
-//! hardware acceleration when available.
+//! This approach avoids complex FFI bindings to NVENC/libva while still
+//! getting hardware acceleration when available.
+//!
+//! **Loss-resilience.** All three encoders use a *finite, bounded GOP*
+//! ([`GOP_PERIOD_FRAMES`]) so a decoder that has desynced — fresh peer
+//! join, or a transport gap that outran NACK retransmission — gets a real
+//! IDR within ~1-2 s rather than waiting indefinitely. The complementary
+//! half of the strategy lives elsewhere: the federated H.264 layer is
+//! encoded at quarter resolution + a capped bitrate (see
+//! `LayerSpec::single` / `single_federated` in `encode/pool.rs`), so even
+//! the periodic IDR is only a handful of RTP packets and survives the
+//! lossy `browser → TURN → remote peer` relay; and `slice-max-size=1200`
+//! (libx264) keeps each NAL inside a single ~MTU RTP payload so a lost
+//! packet costs one slice, not a frame. An earlier iteration replaced the
+//! periodic IDR with libx264 *intra refresh* / an infinite NVENC GOP, but
+//! that left a desynced decoder with no clean recovery point (Linux ffmpeg
+//! ignores PLI on a long-lived stdin pipe, so there was no on-demand
+//! keyframe either) — the finite GOP restores recoverability.
 
 use super::{EncodedPacket, Encoder, PayloadSpec};
 use std::io::{Read, Write};
@@ -20,6 +37,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 /// One-way: never cleared, so we don't keep retrying a known-broken path.
 static VAAPI_BANNED: AtomicBool = AtomicBool::new(false);
 
+/// Process-wide ban on `h264_nvenc`, mirroring [`VAAPI_BANNED`].
+///
+/// NVENC's failure mode at *startup* (no NVIDIA GPU / driver, exhausted
+/// encoder sessions) is a hard immediate ffmpeg exit, which
+/// [`FfmpegH264Encoder::from_child`] already catches and turns into a
+/// fall-through to VA-API/libx264. This flag exists for the *silent*
+/// failure mode (init succeeds, then no output) so the same watchdog that
+/// bans VA-API can ban NVENC and stop re-spawning a known-dead encoder on
+/// every peer reconnect. One-way: never cleared.
+static NVENC_BANNED: AtomicBool = AtomicBool::new(false);
+
 /// Mark `h264_vaapi` as broken on this host for the rest of the process.
 pub fn ban_vaapi() {
     VAAPI_BANNED.store(true, Ordering::SeqCst);
@@ -28,6 +56,16 @@ pub fn ban_vaapi() {
 /// Whether the watchdog has banned `h264_vaapi` for this process.
 pub fn is_vaapi_banned() -> bool {
     VAAPI_BANNED.load(Ordering::Relaxed)
+}
+
+/// Mark `h264_nvenc` as broken on this host for the rest of the process.
+pub fn ban_nvenc() {
+    NVENC_BANNED.store(true, Ordering::SeqCst);
+}
+
+/// Whether the watchdog has banned `h264_nvenc` for this process.
+pub fn is_nvenc_banned() -> bool {
+    NVENC_BANNED.load(Ordering::Relaxed)
 }
 
 /// A complete NAL unit extracted by the reader thread.
@@ -104,8 +142,12 @@ pub struct FfmpegH264Encoder {
 impl FfmpegH264Encoder {
     /// Create a new ffmpeg H264 encoder subprocess.
     ///
-    /// Tries VA-API first (`h264_vaapi`), then falls back to software `libx264`.
-    /// Returns `Err` if ffmpeg is not installed.
+    /// Selection order: `h264_nvenc` (NVIDIA) → `h264_vaapi` (VA-API) →
+    /// software `libx264`. Each arm logs and falls through on failure;
+    /// arms the runtime watchdog has banned for this process (see
+    /// [`NVENC_BANNED`] / [`VAAPI_BANNED`]) are skipped outright so we
+    /// don't re-spawn a known-broken encoder on every peer reconnect.
+    /// Returns `Err` only if ffmpeg is missing or every arm fails.
     pub fn new(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
         // Check that ffmpeg exists.
         let ffmpeg_check = Command::new("ffmpeg")
@@ -118,38 +160,62 @@ impl FfmpegH264Encoder {
             return Err("ffmpeg not found in PATH".to_string());
         }
 
-        // Skip VA-API if the runtime watchdog already banned it on this
-        // host. Avoids re-spawning a known-broken encoder on each peer
-        // reconnect or display re-grant within the same process.
-        if is_vaapi_banned() {
-            let enc = Self::spawn_x264(width, height, bitrate_kbps)?;
-            eprintln!(
-                "[display/h264_linux] using libx264 (VA-API banned this session)",
-            );
-            return Ok(enc);
+        // Accumulate per-arm errors for a useful final message if all fail.
+        let mut errs: Vec<String> = Vec::new();
+
+        // 1) NVENC (NVIDIA hardware). Skipped if banned or if the ffmpeg
+        //    build lacks the encoder (cheap probe avoids a spawn + 100 ms
+        //    sleep on the common no-NVIDIA host). A present-but-GPU-less
+        //    encoder still exits immediately and is caught by from_child.
+        if is_nvenc_banned() {
+            eprintln!("[display/h264_linux] skipping h264_nvenc (banned this session)");
+        } else if !nvenc_encoder_available() {
+            errs.push("nvenc=not built into ffmpeg".to_string());
+        } else {
+            match Self::spawn_nvenc(width, height, bitrate_kbps) {
+                Ok(enc) => {
+                    eprintln!("[display/h264_linux] using h264_nvenc encoder");
+                    return Ok(enc);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[display/h264_linux] NVENC unavailable ({}), trying VA-API",
+                        e,
+                    );
+                    errs.push(format!("nvenc={e}"));
+                }
+            }
         }
 
-        // Try VA-API first.
-        match Self::spawn_vaapi(width, height, bitrate_kbps) {
+        // 2) VA-API.
+        if is_vaapi_banned() {
+            eprintln!("[display/h264_linux] skipping h264_vaapi (banned this session)");
+            errs.push("vaapi=banned".to_string());
+        } else {
+            match Self::spawn_vaapi(width, height, bitrate_kbps) {
+                Ok(enc) => {
+                    eprintln!("[display/h264_linux] using h264_vaapi encoder");
+                    return Ok(enc);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "[display/h264_linux] VA-API unavailable ({}), trying libx264",
+                        e,
+                    );
+                    errs.push(format!("vaapi={e}"));
+                }
+            }
+        }
+
+        // 3) Software libx264 (always-available baseline).
+        match Self::spawn_x264(width, height, bitrate_kbps) {
             Ok(enc) => {
-                eprintln!("[display/h264_linux] using h264_vaapi encoder");
+                eprintln!("[display/h264_linux] using libx264 software encoder");
                 Ok(enc)
             }
-            Err(vaapi_err) => {
-                eprintln!(
-                    "[display/h264_linux] VA-API unavailable ({}), trying libx264",
-                    vaapi_err,
-                );
-                match Self::spawn_x264(width, height, bitrate_kbps) {
-                    Ok(enc) => {
-                        eprintln!("[display/h264_linux] using libx264 software encoder");
-                        Ok(enc)
-                    }
-                    Err(x264_err) => Err(format!(
-                        "no H264 encoder: vaapi={}, x264={}",
-                        vaapi_err, x264_err,
-                    )),
-                }
+            Err(x264_err) => {
+                errs.push(format!("x264={x264_err}"));
+                Err(format!("no H264 encoder: {}", errs.join(", ")))
             }
         }
     }
@@ -159,42 +225,7 @@ impl FfmpegH264Encoder {
         // VA-API requires uploading frames to GPU via hwupload.
         // Input: raw I420 on stdin.  Output: Annex-B H264 on stdout.
         let child = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                // Input: raw I420 from stdin
-                "-f",
-                "rawvideo",
-                "-pixel_format",
-                "yuv420p",
-                "-video_size",
-                &format!("{width}x{height}"),
-                "-framerate",
-                "30",
-                "-i",
-                "pipe:0",
-                // VA-API device
-                "-vaapi_device",
-                "/dev/dri/renderD128",
-                // Upload to GPU + encode
-                "-vf",
-                "format=nv12,hwupload",
-                "-c:v",
-                "h264_vaapi",
-                "-b:v",
-                &format!("{bitrate_kbps}k"),
-                "-profile:v",
-                "constrained_baseline",
-                "-g",
-                "30", // keyframe every 1s at 30fps feed rate
-                "-bf",
-                "0", // no B-frames
-                // Output: raw H264 Annex-B to stdout
-                "-f",
-                "h264",
-                "pipe:1",
-            ])
+            .args(vaapi_ffmpeg_args(width, height, bitrate_kbps))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -208,53 +239,27 @@ impl FfmpegH264Encoder {
         Self::from_child(child, width, height)
     }
 
+    /// Spawn ffmpeg with the NVIDIA NVENC hardware encoder.
+    fn spawn_nvenc(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
+        let child = Command::new("ffmpeg")
+            .args(nvenc_ffmpeg_args(width, height, bitrate_kbps))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .map_err(|e| format!("spawn ffmpeg: {e}"))?;
+
+        // Wait briefly and check if the process exited immediately (no
+        // NVIDIA GPU/driver, exhausted encoder sessions, etc.).
+        std::thread::sleep(std::time::Duration::from_millis(100));
+
+        Self::from_child(child, width, height)
+    }
+
     /// Spawn ffmpeg with software x264 encoder.
     fn spawn_x264(width: u32, height: u32, bitrate_kbps: u32) -> Result<Self, String> {
         let child = Command::new("ffmpeg")
-            .args([
-                "-hide_banner",
-                "-loglevel",
-                "error",
-                // Input: raw I420 from stdin
-                "-f",
-                "rawvideo",
-                "-pixel_format",
-                "yuv420p",
-                "-video_size",
-                &format!("{width}x{height}"),
-                "-framerate",
-                "30",
-                "-i",
-                "pipe:0",
-                // Software encode
-                "-c:v",
-                "libx264",
-                "-b:v",
-                &format!("{bitrate_kbps}k"),
-                "-profile:v",
-                "baseline",
-                "-preset",
-                "ultrafast",
-                "-tune",
-                "zerolatency",
-                "-g",
-                "30",
-                "-bf",
-                "0",
-                // Tell libx264 to repeat SPS/PPS before every IDR. The
-                // load-bearing fix lives in `build_packet` (cached
-                // SPS/PPS daemon-side prepend), which catches encoders
-                // that ignore repeat-headers (and would also catch a
-                // future VAAPI swap whose behaviour differs); this
-                // flag is defense-in-depth so the byte stream is
-                // already correct at the source for libx264.
-                "-x264-params",
-                "repeat-headers=1",
-                // Output: raw H264 Annex-B to stdout
-                "-f",
-                "h264",
-                "pipe:1",
-            ])
+            .args(x264_ffmpeg_args(width, height, bitrate_kbps))
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::piped())
@@ -320,26 +325,13 @@ impl FfmpegH264Encoder {
     /// the cached SPS/PPS values + the first-IDR-without-cache warning,
     /// so each call site has one short helper instead of duplicating the
     /// glue.
-    fn flush_pending_packet(
-        &mut self,
-        duration_ms: u64,
-        out: &mut Vec<EncodedPacket>,
-    ) {
+    fn flush_pending_packet(&mut self, duration_ms: u64, out: &mut Vec<EncodedPacket>) {
         if self.pending_frame_nals.is_empty() {
             return;
         }
-        let has_idr = self
-            .pending_frame_nals
-            .iter()
-            .any(|n| n.nal_type == 5);
-        let has_sps_in_au = self
-            .pending_frame_nals
-            .iter()
-            .any(|n| n.nal_type == 7);
-        let has_pps_in_au = self
-            .pending_frame_nals
-            .iter()
-            .any(|n| n.nal_type == 8);
+        let has_idr = self.pending_frame_nals.iter().any(|n| n.nal_type == 5);
+        let has_sps_in_au = self.pending_frame_nals.iter().any(|n| n.nal_type == 7);
+        let has_pps_in_au = self.pending_frame_nals.iter().any(|n| n.nal_type == 8);
         // Warn at most once per encoder if we ever see a bare IDR before
         // libx264 has shipped its first complete IDR. In practice this
         // never fires on a well-behaved libx264 stdin pipe, but if a
@@ -442,10 +434,7 @@ impl FfmpegH264Encoder {
         // sets are not duplicated.
         let mut params_inserted = false;
         for nal in nals {
-            if !params_inserted
-                && nal.nal_type == 5
-                && (prepend_sps || prepend_pps)
-            {
+            if !params_inserted && nal.nal_type == 5 && (prepend_sps || prepend_pps) {
                 if prepend_sps {
                     data.extend_from_slice(&[0x00, 0x00, 0x00, 0x01]);
                     data.extend_from_slice(cached_sps.unwrap());
@@ -481,8 +470,9 @@ impl Encoder for FfmpegH264Encoder {
     ) -> Result<Vec<EncodedPacket>, String> {
         // NOTE: `force_keyframe` cannot be honored on a long-running ffmpeg
         // stdin pipe -- there is no way to inject per-frame "emit IDR now"
-        // metadata through rawvideo.  We rely on the short GOP (`-g 30`)
-        // configured at spawn time to bound how long a fresh peer waits.
+        // metadata through rawvideo.  We rely on the finite GOP
+        // (`-g GOP_PERIOD_FRAMES`) configured at spawn time to bound how
+        // long a fresh or desynced decoder waits for a clean IDR.
         if i420.len() < self.frame_size {
             return Err(format!(
                 "I420 buffer too small: {} < {}",
@@ -493,17 +483,11 @@ impl Encoder for FfmpegH264Encoder {
 
         // Write the I420 frame to ffmpeg stdin.
         {
-            let stdin = self
-                .child
-                .stdin
-                .as_mut()
-                .ok_or("ffmpeg stdin closed")?;
+            let stdin = self.child.stdin.as_mut().ok_or("ffmpeg stdin closed")?;
             stdin
                 .write_all(&i420[..self.frame_size])
                 .map_err(|e| format!("write to ffmpeg: {e}"))?;
-            stdin
-                .flush()
-                .map_err(|e| format!("flush ffmpeg: {e}"))?;
+            stdin.flush().map_err(|e| format!("flush ffmpeg: {e}"))?;
         }
 
         // Assign pts to THIS input frame. The NALs that come out may
@@ -590,6 +574,232 @@ impl Drop for FfmpegH264Encoder {
     }
 }
 
+/// GOP length in frames (the `-g` interval) for all three H.264 arms.
+///
+/// A finite, bounded GOP guarantees a desynced decoder a real IDR within
+/// `GOP_PERIOD_FRAMES` frames. At the 30 fps feed rate, 60 frames is a
+/// keyframe every ~2 s — short enough that a fresh peer or a
+/// post-loss-burst decoder recovers promptly, long enough that periodic
+/// IDRs don't dominate the bitrate. Combined with the quarter-resolution
+/// + capped-bitrate federated layer (`encode/pool.rs`), each such IDR is
+/// only a handful of RTP packets, so it survives the lossy relay it has
+/// to cross. Replaces the earlier intra-refresh experiment, which left a
+/// desynced decoder with no clean recovery point (Linux ffmpeg ignores
+/// PLI on a long-lived stdin pipe — see the module docs).
+const GOP_PERIOD_FRAMES: &str = "60";
+
+/// Probe whether this ffmpeg build includes the `h264_nvenc` encoder.
+///
+/// Cheap (`ffmpeg -encoders`, no GPU touched) and run before the first
+/// `spawn_nvenc` so the common no-NVIDIA host skips a subprocess spawn +
+/// 100 ms detection sleep. A *present* encoder on a GPU-less host still
+/// passes this probe but then exits immediately on spawn, which
+/// [`FfmpegH264Encoder::from_child`] catches — so this is an optimization,
+/// not the correctness gate.
+fn nvenc_encoder_available() -> bool {
+    let out = Command::new("ffmpeg")
+        .args(["-hide_banner", "-encoders"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .output();
+    match out {
+        Ok(o) => {
+            let listing = String::from_utf8_lossy(&o.stdout);
+            listing.contains("h264_nvenc")
+        }
+        Err(_) => false,
+    }
+}
+
+/// ffmpeg argument vector for the software libx264 encoder.
+///
+/// **Loss-resilience.** `-g GOP_PERIOD_FRAMES` gives a finite, bounded GOP
+/// so a desynced decoder gets a real IDR within ~2 s (the federated layer
+/// is quarter-res + bitrate-capped upstream, so that IDR is only a handful
+/// of RTP packets and survives the lossy relay). `slice-max-size=1200`
+/// keeps each slice small enough to fit a single ~1200-byte RTP payload,
+/// so a lost packet costs one slice, not a frame, and composes with the
+/// reduced resolution. `ref=1` + `bframes=0` pin the closed-GOP, single-
+/// reference shape (`ultrafast`/`zerolatency` already imply no B-frames;
+/// the explicit values keep the GOP closed so each IDR is a clean,
+/// self-contained recovery point).
+///
+/// `repeat-headers=1` keeps SPS/PPS in-band (defense-in-depth alongside the
+/// `build_packet` daemon-side prepend, which guarantees SPS/PPS precede
+/// every periodic IDR even if libx264 omits them on the long-lived pipe).
+/// Input stays `rawvideo`/`yuv420p`; output is Constrained-Baseline Annex-B.
+fn x264_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        // Input: raw I420 from stdin
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        "yuv420p",
+        "-video_size",
+        &format!("{width}x{height}"),
+        "-framerate",
+        "30",
+        "-i",
+        "pipe:0",
+        // Software encode
+        "-c:v",
+        "libx264",
+        "-b:v",
+        &format!("{bitrate_kbps}k"),
+        "-profile:v",
+        "baseline",
+        "-preset",
+        "ultrafast",
+        "-tune",
+        "zerolatency",
+        "-g",
+        GOP_PERIOD_FRAMES,
+        "-bf",
+        "0",
+        // Finite GOP (above) + small slices for loss-resilience, plus
+        // in-band parameter sets. `slice-max-size=1200` caps each NAL to a
+        // single ~MTU RTP payload; `ref=1` + `bframes=0` pin a closed,
+        // single-reference GOP so each periodic IDR is a clean recovery
+        // point. See fn doc.
+        "-x264-params",
+        "slice-max-size=1200:ref=1:bframes=0:repeat-headers=1",
+        // Output: raw H264 Annex-B to stdout
+        "-f",
+        "h264",
+        "pipe:1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// ffmpeg argument vector for the NVIDIA `h264_nvenc` hardware encoder.
+///
+/// Mirrors [`vaapi_ffmpeg_args`] / [`x264_ffmpeg_args`] but for NVENC.
+/// Critically, the input stays `rawvideo`/`yuv420p` with **no**
+/// `format=nv12,hwupload` filter: NVENC ingests host I420 directly (the
+/// `hwupload` dance is VA-API-only — applying it here would fail or force
+/// an unnecessary CUDA frames context). `-preset p1 -tune ll -zerolatency
+/// 1` is the low-latency NVENC config; `-rc cbr` with matched `b:v`/
+/// `maxrate` and a half-`bufsize` gives a steady stream. `-profile:v
+/// baseline` produces a Constrained-Baseline Annex-B stream that matches
+/// the existing SPS/PPS-prepend + NAL-reader expectations exactly.
+///
+/// **Loss-resilience:** `-g GOP_PERIOD_FRAMES` gives a finite, bounded GOP
+/// so NVENC emits a periodic IDR every ~2 s — a real recovery point for a
+/// desynced decoder. Loss-survivability comes from the upstream
+/// quarter-resolution + capped-bitrate federated layer (`encode/pool.rs`),
+/// which keeps that IDR small enough to reassemble on the lossy relay. An
+/// earlier iteration pinned an effectively-infinite GOP + `-intra-refresh
+/// 1` (plus `-no-scenecut 1` / `-forced-idr 0`) to suppress all post-seed
+/// IDRs, but that left a desynced decoder with no clean recovery point
+/// (NVENC ignores PLI on this long-lived stdin pipe just as libx264 does),
+/// so the finite GOP is restored here.
+fn nvenc_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        // Input: raw I420 from stdin (NVENC ingests I420 directly — no
+        // nv12/hwupload, that's the VA-API path).
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        "yuv420p",
+        "-video_size",
+        &format!("{width}x{height}"),
+        "-framerate",
+        "30",
+        "-i",
+        "pipe:0",
+        // NVENC hardware encode, low-latency config.
+        "-c:v",
+        "h264_nvenc",
+        "-preset",
+        "p1",
+        "-tune",
+        "ll",
+        "-zerolatency",
+        "1",
+        "-rc",
+        "cbr",
+        "-b:v",
+        &format!("{bitrate_kbps}k"),
+        "-maxrate",
+        &format!("{bitrate_kbps}k"),
+        "-bufsize",
+        &format!("{}k", bitrate_kbps / 2),
+        "-profile:v",
+        "baseline",
+        // Finite, bounded GOP: a periodic IDR every GOP_PERIOD_FRAMES so a
+        // desynced decoder gets a real recovery point (the federated layer
+        // is quarter-res + bitrate-capped upstream, keeping that IDR small
+        // on the wire). See fn doc + GOP_PERIOD_FRAMES.
+        "-g",
+        GOP_PERIOD_FRAMES,
+        "-bf",
+        "0",
+        // Output: raw H264 Annex-B to stdout
+        "-f",
+        "h264",
+        "pipe:1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
+/// ffmpeg argument vector for the VA-API `h264_vaapi` hardware encoder.
+///
+/// Unchanged from the original inline args (periodic-IDR `-g`), extracted to
+/// a pure builder for symmetry + testability. VA-API uniquely needs
+/// `-vaapi_device` + the `format=nv12,hwupload` filter to move frames onto
+/// the GPU; that filter is intentionally absent from the NVENC/x264 paths.
+fn vaapi_ffmpeg_args(width: u32, height: u32, bitrate_kbps: u32) -> Vec<String> {
+    [
+        "-hide_banner",
+        "-loglevel",
+        "error",
+        // Input: raw I420 from stdin
+        "-f",
+        "rawvideo",
+        "-pixel_format",
+        "yuv420p",
+        "-video_size",
+        &format!("{width}x{height}"),
+        "-framerate",
+        "30",
+        "-i",
+        "pipe:0",
+        // VA-API device
+        "-vaapi_device",
+        "/dev/dri/renderD128",
+        // Upload to GPU + encode
+        "-vf",
+        "format=nv12,hwupload",
+        "-c:v",
+        "h264_vaapi",
+        "-b:v",
+        &format!("{bitrate_kbps}k"),
+        "-profile:v",
+        "constrained_baseline",
+        "-g",
+        "30", // keyframe every 1s at 30fps feed rate
+        "-bf",
+        "0", // no B-frames
+        // Output: raw H264 Annex-B to stdout
+        "-f",
+        "h264",
+        "pipe:1",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
+}
+
 /// Dedicated reader thread for ffmpeg stdout.
 ///
 /// Reads the Annex-B H264 byte stream in blocking mode, splits on start
@@ -608,7 +818,7 @@ fn nal_reader_thread(
 
     loop {
         let n = match stdout.read(&mut tmp) {
-            Ok(0) => break,        // EOF
+            Ok(0) => break, // EOF
             Ok(n) => n,
             Err(ref e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(_) => break,
@@ -648,7 +858,13 @@ fn nal_reader_thread(
 
                     if !nal_data.is_empty() {
                         let nal_type = nal_data[0] & 0x1F;
-                        if nal_tx.send(Nal { data: nal_data, nal_type }).is_err() {
+                        if nal_tx
+                            .send(Nal {
+                                data: nal_data,
+                                nal_type,
+                            })
+                            .is_err()
+                        {
                             return; // receiver dropped
                         }
                     }
@@ -667,7 +883,10 @@ fn nal_reader_thread(
         let nal_data: Vec<u8> = buf[first.sc_len..].to_vec();
         if !nal_data.is_empty() {
             let nal_type = nal_data[0] & 0x1F;
-            let _ = nal_tx.send(Nal { data: nal_data, nal_type });
+            let _ = nal_tx.send(Nal {
+                data: nal_data,
+                nal_type,
+            });
         }
     }
 }
@@ -688,10 +907,16 @@ fn find_start_code(buf: &[u8], from: usize) -> Option<StartCode> {
     while i + 2 < buf.len() {
         if buf[i] == 0 && buf[i + 1] == 0 {
             if i + 3 < buf.len() && buf[i + 2] == 0 && buf[i + 3] == 1 {
-                return Some(StartCode { offset: i, sc_len: 4 });
+                return Some(StartCode {
+                    offset: i,
+                    sc_len: 4,
+                });
             }
             if buf[i + 2] == 1 {
-                return Some(StartCode { offset: i, sc_len: 3 });
+                return Some(StartCode {
+                    offset: i,
+                    sc_len: 3,
+                });
             }
         }
         i += 1;
@@ -771,8 +996,7 @@ mod tests {
     #[test]
     fn find_start_code_with_offset() {
         let buf = [
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A,
-            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
         ];
         // Skip past the first start code body.
         let sc = find_start_code(&buf, 4).unwrap();
@@ -792,7 +1016,7 @@ mod tests {
         let stream = vec![
             0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, // SPS (type 7)
             0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80, // PPS (type 8)
-            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,       // IDR (type 5)
+            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB, // IDR (type 5)
         ];
 
         let (nal_tx, nal_rx) = std::sync::mpsc::sync_channel::<Nal>(64);
@@ -807,9 +1031,8 @@ mod tests {
         // Since we can't easily fake a ChildStdout, test the parsing
         // indirectly through find_start_code + the extraction logic.
         let buf = vec![
-            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A,
-            0x00, 0x00, 0x00, 0x01, 0x68, 0xCE, 0x38, 0x80,
-            0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,
+            0x00, 0x00, 0x00, 0x01, 0x67, 0x42, 0x00, 0x0A, 0x00, 0x00, 0x00, 0x01, 0x68, 0xCE,
+            0x38, 0x80, 0x00, 0x00, 0x00, 0x01, 0x65, 0xAA, 0xBB,
         ];
 
         // Extract NALs the same way the reader thread does.
@@ -846,12 +1069,12 @@ mod tests {
     #[test]
     fn nal_type_classification() {
         // Verify NAL type extraction from first byte.
-        assert_eq!(0x67 & 0x1F, 7);  // SPS
-        assert_eq!(0x68 & 0x1F, 8);  // PPS
-        assert_eq!(0x06 & 0x1F, 6);  // SEI
-        assert_eq!(0x65 & 0x1F, 5);  // IDR slice
-        assert_eq!(0x41 & 0x1F, 1);  // non-IDR slice
-        assert_eq!(0x61 & 0x1F, 1);  // non-IDR slice (different NRI)
+        assert_eq!(0x67 & 0x1F, 7); // SPS
+        assert_eq!(0x68 & 0x1F, 8); // PPS
+        assert_eq!(0x06 & 0x1F, 6); // SEI
+        assert_eq!(0x65 & 0x1F, 5); // IDR slice
+        assert_eq!(0x41 & 0x1F, 1); // non-IDR slice
+        assert_eq!(0x61 & 0x1F, 1); // non-IDR slice (different NRI)
     }
 
     #[test]
@@ -901,11 +1124,17 @@ mod tests {
     #[test]
     fn is_first_slice_detection() {
         // first_mb = 0 → first slice of frame
-        let first = Nal { data: vec![0x65, 0x80], nal_type: 5 };
+        let first = Nal {
+            data: vec![0x65, 0x80],
+            nal_type: 5,
+        };
         assert!(FfmpegH264Encoder::is_first_slice(&first));
 
         // first_mb = 1 → continuation slice
-        let cont = Nal { data: vec![0x41, 0x40], nal_type: 1 };
+        let cont = Nal {
+            data: vec![0x41, 0x40],
+            nal_type: 1,
+        };
         assert!(!FfmpegH264Encoder::is_first_slice(&cont));
     }
 
@@ -927,9 +1156,18 @@ mod tests {
         let pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
         let nals = vec![
-            Nal { data: sps.clone(), nal_type: 7 },
-            Nal { data: pps.clone(), nal_type: 8 },
-            Nal { data: idr.clone(), nal_type: 5 },
+            Nal {
+                data: sps.clone(),
+                nal_type: 7,
+            },
+            Nal {
+                data: pps.clone(),
+                nal_type: 8,
+            },
+            Nal {
+                data: idr.clone(),
+                nal_type: 5,
+            },
         ];
 
         // Cache populated case (the realistic path: cache was filled by
@@ -973,7 +1211,10 @@ mod tests {
         let cached_sps = vec![0x67, 0x42, 0x00, 0x0A];
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
-        let nals = vec![Nal { data: idr.clone(), nal_type: 5 }];
+        let nals = vec![Nal {
+            data: idr.clone(),
+            nal_type: 5,
+        }];
 
         let pkt = FfmpegH264Encoder::build_packet(
             &nals,
@@ -1003,13 +1244,19 @@ mod tests {
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
         let nals = vec![
-            Nal { data: sps.clone(), nal_type: 7 },
-            Nal { data: idr.clone(), nal_type: 5 },
+            Nal {
+                data: sps.clone(),
+                nal_type: 7,
+            },
+            Nal {
+                data: idr.clone(),
+                nal_type: 5,
+            },
         ];
 
         let pkt = FfmpegH264Encoder::build_packet(
             &nals,
-            Some(&sps),       // cache also has SPS, but it's already in AU
+            Some(&sps), // cache also has SPS, but it's already in AU
             Some(&cached_pps),
             33,
             33,
@@ -1029,7 +1276,11 @@ mod tests {
             "AU with SPS but no PPS must get only PPS prepended"
         );
         // Sanity: SPS appears exactly once in the output bytes.
-        let sps_count = pkt.data.windows(sps.len()).filter(|w| *w == sps.as_slice()).count();
+        let sps_count = pkt
+            .data
+            .windows(sps.len())
+            .filter(|w| *w == sps.as_slice())
+            .count();
         assert_eq!(sps_count, 1, "SPS must not be duplicated");
     }
 
@@ -1044,8 +1295,14 @@ mod tests {
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let idr = vec![0x65, 0xAA, 0xBB];
         let nals = vec![
-            Nal { data: aud.clone(), nal_type: 9 },
-            Nal { data: idr.clone(), nal_type: 5 },
+            Nal {
+                data: aud.clone(),
+                nal_type: 9,
+            },
+            Nal {
+                data: idr.clone(),
+                nal_type: 5,
+            },
         ];
 
         let pkt = FfmpegH264Encoder::build_packet(
@@ -1063,7 +1320,10 @@ mod tests {
         want.extend_from_slice(&annexb(&cached_sps));
         want.extend_from_slice(&annexb(&cached_pps));
         want.extend_from_slice(&annexb(&idr));
-        assert_eq!(pkt.data, want, "AUD must precede the cached SPS/PPS prepend");
+        assert_eq!(
+            pkt.data, want,
+            "AUD must precede the cached SPS/PPS prepend"
+        );
     }
 
     #[test]
@@ -1074,7 +1334,10 @@ mod tests {
         let cached_sps = vec![0x67, 0x42, 0x00, 0x0A];
         let cached_pps = vec![0x68, 0xCE, 0x38, 0x80];
         let nidr = vec![0x41, 0x9A];
-        let nals = vec![Nal { data: nidr.clone(), nal_type: 1 }];
+        let nals = vec![Nal {
+            data: nidr.clone(),
+            nal_type: 1,
+        }];
 
         let pkt = FfmpegH264Encoder::build_packet(
             &nals,
@@ -1090,6 +1353,186 @@ mod tests {
             pkt.data,
             annexb(&nidr),
             "P-frame must not have parameter sets prepended"
+        );
+    }
+
+    /// True if `flag` appears in `args` immediately followed by `value`.
+    /// Models ffmpeg's `-flag value` arg pairing so a test can assert a
+    /// specific option value, not just the flag's presence.
+    fn has_flag_value(args: &[String], flag: &str, value: &str) -> bool {
+        args.windows(2).any(|w| w[0] == flag && w[1] == value)
+    }
+
+    fn has_arg(args: &[String], arg: &str) -> bool {
+        args.iter().any(|a| a == arg)
+    }
+
+    #[test]
+    fn x264_args_use_finite_gop_and_small_slices() {
+        let args = x264_ffmpeg_args(1280, 720, 2000);
+        // Codec + baseline profile + zerolatency tune preserved.
+        assert!(has_flag_value(&args, "-c:v", "libx264"));
+        assert!(has_flag_value(&args, "-profile:v", "baseline"));
+        assert!(has_flag_value(&args, "-tune", "zerolatency"));
+        // B-frames off.
+        assert!(has_flag_value(&args, "-bf", "0"));
+        // -g is a finite, bounded GOP (periodic IDR for recoverability),
+        // not an intra-refresh / infinite period.
+        assert!(has_flag_value(&args, "-g", GOP_PERIOD_FRAMES));
+        // The x264-params string keeps small slices + closed-GOP pin +
+        // in-band headers, but NO intra-refresh (periodic IDRs restored).
+        let params_idx = args
+            .iter()
+            .position(|a| a == "-x264-params")
+            .expect("-x264-params present");
+        let params = &args[params_idx + 1];
+        assert!(
+            !params.contains("intra-refresh"),
+            "intra-refresh must be gone (periodic IDR restored): {params}"
+        );
+        assert!(params.contains("slice-max-size=1200"), "params: {params}");
+        assert!(params.contains("ref=1"), "params: {params}");
+        assert!(params.contains("bframes=0"), "params: {params}");
+        assert!(params.contains("repeat-headers=1"), "params: {params}");
+        // Input stays rawvideo/yuv420p; no nv12/hwupload on the x264 path.
+        assert!(has_flag_value(&args, "-pixel_format", "yuv420p"));
+        assert!(
+            !args.iter().any(|a| a.contains("hwupload")),
+            "x264 path must not hwupload"
+        );
+    }
+
+    #[test]
+    fn nvenc_args_use_finite_gop_and_baseline() {
+        let args = nvenc_ffmpeg_args(1920, 1080, 4000);
+        // NVENC codec + low-latency preset/tune.
+        assert!(has_flag_value(&args, "-c:v", "h264_nvenc"));
+        assert!(has_flag_value(&args, "-preset", "p1"));
+        assert!(has_flag_value(&args, "-tune", "ll"));
+        assert!(has_flag_value(&args, "-zerolatency", "1"));
+        // CBR rate control with matched bitrate/maxrate and half bufsize.
+        assert!(has_flag_value(&args, "-rc", "cbr"));
+        assert!(has_flag_value(&args, "-b:v", "4000k"));
+        assert!(has_flag_value(&args, "-maxrate", "4000k"));
+        assert!(has_flag_value(&args, "-bufsize", "2000k"));
+        // Constrained-Baseline Annex-B, no B-frames.
+        assert!(has_flag_value(&args, "-profile:v", "baseline"));
+        assert!(has_flag_value(&args, "-bf", "0"));
+        assert!(has_flag_value(&args, "-f", "h264"));
+        // Finite, bounded GOP (periodic IDR for recoverability) — the
+        // intra-refresh + infinite-GOP + no-scenecut/forced-idr config is
+        // gone.
+        assert!(has_flag_value(&args, "-g", GOP_PERIOD_FRAMES));
+        assert!(
+            !has_arg(&args, "-intra-refresh"),
+            "intra-refresh must be gone (periodic IDR restored): {args:?}"
+        );
+        assert!(
+            !has_arg(&args, "-no-scenecut"),
+            "no-scenecut must be gone: {args:?}"
+        );
+        assert!(
+            !has_arg(&args, "-forced-idr"),
+            "forced-idr must be gone: {args:?}"
+        );
+        // NVENC ingests I420 directly: rawvideo/yuv420p input and NO
+        // VA-API-only nv12/hwupload filter.
+        assert!(has_flag_value(&args, "-f", "rawvideo"));
+        assert!(has_flag_value(&args, "-pixel_format", "yuv420p"));
+        assert!(
+            !args.iter().any(|a| a.contains("hwupload")),
+            "NVENC must not hwupload (that's VA-API only): {args:?}"
+        );
+        assert!(
+            !has_arg(&args, "-vaapi_device"),
+            "NVENC must not set -vaapi_device"
+        );
+    }
+
+    #[test]
+    fn vaapi_args_keep_hwupload_and_periodic_idr() {
+        // Regression guard: the VA-API path is the ONE path that still
+        // needs nv12/hwupload + a vaapi device, and it keeps the periodic
+        // -g (no intra-refresh flag on the VA-API arm).
+        let args = vaapi_ffmpeg_args(1280, 720, 2000);
+        assert!(has_flag_value(&args, "-c:v", "h264_vaapi"));
+        assert!(has_flag_value(
+            &args,
+            "-vaapi_device",
+            "/dev/dri/renderD128"
+        ));
+        assert!(has_flag_value(&args, "-vf", "format=nv12,hwupload"));
+        assert!(has_flag_value(&args, "-profile:v", "constrained_baseline"));
+    }
+
+    /// End-to-end periodic-IDR check against the *real* encoder selected by
+    /// `FfmpegH264Encoder::new` (nvenc → vaapi → libx264). Feeds ~150 frames
+    /// of synthetic, slowly-changing I420 and asserts the emitted packets
+    /// contain the seed IDR at frame 0 PLUS at least one further IDR within
+    /// the GOP cadence — i.e. the finite GOP is actually producing the
+    /// periodic recovery keyframes a desynced decoder relies on, on
+    /// whichever encoder this host uses.
+    ///
+    /// `#[ignore]` because it spawns ffmpeg and needs a working H.264
+    /// encoder; run explicitly on a build box:
+    ///   `cargo test --release periodic_idr_real_encoder -- --ignored --nocapture`
+    #[test]
+    #[ignore]
+    fn periodic_idr_real_encoder_emits_recurring_idrs() {
+        let (w, h, kbps) = (640u32, 480u32, 2000u32);
+        let mut enc = match FfmpegH264Encoder::new(w, h, kbps) {
+            Ok(e) => e,
+            Err(e) => panic!("no H.264 encoder available on this host: {e}"),
+        };
+        let uv_w = ((w + 1) / 2) as usize;
+        let uv_h = ((h + 1) / 2) as usize;
+        let frame_size = (w as usize * h as usize) + 2 * (uv_w * uv_h);
+
+        let mut keyframes = 0usize;
+        let mut frames_emitted = 0usize;
+        let mut first_keyframe_at: Option<usize> = None;
+        let mut last_keyframe_at: Option<usize> = None;
+        // Feed more than 2× the GOP so we observe at least a second IDR.
+        let total_frames = 150usize;
+        for i in 0..total_frames {
+            // Slowly varying luma so the encoder has real content (a flat
+            // frame can be coded as skip and never exercise the GOP).
+            let mut buf = vec![0u8; frame_size];
+            let luma = w as usize * h as usize;
+            let v = (i * 3) as u8;
+            for (j, b) in buf[..luma].iter_mut().enumerate() {
+                *b = v.wrapping_add((j % 251) as u8);
+            }
+            for b in buf[luma..].iter_mut() {
+                *b = 128;
+            }
+            let pkts = enc.encode(&buf, 33, false).expect("encode frame");
+            for p in pkts {
+                frames_emitted += 1;
+                if p.is_keyframe {
+                    keyframes += 1;
+                    first_keyframe_at.get_or_insert(frames_emitted - 1);
+                    last_keyframe_at = Some(frames_emitted - 1);
+                }
+            }
+        }
+        // Drop the encoder to flush; one or two trailing frames may remain
+        // in ffmpeg's pipeline and are not required for the assertion.
+        eprintln!(
+            "[periodic_idr_real_encoder] emitted {frames_emitted} frames, \
+             {keyframes} keyframe(s), first@{first_keyframe_at:?} last@{last_keyframe_at:?}",
+        );
+        assert_eq!(
+            first_keyframe_at,
+            Some(0),
+            "the seed keyframe must be the very first emitted frame"
+        );
+        assert!(
+            keyframes >= 2,
+            "finite GOP must emit recurring IDRs — got only {keyframes} \
+             keyframe(s) over {frames_emitted} frames, which means periodic \
+             IDRs are NOT being produced (a desynced decoder would never \
+             recover)"
         );
     }
 }

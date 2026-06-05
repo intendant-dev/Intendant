@@ -111,6 +111,10 @@ export class PresenceWeb {
      */
     revoke_user_display_with_id(display_id: number): void;
     /**
+     * Select the session whose scoped events should update global UI state.
+     */
+    select_session(session_id: string): any;
+    /**
      * Approve/skip/deny/approve_all a pending action.
      * Returns `UiCommand[]` for UI updates. Sends the action to the server.
      */
@@ -146,10 +150,6 @@ export class PresenceWeb {
     send_interrupt(): any;
     send_key(key: string, ctrl: boolean, alt: boolean, shift: boolean): void;
     /**
-     * Send live model usage to the server for tracking/broadcast.
-     */
-    send_live_usage(input: bigint, output: bigint, cached: bigint, total: bigint, thinking: bigint): void;
-    /**
      * Request to become the active voice owner (triggers handover from current active).
      */
     send_make_active(): boolean;
@@ -168,8 +168,9 @@ export class PresenceWeb {
     /**
      * Inject a user message into the currently running turn. Sends
      * ControlMsg::Steer via the WebSocket with a client-generated id so
-     * the backend can echo it back on SteerRequested/SteerQueued/
-     * SteerDelivered events and the UI can correlate delivery state.
+     * the backend can echo it back on SteerRequested/SteerAccepted/
+     * SteerQueued/SteerDelivered events and the UI can correlate
+     * delivery state.
      *
      * Returns the generated id as a JsValue string so the caller can
      * attach it to the pending-steer row in the activity log.
@@ -237,6 +238,8 @@ export class PresenceWeb {
     set_on_session_changed(f: Function): void;
     set_on_state_snapshot(f: Function): void;
     set_on_term(f: Function): void;
+    set_on_terminal_exited(f: Function): void;
+    set_on_terminal_output(f: Function): void;
     set_on_tool_response(f: Function): void;
     set_on_voice_audio(f: Function): void;
     set_on_voice_interrupted(f: Function): void;
@@ -359,6 +362,7 @@ export interface InitOutput {
     readonly presenceweb_request_display_input_authority: (a: number, b: number) => void;
     readonly presenceweb_revoke_user_display: (a: number) => void;
     readonly presenceweb_revoke_user_display_with_id: (a: number, b: number) => void;
+    readonly presenceweb_select_session: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_approval: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_audio: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_follow_up: (a: number, b: number, c: number, d: number) => any;
@@ -367,7 +371,6 @@ export interface InitOutput {
     readonly presenceweb_send_human_response: (a: number, b: number, c: number) => any;
     readonly presenceweb_send_interrupt: (a: number) => any;
     readonly presenceweb_send_key: (a: number, b: number, c: number, d: number, e: number, f: number) => void;
-    readonly presenceweb_send_live_usage: (a: number, b: bigint, c: bigint, d: bigint, e: bigint, f: bigint) => void;
     readonly presenceweb_send_make_active: (a: number) => number;
     readonly presenceweb_send_presence_checkpoint: (a: number, b: number, c: number) => void;
     readonly presenceweb_send_raw: (a: number, b: number, c: number) => number;
@@ -398,6 +401,8 @@ export interface InitOutput {
     readonly presenceweb_set_on_session_changed: (a: number, b: any) => void;
     readonly presenceweb_set_on_state_snapshot: (a: number, b: any) => void;
     readonly presenceweb_set_on_term: (a: number, b: any) => void;
+    readonly presenceweb_set_on_terminal_exited: (a: number, b: any) => void;
+    readonly presenceweb_set_on_terminal_output: (a: number, b: any) => void;
     readonly presenceweb_set_on_tool_response: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_audio: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_interrupted: (a: number, b: any) => void;
@@ -421,9 +426,9 @@ export interface InitOutput {
     readonly wasmpresence_phase: (a: number) => [number, number];
     readonly wasmpresence_set_state: (a: number, b: any) => void;
     readonly wasmpresence_update_from_event: (a: number, b: any) => any;
-    readonly wasm_bindgen__closure__destroy__h4473cb2a2a923a88: (a: number, b: number) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7: (a: number, b: number, c: any) => void;
-    readonly wasm_bindgen__convert__closures_____invoke__h5974ec181d3c6728: (a: number, b: number) => void;
+    readonly wasm_bindgen__closure__destroy__h432d6732f953cd2d: (a: number, b: number) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__h3b3b2f13817d2e95: (a: number, b: number, c: any) => void;
+    readonly wasm_bindgen__convert__closures_____invoke__hfa31da72a2e78277: (a: number, b: number) => void;
     readonly __wbindgen_malloc: (a: number, b: number) => number;
     readonly __wbindgen_realloc: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_exn_store: (a: number) => void;

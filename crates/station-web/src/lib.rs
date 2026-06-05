@@ -7,11 +7,13 @@ use bytemuck::{Pod, Zeroable};
 use serde::Deserialize;
 use wasm_bindgen::prelude::*;
 use wasm_bindgen::JsCast;
+#[cfg(target_arch = "wasm32")]
 use wasm_bindgen_futures::spawn_local;
 use web_sys::{
     CanvasRenderingContext2d, DeviceOrientationEvent, Event, HtmlCanvasElement, HtmlVideoElement,
     KeyboardEvent, PointerEvent, WheelEvent,
 };
+#[cfg(target_arch = "wasm32")]
 use wgpu::util::DeviceExt;
 
 #[wasm_bindgen]
@@ -22,7 +24,10 @@ pub struct StationWeb {
 #[wasm_bindgen]
 impl StationWeb {
     #[wasm_bindgen(constructor)]
-    pub fn new(scene_canvas: HtmlCanvasElement, hud_canvas: HtmlCanvasElement) -> Result<StationWeb, JsValue> {
+    pub fn new(
+        scene_canvas: HtmlCanvasElement,
+        hud_canvas: HtmlCanvasElement,
+    ) -> Result<StationWeb, JsValue> {
         console_error_panic_hook::set_once();
         let ctx = hud_canvas
             .get_context("2d")?
@@ -32,7 +37,12 @@ impl StationWeb {
             .get_context("2d")?
             .and_then(|ctx| ctx.dyn_into::<CanvasRenderingContext2d>().ok());
 
-        let inner = Rc::new(RefCell::new(StationInner::new(scene_canvas, hud_canvas, ctx, scene_ctx)));
+        let inner = Rc::new(RefCell::new(StationInner::new(
+            scene_canvas,
+            hud_canvas,
+            ctx,
+            scene_ctx,
+        )));
         StationInner::install_events(inner.clone())?;
         StationInner::start_gpu(inner.clone());
         StationInner::start_loop(inner.clone());
@@ -225,7 +235,9 @@ impl StationInner {
 
         let down_inner = inner.clone();
         let down = Closure::wrap(Box::new(move |event: Event| {
-            let Some(e) = event.dyn_ref::<PointerEvent>() else { return; };
+            let Some(e) = event.dyn_ref::<PointerEvent>() else {
+                return;
+            };
             e.prevent_default();
             let mut s = down_inner.borrow_mut();
             s.mark_input();
@@ -263,7 +275,9 @@ impl StationInner {
 
         let move_inner = inner.clone();
         let mv = Closure::wrap(Box::new(move |event: Event| {
-            let Some(e) = event.dyn_ref::<PointerEvent>() else { return; };
+            let Some(e) = event.dyn_ref::<PointerEvent>() else {
+                return;
+            };
             let mut s = move_inner.borrow_mut();
             let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
             if let Some(kind) = s.drag_slider {
@@ -291,7 +305,9 @@ impl StationInner {
 
         let up_inner = inner.clone();
         let up = Closure::wrap(Box::new(move |event: Event| {
-            let Some(e) = event.dyn_ref::<PointerEvent>() else { return; };
+            let Some(e) = event.dyn_ref::<PointerEvent>() else {
+                return;
+            };
             e.prevent_default();
             let mut s = up_inner.borrow_mut();
             let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
@@ -313,7 +329,9 @@ impl StationInner {
 
         let wheel_inner = inner.clone();
         let wheel = Closure::wrap(Box::new(move |event: Event| {
-            let Some(e) = event.dyn_ref::<WheelEvent>() else { return; };
+            let Some(e) = event.dyn_ref::<WheelEvent>() else {
+                return;
+            };
             e.prevent_default();
             let mut s = wheel_inner.borrow_mut();
             s.mark_input();
@@ -328,7 +346,9 @@ impl StationInner {
 
         let key_inner = inner.clone();
         let key = Closure::wrap(Box::new(move |event: Event| {
-            let Some(e) = event.dyn_ref::<KeyboardEvent>() else { return; };
+            let Some(e) = event.dyn_ref::<KeyboardEvent>() else {
+                return;
+            };
             let mut s = key_inner.borrow_mut();
             if !s.active {
                 return;
@@ -356,14 +376,19 @@ impl StationInner {
 
         let orientation_inner = inner.clone();
         let orientation = Closure::wrap(Box::new(move |event: Event| {
-            let Some(e) = event.dyn_ref::<DeviceOrientationEvent>() else { return; };
+            let Some(e) = event.dyn_ref::<DeviceOrientationEvent>() else {
+                return;
+            };
             let mut s = orientation_inner.borrow_mut();
             let gamma = e.gamma().unwrap_or(0.0) as f32;
             let beta = e.beta().unwrap_or(0.0) as f32;
             s.ar_x = (gamma / 45.0).clamp(-1.0, 1.0);
             s.ar_y = (beta / 60.0).clamp(-1.0, 1.0);
         }) as Box<dyn FnMut(_)>);
-        window.add_event_listener_with_callback("deviceorientation", orientation.as_ref().unchecked_ref())?;
+        window.add_event_listener_with_callback(
+            "deviceorientation",
+            orientation.as_ref().unchecked_ref(),
+        )?;
         inner.borrow_mut()._events.push(orientation);
 
         let resize_inner = inner.clone();
@@ -376,6 +401,7 @@ impl StationInner {
         Ok(())
     }
 
+    #[cfg(target_arch = "wasm32")]
     fn start_gpu(inner: Rc<RefCell<Self>>) {
         let canvas = inner.borrow().scene_canvas.clone();
         spawn_local(async move {
@@ -392,6 +418,9 @@ impl StationInner {
         });
     }
 
+    #[cfg(not(target_arch = "wasm32"))]
+    fn start_gpu(_inner: Rc<RefCell<Self>>) {}
+
     fn start_loop(inner: Rc<RefCell<Self>>) {
         let loop_inner = inner.clone();
         let cb = Closure::wrap(Box::new(move |time_ms: f64| {
@@ -399,9 +428,11 @@ impl StationInner {
                 let mut s = loop_inner.borrow_mut();
                 s.render(time_ms);
             }
-            let next = loop_inner.borrow()._raf.as_ref().map(|cb| {
-                cb.as_ref().unchecked_ref::<js_sys::Function>().clone()
-            });
+            let next = loop_inner
+                .borrow()
+                ._raf
+                .as_ref()
+                .map(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone());
             if let Some(next) = next {
                 if let Some(window) = web_sys::window() {
                     let _ = window.request_animation_frame(&next);
@@ -440,14 +471,22 @@ impl StationInner {
             }
         }
         self.snapshot = snapshot;
-        if self.selected_id.as_ref().is_some_and(|id| !self.node_exists(id)) {
+        if self
+            .selected_id
+            .as_ref()
+            .is_some_and(|id| !self.node_exists(id))
+        {
             self.selected_id = None;
         }
     }
 
     fn node_exists(&self, id: &str) -> bool {
         id == "op"
-            || self.snapshot.hosts.iter().any(|h| format!("host:{}", h.id) == id)
+            || self
+                .snapshot
+                .hosts
+                .iter()
+                .any(|h| format!("host:{}", h.id) == id)
             || self.snapshot.agents.iter().any(|a| a.id == id)
     }
 
@@ -498,7 +537,9 @@ impl StationInner {
         let frame = self.build_frame(time_ms);
         if let Some(gpu) = self.gpu.as_mut() {
             if let Err(err) = gpu.render(&frame) {
-                web_sys::console::warn_1(&JsValue::from_str(&format!("Station GPU render failed: {err:?}")));
+                web_sys::console::warn_1(&JsValue::from_str(&format!(
+                    "Station GPU render failed: {err:?}"
+                )));
             }
         } else {
             self.draw_fallback_scene(&frame);
@@ -538,16 +579,28 @@ impl StationInner {
         }
 
         for agent in &self.snapshot.agents {
-            let Some(a_pos) = layout.get(&agent.id).copied() else { continue; };
+            let Some(a_pos) = layout.get(&agent.id).copied() else {
+                continue;
+            };
             let host_id = format!("host:{}", agent.host_id);
             if let Some(parent_id) = agent.parent_id.as_ref().filter(|p| !p.is_empty()) {
                 if let Some(p_pos) = layout.get(parent_id).copied() {
-                    frame.add_line_projected(&mut project, p_pos, a_pos, role_color(&agent.role).with_alpha(0.54));
+                    frame.add_line_projected(
+                        &mut project,
+                        p_pos,
+                        a_pos,
+                        role_color(&agent.role).with_alpha(0.54),
+                    );
                     continue;
                 }
             }
             if let Some(h_pos) = layout.get(&host_id).copied() {
-                frame.add_line_projected(&mut project, h_pos, a_pos, role_color(&agent.role).with_alpha(0.42));
+                frame.add_line_projected(
+                    &mut project,
+                    h_pos,
+                    a_pos,
+                    role_color(&agent.role).with_alpha(0.42),
+                );
             }
         }
         for host in &self.snapshot.hosts {
@@ -561,10 +614,16 @@ impl StationInner {
         for particle in self.particles.drain(..) {
             let t = ((time_ms - particle.born_ms) as f32 / particle.ttl_ms as f32).clamp(0.0, 1.0);
             if t < 1.0 {
-                let lifted = particle.start.lerp(particle.end, t) + Vec3::new(0.0, (t * PI).sin() * 0.6, 0.0);
+                let lifted = particle.start.lerp(particle.end, t)
+                    + Vec3::new(0.0, (t * PI).sin() * 0.6, 0.0);
                 if let Some(p) = project(lifted) {
                     let size = (0.026 * (1.0 - t) + 0.006) * self.density;
-                    frame.add_quad_ndc(p.x, p.y, size, particle.color.with_alpha(0.88 * (1.0 - t)).into());
+                    frame.add_quad_ndc(
+                        p.x,
+                        p.y,
+                        size,
+                        particle.color.with_alpha(0.88 * (1.0 - t)).into(),
+                    );
                 }
                 live_particles.push(particle);
             }
@@ -579,8 +638,18 @@ impl StationInner {
         for i in -grid..=grid {
             let v = i as f32;
             let alpha = if i == 0 { 0.33 } else { 0.16 };
-            frame.add_line_projected(project, Vec3::new(-9.0, -1.8, v), Vec3::new(9.0, -1.8, v), C_SURFACE0.with_alpha(alpha));
-            frame.add_line_projected(project, Vec3::new(v, -1.8, -9.0), Vec3::new(v, -1.8, 9.0), C_SURFACE0.with_alpha(alpha));
+            frame.add_line_projected(
+                project,
+                Vec3::new(-9.0, -1.8, v),
+                Vec3::new(9.0, -1.8, v),
+                C_SURFACE0.with_alpha(alpha),
+            );
+            frame.add_line_projected(
+                project,
+                Vec3::new(v, -1.8, -9.0),
+                Vec3::new(v, -1.8, 9.0),
+                C_SURFACE0.with_alpha(alpha),
+            );
         }
     }
 
@@ -617,8 +686,21 @@ impl StationInner {
     ) {
         let id = format!("host:{}", host.id);
         let spin = time_ms as f32 * 0.00011 * self.motion + stable_angle(&host.id);
-        frame.add_wire_hex(project, pos, 0.58, 0.28, spin, C_PEACH.with_alpha(if host.connected { 0.9 } else { 0.38 }));
-        frame.add_ring(project, pos + Vec3::new(0.0, -0.17, 0.0), 0.82 + (time_ms as f32 * 0.003).sin() * 0.035, C_PEACH.with_alpha(0.28), Plane::XZ);
+        frame.add_wire_hex(
+            project,
+            pos,
+            0.58,
+            0.28,
+            spin,
+            C_PEACH.with_alpha(if host.connected { 0.9 } else { 0.38 }),
+        );
+        frame.add_ring(
+            project,
+            pos + Vec3::new(0.0, -0.17, 0.0),
+            0.82 + (time_ms as f32 * 0.003).sin() * 0.035,
+            C_PEACH.with_alpha(0.28),
+            Plane::XZ,
+        );
         if let Some(p) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 &id,
@@ -652,14 +734,32 @@ impl StationInner {
         } else {
             0.0
         };
-        let budget = if pct < 0.5 { C_GREEN } else if pct < 0.85 { C_YELLOW } else { C_RED };
+        let budget = if pct < 0.5 {
+            C_GREEN
+        } else if pct < 0.85 {
+            C_YELLOW
+        } else {
+            C_RED
+        };
         frame.add_ring(project, pos, 0.56, budget.with_alpha(0.66), Plane::XY);
         frame.add_ring(project, pos, 0.38, phase.with_alpha(0.2), Plane::YZ);
         if agent.status == "in_progress" || agent.phase == "running" {
-            frame.add_ring(project, pos, 0.72 + (time_ms as f32 * 0.004).sin() * 0.05, C_TEAL.with_alpha(0.22), Plane::XY);
+            frame.add_ring(
+                project,
+                pos,
+                0.72 + (time_ms as f32 * 0.004).sin() * 0.05,
+                C_TEAL.with_alpha(0.22),
+                Plane::XY,
+            );
         }
         if agent.needs_approval {
-            frame.add_ring(project, pos, 0.84 + (time_ms as f32 * 0.006).sin() * 0.07, C_YELLOW.with_alpha(0.58), Plane::XY);
+            frame.add_ring(
+                project,
+                pos,
+                0.84 + (time_ms as f32 * 0.006).sin() * 0.07,
+                C_YELLOW.with_alpha(0.58),
+                Plane::XY,
+            );
         }
         if self.selected_id.as_deref() == Some(&agent.id) {
             frame.add_ring(project, pos, 0.96, C_BLUE.with_alpha(0.84), Plane::XY);
@@ -703,7 +803,9 @@ impl StationInner {
 
     fn draw_hud(&mut self, frame: &GpuFrame, time_ms: f64) {
         self.ctx.save();
-        self.ctx.set_transform(self.dpr, 0.0, 0.0, self.dpr, 0.0, 0.0).ok();
+        self.ctx
+            .set_transform(self.dpr, 0.0, 0.0, self.dpr, 0.0, 0.0)
+            .ok();
         let w = self.css_width();
         let h = self.css_height();
         self.ctx.clear_rect(0.0, 0.0, w as f64, h as f64);
@@ -753,14 +855,24 @@ impl StationInner {
             .collect();
 
         for source in self.display_sources.values() {
-            let Some(node) = by_host.get(source.host_id.as_str()) else { continue; };
+            let Some(node) = by_host.get(source.host_id.as_str()) else {
+                continue;
+            };
             let center = ndc_to_screen([node.ndc.x, node.ndc.y], self.width, self.height);
             let css = Vec2::new(center.x / self.dpr as f32, center.y / self.dpr as f32);
             let tw = 164.0_f32.min(self.css_width() * 0.28).max(98.0);
             let th = tw * 0.5625;
             let x = css.x - tw / 2.0;
             let y = css.y - 118.0 - th * 0.2;
-            self.round_rect(x, y, tw, th, 5.0, "rgba(17,17,27,0.86)", "rgba(250,179,135,0.82)");
+            self.round_rect(
+                x,
+                y,
+                tw,
+                th,
+                5.0,
+                "rgba(17,17,27,0.86)",
+                "rgba(250,179,135,0.82)",
+            );
             let video_ready = source.video.video_width() > 0 && source.video.video_height() > 0;
             if video_ready {
                 let _ = self.ctx.draw_image_with_html_video_element_and_dw_and_dh(
@@ -771,37 +883,96 @@ impl StationInner {
                     (th - 6.0) as f64,
                 );
             } else {
-                self.ctx.set_fill_style(&JsValue::from_str("rgba(49,50,68,0.55)"));
-                self.ctx.fill_rect((x + 3.0) as f64, (y + 3.0) as f64, (tw - 6.0) as f64, (th - 6.0) as f64);
-                self.text("linking display", x + 12.0, y + th / 2.0, 10.0, C_OVERLAY1_CSS, "normal");
+                self.ctx
+                    .set_fill_style(&JsValue::from_str("rgba(49,50,68,0.55)"));
+                self.ctx.fill_rect(
+                    (x + 3.0) as f64,
+                    (y + 3.0) as f64,
+                    (tw - 6.0) as f64,
+                    (th - 6.0) as f64,
+                );
+                self.text(
+                    "linking display",
+                    x + 12.0,
+                    y + th / 2.0,
+                    10.0,
+                    C_OVERLAY1_CSS,
+                    "normal",
+                );
             }
-            self.text(&source.label, x + 7.0, y + th + 12.0, 10.0, C_PEACH_CSS, "normal");
+            self.text(
+                &source.label,
+                x + 7.0,
+                y + th + 12.0,
+                10.0,
+                C_PEACH_CSS,
+                "normal",
+            );
         }
     }
 
     fn draw_toolbar(&mut self, w: f32) {
-        self.ctx.set_fill_style(&JsValue::from_str("rgba(24,24,37,0.88)"));
+        self.ctx
+            .set_fill_style(&JsValue::from_str("rgba(24,24,37,0.88)"));
         self.ctx.fill_rect(0.0, 0.0, w as f64, 39.0);
-        self.ctx.set_stroke_style(&JsValue::from_str("rgba(49,50,68,0.92)"));
+        self.ctx
+            .set_stroke_style(&JsValue::from_str("rgba(49,50,68,0.92)"));
         self.line(0.0, 39.0, w, 39.0);
         self.text("STATION", 13.0, 24.0, 10.0, C_OVERLAY1_CSS, "bold");
         let mut x = 86.0;
-        self.pill_button(x, 9.0, 66.0, 22.0, "orbital", self.layout == LayoutName::Orbital, HitAction::Layout(LayoutName::Orbital));
+        self.pill_button(
+            x,
+            9.0,
+            66.0,
+            22.0,
+            "orbital",
+            self.layout == LayoutName::Orbital,
+            HitAction::Layout(LayoutName::Orbital),
+        );
         x += 72.0;
-        self.pill_button(x, 9.0, 102.0, 22.0, "constellation", self.layout == LayoutName::Constellation, HitAction::Layout(LayoutName::Constellation));
+        self.pill_button(
+            x,
+            9.0,
+            102.0,
+            22.0,
+            "constellation",
+            self.layout == LayoutName::Constellation,
+            HitAction::Layout(LayoutName::Constellation),
+        );
         x += 124.0;
-        let active_agents = self.snapshot.agents.iter().filter(|a| a.status == "in_progress").count();
+        let active_agents = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| a.status == "in_progress")
+            .count();
         self.text(
-            &format!("{} hosts · {} active agents", self.snapshot.hosts.len(), active_agents),
+            &format!(
+                "{} hosts · {} active agents",
+                self.snapshot.hosts.len(),
+                active_agents
+            ),
             x,
             24.0,
             11.0,
             C_SUBTEXT0_CSS,
             "normal",
         );
-        let pending = self.snapshot.agents.iter().filter(|a| a.needs_approval).count();
+        let pending = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| a.needs_approval)
+            .count();
         if pending > 0 {
-            self.pill(x + 178.0, 9.0, 118.0, 22.0, &format!("{pending} approval{}", if pending == 1 { "" } else { "s" }), C_YELLOW_CSS);
+            self.pill(
+                x + 178.0,
+                9.0,
+                118.0,
+                22.0,
+                &format!("{pending} approval{}", if pending == 1 { "" } else { "s" }),
+                C_YELLOW_CSS,
+            );
         }
         let role_counts = [
             ("orch", "orchestrator", C_BLUE_CSS),
@@ -810,7 +981,12 @@ impl StationInner {
         ];
         let mut rx = w - 225.0;
         for (label, role, color) in role_counts {
-            let count = self.snapshot.agents.iter().filter(|a| a.role == role).count();
+            let count = self
+                .snapshot
+                .agents
+                .iter()
+                .filter(|a| a.role == role)
+                .count();
             self.pill(rx, 9.0, 66.0, 22.0, &format!("{label} {count}"), color);
             rx += 72.0;
         }
@@ -820,21 +996,86 @@ impl StationInner {
         let x = 12.0;
         let y = 52.0;
         let w = 222.0;
-        self.round_rect(x, y, w, 178.0, 6.0, "rgba(24,24,37,0.78)", "rgba(69,71,90,0.74)");
+        self.round_rect(
+            x,
+            y,
+            w,
+            178.0,
+            6.0,
+            "rgba(24,24,37,0.78)",
+            "rgba(69,71,90,0.74)",
+        );
         self.text("TWEAKS", x + 11.0, y + 19.0, 10.0, C_OVERLAY1_CSS, "bold");
-        self.pill_button(x + 82.0, y + 7.0, 58.0, 22.0, "cockpit", self.mood == Mood::Cockpit, HitAction::Mood(Mood::Cockpit));
-        self.pill_button(x + 145.0, y + 7.0, 48.0, 22.0, "calm", self.mood == Mood::Calm, HitAction::Mood(Mood::Calm));
-        self.slider(x + 12.0, y + 47.0, 190.0, "fov", self.fov_deg, 35.0, 85.0, SliderKind::Fov);
-        self.slider(x + 12.0, y + 78.0, 190.0, "motion", self.motion, 0.0, 2.0, SliderKind::Motion);
-        self.slider(x + 12.0, y + 109.0, 190.0, "ar", self.ar_strength, 0.0, 1.0, SliderKind::Ar);
-        self.slider(x + 12.0, y + 140.0, 190.0, "density", self.density, 0.5, 1.8, SliderKind::Density);
+        self.pill_button(
+            x + 82.0,
+            y + 7.0,
+            58.0,
+            22.0,
+            "cockpit",
+            self.mood == Mood::Cockpit,
+            HitAction::Mood(Mood::Cockpit),
+        );
+        self.pill_button(
+            x + 145.0,
+            y + 7.0,
+            48.0,
+            22.0,
+            "calm",
+            self.mood == Mood::Calm,
+            HitAction::Mood(Mood::Calm),
+        );
+        self.slider(
+            x + 12.0,
+            y + 47.0,
+            190.0,
+            "fov",
+            self.fov_deg,
+            35.0,
+            85.0,
+            SliderKind::Fov,
+        );
+        self.slider(
+            x + 12.0,
+            y + 78.0,
+            190.0,
+            "motion",
+            self.motion,
+            0.0,
+            2.0,
+            SliderKind::Motion,
+        );
+        self.slider(
+            x + 12.0,
+            y + 109.0,
+            190.0,
+            "ar",
+            self.ar_strength,
+            0.0,
+            1.0,
+            SliderKind::Ar,
+        );
+        self.slider(
+            x + 12.0,
+            y + 140.0,
+            190.0,
+            "density",
+            self.density,
+            0.5,
+            1.8,
+            SliderKind::Density,
+        );
     }
 
     fn draw_corners(&self, w: f32, h: f32) {
         let c = "rgba(69,71,90,0.8)";
         self.ctx.set_stroke_style(&JsValue::from_str(c));
         let len = 26.0;
-        for (x, y, sx, sy) in [(11.0, 50.0, 1.0, 1.0), (w - 11.0, 50.0, -1.0, 1.0), (11.0, h - 11.0, 1.0, -1.0), (w - 11.0, h - 11.0, -1.0, -1.0)] {
+        for (x, y, sx, sy) in [
+            (11.0, 50.0, 1.0, 1.0),
+            (w - 11.0, 50.0, -1.0, 1.0),
+            (11.0, h - 11.0, 1.0, -1.0),
+            (w - 11.0, h - 11.0, -1.0, -1.0),
+        ] {
             self.line(x, y, x + sx * len, y);
             self.line(x, y, x, y + sy * len);
         }
@@ -845,7 +1086,15 @@ impl StationInner {
         let cost: f64 = self.snapshot.agents.iter().map(|a| a.cost).sum();
         let mut y = h - 58.0;
         for (k, v, color) in [
-            ("cam", if self.auto_orbit { "orbit · auto".to_string() } else { "orbit".to_string() }, C_SUBTEXT0_CSS),
+            (
+                "cam",
+                if self.auto_orbit {
+                    "orbit · auto".to_string()
+                } else {
+                    "orbit".to_string()
+                },
+                C_SUBTEXT0_CSS,
+            ),
             ("tokens", format!("{tokens:.0}"), C_BLUE_CSS),
             ("cost", format!("${cost:.2}"), C_SUBTEXT0_CSS),
         ] {
@@ -862,30 +1111,62 @@ impl StationInner {
     fn draw_compass(&self, w: f32, h: f32) {
         let cx = w - 71.0;
         let cy = h - 33.0;
-        self.ctx.set_stroke_style(&JsValue::from_str("rgba(69,71,90,0.9)"));
+        self.ctx
+            .set_stroke_style(&JsValue::from_str("rgba(69,71,90,0.9)"));
         self.ctx.begin_path();
-        let _ = self.ctx.arc(cx as f64, cy as f64, 18.0, 0.0, std::f64::consts::TAU);
+        let _ = self
+            .ctx
+            .arc(cx as f64, cy as f64, 18.0, 0.0, std::f64::consts::TAU);
         self.ctx.stroke();
         let angle = -self.yaw as f64;
         self.ctx.set_stroke_style(&JsValue::from_str(C_BLUE_CSS));
         self.ctx.begin_path();
         self.ctx.move_to(cx as f64, cy as f64);
-        self.ctx.line_to(cx as f64 + angle.sin() * 14.0, cy as f64 - angle.cos() * 14.0);
+        self.ctx.line_to(
+            cx as f64 + angle.sin() * 14.0,
+            cy as f64 - angle.cos() * 14.0,
+        );
         self.ctx.stroke();
         self.text("N", cx + 27.0, cy + 4.0, 10.0, C_OVERLAY1_CSS, "bold");
     }
 
     fn draw_ticker(&self, w: f32, h: f32) {
-        let events = self.snapshot.events.iter().rev().take(5).collect::<Vec<_>>();
+        let events = self
+            .snapshot
+            .events
+            .iter()
+            .rev()
+            .take(5)
+            .collect::<Vec<_>>();
         let row_h = 16.0;
         let x = 250.0;
         let mut y = h - row_h * events.len() as f32 - 13.0;
         for ev in events.into_iter().rev() {
-            self.ctx.set_fill_style(&JsValue::from_str("rgba(17,17,27,0.55)"));
-            self.ctx.fill_rect(x as f64, (y - 11.0) as f64, (w - x - 245.0).max(280.0) as f64, 15.0);
+            self.ctx
+                .set_fill_style(&JsValue::from_str("rgba(17,17,27,0.55)"));
+            self.ctx.fill_rect(
+                x as f64,
+                (y - 11.0) as f64,
+                (w - x - 245.0).max(280.0) as f64,
+                15.0,
+            );
             self.text(&ev.ts, x + 6.0, y, 10.0, C_OVERLAY1_CSS, "normal");
-            self.text(&ev.level, x + 72.0, y, 10.0, level_color_css(&ev.level), "bold");
-            self.text(&truncate(&ev.msg, 96), x + 130.0, y, 10.0, C_SUBTEXT0_CSS, "normal");
+            self.text(
+                &ev.level,
+                x + 72.0,
+                y,
+                10.0,
+                level_color_css(&ev.level),
+                "bold",
+            );
+            self.text(
+                &truncate(&ev.msg, 96),
+                x + 130.0,
+                y,
+                10.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
             y += row_h;
         }
     }
@@ -909,16 +1190,39 @@ impl StationInner {
     }
 
     fn draw_boot_splash(&self, w: f32, h: f32, time_ms: f64) {
-        let alpha = (1.0 - ((time_ms - self.boot_started_ms - 700.0) / 450.0).clamp(0.0, 1.0)) as f32;
+        let alpha =
+            (1.0 - ((time_ms - self.boot_started_ms - 700.0) / 450.0).clamp(0.0, 1.0)) as f32;
         if alpha <= 0.0 {
             return;
         }
         self.ctx.set_global_alpha(alpha as f64);
-        self.round_rect(w * 0.5 - 155.0, h * 0.5 - 34.0, 310.0, 68.0, 6.0, "rgba(24,24,37,0.92)", "rgba(69,71,90,0.88)");
+        self.round_rect(
+            w * 0.5 - 155.0,
+            h * 0.5 - 34.0,
+            310.0,
+            68.0,
+            6.0,
+            "rgba(24,24,37,0.92)",
+            "rgba(69,71,90,0.88)",
+        );
         let frames = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
         let idx = ((time_ms / 90.0) as usize) % frames.len();
-        self.text(frames[idx], w * 0.5 - 95.0, h * 0.5 + 5.0, 21.0, C_BLUE_CSS, "normal");
-        self.text("Initializing station · linking hosts", w * 0.5 - 58.0, h * 0.5 + 2.0, 12.0, C_SUBTEXT0_CSS, "normal");
+        self.text(
+            frames[idx],
+            w * 0.5 - 95.0,
+            h * 0.5 + 5.0,
+            21.0,
+            C_BLUE_CSS,
+            "normal",
+        );
+        self.text(
+            "Initializing station · linking hosts",
+            w * 0.5 - 58.0,
+            h * 0.5 + 2.0,
+            12.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
         self.ctx.set_global_alpha(1.0);
     }
 
@@ -927,9 +1231,30 @@ impl StationInner {
         let x = w - panel_w - 14.0;
         let y = 52.0;
         let panel_h = (h - 76.0).min(560.0);
-        self.round_rect(x, y, panel_w, panel_h, 6.0, "rgba(24,24,37,0.94)", "rgba(69,71,90,0.92)");
-        self.hit_zones.push(HitZone::new(x + panel_w - 31.0, y + 8.0, 22.0, 22.0, HitAction::ClosePanel));
-        self.text("×", x + panel_w - 25.0, y + 24.0, 18.0, C_OVERLAY1_CSS, "normal");
+        self.round_rect(
+            x,
+            y,
+            panel_w,
+            panel_h,
+            6.0,
+            "rgba(24,24,37,0.94)",
+            "rgba(69,71,90,0.92)",
+        );
+        self.hit_zones.push(HitZone::new(
+            x + panel_w - 31.0,
+            y + 8.0,
+            22.0,
+            22.0,
+            HitAction::ClosePanel,
+        ));
+        self.text(
+            "×",
+            x + panel_w - 25.0,
+            y + 24.0,
+            18.0,
+            C_OVERLAY1_CSS,
+            "normal",
+        );
 
         if id == "op" {
             self.text("operator", x + 12.0, y + 25.0, 10.0, C_BLUE_CSS, "bold");
@@ -939,16 +1264,55 @@ impl StationInner {
             return;
         }
 
-        if let Some(host) = self.snapshot.hosts.iter().find(|h| format!("host:{}", h.id) == id).cloned() {
+        if let Some(host) = self
+            .snapshot
+            .hosts
+            .iter()
+            .find(|h| format!("host:{}", h.id) == id)
+            .cloned()
+        {
             self.text("host", x + 12.0, y + 25.0, 10.0, C_PEACH_CSS, "bold");
             self.text(&host.name, x + 72.0, y + 25.0, 13.0, C_TEXT_CSS, "bold");
             let mut yy = y + 54.0 - self.panel_scroll;
-            self.panel_row(x, yy, "platform", &host.platform); yy += 22.0;
-            self.panel_row(x, yy, "region", &host.region); yy += 22.0;
-            self.panel_row_color(x, yy, "cpu", &format!("{:.0}%", host.cpu), if host.cpu > 70.0 { C_YELLOW_CSS } else { C_TEXT_CSS }); yy += 22.0;
-            self.panel_row_color(x, yy, "mem", &format!("{:.0}%", host.mem), if host.mem > 70.0 { C_YELLOW_CSS } else { C_TEXT_CSS }); yy += 30.0;
-            self.section_title(x, yy, "Display · WebRTC"); yy += 18.0;
-            self.round_rect(x + 12.0, yy, panel_w - 24.0, 120.0, 4.0, "rgba(17,17,27,0.86)", "rgba(49,50,68,0.86)");
+            self.panel_row(x, yy, "platform", &host.platform);
+            yy += 22.0;
+            self.panel_row(x, yy, "region", &host.region);
+            yy += 22.0;
+            self.panel_row_color(
+                x,
+                yy,
+                "cpu",
+                &format!("{:.0}%", host.cpu),
+                if host.cpu > 70.0 {
+                    C_YELLOW_CSS
+                } else {
+                    C_TEXT_CSS
+                },
+            );
+            yy += 22.0;
+            self.panel_row_color(
+                x,
+                yy,
+                "mem",
+                &format!("{:.0}%", host.mem),
+                if host.mem > 70.0 {
+                    C_YELLOW_CSS
+                } else {
+                    C_TEXT_CSS
+                },
+            );
+            yy += 30.0;
+            self.section_title(x, yy, "Display · WebRTC");
+            yy += 18.0;
+            self.round_rect(
+                x + 12.0,
+                yy,
+                panel_w - 24.0,
+                120.0,
+                4.0,
+                "rgba(17,17,27,0.86)",
+                "rgba(49,50,68,0.86)",
+            );
             let source = self.display_sources.values().find(|s| s.host_id == host.id);
             if let Some(source) = source {
                 if source.video.video_width() > 0 {
@@ -960,68 +1324,253 @@ impl StationInner {
                         112.0,
                     );
                 }
-                self.text(&format!("{} · live", source.display_id), x + 20.0, yy + 112.0, 10.0, C_GREEN_CSS, "normal");
+                self.text(
+                    &format!("{} · live", source.display_id),
+                    x + 20.0,
+                    yy + 112.0,
+                    10.0,
+                    C_GREEN_CSS,
+                    "normal",
+                );
             } else {
-                self.text("no active stream", x + 25.0, yy + 62.0, 12.0, C_OVERLAY1_CSS, "normal");
+                self.text(
+                    "no active stream",
+                    x + 25.0,
+                    yy + 62.0,
+                    12.0,
+                    C_OVERLAY1_CSS,
+                    "normal",
+                );
             }
-            self.hit_zones.push(HitZone::new(x + 188.0, yy + 92.0, 122.0, 22.0, HitAction::OpenDisplay(host.id.clone())));
-            self.pill_at(x + 188.0, yy + 92.0, 122.0, 22.0, "open display", C_BLUE_CSS);
+            self.hit_zones.push(HitZone::new(
+                x + 188.0,
+                yy + 92.0,
+                122.0,
+                22.0,
+                HitAction::OpenDisplay(host.id.clone()),
+            ));
+            self.pill_at(
+                x + 188.0,
+                yy + 92.0,
+                122.0,
+                22.0,
+                "open display",
+                C_BLUE_CSS,
+            );
             yy += 148.0;
-            self.section_title(x, yy, &format!("Agents on host ({})", self.snapshot.agents.iter().filter(|a| a.host_id == host.id).count()));
+            self.section_title(
+                x,
+                yy,
+                &format!(
+                    "Agents on host ({})",
+                    self.snapshot
+                        .agents
+                        .iter()
+                        .filter(|a| a.host_id == host.id)
+                        .count()
+                ),
+            );
             yy += 20.0;
-            for agent in self.snapshot.agents.iter().filter(|a| a.host_id == host.id).take(8) {
-                self.text(&agent.role, x + 16.0, yy, 9.0, role_color_css(&agent.role), "bold");
+            for agent in self
+                .snapshot
+                .agents
+                .iter()
+                .filter(|a| a.host_id == host.id)
+                .take(8)
+            {
+                self.text(
+                    &agent.role,
+                    x + 16.0,
+                    yy,
+                    9.0,
+                    role_color_css(&agent.role),
+                    "bold",
+                );
                 self.text(&agent.id, x + 88.0, yy, 10.0, C_OVERLAY1_CSS, "normal");
-                self.text(&truncate(&agent.task, 32), x + 150.0, yy, 10.0, C_SUBTEXT0_CSS, "normal");
-                self.hit_zones.push(HitZone::new(x + 12.0, yy - 13.0, panel_w - 24.0, 18.0, HitAction::Select(agent.id.clone())));
+                self.text(
+                    &truncate(&agent.task, 32),
+                    x + 150.0,
+                    yy,
+                    10.0,
+                    C_SUBTEXT0_CSS,
+                    "normal",
+                );
+                self.hit_zones.push(HitZone::new(
+                    x + 12.0,
+                    yy - 13.0,
+                    panel_w - 24.0,
+                    18.0,
+                    HitAction::Select(agent.id.clone()),
+                ));
                 yy += 20.0;
             }
             return;
         }
 
         if let Some(agent) = self.snapshot.agents.iter().find(|a| a.id == id).cloned() {
-            self.text(&agent.role, x + 12.0, y + 25.0, 10.0, role_color_css(&agent.role), "bold");
+            self.text(
+                &agent.role,
+                x + 12.0,
+                y + 25.0,
+                10.0,
+                role_color_css(&agent.role),
+                "bold",
+            );
             self.text(&agent.id, x + 102.0, y + 25.0, 13.0, C_TEXT_CSS, "bold");
-            let spin = ["⠋","⠙","⠹","⠸","⠼","⠴","⠦","⠧","⠇","⠏"][(time_ms as usize / 100) % 10];
+            let spin =
+                ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"][(time_ms as usize / 100) % 10];
             let mut yy = y + 54.0 - self.panel_scroll;
-            self.panel_row(x, yy, "task", &agent.task); yy += 34.0;
-            self.panel_row_color(x, yy, "host", &self.host_name(&agent.host_id), C_BLUE_CSS); yy += 22.0;
-            self.panel_row_color(x, yy, "provider", &agent.provider, C_BLUE_CSS); yy += 22.0;
-            self.panel_row_color(x, yy, "model", &agent.model, C_GREEN_CSS); yy += 22.0;
-            self.panel_row_color(x, yy, "phase", &format!("{} {spin}", agent.phase), phase_color_css(&agent.phase)); yy += 22.0;
-            self.panel_row(x, yy, "status", &agent.status.replace('_', " ")); yy += 22.0;
-            self.panel_row(x, yy, "turns", &format!("{}/{}", agent.turns, agent.turn_cap)); yy += 22.0;
-            self.panel_row(x, yy, "autonomy", &agent.autonomy); yy += 28.0;
-            self.section_title(x, yy, "Token budget"); yy += 18.0;
-            let pct = if agent.token_cap > 0.0 { (agent.tokens / agent.token_cap).clamp(0.0, 1.0) } else { 0.0 };
-            let budget = if pct < 0.5 { C_GREEN_CSS } else if pct < 0.85 { C_YELLOW_CSS } else { C_RED_CSS };
-            self.ctx.set_fill_style(&JsValue::from_str("rgba(49,50,68,0.85)"));
-            self.ctx.fill_rect((x + 12.0) as f64, yy as f64, (panel_w - 24.0) as f64, 7.0);
+            self.panel_row(x, yy, "task", &agent.task);
+            yy += 34.0;
+            self.panel_row_color(x, yy, "host", &self.host_name(&agent.host_id), C_BLUE_CSS);
+            yy += 22.0;
+            self.panel_row_color(x, yy, "provider", &agent.provider, C_BLUE_CSS);
+            yy += 22.0;
+            self.panel_row_color(x, yy, "model", &agent.model, C_GREEN_CSS);
+            yy += 22.0;
+            self.panel_row_color(
+                x,
+                yy,
+                "phase",
+                &format!("{} {spin}", agent.phase),
+                phase_color_css(&agent.phase),
+            );
+            yy += 22.0;
+            self.panel_row(x, yy, "status", &agent.status.replace('_', " "));
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "turns",
+                &format!("{}/{}", agent.turns, agent.turn_cap),
+            );
+            yy += 22.0;
+            self.panel_row(x, yy, "autonomy", &agent.autonomy);
+            yy += 28.0;
+            self.section_title(x, yy, "Token budget");
+            yy += 18.0;
+            let pct = if agent.token_cap > 0.0 {
+                (agent.tokens / agent.token_cap).clamp(0.0, 1.0)
+            } else {
+                0.0
+            };
+            let budget = if pct < 0.5 {
+                C_GREEN_CSS
+            } else if pct < 0.85 {
+                C_YELLOW_CSS
+            } else {
+                C_RED_CSS
+            };
+            self.ctx
+                .set_fill_style(&JsValue::from_str("rgba(49,50,68,0.85)"));
+            self.ctx
+                .fill_rect((x + 12.0) as f64, yy as f64, (panel_w - 24.0) as f64, 7.0);
             self.ctx.set_fill_style(&JsValue::from_str(budget));
-            self.ctx.fill_rect((x + 12.0) as f64, yy as f64, ((panel_w - 24.0) * pct) as f64, 7.0);
+            self.ctx.fill_rect(
+                (x + 12.0) as f64,
+                yy as f64,
+                ((panel_w - 24.0) * pct) as f64,
+                7.0,
+            );
             yy += 24.0;
-            self.panel_row(x, yy, "prompt", &format!("{:.0}", agent.prompt)); yy += 20.0;
-            self.panel_row(x, yy, "complete", &format!("{:.0}", agent.completion)); yy += 20.0;
-            self.panel_row(x, yy, "cached", &format!("{:.0}", agent.cached)); yy += 20.0;
-            self.panel_row_color(x, yy, "cost", &format!("${:.2}", agent.cost), C_GREEN_CSS); yy += 30.0;
-            self.section_title(x, yy, "Recent events"); yy += 18.0;
-            self.round_rect(x + 12.0, yy - 8.0, panel_w - 24.0, 92.0, 4.0, "rgba(17,17,27,0.88)", "rgba(49,50,68,0.88)");
+            self.panel_row(x, yy, "prompt", &format!("{:.0}", agent.prompt));
+            yy += 20.0;
+            self.panel_row(x, yy, "complete", &format!("{:.0}", agent.completion));
+            yy += 20.0;
+            self.panel_row(x, yy, "cached", &format!("{:.0}", agent.cached));
+            yy += 20.0;
+            self.panel_row_color(x, yy, "cost", &format!("${:.2}", agent.cost), C_GREEN_CSS);
+            yy += 30.0;
+            self.section_title(x, yy, "Recent events");
+            yy += 18.0;
+            self.round_rect(
+                x + 12.0,
+                yy - 8.0,
+                panel_w - 24.0,
+                92.0,
+                4.0,
+                "rgba(17,17,27,0.88)",
+                "rgba(49,50,68,0.88)",
+            );
             let mut ey = yy + 9.0;
-            for ev in self.snapshot.events.iter().filter(|e| e.agent_id.as_deref() == Some(&agent.id) || e.host_id == agent.host_id).rev().take(5).collect::<Vec<_>>().into_iter().rev() {
+            for ev in self
+                .snapshot
+                .events
+                .iter()
+                .filter(|e| e.agent_id.as_deref() == Some(&agent.id) || e.host_id == agent.host_id)
+                .rev()
+                .take(5)
+                .collect::<Vec<_>>()
+                .into_iter()
+                .rev()
+            {
                 self.text(&ev.ts, x + 20.0, ey, 9.0, C_OVERLAY1_CSS, "normal");
-                self.text(&truncate(&ev.msg, 42), x + 78.0, ey, 9.0, level_color_css(&ev.level), "normal");
+                self.text(
+                    &truncate(&ev.msg, 42),
+                    x + 78.0,
+                    ey,
+                    9.0,
+                    level_color_css(&ev.level),
+                    "normal",
+                );
                 ey += 15.0;
             }
             yy += 108.0;
             if agent.needs_approval {
-                self.section_title_color(x, yy, "Action needs approval", C_YELLOW_CSS); yy += 18.0;
-                self.round_rect(x + 12.0, yy - 6.0, panel_w - 24.0, 42.0, 4.0, "rgba(17,17,27,0.9)", "rgba(49,50,68,0.88)");
-                self.text(&truncate(&agent.approval_command, 56), x + 20.0, yy + 10.0, 10.0, C_SUBTEXT0_CSS, "normal");
+                self.section_title_color(x, yy, "Action needs approval", C_YELLOW_CSS);
+                yy += 18.0;
+                self.round_rect(
+                    x + 12.0,
+                    yy - 6.0,
+                    panel_w - 24.0,
+                    42.0,
+                    4.0,
+                    "rgba(17,17,27,0.9)",
+                    "rgba(49,50,68,0.88)",
+                );
+                self.text(
+                    &truncate(&agent.approval_command, 56),
+                    x + 20.0,
+                    yy + 10.0,
+                    10.0,
+                    C_SUBTEXT0_CSS,
+                    "normal",
+                );
                 yy += 50.0;
-                let approval_id = agent.approval_id.clone().unwrap_or_else(|| agent.id.clone());
-                self.approval_button(x + 12.0, yy, 82.0, "Approve", &agent.host_id, &approval_id, "approve", C_GREEN_CSS);
-                self.approval_button(x + 102.0, yy, 62.0, "Skip", &agent.host_id, &approval_id, "skip", C_OVERLAY1_CSS);
-                self.approval_button(x + 172.0, yy, 62.0, "Deny", &agent.host_id, &approval_id, "deny", C_RED_CSS);
+                let approval_id = agent
+                    .approval_id
+                    .clone()
+                    .unwrap_or_else(|| agent.id.clone());
+                self.approval_button(
+                    x + 12.0,
+                    yy,
+                    82.0,
+                    "Approve",
+                    &agent.host_id,
+                    &approval_id,
+                    "approve",
+                    C_GREEN_CSS,
+                );
+                self.approval_button(
+                    x + 102.0,
+                    yy,
+                    62.0,
+                    "Skip",
+                    &agent.host_id,
+                    &approval_id,
+                    "skip",
+                    C_OVERLAY1_CSS,
+                );
+                self.approval_button(
+                    x + 172.0,
+                    yy,
+                    62.0,
+                    "Deny",
+                    &agent.host_id,
+                    &approval_id,
+                    "deny",
+                    C_RED_CSS,
+                );
             }
         }
     }
@@ -1043,7 +1592,17 @@ impl StationInner {
         self.text(title, x + 14.0, y, 10.0, color, "bold");
     }
 
-    fn approval_button(&mut self, x: f32, y: f32, w: f32, label: &str, host_id: &str, approval_id: &str, decision: &str, color: &str) {
+    fn approval_button(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        label: &str,
+        host_id: &str,
+        approval_id: &str,
+        decision: &str,
+        color: &str,
+    ) {
         self.pill_at(x, y - 14.0, w, 24.0, label, color);
         self.hit_zones.push(HitZone::new(
             x,
@@ -1058,23 +1617,75 @@ impl StationInner {
         ));
     }
 
-    fn slider(&mut self, x: f32, y: f32, w: f32, label: &str, value: f32, min: f32, max: f32, kind: SliderKind) {
+    fn slider(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        label: &str,
+        value: f32,
+        min: f32,
+        max: f32,
+        kind: SliderKind,
+    ) {
         self.text(label, x, y, 10.0, C_OVERLAY1_CSS, "bold");
         let track_x = x + 66.0;
         let pct = ((value - min) / (max - min)).clamp(0.0, 1.0);
-        self.ctx.set_fill_style(&JsValue::from_str("rgba(49,50,68,0.92)"));
-        self.ctx.fill_rect(track_x as f64, (y - 6.0) as f64, (w - 82.0) as f64, 5.0);
+        self.ctx
+            .set_fill_style(&JsValue::from_str("rgba(49,50,68,0.92)"));
+        self.ctx
+            .fill_rect(track_x as f64, (y - 6.0) as f64, (w - 82.0) as f64, 5.0);
         self.ctx.set_fill_style(&JsValue::from_str(C_BLUE_CSS));
-        self.ctx.fill_rect(track_x as f64, (y - 6.0) as f64, ((w - 82.0) * pct) as f64, 5.0);
+        self.ctx.fill_rect(
+            track_x as f64,
+            (y - 6.0) as f64,
+            ((w - 82.0) * pct) as f64,
+            5.0,
+        );
         self.ctx.begin_path();
-        let _ = self.ctx.arc((track_x + (w - 82.0) * pct) as f64, (y - 3.5) as f64, 5.0, 0.0, std::f64::consts::TAU);
+        let _ = self.ctx.arc(
+            (track_x + (w - 82.0) * pct) as f64,
+            (y - 3.5) as f64,
+            5.0,
+            0.0,
+            std::f64::consts::TAU,
+        );
         self.ctx.fill();
-        self.text(&format!("{value:.1}"), x + w - 26.0, y, 9.0, C_SUBTEXT0_CSS, "normal");
-        self.hit_zones.push(HitZone::new(track_x - 6.0, y - 16.0, w - 70.0, 24.0, HitAction::Slider(kind)));
+        self.text(
+            &format!("{value:.1}"),
+            x + w - 26.0,
+            y,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        self.hit_zones.push(HitZone::new(
+            track_x - 6.0,
+            y - 16.0,
+            w - 70.0,
+            24.0,
+            HitAction::Slider(kind),
+        ));
     }
 
-    fn pill_button(&mut self, x: f32, y: f32, w: f32, h: f32, label: &str, active: bool, action: HitAction) {
-        self.pill_at(x, y, w, h, label, if active { C_BLUE_CSS } else { C_OVERLAY1_CSS });
+    fn pill_button(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        label: &str,
+        active: bool,
+        action: HitAction,
+    ) {
+        self.pill_at(
+            x,
+            y,
+            w,
+            h,
+            label,
+            if active { C_BLUE_CSS } else { C_OVERLAY1_CSS },
+        );
         self.hit_zones.push(HitZone::new(x, y, w, h, action));
     }
 
@@ -1094,7 +1705,12 @@ impl StationInner {
         ctx.line_to((x + w - r) as f64, y as f64);
         let _ = ctx.quadratic_curve_to((x + w) as f64, y as f64, (x + w) as f64, (y + r) as f64);
         ctx.line_to((x + w) as f64, (y + h - r) as f64);
-        let _ = ctx.quadratic_curve_to((x + w) as f64, (y + h) as f64, (x + w - r) as f64, (y + h) as f64);
+        let _ = ctx.quadratic_curve_to(
+            (x + w) as f64,
+            (y + h) as f64,
+            (x + w - r) as f64,
+            (y + h) as f64,
+        );
         ctx.line_to((x + r) as f64, (y + h) as f64);
         let _ = ctx.quadratic_curve_to(x as f64, (y + h) as f64, x as f64, (y + h - r) as f64);
         ctx.line_to(x as f64, (y + r) as f64);
@@ -1108,7 +1724,9 @@ impl StationInner {
 
     fn text(&self, text: &str, x: f32, y: f32, px: f32, color: &str, weight: &str) {
         self.ctx.set_fill_style(&JsValue::from_str(color));
-        self.ctx.set_font(&format!("{weight} {px}px 'SF Mono', Menlo, Consolas, monospace"));
+        self.ctx.set_font(&format!(
+            "{weight} {px}px 'SF Mono', Menlo, Consolas, monospace"
+        ));
         let _ = self.ctx.fill_text(text, x as f64, y as f64);
     }
 
@@ -1135,30 +1753,54 @@ impl StationInner {
                     let spread = (host_count as f32 - 1.0).max(1.0);
                     let x = (i as f32 - spread * 0.5) * 3.2;
                     let z = -1.3 + (stable_unit(&host.id) - 0.5) * 2.3;
-                    Vec3::new(x, -0.05 + (stable_unit(&(host.id.clone() + "y")) - 0.5) * 0.8, z)
+                    Vec3::new(
+                        x,
+                        -0.05 + (stable_unit(&(host.id.clone() + "y")) - 0.5) * 0.8,
+                        z,
+                    )
                 }
             };
             map.insert(format!("host:{}", host.id), pos);
         }
         let mut by_host: HashMap<&str, Vec<&StationAgent>> = HashMap::new();
         for agent in &self.snapshot.agents {
-            by_host.entry(agent.host_id.as_str()).or_default().push(agent);
+            by_host
+                .entry(agent.host_id.as_str())
+                .or_default()
+                .push(agent);
         }
         for host in &self.snapshot.hosts {
-            let host_pos = map.get(&format!("host:{}", host.id)).copied().unwrap_or(Vec3::ZERO);
+            let host_pos = map
+                .get(&format!("host:{}", host.id))
+                .copied()
+                .unwrap_or(Vec3::ZERO);
             let agents = by_host.get(host.id.as_str()).cloned().unwrap_or_default();
             let count = agents.len().max(1);
             for (idx, agent) in agents.into_iter().enumerate() {
                 let pos = match self.layout {
                     LayoutName::Orbital => {
                         let angle = idx as f32 / count as f32 * PI * 2.0 + stable_angle(&agent.id);
-                        let ring = if agent.role == "sub-agent" { 1.55 } else { 1.18 };
-                        host_pos + Vec3::new(angle.cos() * ring, 0.55 + (idx % 3) as f32 * 0.28, angle.sin() * ring * 0.72)
+                        let ring = if agent.role == "sub-agent" {
+                            1.55
+                        } else {
+                            1.18
+                        };
+                        host_pos
+                            + Vec3::new(
+                                angle.cos() * ring,
+                                0.55 + (idx % 3) as f32 * 0.28,
+                                angle.sin() * ring * 0.72,
+                            )
                     }
                     LayoutName::Constellation => {
                         let u = stable_unit(&agent.id);
                         let v = stable_unit(&(agent.id.clone() + "v"));
-                        host_pos + Vec3::new((u - 0.5) * 2.9, 0.7 + v * 1.8, (stable_unit(&(agent.id.clone() + "z")) - 0.5) * 2.0)
+                        host_pos
+                            + Vec3::new(
+                                (u - 0.5) * 2.9,
+                                0.7 + v * 1.8,
+                                (stable_unit(&(agent.id.clone() + "z")) - 0.5) * 2.0,
+                            )
                     }
                 };
                 map.insert(agent.id.clone(), pos);
@@ -1168,7 +1810,11 @@ impl StationInner {
     }
 
     fn camera(&self) -> Camera {
-        let parallax = Vec3::new(self.ar_x * self.ar_strength, self.ar_y * self.ar_strength * 0.5, 0.0);
+        let parallax = Vec3::new(
+            self.ar_x * self.ar_strength,
+            self.ar_y * self.ar_strength * 0.5,
+            0.0,
+        );
         let cp = self.pitch.cos();
         let eye = Vec3::new(
             self.yaw.sin() * cp * self.distance,
@@ -1202,7 +1848,11 @@ impl StationInner {
                 self.panel_scroll = 0.0;
             }
             HitAction::Slider(kind) => self.apply_slider_at(kind, x),
-            HitAction::Approval { host_id, approval_id, decision } => {
+            HitAction::Approval {
+                host_id,
+                approval_id,
+                decision,
+            } => {
                 self.emit_action(serde_json::json!({
                     "type": "approval",
                     "host_id": host_id,
@@ -1255,7 +1905,10 @@ impl StationInner {
 
     fn event_xy(&self, client_x: f64, client_y: f64) -> (f32, f32) {
         let rect = self.hud_canvas.get_bounding_client_rect();
-        ((client_x - rect.left()) as f32, (client_y - rect.top()) as f32)
+        (
+            (client_x - rect.left()) as f32,
+            (client_y - rect.top()) as f32,
+        )
     }
 
     fn mark_input(&mut self) {
@@ -1280,6 +1933,7 @@ impl StationInner {
     }
 }
 
+#[cfg(target_arch = "wasm32")]
 struct GpuState {
     surface: wgpu::Surface<'static>,
     device: wgpu::Device,
@@ -1289,6 +1943,7 @@ struct GpuState {
     tri_pipeline: wgpu::RenderPipeline,
 }
 
+#[cfg(target_arch = "wasm32")]
 impl GpuState {
     async fn new(canvas: HtmlCanvasElement) -> Result<Self, JsValue> {
         let width = canvas.width().max(1);
@@ -1335,7 +1990,11 @@ impl GpuState {
             width,
             height,
             present_mode: wgpu::PresentMode::Fifo,
-            alpha_mode: caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto),
+            alpha_mode: caps
+                .alpha_modes
+                .first()
+                .copied()
+                .unwrap_or(wgpu::CompositeAlphaMode::Auto),
             view_formats: vec![],
             desired_maximum_frame_latency: 2,
         };
@@ -1416,21 +2075,29 @@ impl GpuState {
             }
             Err(err) => return Err(err),
         };
-        let view = output.texture.create_view(&wgpu::TextureViewDescriptor::default());
-        let mut encoder = self.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
-            label: Some("Station Encoder"),
-        });
+        let view = output
+            .texture
+            .create_view(&wgpu::TextureViewDescriptor::default());
+        let mut encoder = self
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("Station Encoder"),
+            });
 
-        let line_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Station Lines"),
-            contents: bytemuck::cast_slice(&frame.line_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
-        let tri_buffer = self.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
-            label: Some("Station Triangles"),
-            contents: bytemuck::cast_slice(&frame.tri_vertices),
-            usage: wgpu::BufferUsages::VERTEX,
-        });
+        let line_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Station Lines"),
+                contents: bytemuck::cast_slice(&frame.line_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
+        let tri_buffer = self
+            .device
+            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
+                label: Some("Station Triangles"),
+                contents: bytemuck::cast_slice(&frame.tri_vertices),
+                usage: wgpu::BufferUsages::VERTEX,
+            });
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1469,6 +2136,19 @@ impl GpuState {
     }
 }
 
+#[cfg(not(target_arch = "wasm32"))]
+struct GpuState;
+
+#[cfg(not(target_arch = "wasm32"))]
+impl GpuState {
+    fn resize(&mut self, _width: u32, _height: u32) {}
+
+    fn render(&mut self, _frame: &GpuFrame) -> Result<(), JsValue> {
+        Ok(())
+    }
+}
+
+#[cfg(target_arch = "wasm32")]
 const STATION_WGSL: &str = r#"
 struct VertexOut {
   @builtin(position) position: vec4<f32>,
@@ -1497,8 +2177,11 @@ struct GpuVertex {
 }
 
 impl GpuVertex {
-    const ATTRS: [wgpu::VertexAttribute; 2] = wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
+    #[cfg(target_arch = "wasm32")]
+    const ATTRS: [wgpu::VertexAttribute; 2] =
+        wgpu::vertex_attr_array![0 => Float32x2, 1 => Float32x4];
 
+    #[cfg(target_arch = "wasm32")]
     fn layout<'a>() -> wgpu::VertexBufferLayout<'a> {
         wgpu::VertexBufferLayout {
             array_stride: std::mem::size_of::<GpuVertex>() as wgpu::BufferAddress,
@@ -1517,11 +2200,23 @@ struct GpuFrame {
 
 impl GpuFrame {
     fn add_line_ndc(&mut self, a: Vec2, b: Vec2, color: Color) {
-        self.line_vertices.push(GpuVertex { pos: [a.x, a.y], color: color.into() });
-        self.line_vertices.push(GpuVertex { pos: [b.x, b.y], color: color.into() });
+        self.line_vertices.push(GpuVertex {
+            pos: [a.x, a.y],
+            color: color.into(),
+        });
+        self.line_vertices.push(GpuVertex {
+            pos: [b.x, b.y],
+            color: color.into(),
+        });
     }
 
-    fn add_line_projected(&mut self, project: &mut impl FnMut(Vec3) -> Option<Vec2>, a: Vec3, b: Vec3, color: Color) {
+    fn add_line_projected(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        a: Vec3,
+        b: Vec3,
+        color: Color,
+    ) {
         if let (Some(pa), Some(pb)) = (project(a), project(b)) {
             self.add_line_ndc(pa, pb, color);
         }
@@ -1542,7 +2237,14 @@ impl GpuFrame {
         }
     }
 
-    fn add_ring(&mut self, project: &mut impl FnMut(Vec3) -> Option<Vec2>, center: Vec3, radius: f32, color: Color, plane: Plane) {
+    fn add_ring(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        center: Vec3,
+        radius: f32,
+        color: Color,
+        plane: Plane,
+    ) {
         let seg = 64;
         let mut prev = None;
         for i in 0..=seg {
@@ -1560,7 +2262,14 @@ impl GpuFrame {
         }
     }
 
-    fn add_wire_octa(&mut self, project: &mut impl FnMut(Vec3) -> Option<Vec2>, center: Vec3, scale: f32, spin: f32, color: Color) {
+    fn add_wire_octa(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        center: Vec3,
+        scale: f32,
+        spin: f32,
+        color: Color,
+    ) {
         let verts = [
             Vec3::new(0.0, 1.0, 0.0),
             Vec3::new(1.0, 0.0, 0.0),
@@ -1569,11 +2278,31 @@ impl GpuFrame {
             Vec3::new(0.0, 0.0, -1.0),
             Vec3::new(0.0, -1.0, 0.0),
         ];
-        let edges = [(0, 1), (0, 2), (0, 3), (0, 4), (5, 1), (5, 2), (5, 3), (5, 4), (1, 2), (2, 3), (3, 4), (4, 1)];
+        let edges = [
+            (0, 1),
+            (0, 2),
+            (0, 3),
+            (0, 4),
+            (5, 1),
+            (5, 2),
+            (5, 3),
+            (5, 4),
+            (1, 2),
+            (2, 3),
+            (3, 4),
+            (4, 1),
+        ];
         self.add_edges(project, center, scale, spin, &verts, &edges, color);
     }
 
-    fn add_wire_tetra(&mut self, project: &mut impl FnMut(Vec3) -> Option<Vec2>, center: Vec3, scale: f32, spin: f32, color: Color) {
+    fn add_wire_tetra(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        center: Vec3,
+        scale: f32,
+        spin: f32,
+        color: Color,
+    ) {
         let verts = [
             Vec3::new(1.0, 1.0, 1.0),
             Vec3::new(-1.0, -1.0, 1.0),
@@ -1584,23 +2313,73 @@ impl GpuFrame {
         self.add_edges(project, center, scale, spin, &verts, &edges, color);
     }
 
-    fn add_wire_icosa(&mut self, project: &mut impl FnMut(Vec3) -> Option<Vec2>, center: Vec3, scale: f32, spin: f32, color: Color) {
+    fn add_wire_icosa(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        center: Vec3,
+        scale: f32,
+        spin: f32,
+        color: Color,
+    ) {
         let phi = 1.618;
         let verts = [
-            Vec3::new(-1.0, phi, 0.0), Vec3::new(1.0, phi, 0.0), Vec3::new(-1.0, -phi, 0.0), Vec3::new(1.0, -phi, 0.0),
-            Vec3::new(0.0, -1.0, phi), Vec3::new(0.0, 1.0, phi), Vec3::new(0.0, -1.0, -phi), Vec3::new(0.0, 1.0, -phi),
-            Vec3::new(phi, 0.0, -1.0), Vec3::new(phi, 0.0, 1.0), Vec3::new(-phi, 0.0, -1.0), Vec3::new(-phi, 0.0, 1.0),
+            Vec3::new(-1.0, phi, 0.0),
+            Vec3::new(1.0, phi, 0.0),
+            Vec3::new(-1.0, -phi, 0.0),
+            Vec3::new(1.0, -phi, 0.0),
+            Vec3::new(0.0, -1.0, phi),
+            Vec3::new(0.0, 1.0, phi),
+            Vec3::new(0.0, -1.0, -phi),
+            Vec3::new(0.0, 1.0, -phi),
+            Vec3::new(phi, 0.0, -1.0),
+            Vec3::new(phi, 0.0, 1.0),
+            Vec3::new(-phi, 0.0, -1.0),
+            Vec3::new(-phi, 0.0, 1.0),
         ];
         let edges = [
-            (0, 1), (0, 5), (0, 7), (0, 10), (0, 11), (1, 5), (1, 7), (1, 8), (1, 9),
-            (2, 3), (2, 4), (2, 6), (2, 10), (2, 11), (3, 4), (3, 6), (3, 8), (3, 9),
-            (4, 5), (4, 9), (4, 11), (5, 9), (5, 11), (6, 7), (6, 8), (6, 10),
-            (7, 8), (7, 10), (8, 9), (10, 11),
+            (0, 1),
+            (0, 5),
+            (0, 7),
+            (0, 10),
+            (0, 11),
+            (1, 5),
+            (1, 7),
+            (1, 8),
+            (1, 9),
+            (2, 3),
+            (2, 4),
+            (2, 6),
+            (2, 10),
+            (2, 11),
+            (3, 4),
+            (3, 6),
+            (3, 8),
+            (3, 9),
+            (4, 5),
+            (4, 9),
+            (4, 11),
+            (5, 9),
+            (5, 11),
+            (6, 7),
+            (6, 8),
+            (6, 10),
+            (7, 8),
+            (7, 10),
+            (8, 9),
+            (10, 11),
         ];
         self.add_edges(project, center, scale * 0.55, spin, &verts, &edges, color);
     }
 
-    fn add_wire_hex(&mut self, project: &mut impl FnMut(Vec3) -> Option<Vec2>, center: Vec3, radius: f32, height: f32, spin: f32, color: Color) {
+    fn add_wire_hex(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        center: Vec3,
+        radius: f32,
+        height: f32,
+        spin: f32,
+        color: Color,
+    ) {
         let mut top = Vec::with_capacity(6);
         let mut bottom = Vec::with_capacity(6);
         for i in 0..6 {
@@ -1611,12 +2390,26 @@ impl GpuFrame {
         for i in 0..6 {
             let n = (i + 1) % 6;
             self.add_line_projected(project, top[i], top[n], color);
-            self.add_line_projected(project, bottom[i], bottom[n], color.with_alpha(color.a * 0.7));
+            self.add_line_projected(
+                project,
+                bottom[i],
+                bottom[n],
+                color.with_alpha(color.a * 0.7),
+            );
             self.add_line_projected(project, top[i], bottom[i], color.with_alpha(color.a * 0.6));
         }
     }
 
-    fn add_edges(&mut self, project: &mut impl FnMut(Vec3) -> Option<Vec2>, center: Vec3, scale: f32, spin: f32, verts: &[Vec3], edges: &[(usize, usize)], color: Color) {
+    fn add_edges(
+        &mut self,
+        project: &mut impl FnMut(Vec3) -> Option<Vec2>,
+        center: Vec3,
+        scale: f32,
+        spin: f32,
+        verts: &[Vec3],
+        edges: &[(usize, usize)],
+        color: Color,
+    ) {
         let transformed = verts
             .iter()
             .map(|v| center + rotate_y(rotate_x(*v * scale, spin * 0.7), spin))
@@ -1787,7 +2580,11 @@ enum HitAction {
     Slider(SliderKind),
     Select(String),
     ClosePanel,
-    Approval { host_id: String, approval_id: String, decision: String },
+    Approval {
+        host_id: String,
+        approval_id: String,
+        decision: String,
+    },
     OpenDisplay(String),
 }
 
@@ -1877,8 +2674,16 @@ struct Vec3 {
 }
 
 impl Vec3 {
-    const ZERO: Self = Self { x: 0.0, y: 0.0, z: 0.0 };
-    const Y: Self = Self { x: 0.0, y: 1.0, z: 0.0 };
+    const ZERO: Self = Self {
+        x: 0.0,
+        y: 0.0,
+        z: 0.0,
+    };
+    const Y: Self = Self {
+        x: 0.0,
+        y: 1.0,
+        z: 0.0,
+    };
 
     fn new(x: f32, y: f32, z: f32) -> Self {
         Self { x, y, z }
@@ -1947,7 +2752,12 @@ impl Camera {
         let forward = (target - eye).normalized();
         let right = forward.cross(world_up).normalized();
         let up = right.cross(forward).normalized();
-        Self { eye, right, up, forward }
+        Self {
+            eye,
+            right,
+            up,
+            forward,
+        }
     }
 
     fn project(&self, world: Vec3, aspect: f32, fov_deg: f32) -> Option<Vec2> {
@@ -2094,7 +2904,10 @@ fn rotate_x(v: Vec3, a: f32) -> Vec3 {
 }
 
 fn ndc_to_screen(pos: [f32; 2], width: u32, height: u32) -> Vec2 {
-    Vec2::new((pos[0] * 0.5 + 0.5) * width as f32, (0.5 - pos[1] * 0.5) * height as f32)
+    Vec2::new(
+        (pos[0] * 0.5 + 0.5) * width as f32,
+        (0.5 - pos[1] * 0.5) * height as f32,
+    )
 }
 
 fn css_rgba(color: [f32; 4]) -> String {

@@ -1,10 +1,15 @@
 mod agent_runner;
+mod app_state_pricing;
 mod approval;
+mod audio_routing;
 mod autonomy;
+mod browser_workspace;
 mod computer_use;
+mod context_rewind;
 mod control;
 mod control_plane;
 mod conversation;
+mod ctl;
 mod daemon_log_tee;
 mod debug;
 mod diagnostics;
@@ -12,11 +17,14 @@ mod display;
 mod error;
 mod event;
 mod external_agent;
+mod external_wrapper_index;
 mod file_watcher;
+mod fission_ledger;
 mod frames;
 mod frontend;
 mod knowledge;
 mod lan;
+mod lineage_ledger;
 mod live_audio;
 mod live_audio_types;
 mod mcp;
@@ -25,14 +33,17 @@ mod peer;
 mod platform;
 mod presence;
 mod project;
-mod audio_routing;
-mod quarantine;
-mod recording;
 mod prompts;
 mod provider;
+mod quarantine;
+mod recording;
 mod sandbox;
 mod schema_validator;
+mod session_config;
 mod session_log;
+mod session_names;
+mod session_supervisor;
+mod setup;
 mod skills;
 mod sub_agent;
 mod task_dispatch;
@@ -45,19 +56,23 @@ mod types;
 mod upload_store;
 mod user_mode;
 mod vision;
-mod app_state_pricing;
 mod web_gateway;
+mod web_tls;
 mod worktree;
+mod worktree_inventory;
 
 use autonomy::{AutonomyLevel, AutonomyState, SharedAutonomy};
 use conversation::Conversation;
 use error::CallerError;
 use event::{AppEvent, EventBus};
 use project::Project;
+use serde::Serialize;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tool_batch::{assemble_batch_from_tool_calls, map_results_to_tool_responses};
 
 type SharedSessionLog = Arc<Mutex<session_log::SessionLog>>;
@@ -79,6 +94,112 @@ fn new_json_approval_slot() -> JsonApprovalSlot {
 fn slog(log: &SharedSessionLog, f: impl FnOnce(&mut session_log::SessionLog)) {
     if let Ok(mut l) = log.lock() {
         f(&mut l);
+    }
+}
+
+fn session_log_id(session_log: &SharedSessionLog) -> Option<String> {
+    session_log
+        .lock()
+        .ok()
+        .map(|log| log.session_id().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn record_external_done_and_round_inline(
+    session_log: &SharedSessionLog,
+    enabled: bool,
+    session_id: Option<&str>,
+    message: Option<&str>,
+    round: usize,
+    turns_in_round: usize,
+) {
+    if !enabled {
+        return;
+    }
+    slog(session_log, |log| {
+        log.done_signal_for_session(session_id, message);
+        log.round_complete(round, turns_in_round);
+    });
+}
+
+fn record_external_round_inline(
+    session_log: &SharedSessionLog,
+    enabled: bool,
+    round: usize,
+    turns_in_round: usize,
+) {
+    if !enabled {
+        return;
+    }
+    slog(session_log, |log| log.round_complete(round, turns_in_round));
+}
+
+fn external_rollback_turn_in_progress(err: &CallerError) -> bool {
+    let CallerError::ExternalAgent(message) = err else {
+        return false;
+    };
+    message
+        .to_ascii_lowercase()
+        .contains("cannot rollback while a turn is in progress")
+}
+
+fn event_targets_session(target: &Option<String>, session_id: &Option<String>) -> bool {
+    match target {
+        Some(target) => session_id.as_deref() == Some(target.as_str()),
+        None => true,
+    }
+}
+
+fn event_targets_session_or_alias(
+    target: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+) -> bool {
+    match target {
+        Some(target) => {
+            session_id.as_deref() == Some(target.as_str())
+                || alias_session_id.as_deref() == Some(target.as_str())
+        }
+        None => true,
+    }
+}
+
+fn event_targets_external_session_or_side(
+    target: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    side_threads: &HashMap<String, String>,
+) -> bool {
+    match target {
+        Some(target) => {
+            event_targets_session_or_alias(&Some(target.clone()), session_id, alias_session_id)
+                || side_threads.contains_key(target)
+        }
+        None => true,
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ExternalSteerTargetKind {
+    Primary,
+    Side,
+}
+
+fn resolve_external_steer_target_session(
+    target: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+    side_threads: Option<&HashMap<String, String>>,
+) -> Option<(Option<String>, ExternalSteerTargetKind)> {
+    match target.as_deref() {
+        Some(target) if side_threads.is_some_and(|threads| threads.contains_key(target)) => {
+            Some((Some(target.to_string()), ExternalSteerTargetKind::Side))
+        }
+        Some(_) if event_targets_session_or_alias(target, session_id, alias_session_id) => {
+            Some((session_id.clone(), ExternalSteerTargetKind::Primary))
+        }
+        Some(_) => None,
+        None => Some((session_id.clone(), ExternalSteerTargetKind::Primary)),
     }
 }
 
@@ -114,6 +235,11 @@ fn build_local_advertised_auth(
         "none" => peer::TransportAuth::None,
         "mutual-tls" => peer::TransportAuth::MutualTls,
         "pin-self-cert" => {
+            // `pin-self-cert` reads the local server cert produced by
+            // `intendant lan setup`. The `certs` module is now pure-Rust
+            // (rcgen + p12-keystore) and compiles everywhere, so this works
+            // on all platforms; only the nginx-based `lan setup` flow that
+            // writes the cert is still deferred on Windows.
             let fp = lan::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
                 CallerError::Config(format!(
                     "[server.auth] advertised_transport = \"pin-self-cert\" requires \
@@ -133,12 +259,13 @@ fn build_local_advertised_auth(
             )));
         }
     };
-    let application = server_auth.bearer_token.as_ref().map(|_| {
-        peer::ApplicationAuth::Bearer {
+    let application = server_auth
+        .bearer_token
+        .as_ref()
+        .map(|_| peer::ApplicationAuth::Bearer {
             hint: Some("[server.auth] bearer_token".to_string()),
             rotation_url: None,
-        }
-    });
+        });
     Ok(peer::AuthRequirements {
         transport,
         application,
@@ -264,11 +391,309 @@ fn emit_task_dispatched_log(
     );
     slog(session_log, |l| l.info(&message));
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "info".to_string(),
         source: "system".to_string(),
         content: message,
         turn: None,
     });
+}
+
+fn emit_user_message_log(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    session_id: Option<&str>,
+    user_turn_index: Option<u32>,
+    user_turn_revision: Option<u32>,
+    replacement_for_user_turn_index: Option<u32>,
+    text: &str,
+) {
+    let text = text.trim();
+    if text.is_empty() {
+        return;
+    }
+    slog(session_log, |l| l.info(&format!("[user] {}", text)));
+    bus.send(AppEvent::UserMessageLog {
+        session_id: session_id.map(str::to_string),
+        content: text.to_string(),
+        user_turn_index,
+        user_turn_revision,
+        replacement_for_user_turn_index,
+    });
+}
+
+fn emit_external_session_loop_error(
+    bus: &EventBus,
+    session_log: &SharedSessionLog,
+    session_id: Option<&str>,
+    source: &str,
+    message: String,
+) {
+    slog(session_log, |l| l.warn(&message));
+    bus.send(AppEvent::LogEntry {
+        session_id: session_id.map(str::to_string),
+        level: "warn".to_string(),
+        source: source.to_string(),
+        content: message.clone(),
+        turn: None,
+    });
+    bus.send(AppEvent::LoopError(message));
+}
+
+fn json_string_field(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(str::to_string)
+}
+
+fn collect_jsonl_files(root: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_jsonl_files(&path, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|name| name.ends_with(".jsonl"))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn codex_session_file_id(path: &Path) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    for line in contents.lines() {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
+            return obj
+                .get("payload")
+                .and_then(|payload| json_string_field(payload, "id"));
+        }
+    }
+    None
+}
+
+fn find_codex_session_file_for_main(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let codex = std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".codex"));
+    let mut files = Vec::new();
+    collect_jsonl_files(&codex.join("sessions"), &mut files);
+    collect_jsonl_files(&codex.join("archived_sessions"), &mut files);
+    files
+        .into_iter()
+        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+}
+
+fn codex_message_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                        .map(str::to_string)
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+fn codex_payload_user_text(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+        return None;
+    }
+    if payload.get("role").and_then(|v| v.as_str()) != Some("user") {
+        return None;
+    }
+    let text = codex_message_content_text(payload.get("content")?)?;
+    if is_codex_injected_user_text_for_main(&text) {
+        None
+    } else {
+        Some(text)
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct UserTurnRevisionState {
+    active_count: u32,
+    latest_revision_by_turn: HashMap<u32, u32>,
+    active_revision_by_turn: HashMap<u32, u32>,
+}
+
+impl UserTurnRevisionState {
+    fn active_count(&self) -> u32 {
+        self.active_count
+    }
+
+    fn active_revision(&self, user_turn_index: u32) -> Option<u32> {
+        self.active_revision_by_turn.get(&user_turn_index).copied()
+    }
+
+    fn seed_active_turns_to(&mut self, active_count: u32) {
+        while self.active_count < active_count {
+            self.record_next_turn();
+        }
+    }
+
+    fn record_next_turn(&mut self) -> (u32, u32) {
+        let user_turn_index = self.active_count.saturating_add(1);
+        let revision = self.record_active_turn(user_turn_index);
+        self.active_count = user_turn_index;
+        (user_turn_index, revision)
+    }
+
+    fn record_active_turn(&mut self, user_turn_index: u32) -> u32 {
+        let next_revision = self
+            .latest_revision_by_turn
+            .get(&user_turn_index)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.latest_revision_by_turn
+            .insert(user_turn_index, next_revision);
+        self.active_revision_by_turn
+            .insert(user_turn_index, next_revision);
+        self.active_count = self.active_count.max(user_turn_index);
+        next_revision
+    }
+
+    fn rewind_last_turns(&mut self, turns_to_drop: u32) {
+        if turns_to_drop == 0 || self.active_count == 0 {
+            return;
+        }
+        let first_user_turn_index = self
+            .active_count
+            .saturating_sub(turns_to_drop)
+            .saturating_add(1);
+        self.rewind_from_turn(first_user_turn_index);
+    }
+
+    fn rewind_from_turn(&mut self, first_user_turn_index: u32) {
+        if first_user_turn_index == 0 || first_user_turn_index > self.active_count {
+            return;
+        }
+        for turn in first_user_turn_index..=self.active_count {
+            self.active_revision_by_turn.remove(&turn);
+        }
+        self.active_count = first_user_turn_index.saturating_sub(1);
+    }
+
+    fn validate_expected_revision(
+        &self,
+        user_turn_index: u32,
+        expected_revision: Option<u32>,
+    ) -> Result<(), String> {
+        let Some(expected_revision) = expected_revision else {
+            return Err(format!(
+                "Cannot edit user turn {}; missing active-message revision",
+                user_turn_index
+            ));
+        };
+        match self.active_revision(user_turn_index) {
+            Some(active_revision) if active_revision == expected_revision => Ok(()),
+            Some(active_revision) => Err(format!(
+                "Cannot edit user turn {}; the displayed message revision {} is stale (active revision is {})",
+                user_turn_index, expected_revision, active_revision
+            )),
+            None => Err(format!(
+                "Cannot edit user turn {}; that message is no longer active context",
+                user_turn_index
+            )),
+        }
+    }
+}
+
+fn is_codex_injected_user_text_for_main(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<turn_aborted>")
+        || trimmed.starts_with("<subagent_notification>")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<task-notification>")
+        || trimmed.starts_with("<command-name>")
+        || trimmed.starts_with("<command-message>")
+        || trimmed.starts_with("<local-command-stdout>")
+        || trimmed.starts_with("<bash-input>")
+        || trimmed.starts_with("<bash-stdout>")
+        || trimmed.starts_with("<bash-stderr>")
+        || trimmed.starts_with("<user_shell_command>")
+}
+
+fn codex_user_turn_state_from_history(session_id: &str) -> Option<UserTurnRevisionState> {
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    let path = find_codex_session_file_for_main(&home, session_id)?;
+    codex_user_turn_state_from_history_file(&path)
+}
+
+fn codex_user_turn_state_from_history_file(path: &Path) -> Option<UserTurnRevisionState> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let mut saw_user_message_event = false;
+    let mut event_state = UserTurnRevisionState::default();
+    let mut fallback_state = UserTurnRevisionState::default();
+
+    for line in contents.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "event_msg" => {
+                let Some(payload) = obj.get("payload") else {
+                    continue;
+                };
+                match payload.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+                    "user_message" => {
+                        saw_user_message_event = true;
+                        event_state.record_next_turn();
+                    }
+                    "thread_rolled_back" => {
+                        let turns = payload
+                            .get("num_turns")
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(0) as u32;
+                        event_state.rewind_last_turns(turns);
+                        fallback_state.rewind_last_turns(turns);
+                    }
+                    _ => {}
+                }
+            }
+            "response_item" => {
+                if obj
+                    .get("payload")
+                    .and_then(codex_payload_user_text)
+                    .is_some()
+                {
+                    fallback_state.record_next_turn();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Some(if saw_user_message_event {
+        event_state
+    } else {
+        fallback_state
+    })
 }
 
 /// Resolve external agent backend from an explicit override, falling back to
@@ -299,13 +724,17 @@ fn codex_runtime_config_equal(
     a: &control_plane::CodexRuntimeConfig,
     b: &control_plane::CodexRuntimeConfig,
 ) -> bool {
-    a.sandbox == b.sandbox
+    a.command == b.command
+        && a.sandbox == b.sandbox
         && a.approval_policy == b.approval_policy
         && a.model == b.model
         && a.reasoning_effort == b.reasoning_effort
+        && a.service_tier == b.service_tier
         && a.web_search == b.web_search
         && a.network_access == b.network_access
         && a.writable_roots == b.writable_roots
+        && a.managed_context == b.managed_context
+        && a.context_archive == b.context_archive
 }
 
 /// Structural equality for `GeminiRuntimeConfig`. Every field here is a
@@ -322,6 +751,24 @@ fn gemini_runtime_config_equal(
         && a.allowed_mcp_servers == b.allowed_mcp_servers
         && a.include_directories == b.include_directories
         && a.debug == b.debug
+}
+
+fn normalize_diff_file_path(path: &str) -> Option<String> {
+    let path = path.split('\t').next().unwrap_or(path).trim();
+    if path == "/dev/null" {
+        return None;
+    }
+    // Strip exactly one git-style `a/` or `b/` prefix. Codex sometimes
+    // produces `b//home/...` (double slash) for absolute paths; that
+    // becomes `/home/...` after the single-prefix strip.
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    if path.is_empty() {
+        return None;
+    }
+    Some(path.to_string())
 }
 
 /// Extract file paths from a unified-diff header. Reads `+++ b/<path>` lines
@@ -341,28 +788,256 @@ fn parse_diff_file_paths(unified_diff: &str) -> Vec<String> {
         } else {
             continue;
         };
-        // Drop optional tab-separated timestamp/metadata, trim whitespace.
-        let path = path.split('\t').next().unwrap_or(path).trim();
-        if path == "/dev/null" {
-            continue;
-        }
-        // Strip exactly one git-style `a/` or `b/` prefix. Codex sometimes
-        // produces `b//home/...` (double slash) for absolute paths; that
-        // becomes `/home/...` after the single-prefix strip, which is
-        // exactly what we want.
-        let path = path
-            .strip_prefix("a/")
-            .or_else(|| path.strip_prefix("b/"))
-            .unwrap_or(path);
-        if path.is_empty() {
-            continue;
-        }
-        let owned = path.to_string();
-        if !out.iter().any(|p| p == &owned) {
-            out.push(owned);
+        if let Some(path) = normalize_diff_file_path(path) {
+            if !out.iter().any(|p| p == &path) {
+                out.push(path);
+            }
         }
     }
     out
+}
+
+fn diff_line_text(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn is_unified_file_boundary(lines: &[&str], idx: usize) -> bool {
+    let line = diff_line_text(lines[idx]);
+    line.starts_with("diff --git ")
+        || (line.starts_with("--- ")
+            && lines
+                .get(idx + 1)
+                .is_some_and(|next| diff_line_text(next).starts_with("+++ ")))
+}
+
+fn split_unified_diff_by_file(unified_diff: &str) -> Vec<(String, String)> {
+    if unified_diff.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<&str> = unified_diff.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        lines.push(unified_diff);
+    }
+
+    let mut starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            diff_line_text(line)
+                .starts_with("diff --git ")
+                .then_some(idx)
+        })
+        .collect();
+    if starts.is_empty() {
+        for idx in 0..lines.len() {
+            if is_unified_file_boundary(&lines, idx) {
+                starts.push(idx);
+            }
+        }
+    }
+    if starts.is_empty() {
+        let files = parse_diff_file_paths(unified_diff);
+        return files
+            .into_iter()
+            .next()
+            .map(|path| vec![(path, unified_diff.to_string())])
+            .unwrap_or_default();
+    }
+
+    let mut out = Vec::new();
+    for (i, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(lines.len());
+        let block = lines[start..end].concat();
+        if let Some(path) = parse_diff_file_paths(&block).into_iter().next() {
+            out.push((path, block));
+        }
+    }
+    out
+}
+
+fn external_diff_log_body(message: &str) -> Option<&str> {
+    if !message.starts_with("External agent diff") {
+        return None;
+    }
+    let first_line_end = message.find('\n')?;
+    let body = &message[first_line_end + 1..];
+    if body.contains("diff --git ") || body.contains("--- ") || body.contains("@@ ") {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn parse_session_diff_file_paths(log_dir: &Path) -> Vec<String> {
+    let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+
+    let mut out = Vec::new();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(message) = value.get("message").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(diff_body) = external_diff_log_body(message) else {
+            continue;
+        };
+        for path in parse_diff_file_paths(diff_body) {
+            if !out.iter().any(|p| p == &path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn resolve_diff_file_path(project_root: &Path, display_path: &str) -> Option<PathBuf> {
+    let path = Path::new(display_path);
+    if path.is_absolute() {
+        return (path.starts_with(project_root)
+            || path.starts_with("/tmp")
+            || path.starts_with("/private/tmp"))
+        .then(|| path.to_path_buf());
+    }
+
+    if path.components().any(|component| {
+        matches!(
+            component,
+            std::path::Component::ParentDir
+                | std::path::Component::RootDir
+                | std::path::Component::Prefix(_)
+        )
+    }) {
+        return None;
+    }
+
+    Some(project_root.join(path))
+}
+
+fn read_diff_file_text(project_root: &Path, display_path: &str) -> Option<Option<String>> {
+    let path = resolve_diff_file_path(project_root, display_path)?;
+    match std::fs::read_to_string(path) {
+        Ok(text) => Some(Some(text)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Some(None),
+        Err(_) => None,
+    }
+}
+
+struct ExternalDiffDelta {
+    files_changed: Vec<String>,
+    unified_diff: String,
+}
+
+#[derive(Default)]
+struct ExternalDiffDeltaTracker {
+    snapshots: HashMap<String, Option<String>>,
+}
+
+impl ExternalDiffDeltaTracker {
+    fn seed_current_paths<'a>(
+        &mut self,
+        project_root: &Path,
+        paths: impl IntoIterator<Item = &'a str>,
+    ) {
+        for path in paths {
+            let Some(path) = normalize_diff_file_path(path) else {
+                continue;
+            };
+            let Some(current) = read_diff_file_text(project_root, &path) else {
+                continue;
+            };
+            self.snapshots.insert(path, current);
+        }
+    }
+
+    fn seed_from_session_log(&mut self, project_root: &Path, log_dir: &Path) {
+        let paths = parse_session_diff_file_paths(log_dir);
+        self.seed_current_paths(project_root, paths.iter().map(String::as_str));
+    }
+
+    fn delta(
+        &mut self,
+        project_root: &Path,
+        files_changed: &[String],
+        unified_diff: &str,
+    ) -> Option<ExternalDiffDelta> {
+        let mut ordered_paths = Vec::new();
+        let mut seen = HashSet::new();
+        let mut block_by_path = HashMap::new();
+
+        for (path, block) in split_unified_diff_by_file(unified_diff) {
+            if seen.insert(path.clone()) {
+                ordered_paths.push(path.clone());
+            }
+            block_by_path.entry(path).or_insert(block);
+        }
+
+        for path in files_changed {
+            if let Some(path) = normalize_diff_file_path(path) {
+                if seen.insert(path.clone()) {
+                    ordered_paths.push(path);
+                }
+            }
+        }
+
+        let mut previously_tracked: Vec<String> = self.snapshots.keys().cloned().collect();
+        previously_tracked.sort();
+        for path in previously_tracked {
+            if seen.insert(path.clone()) {
+                ordered_paths.push(path);
+            }
+        }
+
+        let mut delta_diff = String::new();
+        let mut delta_files = Vec::new();
+
+        for path in ordered_paths {
+            let current = read_diff_file_text(project_root, &path).flatten();
+            let maybe_delta = if let Some(previous) = self.snapshots.get(&path) {
+                if previous == &current {
+                    None
+                } else {
+                    Some(file_watcher::compute_unified_diff(
+                        previous.as_deref().unwrap_or(""),
+                        current.as_deref().unwrap_or(""),
+                        &path,
+                    ))
+                }
+            } else if let Some(block) = block_by_path.get(&path) {
+                Some(block.clone())
+            } else {
+                current
+                    .as_ref()
+                    .map(|text| file_watcher::compute_unified_diff("", text, &path))
+            };
+
+            self.snapshots.insert(path.clone(), current);
+
+            let Some(file_delta) = maybe_delta else {
+                continue;
+            };
+            if file_delta.trim().is_empty() {
+                continue;
+            }
+            delta_files.push(path);
+            delta_diff.push_str(&file_delta);
+            if !delta_diff.ends_with('\n') {
+                delta_diff.push('\n');
+            }
+        }
+
+        if delta_diff.trim().is_empty() {
+            None
+        } else {
+            Some(ExternalDiffDelta {
+                files_changed: delta_files,
+                unified_diff: delta_diff,
+            })
+        }
+    }
 }
 
 /// Resolve external agent backend from shared state (written by the web UI),
@@ -374,6 +1049,30 @@ async fn resolve_agent_backend(
     resolve_agent_backend_from_config(shared.read().await.clone(), project)
 }
 
+fn codex_context_trace_dir(
+    session_log: &SharedSessionLog,
+    context_archive: &str,
+) -> (Option<PathBuf>, bool) {
+    match project::normalize_codex_context_archive(context_archive).as_str() {
+        "off" => (None, false),
+        "exact" => (
+            session_log
+                .lock()
+                .ok()
+                .map(|log| log.dir().join("model-request-traces")),
+            false,
+        ),
+        _ => {
+            let session = session_log_id(session_log)
+                .unwrap_or_else(|| uuid::Uuid::new_v4().simple().to_string());
+            let dir = std::env::temp_dir()
+                .join("intendant-context-traces")
+                .join(format!("{session}-{}", uuid::Uuid::new_v4().simple()));
+            (Some(dir), true)
+        }
+    }
+}
+
 /// Construct, initialize, and start a thread for an external agent backend.
 ///
 /// Returns the agent, thread handle, and event receiver. The caller owns the
@@ -383,6 +1082,9 @@ async fn create_external_agent(
     project: &Project,
     session_log: &SharedSessionLog,
     web_port: Option<u16>,
+    resume_session: Option<String>,
+    mcp_session_id: Option<String>,
+    codex_service_tier: Option<String>,
 ) -> Result<
     (
         Box<dyn external_agent::ExternalAgent>,
@@ -393,18 +1095,25 @@ async fn create_external_agent(
 > {
     use external_agent::{AgentBackend, AgentConfig};
 
-    let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend
-    {
+    let mcp_session_id = mcp_session_id.or_else(|| session_log_id(session_log));
+
+    let (mut agent, config): (Box<dyn external_agent::ExternalAgent>, AgentConfig) = match backend {
         AgentBackend::Codex => {
             let cfg = &project.config.agent.codex;
             let sandbox_mode = project::normalize_sandbox_mode(&cfg.sandbox);
             let reasoning_effort =
                 project::normalize_reasoning_effort(cfg.reasoning_effort.as_deref());
+            let codex_managed_context =
+                project::codex_managed_context_enabled(&cfg.managed_context);
+            let context_archive = project::normalize_codex_context_archive(&cfg.context_archive);
+            let (request_trace_dir, request_trace_temporary) =
+                codex_context_trace_dir(session_log, &context_archive);
             let opts = external_agent::codex::CodexAgentOptions {
                 reasoning_effort: reasoning_effort.clone(),
                 web_search: cfg.web_search,
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
+                managed_context: codex_managed_context,
             };
             let agent = Box::new(external_agent::codex::CodexAgent::with_options(
                 cfg.command.clone(),
@@ -417,13 +1126,21 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
+                request_trace_dir,
+                request_trace_temporary,
+                context_archive,
                 approval_policy: cfg.approval_policy.clone(),
                 sandbox: sandbox_mode,
                 reasoning_effort,
+                service_tier: codex_service_tier
+                    .or_else(|| project::normalize_codex_service_tier(cfg.service_tier.as_deref())),
                 web_search: cfg.web_search,
                 network_access: cfg.network_access,
                 writable_roots: cfg.writable_roots.clone(),
+                codex_managed_context,
                 web_port,
+                mcp_session_id: mcp_session_id.clone(),
+                resume_session: resume_session.clone(),
             };
             (agent, config)
         }
@@ -447,6 +1164,9 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
+                request_trace_dir: None,
+                request_trace_temporary: false,
+                context_archive: "off".to_string(),
                 // `AgentConfig.approval_policy` is Codex's `-a` flag; for
                 // Gemini we reuse the field as the ACP approval hint so the
                 // sandbox/prompt layer can adjust if needed. Storing the
@@ -455,10 +1175,14 @@ async fn create_external_agent(
                 approval_policy: approval_mode,
                 sandbox: String::new(),
                 reasoning_effort: None,
+                service_tier: None,
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
+                codex_managed_context: false,
                 web_port,
+                mcp_session_id: None,
+                resume_session: resume_session.clone(),
             };
             (agent, config)
         }
@@ -474,13 +1198,20 @@ async fn create_external_agent(
             let config = AgentConfig {
                 model: cfg.model.clone(),
                 working_dir: project.root.clone(),
+                request_trace_dir: None,
+                request_trace_temporary: false,
+                context_archive: "off".to_string(),
                 approval_policy: cfg.permission_mode.clone(),
                 sandbox: String::new(),
                 reasoning_effort: None,
+                service_tier: None,
                 web_search: false,
                 network_access: false,
                 writable_roots: Vec::new(),
+                codex_managed_context: false,
                 web_port,
+                mcp_session_id: None,
+                resume_session: resume_session.clone(),
             };
             (agent, config)
         }
@@ -500,16 +1231,27 @@ async fn create_external_agent(
 /// Configuration for `drain_external_agent_events`.
 struct DrainConfig<'a> {
     bus: &'a EventBus,
+    session_id: Option<String>,
+    alias_session_id: Option<String>,
     autonomy: SharedAutonomy,
     session_log: &'a SharedSessionLog,
+    project_root: &'a Path,
     log_dir: &'a Path,
     approval_registry: &'a event::ApprovalRegistry,
     json_approval: Option<&'a JsonApprovalSlot>,
+    /// Web dashboard port when serving (`--web`). `Some` means an interactive
+    /// frontend exists, so external-agent approval requests are surfaced to
+    /// the gate rather than auto-denied as if truly headless.
+    web_port: Option<u16>,
     agent_source: Option<String>,
     /// When true, `ToolStarted` just increments the turn counter without
     /// emitting `AgentStarted`. The presence path sets this to avoid
     /// duplicating the model reasoning that's already shown via ModelResponse.
     suppress_agent_started: bool,
+    /// Supervised external sessions have their own session log in addition to
+    /// the daemon's root log writer. Persist model responses here too so
+    /// per-session replay does not depend on the root session log.
+    persist_model_responses_inline: bool,
     /// When true and no `json_approval` slot is set, auto-deny approval
     /// requests (headless mode with no interactive input).
     headless: bool,
@@ -517,6 +1259,259 @@ struct DrainConfig<'a> {
     /// does not support mid-turn steering — queued items are drained on
     /// the next turn's follow-up message path.
     context_injection: &'a event::ContextInjectionQueue,
+}
+
+struct PendingRuntimeSteer {
+    session_id: Option<String>,
+    id: String,
+    text: String,
+}
+
+fn steer_id_has_been_handled(
+    handled_steer_ids: &std::collections::HashSet<String>,
+    id: &str,
+) -> bool {
+    !id.trim().is_empty() && handled_steer_ids.contains(id)
+}
+
+fn mark_steer_id_handled(handled_steer_ids: &mut std::collections::HashSet<String>, id: &str) {
+    if !id.trim().is_empty() {
+        handled_steer_ids.insert(id.to_string());
+    }
+}
+
+fn pending_runtime_steer_targets_session(
+    pending: &PendingRuntimeSteer,
+    session_id: &Option<String>,
+) -> bool {
+    pending.session_id.as_deref() == session_id.as_deref()
+}
+
+fn queued_steer_targets_session(
+    injection: &event::ContextInjection,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+) -> bool {
+    if injection.steer_id.is_none() {
+        return false;
+    }
+    let Some(target) = injection
+        .target_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|target| !target.is_empty())
+    else {
+        return true;
+    };
+    session_id == Some(target) || alias_session_id == Some(target)
+}
+
+fn has_queued_steers_for_session(
+    context_injection: &event::ContextInjectionQueue,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+) -> bool {
+    context_injection
+        .lock()
+        .map(|queue| {
+            queue.iter().any(|injection| {
+                queued_steer_targets_session(injection, session_id, alias_session_id)
+            })
+        })
+        .unwrap_or(false)
+}
+
+fn flush_pending_runtime_steers_for_session(
+    bus: &EventBus,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    session_id: &Option<String>,
+) -> usize {
+    let mut delivered = 0usize;
+    let mut retained = std::collections::VecDeque::with_capacity(pending_runtime_steers.len());
+    while let Some(pending) = pending_runtime_steers.pop_front() {
+        if pending_runtime_steer_targets_session(&pending, session_id) {
+            delivered += 1;
+            bus.send(AppEvent::SteerDelivered {
+                session_id: pending.session_id,
+                id: pending.id,
+                mid_turn: true,
+            });
+        } else {
+            retained.push_back(pending);
+        }
+    }
+    *pending_runtime_steers = retained;
+    delivered
+}
+
+fn flush_pending_runtime_steers_for_model_checkpoint(
+    bus: &EventBus,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    session_id: &Option<String>,
+) -> usize {
+    flush_pending_runtime_steers_for_session(bus, pending_runtime_steers, session_id)
+}
+
+fn mark_pending_runtime_steers_delivered_at_model_checkpoint(
+    config: &DrainConfig<'_>,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    agent_name: &str,
+) {
+    // Codex records turn/steer input in its conversation log, but does not
+    // reliably echo it back through the app-server stream as a userMessage.
+    // Once the model produces new output, the runtime checkpoint happened and
+    // the accepted steer should no longer stay pinned in the dashboard queue.
+    let delivered = flush_pending_runtime_steers_for_model_checkpoint(
+        config.bus,
+        pending_runtime_steers,
+        &config.session_id,
+    );
+    if delivered > 0 {
+        slog(config.session_log, |l| {
+            l.info(&format!(
+                "Marked {} accepted {} steer(s) delivered at model checkpoint",
+                delivered, agent_name
+            ))
+        });
+    }
+}
+
+const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
+const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 64 * 1024;
+
+#[derive(Default)]
+struct ExternalContextSnapshotState {
+    emitted_keys: std::collections::HashSet<u64>,
+    last_error: Option<String>,
+}
+
+#[derive(Default)]
+struct ExternalToolOutputLimiter {
+    items: std::collections::HashMap<String, ExternalToolOutputState>,
+}
+
+#[derive(Default)]
+struct ExternalToolOutputState {
+    emitted_bytes: usize,
+    truncated: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedContextRewindOnlyPressure {
+    used_tokens: u64,
+    rewind_only_limit: u64,
+    hard_context_window: Option<u64>,
+    status: &'static str,
+}
+
+impl ExternalToolOutputLimiter {
+    fn filter(&mut self, item_id: &str, text: String) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+
+        let key = if item_id.is_empty() {
+            "<unknown>".to_string()
+        } else {
+            item_id.to_string()
+        };
+        let state = self.items.entry(key).or_default();
+
+        if state.emitted_bytes >= EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT {
+            if state.truncated {
+                return None;
+            }
+            state.truncated = true;
+            return Some(external_tool_output_truncation_notice());
+        }
+
+        let remaining = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - state.emitted_bytes;
+        if text.len() <= remaining {
+            state.emitted_bytes += text.len();
+            return Some(text);
+        }
+
+        let split_at = char_boundary_at_or_before(&text, remaining);
+        let mut out = text[..split_at].to_string();
+        out.push_str(&external_tool_output_truncation_notice());
+        state.emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT;
+        state.truncated = true;
+        Some(out)
+    }
+
+    fn complete(&mut self, item_id: &str) {
+        let key = if item_id.is_empty() {
+            "<unknown>"
+        } else {
+            item_id
+        };
+        self.items.remove(key);
+    }
+}
+
+fn external_tool_output_truncation_notice() -> String {
+    format!(
+        "\n\n[output truncated by Intendant after {} KiB for this tool; further output is hidden from Activity]\n",
+        EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT / 1024
+    )
+}
+
+fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn external_tool_preview_text(tool_name: &str, preview: &str) -> Option<String> {
+    let tool_name = tool_name.trim();
+    let preview = preview.trim();
+    match (tool_name.is_empty(), preview.is_empty()) {
+        (true, true) => None,
+        (true, false) => Some(preview.to_string()),
+        (false, true) => Some(tool_name.to_string()),
+        (false, false) => Some(format!("{tool_name}: {preview}")),
+    }
+}
+
+fn external_agent_log_source(agent_source: Option<&str>) -> String {
+    agent_source
+        .filter(|source| !source.trim().is_empty())
+        .unwrap_or("worker")
+        .to_string()
+}
+
+fn external_tool_failure_content(
+    item_id: &str,
+    message: &str,
+    tool_preview: Option<&str>,
+) -> String {
+    let preview = tool_preview.map(str::trim).filter(|s| !s.is_empty());
+    let command = preview.and_then(|preview| preview.strip_prefix("command: ").map(str::trim));
+    let label = if command.is_some() {
+        "Command failed"
+    } else {
+        "Tool failed"
+    };
+
+    let mut content = if item_id.trim().is_empty() {
+        format!("{label}: {message}")
+    } else {
+        format!("{label} ({item_id}): {message}")
+    };
+
+    if let Some(command) = command {
+        content.push_str("\nCommand: ");
+        content.push_str(command);
+    } else if let Some(preview) = preview {
+        content.push_str("\nTool: ");
+        content.push_str(preview);
+    }
+    content
 }
 
 /// Result of draining one batch of external agent events.
@@ -534,12 +1529,4151 @@ enum DrainOutcome {
     },
     /// The event channel was closed unexpectedly.
     ChannelClosed,
+    /// The backend finished a turn in a recoverable error state. The external
+    /// agent process is still usable, but the caller must not immediately
+    /// submit another ordinary continuation.
+    RecoveryRequired {
+        message: String,
+        recovery_hint: Option<String>,
+        turns_in_round: usize,
+    },
     /// A user-requested interrupt completed cleanly. The agent was asked to
     /// cancel its turn (e.g. via `session/cancel` or `turn/interrupt`) and
     /// acknowledged with a terminal event. The caller should break its
     /// outer loop the same way it would for `TurnCompleted`, but MUST NOT
     /// wait for a follow-up message — the interrupt *is* the follow-up.
     Interrupted { reason: String },
+    /// A model/tool requested context rewind during the active turn. The drain
+    /// waits until the backend reports the turn complete, then returns this so
+    /// the caller can apply the rollback while the thread is idle.
+    ContextRewindRequested {
+        request: ExternalContextRewindRequest,
+        message: Option<String>,
+        turns_in_round: usize,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalBackendRecovery {
+    message: String,
+    recovery_hint: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalContextRewindRequest {
+    session_id: Option<String>,
+    item_id: String,
+    position: external_agent::RollbackAnchorPosition,
+    reason: Option<String>,
+    primer: Option<String>,
+    preserve: Vec<String>,
+    discard: Vec<String>,
+    artifacts: Vec<String>,
+    next_steps: Vec<String>,
+    auto_resume: bool,
+}
+
+#[derive(Debug, Default)]
+struct CodexThreadActionDedupe {
+    seen: HashSet<String>,
+    order: VecDeque<String>,
+}
+
+impl CodexThreadActionDedupe {
+    const MAX_SEEN: usize = 512;
+
+    fn mark_seen(&mut self, request_id: &str) -> bool {
+        if self.seen.contains(request_id) {
+            return false;
+        }
+        let request_id = request_id.to_string();
+        self.seen.insert(request_id.clone());
+        self.order.push_back(request_id);
+        while self.order.len() > Self::MAX_SEEN {
+            if let Some(oldest) = self.order.pop_front() {
+                self.seen.remove(&oldest);
+            }
+        }
+        true
+    }
+}
+
+impl ExternalContextRewindRequest {
+    fn rendered_primer(
+        &self,
+        record_id: Option<&str>,
+        carried_forward_prior_facts: Option<&str>,
+    ) -> Option<String> {
+        let primer = self.primer.as_deref()?.trim();
+        if primer.is_empty() {
+            return None;
+        }
+        let mut out = String::from(
+            "<model_context_rewind_primer>\nHistory after the rewind target was pruned by rewind_context. Earlier history before the target is still present. Treat this primer as the carry-forward summary of only the pruned span.\n\n",
+        );
+        push_context_rewind_text_section(
+            &mut out,
+            "Reason",
+            self.reason.as_deref().unwrap_or("context rewind"),
+        );
+        if let Some(record_id) = record_id.map(str::trim).filter(|id| !id.is_empty()) {
+            push_context_rewind_text_section(&mut out, "Record id", record_id);
+        }
+        push_context_rewind_text_section(&mut out, "Primer", primer);
+        push_context_rewind_list_section(&mut out, "Preserve", &self.preserve);
+        push_context_rewind_list_section(&mut out, "Discard", &self.discard);
+        push_context_rewind_list_section(&mut out, "Artifacts", &self.artifacts);
+        push_context_rewind_list_section(&mut out, "Next steps", &self.next_steps);
+        if let Some(facts) = carried_forward_prior_facts
+            .map(str::trim)
+            .filter(|facts| !facts.is_empty())
+        {
+            push_context_rewind_text_section(
+                &mut out,
+                "Previous managed-context primer facts not repeated above",
+                facts,
+            );
+        }
+        out.push_str("</model_context_rewind_primer>");
+        Some(out)
+    }
+
+    fn resume_followup(&self) -> Option<FollowUpMessage> {
+        if !self.auto_resume || self.primer.as_deref()?.trim().is_empty() {
+            return None;
+        }
+        Some(FollowUpMessage::text(
+            "<context_rewind_resumed>\nContinue from the model_context_rewind_primer that Intendant injected as developer context for the pruned span. Do not redo discarded work; continue with the next useful step.\n</context_rewind_resumed>"
+                .to_string(),
+        ))
+    }
+
+    fn target_label(&self) -> String {
+        format!("{} item {}", self.position.as_str(), self.item_id)
+    }
+}
+
+fn context_rewind_should_interrupt_active_turn(request: &ExternalContextRewindRequest) -> bool {
+    // Model-origin managed rewinds must make the active Codex turn idle before
+    // Intendant can apply the rewrite. Relying on the model to stop after the
+    // tool result is brittle under context pressure: a single response can keep
+    // issuing recovery tools and grow context before the scheduler runs.
+    request.auto_resume
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ResolvedContextRewindAnchor {
+    item_id: String,
+}
+
+impl ResolvedContextRewindAnchor {
+    fn requested(item_id: &str) -> Self {
+        Self {
+            item_id: item_id.to_string(),
+        }
+    }
+
+    fn target_label(&self, position: external_agent::RollbackAnchorPosition) -> String {
+        format!("{} item {}", position.as_str(), self.item_id)
+    }
+}
+
+fn push_context_rewind_text_section(out: &mut String, label: &str, value: &str) {
+    let value = value.trim();
+    if value.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push_str(":\n");
+    out.push_str(value);
+    out.push_str("\n\n");
+}
+
+fn push_context_rewind_list_section(out: &mut String, label: &str, values: &[String]) {
+    if values.is_empty() {
+        return;
+    }
+    out.push_str(label);
+    out.push_str(":\n");
+    for value in values {
+        out.push_str("- ");
+        out.push_str(value);
+        out.push('\n');
+    }
+    out.push('\n');
+}
+
+fn clean_context_rewind_list(params: &serde_json::Value, key: &str) -> Vec<String> {
+    params
+        .get(key)
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+fn optional_trimmed_string(params: &serde_json::Value, key: &str) -> Option<String> {
+    params
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+}
+
+fn context_rewind_anchor_item_id(params: &serde_json::Value) -> Option<String> {
+    params
+        .pointer("/anchor/itemId")
+        .and_then(|value| value.as_str())
+        .or_else(|| {
+            params
+                .pointer("/anchor/item_id")
+                .and_then(|value| value.as_str())
+        })
+        .or_else(|| params.get("itemId").and_then(|value| value.as_str()))
+        .or_else(|| params.get("item_id").and_then(|value| value.as_str()))
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|item_id| !item_id.is_empty())
+        .map(str::to_string)
+}
+
+fn context_rewind_anchor_position(
+    params: &serde_json::Value,
+) -> Option<external_agent::RollbackAnchorPosition> {
+    match params
+        .pointer("/anchor/position")
+        .and_then(|value| value.as_str())
+        .or_else(|| params.get("position").and_then(|value| value.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => external_agent::RollbackAnchorPosition::from_str(value),
+        None => Some(external_agent::RollbackAnchorPosition::After),
+    }
+}
+
+fn is_context_rewind_action(action: &str) -> bool {
+    matches!(
+        action,
+        "rewind_context"
+            | "rewind-context"
+            | "rewind-anchor"
+            | "rewind_anchor"
+            | "rewind-to-item"
+            | "rewind_to_item"
+            | "rollback-anchor"
+            | "rollback_anchor"
+            | "rollback-to-item"
+            | "rollback_to_item"
+    )
+}
+
+fn external_context_rewind_request_from_action(
+    action: &str,
+    params: &serde_json::Value,
+    session_id: Option<String>,
+) -> Option<Result<ExternalContextRewindRequest, String>> {
+    if !is_context_rewind_action(action) {
+        return None;
+    }
+
+    let item_id = match context_rewind_anchor_item_id(params) {
+        Some(item_id) => item_id,
+        None => {
+            return Some(Err(
+                "rewind_context requires anchor.item_id or itemId".to_string()
+            ));
+        }
+    };
+    let position = match context_rewind_anchor_position(params) {
+        Some(position) => position,
+        None => {
+            return Some(Err(
+                "rewind_context anchor.position must be `before` or `after`".to_string(),
+            ));
+        }
+    };
+    let is_model_rewind = matches!(action, "rewind_context" | "rewind-context");
+    let reason = optional_trimmed_string(params, "reason");
+    let primer = optional_trimmed_string(params, "primer");
+    if is_model_rewind {
+        if reason.is_none() {
+            return Some(Err("rewind_context requires a non-empty reason".to_string()));
+        }
+        if primer.is_none() {
+            return Some(Err("rewind_context requires a non-empty primer".to_string()));
+        }
+    }
+
+    Some(Ok(ExternalContextRewindRequest {
+        session_id,
+        item_id,
+        position,
+        reason,
+        primer,
+        preserve: clean_context_rewind_list(params, "preserve"),
+        discard: clean_context_rewind_list(params, "discard"),
+        artifacts: clean_context_rewind_list(params, "artifacts"),
+        next_steps: clean_context_rewind_list(params, "next_steps"),
+        auto_resume: is_model_rewind,
+    }))
+}
+
+fn backend_recovery_outcome_or_context_rewind(
+    request: Option<ExternalContextRewindRequest>,
+    recovery: Option<ExternalBackendRecovery>,
+    message: Option<String>,
+    turns_in_round: usize,
+) -> DrainOutcome {
+    if let Some(request) = request {
+        return DrainOutcome::ContextRewindRequested {
+            request,
+            message,
+            turns_in_round,
+        };
+    }
+    if let Some(recovery) = recovery {
+        return DrainOutcome::RecoveryRequired {
+            message: recovery.message,
+            recovery_hint: recovery.recovery_hint,
+            turns_in_round,
+        };
+    }
+    DrainOutcome::TurnCompleted {
+        message,
+        turns_in_round,
+    }
+}
+
+fn recovery_required_message(message: &str, recovery_hint: Option<&str>) -> String {
+    let mut out = format!("External agent recovery required after backend error: {message}");
+    if let Some(hint) = recovery_hint.filter(|hint| !hint.trim().is_empty()) {
+        out.push_str("\nRecovery: ");
+        out.push_str(hint.trim());
+    }
+    out
+}
+
+fn resolve_context_rewind_anchor(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+) -> Result<ResolvedContextRewindAnchor, String> {
+    let requested_item_id = requested_item_id.trim();
+    if requested_item_id.is_empty() {
+        return Err("rewind anchor item id is required".to_string());
+    }
+
+    let anchor = find_context_rewind_anchor_entry(source_rollout_path, requested_item_id).map_err(
+        |err| {
+            format!(
+                "failed to inspect rollout anchors in {}: {err}",
+                source_rollout_path.display()
+            )
+        },
+    )?;
+    if anchor.is_none() {
+        return Err(format!(
+            "rollback anchor item_id `{requested_item_id}` was not found in {}; call list_rewind_anchors to inspect valid exact anchors before retrying",
+            source_rollout_path.display()
+        ));
+    }
+
+    Ok(ResolvedContextRewindAnchor::requested(requested_item_id))
+}
+
+fn context_rewind_anchor_prefix_estimate(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    position: external_agent::RollbackAnchorPosition,
+) -> Option<u64> {
+    match position {
+        external_agent::RollbackAnchorPosition::Before => {
+            anchor.prefix_estimated_tokens_before_anchor
+        }
+        external_agent::RollbackAnchorPosition::After => {
+            anchor.prefix_estimated_tokens_after_anchor
+        }
+    }
+}
+
+fn validate_context_rewind_anchor_restore_headroom(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> Result<(), String> {
+    let requested_item_id = requested_item_id.trim();
+    let Some(anchor) = find_context_rewind_anchor_entry(source_rollout_path, requested_item_id)
+        .map_err(|err| {
+            format!(
+                "failed to inspect rollout anchors in {}: {err}",
+                source_rollout_path.display()
+            )
+        })?
+    else {
+        return Ok(());
+    };
+
+    let Some(rewind_only_limit) = anchor.rewind_only_limit_at_or_after_anchor else {
+        return Ok(());
+    };
+    let Some(prefix_tokens) = context_rewind_anchor_prefix_estimate(&anchor, position) else {
+        return Ok(());
+    };
+    if context_rewind_anchor_has_recovery_headroom(prefix_tokens, rewind_only_limit) {
+        if let Some(outcome) = latest_context_rewind_outcome_for_anchor(
+            source_rollout_path,
+            requested_item_id,
+            position,
+        )
+        .map_err(|err| {
+            format!(
+                "failed to inspect prior rewind outcomes in {}: {err}",
+                source_rollout_path.display()
+            )
+        })? {
+            if context_rewind_anchor_has_recovery_headroom(
+                outcome.used_tokens,
+                outcome.rewind_only_limit,
+            ) {
+                return Ok(());
+            }
+            return Err(format!(
+                "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: a prior rewind to {} item was followed by {} tokens against the {} token rewind-only limit. Call list_rewind_anchors again and choose an anchor whose recovery_eligible field is true.",
+                position.as_str(),
+                outcome.used_tokens,
+                outcome.rewind_only_limit
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: restoring {} item would keep an estimated {} prefix tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Call list_rewind_anchors again and choose an anchor whose recovery_eligible field is true.",
+        position.as_str(),
+        prefix_tokens,
+        CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS,
+        rewind_only_limit
+    ))
+}
+
+fn context_rewind_thread_id_candidates(
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+) -> Vec<String> {
+    let mut ids = Vec::new();
+    for id in [session_id, alias_session_id]
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        if !ids.iter().any(|existing| existing == id) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+fn active_context_rewind_thread_ids(config: &DrainConfig<'_>) -> Vec<String> {
+    context_rewind_thread_id_candidates(
+        config.session_id.as_deref(),
+        config.alias_session_id.as_deref(),
+    )
+}
+
+async fn validate_context_rewind_request_before_schedule(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread_ids: &[String],
+    request: &ExternalContextRewindRequest,
+) -> Result<(), String> {
+    if !agent.supports_item_anchor_rewind() {
+        return Err(format!(
+            "{} does not support item-anchor rewind",
+            agent.name()
+        ));
+    }
+    if thread_ids.is_empty() {
+        return Err(
+            "cannot validate context rewind: active Codex thread id is unknown".to_string(),
+        );
+    }
+
+    let mut metadata_errors = Vec::new();
+    for thread_id in thread_ids {
+        match agent.read_thread_snapshot(thread_id).await {
+            Ok(snapshot) => {
+                let source_rollout_path = snapshot.rollout_path.ok_or_else(|| {
+                    format!("thread metadata for {thread_id} did not include a rollout path")
+                })?;
+                resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
+                validate_context_rewind_anchor_restore_headroom(
+                    &source_rollout_path,
+                    &request.item_id,
+                    request.position,
+                )?;
+                return Ok(());
+            }
+            Err(e) => metadata_errors.push(format!("{thread_id}: {e}")),
+        }
+    }
+
+    Err(format!(
+        "failed to read thread metadata before rewind for active thread candidates [{}]: {}",
+        thread_ids.join(", "),
+        metadata_errors.join("; ")
+    ))
+}
+
+fn find_context_rewind_anchor_entry(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+) -> io::Result<Option<ContextRewindAnchorCatalogEntry>> {
+    Ok(scan_context_rewind_anchor_catalog(source_rollout_path)?
+        .into_iter()
+        .find(|anchor| anchor.item_id == requested_item_id))
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RolloutUserTurn {
+    index: u32,
+    line: usize,
+    text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ManagedContextEditBranchTarget {
+    record_id: String,
+    parent_thread_id: String,
+    recovery_rollout_path: PathBuf,
+    source_turn_count: u32,
+    target_turn_text: String,
+}
+
+fn rollout_user_turns(rollout_path: &Path) -> io::Result<Vec<RolloutUserTurn>> {
+    let file = std::fs::File::open(rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut saw_user_message_event = false;
+    let mut event_turns = Vec::new();
+    let mut fallback_turns = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        match entry.get("type").and_then(|value| value.as_str()) {
+            Some("event_msg") => {
+                let Some(payload) = entry.get("payload") else {
+                    continue;
+                };
+                match payload.get("type").and_then(|value| value.as_str()) {
+                    Some("user_message") => {
+                        saw_user_message_event = true;
+                        if let Some(text) = payload
+                            .get("message")
+                            .and_then(|value| value.as_str())
+                            .filter(|text| !is_codex_injected_user_text_for_main(text))
+                        {
+                            push_rollout_user_turn(
+                                &mut event_turns,
+                                line_index.saturating_add(1),
+                                text.to_string(),
+                            );
+                        }
+                    }
+                    Some("thread_rolled_back") => {
+                        let turns_to_drop = payload
+                            .get("num_turns")
+                            .and_then(|value| value.as_u64())
+                            .unwrap_or(0) as u32;
+                        truncate_rollout_user_turns(&mut event_turns, turns_to_drop);
+                        truncate_rollout_user_turns(&mut fallback_turns, turns_to_drop);
+                    }
+                    _ => {}
+                }
+            }
+            Some("response_item") => {
+                let Some(payload) = entry.get("payload") else {
+                    continue;
+                };
+                if let Some(text) = codex_payload_user_text(payload) {
+                    push_rollout_user_turn(&mut fallback_turns, line_index.saturating_add(1), text);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(if saw_user_message_event {
+        event_turns
+    } else {
+        fallback_turns
+    })
+}
+
+fn push_rollout_user_turn(turns: &mut Vec<RolloutUserTurn>, line: usize, text: String) {
+    turns.push(RolloutUserTurn {
+        index: turns.len().saturating_add(1) as u32,
+        line,
+        text,
+    });
+}
+
+fn truncate_rollout_user_turns(turns: &mut Vec<RolloutUserTurn>, turns_to_drop: u32) {
+    if turns_to_drop == 0 || turns.is_empty() {
+        return;
+    }
+    let keep = turns.len().saturating_sub(turns_to_drop as usize);
+    turns.truncate(keep);
+}
+
+fn managed_context_edit_record_dirs(
+    log_dir: &Path,
+    thread_id: &str,
+    session_id: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let mut push_dir = |path: PathBuf| {
+        if !path.is_dir() {
+            return;
+        }
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        if seen.insert(key) {
+            dirs.push(path);
+        }
+    };
+
+    push_dir(log_dir.to_path_buf());
+    let Some(home) = external_wrapper_index::home_from_log_dir(log_dir) else {
+        return dirs;
+    };
+
+    let ids = [Some(thread_id), session_id];
+    for id in ids
+        .into_iter()
+        .flatten()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        push_dir(home.join(".intendant").join("logs").join(id));
+        for record in external_wrapper_index::wrappers_for(&home, "codex", id) {
+            push_dir(PathBuf::from(record.log_path));
+        }
+    }
+
+    let logs_dir = home.join(".intendant").join("logs");
+    if let Ok(entries) = std::fs::read_dir(logs_dir) {
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.is_dir() && context_rewind::records_dir(&path).is_dir() {
+                push_dir(path);
+            }
+        }
+    }
+
+    dirs
+}
+
+fn managed_context_edit_records(
+    log_dir: &Path,
+    thread_id: &str,
+    session_id: Option<&str>,
+) -> Result<Vec<context_rewind::ContextRewindRecord>, String> {
+    let mut records = Vec::new();
+    let mut seen = HashSet::new();
+    for dir in managed_context_edit_record_dirs(log_dir, thread_id, session_id) {
+        let mut from_dir = context_rewind::list_records(&dir).map_err(|err| {
+            format!(
+                "failed to list managed-context rewind records in {}: {err}",
+                dir.display()
+            )
+        })?;
+        from_dir.retain(|record| {
+            record.thread_id == thread_id
+                || session_id
+                    .is_some_and(|session_id| record.session_id.as_deref() == Some(session_id))
+        });
+        for record in from_dir {
+            let key = format!(
+                "{}\0{}\0{}",
+                record.record_id,
+                record.thread_id,
+                record
+                    .recovery_rollout_path
+                    .as_ref()
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default()
+            );
+            if seen.insert(key) {
+                records.push(record);
+            }
+        }
+    }
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    Ok(records)
+}
+
+fn managed_context_edit_text_matches(recorded: &str, original: Option<&str>) -> bool {
+    let Some(original) = original.map(str::trim).filter(|text| !text.is_empty()) else {
+        return true;
+    };
+    recorded.trim() == original
+}
+
+fn resolve_managed_context_edit_branch_target(
+    log_dir: &Path,
+    thread_id: &str,
+    session_id: Option<&str>,
+    user_turn_index: u32,
+    original_text: Option<&str>,
+) -> Result<Option<ManagedContextEditBranchTarget>, String> {
+    if user_turn_index == 0 {
+        return Ok(None);
+    }
+    let records = managed_context_edit_records(log_dir, thread_id, session_id)?;
+    let mut text_mismatches = Vec::new();
+
+    for record in records {
+        let matches_thread = record.thread_id == thread_id
+            || session_id
+                .is_some_and(|session_id| record.session_id.as_deref() == Some(session_id));
+        if !matches_thread {
+            continue;
+        }
+        let Some(recovery_rollout_path) = record.recovery_rollout_path.as_deref() else {
+            continue;
+        };
+        let turns = rollout_user_turns(recovery_rollout_path).map_err(|err| {
+            format!(
+                "failed to inspect archived rollout for rewind record {}: {err}",
+                record.record_id
+            )
+        })?;
+        let Some(turn) = turns.get(user_turn_index.saturating_sub(1) as usize) else {
+            continue;
+        };
+        if !managed_context_edit_text_matches(&turn.text, original_text) {
+            text_mismatches.push(record.record_id.clone());
+            continue;
+        }
+        return Ok(Some(ManagedContextEditBranchTarget {
+            record_id: record.record_id,
+            parent_thread_id: record.thread_id,
+            recovery_rollout_path: recovery_rollout_path.to_path_buf(),
+            source_turn_count: turns.len() as u32,
+            target_turn_text: turn.text.clone(),
+        }));
+    }
+
+    if !text_mismatches.is_empty() {
+        return Err(format!(
+            "found archived managed-context rollout(s) containing user turn {}, but none matched the clicked message text; refusing to branch from an ambiguous stale edit",
+            user_turn_index
+        ));
+    }
+    Ok(None)
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCatalogEntry {
+    ordinal: usize,
+    item_id: String,
+    first_line: usize,
+    last_line: usize,
+    first_item_type: String,
+    last_item_type: String,
+    positions: Vec<&'static str>,
+    position_hint: &'static str,
+    names: Vec<String>,
+    roles: Vec<String>,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_usage_at_or_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rewind_only_limit_at_or_after_anchor: Option<u64>,
+    #[serde(skip_serializing)]
+    prefix_estimated_tokens_before_anchor: Option<u64>,
+    #[serde(skip_serializing)]
+    prefix_estimated_tokens_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_tokens_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_rewind_usage_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_rewind_limit_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_eligible: Option<bool>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCatalog {
+    rollout_path: String,
+    total: usize,
+    filtered_total: usize,
+    offset: usize,
+    limit: usize,
+    next_offset: Option<usize>,
+    query: Option<String>,
+    include_management_tools: bool,
+    recovery_candidates_only: bool,
+    anchors: Vec<ContextRewindAnchorCatalogEntry>,
+    usage: &'static str,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorInspectItem {
+    line: usize,
+    item_type: String,
+    item_ids: Vec<String>,
+    names: Vec<String>,
+    roles: Vec<String>,
+    summary: String,
+    anchor_span: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ContextRewindAnchorInspection {
+    rollout_path: String,
+    anchor: ContextRewindAnchorCatalogEntry,
+    radius: usize,
+    context: Vec<ContextRewindAnchorInspectItem>,
+    usage: &'static str,
+}
+
+const CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT: usize = 5;
+const CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT: usize = 10;
+const CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS: usize = 2;
+const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
+const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
+const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
+const CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS: u64 = 8_000;
+const CONTEXT_REWIND_PRIOR_PRIMER_FACT_LIMIT: usize = 12_000;
+
+#[derive(Debug, Clone, Copy)]
+struct ContextRewindBackendUsageAtLine {
+    line: usize,
+    used_tokens: u64,
+    rewind_only_limit: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingContextRewindOutcome {
+    key: String,
+    prior_usage: Option<ContextRewindBackendUsageAtLine>,
+}
+
+fn context_rewind_anchor_outcome_key(
+    item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> String {
+    format!("{}\0{}", position.as_str(), item_id)
+}
+
+fn list_context_rewind_anchors_from_rollout(
+    source_rollout_path: &Path,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let offset = params
+        .get("offset")
+        .or_else(|| params.get("start_index"))
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let limit = params
+        .get("limit")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT)
+        .clamp(1, CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT);
+    let query = params
+        .get("query")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    let include_management_tools = params
+        .get("include_management_tools")
+        .or_else(|| params.get("includeManagementTools"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let recovery_candidates_only = params
+        .get("recovery_candidates_only")
+        .or_else(|| params.get("recoveryCandidatesOnly"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(true);
+    let include_non_recovery = params
+        .get("include_non_recovery")
+        .or_else(|| params.get("includeNonRecovery"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+    let reverse = params
+        .get("reverse")
+        .and_then(|value| value.as_bool())
+        .unwrap_or_else(|| {
+            params
+                .get("direction")
+                .and_then(|value| value.as_str())
+                .map(str::trim)
+                .is_some_and(|direction| direction.eq_ignore_ascii_case("backward"))
+        });
+
+    let mut anchors = scan_context_rewind_anchor_catalog(source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchors in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let total = anchors.len();
+    if !include_management_tools {
+        anchors.retain(|anchor| !context_rewind_anchor_is_management_tool(anchor));
+    }
+    if recovery_candidates_only && !include_non_recovery {
+        anchors.retain(|anchor| anchor.recovery_eligible != Some(false));
+    }
+    if reverse {
+        anchors.reverse();
+    }
+    if let Some(query) = query.as_deref() {
+        let needle = query.to_ascii_lowercase();
+        anchors.retain(|anchor| context_rewind_anchor_matches_query(anchor, &needle));
+    }
+    let filtered_total = anchors.len();
+    let page = anchors
+        .into_iter()
+        .skip(offset)
+        .take(limit)
+        .collect::<Vec<_>>();
+    let next_offset =
+        (offset.saturating_add(limit) < filtered_total).then_some(offset.saturating_add(limit));
+    let catalog = ContextRewindAnchorCatalog {
+        rollout_path: source_rollout_path.display().to_string(),
+        total,
+        filtered_total,
+        offset,
+        limit,
+        next_offset,
+        query,
+        include_management_tools,
+        recovery_candidates_only: recovery_candidates_only && !include_non_recovery,
+        anchors: page,
+        usage: "Use item_id exactly in rewind_context.anchor.item_id. Management calls are hidden by default; set include_management_tools=true only for internals. During recovery, anchors known at/above the rewind-only limit or without enough resume headroom are hidden unless include_non_recovery=true; absent recovery_eligible means no nearby backend usage sample. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too.",
+    };
+    serde_json::to_string(&catalog).map_err(|err| err.to_string())
+}
+
+fn inspect_context_rewind_anchor_from_rollout(
+    source_rollout_path: &Path,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let item_id = context_rewind_anchor_item_id(params)
+        .ok_or_else(|| "inspect_rewind_anchor requires anchor.item_id or item_id".to_string())?;
+    let radius = params
+        .get("radius")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS)
+        .min(CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS);
+    let anchors = scan_context_rewind_anchor_catalog(source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchors in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let anchor = anchors
+        .into_iter()
+        .find(|anchor| anchor.item_id == item_id)
+        .ok_or_else(|| {
+            format!(
+                "rollback anchor item_id `{item_id}` was not found in {}; call list_rewind_anchors to inspect valid exact anchors before retrying",
+                source_rollout_path.display()
+            )
+        })?;
+    let first_line = anchor.first_line.saturating_sub(radius).max(1);
+    let last_line = anchor.last_line.saturating_add(radius);
+    let file = std::fs::File::open(source_rollout_path).map_err(|err| {
+        format!(
+            "failed to inspect rewind anchor context in {}: {err}",
+            source_rollout_path.display()
+        )
+    })?;
+    let reader = io::BufReader::new(file);
+    let mut context = Vec::new();
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index.saturating_add(1);
+        if line_number < first_line || line_number > last_line {
+            continue;
+        }
+        let line = line.map_err(|err| {
+            format!(
+                "failed to read rewind anchor context in {}: {err}",
+                source_rollout_path.display()
+            )
+        })?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        let item_type = payload
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let item_ids = response_item_anchor_ids(payload);
+        let anchor_span = (line_number >= anchor.first_line && line_number <= anchor.last_line)
+            || item_ids
+                .iter()
+                .any(|candidate| candidate == &anchor.item_id);
+        context.push(ContextRewindAnchorInspectItem {
+            line: line_number,
+            item_type,
+            item_ids,
+            names: context_rewind_anchor_names(payload),
+            roles: context_rewind_anchor_roles(payload),
+            summary: context_rewind_anchor_summary(payload),
+            anchor_span,
+        });
+    }
+
+    let inspection = ContextRewindAnchorInspection {
+        rollout_path: source_rollout_path.display().to_string(),
+        anchor,
+        radius,
+        context,
+        usage: "Use this context to decide whether the selected item_id is the intended rewind point. If so, pass only the exact item_id and position to rewind_context; otherwise inspect another anchor.",
+    };
+    serde_json::to_string(&inspection).map_err(|err| err.to_string())
+}
+
+fn scan_context_rewind_anchor_catalog(
+    source_rollout_path: &Path,
+) -> io::Result<Vec<ContextRewindAnchorCatalogEntry>> {
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut anchors = Vec::<ContextRewindAnchorCatalogEntry>::new();
+    let mut by_item_id = HashMap::<String, usize>::new();
+    let mut backend_usage = Vec::<ContextRewindBackendUsageAtLine>::new();
+    let mut pending_rewind_outcome: Option<PendingContextRewindOutcome> = None;
+    let mut latest_rewind_outcomes = HashMap::<String, ContextRewindBackendUsageAtLine>::new();
+    let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
+    let mut prefix_estimated_tokens = 0_u64;
+
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let line_number = line_index.saturating_add(1);
+        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry) {
+            if let Some(pending) = pending_rewind_outcome.take() {
+                latest_rewind_outcomes.insert(
+                    pending.key,
+                    context_rewind_worse_usage(pending.prior_usage, usage),
+                );
+            }
+            latest_backend_usage = Some(usage);
+            backend_usage.push(usage);
+        }
+        if let Some(key) = context_rewind_rollback_anchor_outcome_key_from_rollout_entry(&entry) {
+            if let Some(pending) = pending_rewind_outcome.take() {
+                if let Some(prior_usage) = pending.prior_usage {
+                    latest_rewind_outcomes.insert(pending.key, prior_usage);
+                }
+            }
+            pending_rewind_outcome = Some(PendingContextRewindOutcome {
+                key,
+                prior_usage: latest_backend_usage
+                    .filter(|usage| line_number.saturating_sub(usage.line) <= 3),
+            });
+        }
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        let prefix_before_item = prefix_estimated_tokens;
+        prefix_estimated_tokens =
+            prefix_estimated_tokens.saturating_add(context_rewind_estimated_tokens(payload));
+        let prefix_after_item = prefix_estimated_tokens;
+        let item_type = payload
+            .get("type")
+            .and_then(|value| value.as_str())
+            .unwrap_or("unknown")
+            .to_string();
+        let names = context_rewind_anchor_names(payload);
+        let roles = context_rewind_anchor_roles(payload);
+        let summary = context_rewind_anchor_summary(payload);
+        for item_id in response_item_anchor_ids(payload) {
+            if let Some(index) = by_item_id.get(&item_id).copied() {
+                let anchor = &mut anchors[index];
+                anchor.last_line = line_number;
+                anchor.last_item_type = item_type.clone();
+                anchor.prefix_estimated_tokens_after_anchor = Some(prefix_after_item);
+                merge_string_set(&mut anchor.names, names.iter().cloned());
+                merge_string_set(&mut anchor.roles, roles.iter().cloned());
+                if !summary.is_empty() && !anchor.summary.contains(&summary) {
+                    if !anchor.summary.is_empty() {
+                        anchor.summary.push_str(" | ");
+                    }
+                    anchor.summary.push_str(&summary);
+                    truncate_string(
+                        &mut anchor.summary,
+                        CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT,
+                    );
+                }
+                continue;
+            }
+            let index = anchors.len();
+            by_item_id.insert(item_id.clone(), index);
+            anchors.push(ContextRewindAnchorCatalogEntry {
+                ordinal: index,
+                item_id,
+                first_line: line_number,
+                last_line: line_number,
+                first_item_type: item_type.clone(),
+                last_item_type: item_type.clone(),
+                positions: vec!["before", "after"],
+                position_hint: "after",
+                names: names.clone(),
+                roles: roles.clone(),
+                summary: summary.clone(),
+                backend_usage_at_or_after_anchor: None,
+                rewind_only_limit_at_or_after_anchor: None,
+                prefix_estimated_tokens_before_anchor: Some(prefix_before_item),
+                prefix_estimated_tokens_after_anchor: Some(prefix_after_item),
+                prefix_tokens_after: None,
+                latest_rewind_usage_after_anchor: None,
+                latest_rewind_limit_after_anchor: None,
+                recovery_eligible: None,
+            });
+        }
+    }
+    if let Some(pending) = pending_rewind_outcome {
+        if let Some(prior_usage) = pending.prior_usage {
+            latest_rewind_outcomes.insert(pending.key, prior_usage);
+        }
+    }
+
+    for anchor in &mut anchors {
+        let Some(usage) = backend_usage
+            .iter()
+            .find(|usage| usage.line >= anchor.last_line)
+            .copied()
+        else {
+            continue;
+        };
+        anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
+        anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
+        let backend_has_headroom =
+            context_rewind_anchor_has_recovery_headroom(usage.used_tokens, usage.rewind_only_limit);
+        let restore_prefix_has_headroom =
+            anchor
+                .prefix_estimated_tokens_after_anchor
+                .is_some_and(|prefix_tokens| {
+                    context_rewind_anchor_has_recovery_headroom(
+                        prefix_tokens,
+                        usage.rewind_only_limit,
+                    )
+                });
+        if !restore_prefix_has_headroom {
+            anchor.prefix_tokens_after = anchor.prefix_estimated_tokens_after_anchor;
+        }
+        let latest_rewind_outcome = latest_rewind_outcomes
+            .get(&context_rewind_anchor_outcome_key(
+                &anchor.item_id,
+                external_agent::RollbackAnchorPosition::After,
+            ))
+            .copied();
+        let latest_rewind_has_headroom = latest_rewind_outcome.is_none_or(|outcome| {
+            context_rewind_anchor_has_recovery_headroom(
+                outcome.used_tokens,
+                outcome.rewind_only_limit,
+            )
+        });
+        if let Some(outcome) = latest_rewind_outcome.filter(|_| !latest_rewind_has_headroom) {
+            anchor.latest_rewind_usage_after_anchor = Some(outcome.used_tokens);
+            anchor.latest_rewind_limit_after_anchor = Some(outcome.rewind_only_limit);
+        }
+        anchor.recovery_eligible =
+            Some(backend_has_headroom && restore_prefix_has_headroom && latest_rewind_has_headroom);
+    }
+
+    Ok(anchors)
+}
+
+fn latest_context_rewind_outcome_for_anchor(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> io::Result<Option<ContextRewindBackendUsageAtLine>> {
+    let key = context_rewind_anchor_outcome_key(requested_item_id, position);
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut pending = None::<PendingContextRewindOutcome>;
+    let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
+    let mut latest = None;
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let line_number = line_index.saturating_add(1);
+        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry) {
+            if let Some(pending_key) = pending.take() {
+                if pending_key.key == key {
+                    latest = Some(context_rewind_worse_usage(pending_key.prior_usage, usage));
+                }
+            }
+            latest_backend_usage = Some(usage);
+        }
+        if let Some(outcome_key) =
+            context_rewind_rollback_anchor_outcome_key_from_rollout_entry(&entry)
+        {
+            if let Some(pending_key) = pending.take() {
+                if pending_key.key == key {
+                    if let Some(prior_usage) = pending_key.prior_usage {
+                        latest = Some(prior_usage);
+                    }
+                }
+            }
+            pending = Some(PendingContextRewindOutcome {
+                key: outcome_key,
+                prior_usage: latest_backend_usage
+                    .filter(|usage| line_number.saturating_sub(usage.line) <= 3),
+            });
+        }
+    }
+    if let Some(pending_key) = pending {
+        if pending_key.key == key {
+            if let Some(prior_usage) = pending_key.prior_usage {
+                latest = Some(prior_usage);
+            }
+        }
+    }
+    Ok(latest)
+}
+
+fn context_rewind_estimated_tokens(value: &serde_json::Value) -> u64 {
+    let chars = serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| value.to_string().len());
+    std::cmp::max(1, chars.div_ceil(4) as u64)
+}
+
+fn context_rewind_anchor_has_recovery_headroom(used_tokens: u64, rewind_only_limit: u64) -> bool {
+    used_tokens < rewind_only_limit
+        && rewind_only_limit.saturating_sub(used_tokens)
+            >= CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS
+}
+
+fn context_rewind_worse_usage(
+    prior_usage: Option<ContextRewindBackendUsageAtLine>,
+    next_usage: ContextRewindBackendUsageAtLine,
+) -> ContextRewindBackendUsageAtLine {
+    let Some(prior_usage) = prior_usage else {
+        return next_usage;
+    };
+    let prior_has_headroom = context_rewind_anchor_has_recovery_headroom(
+        prior_usage.used_tokens,
+        prior_usage.rewind_only_limit,
+    );
+    let next_has_headroom = context_rewind_anchor_has_recovery_headroom(
+        next_usage.used_tokens,
+        next_usage.rewind_only_limit,
+    );
+    match (prior_has_headroom, next_has_headroom) {
+        (false, true) => prior_usage,
+        (true, false) => next_usage,
+        _ => {
+            let prior_remaining = prior_usage
+                .rewind_only_limit
+                .saturating_sub(prior_usage.used_tokens);
+            let next_remaining = next_usage
+                .rewind_only_limit
+                .saturating_sub(next_usage.used_tokens);
+            if prior_remaining <= next_remaining {
+                prior_usage
+            } else {
+                next_usage
+            }
+        }
+    }
+}
+
+fn context_rewind_backend_usage_from_rollout_entry(
+    line: usize,
+    entry: &serde_json::Value,
+) -> Option<ContextRewindBackendUsageAtLine> {
+    if entry.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type").and_then(|value| value.as_str()) != Some("token_count") {
+        return None;
+    }
+    let info = payload.get("info")?;
+    let rewind_only_limit = info
+        .get("model_context_window")
+        .or_else(|| info.get("modelContextWindow"))?
+        .as_u64()?;
+    if rewind_only_limit == 0 {
+        return None;
+    }
+    let last = info
+        .get("last_token_usage")
+        .or_else(|| info.get("lastTokenUsage"))?;
+    let used_tokens = last
+        .get("total_tokens")
+        .or_else(|| last.get("totalTokens"))?
+        .as_u64()?;
+    Some(ContextRewindBackendUsageAtLine {
+        line,
+        used_tokens,
+        rewind_only_limit,
+    })
+}
+
+fn context_rewind_rollback_anchor_outcome_key_from_rollout_entry(
+    entry: &serde_json::Value,
+) -> Option<String> {
+    if entry.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type").and_then(|value| value.as_str()) != Some("thread_rolled_back") {
+        return None;
+    }
+    let anchor = payload.get("anchor")?;
+    let item_id = anchor
+        .get("itemId")
+        .or_else(|| anchor.get("item_id"))?
+        .as_str()?
+        .trim();
+    if item_id.is_empty() {
+        return None;
+    }
+    let position = anchor
+        .get("position")
+        .and_then(|value| value.as_str())
+        .and_then(external_agent::RollbackAnchorPosition::from_str)
+        .unwrap_or(external_agent::RollbackAnchorPosition::After);
+    Some(context_rewind_anchor_outcome_key(item_id, position))
+}
+
+fn context_rewind_anchor_matches_query(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    needle: &str,
+) -> bool {
+    anchor.item_id.to_ascii_lowercase().contains(needle)
+        || anchor.first_item_type.to_ascii_lowercase().contains(needle)
+        || anchor.last_item_type.to_ascii_lowercase().contains(needle)
+        || anchor
+            .names
+            .iter()
+            .any(|name| name.to_ascii_lowercase().contains(needle))
+        || anchor
+            .roles
+            .iter()
+            .any(|role| role.to_ascii_lowercase().contains(needle))
+        || anchor.summary.to_ascii_lowercase().contains(needle)
+        || anchor.first_line.to_string() == needle
+        || anchor.last_line.to_string() == needle
+}
+
+fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
+    anchor.names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "list_rewind_anchors"
+                | "inspect_rewind_anchor"
+                | "rewind_context"
+                | "rewind_backout"
+                | "context_rewind_anchors"
+                | "context_rewind_anchor_inspect"
+                | "context_rewind"
+                | "context_rewind_backout"
+        )
+    })
+}
+
+fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
+    item.get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn context_rewind_anchor_roles(item: &serde_json::Value) -> Vec<String> {
+    item.get("role")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| vec![value.to_string()])
+        .unwrap_or_default()
+}
+
+fn context_rewind_anchor_summary(item: &serde_json::Value) -> String {
+    let item_type = item
+        .get("type")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown");
+    let mut summary = match item_type {
+        "message" => response_item_content_text(item)
+            .collect::<Vec<_>>()
+            .join(" "),
+        "function_call" | "custom_tool_call" | "local_shell_call" | "tool_search_call" => {
+            let name = item
+                .get("name")
+                .and_then(|value| value.as_str())
+                .unwrap_or("tool");
+            let arguments = item
+                .get("arguments")
+                .or_else(|| item.get("input"))
+                .and_then(|value| value.as_str())
+                .unwrap_or("");
+            format!("{name} {arguments}")
+        }
+        "function_call_output" | "custom_tool_call_output" | "tool_search_output" => item
+            .get("output")
+            .or_else(|| item.get("result"))
+            .and_then(|value| value.as_str())
+            .unwrap_or("tool output")
+            .to_string(),
+        _ => item_type.to_string(),
+    };
+    summary = summary.split_whitespace().collect::<Vec<_>>().join(" ");
+    truncate_string(&mut summary, CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT);
+    summary
+}
+
+fn merge_string_set(target: &mut Vec<String>, values: impl Iterator<Item = String>) {
+    for value in values {
+        if !target.iter().any(|existing| existing == &value) {
+            target.push(value);
+        }
+    }
+}
+
+fn truncate_string(value: &mut String, max_chars: usize) {
+    if value.chars().count() <= max_chars {
+        return;
+    }
+    *value = value.chars().take(max_chars).collect::<String>();
+    value.push_str("...");
+}
+
+fn response_item_content_text(item: &serde_json::Value) -> impl Iterator<Item = &str> {
+    item.get("content")
+        .and_then(|value| value.as_array())
+        .into_iter()
+        .flatten()
+        .filter_map(|content| {
+            content
+                .get("text")
+                .or_else(|| content.get("input_text"))
+                .or_else(|| content.get("output_text"))
+                .and_then(|value| value.as_str())
+        })
+}
+
+fn response_item_managed_context_rewind_primer_text(item: &serde_json::Value) -> Option<String> {
+    if item.get("type").and_then(|value| value.as_str()) != Some("message") {
+        return None;
+    }
+    let text = response_item_content_text(item)
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.contains("<model_context_rewind_primer>")
+        .then_some(text)
+}
+
+fn context_rewind_pruned_prior_primer_facts(
+    source_rollout_path: &Path,
+    anchor_item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+    request: &ExternalContextRewindRequest,
+) -> io::Result<Option<String>> {
+    let Some(current_primer) = request.rendered_primer(None, None) else {
+        return Ok(None);
+    };
+    let Some(anchor) = find_context_rewind_anchor_entry(source_rollout_path, anchor_item_id)?
+    else {
+        return Ok(None);
+    };
+
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut prior_primers = Vec::new();
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index.saturating_add(1);
+        let pruned_by_rewind = match position {
+            external_agent::RollbackAnchorPosition::After => line_number > anchor.last_line,
+            external_agent::RollbackAnchorPosition::Before => line_number >= anchor.first_line,
+        };
+        if !pruned_by_rewind {
+            continue;
+        }
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        if let Some(primer) = response_item_managed_context_rewind_primer_text(payload) {
+            prior_primers.push(primer);
+        }
+    }
+
+    Ok(context_rewind_unrepeated_prior_primer_facts(
+        &prior_primers,
+        &current_primer,
+    ))
+}
+
+fn context_rewind_unrepeated_prior_primer_facts(
+    prior_primers: &[String],
+    current_primer: &str,
+) -> Option<String> {
+    if prior_primers.is_empty() {
+        return None;
+    }
+    let current_normalized =
+        normalize_context_rewind_fact_for_compare(current_primer).to_ascii_lowercase();
+    let mut seen = HashSet::new();
+    let mut out = String::new();
+
+    for primer in prior_primers.iter().rev() {
+        for line in context_rewind_prior_primer_fact_lines(primer) {
+            let normalized = normalize_context_rewind_fact_for_compare(&line);
+            if normalized.is_empty() {
+                continue;
+            }
+            let normalized_lower = normalized.to_ascii_lowercase();
+            if current_normalized.contains(&normalized_lower) || !seen.insert(normalized_lower) {
+                continue;
+            }
+            let additional = line.len().saturating_add(1);
+            if out.len().saturating_add(additional) > CONTEXT_REWIND_PRIOR_PRIMER_FACT_LIMIT {
+                if !out.is_empty() {
+                    out.push_str("...\n");
+                }
+                return (!out.trim().is_empty()).then(|| out.trim().to_string());
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    (!out.trim().is_empty()).then(|| out.trim().to_string())
+}
+
+fn context_rewind_prior_primer_fact_lines(primer: &str) -> Vec<String> {
+    primer
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !context_rewind_prior_primer_admin_line(line))
+        .map(str::to_string)
+        .collect()
+}
+
+fn context_rewind_prior_primer_admin_line(line: &str) -> bool {
+    matches!(
+        line,
+        "<model_context_rewind_primer>"
+            | "</model_context_rewind_primer>"
+            | "Reason:"
+            | "Record id:"
+            | "Primer:"
+            | "Preserve:"
+            | "Discard:"
+            | "Artifacts:"
+            | "Next steps:"
+            | "Previous managed-context primer facts not repeated above:"
+    ) || line.starts_with("History after the rewind target was pruned")
+        || (line.starts_with("rewind-") && line.split_whitespace().count() == 1)
+}
+
+fn normalize_context_rewind_fact_for_compare(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+fn response_item_anchor_ids(item: &serde_json::Value) -> Vec<String> {
+    let mut ids = Vec::new();
+    match item.get("type").and_then(|value| value.as_str()) {
+        Some("message")
+        | Some("reasoning")
+        | Some("web_search_call")
+        | Some("image_generation_call") => {
+            push_json_string_id(item, &mut ids, "id");
+        }
+        Some("local_shell_call")
+        | Some("function_call")
+        | Some("tool_search_call")
+        | Some("custom_tool_call") => {
+            push_json_string_id(item, &mut ids, "id");
+            push_json_string_id(item, &mut ids, "call_id");
+            push_json_string_id(item, &mut ids, "callId");
+        }
+        Some("function_call_output")
+        | Some("tool_search_output")
+        | Some("custom_tool_call_output") => {
+            push_json_string_id(item, &mut ids, "call_id");
+            push_json_string_id(item, &mut ids, "callId");
+        }
+        _ => {}
+    }
+    ids
+}
+
+fn push_json_string_id(item: &serde_json::Value, ids: &mut Vec<String>, key: &str) {
+    if let Some(id) = item
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    {
+        ids.push(id.to_string());
+    }
+}
+
+async fn apply_external_context_rewind(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread_id: &str,
+    request: &ExternalContextRewindRequest,
+    config: &DrainConfig<'_>,
+) -> Result<Option<FollowUpMessage>, String> {
+    if !agent.supports_item_anchor_rewind() {
+        return Err(format!(
+            "{} does not support item-anchor rewind",
+            agent.name()
+        ));
+    }
+
+    let record_id = format!("rewind-{}", uuid::Uuid::new_v4().simple());
+    let snapshot = agent
+        .read_thread_snapshot(thread_id)
+        .await
+        .map_err(|e| format!("failed to read thread metadata before rewind: {}", e))?;
+    let source_rollout_path = snapshot
+        .rollout_path
+        .clone()
+        .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
+    let resolved_anchor = resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
+    validate_context_rewind_anchor_restore_headroom(
+        &source_rollout_path,
+        &resolved_anchor.item_id,
+        request.position,
+    )?;
+    let carried_forward_prior_facts = match context_rewind_pruned_prior_primer_facts(
+        &source_rollout_path,
+        &resolved_anchor.item_id,
+        request.position,
+        request,
+    ) {
+        Ok(facts) => facts,
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not inspect pruned prior managed-context primers before rewind {record_id}: {err}"
+                ))
+            });
+            None
+        }
+    };
+    let recovery_rollout_path =
+        context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
+            .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
+    let fission_snapshot = match context_rewind::read_fission_snapshot(config.log_dir, thread_id) {
+        Ok(snapshot) => snapshot,
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not snapshot fission/session relationships before rewind: {err}"
+                ))
+            });
+            None
+        }
+    };
+    let lineage_ledger = match lineage_ledger::read_lineage_ledger(config.log_dir, thread_id) {
+        Ok(ledger) => ledger,
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not snapshot lineage ledger before rewind: {err}"
+                ))
+            });
+            None
+        }
+    };
+    let fission_ledger =
+        match fission_ledger::read_fission_ledger_for_session(config.log_dir, thread_id) {
+            Ok(ledger) => ledger,
+            Err(err) => {
+                slog(config.session_log, |log| {
+                    log.warn(&format!(
+                        "Could not snapshot fission ledger before rewind: {err}"
+                    ))
+                });
+                None
+            }
+        };
+
+    let record = context_rewind::ContextRewindRecord {
+        record_id: record_id.clone(),
+        created_at: chrono::Utc::now().to_rfc3339(),
+        session_id: request
+            .session_id
+            .clone()
+            .or_else(|| config.session_id.clone()),
+        thread_id: snapshot.thread_id,
+        item_id: resolved_anchor.item_id.clone(),
+        position: request.position.as_str().to_string(),
+        reason: request.reason.clone(),
+        primer: request.primer.clone(),
+        preserve: request.preserve.clone(),
+        discard: request.discard.clone(),
+        artifacts: request.artifacts.clone(),
+        next_steps: request.next_steps.clone(),
+        source_rollout_path: Some(source_rollout_path),
+        recovery_rollout_path: Some(recovery_rollout_path),
+        fission_snapshot,
+        lineage_ledger,
+        fission_ledger,
+    };
+    // Perform the rollback BEFORE persisting the durable record. The recovery
+    // rollout was copied above (copy-before-mutation), but the record itself is
+    // only written once the rollback succeeds, so an invalid/stale anchor (which
+    // the backend rejects as a normal tool error) never leaves a success-looking
+    // orphan record on disk. On failure, delete the orphaned recovery-rollout copy.
+    if let Err(e) = agent
+        .rollback_thread_to_item_anchor(thread_id, &resolved_anchor.item_id, request.position)
+        .await
+    {
+        if let Err(cleanup) = context_rewind::remove_recovery_rollout(config.log_dir, &record_id) {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Failed to clean up recovery rollout after failed rewind {record_id}: {cleanup}"
+                ))
+            });
+        }
+        return Err(format!("thread rollback failed: {}", e));
+    }
+
+    context_rewind::persist_record(config.log_dir, &record)
+        .map_err(|e| format!("failed to persist context rewind record: {}", e))?;
+
+    if let Some(primer) = request.rendered_primer(
+        Some(record_id.as_str()),
+        carried_forward_prior_facts.as_deref(),
+    ) {
+        agent
+            .inject_thread_developer_message(thread_id, &primer)
+            .await
+            .map_err(|e| format!("failed to inject context rewind primer: {}", e))?;
+    }
+
+    let message = if request.primer.is_some() {
+        format!(
+            "context rewound to {}; primer injected; record {}",
+            resolved_anchor.target_label(request.position),
+            record_id
+        )
+    } else {
+        format!(
+            "rewound to {}; record {}",
+            resolved_anchor.target_label(request.position),
+            record_id
+        )
+    };
+    slog(config.session_log, |l| l.info(&message));
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: request
+            .session_id
+            .clone()
+            .or_else(|| config.session_id.clone()),
+        action: "rewind_context".to_string(),
+        success: true,
+        message,
+    });
+
+    Ok(request.resume_followup())
+}
+
+fn emit_context_rewind_failure(
+    request: &ExternalContextRewindRequest,
+    message: String,
+    config: &DrainConfig<'_>,
+) {
+    slog(config.session_log, |l| {
+        l.warn(&format!("Context rewind failed: {message}"))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: request
+            .session_id
+            .clone()
+            .or_else(|| config.session_id.clone()),
+        action: "rewind_context".to_string(),
+        success: false,
+        message,
+    });
+}
+
+struct ExternalContextRewindResume<'a, 'b> {
+    event_rx: &'a mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    turn_bus_rx: &'a mut tokio::sync::broadcast::Receiver<AppEvent>,
+    config: &'a DrainConfig<'b>,
+    stats: &'a mut LoopStats,
+    diff_tracker: &'a mut ExternalDiffDeltaTracker,
+    pending_runtime_steers: &'a mut std::collections::VecDeque<PendingRuntimeSteer>,
+    handled_steer_ids: &'a mut std::collections::HashSet<String>,
+    codex_thread_action_dedupe: &'a mut CodexThreadActionDedupe,
+    side_sessions: Option<&'a mut ExternalSideSessionState<'b>>,
+}
+
+async fn send_external_context_rewind_resume_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread: &external_agent::AgentThread,
+    followup: FollowUpMessage,
+    resume: ExternalContextRewindResume<'_, '_>,
+) -> Result<DrainOutcome, String> {
+    agent
+        .send_message(thread, &followup.text)
+        .await
+        .map_err(|e| format!("failed to start resumed context-rewind turn: {}", e))?;
+    Ok(drain_external_agent_events(
+        agent,
+        resume.event_rx,
+        resume.turn_bus_rx,
+        resume.config,
+        resume.stats,
+        resume.diff_tracker,
+        resume.pending_runtime_steers,
+        resume.handled_steer_ids,
+        resume.codex_thread_action_dedupe,
+        resume.side_sessions,
+    )
+    .await)
+}
+
+struct ExternalSideSessionState<'a> {
+    open_side_threads: &'a mut HashMap<String, String>,
+    side_rounds: &'a mut HashMap<String, usize>,
+    side_turn_revisions: &'a mut HashMap<String, UserTurnRevisionState>,
+}
+
+impl<'a> ExternalSideSessionState<'a> {
+    fn has_side_thread(&self, thread_id: &str) -> bool {
+        self.open_side_threads.contains_key(thread_id)
+    }
+
+    fn record_started(&mut self, parent_thread_id: String, child_thread_id: String) {
+        self.open_side_threads
+            .insert(child_thread_id.clone(), parent_thread_id);
+        self.side_rounds.entry(child_thread_id.clone()).or_insert(1);
+        self.side_turn_revisions
+            .entry(child_thread_id)
+            .or_insert_with(|| {
+                let mut state = UserTurnRevisionState::default();
+                state.record_next_turn();
+                state
+            });
+    }
+
+    fn record_closed(&mut self, child_thread_id: &str) {
+        self.open_side_threads.remove(child_thread_id);
+        self.side_rounds.remove(child_thread_id);
+        self.side_turn_revisions.remove(child_thread_id);
+    }
+}
+
+fn claim_active_side_turn_completion(
+    active_side_turns: &mut HashSet<String>,
+    session_id: Option<&str>,
+) -> bool {
+    session_id
+        .map(|session_id| active_side_turns.remove(session_id))
+        .unwrap_or(true)
+}
+
+fn scoped_event_targets_config(
+    thread_id: &Option<String>,
+    session_id: &Option<String>,
+    alias_session_id: &Option<String>,
+) -> bool {
+    match thread_id {
+        Some(thread_id) => {
+            session_id.as_deref() == Some(thread_id.as_str())
+                || alias_session_id.as_deref() == Some(thread_id.as_str())
+        }
+        None => true,
+    }
+}
+
+fn emit_child_turn_complete(
+    config: &DrainConfig<'_>,
+    conversation_kind: &str,
+    message: Option<String>,
+) {
+    emit_child_turn_complete_for_session(
+        config.bus,
+        config.session_id.clone(),
+        conversation_kind,
+        message,
+    );
+}
+
+fn emit_child_turn_complete_for_session(
+    bus: &EventBus,
+    session_id: Option<String>,
+    conversation_kind: &str,
+    message: Option<String>,
+) {
+    if let Some(message) = message {
+        bus.send(AppEvent::LogEntry {
+            session_id: session_id.clone(),
+            level: "info".to_string(),
+            source: "Codex".to_string(),
+            content: message,
+            turn: None,
+        });
+    }
+    bus.send(AppEvent::LogEntry {
+        session_id,
+        level: "info".to_string(),
+        source: "Codex".to_string(),
+        content: format!(
+            "Round complete: {} conversation ready for follow-up",
+            conversation_kind
+        ),
+        turn: None,
+    });
+}
+
+fn external_context_snapshot_key(snapshot: &external_agent::AgentContextSnapshot) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    let mut h = DefaultHasher::new();
+    if snapshot.request_id.is_some() {
+        snapshot.source.hash(&mut h);
+        snapshot.request_id.hash(&mut h);
+        snapshot.request_index.hash(&mut h);
+        return h.finish();
+    }
+    snapshot.source.hash(&mut h);
+    snapshot.label.hash(&mut h);
+    snapshot.format.hash(&mut h);
+    snapshot.token_count.hash(&mut h);
+    snapshot.token_count_kind.hash(&mut h);
+    snapshot.context_window.hash(&mut h);
+    snapshot.hard_context_window.hash(&mut h);
+    snapshot.item_count.hash(&mut h);
+    match serde_json::to_vec(&snapshot.raw) {
+        Ok(bytes) => bytes.hash(&mut h),
+        Err(_) => snapshot.raw.to_string().hash(&mut h),
+    }
+    h.finish()
+}
+
+fn external_context_snapshot_turn(stats: &LoopStats) -> Option<usize> {
+    if stats.turns > 0 {
+        Some(stats.turns)
+    } else {
+        None
+    }
+}
+
+fn external_context_snapshot_usage(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<frontend::ModelUsageSnapshot> {
+    let tokens_used = external_context_snapshot_backend_token_count(snapshot)?;
+    let context_window = snapshot.context_window?;
+    if context_window == 0 {
+        return None;
+    }
+
+    let provider = if snapshot.format.starts_with("openai.") {
+        "openai"
+    } else if snapshot.format.starts_with("anthropic.") {
+        "anthropic"
+    } else if snapshot.format.starts_with("gemini.") {
+        "gemini"
+    } else {
+        snapshot.source.as_str()
+    };
+    let model = snapshot
+        .raw
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(snapshot.source.as_str());
+
+    Some(frontend::ModelUsageSnapshot {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        tokens_used,
+        context_window,
+        hard_context_window: snapshot.hard_context_window,
+        usage_pct: tokens_used as f64 / context_window as f64 * 100.0,
+        prompt_tokens: tokens_used,
+        completion_tokens: 0,
+        cached_tokens: 0,
+    })
+}
+
+fn external_context_snapshot_backend_token_count(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<u64> {
+    (snapshot.token_count_kind == Some(external_agent::AgentContextTokenCountKind::BackendReported))
+        .then_some(snapshot.token_count)
+        .flatten()
+}
+
+fn managed_context_rewind_only_pressure(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<ManagedContextRewindOnlyPressure> {
+    let pressure = managed_context_recovery_pressure(snapshot)?;
+    if pressure.used_tokens < pressure.rewind_only_limit {
+        return None;
+    }
+    Some(pressure)
+}
+
+fn managed_context_recovery_pressure(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<ManagedContextRewindOnlyPressure> {
+    let used_tokens = external_context_snapshot_backend_token_count(snapshot)?;
+    let rewind_only_limit = snapshot.context_window?;
+    if rewind_only_limit == 0 {
+        return None;
+    }
+    let hard_context_window = snapshot.hard_context_window;
+    let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
+        "critical"
+    } else if used_tokens >= rewind_only_limit {
+        "high"
+    } else {
+        "recovery_required"
+    };
+    Some(ManagedContextRewindOnlyPressure {
+        used_tokens,
+        rewind_only_limit,
+        hard_context_window,
+        status,
+    })
+}
+
+fn managed_context_user_kickstart_is_trivial(text: &str) -> bool {
+    let normalized = text.trim().to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "continue" | "resume" | "go on" | "carry on" | "keep going"
+    )
+}
+
+fn managed_context_drop_original_for_recovery(
+    text: &str,
+    has_attachments: bool,
+    has_steer_id: bool,
+    is_user_turn_edit: bool,
+) -> bool {
+    !has_attachments
+        && !has_steer_id
+        && !is_user_turn_edit
+        && managed_context_user_kickstart_is_trivial(text)
+}
+
+const MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND: u8 = 2;
+
+fn managed_context_recovery_kickstart_text(
+    pressure: ManagedContextRewindOnlyPressure,
+    held_user_input: bool,
+) -> String {
+    let hard = pressure
+        .hard_context_window
+        .map(|hard| format!(" hard_limit={hard}"))
+        .unwrap_or_default();
+    let held = if held_user_input {
+        " Intendant is holding the user's follow-up outside Codex history; replay it only after rewind_context succeeds."
+    } else {
+        ""
+    };
+    format!(
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        status = pressure.status,
+        used = pressure.used_tokens,
+        limit = pressure.rewind_only_limit,
+        hard = hard,
+        held = held,
+    )
+}
+
+fn managed_context_backend_recovery_kickstart_text(
+    message: &str,
+    recovery_hint: Option<&str>,
+) -> String {
+    let hint = recovery_hint
+        .map(str::trim)
+        .filter(|hint| !hint.is_empty())
+        .map(|hint| format!(" Codex recovery hint: {hint}"))
+        .unwrap_or_default();
+    format!(
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+    )
+}
+
+async fn emit_external_context_snapshot_if_changed(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+    turn: Option<usize>,
+    state: &mut ExternalContextSnapshotState,
+) {
+    match agent.context_snapshots().await {
+        Ok(snapshots) => {
+            let mut emitted = false;
+            for snapshot in snapshots {
+                let key = external_context_snapshot_key(&snapshot);
+                if !state.emitted_keys.insert(key) {
+                    continue;
+                }
+                emitted = true;
+                state.last_error = None;
+                let usage = external_context_snapshot_usage(&snapshot);
+                config.bus.send(AppEvent::ContextSnapshot {
+                    session_id: config.session_id.clone(),
+                    source: snapshot.source,
+                    label: snapshot.label,
+                    request_id: snapshot.request_id,
+                    request_index: snapshot.request_index,
+                    turn,
+                    format: snapshot.format,
+                    token_count: snapshot.token_count,
+                    token_count_kind: snapshot
+                        .token_count_kind
+                        .map(|kind| kind.as_str().to_string()),
+                    context_window: snapshot.context_window,
+                    hard_context_window: snapshot.hard_context_window,
+                    item_count: snapshot.item_count,
+                    raw: snapshot.raw,
+                });
+                if let Some(main) = usage {
+                    config.bus.send(AppEvent::UsageSnapshot {
+                        session_id: config.session_id.clone(),
+                        main,
+                        presence: None,
+                    });
+                }
+            }
+            if !emitted {
+                state.last_error = None;
+            }
+        }
+        Err(e) => {
+            let message = format!(
+                "Failed to read context snapshot from {}: {}",
+                agent.name(),
+                e
+            );
+            if state.last_error.as_deref() != Some(message.as_str()) {
+                slog(config.session_log, |l| l.warn(&message));
+                state.last_error = Some(message);
+            }
+        }
+    }
+}
+
+fn forked_thread_id_from_message(message: &str) -> Option<String> {
+    message
+        .strip_prefix("forked into thread ")
+        .map(str::trim)
+        .filter(|id| !id.is_empty() && *id != "(unknown)")
+        .map(str::to_string)
+}
+
+enum ExternalThreadActionEffect {
+    None,
+    SideTurnStarted {
+        parent_thread_id: String,
+        child_thread_id: String,
+        prompt: Option<String>,
+    },
+    SideTurnClosed {
+        child_thread_id: String,
+    },
+}
+
+fn side_thread_ids_from_message(message: &str) -> Option<(String, String)> {
+    let rest = message.strip_prefix("side conversation started in thread ")?;
+    let (child, parent) = rest.split_once(" from parent ")?;
+    let child = child.trim();
+    let parent = parent.trim();
+    if child.is_empty() || parent.is_empty() {
+        return None;
+    }
+    Some((parent.to_string(), child.to_string()))
+}
+
+fn fork_session_name_from_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("name")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_thread_rename_name_from_result(
+    params: &serde_json::Value,
+    message: &str,
+) -> Option<String> {
+    fork_session_name_from_params(params).or_else(|| {
+        message
+            .strip_prefix("Codex thread renamed to ")
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+    })
+}
+
+fn persist_codex_thread_rename_overlay(
+    home: &Path,
+    session_id: Option<&str>,
+    params: &serde_json::Value,
+    message: &str,
+) -> Result<Option<String>, String> {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return Ok(None);
+    };
+    let Some(name) = codex_thread_rename_name_from_result(params, message) else {
+        return Ok(None);
+    };
+    crate::session_names::rename_session(home, "codex", session_id, &name).map(Some)
+}
+
+fn codex_thread_action_capabilities() -> Vec<String> {
+    [
+        "compact",
+        "fast",
+        "fork",
+        "side",
+        "side-close",
+        "undo",
+        "review",
+        "rename",
+        "goal",
+        "goal-set",
+        "goal-get",
+        "goal-clear",
+        "goal-pause",
+        "goal-resume",
+        "memory-reset",
+    ]
+    .into_iter()
+    .map(str::to_string)
+    .collect()
+}
+
+fn codex_service_tier_is_fast(service_tier: Option<&str>) -> bool {
+    service_tier
+        .map(str::trim)
+        .filter(|tier| !tier.is_empty())
+        .is_some_and(|tier| {
+            tier.eq_ignore_ascii_case(external_agent::codex::CODEX_FAST_SERVICE_TIER)
+                || tier.eq_ignore_ascii_case("fast")
+        })
+}
+
+fn codex_service_tier_value(service_tier: Option<&str>) -> Option<String> {
+    project::normalize_codex_service_tier(service_tier)
+        .filter(|tier| !project::codex_service_tier_is_standard_clear(tier))
+}
+
+fn codex_external_session_capabilities(
+    project: &Project,
+    service_tier: Option<&str>,
+) -> types::SessionCapabilities {
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        codex_thread_actions: codex_thread_action_capabilities(),
+        codex_managed_context: Some(project::normalize_codex_managed_context(
+            &project.config.agent.codex.managed_context,
+        )),
+        codex_context_archive: Some(project::normalize_codex_context_archive(
+            &project.config.agent.codex.context_archive,
+        )),
+        codex_command: Some(project.config.agent.codex.command.clone()),
+        codex_fast_mode: Some(codex_service_tier_is_fast(service_tier)),
+        codex_service_tier: codex_service_tier_value(service_tier),
+    }
+}
+
+fn emit_codex_session_capabilities_for_project(
+    bus: &EventBus,
+    session_id: Option<&str>,
+    project: &Project,
+    service_tier: Option<&str>,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: codex_external_session_capabilities(project, service_tier),
+    });
+}
+
+fn codex_drain_session_capabilities(
+    config: &DrainConfig<'_>,
+    service_tier: Option<&str>,
+) -> types::SessionCapabilities {
+    let launch = crate::session_config::read_log_dir_config(config.log_dir);
+    let effective_service_tier = service_tier.or_else(|| {
+        launch
+            .as_ref()
+            .and_then(|cfg| cfg.codex_service_tier.as_deref())
+    });
+    types::SessionCapabilities {
+        follow_up: true,
+        steer: true,
+        interrupt: true,
+        codex_thread_actions: codex_thread_action_capabilities(),
+        codex_managed_context: launch
+            .as_ref()
+            .and_then(|cfg| cfg.codex_managed_context.clone()),
+        codex_context_archive: launch
+            .as_ref()
+            .and_then(|cfg| cfg.codex_context_archive.clone()),
+        codex_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
+        codex_fast_mode: Some(codex_service_tier_is_fast(effective_service_tier)),
+        codex_service_tier: codex_service_tier_value(effective_service_tier),
+    }
+}
+
+fn persist_codex_service_tier_for_drain(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    service_tier: Option<&str>,
+) {
+    let mut launch = crate::session_config::read_log_dir_config(config.log_dir).unwrap_or_default();
+    if launch.source.is_none() {
+        launch.source = Some("codex".to_string());
+    }
+    launch.codex_service_tier = codex_service_tier_value(service_tier);
+    if let Err(e) = crate::session_config::write_log_dir_config(config.log_dir, &launch) {
+        slog(config.session_log, |l| {
+            l.debug(&format!("Persist Codex service tier failed: {e}"))
+        });
+    }
+
+    let home = crate::platform::home_dir();
+    for id in [
+        session_id,
+        config.session_id.as_deref(),
+        config.alias_session_id.as_deref(),
+    ]
+    .into_iter()
+    .flatten()
+    .map(str::trim)
+    .filter(|id| !id.is_empty())
+    {
+        if let Err(e) = crate::session_config::write_external_overlay(&home, "codex", id, &launch) {
+            slog(config.session_log, |l| {
+                l.debug(&format!(
+                    "Persist Codex service tier overlay for {} failed: {e}",
+                    short_external_session_id(id)
+                ))
+            });
+        }
+    }
+}
+
+fn emit_codex_session_capabilities_for_drain(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    service_tier: Option<&str>,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    config.bus.send(AppEvent::SessionCapabilities {
+        session_id: session_id.to_string(),
+        capabilities: codex_drain_session_capabilities(config, service_tier),
+    });
+}
+
+fn side_session_prompt_from_params(params: &serde_json::Value) -> Option<String> {
+    ["prompt", "message", "text", "task"]
+        .iter()
+        .find_map(|key| params.get(*key).and_then(|v| v.as_str()))
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+}
+
+fn side_child_thread_id_from_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("threadId")
+        .or_else(|| params.get("thread_id"))
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn is_context_rewind_backout_action(op: &str) -> bool {
+    matches!(
+        op,
+        "rewind-backout"
+            | "rewind_backout"
+            | "rewind-inspect"
+            | "rewind_inspect"
+            | "rewind-restore"
+            | "rewind_restore"
+            | "context-rewind-backout"
+            | "context_rewind_backout"
+            | "context-rewind-restore"
+            | "context_rewind_restore"
+    )
+}
+
+fn is_context_rewind_anchor_list_action(op: &str) -> bool {
+    matches!(
+        op,
+        "list_rewind_anchors"
+            | "list-rewind-anchors"
+            | "rewind_anchors"
+            | "rewind-anchors"
+            | "context_rewind_anchors"
+            | "context-rewind-anchors"
+    )
+}
+
+fn is_context_rewind_anchor_inspect_action(op: &str) -> bool {
+    matches!(
+        op,
+        "inspect_rewind_anchor"
+            | "inspect-rewind-anchor"
+            | "rewind_anchor_inspect"
+            | "rewind-anchor-inspect"
+            | "context_rewind_anchor_inspect"
+            | "context-rewind-anchor-inspect"
+    )
+}
+
+fn context_rewind_record_id_from_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .get("recordId")
+        .or_else(|| params.get("record_id"))
+        .or_else(|| params.get("id"))
+        .and_then(|value| value.as_str())
+        .or_else(|| params.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn context_rewind_backout_mode(op: &str, params: &serde_json::Value) -> String {
+    if let Some(mode) = params
+        .get("mode")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|mode| !mode.is_empty())
+    {
+        return mode.to_string();
+    }
+    match op {
+        "rewind-restore"
+        | "rewind_restore"
+        | "context-rewind-restore"
+        | "context_rewind_restore" => "restore".to_string(),
+        "rewind-inspect" | "rewind_inspect" => "inspect".to_string(),
+        _ => "inspect".to_string(),
+    }
+}
+
+#[cfg(test)]
+fn context_rewind_allows_cache_reset(params: &serde_json::Value) -> bool {
+    [
+        "allowCacheReset",
+        "allow_cache_reset",
+        "allowCacheBreakingFork",
+        "allow_cache_breaking_fork",
+    ]
+    .iter()
+    .any(|key| {
+        params
+            .get(*key)
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false)
+    })
+}
+
+async fn fork_managed_context_edit_branch(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    thread_id: &str,
+    user_turn_index: u32,
+    original_text: Option<&str>,
+    replacement_text: String,
+    unresolved_attachment_ids: Vec<String>,
+    config: &DrainConfig<'_>,
+) -> Result<Option<String>, String> {
+    let Some(target) = resolve_managed_context_edit_branch_target(
+        config.log_dir,
+        thread_id,
+        config.session_id.as_deref(),
+        user_turn_index,
+        original_text,
+    )?
+    else {
+        return Ok(None);
+    };
+    let turns_to_drop = target
+        .source_turn_count
+        .saturating_sub(user_turn_index)
+        .saturating_add(1);
+    let name = format!(
+        "Edit turn {} from {}",
+        user_turn_index,
+        short_external_session_id(&target.parent_thread_id)
+    );
+    let child = agent
+        .fork_thread_from_rollout_path(&target.recovery_rollout_path, Some(&name))
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to fork archived managed-context rollout {} for edit: {e}",
+                target.record_id
+            )
+        })?;
+    agent
+        .rollback_thread_turns(&child.thread_id, turns_to_drop)
+        .await
+        .map_err(|e| {
+            format!(
+                "failed to roll back edit branch {} to before user turn {}: {e}",
+                child.thread_id, user_turn_index
+            )
+        })?;
+
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+            source: Some("codex".to_string()),
+            session_id: child.thread_id.clone(),
+            backend_session_id: Some(child.thread_id.clone()),
+            name: name.clone(),
+        }));
+    emit_session_relationship(
+        config.bus,
+        Some(target.parent_thread_id.as_str()),
+        &child.thread_id,
+        "managed-edit-branch",
+        false,
+    );
+    let launch = crate::session_config::read_log_dir_config(config.log_dir);
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+            source: "codex".to_string(),
+            session_id: child.thread_id.clone(),
+            resume_id: Some(child.thread_id.clone()),
+            project_root: Some(config.project_root.to_string_lossy().to_string()),
+            task: Some(replacement_text),
+            direct: Some(true),
+            attachments: unresolved_attachment_ids,
+            agent_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
+            codex_managed_context: launch
+                .as_ref()
+                .and_then(|cfg| cfg.codex_managed_context.clone()),
+            codex_context_archive: launch
+                .as_ref()
+                .and_then(|cfg| cfg.codex_context_archive.clone()),
+        }));
+
+    Ok(Some(format!(
+        "created managed edit branch {} from rewind record {} at user turn {} (dropped {} archived turn{} before replay)",
+        child.thread_id,
+        target.record_id,
+        user_turn_index,
+        turns_to_drop,
+        if turns_to_drop == 1 { "" } else { "s" }
+    )))
+}
+
+fn thread_id_from_action_params(params: &serde_json::Value) -> Option<String> {
+    params
+        .pointer("/thread/id")
+        .and_then(|value| value.as_str())
+        .or_else(|| params.pointer("/threadId").and_then(|value| value.as_str()))
+        .or_else(|| {
+            params
+                .pointer("/thread_id")
+                .and_then(|value| value.as_str())
+        })
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn thread_action_params_with_thread_id(
+    op: &str,
+    params: serde_json::Value,
+    thread_id: Option<&str>,
+) -> serde_json::Value {
+    if thread_id_from_action_params(&params).is_some() {
+        return params;
+    }
+
+    let Some(thread_id) = thread_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return params;
+    };
+
+    match params {
+        serde_json::Value::Object(mut obj) => {
+            obj.insert(
+                "threadId".to_string(),
+                serde_json::Value::String(thread_id.to_string()),
+            );
+            serde_json::Value::Object(obj)
+        }
+        serde_json::Value::Null => serde_json::json!({ "threadId": thread_id }),
+        serde_json::Value::String(prompt) if matches!(op, "side" | "btw") => {
+            serde_json::json!({
+                "threadId": thread_id,
+                "prompt": prompt,
+            })
+        }
+        other => other,
+    }
+}
+
+fn thread_action_params_for_target(
+    op: &str,
+    params: serde_json::Value,
+    target_session_id: &Option<String>,
+    config: &DrainConfig<'_>,
+) -> serde_json::Value {
+    if thread_id_from_action_params(&params).is_some() {
+        return params;
+    }
+
+    let target = target_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .or(config.session_id.as_deref());
+    let thread_id = target.map(|target| {
+        if config.alias_session_id.as_deref() == Some(target) {
+            config.session_id.as_deref().unwrap_or(target)
+        } else {
+            target
+        }
+    });
+
+    thread_action_params_with_thread_id(op, params, thread_id)
+}
+
+fn emit_session_relationship(
+    bus: &EventBus,
+    parent_session_id: Option<&str>,
+    child_session_id: &str,
+    relationship: &str,
+    ephemeral: bool,
+) {
+    let Some(parent_session_id) = parent_session_id.map(str::trim).filter(|id| !id.is_empty())
+    else {
+        return;
+    };
+    if parent_session_id == child_session_id {
+        return;
+    }
+    bus.send(AppEvent::SessionRelationship {
+        parent_session_id: parent_session_id.to_string(),
+        child_session_id: child_session_id.to_string(),
+        relationship: relationship.to_string(),
+        ephemeral,
+    });
+}
+
+fn emit_codex_fork_session_name(bus: &EventBus, child_id: &str, params: &serde_json::Value) {
+    let Some(name) = fork_session_name_from_params(params) else {
+        return;
+    };
+    bus.send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+        source: Some("codex".to_string()),
+        session_id: child_id.to_string(),
+        backend_session_id: Some(child_id.to_string()),
+        name,
+    }));
+}
+
+async fn apply_context_rewind_backout_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    op: &str,
+    params: &serde_json::Value,
+    config: &DrainConfig<'_>,
+) -> Result<String, String> {
+    let mode = context_rewind_backout_mode(op, params).to_ascii_lowercase();
+    let restore = mode == "restore";
+    if !matches!(mode.as_str(), "inspect" | "fork" | "backout" | "restore") {
+        return Err(format!(
+            "context rewind backout mode `{mode}` is not supported; use `inspect`, `fork`, or `restore`"
+        ));
+    }
+    let record_id = context_rewind_record_id_from_params(params)
+        .ok_or_else(|| "context rewind backout requires recordId".to_string())?;
+    let record = context_rewind::read_record(config.log_dir, &record_id)
+        .map_err(|e| format!("failed to read context rewind record {record_id}: {e}"))?;
+    let recovery_rollout_path = record
+        .recovery_rollout_path
+        .as_deref()
+        .ok_or_else(|| format!("context rewind record {record_id} has no recovery rollout"))?;
+    if mode == "inspect" {
+        let source = record
+            .source_rollout_path
+            .as_deref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| "<unknown>".to_string());
+        return Ok(format!(
+            "context rewind record {record_id}: pre-rewind rollout copied from {source} to {}; restore uses same-thread Codex thread/restore when available; fork/backout creates a new Codex thread that inherits the lineage prompt-cache key when using the patched managed Codex binary",
+            recovery_rollout_path.display()
+        ));
+    }
+    if restore {
+        // Restore must target the exact Codex thread that was rewound. That is
+        // `record.thread_id` (captured from the thread snapshot at rewind time),
+        // never the Intendant session id/alias that `thread_action_params_for_target`
+        // may have injected into `params`, nor `record.session_id` (the Intendant id).
+        let target_thread_id = Some(record.thread_id.clone())
+            .filter(|id| !id.trim().is_empty())
+            .or_else(|| thread_id_from_action_params(params))
+            .or_else(|| record.session_id.clone())
+            .ok_or_else(|| {
+                format!("context rewind record {record_id} has no thread to restore into")
+            })?;
+        agent
+            .restore_thread_from_rollout_path(
+                &target_thread_id,
+                recovery_rollout_path,
+                Some(record_id.as_str()),
+            )
+            .await
+            .map_err(|e| {
+                format!("failed to restore recovery rollout into thread {target_thread_id}: {e}")
+            })?;
+        // Record the restore in the durable lineage ledger so the TUI/dashboard can
+        // see that previously pruned context was reintroduced into this thread. This
+        // is a same-thread restore (parent == child), so emit the rewind-restore edge
+        // directly — the guarded `emit_session_relationship` helper drops self-edges.
+        config.bus.send(AppEvent::SessionRelationship {
+            parent_session_id: target_thread_id.clone(),
+            child_session_id: target_thread_id.clone(),
+            relationship: "rewind-restore".to_string(),
+            ephemeral: false,
+        });
+        return Ok(format!(
+            "restored context rewind record {} into existing Codex thread {}",
+            record_id, target_thread_id
+        ));
+    }
+    let default_name = if restore {
+        format!("Rewind restore {}", record_id)
+    } else {
+        format!("Rewind backout {}", record_id)
+    };
+    let name = fork_session_name_from_params(params).unwrap_or(default_name);
+    let child = agent
+        .fork_thread_from_rollout_path(recovery_rollout_path, Some(&name))
+        .await
+        .map_err(|e| format!("failed to fork recovery rollout: {e}"))?;
+
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::RenameSession {
+            source: Some("codex".to_string()),
+            session_id: child.thread_id.clone(),
+            backend_session_id: Some(child.thread_id.clone()),
+            name,
+        }));
+    emit_session_relationship(
+        config.bus,
+        Some(record.thread_id.as_str()),
+        &child.thread_id,
+        if restore {
+            "rewind-restore"
+        } else {
+            "rewind-backout"
+        },
+        false,
+    );
+    config
+        .bus
+        .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+            source: "codex".to_string(),
+            session_id: child.thread_id.clone(),
+            resume_id: Some(child.thread_id.clone()),
+            project_root: Some(config.project_root.to_string_lossy().to_string()),
+            task: None,
+            direct: Some(true),
+            attachments: Vec::new(),
+            agent_command: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.agent_command),
+            codex_managed_context: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.codex_managed_context),
+            codex_context_archive: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.codex_context_archive),
+        }));
+
+    Ok(format!(
+        "forked context rewind record {} with inherited lineage prompt-cache key into thread {}",
+        record_id, child.thread_id
+    ))
+}
+
+async fn apply_context_rewind_anchor_list_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let thread_id = thread_id_from_action_params(params);
+    let mut rollout_path = None;
+    if let Some(thread_id) = thread_id.as_deref() {
+        rollout_path = agent
+            .read_thread_snapshot(thread_id)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    if rollout_path.is_none() {
+        rollout_path = agent
+            .context_snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    let rollout_path = rollout_path
+        .ok_or_else(|| "Codex thread metadata did not include a rollout path".to_string())?;
+    list_context_rewind_anchors_from_rollout(&rollout_path, params)
+}
+
+async fn apply_context_rewind_anchor_inspect_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    params: &serde_json::Value,
+) -> Result<String, String> {
+    let thread_id = thread_id_from_action_params(params);
+    let mut rollout_path = None;
+    if let Some(thread_id) = thread_id.as_deref() {
+        rollout_path = agent
+            .read_thread_snapshot(thread_id)
+            .await
+            .ok()
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    if rollout_path.is_none() {
+        rollout_path = agent
+            .context_snapshot()
+            .await
+            .map_err(|e| e.to_string())?
+            .and_then(|snapshot| snapshot.rollout_path);
+    }
+    let rollout_path = rollout_path
+        .ok_or_else(|| "Codex thread metadata did not include a rollout path".to_string())?;
+    inspect_context_rewind_anchor_from_rollout(&rollout_path, params)
+}
+
+async fn handle_external_thread_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    op: String,
+    params: serde_json::Value,
+    target_session_id: Option<String>,
+    config: &DrainConfig<'_>,
+) -> ExternalThreadActionEffect {
+    let params = thread_action_params_for_target(&op, params, &target_session_id, config);
+    let action_thread_id = thread_id_from_action_params(&params);
+    let result_session_id = target_session_id.or_else(|| config.session_id.clone());
+    let result = if is_context_rewind_anchor_list_action(&op) {
+        apply_context_rewind_anchor_list_action(agent, &params).await
+    } else if is_context_rewind_anchor_inspect_action(&op) {
+        apply_context_rewind_anchor_inspect_action(agent, &params).await
+    } else if is_context_rewind_backout_action(&op) {
+        apply_context_rewind_backout_action(agent, &op, &params, config).await
+    } else {
+        agent
+            .thread_action(&op, &params)
+            .await
+            .map_err(|e| e.to_string())
+    };
+    let (success, mut message) = match result {
+        Ok(msg) => (true, msg),
+        Err(e) => (false, e),
+    };
+    if success && op == "rename" {
+        if let Some(home) = dirs::home_dir() {
+            match persist_codex_thread_rename_overlay(
+                &home,
+                result_session_id.as_deref(),
+                &params,
+                &message,
+            ) {
+                Ok(Some(name)) => {
+                    message = format!("Codex thread renamed to {}", name);
+                }
+                Ok(None) => {}
+                Err(err) => slog(config.session_log, |l| {
+                    l.warn(&format!("Failed to persist Codex thread rename: {err}"))
+                }),
+            }
+        }
+    }
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Codex thread action /{}: {} — {}",
+            op,
+            if success { "ok" } else { "FAILED" },
+            message
+        ))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: result_session_id.clone(),
+        action: op.clone(),
+        success,
+        message: message.clone(),
+    });
+
+    if success && op == "fast" {
+        let service_tier = agent.service_tier().map(str::to_string);
+        persist_codex_service_tier_for_drain(
+            config,
+            result_session_id.as_deref(),
+            service_tier.as_deref(),
+        );
+        emit_codex_session_capabilities_for_drain(
+            config,
+            result_session_id.as_deref(),
+            service_tier.as_deref(),
+        );
+    }
+
+    if success && op == "fork" {
+        if let Some(child_id) = forked_thread_id_from_message(&message) {
+            emit_codex_fork_session_name(config.bus, &child_id, &params);
+            emit_session_relationship(
+                config.bus,
+                action_thread_id
+                    .as_deref()
+                    .or(result_session_id.as_deref())
+                    .or(config.session_id.as_deref()),
+                &child_id,
+                "fork",
+                false,
+            );
+            config
+                .bus
+                .send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                    source: "codex".to_string(),
+                    session_id: child_id.clone(),
+                    resume_id: Some(child_id),
+                    project_root: Some(config.project_root.to_string_lossy().to_string()),
+                    task: None,
+                    direct: Some(true),
+                    attachments: Vec::new(),
+                    agent_command: crate::session_config::read_log_dir_config(config.log_dir)
+                        .and_then(|cfg| cfg.agent_command),
+                    codex_managed_context: crate::session_config::read_log_dir_config(
+                        config.log_dir,
+                    )
+                    .and_then(|cfg| cfg.codex_managed_context),
+                    codex_context_archive: crate::session_config::read_log_dir_config(
+                        config.log_dir,
+                    )
+                    .and_then(|cfg| cfg.codex_context_archive),
+                }));
+        }
+    }
+
+    if success && op == "side" {
+        if let Some((parent_thread_id, child_thread_id)) = side_thread_ids_from_message(&message) {
+            return ExternalThreadActionEffect::SideTurnStarted {
+                parent_thread_id,
+                child_thread_id,
+                prompt: side_session_prompt_from_params(&params),
+            };
+        }
+    }
+
+    if success && matches!(op.as_str(), "side-close" | "side_close") {
+        if let Some(child_thread_id) = side_child_thread_id_from_params(&params) {
+            config.bus.send(AppEvent::SessionEnded {
+                session_id: child_thread_id.clone(),
+                reason: "side conversation closed".to_string(),
+            });
+            return ExternalThreadActionEffect::SideTurnClosed { child_thread_id };
+        }
+    }
+
+    ExternalThreadActionEffect::None
+}
+
+fn parse_codex_fast_slash_command(
+    text: &str,
+) -> Option<Result<(&'static str, serde_json::Value), String>> {
+    let trimmed = text.trim();
+    let rest = trimmed.strip_prefix('/')?;
+    let mut split = rest.splitn(2, char::is_whitespace);
+    let name = split.next()?.trim().to_ascii_lowercase();
+    if name != "fast" {
+        return None;
+    }
+    let args = split.next().unwrap_or("").trim();
+    if !args.is_empty() {
+        return Some(Err("/fast does not accept arguments".to_string()));
+    }
+    Some(Ok(("fast", serde_json::json!({}))))
+}
+
+async fn maybe_handle_codex_fast_slash_steer(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    text: &str,
+    target_session_id: Option<String>,
+    steer_id: String,
+    config: &DrainConfig<'_>,
+) -> bool {
+    if agent.name() != "codex" {
+        return false;
+    }
+    // Codex app-server `turn/steer` is text-only; service-tier changes must
+    // be routed as thread actions and applied to future supported requests.
+    let Some(parsed) = parse_codex_fast_slash_command(text) else {
+        return false;
+    };
+    match parsed {
+        Ok((op, params)) => {
+            handle_external_thread_action(
+                agent,
+                op.to_string(),
+                params,
+                target_session_id.clone(),
+                config,
+            )
+            .await;
+        }
+        Err(message) => {
+            config.bus.send(AppEvent::CodexThreadActionResult {
+                session_id: target_session_id
+                    .clone()
+                    .or_else(|| config.session_id.clone()),
+                action: "fast".to_string(),
+                success: false,
+                message,
+            });
+        }
+    }
+    if !steer_id.trim().is_empty() {
+        config.bus.send(AppEvent::SteerDelivered {
+            session_id: target_session_id,
+            id: steer_id,
+            mid_turn: false,
+        });
+    }
+    true
+}
+
+fn undo_turns_from_params(params: &serde_json::Value) -> u32 {
+    params.get("turns").and_then(|v| v.as_u64()).unwrap_or(1) as u32
+}
+
+fn side_rewind_first_turn_for_undo(
+    current_turn_count: usize,
+    turns: u32,
+    side_thread_id: &str,
+) -> Result<u32, String> {
+    if turns == 0 {
+        return Err("rollback count must be at least 1".to_string());
+    }
+    if turns as usize > current_turn_count {
+        return Err(format!(
+            "Cannot /undo {} turn(s) in side conversation {}; only {} side turn(s) exist after the /side boundary",
+            turns, side_thread_id, current_turn_count
+        ));
+    }
+    Ok(current_turn_count as u32 - turns + 1)
+}
+
+fn parent_rewind_first_turn_for_undo(current_turn_count: usize, turns: u32) -> Result<u32, String> {
+    if turns == 0 {
+        return Err("rollback count must be at least 1".to_string());
+    }
+    if turns as usize > current_turn_count {
+        return Err(format!(
+            "Cannot /undo {} turn(s); only {} user turn(s) are active",
+            turns, current_turn_count
+        ));
+    }
+    Ok(current_turn_count as u32 - turns + 1)
+}
+
+async fn rollback_parent_thread_from_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    round: &mut usize,
+    user_turn_revisions: &mut UserTurnRevisionState,
+    first_user_turn_index: u32,
+    config: &DrainConfig<'_>,
+) -> Result<u32, String> {
+    if first_user_turn_index == 0 {
+        return Err("Cannot rewind user turn 0".to_string());
+    }
+    if first_user_turn_index as usize > *round {
+        return Err(format!(
+            "Cannot rewind to user turn {}; current user turn count is {}",
+            first_user_turn_index, *round
+        ));
+    }
+
+    let turns_to_drop = *round as u32 - first_user_turn_index + 1;
+    agent
+        .rollback_turns(turns_to_drop)
+        .await
+        .map_err(|e| format!("thread rollback failed: {}", e))?;
+
+    user_turn_revisions.rewind_from_turn(first_user_turn_index);
+    *round = first_user_turn_index.saturating_sub(1) as usize;
+    config.bus.send(AppEvent::UserMessageRewind {
+        session_id: config.session_id.clone(),
+        user_turn_index: first_user_turn_index,
+        turns_removed: turns_to_drop,
+    });
+    Ok(turns_to_drop)
+}
+
+async fn handle_parent_undo_thread_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    round: &mut usize,
+    user_turn_revisions: &mut UserTurnRevisionState,
+    params: serde_json::Value,
+    config: &DrainConfig<'_>,
+) {
+    let turns = undo_turns_from_params(&params);
+    let result = match parent_rewind_first_turn_for_undo(*round, turns) {
+        Ok(first_user_turn_index) => rollback_parent_thread_from_turn(
+            agent,
+            round,
+            user_turn_revisions,
+            first_user_turn_index,
+            config,
+        )
+        .await
+        .map(|turns_removed| format!("rolled back {} turn(s)", turns_removed)),
+        Err(message) => Err(message),
+    };
+
+    let (success, message) = match result {
+        Ok(message) => (true, message),
+        Err(message) => (false, message),
+    };
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Codex thread action /undo: {} — {}",
+            if success { "ok" } else { "FAILED" },
+            message
+        ))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: config.session_id.clone(),
+        action: "undo".to_string(),
+        success,
+        message,
+    });
+}
+
+async fn rollback_side_thread_from_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    side_rounds: &mut HashMap<String, usize>,
+    side_turn_revisions: &mut HashMap<String, UserTurnRevisionState>,
+    side_thread_id: &str,
+    first_user_turn_index: u32,
+    config: &DrainConfig<'_>,
+) -> Result<u32, String> {
+    if first_user_turn_index == 0 {
+        return Err(format!(
+            "Cannot rewind side conversation {}; user turn index must be at least 1",
+            side_thread_id
+        ));
+    }
+
+    let current_turn_count = *side_rounds.entry(side_thread_id.to_string()).or_insert(1);
+    if first_user_turn_index as usize > current_turn_count {
+        return Err(format!(
+            "Cannot rewind side conversation {} to user turn {}; current side user turn count is {}",
+            side_thread_id, first_user_turn_index, current_turn_count
+        ));
+    }
+
+    let turns_to_drop = current_turn_count as u32 - first_user_turn_index + 1;
+    agent
+        .rollback_thread_turns(side_thread_id, turns_to_drop)
+        .await
+        .map_err(|e| format!("thread rollback failed: {}", e))?;
+
+    let revisions = side_turn_revisions
+        .entry(side_thread_id.to_string())
+        .or_default();
+    revisions.seed_active_turns_to(current_turn_count as u32);
+    revisions.rewind_from_turn(first_user_turn_index);
+    side_rounds.insert(
+        side_thread_id.to_string(),
+        first_user_turn_index.saturating_sub(1) as usize,
+    );
+    config.bus.send(AppEvent::UserMessageRewind {
+        session_id: Some(side_thread_id.to_string()),
+        user_turn_index: first_user_turn_index,
+        turns_removed: turns_to_drop,
+    });
+    Ok(turns_to_drop)
+}
+
+async fn handle_side_undo_thread_action(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    side_rounds: &mut HashMap<String, usize>,
+    side_turn_revisions: &mut HashMap<String, UserTurnRevisionState>,
+    side_thread_id: &str,
+    params: serde_json::Value,
+    config: &DrainConfig<'_>,
+) {
+    let turns = undo_turns_from_params(&params);
+    let current_turn_count = *side_rounds.entry(side_thread_id.to_string()).or_insert(1);
+    let result = match side_rewind_first_turn_for_undo(current_turn_count, turns, side_thread_id) {
+        Ok(first_user_turn_index) => rollback_side_thread_from_turn(
+            agent,
+            side_rounds,
+            side_turn_revisions,
+            side_thread_id,
+            first_user_turn_index,
+            config,
+        )
+        .await
+        .map(|turns_removed| format!("rolled back {} turn(s)", turns_removed)),
+        Err(message) => Err(message),
+    };
+
+    let (success, message) = match result {
+        Ok(message) => (true, message),
+        Err(message) => (false, message),
+    };
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Codex side thread action /undo: {} — {}",
+            if success { "ok" } else { "FAILED" },
+            message
+        ))
+    });
+    config.bus.send(AppEvent::CodexThreadActionResult {
+        session_id: Some(side_thread_id.to_string()),
+        action: "undo".to_string(),
+        success,
+        message,
+    });
+}
+
+fn emit_side_session_started(
+    config: &DrainConfig<'_>,
+    parent_thread_id: &str,
+    child_thread_id: &str,
+    prompt: Option<&str>,
+) {
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Codex /side: side conversation started in thread {} from parent {}",
+            child_thread_id, parent_thread_id
+        ))
+    });
+    config.bus.send(AppEvent::SessionStarted {
+        session_id: child_thread_id.to_string(),
+        task: Some(
+            prompt
+                .filter(|text| !text.trim().is_empty())
+                .unwrap_or("Side conversation")
+                .to_string(),
+        ),
+    });
+    config.bus.send(AppEvent::SessionIdentity {
+        session_id: child_thread_id.to_string(),
+        source: "codex".to_string(),
+        backend_session_id: child_thread_id.to_string(),
+    });
+    let parent_session_id = config.session_id.as_deref().unwrap_or(parent_thread_id);
+    emit_session_relationship(
+        config.bus,
+        Some(parent_session_id),
+        child_thread_id,
+        "side",
+        true,
+    );
+}
+
+fn emit_codex_subagent_started(
+    config: &DrainConfig<'_>,
+    parent_thread_id: &str,
+    child_thread_id: &str,
+    prompt: Option<&str>,
+    model: Option<&str>,
+    reasoning_effort: Option<&str>,
+) {
+    let child_thread_id = child_thread_id.trim();
+    if child_thread_id.is_empty() {
+        return;
+    }
+    let parent_thread_id = parent_thread_id.trim();
+    let parent_session_id = if parent_thread_id.is_empty() {
+        config.session_id.as_deref().unwrap_or("")
+    } else {
+        parent_thread_id
+    };
+    if parent_session_id.is_empty() || parent_session_id == child_thread_id {
+        return;
+    }
+
+    config.bus.send(AppEvent::SessionIdentity {
+        session_id: child_thread_id.to_string(),
+        source: "codex".to_string(),
+        backend_session_id: child_thread_id.to_string(),
+    });
+    emit_session_relationship(
+        config.bus,
+        Some(parent_session_id),
+        child_thread_id,
+        "subagent",
+        false,
+    );
+    config.bus.send(AppEvent::SessionCapabilities {
+        session_id: child_thread_id.to_string(),
+        capabilities: types::SessionCapabilities {
+            follow_up: true,
+            steer: false,
+            interrupt: false,
+            codex_thread_actions: Vec::new(),
+            codex_managed_context: None,
+            codex_context_archive: None,
+            codex_command: None,
+            codex_fast_mode: None,
+            codex_service_tier: None,
+        },
+    });
+    config.bus.send(AppEvent::SessionStarted {
+        session_id: child_thread_id.to_string(),
+        task: Some(
+            prompt
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Codex subagent")
+                .to_string(),
+        ),
+    });
+
+    let mut details = Vec::new();
+    if let Some(model) = model.map(str::trim).filter(|s| !s.is_empty()) {
+        details.push(format!("model {model}"));
+    }
+    if let Some(effort) = reasoning_effort.map(str::trim).filter(|s| !s.is_empty()) {
+        details.push(format!("reasoning {effort}"));
+    }
+    let suffix = if details.is_empty() {
+        String::new()
+    } else {
+        format!(" ({})", details.join(", "))
+    };
+    let content = prompt
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(|prompt| format!("Codex subagent started{suffix}: {prompt}"))
+        .unwrap_or_else(|| format!("Codex subagent started{suffix}"));
+    config.bus.send(AppEvent::LogEntry {
+        session_id: Some(child_thread_id.to_string()),
+        level: "agent".to_string(),
+        source: "Codex".to_string(),
+        content,
+        turn: None,
+    });
+}
+
+fn emit_codex_subagent_state(config: &DrainConfig<'_>, state: &external_agent::SubAgentState) {
+    let thread_id = state.thread_id.trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let status = state.status.trim();
+    let message = state
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let (level, content) = match status {
+        "completed" => (
+            "info",
+            message
+                .map(|message| format!("Task complete: Codex subagent completed: {message}"))
+                .unwrap_or_else(|| "Task complete: Codex subagent completed".to_string()),
+        ),
+        "interrupted" => (
+            "warn",
+            message
+                .map(|message| format!("Agent interrupted: Codex subagent interrupted: {message}"))
+                .unwrap_or_else(|| "Agent interrupted: Codex subagent interrupted".to_string()),
+        ),
+        "errored" => (
+            "warn",
+            message
+                .map(|message| format!("Session ended: Codex subagent errored: {message}"))
+                .unwrap_or_else(|| "Session ended: Codex subagent errored".to_string()),
+        ),
+        "shutdown" => (
+            "info",
+            message
+                .map(|message| format!("Session ended: Codex subagent shut down: {message}"))
+                .unwrap_or_else(|| "Session ended: Codex subagent shut down".to_string()),
+        ),
+        "notFound" => (
+            "warn",
+            message
+                .map(|message| format!("Session ended: Codex subagent not found: {message}"))
+                .unwrap_or_else(|| "Session ended: Codex subagent not found".to_string()),
+        ),
+        "pendingInit" | "running" => return,
+        other => (
+            "info",
+            message
+                .map(|message| format!("Codex subagent {other}: {message}"))
+                .unwrap_or_else(|| format!("Codex subagent {other}")),
+        ),
+    };
+    config.bus.send(AppEvent::LogEntry {
+        session_id: Some(thread_id.to_string()),
+        level: level.to_string(),
+        source: "Codex".to_string(),
+        content,
+        turn: None,
+    });
+}
+
+fn codex_subagent_terminal_reason(state: &external_agent::SubAgentState) -> Option<String> {
+    let status = state.status.trim();
+    let message = state
+        .message
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    match status {
+        "interrupted" => Some(
+            message
+                .map(|message| format!("Codex subagent interrupted: {message}"))
+                .unwrap_or_else(|| "Codex subagent interrupted".to_string()),
+        ),
+        "errored" => Some(
+            message
+                .map(|message| format!("Codex subagent errored: {message}"))
+                .unwrap_or_else(|| "Codex subagent errored".to_string()),
+        ),
+        "shutdown" => Some(
+            message
+                .map(|message| format!("Codex subagent shut down: {message}"))
+                .unwrap_or_else(|| "Codex subagent shut down".to_string()),
+        ),
+        "notFound" => Some(
+            message
+                .map(|message| format!("Codex subagent not found: {message}"))
+                .unwrap_or_else(|| "Codex subagent not found".to_string()),
+        ),
+        _ => None,
+    }
+}
+
+fn emit_codex_subagent_terminal(
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    state: &external_agent::SubAgentState,
+) {
+    let thread_id = state.thread_id.trim();
+    if thread_id.is_empty() {
+        return;
+    }
+    let Some(reason) = codex_subagent_terminal_reason(state) else {
+        return;
+    };
+    if !stats
+        .codex_subagent_terminal_sessions
+        .insert(thread_id.to_string())
+    {
+        return;
+    }
+
+    if state.status.trim() == "interrupted" {
+        config.bus.send(AppEvent::Interrupted {
+            session_id: Some(thread_id.to_string()),
+            reason,
+        });
+    } else {
+        config.bus.send(AppEvent::SessionEnded {
+            session_id: thread_id.to_string(),
+            reason,
+        });
+    }
+}
+
+fn json_u32_field(value: &serde_json::Value, key: &str) -> Option<u32> {
+    value
+        .get(key)
+        .and_then(|v| v.as_u64())
+        .and_then(|v| u32::try_from(v).ok())
+}
+
+fn emit_codex_subagent_transcript_entry(
+    config: &DrainConfig<'_>,
+    child_thread_id: &str,
+    entry: &serde_json::Value,
+) {
+    let content = entry
+        .get("content")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(content) = content else {
+        return;
+    };
+    let source = entry
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("codex");
+    if source.eq_ignore_ascii_case("user") {
+        config.bus.send(AppEvent::UserMessageLog {
+            session_id: Some(child_thread_id.to_string()),
+            content: content.to_string(),
+            user_turn_index: json_u32_field(entry, "user_turn_index"),
+            user_turn_revision: json_u32_field(entry, "user_turn_revision"),
+            replacement_for_user_turn_index: json_u32_field(
+                entry,
+                "replacement_for_user_turn_index",
+            ),
+        });
+        return;
+    }
+
+    config.bus.send(AppEvent::LogEntry {
+        session_id: Some(child_thread_id.to_string()),
+        level: entry
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("info")
+            .to_string(),
+        source: source.to_string(),
+        content: content.to_string(),
+        turn: None,
+    });
+}
+
+fn emit_codex_subagent_transcript_updates(
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    child_thread_id: &str,
+) {
+    let child_thread_id = child_thread_id.trim();
+    if child_thread_id.is_empty() {
+        return;
+    }
+    let home = PathBuf::from(std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string()));
+    let Some(entries) =
+        crate::web_gateway::external_session_entries_from_home(&home, "codex", child_thread_id)
+    else {
+        return;
+    };
+
+    let offset = stats
+        .codex_subagent_transcript_offsets
+        .entry(child_thread_id.to_string())
+        .or_insert(0);
+    if *offset > entries.len() {
+        *offset = 0;
+    }
+    for entry in entries.iter().skip(*offset) {
+        emit_codex_subagent_transcript_entry(config, child_thread_id, entry);
+    }
+    *offset = entries.len();
+}
+
+fn codex_subagent_thread_ids(
+    receiver_thread_ids: &[String],
+    agents: &[external_agent::SubAgentState],
+) -> Vec<String> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for id in receiver_thread_ids
+        .iter()
+        .map(String::as_str)
+        .chain(agents.iter().map(|state| state.thread_id.as_str()))
+    {
+        let id = id.trim();
+        if !id.is_empty() && seen.insert(id.to_string()) {
+            ids.push(id.to_string());
+        }
+    }
+    ids
+}
+
+struct CodexFissionObservationInput<'a> {
+    item_id: &'a str,
+    tool: &'a str,
+    status: &'a str,
+    sender_thread_id: &'a str,
+    subagent_thread_ids: &'a [String],
+    prompt: Option<&'a str>,
+    model: Option<&'a str>,
+    reasoning_effort: Option<&'a str>,
+    agents: &'a [external_agent::SubAgentState],
+}
+
+fn record_codex_fission_observation(
+    config: &DrainConfig<'_>,
+    input: CodexFissionObservationInput<'_>,
+) {
+    let parent_session_id = {
+        let sender_thread_id = input.sender_thread_id.trim();
+        if sender_thread_id.is_empty() {
+            config.session_id.clone().unwrap_or_default()
+        } else {
+            sender_thread_id.to_string()
+        }
+    };
+    if parent_session_id.trim().is_empty() || input.item_id.trim().is_empty() {
+        return;
+    }
+
+    let default_branch_status = if input.status.trim() == "failed" {
+        "failed"
+    } else {
+        "running"
+    };
+    let mut branches = std::collections::BTreeMap::new();
+    for id in input.subagent_thread_ids {
+        let id = id.trim();
+        if !id.is_empty() && id != parent_session_id {
+            branches.insert(
+                id.to_string(),
+                fission_ledger::FissionBranchObservation {
+                    session_id: id.to_string(),
+                    status: default_branch_status.to_string(),
+                    summary: None,
+                },
+            );
+        }
+    }
+    for state in input.agents {
+        let id = state.thread_id.trim();
+        if id.is_empty() || id == parent_session_id {
+            continue;
+        }
+        branches.insert(
+            id.to_string(),
+            fission_ledger::FissionBranchObservation {
+                session_id: id.to_string(),
+                status: state.status.trim().to_string(),
+                summary: state
+                    .message
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|message| !message.is_empty())
+                    .map(str::to_string),
+            },
+        );
+    }
+    if branches.is_empty() {
+        return;
+    }
+
+    let observation = fission_ledger::FissionObservation {
+        parent_session_id,
+        anchor_item_id: input.item_id.trim().to_string(),
+        tool: input.tool.trim().to_string(),
+        status: input.status.trim().to_string(),
+        prompt: input
+            .prompt
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        model: input
+            .model
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        reasoning_effort: input
+            .reasoning_effort
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_string),
+        branches: branches.into_values().collect(),
+    };
+    if let Err(err) = fission_ledger::record_fission_observation(config.log_dir, observation) {
+        slog(config.session_log, |log| {
+            log.warn(&format!(
+                "Could not persist fission ledger observation: {err}"
+            ))
+        });
+    }
+}
+
+fn short_external_session_id(session_id: &str) -> String {
+    session_id.chars().take(8).collect()
+}
+
+fn collab_agent_tool_preview(
+    tool: &str,
+    receiver_thread_ids: &[String],
+    prompt: Option<&str>,
+) -> String {
+    let mut parts = Vec::new();
+    let receivers: Vec<String> = receiver_thread_ids
+        .iter()
+        .map(|id| short_external_session_id(id))
+        .collect();
+    if !receivers.is_empty() {
+        parts.push(format!("target {}", receivers.join(", ")));
+    }
+    if let Some(prompt) = prompt.map(str::trim).filter(|s| !s.is_empty()) {
+        parts.push(prompt.chars().take(120).collect());
+    }
+    if parts.is_empty() {
+        tool.to_string()
+    } else {
+        format!("{}: {}", tool, parts.join(" - "))
+    }
+}
+
+async fn drain_external_child_turn(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    diff_tracker: &mut ExternalDiffDeltaTracker,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    handled_steer_ids: &mut std::collections::HashSet<String>,
+    codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
+    child_thread_id: String,
+    conversation_kind: &str,
+) {
+    slog(config.session_log, |l| {
+        l.info(&format!(
+            "Draining Codex {} conversation {}",
+            conversation_kind, child_thread_id
+        ))
+    });
+
+    let child_session_id = Some(child_thread_id.clone());
+    let child_config = DrainConfig {
+        bus: config.bus,
+        web_port: config.web_port,
+        session_id: child_session_id.clone(),
+        alias_session_id: None,
+        autonomy: config.autonomy.clone(),
+        session_log: config.session_log,
+        project_root: config.project_root,
+        log_dir: config.log_dir,
+        approval_registry: config.approval_registry,
+        json_approval: config.json_approval.clone(),
+        agent_source: config.agent_source.clone(),
+        suppress_agent_started: config.suppress_agent_started,
+        persist_model_responses_inline: config.persist_model_responses_inline,
+        headless: config.headless,
+        context_injection: config.context_injection,
+    };
+
+    match drain_external_agent_events(
+        agent,
+        event_rx,
+        bus_rx,
+        &child_config,
+        stats,
+        diff_tracker,
+        pending_runtime_steers,
+        handled_steer_ids,
+        codex_thread_action_dedupe,
+        None,
+    )
+    .await
+    {
+        DrainOutcome::TurnCompleted { message, .. } => {
+            emit_child_turn_complete(&child_config, conversation_kind, message);
+        }
+        DrainOutcome::ContextRewindRequested { request, .. } => {
+            emit_context_rewind_failure(
+                &request,
+                format!(
+                    "context rewind is not supported inside {} conversations",
+                    conversation_kind
+                ),
+                &child_config,
+            );
+        }
+        DrainOutcome::RecoveryRequired {
+            message,
+            recovery_hint,
+            ..
+        } => {
+            let mut content = format!(
+                "Agent recovery required: {} conversation stopped after backend error: {}",
+                conversation_kind, message
+            );
+            if let Some(hint) = recovery_hint {
+                content.push_str("\nRecovery: ");
+                content.push_str(&hint);
+            }
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "error".to_string(),
+                source: "Codex".to_string(),
+                content,
+                turn: None,
+            });
+        }
+        DrainOutcome::Interrupted { reason } => {
+            child_config.bus.send(AppEvent::LogEntry {
+                session_id: child_config.session_id.clone(),
+                level: "warn".to_string(),
+                source: "Codex".to_string(),
+                content: format!(
+                    "Agent interrupted: {} conversation stopped: {}",
+                    conversation_kind, reason
+                ),
+                turn: None,
+            });
+        }
+        DrainOutcome::Terminated { reason, exit_code } => {
+            slog(config.session_log, |l| {
+                l.warn(&format!(
+                    "Codex terminated during {} conversation: {} (exit code: {:?})",
+                    conversation_kind, reason, exit_code
+                ))
+            });
+        }
+        DrainOutcome::ChannelClosed => {
+            slog(config.session_log, |l| {
+                l.warn(&format!(
+                    "Codex {} conversation event channel closed",
+                    conversation_kind
+                ))
+            });
+        }
+    }
+}
+
+fn persist_external_model_response_if_needed(
+    config: &DrainConfig<'_>,
+    content: &str,
+    reasoning: Option<&str>,
+) {
+    persist_external_model_response_for_session_if_needed(
+        config,
+        config.session_id.as_deref(),
+        content,
+        reasoning,
+    );
+}
+
+fn persist_external_model_response_for_session_if_needed(
+    config: &DrainConfig<'_>,
+    session_id: Option<&str>,
+    content: &str,
+    reasoning: Option<&str>,
+) {
+    if !config.persist_model_responses_inline {
+        return;
+    }
+    if !content.is_empty() {
+        slog(config.session_log, |l| {
+            l.model_response_for_session(
+                session_id,
+                content,
+                0,
+                0,
+                0,
+                0,
+                config.agent_source.as_deref(),
+            )
+        });
+    }
+    if let Some(reasoning) = reasoning.filter(|text| !text.is_empty()) {
+        slog(config.session_log, |l| {
+            l.reasoning_content(Some(reasoning), None)
+        });
+    }
+}
+
+fn scoped_event_codex_subagent_thread_id(
+    event_thread_id: &Option<String>,
+    stats: &LoopStats,
+) -> Option<String> {
+    event_thread_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|thread_id| !thread_id.is_empty())
+        .filter(|thread_id| stats.codex_subagent_parent_threads.contains_key(*thread_id))
+        .map(str::to_string)
+}
+
+fn emit_external_session_goal(
+    config: &DrainConfig<'_>,
+    session_id: Option<String>,
+    goal: Option<types::SessionGoal>,
+) {
+    if let Some(session_id) = session_id.or_else(|| config.session_id.clone()) {
+        config.bus.send(AppEvent::SessionGoal { session_id, goal });
+    }
+}
+
+fn handle_idle_codex_subagent_event(
+    config: &DrainConfig<'_>,
+    stats: &mut LoopStats,
+    child_thread_id: String,
+    event: external_agent::AgentEvent,
+) {
+    let session_id = Some(child_thread_id.clone());
+    match event {
+        external_agent::AgentEvent::MessageDelta { text } => {
+            config
+                .bus
+                .send(AppEvent::ModelResponseDelta { session_id, text });
+        }
+        external_agent::AgentEvent::Message { text } => {
+            persist_external_model_response_for_session_if_needed(
+                config,
+                Some(&child_thread_id),
+                &text,
+                None,
+            );
+            config.bus.send(AppEvent::ModelResponse {
+                session_id,
+                turn: stats
+                    .codex_subagent_rounds
+                    .get(&child_thread_id)
+                    .copied()
+                    .unwrap_or(0),
+                content: text,
+                usage: provider::TokenUsage::default(),
+                reasoning: None,
+                source: config.agent_source.clone(),
+            });
+        }
+        external_agent::AgentEvent::UserMessage { text } => {
+            config.bus.send(AppEvent::UserMessageLog {
+                session_id,
+                content: text,
+                user_turn_index: None,
+                user_turn_revision: None,
+                replacement_for_user_turn_index: None,
+            });
+        }
+        external_agent::AgentEvent::Reasoning { text } => {
+            persist_external_model_response_for_session_if_needed(
+                config,
+                Some(&child_thread_id),
+                "",
+                Some(&text),
+            );
+            config.bus.send(AppEvent::ModelResponse {
+                session_id,
+                turn: stats
+                    .codex_subagent_rounds
+                    .get(&child_thread_id)
+                    .copied()
+                    .unwrap_or(0),
+                content: String::new(),
+                usage: provider::TokenUsage::default(),
+                reasoning: Some(text),
+                source: config.agent_source.clone(),
+            });
+        }
+        external_agent::AgentEvent::Log { level, message } => {
+            config.bus.send(AppEvent::LogEntry {
+                session_id,
+                level,
+                source: config
+                    .agent_source
+                    .clone()
+                    .unwrap_or_else(|| "worker".to_string()),
+                content: message,
+                turn: None,
+            });
+        }
+        external_agent::AgentEvent::BackendError {
+            message,
+            code,
+            details,
+            recovery_hint,
+            ..
+        } => {
+            let mut content = if let Some(code) = code {
+                format!("Codex subagent backend error ({code}): {message}")
+            } else {
+                format!("Codex subagent backend error: {message}")
+            };
+            if let Some(details) = details.filter(|s| !s.trim().is_empty()) {
+                content.push('\n');
+                content.push_str(details.trim());
+            }
+            if let Some(hint) = recovery_hint {
+                content.push_str("\nRecovery: ");
+                content.push_str(&hint);
+            }
+            config.bus.send(AppEvent::LogEntry {
+                session_id,
+                level: "error".to_string(),
+                source: external_agent_log_source(config.agent_source.as_deref()),
+                content,
+                turn: None,
+            });
+        }
+        external_agent::AgentEvent::ToolStarted {
+            item_id,
+            tool_name,
+            preview,
+        } => {
+            let turn = stats
+                .codex_subagent_rounds
+                .entry(child_thread_id.clone())
+                .or_insert(0);
+            *turn += 1;
+            config.bus.send(AppEvent::AgentStarted {
+                session_id,
+                turn: *turn,
+                commands_preview: format!("{tool_name}: {preview}"),
+                item_id: Some(item_id),
+                source: config.agent_source.clone(),
+            });
+        }
+        external_agent::AgentEvent::ToolOutputDelta { text, .. } => {
+            let output_id = event::next_agent_output_id();
+            slog(config.session_log, |l| {
+                l.agent_output_with_session_id(
+                    Some(&child_thread_id),
+                    &text,
+                    "",
+                    config.agent_source.as_deref(),
+                    Some(&output_id),
+                )
+            });
+            config.bus.send(AppEvent::AgentOutput {
+                session_id,
+                stdout: text,
+                stderr: String::new(),
+                source: config.agent_source.clone(),
+                output_id: Some(output_id),
+            });
+        }
+        external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+            if let external_agent::ToolCompletionStatus::Failed { message } = status {
+                let content = external_tool_failure_content(&item_id, &message, None);
+                config.bus.send(AppEvent::LogEntry {
+                    session_id,
+                    level: "warn".to_string(),
+                    source: external_agent_log_source(config.agent_source.as_deref()),
+                    content,
+                    turn: None,
+                });
+            }
+        }
+        external_agent::AgentEvent::TurnCompleted { message } => {
+            emit_child_turn_complete_for_session(config.bus, session_id, "subagent", message);
+        }
+        external_agent::AgentEvent::SubAgentToolCall {
+            item_id,
+            tool,
+            status,
+            sender_thread_id,
+            receiver_thread_ids,
+            prompt,
+            model,
+            reasoning_effort,
+            agents,
+        } => {
+            let subagent_thread_ids = codex_subagent_thread_ids(&receiver_thread_ids, &agents);
+            record_codex_fission_observation(
+                config,
+                CodexFissionObservationInput {
+                    item_id: &item_id,
+                    tool: &tool,
+                    status: &status,
+                    sender_thread_id: &sender_thread_id,
+                    subagent_thread_ids: &subagent_thread_ids,
+                    prompt: prompt.as_deref(),
+                    model: model.as_deref(),
+                    reasoning_effort: reasoning_effort.as_deref(),
+                    agents: &agents,
+                },
+            );
+            for state in &agents {
+                emit_codex_subagent_state(config, state);
+                emit_codex_subagent_terminal(config, stats, state);
+            }
+        }
+        external_agent::AgentEvent::Usage { usage } => {
+            config.bus.send(AppEvent::UsageSnapshot {
+                session_id,
+                main: frontend::ModelUsageSnapshot {
+                    provider: usage.provider,
+                    model: usage.model,
+                    tokens_used: usage.tokens_used,
+                    context_window: usage.context_window,
+                    hard_context_window: usage.hard_context_window,
+                    usage_pct: usage.usage_pct,
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    cached_tokens: usage.cached_tokens,
+                },
+                presence: None,
+            });
+        }
+        external_agent::AgentEvent::GoalUpdated { goal } => {
+            emit_external_session_goal(config, Some(child_thread_id), Some(goal));
+        }
+        external_agent::AgentEvent::GoalCleared => {
+            emit_external_session_goal(config, Some(child_thread_id), None);
+        }
+        external_agent::AgentEvent::PlanUpdate { .. }
+        | external_agent::AgentEvent::ApprovalRequest { .. }
+        | external_agent::AgentEvent::FileApprovalRequest { .. }
+        | external_agent::AgentEvent::DiffUpdated { .. }
+        | external_agent::AgentEvent::Terminated { .. }
+        | external_agent::AgentEvent::Scoped { .. } => {}
+    }
+}
+
+fn provider_request_item_count(raw: &serde_json::Value) -> Option<usize> {
+    for key in ["input", "messages", "contents"] {
+        if let Some(items) = raw.get(key).and_then(|v| v.as_array()) {
+            return Some(items.len());
+        }
+    }
+    None
 }
 
 /// Drain external agent events until a turn completes, the agent terminates,
@@ -555,14 +5689,21 @@ enum DrainOutcome {
 async fn drain_external_agent_events(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     event_rx: &mut tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    bus_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
     config: &DrainConfig<'_>,
     stats: &mut LoopStats,
+    diff_tracker: &mut ExternalDiffDeltaTracker,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    handled_steer_ids: &mut std::collections::HashSet<String>,
+    codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
+    mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
 
     let approval_counter = std::sync::atomic::AtomicU64::new(1);
     let mut turns_in_round = 0usize;
-    let mut bus_rx = config.bus.subscribe();
+    let local_session_id = config.session_id.clone();
+    let alias_session_id = config.alias_session_id.clone();
     // Track whether we've been asked to interrupt this drain cycle. When the
     // agent finally emits TurnCompleted / Terminated we convert that into a
     // DrainOutcome::Interrupted + Interrupted event so the caller can choose
@@ -574,6 +5715,22 @@ async fn drain_external_agent_events(
     // see 2-4 identical emissions per real file write. We dedupe on the
     // unified-diff bytes: if nothing changed, don't spam session.jsonl.
     let mut last_diff_hash: Option<u64> = None;
+    let mut context_snapshot_state = ExternalContextSnapshotState::default();
+    let mut tool_output_limiter = ExternalToolOutputLimiter::default();
+    let mut tool_previews: std::collections::HashMap<String, String> =
+        std::collections::HashMap::new();
+    let mut context_snapshot_tick = tokio::time::interval_at(
+        tokio::time::Instant::now() + EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
+        EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
+    );
+    context_snapshot_tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let post_turn_sleep = tokio::time::sleep(EXTERNAL_POST_TURN_DRAIN_GRACE);
+    tokio::pin!(post_turn_sleep);
+    let mut post_turn_sleep_active = false;
+    let mut pending_turn_completion: Option<(Option<String>, usize)> = None;
+    let mut active_side_turns: HashSet<String> = HashSet::new();
+    let mut pending_context_rewind: Option<ExternalContextRewindRequest> = None;
+    let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -588,10 +5745,19 @@ async fn drain_external_agent_events(
     let watcher_handle = {
         let mut watcher_rx = config.bus.subscribe();
         let registry = config.approval_registry.clone();
+        let watcher_session_id = local_session_id.clone();
+        let watcher_alias_session_id = alias_session_id.clone();
         tokio::spawn(async move {
             loop {
                 match watcher_rx.recv().await {
-                    Ok(AppEvent::InterruptRequested) => {
+                    Ok(AppEvent::InterruptRequested { session_id })
+                    | Ok(AppEvent::SessionStopRequested { session_id, .. })
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &watcher_session_id,
+                            &watcher_alias_session_id,
+                        ) =>
+                    {
                         let pending: Vec<_> = {
                             let mut reg = registry.lock().unwrap();
                             reg.drain().collect()
@@ -625,12 +5791,42 @@ async fn drain_external_agent_events(
         handle: Some(watcher_handle),
     };
 
+    // Per-session "Approve all": once the user approves-all for this external
+    // session, auto-accept subsequent approval requests without prompting until
+    // the session ends. Scoped to this session — does not touch global autonomy.
+    // (Codex doesn't honor `acceptForSession` as a session-wide grant, so
+    // Intendant enforces the session-wide accept itself.)
+    let mut approve_all_session = false;
+
     loop {
         let event = tokio::select! {
             biased;
             bus_event = bus_rx.recv() => {
                 match bus_event {
-                    Ok(AppEvent::InterruptRequested) => {
+                    Ok(AppEvent::SessionStopRequested { session_id, reason })
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &local_session_id,
+                            &alias_session_id,
+                        ) =>
+                    {
+                        if let Err(e) = agent.interrupt_turn().await {
+                            slog(config.session_log, |l| {
+                                l.warn(&format!("Stop interrupt failed for {}: {}", agent.name(), e))
+                            });
+                        }
+                        return DrainOutcome::Terminated {
+                            reason,
+                            exit_code: None,
+                        };
+                    }
+                    Ok(AppEvent::InterruptRequested { session_id })
+                        if event_targets_session_or_alias(
+                            &session_id,
+                            &local_session_id,
+                            &alias_session_id,
+                        ) =>
+                    {
                         interrupt_pending = true;
                         // Approval registry is drained by the background
                         // watcher task above (so inner `rx.await` sites
@@ -666,26 +5862,111 @@ async fn drain_external_agent_events(
                         }
                         continue;
                     }
-                    Ok(AppEvent::SteerRequested { text, id }) => {
+                    Ok(AppEvent::SteerRequested {
+                        session_id,
+                        text,
+                        id,
+                    }) => {
+                        let Some((target_session_id, target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &alias_session_id,
+                                side_sessions
+                                    .as_ref()
+                                    .map(|state| &*state.open_side_threads),
+                            )
+                        else {
+                            continue;
+                        };
+                        if steer_id_has_been_handled(handled_steer_ids, &id) {
+                            slog(config.session_log, |l| {
+                                l.debug(&format!(
+                                    "Ignoring duplicate steer {} already consumed by another delivery path",
+                                    id
+                                ))
+                            });
+                            continue;
+                        }
+                        mark_steer_id_handled(handled_steer_ids, &id);
+                        let target_is_side = target_kind == ExternalSteerTargetKind::Side;
+                        if maybe_handle_codex_fast_slash_steer(
+                            agent,
+                            &text,
+                            target_session_id.clone(),
+                            id.clone(),
+                            config,
+                        )
+                        .await
+                        {
+                            continue;
+                        }
                         // Try native mid-turn steering first. On success the
-                        // backend injects the text into the active turn and
-                        // we're done. On failure (unsupported or no active
-                        // turn), fall back to queuing onto context_injection
-                        // — the drain-between-turns path in
+                        // backend/runtime has accepted the steer for the
+                        // active turn, but it may only surface to the model at
+                        // the backend's next checkpoint. We keep tracking it
+                        // until the adapter observes the echoed user message.
+                        // On failure (unsupported or no active turn), fall
+                        // back to queuing onto context_injection — the drain-between-turns path in
                         // `run_external_agent_mode` / `run_with_presence`
                         // will flush it as a follow-up prefix on the next
                         // user message and emit SteerDelivered at that point.
+                        let activation_error = if target_is_side {
+                            match target_session_id.as_deref() {
+                                Some(target) => agent.activate_thread(target).await.err(),
+                                None => Some(CallerError::ExternalAgent(
+                                    "missing side thread target for steer".to_string(),
+                                )),
+                            }
+                        } else {
+                            None
+                        };
+                        if let Some(e) = activation_error {
+                            let reason =
+                                format!("{} couldn't target side conversation ({})", agent.name(), e);
+                            if let Ok(mut q) = config.context_injection.lock() {
+                                q.push(event::ContextInjection::text_with_steer_id_for_target(
+                                    text.clone(),
+                                    id.clone(),
+                                    target_session_id.clone(),
+                                ));
+                            }
+                            slog(config.session_log, |l| l.info(&reason));
+                            config.bus.send(AppEvent::SteerQueued {
+                                session_id: target_session_id,
+                                id,
+                                reason,
+                            });
+                            continue;
+                        }
                         match agent.steer_turn(&text).await {
                             Ok(()) => {
-                                slog(config.session_log, |l| {
-                                    l.info(&format!(
-                                        "Steer delivered mid-turn to {}",
-                                        agent.name()
-                                    ))
+                                let accepted_session_id = target_session_id.clone();
+                                emit_user_message_log(
+                                    config.bus,
+                                    config.session_log,
+                                    accepted_session_id.as_deref(),
+                                    None,
+                                    None,
+                                    None,
+                                    &text,
+                                );
+                                pending_runtime_steers.push_back(PendingRuntimeSteer {
+                                    session_id: accepted_session_id.clone(),
+                                    id: id.clone(),
+                                    text: text.clone(),
                                 });
-                                config.bus.send(AppEvent::SteerDelivered {
+                                let reason = format!(
+                                    "{} accepted the steer; waiting for the next runtime checkpoint",
+                                    agent.name()
+                                );
+                                slog(config.session_log, |l| {
+                                    l.info(&format!("Steer accepted by {}", agent.name()))
+                                });
+                                config.bus.send(AppEvent::SteerAccepted {
+                                    session_id: accepted_session_id,
                                     id,
-                                    mid_turn: true,
+                                    reason,
                                 });
                             }
                             Err(e) => {
@@ -694,17 +5975,254 @@ async fn drain_external_agent_events(
                                     agent.name(), e
                                 );
                                 if let Ok(mut q) = config.context_injection.lock() {
-                                    q.push(event::ContextInjection::text_with_steer_id(
+                                    q.push(event::ContextInjection::text_with_steer_id_for_target(
                                         text.clone(),
                                         id.clone(),
+                                        target_session_id.clone(),
                                     ));
                                 }
                                 slog(config.session_log, |l| l.info(&reason));
                                 config.bus.send(AppEvent::SteerQueued {
+                                    session_id: target_session_id,
                                     id,
                                     reason,
                                 });
                             }
+                        }
+                        continue;
+                    }
+                    Ok(AppEvent::ExternalFollowUpRequested {
+                        session_id,
+                        text,
+                        attachments,
+                        follow_up_id,
+                    }) => {
+                        let side_turn = if let Some(state) = side_sessions.as_deref_mut() {
+                            if state.has_side_thread(&session_id) {
+                                let side_round =
+                                    state.side_rounds.entry(session_id.clone()).or_insert(0);
+                                *side_round += 1;
+                                let user_turn_revision = state
+                                    .side_turn_revisions
+                                    .entry(session_id.clone())
+                                    .or_default()
+                                    .record_active_turn(*side_round as u32);
+                                Some((*side_round, user_turn_revision))
+                            } else {
+                                None
+                            }
+                        } else {
+                            None
+                        };
+                        let Some((side_round, user_turn_revision)) = side_turn else {
+                            continue;
+                        };
+
+                        emit_user_message_log(
+                            config.bus,
+                            config.session_log,
+                            Some(&session_id),
+                            Some(side_round as u32),
+                            Some(user_turn_revision),
+                            None,
+                            &text,
+                        );
+                        let attachments = UserAttachments::from_items(attachments);
+                        let merged = drain_steer_queue_as_followup(
+                            config.context_injection,
+                            &text,
+                            config.bus,
+                            Some(&session_id),
+                            None,
+                        )
+                        .unwrap_or_else(|| text.clone());
+                        let side_thread = external_agent::AgentThread {
+                            thread_id: session_id.clone(),
+                        };
+                        emit_external_turn_status(
+                            config.bus,
+                            &config.autonomy,
+                            Some(&session_id),
+                            side_round,
+                            "thinking",
+                            format!("{} side turn in progress", agent.name()),
+                        )
+                        .await;
+                        let send_result = if attachments.is_empty() {
+                            agent.send_message(&side_thread, &merged).await
+                        } else {
+                            agent
+                                .send_message_with_attachments(&side_thread, &merged, &attachments.items)
+                                .await
+                        };
+                        if let Err(e) = send_result {
+                            emit_follow_up_status(
+                                config.bus,
+                                Some(&session_id),
+                                &follow_up_id,
+                                Some(&text),
+                                "failed",
+                                Some("failed to send side follow-up"),
+                            );
+                            config.bus.send(AppEvent::LoopError(format!(
+                                "Failed to send side follow-up: {}",
+                                e
+                            )));
+                            continue;
+                        }
+                        emit_follow_up_status(
+                            config.bus,
+                            Some(&session_id),
+                            &follow_up_id,
+                            Some(&text),
+                            "delivered",
+                            None,
+                        );
+                        active_side_turns.insert(session_id);
+                        continue;
+                    }
+                    Ok(AppEvent::CodexThreadActionRequested {
+                        request_id,
+                        session_id,
+                        action,
+                        params,
+                    }) if event_targets_session_or_alias(
+                        &session_id,
+                        &local_session_id,
+                        &alias_session_id,
+                    ) => {
+                        let result_session_id =
+                            session_id.clone().or_else(|| local_session_id.clone());
+                        if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                            continue;
+                        }
+                        if action == "undo" {
+                            let message =
+                                "/undo is only available between turns for this session"
+                                    .to_string();
+                            config.bus.send(AppEvent::CodexThreadActionResult {
+                                session_id: result_session_id.clone(),
+                                action,
+                                success: false,
+                                message,
+                            });
+                            continue;
+                        }
+                        if let Some(request) =
+                            external_context_rewind_request_from_action(
+                                &action,
+                                &params,
+                                session_id.clone(),
+                            )
+                        {
+                            match request {
+                                Ok(request) => {
+                                    if pending_context_rewind.is_some() {
+                                        config.bus.send(AppEvent::CodexThreadActionResult {
+                                            session_id: result_session_id.clone(),
+                                            action,
+                                            success: false,
+                                            message:
+                                                "a context rewind is already scheduled for this turn"
+                                                    .to_string(),
+                                        });
+                                    } else {
+                                        let thread_ids = active_context_rewind_thread_ids(config);
+                                        if let Err(message) =
+                                            validate_context_rewind_request_before_schedule(
+                                                agent,
+                                                &thread_ids,
+                                                &request,
+                                            )
+                                            .await
+                                        {
+                                            config.bus.send(AppEvent::CodexThreadActionResult {
+                                                session_id: result_session_id.clone(),
+                                                action,
+                                                success: false,
+                                                message,
+                                            });
+                                            continue;
+                                        }
+                                        let target = request.target_label();
+                                        let should_finish_naturally = request.auto_resume
+                                            && !context_rewind_should_interrupt_active_turn(
+                                                &request,
+                                            );
+                                        let should_stop_turn =
+                                            context_rewind_should_interrupt_active_turn(&request);
+                                        pending_context_rewind = Some(request);
+                                        let mut message = format!(
+                                            "context rewind scheduled to {target}; it will apply when the current turn is idle"
+                                        );
+                                        if should_finish_naturally {
+                                            message.push_str(
+                                                "; finish this turn now without starting more tools so the rewind can apply while preserving background tool sessions",
+                                            );
+                                        }
+                                        if should_stop_turn {
+                                            match agent.interrupt_turn().await {
+                                                Ok(()) => {
+                                                    message.push_str(
+                                                        "; active turn stop requested",
+                                                    );
+                                                }
+                                                Err(e) => {
+                                                    message.push_str(&format!(
+                                                        "; active turn stop failed: {e}"
+                                                    ));
+                                                }
+                                            }
+                                        }
+                                        slog(config.session_log, |l| l.info(&message));
+                                        config.bus.send(AppEvent::CodexThreadActionResult {
+                                            session_id: result_session_id.clone(),
+                                            action,
+                                            success: true,
+                                            message,
+                                        });
+                                    }
+                                }
+                                Err(message) => {
+                                    config.bus.send(AppEvent::CodexThreadActionResult {
+                                        session_id: result_session_id.clone(),
+                                        action,
+                                        success: false,
+                                        message,
+                                    });
+                                }
+                            }
+                            continue;
+                        }
+                        let effect =
+                            handle_external_thread_action(agent, action, params, session_id, config)
+                                .await;
+                        match effect {
+                            ExternalThreadActionEffect::SideTurnStarted {
+                                parent_thread_id,
+                                child_thread_id,
+                                prompt,
+                            } => {
+                                if let Some(state) = side_sessions.as_deref_mut() {
+                                    state.record_started(
+                                        parent_thread_id.clone(),
+                                        child_thread_id.clone(),
+                                    );
+                                    active_side_turns.insert(child_thread_id.clone());
+                                    emit_side_session_started(
+                                        config,
+                                        &parent_thread_id,
+                                        &child_thread_id,
+                                        prompt.as_deref(),
+                                    );
+                                }
+                            }
+                            ExternalThreadActionEffect::SideTurnClosed { child_thread_id } => {
+                                if let Some(state) = side_sessions.as_deref_mut() {
+                                    state.record_closed(&child_thread_id);
+                                }
+                            }
+                            ExternalThreadActionEffect::None => {}
                         }
                         continue;
                     }
@@ -717,21 +6235,116 @@ async fn drain_external_agent_events(
                     }
                 }
             }
+            _ = context_snapshot_tick.tick() => {
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
+                continue;
+            }
             maybe_event = event_rx.recv() => {
                 match maybe_event {
                     Some(e) => e,
+                    None if pending_turn_completion.is_some() => {
+                        let (message, turns_in_round) = pending_turn_completion
+                            .take()
+                            .expect("checked pending turn completion");
+                        return backend_recovery_outcome_or_context_rewind(
+                            pending_context_rewind.take(),
+                            pending_backend_recovery.take(),
+                            message,
+                            turns_in_round,
+                        );
+                    }
                     None => return DrainOutcome::ChannelClosed,
                 }
             }
+            _ = &mut post_turn_sleep, if post_turn_sleep_active => {
+                let (message, turns_in_round) = pending_turn_completion
+                    .take()
+                    .expect("post-turn sleep active only while completion is pending");
+                return backend_recovery_outcome_or_context_rewind(
+                    pending_context_rewind.take(),
+                    pending_backend_recovery.take(),
+                    message,
+                    turns_in_round,
+                );
+            }
+        };
+
+        let (event_thread_id, _event_turn_id, event) = event.into_scope();
+        let event_is_primary =
+            scoped_event_targets_config(&event_thread_id, &local_session_id, &alias_session_id);
+        let side_thread_id = event_thread_id.as_deref().and_then(|thread_id| {
+            side_sessions.as_ref().and_then(|state| {
+                state
+                    .has_side_thread(thread_id)
+                    .then(|| thread_id.to_string())
+            })
+        });
+        let codex_subagent_thread_id =
+            scoped_event_codex_subagent_thread_id(&event_thread_id, stats);
+        if !event_is_primary && side_thread_id.is_none() && codex_subagent_thread_id.is_none() {
+            continue;
+        }
+
+        let child_config_storage;
+        let event_is_side = side_thread_id.is_some() && !event_is_primary;
+        let event_is_codex_subagent =
+            codex_subagent_thread_id.is_some() && !event_is_primary && !event_is_side;
+        let child_thread_id = side_thread_id
+            .as_ref()
+            .or(codex_subagent_thread_id.as_ref());
+        let config = if let Some(child_thread_id) = child_thread_id.filter(|_| !event_is_primary) {
+            child_config_storage = DrainConfig {
+                bus: config.bus,
+                web_port: config.web_port,
+                session_id: Some(child_thread_id.clone()),
+                alias_session_id: None,
+                autonomy: config.autonomy.clone(),
+                session_log: config.session_log,
+                project_root: config.project_root,
+                log_dir: config.log_dir,
+                approval_registry: config.approval_registry,
+                json_approval: config.json_approval.clone(),
+                agent_source: config.agent_source.clone(),
+                suppress_agent_started: config.suppress_agent_started,
+                persist_model_responses_inline: config.persist_model_responses_inline,
+                headless: config.headless,
+                context_injection: config.context_injection,
+            };
+            &child_config_storage
+        } else {
+            config
         };
 
         match event {
             external_agent::AgentEvent::MessageDelta { text } => {
-                config.bus.send(AppEvent::ModelResponseDelta { text });
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
+                config.bus.send(AppEvent::ModelResponseDelta {
+                    session_id: config.session_id.clone(),
+                    text,
+                });
             }
             external_agent::AgentEvent::Message { text } => {
-                stats.last_response = Some(text.clone());
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
+                if event_is_primary {
+                    stats.last_response = Some(text.clone());
+                }
+                persist_external_model_response_if_needed(config, &text, None);
                 config.bus.send(AppEvent::ModelResponse {
+                    session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: text,
                     usage: provider::TokenUsage::default(),
@@ -739,12 +6352,37 @@ async fn drain_external_agent_events(
                     source: config.agent_source.clone(),
                 });
             }
+            external_agent::AgentEvent::UserMessage { text } => {
+                if let Some(pos) = pending_runtime_steers.iter().position(|pending| {
+                    pending_runtime_steer_targets_session(pending, &config.session_id)
+                        && (pending.text == text || pending.text.trim() == text.trim())
+                }) {
+                    let Some(pending) = pending_runtime_steers.remove(pos) else {
+                        continue;
+                    };
+                    slog(config.session_log, |l| {
+                        l.info(&format!("Steer observed in {} conversation", agent.name()))
+                    });
+                    config.bus.send(AppEvent::SteerDelivered {
+                        session_id: pending.session_id.or_else(|| config.session_id.clone()),
+                        id: pending.id,
+                        mid_turn: true,
+                    });
+                }
+            }
             external_agent::AgentEvent::Reasoning { text } => {
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 // Surface reasoning via ModelResponse with empty content +
                 // reasoning set.  WASM renders this at "detail" verbosity
                 // (visible in Verbose + Debug, hidden in Normal) via the
                 // existing reasoning_summary path in app_state.rs.
+                persist_external_model_response_if_needed(config, "", Some(&text));
                 config.bus.send(AppEvent::ModelResponse {
+                    session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: String::new(),
                     usage: provider::TokenUsage::default(),
@@ -753,6 +6391,11 @@ async fn drain_external_agent_events(
                 });
             }
             external_agent::AgentEvent::PlanUpdate { entries } => {
+                mark_pending_runtime_steers_delivered_at_model_checkpoint(
+                    config,
+                    pending_runtime_steers,
+                    agent.name(),
+                );
                 let mut md = String::from("**Plan**\n");
                 for (content, _priority, status) in &entries {
                     let marker = match status.as_str() {
@@ -762,13 +6405,42 @@ async fn drain_external_agent_events(
                     };
                     md.push_str(&format!("- {} {}\n", marker, content));
                 }
+                persist_external_model_response_if_needed(config, &md, None);
                 config.bus.send(AppEvent::ModelResponse {
+                    session_id: config.session_id.clone(),
                     turn: stats.turns,
                     content: md,
                     usage: provider::TokenUsage::default(),
                     reasoning: None,
                     source: config.agent_source.clone(),
                 });
+            }
+            external_agent::AgentEvent::Usage { usage } => {
+                stats.usage.prompt_tokens = usage.prompt_tokens;
+                stats.usage.completion_tokens = usage.completion_tokens;
+                stats.usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
+                stats.usage.cached_tokens = usage.cached_tokens;
+                config.bus.send(AppEvent::UsageSnapshot {
+                    session_id: config.session_id.clone(),
+                    main: frontend::ModelUsageSnapshot {
+                        provider: usage.provider,
+                        model: usage.model,
+                        tokens_used: usage.tokens_used,
+                        context_window: usage.context_window,
+                        hard_context_window: usage.hard_context_window,
+                        usage_pct: usage.usage_pct,
+                        prompt_tokens: usage.prompt_tokens,
+                        completion_tokens: usage.completion_tokens,
+                        cached_tokens: usage.cached_tokens,
+                    },
+                    presence: None,
+                });
+            }
+            external_agent::AgentEvent::GoalUpdated { goal } => {
+                emit_external_session_goal(config, event_thread_id.clone(), Some(goal));
+            }
+            external_agent::AgentEvent::GoalCleared => {
+                emit_external_session_goal(config, event_thread_id.clone(), None);
             }
             external_agent::AgentEvent::Log { level, message } => {
                 slog(config.session_log, |l| match level.as_str() {
@@ -777,6 +6449,7 @@ async fn drain_external_agent_events(
                     _ => l.info(&message),
                 });
                 config.bus.send(AppEvent::LogEntry {
+                    session_id: config.session_id.clone(),
                     level,
                     source: config
                         .agent_source
@@ -786,23 +6459,210 @@ async fn drain_external_agent_events(
                     turn: None,
                 });
             }
+            external_agent::AgentEvent::BackendError {
+                message,
+                code,
+                details,
+                will_retry,
+                likely_generation_starvation,
+                recovery_hint,
+            } => {
+                let recovery_required = likely_generation_starvation || recovery_hint.is_some();
+                let mut content = if let Some(code) = code.as_deref() {
+                    if recovery_required {
+                        format!(
+                            "{} context recovery required ({code}): {message}",
+                            agent.name()
+                        )
+                    } else {
+                        format!("{} backend error ({code}): {message}", agent.name())
+                    }
+                } else if recovery_required {
+                    format!("{} context recovery required: {message}", agent.name())
+                } else {
+                    format!("{} backend error: {message}", agent.name())
+                };
+                if let Some(details) = details.as_deref().filter(|s| !s.trim().is_empty()) {
+                    content.push('\n');
+                    content.push_str(details.trim());
+                }
+                if let Some(hint) = recovery_hint.as_deref() {
+                    content.push('\n');
+                    content.push_str("Recovery instruction: ");
+                    content.push_str(hint);
+                }
+
+                slog(config.session_log, |l| {
+                    if will_retry || recovery_required {
+                        l.warn(&content);
+                    } else {
+                        l.error(&content);
+                    }
+                });
+                config.bus.send(AppEvent::LogEntry {
+                    session_id: config.session_id.clone(),
+                    level: if will_retry || recovery_required {
+                        "warn"
+                    } else {
+                        "error"
+                    }
+                    .to_string(),
+                    source: external_agent_log_source(config.agent_source.as_deref()),
+                    content,
+                    turn: None,
+                });
+
+                if !will_retry && likely_generation_starvation && event_is_primary {
+                    pending_backend_recovery = Some(ExternalBackendRecovery {
+                        message,
+                        recovery_hint,
+                    });
+                }
+            }
+            external_agent::AgentEvent::SubAgentToolCall {
+                item_id,
+                tool,
+                status,
+                sender_thread_id,
+                receiver_thread_ids,
+                prompt,
+                model,
+                reasoning_effort,
+                agents,
+            } => {
+                let prompt_ref = prompt.as_deref();
+                let subagent_thread_ids = codex_subagent_thread_ids(&receiver_thread_ids, &agents);
+                record_codex_fission_observation(
+                    config,
+                    CodexFissionObservationInput {
+                        item_id: &item_id,
+                        tool: &tool,
+                        status: &status,
+                        sender_thread_id: &sender_thread_id,
+                        subagent_thread_ids: &subagent_thread_ids,
+                        prompt: prompt_ref,
+                        model: model.as_deref(),
+                        reasoning_effort: reasoning_effort.as_deref(),
+                        agents: &agents,
+                    },
+                );
+                if status == "inProgress" {
+                    turns_in_round += 1;
+                    if !config.suppress_agent_started {
+                        stats.turns += 1;
+                        config.bus.send(AppEvent::AgentStarted {
+                            session_id: config.session_id.clone(),
+                            turn: stats.turns,
+                            commands_preview: collab_agent_tool_preview(
+                                &tool,
+                                &receiver_thread_ids,
+                                prompt_ref,
+                            ),
+                            item_id: Some(item_id.clone()),
+                            source: config.agent_source.clone(),
+                        });
+                    }
+                }
+
+                for child_thread_id in &subagent_thread_ids {
+                    let child_thread_id = child_thread_id.trim();
+                    if child_thread_id.is_empty() || child_thread_id == sender_thread_id.trim() {
+                        continue;
+                    }
+                    let sender_thread_id = sender_thread_id.trim();
+                    if !sender_thread_id.is_empty() {
+                        stats
+                            .codex_subagent_parent_threads
+                            .entry(child_thread_id.to_string())
+                            .or_insert_with(|| sender_thread_id.to_string());
+                    }
+                    if stats
+                        .codex_subagent_sessions
+                        .insert(child_thread_id.to_string())
+                    {
+                        emit_codex_subagent_started(
+                            config,
+                            sender_thread_id,
+                            child_thread_id,
+                            prompt_ref,
+                            model.as_deref(),
+                            reasoning_effort.as_deref(),
+                        );
+                    }
+                    emit_codex_subagent_transcript_updates(config, stats, child_thread_id);
+                }
+
+                if status == "failed" {
+                    let item_id = item_id.trim();
+                    let item_suffix = if item_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({item_id})")
+                    };
+                    let content = format!(
+                        "Codex subagent tool {}{} failed{}",
+                        tool,
+                        item_suffix,
+                        prompt_ref
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(|p| format!(": {p}"))
+                            .unwrap_or_default()
+                    );
+                    slog(config.session_log, |l| l.warn(&content));
+                    config.bus.send(AppEvent::LogEntry {
+                        session_id: config.session_id.clone(),
+                        level: "warn".to_string(),
+                        source: external_agent_log_source(config.agent_source.as_deref()),
+                        content,
+                        turn: None,
+                    });
+                }
+
+                for state in &agents {
+                    emit_codex_subagent_state(config, state);
+                    emit_codex_subagent_terminal(config, stats, state);
+                }
+
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
+            }
             external_agent::AgentEvent::ToolStarted {
+                item_id,
                 preview,
                 tool_name,
-                ..
             } => {
                 turns_in_round += 1;
+                if let Some(preview_text) = external_tool_preview_text(&tool_name, &preview) {
+                    if !item_id.is_empty() {
+                        tool_previews.insert(item_id.clone(), preview_text);
+                    }
+                }
                 if !config.suppress_agent_started {
                     stats.turns += 1;
                     let preview_text = format!("{}: {}", tool_name, preview);
                     config.bus.send(AppEvent::AgentStarted {
+                        session_id: config.session_id.clone(),
                         turn: stats.turns,
                         commands_preview: preview_text,
+                        item_id: Some(item_id.clone()),
                         source: config.agent_source.clone(),
                     });
                 }
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
             }
-            external_agent::AgentEvent::ToolOutputDelta { text, .. } => {
+            external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
                 // Gemini CLI strips images from ACP, sending "[Image: image/png]".
                 // Substitute with the latest screenshot from disk so the Activity
                 // tab can render it.
@@ -813,13 +6673,29 @@ async fn drain_external_agent_events(
                 } else {
                     text
                 };
-                config.bus.send(AppEvent::AgentOutput {
-                    stdout,
-                    stderr: String::new(),
-                    source: config.agent_source.clone(),
-                });
+                if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
+                    let output_id = event::next_agent_output_id();
+                    slog(config.session_log, |l| {
+                        l.agent_output_with_session_id(
+                            config.session_id.as_deref(),
+                            &stdout,
+                            "",
+                            config.agent_source.as_deref(),
+                            Some(&output_id),
+                        )
+                    });
+                    config.bus.send(AppEvent::AgentOutput {
+                        session_id: config.session_id.clone(),
+                        stdout,
+                        stderr: String::new(),
+                        source: config.agent_source.clone(),
+                        output_id: Some(output_id),
+                    });
+                }
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+                tool_output_limiter.complete(&item_id);
+                let tool_preview = tool_previews.remove(&item_id);
                 // Success: nothing to emit.  The tool command was already
                 // shown via AgentStarted at start, and any output streamed
                 // via ToolOutputDelta → AgentOutput.  A completion marker
@@ -829,13 +6705,17 @@ async fn drain_external_agent_events(
                 // Cancelled: silent.
                 match &status {
                     external_agent::ToolCompletionStatus::Failed { message } => {
-                        slog(config.session_log, |l| {
-                            l.warn(&format!("Tool {} failed: {}", item_id, message))
-                        });
+                        let content = external_tool_failure_content(
+                            &item_id,
+                            message,
+                            tool_preview.as_deref(),
+                        );
+                        slog(config.session_log, |l| l.warn(&content));
                         config.bus.send(AppEvent::LogEntry {
+                            session_id: config.session_id.clone(),
                             level: "warn".to_string(),
-                            source: "worker".to_string(),
-                            content: format!("Tool failed: {}", message),
+                            source: external_agent_log_source(config.agent_source.as_deref()),
+                            content,
                             turn: None,
                         });
                     }
@@ -848,6 +6728,13 @@ async fn drain_external_agent_events(
                 command,
                 category,
             } => {
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
                 let cat = match category {
                     external_agent::ApprovalCategory::CommandExecution => {
                         autonomy::ActionCategory::CommandExec
@@ -855,41 +6742,55 @@ async fn drain_external_agent_events(
                     external_agent::ApprovalCategory::FileChange => {
                         autonomy::ActionCategory::FileWrite
                     }
+                    external_agent::ApprovalCategory::McpTool => autonomy::ActionCategory::ToolCall,
                 };
-                let needs = { config.autonomy.read().await.needs_approval(cat) };
-                if !needs {
-                    config
-                        .bus
-                        .send(AppEvent::AutoApproved { preview: command.clone() });
+                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
+                if approve_all_session
+                    || decision == autonomy::ExternalApprovalDecision::AutoApprove
+                {
+                    config.bus.send(AppEvent::AutoApproved {
+                        preview: command.clone(),
+                    });
                     slog(config.session_log, |l| l.auto_approved(&command));
                     if let Err(e) = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Accept,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Accept)
                         .await
                     {
                         slog(config.session_log, |l| {
                             l.warn(&format!("Failed to auto-approve: {}", e))
                         });
                     }
-                } else if config.headless && config.json_approval.is_none() {
+                } else if decision == autonomy::ExternalApprovalDecision::Reject {
                     slog(config.session_log, |l| {
-                        l.warn(&format!("Headless auto-deny: {}", command))
+                        l.warn(&format!("Policy auto-deny (category Deny): {}", command))
                     });
                     config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
                         id: 0,
                         action: "deny".to_string(),
                     });
                     let _ = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Decline,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
+                        .await;
+                } else if config.headless
+                    && config.json_approval.is_none()
+                    && config.web_port.is_none()
+                {
+                    slog(config.session_log, |l| {
+                        l.warn(&format!("Headless auto-deny: {}", command))
+                    });
+                    config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
+                        id: 0,
+                        action: "deny".to_string(),
+                    });
+                    let _ = agent
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
                         .await;
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
+                        session_id: config.session_id.clone(),
                         id,
                         command_preview: command.clone(),
                         category: cat,
@@ -916,10 +6817,16 @@ async fn drain_external_agent_events(
                                 event::ApprovalResponse::Approve => {
                                     (external_agent::ApprovalDecision::Accept, "approve")
                                 }
-                                event::ApprovalResponse::ApproveAll => (
-                                    external_agent::ApprovalDecision::AcceptForSession,
-                                    "approve_all",
-                                ),
+                                event::ApprovalResponse::ApproveAll => {
+                                    // Grant session-wide auto-approval; enforced
+                                    // by Intendant for every later request in
+                                    // this session (see `approve_all_session`).
+                                    approve_all_session = true;
+                                    (
+                                        external_agent::ApprovalDecision::AcceptForSession,
+                                        "approve_all",
+                                    )
+                                }
                                 event::ApprovalResponse::Deny => {
                                     (external_agent::ApprovalDecision::Decline, "deny")
                                 }
@@ -928,10 +6835,10 @@ async fn drain_external_agent_events(
                                 }
                             };
                             config.bus.send(AppEvent::ApprovalResolved {
+                                session_id: config.session_id.clone(),
                                 id,
                                 action: action_str.to_string(),
                             });
-                            slog(config.session_log, |l| l.approval_resolved(id, action_str));
                             if let Err(e) = agent.resolve_approval(&request_id, decision).await {
                                 slog(config.session_log, |l| {
                                     l.warn(&format!("Failed to resolve approval: {}", e))
@@ -958,42 +6865,55 @@ async fn drain_external_agent_events(
                 diff,
             } => {
                 let cat = autonomy::ActionCategory::FileWrite;
-                let needs = { config.autonomy.read().await.needs_approval(cat) };
+                let decision = { config.autonomy.read().await.external_approval_decision(cat) };
                 let preview = format!("file change: {}", path);
 
-                if !needs {
-                    config
-                        .bus
-                        .send(AppEvent::AutoApproved { preview: preview.clone() });
+                if approve_all_session
+                    || decision == autonomy::ExternalApprovalDecision::AutoApprove
+                {
+                    config.bus.send(AppEvent::AutoApproved {
+                        preview: preview.clone(),
+                    });
                     slog(config.session_log, |l| l.auto_approved(&preview));
                     if let Err(e) = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Accept,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Accept)
                         .await
                     {
                         slog(config.session_log, |l| {
                             l.warn(&format!("Failed to auto-approve file change: {}", e))
                         });
                     }
-                } else if config.headless && config.json_approval.is_none() {
+                } else if decision == autonomy::ExternalApprovalDecision::Reject {
                     slog(config.session_log, |l| {
-                        l.warn(&format!("Headless auto-deny: {}", preview))
+                        l.warn(&format!("Policy auto-deny (category Deny): {}", preview))
                     });
                     config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
                         id: 0,
                         action: "deny".to_string(),
                     });
                     let _ = agent
-                        .resolve_approval(
-                            &request_id,
-                            external_agent::ApprovalDecision::Decline,
-                        )
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
+                        .await;
+                } else if config.headless
+                    && config.json_approval.is_none()
+                    && config.web_port.is_none()
+                {
+                    slog(config.session_log, |l| {
+                        l.warn(&format!("Headless auto-deny: {}", preview))
+                    });
+                    config.bus.send(AppEvent::ApprovalResolved {
+                        session_id: config.session_id.clone(),
+                        id: 0,
+                        action: "deny".to_string(),
+                    });
+                    let _ = agent
+                        .resolve_approval(&request_id, external_agent::ApprovalDecision::Decline)
                         .await;
                 } else {
                     let id = approval_counter.fetch_add(1, Ordering::Relaxed);
                     config.bus.send(AppEvent::ApprovalRequired {
+                        session_id: config.session_id.clone(),
                         id,
                         command_preview: format!("{}\n{}", preview, diff),
                         category: cat,
@@ -1020,10 +6940,16 @@ async fn drain_external_agent_events(
                                 event::ApprovalResponse::Approve => {
                                     (external_agent::ApprovalDecision::Accept, "approve")
                                 }
-                                event::ApprovalResponse::ApproveAll => (
-                                    external_agent::ApprovalDecision::AcceptForSession,
-                                    "approve_all",
-                                ),
+                                event::ApprovalResponse::ApproveAll => {
+                                    // Grant session-wide auto-approval; enforced
+                                    // by Intendant for every later request in
+                                    // this session (see `approve_all_session`).
+                                    approve_all_session = true;
+                                    (
+                                        external_agent::ApprovalDecision::AcceptForSession,
+                                        "approve_all",
+                                    )
+                                }
                                 event::ApprovalResponse::Deny => {
                                     (external_agent::ApprovalDecision::Decline, "deny")
                                 }
@@ -1032,10 +6958,10 @@ async fn drain_external_agent_events(
                                 }
                             };
                             config.bus.send(AppEvent::ApprovalResolved {
+                                session_id: config.session_id.clone(),
                                 id,
                                 action: action_str.to_string(),
                             });
-                            slog(config.session_log, |l| l.approval_resolved(id, action_str));
                             if let Err(e) = agent.resolve_approval(&request_id, decision).await {
                                 slog(config.session_log, |l| {
                                     l.warn(&format!("Failed to resolve file approval: {}", e))
@@ -1071,13 +6997,18 @@ async fn drain_external_agent_events(
                     // Identical to the previous emission — skip.
                 } else {
                     last_diff_hash = Some(hash);
+                    let Some(delta) =
+                        diff_tracker.delta(config.project_root, &files_changed, &unified_diff)
+                    else {
+                        continue;
+                    };
                     // Prefer the file paths from the unified diff header
                     // (`+++ b/<path>`) because `files_changed` from Codex is
                     // frequently empty in practice. Fall back to the agent's
                     // own list if parsing the diff yields nothing.
-                    let parsed_files = parse_diff_file_paths(&unified_diff);
+                    let parsed_files = parse_diff_file_paths(&delta.unified_diff);
                     let files = if parsed_files.is_empty() {
-                        files_changed
+                        delta.files_changed
                     } else {
                         parsed_files
                     };
@@ -1092,32 +7023,95 @@ async fn drain_external_agent_events(
                             files.join(", ")
                         )
                     };
+                    let diff_content = format!(
+                        "# intendant-project-root: {}\n{}",
+                        config.project_root.display(),
+                        delta.unified_diff
+                    );
                     slog(config.session_log, |l| {
-                        l.info(&format!("{}\n{}", header, unified_diff));
+                        l.info(&format!("{}\n{}", header, diff_content));
                     });
+                    if !delta.unified_diff.trim().is_empty() {
+                        config.bus.send(AppEvent::LogEntry {
+                            session_id: config.session_id.clone(),
+                            level: "info".to_string(),
+                            source: "Diff".to_string(),
+                            content: diff_content,
+                            turn: None,
+                        });
+                    }
                 }
             }
             external_agent::AgentEvent::TurnCompleted { message } => {
+                if event_is_side || event_is_codex_subagent {
+                    if event_is_side
+                        && !claim_active_side_turn_completion(
+                            &mut active_side_turns,
+                            config.session_id.as_deref(),
+                        )
+                    {
+                        continue;
+                    }
+                    let conversation_kind = if event_is_side { "side" } else { "subagent" };
+                    emit_child_turn_complete(config, conversation_kind, message);
+                    if event_is_side
+                        && pending_turn_completion.is_some()
+                        && active_side_turns.is_empty()
+                    {
+                        post_turn_sleep_active = true;
+                        post_turn_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + EXTERNAL_POST_TURN_DRAIN_GRACE);
+                    }
+                    continue;
+                }
                 if let Some(ref msg) = message {
                     stats.last_response = Some(msg.clone());
                 }
+                emit_external_context_snapshot_if_changed(
+                    agent,
+                    config,
+                    external_context_snapshot_turn(stats),
+                    &mut context_snapshot_state,
+                )
+                .await;
                 if interrupt_pending {
                     let reason = message
                         .clone()
                         .unwrap_or_else(|| "user requested".to_string());
                     config.bus.send(AppEvent::Interrupted {
+                        session_id: config.session_id.clone(),
                         reason: "user requested".into(),
                     });
                     return DrainOutcome::Interrupted { reason };
                 }
-                return DrainOutcome::TurnCompleted {
-                    message,
-                    turns_in_round,
-                };
+                let delivered = flush_pending_runtime_steers_for_session(
+                    config.bus,
+                    pending_runtime_steers,
+                    &local_session_id,
+                );
+                if delivered > 0 {
+                    slog(config.session_log, |l| {
+                        l.info(&format!(
+                            "Marked {} accepted {} steer(s) delivered at turn completion",
+                            delivered,
+                            agent.name()
+                        ))
+                    });
+                }
+                pending_turn_completion = Some((message, turns_in_round));
+                if active_side_turns.is_empty() {
+                    post_turn_sleep_active = true;
+                    post_turn_sleep
+                        .as_mut()
+                        .reset(tokio::time::Instant::now() + EXTERNAL_POST_TURN_DRAIN_GRACE);
+                }
+                continue;
             }
             external_agent::AgentEvent::Terminated { reason, exit_code } => {
                 if interrupt_pending {
                     config.bus.send(AppEvent::Interrupted {
+                        session_id: config.session_id.clone(),
                         reason: "user requested".into(),
                     });
                     return DrainOutcome::Interrupted {
@@ -1126,6 +7120,7 @@ async fn drain_external_agent_events(
                 }
                 return DrainOutcome::Terminated { reason, exit_code };
             }
+            external_agent::AgentEvent::Scoped { .. } => continue,
         }
     }
 }
@@ -1144,25 +7139,31 @@ async fn drain_external_agent_events(
 /// caller's `followup` text — the result is sent as a single external agent
 /// message so the agent sees both in the same turn's input.
 ///
-/// When `followup` is empty the return is `None`, meaning "nothing to send"
-/// — this lets callers avoid an empty `send_message` when the follow-up
-/// was purely a delivery of queued steers (the external agent loop does
-/// not distinguish "steer only" from "user message", so we skip the send
-/// and wait for the next follow-up).
+/// When `followup` is empty and queued steer text exists, the queued steer
+/// text becomes the whole follow-up. When both are empty, the return is
+/// `None`, meaning "nothing to send".
 fn drain_steer_queue_as_followup(
     context_injection: &event::ContextInjectionQueue,
     followup: &str,
     bus: &EventBus,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
 ) -> Option<String> {
     let mut prefix_lines: Vec<String> = Vec::new();
     if let Ok(mut q) = context_injection.lock() {
-        // Partition: keep non-steer entries, pull out steer entries.
+        // Partition: keep non-steer entries and steers for other sessions,
+        // pull out steer entries for this session.
         let mut kept = Vec::with_capacity(q.len());
         for inj in q.drain(..) {
-            if inj.steer_id.is_some() {
+            if queued_steer_targets_session(&inj, session_id, alias_session_id) {
                 prefix_lines.push(format!("[User] {}", inj.text));
                 let id = inj.steer_id.clone().unwrap_or_default();
                 bus.send(AppEvent::SteerDelivered {
+                    session_id: inj
+                        .target_session_id
+                        .as_deref()
+                        .map(str::to_string)
+                        .or_else(|| session_id.map(str::to_string)),
                     id,
                     mid_turn: false,
                 });
@@ -1184,12 +7185,98 @@ fn drain_steer_queue_as_followup(
     }
 }
 
+fn emit_follow_up_status(
+    bus: &EventBus,
+    session_id: Option<&str>,
+    id: &Option<String>,
+    text: Option<&str>,
+    status: &str,
+    reason: Option<&str>,
+) {
+    let Some(id) = id.as_deref().map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::FollowUpStatus {
+        session_id: session_id.map(str::to_string),
+        id: id.to_string(),
+        text: text.map(str::to_string),
+        status: status.to_string(),
+        reason: reason.map(str::to_string),
+    });
+}
+
+async fn emit_external_turn_status(
+    bus: &EventBus,
+    autonomy: &SharedAutonomy,
+    session_id: Option<&str>,
+    turn: usize,
+    phase: &str,
+    task: String,
+) {
+    let Some(session_id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+        return;
+    };
+    let autonomy = autonomy.read().await.level.to_string();
+    bus.send(AppEvent::StatusUpdate {
+        turn,
+        phase: phase.to_string(),
+        autonomy,
+        session_id: session_id.to_string(),
+        task,
+    });
+}
+
+fn codex_subagent_parent_threads_from_log(log_dir: &std::path::Path) -> HashMap<String, String> {
+    let path = log_dir.join("session.jsonl");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return HashMap::new();
+    };
+
+    let mut parents = HashMap::new();
+    for line in contents.lines() {
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry.get("event").and_then(|v| v.as_str()) != Some("session_relationship") {
+            continue;
+        }
+        let Some(data) = entry.get("data") else {
+            continue;
+        };
+        let relationship = data
+            .get("relationship")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if relationship != "subagent" {
+            continue;
+        }
+        let parent = data
+            .get("parent_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        let child = data
+            .get("child_session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if parent.is_empty() || child.is_empty() || parent == child {
+            continue;
+        }
+        parents.insert(child.to_string(), parent.to_string());
+    }
+    parents
+}
+
 /// Configuration for `run_daemon_loop`.
 struct DaemonConfig {
     bus: EventBus,
     project_root: PathBuf,
     autonomy: SharedAutonomy,
     shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>>,
+    shared_codex_config: control_plane::SharedCodexConfig,
+    shared_gemini_config: control_plane::SharedGeminiConfig,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
     web_port: Option<u16>,
     flags_direct: bool,
@@ -1207,231 +7294,26 @@ struct DaemonConfig {
 /// deliberately do not also listen for it here because racing two handlers
 /// risked the loop `break`ing before the meta update ran.
 async fn run_daemon_loop(config: DaemonConfig) {
-    let mut event_rx = config.bus.subscribe();
-    loop {
-        tokio::select! {
-            event = event_rx.recv() => {
-                match event {
-                    Ok(AppEvent::ControlCommand(event::ControlMsg::StartTask {
-                        task: new_task,
-                        orchestrate,
-                        direct,
-                        reference_frame_ids,
-                        display_target,
-                        attachments,
-                    })) => {
-                        eprintln!(
-                            "New session{}: {}",
-                            if direct.unwrap_or(false) { " (direct)" } else { "" },
-                            &new_task[..new_task.len().min(80)]
-                        );
-
-                        // Create fresh session resources
-                        let new_log_dir = session_log::SessionLog::resolve_path(None);
-                        let new_session_log = match session_log::SessionLog::open(new_log_dir.clone()) {
-                            Ok(l) => Arc::new(Mutex::new(l)),
-                            Err(e) => {
-                                config.bus.send(AppEvent::LoopError(format!("Session create failed: {}", e)));
-                                continue;
-                            }
-                        };
-                        let new_project = match Project::from_root(config.project_root.clone()) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                config.bus.send(AppEvent::LoopError(format!("Project load failed: {}", e)));
-                                continue;
-                            }
-                        };
-
-                        // CU path: when reference_frame_ids are present, run ephemeral CU task
-                        if !reference_frame_ids.is_empty() {
-                            let reference_images = resolve_frame_ids(
-                                &reference_frame_ids, &config.frame_registry,
-                            ).await;
-                            if !reference_images.is_empty() {
-                                let cu_provider = match provider::select_cu_provider(
-                                    &new_project.config.computer_use,
-                                ) {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        config.bus.send(AppEvent::LoopError(format!("CU provider failed: {}", e)));
-                                        continue;
-                                    }
-                                };
-                                config.bus.send(AppEvent::PresenceLog {
-                                    message: format!("Starting CU task: {}", new_task),
-                                    level: None,
-                                    turn: None,
-                                });
-                                let bus_cu = config.bus.clone();
-                                let session_log_cu = new_session_log.clone();
-                                let cu_config = new_project.config.computer_use.clone();
-                                tokio::spawn(async move {
-                                    let cu_target = display_target.as_deref()
-                                        .map(parse_display_target_str);
-                                    match run_cu_task(
-                                        cu_provider.as_ref(), &new_task, reference_images, vec![],
-                                        &session_log_cu, &new_log_dir, &bus_cu, &cu_config, cu_target,
-                                    ).await {
-                                        Ok(CuTaskResult::Completed(stats)) => {
-                                            bus_cu.send(AppEvent::PresenceLog {
-                                                message: format!("CU task complete ({} turns)", stats.turns),
-                                                level: None, turn: None,
-                                            });
-                                        }
-                                        Ok(CuTaskResult::Escalate { task }) => {
-                                            bus_cu.send(AppEvent::PresenceLog {
-                                                message: format!(
-                                                    "CU escalated (not a display task): {}",
-                                                    &task[..task.len().min(80)]
-                                                ),
-                                                level: None, turn: None,
-                                            });
-                                        }
-                                        Err(e) => {
-                                            bus_cu.send(AppEvent::PresenceLog {
-                                                message: format!("CU task error: {}", e),
-                                                level: Some(types::LogLevel::Error), turn: None,
-                                            });
-                                        }
-                                    }
-                                });
-                                continue;
-                            }
-                        }
-
-                        // Update shared session state (headless mode)
-                        if let Some(ref shared_session) = config.shared_session {
-                            let mut ss = shared_session.write().await;
-                            ss.session_log = Some(new_session_log.clone());
-                        }
-
-                        let new_session_id = new_log_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("unknown")
-                            .to_string();
-                        config.bus.send(AppEvent::SessionStarted {
-                            session_id: new_session_id.clone(),
-                            task: Some(new_task.clone()),
-                        });
-
-                        let bus_spawn = config.bus.clone();
-                        let autonomy_spawn = config.autonomy.clone();
-                        let session_log_spawn = new_session_log.clone();
-                        let shared_cleanup = config.shared_session.clone();
-                        let use_direct = direct.unwrap_or(false)
-                            || orchestrate
-                                .map(|o| !o)
-                                .unwrap_or_else(|| config.flags_direct || is_simple_task(&new_task));
-                        // Read shared state (web UI may have changed it)
-                        let restart_agent_backend = resolve_agent_backend(
-                            &config.shared_external_agent, &new_project,
-                        ).await;
-                        let web_port_for_spawn = config.web_port;
-                        // Resolve attachments → image data once, before the spawn.
-                        // The daemon path creates a fresh session per task, so we
-                        // don't have to worry about clobbering pending attachments.
-                        let attachment_images = resolve_frame_ids(
-                            &attachments, &config.frame_registry,
-                        ).await;
-                        // Backend-side dispatch log: emitted once the daemon
-                        // has accepted the task envelope and resolved its
-                        // session resources, just before spawning the agent.
-                        emit_task_dispatched_log(
-                            &config.bus,
-                            &new_session_log,
-                            &new_task,
-                            attachments.len(),
-                        );
-
-                        tokio::spawn(async move {
-                            let (_, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
-                            let result = if let Some(backend) = restart_agent_backend {
-                                run_external_agent_mode(
-                                    backend, new_task.clone(), new_project,
-                                    bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                    new_log_dir, follow_up_rx, None,
-                                    event::ApprovalRegistry::default(),
-                                    event::ContextInjectionQueue::default(),
-                                    true, web_port_for_spawn,
-                                    attachment_images.clone(),
-                                ).await
-                            } else {
-                                let new_provider = match provider::select_provider() {
-                                    Ok(p) => p,
-                                    Err(e) => {
-                                        return bus_spawn.send(AppEvent::LoopError(
-                                            format!("Provider failed: {}", e),
-                                        ));
-                                    }
-                                };
-                                if use_direct {
-                                    run_direct_mode(
-                                        new_provider, new_task.clone(), new_project,
-                                        bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                        new_log_dir, None, follow_up_rx, None,
-                                        event::ApprovalRegistry::default(),
-                                        event::ContextInjectionQueue::default(),
-                                        true,
-                                        attachment_images,
-                                    ).await
-                                } else {
-                                    run_user_mode(
-                                        new_provider, new_task.clone(), new_project,
-                                        bus_spawn.clone(), autonomy_spawn, session_log_spawn.clone(),
-                                    ).await
-                                }
-                            };
-
-                            let reason = match &result {
-                                Ok(stats) => {
-                                    slog(&session_log_spawn, |l| {
-                                        l.write_summary_with_rounds(
-                                            &new_task, "completed",
-                                            stats.turns, Some(stats.rounds),
-                                        )
-                                    });
-                                    "completed".to_string()
-                                }
-                                Err(e) => {
-                                    slog(&session_log_spawn, |l| {
-                                        l.write_summary(&new_task, &format!("error: {}", e), 0)
-                                    });
-                                    format!("error: {}", e)
-                                }
-                            };
-
-                            bus_spawn.send(AppEvent::SessionEnded {
-                                session_id: new_session_id,
-                                reason,
-                            });
-
-                            // Clear session state (headless mode)
-                            if let Some(ref ss) = shared_cleanup {
-                                let mut state = ss.write().await;
-                                state.session_log = None;
-                                state.query_ctx = None;
-                            }
-                        });
-                    }
-                    Ok(AppEvent::ControlCommand(event::ControlMsg::SetExternalAgent { agent })) => {
-                        let label = agent.as_deref().unwrap_or("none");
-                        eprintln!("External agent set to {} (takes effect on next task)", label);
-                        // Shared state updated by ControlPlane
-                    }
-                    Ok(_) => {}
-                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
-                    Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-                }
-            }
-        }
-    }
+    session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
+        bus: config.bus,
+        project_root: config.project_root,
+        autonomy: config.autonomy,
+        shared_external_agent: config.shared_external_agent,
+        shared_codex_config: config.shared_codex_config,
+        shared_gemini_config: config.shared_gemini_config,
+        frame_registry: config.frame_registry,
+        web_port: config.web_port,
+        flags_direct: config.flags_direct,
+        shared_session: config.shared_session,
+    })
+    .run()
+    .await;
 }
 
 const SAFETY_CAP: usize = 500;
 const MIN_BUDGET_TOKENS: u64 = 4096;
 const BUDGET_WARNING_THRESHOLD: f64 = 0.85;
+const EXTERNAL_POST_TURN_DRAIN_GRACE: Duration = Duration::from_millis(750);
 
 /// Why the agent loop exited after a round.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1457,11 +7339,163 @@ struct LoopStats {
     turns: usize,
     rounds: usize,
     usage: provider::TokenUsage,
+    codex_subagent_sessions: std::collections::HashSet<String>,
+    codex_subagent_parent_threads: std::collections::HashMap<String, String>,
+    codex_subagent_rounds: std::collections::HashMap<String, usize>,
+    codex_subagent_terminal_sessions: std::collections::HashSet<String>,
+    codex_subagent_transcript_offsets: std::collections::HashMap<String, usize>,
     /// Last model response content (for sub-agent result summaries).
     last_response: Option<String>,
 }
 
-type FollowUpReceiver = tokio::sync::mpsc::Receiver<String>;
+#[derive(Debug, Clone, Default)]
+struct UserAttachments {
+    items: Vec<external_agent::AgentAttachment>,
+}
+
+impl UserAttachments {
+    fn from_items(items: Vec<external_agent::AgentAttachment>) -> Self {
+        Self { items }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.items.is_empty()
+    }
+
+    fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    fn conversation_images(&self) -> Vec<conversation::ImageData> {
+        self.items
+            .iter()
+            .filter_map(|att| match att {
+                external_agent::AgentAttachment::Image(img) => Some(conversation::ImageData {
+                    media_type: img.mime_type.clone(),
+                    data: img.base64.clone(),
+                }),
+                external_agent::AgentAttachment::File(_) => None,
+            })
+            .collect()
+    }
+
+    fn text_with_file_prelude(&self, text: &str) -> String {
+        let files: Vec<&external_agent::AgentFileAttachment> = self
+            .items
+            .iter()
+            .filter_map(|att| match att {
+                external_agent::AgentAttachment::File(file) => Some(file),
+                external_agent::AgentAttachment::Image(_) => None,
+            })
+            .collect();
+        let prelude = external_agent::format_file_attachments_prelude(&files);
+        if prelude.is_empty() {
+            text.to_string()
+        } else {
+            format!("{}{}", prelude, text)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+struct FollowUpMessage {
+    text: String,
+    attachments: UserAttachments,
+    steer_id: Option<String>,
+    follow_up_id: Option<String>,
+    edit_user_turn_index: Option<u32>,
+    edit_user_turn_revision: Option<u32>,
+    edit_original_text: Option<String>,
+    unresolved_attachment_ids: Vec<String>,
+    target_session_id: Option<String>,
+    managed_context_recovery_kickstart: bool,
+}
+
+impl FollowUpMessage {
+    fn text(text: String) -> Self {
+        Self {
+            text,
+            attachments: UserAttachments::default(),
+            steer_id: None,
+            follow_up_id: None,
+            edit_user_turn_index: None,
+            edit_user_turn_revision: None,
+            edit_original_text: None,
+            unresolved_attachment_ids: Vec::new(),
+            target_session_id: None,
+            managed_context_recovery_kickstart: false,
+        }
+    }
+
+    fn with_attachments(text: String, attachments: UserAttachments) -> Self {
+        Self {
+            text,
+            attachments,
+            steer_id: None,
+            follow_up_id: None,
+            edit_user_turn_index: None,
+            edit_user_turn_revision: None,
+            edit_original_text: None,
+            unresolved_attachment_ids: Vec::new(),
+            target_session_id: None,
+            managed_context_recovery_kickstart: false,
+        }
+    }
+
+    fn steer(text: String, attachments: UserAttachments, steer_id: String) -> Self {
+        Self {
+            text,
+            attachments,
+            steer_id: Some(steer_id),
+            follow_up_id: None,
+            edit_user_turn_index: None,
+            edit_user_turn_revision: None,
+            edit_original_text: None,
+            unresolved_attachment_ids: Vec::new(),
+            target_session_id: None,
+            managed_context_recovery_kickstart: false,
+        }
+    }
+
+    fn edit_user_message(
+        text: String,
+        attachments: UserAttachments,
+        user_turn_index: u32,
+        user_turn_revision: u32,
+        original_text: Option<String>,
+        unresolved_attachment_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            text,
+            attachments,
+            steer_id: None,
+            follow_up_id: None,
+            edit_user_turn_index: Some(user_turn_index),
+            edit_user_turn_revision: Some(user_turn_revision),
+            edit_original_text: original_text,
+            unresolved_attachment_ids,
+            target_session_id: None,
+            managed_context_recovery_kickstart: false,
+        }
+    }
+
+    fn for_target(mut self, target_session_id: Option<String>) -> Self {
+        self.target_session_id = target_session_id;
+        self
+    }
+
+    fn with_follow_up_id(mut self, follow_up_id: Option<String>) -> Self {
+        self.follow_up_id = follow_up_id;
+        self
+    }
+
+    fn managed_context_recovery_kickstart(mut self) -> Self {
+        self.managed_context_recovery_kickstart = true;
+        self
+    }
+}
+
+type FollowUpReceiver = tokio::sync::mpsc::Receiver<FollowUpMessage>;
 
 /// CLI flags parsed from command-line arguments.
 struct CliFlags {
@@ -1491,6 +7525,16 @@ struct CliFlags {
     /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
     web: bool,
     web_port: u16,
+    /// --tls: Serve the `--web` dashboard over HTTPS/WSS. Off by default
+    /// (plain HTTP). ORs with `[server.tls] enabled` in intendant.toml.
+    /// With no cert/key override, a self-signed cert is minted at startup
+    /// (SAN = bind IP + localhost, optional config hostname).
+    tls: bool,
+    /// --tls-cert <PATH>: PEM cert (chain) overriding the auto self-signed
+    /// cert. Must be paired with `--tls-key`. Implies `--tls`.
+    tls_cert: Option<String>,
+    /// --tls-key <PATH>: PEM private key matching `--tls-cert`.
+    tls_key: Option<String>,
     /// --transcription: Enable user speech transcription.
     transcription: bool,
     /// --record-display <ID>: Record an existing X11 display (repeatable).
@@ -1532,17 +7576,31 @@ fn print_help() {
     println!("    --sandbox             Enable Landlock filesystem sandboxing for the runtime");
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
-    println!("    --web [PORT]          Web dashboard (default: on, port 8765). Use --no-web to disable");
-    println!("    --no-web              Disable web dashboard");
+    println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
+    println!(
+        "    --tls                 Serve the web dashboard over HTTPS/WSS (auto self-signed cert)"
+    );
+    println!("    --tls-cert <PATH>     PEM cert overriding the self-signed cert (with --tls-key; implies --tls)");
+    println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
+    println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
     println!("    --transcription       Enable user speech transcription");
-    println!("    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)");
+    println!(
+        "    --record-display <ID> Record an existing X11 display (e.g. 50 for :50, repeatable)"
+    );
     println!("    --agent <BACKEND>     Use external agent backend (codex, claude-code)");
     println!("    --advertise-url <URL> WebSocket URL to advertise to peers in this daemon's");
     println!("                          Agent Card (repeatable, preference order). Overrides");
     println!("                          [server.advertise] in intendant.toml when given.");
     println!("                          Example: --advertise-url ws://192.168.1.42:8765/ws");
-    println!("                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws");
+    println!(
+        "                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws"
+    );
     println!("    --help, -h            Show this help message");
+    println!();
+    println!("SUBCOMMANDS:");
+    println!("    ctl                   Control a running Intendant daemon over MCP");
+    println!("    lan                   Configure LAN mTLS access");
+    println!("    setup                 Install or verify host-level Intendant dependencies");
     println!();
     println!("SESSION LOGS:");
     println!(
@@ -1669,6 +7727,59 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
     tokio::net::TcpListener::from_std(std_listener)
 }
 
+/// Build the optional TLS acceptor for the `--web` dashboard.
+///
+/// TLS is enabled when either the CLI `--tls` flag is set or
+/// `[server.tls] enabled = true` is in intendant.toml. When enabled, the
+/// cert source is resolved in priority order:
+///   1. Explicit PEM files — CLI `--tls-cert`/`--tls-key` first, else
+///      `[server.tls] cert`/`key`. Both halves of a pair must be present.
+///   2. Otherwise a self-signed cert minted by `rcgen`, with the listener
+///      bind IP plus `localhost` (and optional `[server.tls] hostname`) in
+///      the SAN list.
+///
+/// Returns `Ok(None)` when TLS is off (the default), `Ok(Some(acceptor))`
+/// when on and the cert built, or `Err` when enabled but misconfigured
+/// (mismatched cert/key pair, unreadable/invalid PEM, cert-gen failure) —
+/// surfaced loudly at startup rather than silently serving plain HTTP.
+fn build_web_tls_acceptor(
+    flags: &CliFlags,
+    server_cfg: &project::ServerTlsConfig,
+    bind_addr: Option<std::net::SocketAddr>,
+) -> Result<Option<tokio_rustls::TlsAcceptor>, CallerError> {
+    let enabled = flags.tls || server_cfg.enabled;
+    if !enabled {
+        return Ok(None);
+    }
+
+    // Resolve an explicit cert/key pair: CLI overrides config. A
+    // half-specified pair (only cert or only key) is a configuration
+    // error rather than a silent fallback to self-signed.
+    let cert_path = flags.tls_cert.clone().or_else(|| server_cfg.cert.clone());
+    let key_path = flags.tls_key.clone().or_else(|| server_cfg.key.clone());
+    let source = match (cert_path, key_path) {
+        (Some(c), Some(k)) => web_tls::TlsCertSource::Files {
+            cert_path: c.into(),
+            key_path: k.into(),
+        },
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(CallerError::Config(
+                "TLS cert/key must be supplied together (got only one of --tls-cert/--tls-key \
+                 or [server.tls] cert/key)"
+                    .to_string(),
+            ));
+        }
+        (None, None) => web_tls::TlsCertSource::SelfSigned {
+            bind_ip: bind_addr.map(|a| a.ip()),
+            hostname: server_cfg.hostname.clone(),
+        },
+    };
+
+    let acceptor = web_tls::build_acceptor(&source)
+        .map_err(|e| CallerError::Config(format!("TLS setup failed: {e}")))?;
+    Ok(Some(acceptor))
+}
+
 fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = CliFlags {
@@ -1689,6 +7800,9 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         no_presence: false,
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
+        tls: false,
+        tls_cert: None,
+        tls_key: None,
         transcription: false,
         record_displays: Vec::new(),
 
@@ -1798,14 +7912,43 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
             }
             "--web" => {
                 flags.web = true;
-                // --web serves the TUI via web (xterm.js). Use --web --mcp
-                // for voice-only MCP mode without the web TUI.
+                // --web enables the dashboard. Idle web startup uses the
+                // daemon/no-terminal-TUI path; a task still runs through the
+                // normal frontend selection below.
                 // Optional port argument (next arg if it's numeric)
                 if i + 1 < args.len() && args[i + 1].parse::<u16>().is_ok() {
                     flags.web_port = args[i + 1].parse().unwrap();
                     i += 2;
                 } else {
                     i += 1;
+                }
+            }
+            "--tls" => {
+                // Serve the dashboard over HTTPS/WSS. Auto self-signed
+                // cert unless --tls-cert/--tls-key are also given.
+                flags.tls = true;
+                i += 1;
+            }
+            "--tls-cert" => {
+                if i + 1 < args.len() {
+                    flags.tls_cert = Some(args[i + 1].clone());
+                    flags.tls = true; // a cert override implies TLS
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --tls-cert".to_string(),
+                    ));
+                }
+            }
+            "--tls-key" => {
+                if i + 1 < args.len() {
+                    flags.tls_key = Some(args[i + 1].clone());
+                    flags.tls = true; // a key override implies TLS
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --tls-key".to_string(),
+                    ));
                 }
             }
             "--transcription" => {
@@ -1824,9 +7967,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     flags.agent_backend = Some(backend);
                     i += 2;
                 } else {
-                    return Err(CallerError::Config(
-                        "Missing value for --agent".to_string(),
-                    ));
+                    return Err(CallerError::Config("Missing value for --agent".to_string()));
                 }
             }
             "--advertise-url" => {
@@ -1876,6 +8017,16 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     }
 
     Ok(flags)
+}
+
+fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
+    use_web
+        && !flags.mcp
+        && flags
+            .task
+            .as_ref()
+            .map(|task| task.trim().is_empty())
+            .unwrap_or(true)
 }
 
 fn extract_json(text: &str) -> Option<&str> {
@@ -2172,13 +8323,13 @@ fn substitute_screenshot_from_disk(text: &str, log_dir: &std::path::Path) -> Str
         return text.to_string();
     };
 
-    let base64_data = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        &png_bytes,
-    );
+    let base64_data =
+        base64::Engine::encode(&base64::engine::general_purpose::STANDARD, &png_bytes);
 
     // Build MCP-style JSON with both text and image content blocks
-    let text_part = text.replace("[Image: image/png]", "").replace("[Image: image/jpeg]", "");
+    let text_part = text
+        .replace("[Image: image/png]", "")
+        .replace("[Image: image/jpeg]", "");
     let text_part = text_part.trim();
 
     let mut content = Vec::new();
@@ -2222,20 +8373,31 @@ fn encode_screenshot(result_text: &str) -> Option<Vec<conversation::ImageData>> 
 pub(crate) fn format_commands_preview(json_str: &str) -> String {
     if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(json_str) {
         if let Some(cmds) = parsed.get("commands").and_then(|v| v.as_array()) {
-            let parts: Vec<String> = cmds.iter().filter_map(|cmd| {
-                let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
-                match func {
-                    "execAsAgent" => cmd.get("command").and_then(|v| v.as_str())
-                        .map(|c| format!("exec: {}", c)),
-                    "inspectPath" => cmd.get("path").and_then(|v| v.as_str())
-                        .map(|p| format!("inspect: {}", p)),
-                    "editFile" | "writeFile" => cmd.get("file_path").and_then(|v| v.as_str())
-                        .map(|p| format!("{}: {}", func, p)),
-                    "spawn_live_audio" => Some(format!("spawn_live_audio ({})",
-                        cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?"))),
-                    _ => Some(func.to_string()),
-                }
-            }).collect();
+            let parts: Vec<String> = cmds
+                .iter()
+                .filter_map(|cmd| {
+                    let func = cmd.get("function").and_then(|v| v.as_str()).unwrap_or("?");
+                    match func {
+                        "execAsAgent" => cmd
+                            .get("command")
+                            .and_then(|v| v.as_str())
+                            .map(|c| format!("exec: {}", c)),
+                        "inspectPath" => cmd
+                            .get("path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| format!("inspect: {}", p)),
+                        "editFile" | "writeFile" => cmd
+                            .get("file_path")
+                            .and_then(|v| v.as_str())
+                            .map(|p| format!("{}: {}", func, p)),
+                        "spawn_live_audio" => Some(format!(
+                            "spawn_live_audio ({})",
+                            cmd.get("provider").and_then(|v| v.as_str()).unwrap_or("?")
+                        )),
+                        _ => Some(func.to_string()),
+                    }
+                })
+                .collect();
             if !parts.is_empty() {
                 return parts.join(" | ");
             }
@@ -2301,7 +8463,10 @@ async fn maybe_auto_launch_xvfb(
             // Phase 1: no DisplayReady for virtual displays — no DisplaySession means no web slot.
             // The agent uses this display for CU via X11 tools directly.
             slog(session_log, |l| {
-                l.info(&format!("Xvfb :{} launched (no web slot in phase 1)", virtual_id))
+                l.info(&format!(
+                    "Xvfb :{} launched (no web slot in phase 1)",
+                    virtual_id
+                ))
             });
             *xvfb_guard = Some(guard);
         }
@@ -2360,7 +8525,7 @@ pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
 
 /// Query the resolution of an existing X11 display via xdpyinfo.
 /// Returns (width, height) or a default of (1280, 720) if detection fails.
-#[cfg(not(target_os = "macos"))]
+#[cfg(all(not(target_os = "macos"), not(target_os = "windows")))]
 pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
     let output = std::process::Command::new("xdpyinfo")
         .arg("-display")
@@ -2386,6 +8551,14 @@ pub(crate) fn query_display_resolution(display_id: u32) -> (u32, u32) {
     (1280, 720)
 }
 
+/// No X11 / `xdpyinfo` on Windows. Return the same conservative default
+/// the X11 path falls back to; Tier-1's DXGI backend will report the real
+/// resolution via the display enumeration path instead.
+#[cfg(target_os = "windows")]
+pub(crate) fn query_display_resolution(_display_id: u32) -> (u32, u32) {
+    (1280, 720)
+}
+
 /// Start recording external displays (--record-display) directly on the registry.
 /// Does NOT emit DisplayReady — external displays have no DisplaySession, so the
 /// web dashboard can't connect. Recording uses x11grab independently.
@@ -2396,13 +8569,10 @@ async fn start_external_display_recordings(
 ) {
     for &id in displays {
         let (width, height) = query_display_resolution(id);
-        eprintln!(
-            "Recording external display :{} ({}x{})",
-            id, width, height
-        );
+        eprintln!("Recording external display :{} ({}x{})", id, width, height);
         let mut reg = registry.write().await;
         if !reg.is_enabled() {
-            eprintln!("Recording not enabled in config — skipping :{}",id);
+            eprintln!("Recording not enabled in config — skipping :{}", id);
             continue;
         }
         if !recording::is_ffmpeg_available() {
@@ -2479,7 +8649,6 @@ fn normalize_command_batch(json_str: &str) -> String {
     serde_json::to_string(&value).unwrap_or_else(|_| json_str.to_string())
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2495,6 +8664,1969 @@ mod tests {
         let cert_dir = std::path::PathBuf::from("/nonexistent");
         let auth = build_local_advertised_auth(&server_auth, &cert_dir).unwrap();
         assert_eq!(auth, peer::AuthRequirements::none());
+    }
+
+    #[test]
+    fn fork_session_name_from_params_trims_blank_names() {
+        assert_eq!(
+            fork_session_name_from_params(&serde_json::json!({ "name": "  Forked work  " })),
+            Some("Forked work".to_string())
+        );
+        assert_eq!(
+            fork_session_name_from_params(&serde_json::json!({ "name": "   " })),
+            None
+        );
+        assert_eq!(fork_session_name_from_params(&serde_json::json!({})), None);
+    }
+
+    #[test]
+    fn codex_thread_rename_overlay_persists_native_rename() {
+        let home = tempfile::TempDir::new().unwrap();
+        let persisted = persist_codex_thread_rename_overlay(
+            home.path(),
+            Some("thread-1"),
+            &serde_json::json!({ "name": "  Better name  " }),
+            "Codex thread renamed to ignored fallback",
+        )
+        .unwrap();
+        assert_eq!(persisted.as_deref(), Some("Better name"));
+
+        let mut sessions = vec![serde_json::json!({
+            "source": "codex",
+            "session_id": "thread-1",
+            "name": "Old name"
+        })];
+        crate::session_names::apply_session_name_overlays(home.path(), &mut sessions);
+        assert_eq!(sessions[0]["name"], "Better name");
+    }
+
+    #[test]
+    fn codex_thread_rename_name_falls_back_to_result_message() {
+        assert_eq!(
+            codex_thread_rename_name_from_result(
+                &serde_json::json!({}),
+                "Codex thread renamed to Fallback name"
+            ),
+            Some("Fallback name".to_string())
+        );
+        assert_eq!(
+            codex_thread_rename_name_from_result(
+                &serde_json::json!({ "name": "Param name" }),
+                "Codex thread renamed to Fallback name"
+            ),
+            Some("Param name".to_string())
+        );
+    }
+
+    #[test]
+    fn codex_thread_action_capabilities_cover_dashboard_actions() {
+        let actions = codex_thread_action_capabilities();
+        for action in [
+            "fast",
+            "side-close",
+            "goal",
+            "goal-get",
+            "goal-clear",
+            "goal-pause",
+            "goal-resume",
+        ] {
+            assert!(
+                actions.iter().any(|candidate| candidate == action),
+                "missing dashboard Codex action capability: {}",
+                action
+            );
+        }
+    }
+
+    #[test]
+    fn codex_service_tier_fast_mode_accepts_canonical_and_legacy_values() {
+        assert!(codex_service_tier_is_fast(Some("priority")));
+        assert!(codex_service_tier_is_fast(Some(" FAST ")));
+        assert!(!codex_service_tier_is_fast(None));
+        assert!(!codex_service_tier_is_fast(Some("")));
+        assert!(!codex_service_tier_is_fast(Some("standard")));
+        assert_eq!(codex_service_tier_value(Some("normal")), None);
+        assert_eq!(
+            codex_service_tier_value(Some(" FAST ")).as_deref(),
+            Some("priority")
+        );
+    }
+
+    #[test]
+    fn codex_fast_slash_command_parses_for_steer_intercept() {
+        let parsed = parse_codex_fast_slash_command(" /fast ")
+            .expect("recognized slash command")
+            .expect("valid slash command");
+        assert_eq!(parsed.0, "fast");
+        assert_eq!(parsed.1, serde_json::json!({}));
+        assert!(parse_codex_fast_slash_command("/fork").is_none());
+
+        let err = parse_codex_fast_slash_command("/fast now")
+            .expect("recognized slash command")
+            .unwrap_err();
+        assert!(err.contains("does not accept arguments"), "got: {err}");
+    }
+
+    #[test]
+    fn external_rollback_turn_in_progress_matches_codex_rpc_error() {
+        let err = CallerError::ExternalAgent(
+            "thread/rollback: External agent error: JSON-RPC error -32600: Cannot rollback while a turn is in progress"
+                .to_string(),
+        );
+        assert!(external_rollback_turn_in_progress(&err));
+
+        let unrelated = CallerError::ExternalAgent(
+            "thread/rollback: External agent error: JSON-RPC error -32600: thread not found"
+                .to_string(),
+        );
+        assert!(!external_rollback_turn_in_progress(&unrelated));
+    }
+
+    #[test]
+    fn side_session_prompt_from_params_accepts_prompt_aliases() {
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!({ "prompt": "  quick question  " })),
+            Some("quick question".to_string())
+        );
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!({ "task": "check this" })),
+            Some("check this".to_string())
+        );
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!("inline prompt")),
+            Some("inline prompt".to_string())
+        );
+        assert_eq!(
+            side_session_prompt_from_params(&serde_json::json!({ "prompt": "   " })),
+            None
+        );
+    }
+
+    #[test]
+    fn codex_subagent_thread_ids_uses_late_agent_state_ids() {
+        let agents = vec![
+            external_agent::SubAgentState {
+                thread_id: " child-from-state ".to_string(),
+                status: "completed".to_string(),
+                message: None,
+            },
+            external_agent::SubAgentState {
+                thread_id: "child-from-receiver".to_string(),
+                status: "running".to_string(),
+                message: None,
+            },
+        ];
+        assert_eq!(
+            codex_subagent_thread_ids(
+                &[
+                    " child-from-receiver ".to_string(),
+                    String::new(),
+                    "child-from-receiver".to_string(),
+                ],
+                &agents,
+            ),
+            vec![
+                "child-from-receiver".to_string(),
+                "child-from-state".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_subagent_completed_is_not_terminal() {
+        let state = external_agent::SubAgentState {
+            thread_id: "child".to_string(),
+            status: "completed".to_string(),
+            message: Some("done".to_string()),
+        };
+        assert!(codex_subagent_terminal_reason(&state).is_none());
+
+        let running = external_agent::SubAgentState {
+            thread_id: "child".to_string(),
+            status: "running".to_string(),
+            message: None,
+        };
+        assert!(codex_subagent_terminal_reason(&running).is_none());
+    }
+
+    #[test]
+    fn side_thread_ids_from_message_extracts_parent_child() {
+        assert_eq!(
+            side_thread_ids_from_message(
+                "side conversation started in thread child-123 from parent parent-456"
+            ),
+            Some(("parent-456".to_string(), "child-123".to_string()))
+        );
+        assert_eq!(
+            side_thread_ids_from_message("forked into thread child"),
+            None
+        );
+    }
+
+    #[test]
+    fn scoped_event_targets_config_matches_session_or_alias() {
+        assert!(scoped_event_targets_config(
+            &Some("session-1".to_string()),
+            &Some("session-1".to_string()),
+            &None,
+        ));
+        assert!(scoped_event_targets_config(
+            &Some("codex-thread".to_string()),
+            &Some("intendant-session".to_string()),
+            &Some("codex-thread".to_string()),
+        ));
+        assert!(!scoped_event_targets_config(
+            &Some("side-thread".to_string()),
+            &Some("intendant-session".to_string()),
+            &Some("codex-thread".to_string()),
+        ));
+        assert!(scoped_event_targets_config(
+            &None,
+            &Some("intendant-session".to_string()),
+            &Some("codex-thread".to_string()),
+        ));
+    }
+
+    #[test]
+    fn external_context_snapshot_usage_tracks_codex_backend_pressure() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(71_876),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(51),
+            raw: serde_json::json!({
+                "model": "gpt-5.5",
+                "input": []
+            }),
+        };
+
+        let usage = external_context_snapshot_usage(&snapshot).unwrap();
+        assert_eq!(usage.provider, "openai");
+        assert_eq!(usage.model, "gpt-5.5");
+        assert_eq!(usage.tokens_used, 71_876);
+        assert_eq!(usage.context_window, 258_400);
+        assert_eq!(usage.hard_context_window, Some(272_000));
+        assert_eq!(usage.prompt_tokens, 71_876);
+        assert_eq!(usage.completion_tokens, 0);
+        assert!((usage.usage_pct - (71_876.0 / 258_400.0 * 100.0)).abs() < 1e-12);
+
+        let local_estimate = external_agent::AgentContextSnapshot {
+            token_count: Some(312_502),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::LocalEstimate),
+            ..snapshot
+        };
+        assert!(external_context_snapshot_usage(&local_estimate).is_none());
+    }
+
+    #[test]
+    fn managed_context_rewind_only_pressure_uses_soft_limit() {
+        let below_soft = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(258_399),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(51),
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(managed_context_rewind_only_pressure(&below_soft), None);
+
+        let at_soft = external_agent::AgentContextSnapshot {
+            token_count: Some(258_400),
+            ..below_soft.clone()
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure(&at_soft),
+            Some(ManagedContextRewindOnlyPressure {
+                used_tokens: 258_400,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "high",
+            })
+        );
+
+        let at_hard = external_agent::AgentContextSnapshot {
+            token_count: Some(272_000),
+            ..below_soft
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure(&at_hard).map(|pressure| pressure.status),
+            Some("critical")
+        );
+
+        let over_hard = external_agent::AgentContextSnapshot {
+            token_count: Some(312_502),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::LocalEstimate),
+            ..at_hard
+        };
+        assert_eq!(managed_context_rewind_only_pressure(&over_hard), None);
+    }
+
+    #[test]
+    fn managed_context_recovery_pressure_includes_below_soft_recovery_required() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(253_741),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+
+        assert_eq!(
+            managed_context_recovery_pressure(&snapshot),
+            Some(ManagedContextRewindOnlyPressure {
+                used_tokens: 253_741,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "recovery_required",
+            })
+        );
+        assert_eq!(managed_context_rewind_only_pressure(&snapshot), None);
+    }
+
+    #[test]
+    fn context_rewind_thread_id_candidates_prefers_session_then_alias() {
+        assert_eq!(
+            context_rewind_thread_id_candidates(Some("backend-thread"), Some("wrapper-session")),
+            vec!["backend-thread".to_string(), "wrapper-session".to_string()]
+        );
+        assert_eq!(
+            context_rewind_thread_id_candidates(Some("same"), Some(" same ")),
+            vec!["same".to_string()]
+        );
+        assert_eq!(
+            context_rewind_thread_id_candidates(Some("  "), Some("alias")),
+            vec!["alias".to_string()]
+        );
+    }
+
+    #[test]
+    fn managed_context_trivial_kickstarts_do_not_hold_user_input() {
+        assert!(managed_context_user_kickstart_is_trivial(" Continue "));
+        assert!(managed_context_user_kickstart_is_trivial("keep going"));
+        assert!(!managed_context_user_kickstart_is_trivial(""));
+        assert!(!managed_context_user_kickstart_is_trivial(
+            "continue, but use the station prototype"
+        ));
+        assert!(managed_context_drop_original_for_recovery(
+            "continue", false, false, false
+        ));
+        assert!(!managed_context_drop_original_for_recovery(
+            "continue", false, false, true
+        ));
+        assert!(!managed_context_drop_original_for_recovery(
+            "continue", true, false, false
+        ));
+        assert!(!managed_context_drop_original_for_recovery(
+            "continue", false, true, false
+        ));
+    }
+
+    #[test]
+    fn managed_context_recovery_kickstart_corrects_stale_tool_claims_without_anchors() {
+        let text = managed_context_recovery_kickstart_text(
+            ManagedContextRewindOnlyPressure {
+                used_tokens: 269_000,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "critical",
+            },
+            true,
+        );
+
+        assert!(text.contains("list_rewind_anchors and inspect_rewind_anchor are callable"));
+        assert!(text.contains("First call list_rewind_anchors without a query"));
+        assert!(text.contains("stale and incorrect"));
+        assert!(text.contains("Do not synthesize anchor ids"));
+        assert!(text.contains("hard_limit=272000"));
+        assert!(text.contains("holding the user's follow-up outside Codex history"));
+        assert!(!text.contains("call_"));
+        assert!(!text.contains("item_id `"));
+    }
+
+    #[test]
+    fn managed_context_backend_recovery_kickstart_requires_exact_rewind() {
+        let text = managed_context_backend_recovery_kickstart_text(
+            "Codex ran out of room",
+            Some("rewind context first"),
+        );
+
+        assert!(text.contains("backend recovery required"));
+        assert!(text.contains("Codex recovery hint: rewind context first"));
+        assert!(text.contains("list_rewind_anchors"));
+        assert!(text.contains("inspect_rewind_anchor"));
+        assert!(text.contains("First call list_rewind_anchors without a query"));
+        assert!(text.contains("rewind_context with one exact returned item_id"));
+        assert!(text.contains("Do not synthesize anchor ids"));
+        assert!(!text.contains("call_"));
+    }
+
+    #[test]
+    fn scoped_codex_subagent_events_match_known_child_threads() {
+        let mut stats = LoopStats::default();
+        stats
+            .codex_subagent_parent_threads
+            .insert("child-thread".to_string(), "parent-thread".to_string());
+
+        assert_eq!(
+            scoped_event_codex_subagent_thread_id(&Some(" child-thread ".to_string()), &stats),
+            Some("child-thread".to_string())
+        );
+        assert_eq!(
+            scoped_event_codex_subagent_thread_id(&Some("parent-thread".to_string()), &stats),
+            None
+        );
+        assert_eq!(scoped_event_codex_subagent_thread_id(&None, &stats), None);
+    }
+
+    #[test]
+    fn idle_codex_subagent_turn_completed_marks_child_ready() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("parent-thread".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let mut stats = LoopStats::default();
+
+        handle_idle_codex_subagent_event(
+            &config,
+            &mut stats,
+            "child-thread".to_string(),
+            external_agent::AgentEvent::TurnCompleted {
+                message: Some("child final answer".to_string()),
+            },
+        );
+
+        match rx.try_recv().expect("child final message") {
+            AppEvent::LogEntry {
+                session_id,
+                content,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(content, "child final answer");
+            }
+            other => panic!("expected child final LogEntry, got {:?}", other),
+        }
+
+        match rx.try_recv().expect("child round completion") {
+            AppEvent::LogEntry {
+                session_id,
+                content,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert_eq!(
+                    content,
+                    "Round complete: subagent conversation ready for follow-up"
+                );
+            }
+            other => panic!("expected child completion LogEntry, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn side_rewind_first_turn_for_undo_stays_inside_side_boundary() {
+        assert_eq!(
+            side_rewind_first_turn_for_undo(3, 1, "side-child").unwrap(),
+            3
+        );
+        assert_eq!(
+            side_rewind_first_turn_for_undo(3, 3, "side-child").unwrap(),
+            1
+        );
+
+        let zero = side_rewind_first_turn_for_undo(3, 0, "side-child").unwrap_err();
+        assert!(zero.contains("at least 1"), "got: {zero}");
+
+        let beyond = side_rewind_first_turn_for_undo(3, 4, "side-child").unwrap_err();
+        assert!(beyond.contains("after the /side boundary"), "got: {beyond}");
+    }
+
+    #[test]
+    fn parent_rewind_first_turn_for_undo_tracks_active_turn_count() {
+        assert_eq!(parent_rewind_first_turn_for_undo(3, 1).unwrap(), 3);
+        assert_eq!(parent_rewind_first_turn_for_undo(3, 2).unwrap(), 2);
+
+        let zero = parent_rewind_first_turn_for_undo(3, 0).unwrap_err();
+        assert!(zero.contains("at least 1"), "got: {zero}");
+
+        let beyond = parent_rewind_first_turn_for_undo(3, 4).unwrap_err();
+        assert!(beyond.contains("only 3 user turn"), "got: {beyond}");
+    }
+
+    #[test]
+    fn user_turn_revision_state_rejects_stale_replacement() {
+        let mut state = UserTurnRevisionState::default();
+        let (turn, revision) = state.record_next_turn();
+        assert_eq!((turn, revision), (1, 1));
+        assert!(state.validate_expected_revision(1, Some(1)).is_ok());
+
+        state.rewind_from_turn(1);
+        let (replacement_turn, replacement_revision) = state.record_next_turn();
+        assert_eq!((replacement_turn, replacement_revision), (1, 2));
+
+        let stale = state.validate_expected_revision(1, Some(1)).unwrap_err();
+        assert!(stale.contains("stale"), "got: {stale}");
+        assert!(state.validate_expected_revision(1, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn codex_user_turn_state_prefers_user_message_events_over_provider_items() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let session_id = "019e37b2-main-event-user-canonical";
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "provider request context 1" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "provider request context 2" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "human prompt" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let state = codex_user_turn_state_from_history_file(&path).expect("state");
+        assert_eq!(state.active_count(), 1);
+        assert_eq!(state.active_revision(1), Some(1));
+        assert_eq!(state.active_revision(2), None);
+    }
+
+    #[test]
+    fn context_rewind_request_requires_primer_for_model_tool() {
+        let params = serde_json::json!({
+            "anchor": {"item_id": "call-123", "position": "after"},
+            "reason": "prune noisy output"
+        });
+        let err = external_context_rewind_request_from_action("rewind_context", &params, None)
+            .expect("rewind action")
+            .unwrap_err();
+        assert!(err.contains("primer"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_request_renders_developer_primer() {
+        let params = serde_json::json!({
+            "anchor": {"item_id": "call-123", "position": "before"},
+            "reason": "dead end",
+            "primer": "Keep the useful result.",
+            "preserve": [" fact A ", ""],
+            "discard": ["bad assumption"],
+            "artifacts": ["log.txt"],
+            "next_steps": ["continue"]
+        });
+        let request = external_context_rewind_request_from_action(
+            "rewind_context",
+            &params,
+            Some("s".into()),
+        )
+        .expect("rewind action")
+        .expect("valid request");
+        assert_eq!(request.item_id, "call-123");
+        assert_eq!(
+            request.position,
+            external_agent::RollbackAnchorPosition::Before
+        );
+        assert!(request.auto_resume);
+        assert!(context_rewind_should_interrupt_active_turn(&request));
+
+        let primer = request
+            .rendered_primer(Some("rewind-test-record"), None)
+            .expect("primer");
+        assert!(primer.contains("<model_context_rewind_primer>"));
+        assert!(primer.contains("Earlier history before the target is still present"));
+        assert!(primer.contains("Record id:\nrewind-test-record"));
+        assert!(primer.contains("Keep the useful result."));
+        assert!(primer.contains("- fact A"));
+        assert!(primer.contains("- bad assumption"));
+        assert!(!primer.contains("- \n"));
+        assert!(request.resume_followup().is_some());
+    }
+
+    #[test]
+    fn context_rewind_request_renders_carried_forward_prior_facts() {
+        let request = ExternalContextRewindRequest {
+            session_id: Some("s".to_string()),
+            item_id: "call-123".to_string(),
+            position: external_agent::RollbackAnchorPosition::After,
+            reason: Some("repeat rewind".to_string()),
+            primer: Some("Current durable fact.".to_string()),
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            auto_resume: true,
+        };
+
+        let primer = request
+            .rendered_primer(
+                Some("rewind-test-record"),
+                Some("- Prior selector: .display-picker.visible .display-picker-item"),
+            )
+            .expect("primer");
+
+        assert!(primer.contains("Current durable fact."));
+        assert!(primer.contains("Previous managed-context primer facts not repeated above"));
+        assert!(primer.contains(".display-picker.visible .display-picker-item"));
+    }
+
+    #[test]
+    fn context_rewind_carries_unrepeated_prior_primer_facts_from_pruned_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let prior_primer = "<model_context_rewind_primer>\nHistory after the rewind target was pruned by rewind_context. Earlier history before the target is still present. Treat this primer as the carry-forward summary of only the pruned span.\n\nPrimer:\nHost peer connected.\n- Prior selector: .display-picker.visible .display-picker-item\n\n</model_context_rewind_primer>";
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_anchor",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{ "type": "input_text", "text": prior_primer }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let request = ExternalContextRewindRequest {
+            session_id: Some("s".to_string()),
+            item_id: "call_anchor".to_string(),
+            position: external_agent::RollbackAnchorPosition::After,
+            reason: Some("repeat rewind".to_string()),
+            primer: Some("Host peer connected.".to_string()),
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            auto_resume: true,
+        };
+
+        let carried = context_rewind_pruned_prior_primer_facts(
+            &path,
+            "call_anchor",
+            external_agent::RollbackAnchorPosition::After,
+            &request,
+        )
+        .expect("carry-forward scan")
+        .expect("missing prior fact");
+
+        assert!(!carried.contains("Host peer connected."));
+        assert!(carried.contains(".display-picker.visible .display-picker-item"));
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_lists_all_exact_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "rewind_context",
+                        "call_id": "call_prior_rewind",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_prior_rewind",
+                        "output": "ok"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<model_context_rewind_primer>dense state</model_context_rewind_primer>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "rewind_context",
+                        "call_id": "call_latest_rewind",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 1
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_latest_rewind",
+                        "output": "ok"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<model_context_rewind_primer>newer dense state</model_context_rewind_primer>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let default_catalog = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 0, "limit": 20 }),
+        )
+        .expect("default anchor catalog");
+        let default_catalog: serde_json::Value = serde_json::from_str(&default_catalog).unwrap();
+        let default_ids = default_catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(!default_ids.contains(&"call_prior_rewind"));
+        assert!(!default_ids.contains(&"call_latest_rewind"));
+
+        let catalog = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 20,
+                "include_management_tools": true,
+            }),
+        )
+        .expect("anchor catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&catalog).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"call_prior_rewind"));
+        assert!(ids.contains(&"call_latest_rewind"));
+
+        let filtered = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "query": "latest",
+                "offset": 0,
+                "limit": 20,
+                "include_management_tools": true,
+            }),
+        )
+        .expect("filtered anchor catalog");
+        let filtered: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        let filtered_ids = filtered["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(filtered_ids, vec!["call_latest_rewind"]);
+
+        let missing = resolve_context_rewind_anchor(&path, "rewind_context-call_7")
+            .expect_err("synthetic anchors are not accepted");
+        assert!(missing.contains("call list_rewind_anchors"));
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_query_hides_recovery_tools_by_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_launch_dashboard",
+                        "arguments": "{\"cmd\":\"./target/debug/intendant --web 8767 --no-presence\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_launch_dashboard",
+                        "output": "Web TUI: http://0.0.0.0:8767"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "list_rewind_anchors",
+                        "call_id": "call_recovery_list",
+                        "arguments": "{\"query\":\"target/debug/intendant --web 8767\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_recovery_list",
+                        "output": "target/debug/intendant --web 8767"
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "query": "target/debug/intendant --web 8767",
+                "reverse": true,
+                "limit": 10,
+            }),
+        )
+        .expect("anchor catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_launch_dashboard"]);
+        assert_eq!(catalog["include_management_tools"].as_bool(), Some(false));
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "query": "target/debug/intendant --web 8767",
+                "reverse": true,
+                "limit": 10,
+                "include_management_tools": true,
+            }),
+        )
+        .expect("anchor catalog with management tools");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_recovery_list", "call_launch_dashboard"]);
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_filters_known_non_recovery_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_below_soft",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 800,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 10000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "get_status",
+                        "call_id": "call_near_soft",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 9700,
+                                "cached_input_tokens": 9000,
+                                "output_tokens": 0,
+                                "total_tokens": 9700
+                            },
+                            "model_context_window": 10000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_above_soft",
+                        "arguments": "{\"cmd\":\"rg noisy\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "lastTokenUsage": {
+                                "inputTokens": 10500,
+                                "cachedInputTokens": 10000,
+                                "outputTokens": 0,
+                                "totalTokens": 10500
+                            },
+                            "modelContextWindow": 10000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("full catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchors = catalog["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 3);
+        let below = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_below_soft")
+            .expect("below-soft anchor");
+        assert_eq!(
+            below["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(1000)
+        );
+        assert_eq!(
+            below["rewind_only_limit_at_or_after_anchor"].as_u64(),
+            Some(10000)
+        );
+        assert_eq!(below["recovery_eligible"].as_bool(), Some(true));
+        let near = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_near_soft")
+            .expect("near-soft anchor");
+        assert_eq!(
+            near["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(9700)
+        );
+        assert_eq!(near["recovery_eligible"].as_bool(), Some(false));
+        let above = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_above_soft")
+            .expect("above-soft anchor");
+        assert_eq!(
+            above["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(10500)
+        );
+        assert_eq!(above["recovery_eligible"].as_bool(), Some(false));
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_below_soft"]);
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(1));
+        assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(true));
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["anchors"].as_array().unwrap().len(), 3);
+        assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_filters_oversized_restored_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let huge_prior_context = "x".repeat(90_000);
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_fit",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": huge_prior_context }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_after_huge_prefix",
+                        "arguments": "{\"cmd\":\"echo after\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_fit"]);
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let oversized = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_after_huge_prefix")
+            .expect("oversized-prefix anchor");
+        assert_eq!(
+            oversized["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(1000)
+        );
+        assert_eq!(oversized["recovery_eligible"].as_bool(), Some(false));
+        assert!(
+            oversized["prefix_tokens_after"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 22_000),
+            "got {oversized}"
+        );
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_after_huge_prefix",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("oversized restored prefix must be rejected");
+        assert!(err.contains("not a valid recovery target"), "got: {err}");
+        assert!(err.contains("recovery_eligible"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_filters_prior_failed_rewind_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_failed_recovery_anchor",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 0,
+                        "anchor": {
+                            "itemId": "call_failed_recovery_anchor",
+                            "position": "after"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 0,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 45000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog["anchors"].as_array().unwrap().is_empty());
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchor = &catalog["anchors"].as_array().unwrap()[0];
+        assert_eq!(anchor["recovery_eligible"].as_bool(), Some(false));
+        assert_eq!(
+            anchor["latest_rewind_usage_after_anchor"].as_u64(),
+            Some(45000)
+        );
+        assert_eq!(
+            anchor["latest_rewind_limit_after_anchor"].as_u64(),
+            Some(30000)
+        );
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_failed_recovery_anchor",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("prior failed rewind must be rejected");
+        assert!(err.contains("prior rewind"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_uses_pre_rollback_restore_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_failed_pre_marker",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 0,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 45000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 1,
+                        "anchor": {
+                            "itemId": "call_failed_pre_marker",
+                            "position": "after"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1200,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1200
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog["anchors"].as_array().unwrap().is_empty());
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchor = &catalog["anchors"].as_array().unwrap()[0];
+        assert_eq!(anchor["recovery_eligible"].as_bool(), Some(false));
+        assert_eq!(
+            anchor["latest_rewind_usage_after_anchor"].as_u64(),
+            Some(45000)
+        );
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_failed_pre_marker",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("prior pre-marker failed rewind must be rejected");
+        assert!(err.contains("prior rewind"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_is_compact_under_pressure() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let long_output = "large diagnostic output ".repeat(50);
+        let lines = (0..12)
+            .flat_map(|idx| {
+                let call_id = format!("call_{idx}");
+                [
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "arguments": "{\"command\":\"very long command output\"}"
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": long_output
+                        }
+                    }),
+                ]
+            })
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, lines).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 0, "limit": 500 }),
+        )
+        .expect("anchor catalog");
+        assert!(!raw.contains('\n'), "catalog should use compact JSON");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(
+            catalog["limit"].as_u64(),
+            Some(CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT as u64)
+        );
+        let anchors = catalog["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT);
+        for anchor in anchors {
+            let summary = anchor["summary"].as_str().unwrap_or_default();
+            assert!(summary.len() <= CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT + 3);
+        }
+        assert!(raw.len() < 5_000, "catalog too large: {} bytes", raw.len());
+    }
+
+    #[test]
+    fn context_rewind_anchor_keeps_exact_rollout_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "call_id": "call_exact",
+                    "arguments": "{}"
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let exact = resolve_context_rewind_anchor(&path, "call_exact").expect("exact anchor");
+        assert_eq!(exact.item_id, "call_exact");
+    }
+
+    fn write_user_turn_rollout(path: &Path, turns: &[&str]) {
+        let mut rows = vec![serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<environment_context>ignored injected context</environment_context>"
+                }]
+            }
+        })];
+        rows.extend(turns.iter().map(|turn| {
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": turn }]
+                }
+            })
+        }));
+        std::fs::write(
+            path,
+            rows.into_iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_event_user_turn_rollout(path: &Path, events: &[serde_json::Value]) {
+        std::fs::write(
+            path,
+            events
+                .iter()
+                .map(|payload| {
+                    serde_json::json!({
+                        "type": "event_msg",
+                        "payload": payload
+                    })
+                    .to_string()
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn write_rewind_record(
+        log_dir: &Path,
+        record_id: &str,
+        created_at: &str,
+        recovery_rollout_path: &Path,
+    ) {
+        context_rewind::persist_record(
+            log_dir,
+            &context_rewind::ContextRewindRecord {
+                record_id: record_id.to_string(),
+                created_at: created_at.to_string(),
+                session_id: Some("intendant-session".to_string()),
+                thread_id: "codex-thread".to_string(),
+                item_id: "call_anchor".to_string(),
+                position: "after".to_string(),
+                reason: Some("test".to_string()),
+                primer: Some("dense".to_string()),
+                preserve: Vec::new(),
+                discard: Vec::new(),
+                artifacts: Vec::new(),
+                next_steps: Vec::new(),
+                source_rollout_path: None,
+                recovery_rollout_path: Some(recovery_rollout_path.to_path_buf()),
+                fission_snapshot: None,
+                lineage_ledger: None,
+                fission_ledger: None,
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn managed_context_edit_branch_resolves_latest_matching_archived_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let old_rollout = dir.path().join("old.jsonl");
+        let new_rollout = dir.path().join("new.jsonl");
+        write_user_turn_rollout(&old_rollout, &["first", "clicked", "old tail"]);
+        write_user_turn_rollout(
+            &new_rollout,
+            &["first", "clicked", "new tail", "latest tail"],
+        );
+        write_rewind_record(
+            dir.path(),
+            "rewind-old",
+            "2026-06-01T00:00:00Z",
+            &old_rollout,
+        );
+        write_rewind_record(
+            dir.path(),
+            "rewind-new",
+            "2026-06-02T00:00:00Z",
+            &new_rollout,
+        );
+
+        let target = resolve_managed_context_edit_branch_target(
+            dir.path(),
+            "codex-thread",
+            Some("intendant-session"),
+            2,
+            Some("clicked"),
+        )
+        .unwrap()
+        .expect("matching archived rollout");
+
+        assert_eq!(target.record_id, "rewind-new");
+        assert_eq!(target.source_turn_count, 4);
+        assert_eq!(target.target_turn_text, "clicked");
+    }
+
+    #[test]
+    fn rollout_user_turns_prefers_canonical_events_and_rewinds() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_event_user_turn_rollout(
+            &rollout,
+            &[
+                serde_json::json!({ "type": "user_message", "message": "first" }),
+                serde_json::json!({ "type": "user_message", "message": "continue" }),
+                serde_json::json!({ "type": "thread_rolled_back", "num_turns": 1 }),
+                serde_json::json!({ "type": "user_message", "message": "managed recovery" }),
+            ],
+        );
+
+        let turns = rollout_user_turns(&rollout).unwrap();
+
+        assert_eq!(
+            turns
+                .iter()
+                .map(|turn| (turn.index, turn.text.as_str()))
+                .collect::<Vec<_>>(),
+            vec![(1, "first"), (2, "managed recovery")]
+        );
+    }
+
+    #[test]
+    fn managed_context_edit_branch_scans_historical_wrapper_logs() {
+        let home = tempfile::tempdir().unwrap();
+        let current_log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("current-wrapper");
+        let historical_log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("historical-wrapper");
+        std::fs::create_dir_all(&current_log_dir).unwrap();
+        std::fs::create_dir_all(&historical_log_dir).unwrap();
+
+        let old_rollout = historical_log_dir.join("old.jsonl");
+        let new_rollout = historical_log_dir.join("new.jsonl");
+        write_event_user_turn_rollout(
+            &old_rollout,
+            &[
+                serde_json::json!({ "type": "user_message", "message": "first" }),
+                serde_json::json!({ "type": "user_message", "message": "continue" }),
+            ],
+        );
+        write_event_user_turn_rollout(
+            &new_rollout,
+            &[
+                serde_json::json!({ "type": "user_message", "message": "first" }),
+                serde_json::json!({ "type": "user_message", "message": "managed recovery" }),
+            ],
+        );
+        write_rewind_record(
+            &historical_log_dir,
+            "rewind-old",
+            "2026-06-02T08:08:19Z",
+            &old_rollout,
+        );
+        write_rewind_record(
+            &historical_log_dir,
+            "rewind-new",
+            "2026-06-02T08:11:12Z",
+            &new_rollout,
+        );
+
+        let target = resolve_managed_context_edit_branch_target(
+            &current_log_dir,
+            "codex-thread",
+            Some("intendant-session"),
+            2,
+            Some("continue"),
+        )
+        .unwrap()
+        .expect("matching historical rollout");
+
+        assert_eq!(target.record_id, "rewind-old");
+        assert_eq!(target.source_turn_count, 2);
+        assert_eq!(target.target_turn_text, "continue");
+    }
+
+    #[test]
+    fn managed_context_edit_branch_rejects_text_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_user_turn_rollout(&rollout, &["first", "different"]);
+        write_rewind_record(dir.path(), "rewind-one", "2026-06-02T00:00:00Z", &rollout);
+
+        let err = resolve_managed_context_edit_branch_target(
+            dir.path(),
+            "codex-thread",
+            Some("intendant-session"),
+            2,
+            Some("clicked"),
+        )
+        .unwrap_err();
+
+        assert!(err.contains("none matched the clicked message text"));
+    }
+
+    #[test]
+    fn context_rewind_anchor_inspect_returns_neighbor_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "before anchor" }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_exact",
+                        "arguments": "{\"cmd\":\"pwd\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_exact",
+                        "output": "/tmp/project"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "after anchor" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let inspection = inspect_context_rewind_anchor_from_rollout(
+            &path,
+            &serde_json::json!({ "anchor": { "item_id": "call_exact" }, "radius": 1 }),
+        )
+        .expect("inspection");
+        let inspection: serde_json::Value = serde_json::from_str(&inspection).unwrap();
+        assert_eq!(inspection["anchor"]["item_id"], "call_exact");
+        assert_eq!(inspection["radius"], 1);
+        let context = inspection["context"].as_array().unwrap();
+        assert_eq!(context.len(), 4);
+        assert!(context.iter().any(|item| item["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("before anchor"))));
+        assert!(context.iter().any(|item| item["summary"]
+            .as_str()
+            .is_some_and(|summary| summary.contains("after anchor"))));
+        assert!(context
+            .iter()
+            .any(|item| item["anchor_span"].as_bool() == Some(true)));
+        assert!(inspection["usage"]
+            .as_str()
+            .unwrap()
+            .contains("pass only the exact item_id"));
+    }
+
+    #[test]
+    fn codex_thread_action_dedupe_rejects_replayed_broadcast_ids() {
+        let mut dedupe = CodexThreadActionDedupe::default();
+        assert!(dedupe.mark_seen("request-1"));
+        assert!(!dedupe.mark_seen("request-1"));
+        assert!(dedupe.mark_seen("request-2"));
+    }
+
+    #[test]
+    fn context_rewind_backout_mode_supports_restore_aliases() {
+        assert_eq!(
+            context_rewind_backout_mode("rewind_backout", &serde_json::json!({})),
+            "inspect"
+        );
+        assert_eq!(
+            context_rewind_backout_mode(
+                "rewind_backout",
+                &serde_json::json!({"mode": " restore "})
+            ),
+            "restore"
+        );
+        assert_eq!(
+            context_rewind_backout_mode("rewind-restore", &serde_json::json!({})),
+            "restore"
+        );
+        assert!(is_context_rewind_backout_action("context-rewind-restore"));
+    }
+
+    #[test]
+    fn context_rewind_backout_parses_legacy_cache_reset_aliases() {
+        assert!(!context_rewind_allows_cache_reset(&serde_json::json!({})));
+        assert!(!context_rewind_allows_cache_reset(&serde_json::json!({
+            "allowCacheReset": false,
+        })));
+        assert!(context_rewind_allows_cache_reset(&serde_json::json!({
+            "allowCacheReset": true,
+        })));
+        assert!(context_rewind_allows_cache_reset(&serde_json::json!({
+            "allow_cache_breaking_fork": true,
+        })));
+    }
+
+    #[test]
+    fn codex_injected_user_text_filters_subagent_notifications() {
+        assert!(is_codex_injected_user_text_for_main(
+            "<subagent_notification>\n{\"agent_path\":\"child\"}\n</subagent_notification>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<user_shell_command>\n<command>\nhtop\n</command>\n</user_shell_command>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<task-notification>\n<task-id>child</task-id>\n</task-notification>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<command-name>/context</command-name>\n<command-args></command-args>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<local-command-stdout>context usage</local-command-stdout>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<bash-input>cargo test</bash-input>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<bash-stdout>ok</bash-stdout>"
+        ));
+        assert!(is_codex_injected_user_text_for_main(
+            "<bash-stderr>warning</bash-stderr>"
+        ));
+        assert!(!is_codex_injected_user_text_for_main(
+            "please inspect subagent_notification handling"
+        ));
+        assert!(!is_codex_injected_user_text_for_main(
+            "please inspect <bash-input> handling"
+        ));
+    }
+
+    #[test]
+    fn thread_action_params_with_thread_id_targets_clicked_window() {
+        let params = thread_action_params_with_thread_id(
+            "fork",
+            serde_json::json!({ "name": "Parent fork" }),
+            Some("parent-thread"),
+        );
+        assert_eq!(params["threadId"], "parent-thread");
+        assert_eq!(params["name"], "Parent fork");
+
+        let explicit = thread_action_params_with_thread_id(
+            "fork",
+            serde_json::json!({ "threadId": "explicit-thread" }),
+            Some("parent-thread"),
+        );
+        assert_eq!(explicit["threadId"], "explicit-thread");
+
+        let side_prompt = thread_action_params_with_thread_id(
+            "side",
+            serde_json::json!("quick check"),
+            Some("parent-thread"),
+        );
+        assert_eq!(side_prompt["threadId"], "parent-thread");
+        assert_eq!(side_prompt["prompt"], "quick check");
     }
 
     /// `advertised_transport = "mutual-tls"` advertises plain mTLS.
@@ -2514,6 +10646,8 @@ mod tests {
     /// `advertised_transport = "pin-self-cert"` reads the LAN cert
     /// dir, computes the fingerprint, embeds it in PinnedMutualTls.
     /// Uses `lan::certs::ensure_certs` to populate a tempdir.
+    /// `lan::certs` is now pure-Rust and compiles everywhere, so this
+    /// applies on all platforms.
     #[test]
     fn build_local_advertised_auth_pin_self_cert_reads_cert_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2585,7 +10719,10 @@ mod tests {
             Some(peer::ApplicationAuth::Bearer { hint, rotation_url }) => {
                 assert!(hint.is_some(), "hint should document the source");
                 assert!(hint.as_ref().unwrap().contains("[server.auth]"));
-                assert!(rotation_url.is_none(), "rotation_url unset until rotation lands");
+                assert!(
+                    rotation_url.is_none(),
+                    "rotation_url unset until rotation lands"
+                );
             }
             other => panic!("expected Bearer application auth, got {other:?}"),
         }
@@ -2595,6 +10732,8 @@ mod tests {
     /// full defense-in-depth advertise (PinnedMutualTls transport +
     /// Bearer application). The expected configuration for WAN-
     /// exposed daemons that want both wire-layer and app-layer auth.
+    /// `lan::certs` is now pure-Rust and compiles everywhere, so this
+    /// applies on all platforms.
     #[test]
     fn build_local_advertised_auth_full_defense_in_depth() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -2613,6 +10752,133 @@ mod tests {
             auth.application,
             Some(peer::ApplicationAuth::Bearer { .. })
         ));
+    }
+
+    #[tokio::test]
+    async fn resolve_attachments_includes_uploaded_files_and_images() {
+        use std::io::Write as _;
+
+        fn upload_tempfile(bytes: &[u8]) -> tempfile::NamedTempFile {
+            let mut file = tempfile::NamedTempFile::new().unwrap();
+            file.write_all(bytes).unwrap();
+            file.flush().unwrap();
+            file
+        }
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("session");
+        let project_root = tmp.path().join("project");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&project_root).unwrap();
+
+        let file_upload = upload_store::commit_upload(
+            upload_tempfile(b"a,b\n1,2\n"),
+            "data.csv",
+            "text/csv",
+            8,
+            upload_store::UploadDestination::Workspace,
+            &session_dir,
+            "sess-1",
+            &project_root,
+        )
+        .unwrap();
+        let image_upload = upload_store::commit_upload(
+            upload_tempfile(b"not-really-a-png"),
+            "screen.png",
+            "image/png",
+            16,
+            upload_store::UploadDestination::Task,
+            &session_dir,
+            "sess-1",
+            &project_root,
+        )
+        .unwrap();
+
+        let registry = Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(
+            &session_dir,
+        )));
+        let ids = vec![
+            format!("upload:{}", file_upload.id),
+            format!("upload:{}", image_upload.id),
+        ];
+        let attachments = resolve_attachments(&ids, &registry, &session_dir, &project_root).await;
+
+        assert_eq!(attachments.len(), 2);
+        match &attachments[0] {
+            external_agent::AgentAttachment::File(file) => {
+                assert_eq!(file.name, "data.csv");
+                assert_eq!(file.mime_type, "text/csv");
+                assert_eq!(file.size, 8);
+                assert!(file.local_path.starts_with(
+                    project_root
+                        .join(".intendant")
+                        .join("uploads")
+                        .join("sess-1")
+                ));
+            }
+            other => panic!("expected file upload attachment, got {other:?}"),
+        }
+        match &attachments[1] {
+            external_agent::AgentAttachment::Image(image) => {
+                assert_eq!(image.mime_type, "image/png");
+                assert_eq!(image.local_path.as_ref(), Some(&image_upload.path));
+                assert!(!image.base64.is_empty());
+            }
+            other => panic!("expected image upload attachment, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_attachments_falls_back_to_daemon_project_uploads() {
+        use std::io::Write as _;
+
+        let mut file = tempfile::NamedTempFile::new().unwrap();
+        file.write_all(b"pending upload").unwrap();
+        file.flush().unwrap();
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let session_dir = tmp.path().join("new-session-log");
+        let launch_project_root = tmp.path().join("launch-project");
+        let daemon_project_root = tmp.path().join("daemon-project");
+        std::fs::create_dir_all(&session_dir).unwrap();
+        std::fs::create_dir_all(&launch_project_root).unwrap();
+        std::fs::create_dir_all(&daemon_project_root).unwrap();
+
+        let upload = upload_store::commit_upload(
+            file,
+            "pending.txt",
+            "text/plain",
+            14,
+            upload_store::UploadDestination::Task,
+            &session_dir,
+            "daemon-session",
+            &daemon_project_root,
+        )
+        .unwrap();
+
+        let registry = Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(
+            &session_dir,
+        )));
+        let ids = vec![format!("upload:{}", upload.id)];
+        assert!(
+            resolve_attachments(&ids, &registry, &session_dir, &launch_project_root)
+                .await
+                .is_empty(),
+            "single-root lookup should not find uploads committed under another project"
+        );
+
+        let roots = vec![launch_project_root, daemon_project_root];
+        let attachments =
+            resolve_attachments_with_project_roots(&ids, &registry, &session_dir, &roots).await;
+
+        assert_eq!(attachments.len(), 1);
+        match &attachments[0] {
+            external_agent::AgentAttachment::File(file) => {
+                assert_eq!(file.name, "pending.txt");
+                assert_eq!(file.local_path, upload.path);
+            }
+            other => panic!("expected fallback file upload attachment, got {other:?}"),
+        }
     }
 
     #[test]
@@ -2678,6 +10944,179 @@ deleted file mode 100644
 ";
         let files = parse_diff_file_paths(diff);
         assert_eq!(files, vec!["one.rs".to_string(), "two.rs".to_string()]);
+    }
+
+    #[test]
+    fn split_unified_diff_by_file_keeps_file_blocks() {
+        let diff = "\
+diff --git a/one.rs b/one.rs
+--- a/one.rs
++++ b/one.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/two.rs b/two.rs
+--- a/two.rs
++++ b/two.rs
+@@ -1 +1 @@
+-x
++y
+";
+        let blocks = split_unified_diff_by_file(diff);
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].0, "one.rs");
+        assert!(blocks[0].1.contains("diff --git a/one.rs b/one.rs"));
+        assert!(!blocks[0].1.contains("diff --git a/two.rs b/two.rs"));
+        assert_eq!(blocks[1].0, "two.rs");
+        assert!(blocks[1].1.contains("diff --git a/two.rs b/two.rs"));
+    }
+
+    #[test]
+    fn resolve_diff_file_path_allows_project_and_tmp_absolute_paths() {
+        let project_root = Path::new("/work/project");
+        assert_eq!(
+            resolve_diff_file_path(project_root, "/work/project/src/main.rs").unwrap(),
+            PathBuf::from("/work/project/src/main.rs")
+        );
+        assert_eq!(
+            resolve_diff_file_path(project_root, "/tmp/intendant-edit.txt").unwrap(),
+            PathBuf::from("/tmp/intendant-edit.txt")
+        );
+        assert!(resolve_diff_file_path(project_root, "/etc/passwd").is_none());
+        assert!(resolve_diff_file_path(project_root, "../outside.txt").is_none());
+    }
+
+    #[test]
+    fn parse_session_diff_file_paths_reads_persisted_diff_logs() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let jsonl = r#"{"event":"info","message":"External agent diff: one.rs\n--- a/one.rs\n+++ b/one.rs\n@@ -1 +1 @@\n-a\n+b\n"}"#;
+        std::fs::write(tmp.path().join("session.jsonl"), format!("{jsonl}\n")).unwrap();
+
+        let files = parse_session_diff_file_paths(tmp.path());
+        assert_eq!(files, vec!["one.rs".to_string()]);
+    }
+
+    #[test]
+    fn external_diff_delta_tracker_can_seed_resumed_session_state() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path().join("project");
+        let log_dir = tmp.path().join("session");
+        std::fs::create_dir_all(&project_root).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(project_root.join("tracked.txt"), "old logged state\n").unwrap();
+        let jsonl = r#"{"event":"info","message":"External agent diff: tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -0,0 +1 @@\n+old logged state\n"}"#;
+        std::fs::write(log_dir.join("session.jsonl"), format!("{jsonl}\n")).unwrap();
+
+        let mut tracker = ExternalDiffDeltaTracker::default();
+        tracker.seed_from_session_log(&project_root, &log_dir);
+
+        std::fs::write(
+            project_root.join("tracked.txt"),
+            "old logged state\nnew resumed edit\n",
+        )
+        .unwrap();
+        let cumulative_after_resume = "\
+diff --git a/tracked.txt b/tracked.txt
+--- /dev/null
++++ b/tracked.txt
+@@ -0,0 +1,2 @@
++old logged state
++new resumed edit
+";
+        let delta = tracker
+            .delta(&project_root, &[], cumulative_after_resume)
+            .unwrap();
+        assert_eq!(delta.files_changed, vec!["tracked.txt".to_string()]);
+        assert!(delta.unified_diff.contains("+new resumed edit"));
+        assert!(!delta.unified_diff.contains("+old logged state"));
+    }
+
+    #[test]
+    fn external_diff_delta_tracker_emits_per_event_changes() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let project_root = tmp.path();
+        let mut tracker = ExternalDiffDeltaTracker::default();
+
+        let smoke_delete = "\
+diff --git a/activity-diff-smoke.txt b/activity-diff-smoke.txt
+deleted file mode 100644
+--- a/activity-diff-smoke.txt
++++ /dev/null
+@@ -1,2 +0,0 @@
+-old one
+-old two
+";
+        let first = tracker.delta(project_root, &[], smoke_delete).unwrap();
+        assert_eq!(
+            first.files_changed,
+            vec!["activity-diff-smoke.txt".to_string()]
+        );
+        assert!(first.unified_diff.contains("activity-diff-smoke.txt"));
+        assert!(first.unified_diff.contains("-old one"));
+
+        std::fs::write(
+            project_root.join("activity-diff-live-check.md"),
+            "# Activity Diff Live Check\n\n- first event\n",
+        )
+        .unwrap();
+        let cumulative_after_create = format!(
+            "{}{}",
+            smoke_delete,
+            "\
+diff --git a/activity-diff-live-check.md b/activity-diff-live-check.md
+new file mode 100644
+--- /dev/null
++++ b/activity-diff-live-check.md
+@@ -0,0 +1,3 @@
++# Activity Diff Live Check
++
++- first event
+"
+        );
+        let second = tracker
+            .delta(project_root, &[], &cumulative_after_create)
+            .unwrap();
+        assert_eq!(
+            second.files_changed,
+            vec!["activity-diff-live-check.md".to_string()]
+        );
+        assert!(!second.unified_diff.contains("activity-diff-smoke.txt"));
+        assert!(second.unified_diff.contains("activity-diff-live-check.md"));
+        assert!(second.unified_diff.contains("+- first event"));
+
+        std::fs::write(
+            project_root.join("activity-diff-live-check.md"),
+            "# Activity Diff Live Check\n\n- first event\n- second event\n",
+        )
+        .unwrap();
+        let cumulative_after_modify = format!(
+            "{}{}",
+            smoke_delete,
+            "\
+diff --git a/activity-diff-live-check.md b/activity-diff-live-check.md
+new file mode 100644
+--- /dev/null
++++ b/activity-diff-live-check.md
+@@ -0,0 +1,4 @@
++# Activity Diff Live Check
++
++- first event
++- second event
+"
+        );
+        let third = tracker
+            .delta(project_root, &[], &cumulative_after_modify)
+            .unwrap();
+        assert_eq!(
+            third.files_changed,
+            vec!["activity-diff-live-check.md".to_string()]
+        );
+        assert!(!third.unified_diff.contains("activity-diff-smoke.txt"));
+        assert!(third
+            .unified_diff
+            .contains("--- a/activity-diff-live-check.md"));
+        assert!(third.unified_diff.contains("+- second event"));
+        assert!(!third.unified_diff.contains("+@"));
     }
 
     #[test]
@@ -2762,7 +11201,8 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn parse_brief_found() {
-        let text = "I did a bunch of work.\n\nBRIEF: Implemented the login feature and added tests.";
+        let text =
+            "I did a bunch of work.\n\nBRIEF: Implemented the login feature and added tests.";
         let (brief, explicit) = parse_brief(text);
         assert_eq!(brief, "Implemented the login feature and added tests.");
         assert!(explicit);
@@ -2926,16 +11366,25 @@ Also: {"source": "bare"}"#;
 
     #[test]
     fn inject_project_context_adds_memory_file() {
+        let root = std::path::PathBuf::from("/tmp/proj");
         let project = Project {
-            root: std::path::PathBuf::from("/tmp/proj"),
+            root: root.clone(),
             config: project::ProjectConfig::default(),
         };
         let input = r#"{"commands":[{"function":"storeMemory","nonce":1,"memory_key":"test","memory_summary":"hello"}]}"#;
         let result = inject_project_context(input, &project);
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
+        // Build the expected path the same platform-aware way production does
+        // (via `PathBuf::join`) instead of hardcoding '/'-joined POSIX text,
+        // so the assertion holds on Windows (separator '\\') too.
+        let expected = root
+            .join(".intendant")
+            .join("memory.json")
+            .to_string_lossy()
+            .into_owned();
         assert_eq!(
             parsed["commands"][0]["memory_file"].as_str().unwrap(),
-            "/tmp/proj/.intendant/memory.json"
+            expected
         );
     }
 
@@ -3003,6 +11452,51 @@ Also: {"source": "bare"}"#;
         assert!(!is_simple_task("line1\nline2\nline3\nline4"));
     }
 
+    fn cli_flags_for_tests() -> CliFlags {
+        CliFlags {
+            task: None,
+            provider: None,
+            model: None,
+            verbose: false,
+            no_tui: false,
+            mcp: false,
+            autonomy: AutonomyLevel::Medium,
+            log_file: None,
+            continue_last: false,
+            resume_id: None,
+            control_socket: false,
+            json_output: false,
+            sandbox: false,
+            direct: false,
+            no_presence: false,
+            web: false,
+            web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
+            transcription: false,
+            record_displays: Vec::new(),
+            agent_backend: None,
+            no_web: false,
+            advertise_urls: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn idle_web_defaults_to_daemon_without_no_tui() {
+        let flags = cli_flags_for_tests();
+        assert!(should_start_idle_web_daemon(true, &flags));
+    }
+
+    #[test]
+    fn idle_web_daemon_requires_web_and_no_task() {
+        let mut flags = cli_flags_for_tests();
+        assert!(!should_start_idle_web_daemon(false, &flags));
+
+        flags.task = Some("do the thing".to_string());
+        assert!(!should_start_idle_web_daemon(true, &flags));
+    }
+
     #[test]
     fn parse_cli_flags_empty() {
         // Can't easily test parse_cli_flags since it reads env::args(),
@@ -3025,6 +11519,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -3070,6 +11567,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -3103,6 +11603,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: 9000,
+            tls: false,
+            tls_cert: None,
+            tls_key: None,
             transcription: false,
             record_displays: Vec::new(),
 
@@ -3262,7 +11765,6 @@ Also: {"source": "bare"}"#;
     fn has_exec_command_invalid_json() {
         assert!(!has_exec_command("not json"));
     }
-
 
     // --- assemble_batch_from_tool_calls tests ---
 
@@ -3539,12 +12041,166 @@ Also: {"source": "bare"}"#;
         assert_eq!(results[0].2, "OK");
     }
 
+    #[test]
+    fn external_tool_output_limiter_caps_each_tool() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let first = "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - 2);
+        let out = limiter.filter("item-1", first.clone()).unwrap();
+        assert_eq!(out, first);
+
+        let out = limiter.filter("item-1", "bcdef".to_string()).unwrap();
+        assert!(out.starts_with("bc"));
+        assert!(out.contains("output truncated by Intendant"));
+        assert!(
+            limiter.filter("item-1", "more".to_string()).is_none(),
+            "further output after truncation should be suppressed"
+        );
+    }
+
+    #[test]
+    fn external_tool_output_limiter_resets_on_completion() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let oversized = "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT + 10);
+        let out = limiter.filter("item-1", oversized).unwrap();
+        assert!(out.contains("output truncated by Intendant"));
+
+        limiter.complete("item-1");
+
+        let out = limiter.filter("item-1", "fresh".to_string()).unwrap();
+        assert_eq!(out, "fresh");
+    }
+
+    #[test]
+    fn external_tool_failure_content_includes_item_and_preview() {
+        let content = external_tool_failure_content(
+            "call-1",
+            "command exited 1",
+            Some("command: rg missing static/app.html"),
+        );
+
+        assert_eq!(
+            content,
+            "Command failed (call-1): command exited 1\nCommand: rg missing static/app.html"
+        );
+    }
+
+    #[test]
+    fn external_tool_failure_content_omits_empty_preview() {
+        let content = external_tool_failure_content("call-1", "unknown error", Some("  "));
+
+        assert_eq!(content, "Tool failed (call-1): unknown error");
+    }
+
+    #[test]
+    fn external_agent_log_source_prefers_backend_source() {
+        assert_eq!(external_agent_log_source(Some("Codex")), "Codex");
+        assert_eq!(external_agent_log_source(Some("  ")), "worker");
+        assert_eq!(external_agent_log_source(None), "worker");
+    }
+
+    #[test]
+    fn external_tool_preview_text_combines_tool_name_and_preview() {
+        assert_eq!(
+            external_tool_preview_text("command", "rg needle file").as_deref(),
+            Some("command: rg needle file")
+        );
+        assert_eq!(
+            external_tool_preview_text("", "rg needle file").as_deref(),
+            Some("rg needle file")
+        );
+        assert_eq!(external_tool_preview_text("", ""), None);
+    }
+
     // ── Steer fallback plumbing ──
     //
     // The full `drain_external_agent_events` loop is integration-heavy
     // (needs a backend + event channel); we unit-test the smaller helpers
     // that encapsulate the fallback policy. The end-to-end flow is covered
     // indirectly by the dispatcher / Codex tests.
+
+    #[test]
+    fn resolve_external_steer_target_prefers_side_thread_id() {
+        let mut side_threads = std::collections::HashMap::new();
+        side_threads.insert("side-thread".to_string(), "parent-thread".to_string());
+
+        let resolved = resolve_external_steer_target_session(
+            &Some("side-thread".to_string()),
+            &Some("parent-thread".to_string()),
+            &Some("alias-thread".to_string()),
+            Some(&side_threads),
+        );
+
+        assert_eq!(
+            resolved,
+            Some((
+                Some("side-thread".to_string()),
+                ExternalSteerTargetKind::Side
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_external_steer_target_maps_parent_alias_to_primary_session() {
+        let side_threads = std::collections::HashMap::new();
+
+        let alias = resolve_external_steer_target_session(
+            &Some("alias-thread".to_string()),
+            &Some("parent-thread".to_string()),
+            &Some("alias-thread".to_string()),
+            Some(&side_threads),
+        );
+        assert_eq!(
+            alias,
+            Some((
+                Some("parent-thread".to_string()),
+                ExternalSteerTargetKind::Primary
+            ))
+        );
+
+        let untargeted = resolve_external_steer_target_session(
+            &None,
+            &Some("parent-thread".to_string()),
+            &Some("alias-thread".to_string()),
+            Some(&side_threads),
+        );
+        assert_eq!(
+            untargeted,
+            Some((
+                Some("parent-thread".to_string()),
+                ExternalSteerTargetKind::Primary
+            ))
+        );
+    }
+
+    #[test]
+    fn resolve_external_steer_target_rejects_unrelated_session() {
+        let mut side_threads = std::collections::HashMap::new();
+        side_threads.insert("side-thread".to_string(), "parent-thread".to_string());
+
+        assert_eq!(
+            resolve_external_steer_target_session(
+                &Some("other-thread".to_string()),
+                &Some("parent-thread".to_string()),
+                &Some("alias-thread".to_string()),
+                Some(&side_threads),
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn claim_active_side_turn_completion_is_idempotent() {
+        let mut active_side_turns = std::collections::HashSet::from(["side-thread".to_string()]);
+
+        assert!(claim_active_side_turn_completion(
+            &mut active_side_turns,
+            Some("side-thread")
+        ));
+        assert!(!claim_active_side_turn_completion(
+            &mut active_side_turns,
+            Some("side-thread")
+        ));
+    }
 
     #[tokio::test]
     async fn drain_steer_queue_as_followup_prefixes_single_queued_item() {
@@ -3559,9 +12215,8 @@ Also: {"source": "bare"}"#;
                 "steer-1".into(),
             ));
 
-        let merged =
-            drain_steer_queue_as_followup(&queue, "original follow-up", &bus)
-                .expect("should produce a message");
+        let merged = drain_steer_queue_as_followup(&queue, "original follow-up", &bus, None, None)
+            .expect("should produce a message");
 
         assert_eq!(merged, "[User] switch to Python\noriginal follow-up");
         // Queue drained.
@@ -3570,7 +12225,7 @@ Also: {"source": "bare"}"#;
         // SteerDelivered emitted for the drained item.
         let ev = rx.try_recv().expect("SteerDelivered event");
         match ev {
-            AppEvent::SteerDelivered { id, mid_turn } => {
+            AppEvent::SteerDelivered { id, mid_turn, .. } => {
                 assert_eq!(id, "steer-1");
                 assert!(!mid_turn, "queued fallback should report mid_turn=false");
             }
@@ -3590,9 +12245,8 @@ Also: {"source": "bare"}"#;
             .unwrap()
             .push(event::ContextInjection::text("display grant".into()));
 
-        let merged =
-            drain_steer_queue_as_followup(&queue, "follow-up", &bus)
-                .expect("should produce a message");
+        let merged = drain_steer_queue_as_followup(&queue, "follow-up", &bus, None, None)
+            .expect("should produce a message");
         assert_eq!(merged, "follow-up");
         assert_eq!(queue.lock().unwrap().len(), 1, "non-steer entry preserved");
     }
@@ -3604,7 +12258,7 @@ Also: {"source": "bare"}"#;
         // case doesn't produce an empty agent message.
         let bus = EventBus::new();
         let queue = event::ContextInjectionQueue::default();
-        assert!(drain_steer_queue_as_followup(&queue, "", &bus).is_none());
+        assert!(drain_steer_queue_as_followup(&queue, "", &bus, None, None).is_none());
     }
 
     #[tokio::test]
@@ -3625,17 +12279,205 @@ Also: {"source": "bare"}"#;
         }
 
         let merged =
-            drain_steer_queue_as_followup(&queue, "main", &bus).expect("merged");
+            drain_steer_queue_as_followup(&queue, "main", &bus, None, None).expect("merged");
         assert_eq!(merged, "[User] first\n[User] second\nmain");
 
         let mut delivered_ids: Vec<String> = Vec::new();
         while let Ok(ev) = rx.try_recv() {
-            if let AppEvent::SteerDelivered { id, mid_turn } = ev {
+            if let AppEvent::SteerDelivered { id, mid_turn, .. } = ev {
                 assert!(!mid_turn);
                 delivered_ids.push(id);
             }
         }
         assert_eq!(delivered_ids, vec!["s1".to_string(), "s2".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn drain_steer_queue_as_followup_keeps_other_session_items() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+        {
+            let mut q = queue.lock().unwrap();
+            q.push(event::ContextInjection::text_with_steer_id_for_target(
+                "for session a".into(),
+                "s-a".into(),
+                Some("session-a".into()),
+            ));
+            q.push(event::ContextInjection::text_with_steer_id_for_target(
+                "for session b".into(),
+                "s-b".into(),
+                Some("session-b".into()),
+            ));
+        }
+
+        let merged = drain_steer_queue_as_followup(&queue, "main", &bus, Some("session-b"), None)
+            .expect("merged");
+        assert_eq!(merged, "[User] for session b\nmain");
+
+        let remaining = queue.lock().unwrap();
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(remaining[0].text, "for session a");
+        assert_eq!(remaining[0].target_session_id.as_deref(), Some("session-a"));
+        drop(remaining);
+
+        let ev = rx.try_recv().expect("SteerDelivered event");
+        match ev {
+            AppEvent::SteerDelivered {
+                session_id,
+                id,
+                mid_turn,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-b"));
+                assert_eq!(id, "s-b");
+                assert!(!mid_turn);
+            }
+            other => panic!("expected SteerDelivered, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "only matching steer should drain");
+    }
+
+    #[test]
+    fn has_queued_steers_for_session_matches_target_or_alias() {
+        let queue = event::ContextInjectionQueue::default();
+        queue
+            .lock()
+            .unwrap()
+            .push(event::ContextInjection::text_with_steer_id_for_target(
+                "for alias".into(),
+                "s-alias".into(),
+                Some("alias-session".into()),
+            ));
+
+        assert!(has_queued_steers_for_session(
+            &queue,
+            Some("live-session"),
+            Some("alias-session")
+        ));
+        assert!(!has_queued_steers_for_session(
+            &queue,
+            Some("other-session"),
+            None
+        ));
+    }
+
+    #[test]
+    fn shared_external_control_receiver_consumes_turn_controls_once() {
+        let bus = EventBus::new();
+        let mut control_rx = bus.subscribe();
+
+        bus.send(AppEvent::SteerRequested {
+            session_id: Some("codex-thread".to_string()),
+            text: "steer once".to_string(),
+            id: "s1".to_string(),
+        });
+
+        match control_rx.try_recv() {
+            Ok(AppEvent::SteerRequested { id, .. }) => assert_eq!(id, "s1"),
+            other => panic!("expected control receiver to see steer, got {:?}", other),
+        }
+
+        assert!(matches!(
+            control_rx.try_recv(),
+            Err(tokio::sync::broadcast::error::TryRecvError::Empty)
+        ));
+
+        bus.send(AppEvent::SteerRequested {
+            session_id: Some("codex-thread".to_string()),
+            text: "steer later".to_string(),
+            id: "s2".to_string(),
+        });
+
+        match control_rx.try_recv() {
+            Ok(AppEvent::SteerRequested { id, .. }) => assert_eq!(id, "s2"),
+            other => panic!(
+                "expected shared receiver to see later steer, got {:?}",
+                other
+            ),
+        }
+    }
+
+    #[test]
+    fn flush_pending_runtime_steers_delivers_only_matching_session() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut pending = std::collections::VecDeque::from([
+            PendingRuntimeSteer {
+                session_id: Some("parent".to_string()),
+                id: "steer-parent".to_string(),
+                text: "parent steer".to_string(),
+            },
+            PendingRuntimeSteer {
+                session_id: Some("side".to_string()),
+                id: "steer-side".to_string(),
+                text: "side steer".to_string(),
+            },
+        ]);
+
+        let delivered =
+            flush_pending_runtime_steers_for_session(&bus, &mut pending, &Some("side".into()));
+
+        assert_eq!(delivered, 1);
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, "steer-parent");
+
+        let ev = rx.try_recv().expect("SteerDelivered event");
+        match ev {
+            AppEvent::SteerDelivered {
+                session_id,
+                id,
+                mid_turn,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("side"));
+                assert_eq!(id, "steer-side");
+                assert!(mid_turn);
+            }
+            other => panic!("expected SteerDelivered, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn model_checkpoint_flushes_pending_runtime_steers() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut pending = std::collections::VecDeque::from([
+            PendingRuntimeSteer {
+                session_id: Some("codex-thread".to_string()),
+                id: "steer-1".to_string(),
+                text: "first steer".to_string(),
+            },
+            PendingRuntimeSteer {
+                session_id: Some("codex-thread".to_string()),
+                id: "steer-2".to_string(),
+                text: "second steer".to_string(),
+            },
+        ]);
+
+        let delivered = flush_pending_runtime_steers_for_model_checkpoint(
+            &bus,
+            &mut pending,
+            &Some("codex-thread".into()),
+        );
+
+        assert_eq!(delivered, 2);
+        assert!(pending.is_empty());
+
+        let mut ids = Vec::new();
+        while let Ok(ev) = rx.try_recv() {
+            match ev {
+                AppEvent::SteerDelivered {
+                    session_id,
+                    id,
+                    mid_turn,
+                } => {
+                    assert_eq!(session_id.as_deref(), Some("codex-thread"));
+                    assert!(mid_turn);
+                    ids.push(id);
+                }
+                other => panic!("expected SteerDelivered, got {:?}", other),
+            }
+        }
+        assert_eq!(ids, vec!["steer-1".to_string(), "steer-2".to_string()]);
     }
 }
 
@@ -3687,23 +12529,26 @@ async fn run_agent_loop(
     // The same watcher also handles AppEvent::SteerRequested: it pushes
     // the steer text onto the shared `context_injection` queue (tagged as
     // a user injection so it survives inter-task drains) and emits
-    // `SteerDelivered { mid_turn: true }`. The native agent loop drains
-    // `context_injection` at the top of every turn, so queued steers land
-    // on the next iteration's user message — from the user's perspective
-    // that's mid-turn (no follow-up required from them). We keep the
-    // watcher alive across multiple steers — unlike the interrupt branch
-    // which exits after cancelling.
+    // `SteerAccepted`. The native agent loop drains `context_injection` at
+    // the top of every turn and emits `SteerDelivered` at that point, so
+    // queued steers are distinguishable from actual model-context delivery.
+    // We keep the watcher alive across multiple steers — unlike the interrupt
+    // branch which exits after cancelling.
+    let local_session_id = session_log_id(&session_log);
     let cancel_token = tokio_util::sync::CancellationToken::new();
     let cancel_watcher_handle = {
         let watcher_token = cancel_token.clone();
         let watcher_registry = approval_registry.clone();
         let watcher_injection = context_injection.clone();
         let watcher_bus = bus.clone();
+        let watcher_session_id = local_session_id.clone();
         let mut bus_rx = bus.subscribe();
         tokio::spawn(async move {
             loop {
                 match bus_rx.recv().await {
-                    Ok(AppEvent::InterruptRequested) => {
+                    Ok(AppEvent::InterruptRequested { session_id })
+                        if event_targets_session(&session_id, &watcher_session_id) =>
+                    {
                         // Drain pending approvals with Deny so their
                         // receivers unblock and the loop can reach its
                         // cancellation-check boundary.
@@ -3717,24 +12562,26 @@ async fn run_agent_loop(
                         watcher_token.cancel();
                         break;
                     }
-                    Ok(AppEvent::SteerRequested { text, id }) => {
+                    Ok(AppEvent::SteerRequested {
+                        session_id,
+                        text,
+                        id,
+                    }) if event_targets_session(&session_id, &watcher_session_id) => {
                         // Queue the steer for the next turn's drain. The
                         // native loop has no separate "mid-turn inject"
-                        // hook — model calls are atomic — so this is as
-                        // close to mid-turn as the native path gets.
-                        // Frontends see `mid_turn: true` because they did
-                        // not have to send a follow-up themselves.
+                        // hook — model calls are atomic — so acceptance and
+                        // delivery are separate UI states.
                         if let Ok(mut q) = watcher_injection.lock() {
-                            q.push(
-                                event::ContextInjection::text_with_steer_id(
-                                    text,
-                                    id.clone(),
-                                ),
-                            );
+                            q.push(event::ContextInjection::text_with_steer_id_for_target(
+                                text,
+                                id.clone(),
+                                watcher_session_id.clone(),
+                            ));
                         }
-                        watcher_bus.send(AppEvent::SteerDelivered {
+                        watcher_bus.send(AppEvent::SteerAccepted {
+                            session_id: watcher_session_id.clone(),
                             id,
-                            mid_turn: true,
+                            reason: "Queued for the next model checkpoint".to_string(),
                         });
                     }
                     Ok(_) => continue,
@@ -3775,6 +12622,7 @@ async fn run_agent_loop(
                 let _ = sender.send(event::ApprovalResponse::Deny);
             }
             bus.send(AppEvent::Interrupted {
+                session_id: local_session_id.clone(),
                 reason: "user requested".into(),
             });
             slog(&session_log, |l| l.info("Agent loop interrupted"));
@@ -3801,14 +12649,27 @@ async fn run_agent_loop(
         // always used.
         if let Ok(mut q) = context_injection.lock() {
             for inj in q.drain(..) {
-                let prefix = if inj.steer_id.is_some() { "User" } else { "System" };
+                let prefix = if inj.steer_id.is_some() {
+                    "User"
+                } else {
+                    "System"
+                };
                 let text = format!("[{}] {}", prefix, inj.text);
                 if inj.images.is_empty() {
                     conversation.add_user(text.clone());
                 } else {
                     conversation.add_user_with_images(text.clone(), inj.images);
                 }
-                slog(&session_log, |l| l.info(&format!("Context injected: {}", inj.text)));
+                slog(&session_log, |l| {
+                    l.info(&format!("Context injected: {}", inj.text))
+                });
+                if let Some(id) = inj.steer_id {
+                    bus.send(AppEvent::SteerDelivered {
+                        session_id: local_session_id.clone(),
+                        id,
+                        mid_turn: false,
+                    });
+                }
             }
         }
 
@@ -3819,10 +12680,18 @@ async fn run_agent_loop(
         slog(&session_log, |l| l.turn_start(turn, budget_pct, remaining));
 
         bus.send(AppEvent::TurnStarted {
+            session_id: local_session_id.clone(),
             turn,
             budget_pct,
             remaining,
         });
+
+        // When CU is enabled, the OpenAI computer tool rejects multiple images.
+        // Strip all but the most recent screenshot before each API call so the
+        // logged context matches the payload sent to the model.
+        if provider.cu_enabled() {
+            conversation.strip_old_images();
+        }
 
         // Log the full messages array being sent to the API
         slog(&session_log, |l| {
@@ -3830,11 +12699,32 @@ async fn run_agent_loop(
                 l.messages_input(&json);
             }
         });
-
-        // When CU is enabled, the OpenAI computer tool rejects multiple images.
-        // Strip all but the most recent screenshot before each API call.
-        if provider.cu_enabled() {
-            conversation.strip_old_images();
+        match provider.request_snapshot(conversation.messages(), true) {
+            Ok((context_format, raw_context)) => {
+                bus.send(AppEvent::ContextSnapshot {
+                    session_id: local_session_id.clone(),
+                    source: "native".to_string(),
+                    label: "Internal agent request payload".to_string(),
+                    request_id: Some(format!("native-turn-{turn}")),
+                    request_index: Some(turn as u64),
+                    turn: Some(turn),
+                    format: context_format,
+                    token_count: conversation.last_usage().map(|u| u.total_tokens),
+                    token_count_kind: None,
+                    context_window: Some(conversation.context_window()),
+                    hard_context_window: Some(conversation.context_window()),
+                    item_count: provider_request_item_count(&raw_context),
+                    raw: raw_context,
+                });
+            }
+            Err(e) => {
+                slog(&session_log, |l| {
+                    l.warn(&format!(
+                        "Failed to build provider request context snapshot: {}",
+                        e
+                    ))
+                });
+            }
         }
 
         // Streaming API call — wrapped in select! so an interrupt cancels
@@ -3848,9 +12738,13 @@ async fn run_agent_loop(
             let mut was_cancelled = false;
             for attempt in 0..=STREAM_RETRIES {
                 let stream_bus = bus.clone();
+                let stream_session_id = local_session_id.clone();
                 let on_stream_event = move |event: crate::provider::StreamEvent| {
                     if let crate::provider::StreamEvent::Delta(ref text) = event {
-                        stream_bus.send(AppEvent::ModelResponseDelta { text: text.clone() });
+                        stream_bus.send(AppEvent::ModelResponseDelta {
+                            session_id: stream_session_id.clone(),
+                            text: text.clone(),
+                        });
                     }
                 };
                 let stream_fut = provider.chat_stream(conversation.messages(), &on_stream_event);
@@ -3929,9 +12823,12 @@ async fn run_agent_loop(
                     let _ = sender.send(event::ApprovalResponse::Deny);
                 }
                 bus.send(AppEvent::Interrupted {
+                    session_id: local_session_id.clone(),
                     reason: "user requested".into(),
                 });
-                slog(&session_log, |l| l.info("Agent loop interrupted mid-stream"));
+                slog(&session_log, |l| {
+                    l.info("Agent loop interrupted mid-stream")
+                });
                 return Ok((loop_stats, LoopExitReason::Interrupted));
             }
         };
@@ -4032,24 +12929,35 @@ async fn run_agent_loop(
 
         // For CU-only turns, synthesize a content summary from the actions
         let display_content = if response.content.is_empty() && has_cu_calls {
-            let descs: Vec<String> = response.cu_calls.iter().flat_map(|cu| {
-                cu.actions.iter().map(|a| match a {
-                    computer_use::CuAction::Click { x, y, .. } => format!("click({},{})", x, y),
-                    computer_use::CuAction::DoubleClick { x, y, .. } => format!("double_click({},{})", x, y),
-                    computer_use::CuAction::Type { text } => format!("type(\"{}\")", &text[..text.len().min(30)]),
-                    computer_use::CuAction::Key { key } => format!("key({})", key),
-                    computer_use::CuAction::Scroll { x, y, .. } => format!("scroll({},{})", x, y),
-                    computer_use::CuAction::Screenshot => "screenshot".to_string(),
-                    computer_use::CuAction::Wait { .. } => "wait".to_string(),
-                    _ => format!("{:?}", a),
+            let descs: Vec<String> = response
+                .cu_calls
+                .iter()
+                .flat_map(|cu| {
+                    cu.actions.iter().map(|a| match a {
+                        computer_use::CuAction::Click { x, y, .. } => format!("click({},{})", x, y),
+                        computer_use::CuAction::DoubleClick { x, y, .. } => {
+                            format!("double_click({},{})", x, y)
+                        }
+                        computer_use::CuAction::Type { text } => {
+                            format!("type(\"{}\")", &text[..text.len().min(30)])
+                        }
+                        computer_use::CuAction::Key { key } => format!("key({})", key),
+                        computer_use::CuAction::Scroll { x, y, .. } => {
+                            format!("scroll({},{})", x, y)
+                        }
+                        computer_use::CuAction::Screenshot => "screenshot".to_string(),
+                        computer_use::CuAction::Wait { .. } => "wait".to_string(),
+                        _ => format!("{:?}", a),
+                    })
                 })
-            }).collect();
+                .collect();
             descs.join(" → ")
         } else {
             response.content.clone()
         };
 
         bus.send(AppEvent::ModelResponse {
+            session_id: local_session_id.clone(),
             turn,
             content: display_content,
             usage: response.usage.clone(),
@@ -4110,6 +13018,7 @@ async fn run_agent_loop(
                     conversation.add_tool_result(&call_id, &tool_name, "OK");
                 }
                 bus.send(AppEvent::DoneSignal {
+                    session_id: local_session_id.clone(),
                     message: batch.done_message.clone(),
                 });
                 exit_reason = LoopExitReason::DoneSignal;
@@ -4143,17 +13052,18 @@ async fn run_agent_loop(
             // Process invoke_skill tool calls (if any)
             for (call_id, skill_name, arguments) in &batch.skill_invocations {
                 let discovered = skills::discover_skills(Some(&project.root));
-                match discovered
-                    .iter()
-                    .find(|s| s.config.name == *skill_name)
-                {
+                match discovered.iter().find(|s| s.config.name == *skill_name) {
                     Some(skill) => {
                         let body = skills::load_skill_body(skill, arguments);
                         slog(&session_log, |l| {
                             l.info(&format!(
                                 "Invoked skill '{}' (args: {})",
                                 skill_name,
-                                if arguments.is_empty() { "(none)" } else { arguments }
+                                if arguments.is_empty() {
+                                    "(none)"
+                                } else {
+                                    arguments
+                                }
                             ))
                         });
                         conversation.add_tool_result(
@@ -4214,6 +13124,11 @@ async fn run_agent_loop(
                             }
                         };
 
+                        // Vortex shared-memory probe is POSIX-only
+                        // (`shm_open`). On Windows the Vortex bridge isn't
+                        // available, so the probe is compiled out and the
+                        // code falls through to the regular audio bridge.
+                        #[cfg(unix)]
                         let vortex_shm_available = unsafe {
                             let fd = libc::shm_open(
                                 b"/vortex-audio\0".as_ptr() as *const libc::c_char,
@@ -4227,6 +13142,8 @@ async fn run_agent_loop(
                                 false
                             }
                         };
+                        #[cfg(not(unix))]
+                        let vortex_shm_available = false;
                         let mut bridge = if vortex_shm_available {
                             audio_routing::create_vortex_bridge("shm")
                         } else {
@@ -4246,10 +13163,7 @@ async fn run_agent_loop(
                         if bridge.vortex_socket_path().is_none() {
                             if let Err(e) = audio_routing::set_as_default(&mut bridge).await {
                                 slog(&session_log, |l| {
-                                    l.warn(&format!(
-                                        "Could not set audio bridge as default: {}",
-                                        e
-                                    ))
+                                    l.warn(&format!("Could not set audio bridge as default: {}", e))
                                 });
                             }
                         }
@@ -4261,14 +13175,9 @@ async fn run_agent_loop(
                             ))
                         });
 
-                        let result = live_audio::run_session(
-                            &spec,
-                            &api_key,
-                            &bridge,
-                            log_dir,
-                            Some(bus),
-                        )
-                        .await;
+                        let result =
+                            live_audio::run_session(&spec, &api_key, &bridge, log_dir, Some(bus))
+                                .await;
 
                         drop(bridge);
 
@@ -4322,10 +13231,7 @@ async fn run_agent_loop(
             let json_str = normalize_command_batch(&inject_project_context(json_str, project));
 
             // Headless askHuman check — skip unless JSON mode (which handles it via stdin)
-            if headless
-                && json_approval.is_none()
-                && has_ask_human_command(&json_str)
-            {
+            if headless && json_approval.is_none() && has_ask_human_command(&json_str) {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -4382,153 +13288,173 @@ async fn run_agent_loop(
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
                 } else {
-                slog(&session_log, |l| {
-                    l.approval(&cat.to_string(), &preview, "waiting")
-                });
-
-                if denied_by_policy {
                     slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-policy")
+                        l.approval(&cat.to_string(), &preview, "waiting")
                     });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!("Denied by policy ({})", cat),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                }
 
-                if let Some(slot) = json_approval {
-                    // JSON mode: emit approval event and wait for stdin response
-                    bus.send(AppEvent::ApprovalRequired {
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    {
-                        let mut guard = slot.lock().unwrap();
-                        *guard = Some((turn as u64, tx));
+                    if denied_by_policy {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-policy")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
+                            reason: format!("Denied by policy ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
                     }
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
-                            // Record approved command for dedup
-                            autonomy.write().await.record_approved_command(&preview);
-                            // Session-grant: first DisplayControl approval unlocks the session
-                            if cat == autonomy::ActionCategory::DisplayControl {
+
+                    if let Some(slot) = json_approval {
+                        // JSON mode: emit approval event and wait for stdin response
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((turn as u64, tx));
+                        }
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve".to_string(),
+                                });
+                                // Record approved command for dedup
+                                autonomy.write().await.record_approved_command(&preview);
+                                // Session-grant: first DisplayControl approval unlocks the session
+                                if cat == autonomy::ActionCategory::DisplayControl {
+                                    let mut state = autonomy.write().await;
+                                    if !state.user_display_granted {
+                                        state.user_display_granted = true;
+                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+                                    }
+                                }
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve_all".to_string(),
+                                });
                                 let mut state = autonomy.write().await;
-                                if !state.user_display_granted {
+                                state.level = AutonomyLevel::Full;
+                                // Session-grant: DisplayControl approval also unlocks user display
+                                if cat == autonomy::ActionCategory::DisplayControl
+                                    && !state.user_display_granted
+                                {
                                     state.user_display_granted = true;
                                     std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
                                     bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                                 }
                             }
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                            // Session-grant: DisplayControl approval also unlocks user display
-                            if cat == autonomy::ActionCategory::DisplayControl
-                                && !state.user_display_granted
-                            {
-                                state.user_display_granted = true;
-                                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                            }
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "skip".to_string() });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "deny".to_string() });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
-                        }
-                    }
-                } else if headless {
-                    slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                    });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!(
-                            "Approval required in headless mode ({})",
-                            cat
-                        ),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                } else {
-                    // Interactive mode (TUI/MCP): approval via registry
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    approval_registry.lock().unwrap().insert(turn as u64, tx);
-                    bus.send(AppEvent::ApprovalRequired {
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            // Distinguish a real user deny from an interrupt
-                            // that caused the watcher to drain the registry
-                            // with Deny as a synthetic response. Interrupt
-                            // takes precedence so the phase/exit reason
-                            // reflects what actually happened.
-                            if cancel_token.is_cancelled() {
-                                bus.send(AppEvent::Interrupted {
-                                    reason: "user requested".into(),
-                                });
+                            Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
-                                    l.info("Agent loop interrupted during approval wait")
+                                    l.approval(&cat.to_string(), &preview, "skipped")
                                 });
-                                return Ok((loop_stats, LoopExitReason::Interrupted));
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "skip".to_string(),
+                                });
+                                should_skip = true;
                             }
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "deny".to_string(),
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
+                        }
+                    } else if headless {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
+                            reason: format!("Approval required in headless mode ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
+                    } else {
+                        // Interactive mode (TUI/MCP): approval via registry
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                let mut state = autonomy.write().await;
+                                state.level = AutonomyLevel::Full;
+                            }
+                            Ok(event::ApprovalResponse::Skip) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "skipped")
+                                });
+                                should_skip = true;
+                            }
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                // Distinguish a real user deny from an interrupt
+                                // that caused the watcher to drain the registry
+                                // with Deny as a synthetic response. Interrupt
+                                // takes precedence so the phase/exit reason
+                                // reflects what actually happened.
+                                if cancel_token.is_cancelled() {
+                                    bus.send(AppEvent::Interrupted {
+                                        session_id: local_session_id.clone(),
+                                        reason: "user requested".into(),
+                                    });
+                                    slog(&session_log, |l| {
+                                        l.info("Agent loop interrupted during approval wait")
+                                    });
+                                    return Ok((loop_stats, LoopExitReason::Interrupted));
+                                }
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
                         }
                     }
-                }
-            } // close dedup else block
+                } // close dedup else block
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);
@@ -4548,26 +13474,37 @@ async fn run_agent_loop(
 
             // Run agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
-                .await;
+            maybe_auto_launch_xvfb(
+                &json_str,
+                &mut xvfb_guard,
+                provider.name(),
+                &session_log,
+                bus,
+            )
+            .await;
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
+                session_id: local_session_id.clone(),
                 turn,
                 commands_preview: preview.clone(),
+                item_id: None,
                 source: None,
             });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
+            let output_id = event::next_agent_output_id();
 
             // Log agent output
             slog(&session_log, |l| {
-                l.agent_output(&output.stdout, &output.stderr, None)
+                l.agent_output_with_id(&output.stdout, &output.stderr, None, Some(&output_id))
             });
 
             bus.send(AppEvent::AgentOutput {
+                session_id: local_session_id.clone(),
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
                 source: None,
+                output_id: Some(output_id),
             });
 
             // Map results back to individual tool responses
@@ -4582,9 +13519,7 @@ async fn run_agent_loop(
                 let text = format!("{}\n\n{}", result_text, budget);
                 if tool_name == "capture_screen" {
                     if let Some(images) = encode_screenshot(result_text) {
-                        conversation.add_tool_result_with_images(
-                            call_id, tool_name, &text, images,
-                        );
+                        conversation.add_tool_result_with_images(call_id, tool_name, &text, images);
                         continue;
                     }
                 }
@@ -4600,7 +13535,8 @@ async fn run_agent_loop(
                     log_dir,
                     &mut cu_action_counter,
                     &session_log,
-                ).await;
+                )
+                .await;
             }
         } else if has_cu_calls {
             // CU-only turn (no function tool calls)
@@ -4611,7 +13547,8 @@ async fn run_agent_loop(
                 log_dir,
                 &mut cu_action_counter,
                 &session_log,
-            ).await;
+            )
+            .await;
         } else {
             // --- Legacy text extraction path ---
 
@@ -4624,8 +13561,13 @@ async fn run_agent_loop(
                     });
                     let brief: String = response.content.chars().take(500).collect();
                     bus.send(AppEvent::TaskComplete {
+                        session_id: local_session_id.clone(),
                         reason: "Task complete".to_string(),
-                        summary: if brief.is_empty() { None } else { Some(brief.clone()) },
+                        summary: if brief.is_empty() {
+                            None
+                        } else {
+                            Some(brief.clone())
+                        },
                     });
                     exit_reason = LoopExitReason::TaskComplete;
                     break;
@@ -4656,6 +13598,7 @@ async fn run_agent_loop(
                         ))
                     });
                     bus.send(AppEvent::DoneSignal {
+                        session_id: local_session_id.clone(),
                         message: message.clone(),
                     });
                     exit_reason = LoopExitReason::DoneSignal;
@@ -4688,8 +13631,13 @@ async fn run_agent_loop(
                         });
                         let brief: String = response.content.chars().take(500).collect();
                         bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
                             reason: "Task complete".to_string(),
-                            summary: if brief.is_empty() { None } else { Some(brief.clone()) },
+                            summary: if brief.is_empty() {
+                                None
+                            } else {
+                                Some(brief.clone())
+                            },
                         });
                         exit_reason = LoopExitReason::TaskComplete;
                         break;
@@ -4711,10 +13659,7 @@ async fn run_agent_loop(
             let json_str = normalize_command_batch(&inject_project_context(&json_str, project));
 
             // In headless mode there is no askHuman input panel — skip unless JSON mode.
-            if headless
-                && json_approval.is_none()
-                && has_ask_human_command(&json_str)
-            {
+            if headless && json_approval.is_none() && has_ask_human_command(&json_str) {
                 slog(&session_log, |l| {
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
@@ -4769,153 +13714,173 @@ Proceed with explicit assumptions and continue without additional questions."
                         l.approval(&cat.to_string(), &preview, "dedup-auto-approved")
                     });
                 } else {
-                slog(&session_log, |l| {
-                    l.approval(&cat.to_string(), &preview, "waiting")
-                });
-
-                if denied_by_policy {
                     slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-policy")
+                        l.approval(&cat.to_string(), &preview, "waiting")
                     });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!("Denied by policy ({})", cat),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                }
 
-                if let Some(slot) = json_approval {
-                    // JSON mode: emit approval event and wait for stdin response
-                    bus.send(AppEvent::ApprovalRequired {
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    {
-                        let mut guard = slot.lock().unwrap();
-                        *guard = Some((turn as u64, tx));
+                    if denied_by_policy {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-policy")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
+                            reason: format!("Denied by policy ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
                     }
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve".to_string() });
-                            // Record approved command for dedup
-                            autonomy.write().await.record_approved_command(&preview);
-                            // Session-grant: first DisplayControl approval unlocks the session
-                            if cat == autonomy::ActionCategory::DisplayControl {
+
+                    if let Some(slot) = json_approval {
+                        // JSON mode: emit approval event and wait for stdin response
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        {
+                            let mut guard = slot.lock().unwrap();
+                            *guard = Some((turn as u64, tx));
+                        }
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve".to_string(),
+                                });
+                                // Record approved command for dedup
+                                autonomy.write().await.record_approved_command(&preview);
+                                // Session-grant: first DisplayControl approval unlocks the session
+                                if cat == autonomy::ActionCategory::DisplayControl {
+                                    let mut state = autonomy.write().await;
+                                    if !state.user_display_granted {
+                                        state.user_display_granted = true;
+                                        std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+                                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+                                    }
+                                }
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "approve_all".to_string(),
+                                });
                                 let mut state = autonomy.write().await;
-                                if !state.user_display_granted {
+                                state.level = AutonomyLevel::Full;
+                                // Session-grant: DisplayControl approval also unlocks user display
+                                if cat == autonomy::ActionCategory::DisplayControl
+                                    && !state.user_display_granted
+                                {
                                     state.user_display_granted = true;
                                     std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
                                     bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
                                 }
                             }
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "approve_all".to_string() });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                            // Session-grant: DisplayControl approval also unlocks user display
-                            if cat == autonomy::ActionCategory::DisplayControl
-                                && !state.user_display_granted
-                            {
-                                state.user_display_granted = true;
-                                std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-                                bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
-                            }
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "skip".to_string() });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::ApprovalResolved { id: turn as u64, action: "deny".to_string() });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
-                        }
-                    }
-                } else if headless {
-                    slog(&session_log, |l| {
-                        l.approval(&cat.to_string(), &preview, "denied-no-approver")
-                    });
-                    bus.send(AppEvent::TaskComplete {
-                        reason: format!(
-                            "Approval required in headless mode ({})",
-                            cat
-                        ),
-                        summary: None,
-                    });
-                    return Ok((loop_stats, LoopExitReason::Denied));
-                } else {
-                    // Interactive mode (TUI/MCP): approval via registry
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    approval_registry.lock().unwrap().insert(turn as u64, tx);
-                    bus.send(AppEvent::ApprovalRequired {
-                        id: turn as u64,
-                        command_preview: preview.clone(),
-                        category: cat,
-                    });
-                    match rx.await {
-                        Ok(event::ApprovalResponse::Approve) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approved")
-                            });
-                        }
-                        Ok(event::ApprovalResponse::ApproveAll) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "approve-all")
-                            });
-                            let mut state = autonomy.write().await;
-                            state.level = AutonomyLevel::Full;
-                        }
-                        Ok(event::ApprovalResponse::Skip) => {
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "skipped")
-                            });
-                            should_skip = true;
-                        }
-                        Ok(event::ApprovalResponse::Deny) | Err(_) => {
-                            // Distinguish a real user deny from an interrupt
-                            // that caused the watcher to drain the registry
-                            // with Deny as a synthetic response. Interrupt
-                            // takes precedence so the phase/exit reason
-                            // reflects what actually happened.
-                            if cancel_token.is_cancelled() {
-                                bus.send(AppEvent::Interrupted {
-                                    reason: "user requested".into(),
-                                });
+                            Ok(event::ApprovalResponse::Skip) => {
                                 slog(&session_log, |l| {
-                                    l.info("Agent loop interrupted during approval wait")
+                                    l.approval(&cat.to_string(), &preview, "skipped")
                                 });
-                                return Ok((loop_stats, LoopExitReason::Interrupted));
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "skip".to_string(),
+                                });
+                                should_skip = true;
                             }
-                            slog(&session_log, |l| {
-                                l.approval(&cat.to_string(), &preview, "denied")
-                            });
-                            bus.send(AppEvent::TaskComplete {
-                                reason: "Denied by user".to_string(),
-                                summary: None,
-                            });
-                            return Ok((loop_stats, LoopExitReason::Denied));
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::ApprovalResolved {
+                                    session_id: local_session_id.clone(),
+                                    id: turn as u64,
+                                    action: "deny".to_string(),
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
+                        }
+                    } else if headless {
+                        slog(&session_log, |l| {
+                            l.approval(&cat.to_string(), &preview, "denied-no-approver")
+                        });
+                        bus.send(AppEvent::TaskComplete {
+                            session_id: local_session_id.clone(),
+                            reason: format!("Approval required in headless mode ({})", cat),
+                            summary: None,
+                        });
+                        return Ok((loop_stats, LoopExitReason::Denied));
+                    } else {
+                        // Interactive mode (TUI/MCP): approval via registry
+                        let (tx, rx) = tokio::sync::oneshot::channel();
+                        approval_registry.lock().unwrap().insert(turn as u64, tx);
+                        bus.send(AppEvent::ApprovalRequired {
+                            session_id: local_session_id.clone(),
+                            id: turn as u64,
+                            command_preview: preview.clone(),
+                            category: cat,
+                        });
+                        match rx.await {
+                            Ok(event::ApprovalResponse::Approve) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approved")
+                                });
+                            }
+                            Ok(event::ApprovalResponse::ApproveAll) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "approve-all")
+                                });
+                                let mut state = autonomy.write().await;
+                                state.level = AutonomyLevel::Full;
+                            }
+                            Ok(event::ApprovalResponse::Skip) => {
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "skipped")
+                                });
+                                should_skip = true;
+                            }
+                            Ok(event::ApprovalResponse::Deny) | Err(_) => {
+                                // Distinguish a real user deny from an interrupt
+                                // that caused the watcher to drain the registry
+                                // with Deny as a synthetic response. Interrupt
+                                // takes precedence so the phase/exit reason
+                                // reflects what actually happened.
+                                if cancel_token.is_cancelled() {
+                                    bus.send(AppEvent::Interrupted {
+                                        session_id: local_session_id.clone(),
+                                        reason: "user requested".into(),
+                                    });
+                                    slog(&session_log, |l| {
+                                        l.info("Agent loop interrupted during approval wait")
+                                    });
+                                    return Ok((loop_stats, LoopExitReason::Interrupted));
+                                }
+                                slog(&session_log, |l| {
+                                    l.approval(&cat.to_string(), &preview, "denied")
+                                });
+                                bus.send(AppEvent::TaskComplete {
+                                    session_id: local_session_id.clone(),
+                                    reason: "Denied by user".to_string(),
+                                    summary: None,
+                                });
+                                return Ok((loop_stats, LoopExitReason::Denied));
+                            }
                         }
                     }
-                }
-            } // close dedup else block
+                } // close dedup else block
             } else {
                 // Commands auto-approved — log for visibility at Normal verbosity
                 let preview = format_command_preview(&json_str);
@@ -4933,27 +13898,38 @@ Proceed with explicit assumptions and continue without additional questions."
 
             // Log the full JSON being sent to the agent
             slog(&session_log, |l| l.agent_input(&json_str));
-            maybe_auto_launch_xvfb(&json_str, &mut xvfb_guard, provider.name(), &session_log, bus)
-                .await;
+            maybe_auto_launch_xvfb(
+                &json_str,
+                &mut xvfb_guard,
+                provider.name(),
+                &session_log,
+                bus,
+            )
+            .await;
 
             let preview = format_commands_preview(&json_str);
             bus.send(AppEvent::AgentStarted {
+                session_id: local_session_id.clone(),
                 turn,
                 commands_preview: preview.clone(),
+                item_id: None,
                 source: None,
             });
 
             let output = agent_runner::run_agent(&json_str, log_dir).await?;
+            let output_id = event::next_agent_output_id();
 
             // Log agent output
             slog(&session_log, |l| {
-                l.agent_output(&output.stdout, &output.stderr, None)
+                l.agent_output_with_id(&output.stdout, &output.stderr, None, Some(&output_id))
             });
 
             bus.send(AppEvent::AgentOutput {
+                session_id: local_session_id.clone(),
                 stdout: output.stdout.clone(),
                 stderr: output.stderr.clone(),
                 source: None,
+                output_id: Some(output_id),
             });
 
             // Check for completed sub-agent results
@@ -5027,6 +14003,7 @@ async fn run_round_loop(
     let mut round = 1usize;
     let mut cumulative_stats = LoopStats::default();
     let mut xvfb_guard: Option<vision::XvfbGuard> = None;
+    let local_session_id = session_log_id(&session_log);
 
     loop {
         let (stats, exit_reason) = run_agent_loop(
@@ -5067,6 +14044,7 @@ async fn run_round_loop(
                 let turns_in_round = stats.turns;
                 let native_message_count = Some(conversation.messages().len() as u32);
                 bus.send(AppEvent::RoundComplete {
+                    session_id: local_session_id.clone(),
                     round,
                     turns_in_round,
                     native_message_count,
@@ -5076,10 +14054,41 @@ async fn run_round_loop(
                 match follow_up_rx.recv().await {
                     Some(message) => {
                         round += 1;
+                        let followup_text =
+                            message.attachments.text_with_file_prelude(&message.text);
+                        let followup_images = message.attachments.conversation_images();
                         slog(&session_log, |l| {
-                            l.info(&format!("Round {} follow-up: {}", round, &message))
+                            l.info(&format!(
+                                "Round {} follow-up: {}{}",
+                                round,
+                                &message.text,
+                                if message.attachments.is_empty() {
+                                    String::new()
+                                } else {
+                                    format!(" ({} attachment(s))", message.attachments.len())
+                                }
+                            ))
                         });
-                        conversation.add_user(message);
+                        if followup_images.is_empty() {
+                            conversation.add_user(followup_text);
+                        } else {
+                            conversation.add_user_with_images(followup_text, followup_images);
+                        }
+                        if let Some(id) = message.steer_id {
+                            bus.send(AppEvent::SteerDelivered {
+                                session_id: local_session_id.clone(),
+                                id,
+                                mid_turn: false,
+                            });
+                        }
+                        emit_follow_up_status(
+                            bus,
+                            local_session_id.as_deref(),
+                            &message.follow_up_id,
+                            Some(&message.text),
+                            "delivered",
+                            None,
+                        );
                     }
                     None => {
                         // Channel closed — user quit or sender dropped
@@ -5225,7 +14234,7 @@ All relative paths and commands execute from this directory.",
         &sub_agent_registry,
         &event::ContextInjectionQueue::default(),
         &mut None, // sub-agents get their own display if needed
-        true, // headless (sub-agents have no interactive UI)
+        true,      // headless (sub-agents have no interactive UI)
     )
     .await;
 
@@ -5448,6 +14457,7 @@ async fn run_with_presence(
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachment_frame_ids: vec![],
+                steer_id: None,
             };
             let _ = fallback_task_tx.send(envelope).await;
         }
@@ -5475,6 +14485,7 @@ async fn run_with_presence(
                 reference_frame_ids: vec![],
                 display_target: None,
                 attachment_frame_ids: vec![],
+                steer_id: None,
             };
             let _ = fallback_task_tx.send(envelope).await;
         }
@@ -5492,6 +14503,7 @@ async fn run_with_presence(
                     reference_frame_ids: vec![],
                     display_target: None,
                     attachment_frame_ids: vec![],
+                    steer_id: None,
                 };
                 if forwarder_tx.send(envelope).await.is_err() {
                     break;
@@ -5508,8 +14520,7 @@ async fn run_with_presence(
     let project_root = project.root.clone();
 
     // Resolve external agent backend: CLI override > web UI selection > config default > None.
-    let initial_agent_backend =
-        resolve_agent_backend_from_config(agent_backend_override, &project);
+    let initial_agent_backend = resolve_agent_backend_from_config(agent_backend_override, &project);
     // Seed the shared state so the web UI reflects the initial selection.
     {
         let mut guard = shared_external_agent.write().await;
@@ -5525,7 +14536,17 @@ async fn run_with_presence(
     // External agent + thread — created on first task, reused for subsequent messages.
     let mut persistent_agent: Option<Box<dyn external_agent::ExternalAgent>> = None;
     let mut persistent_thread: Option<external_agent::AgentThread> = None;
-    let mut persistent_event_rx: Option<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>> = None;
+    let mut persistent_event_rx: Option<
+        tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>,
+    > = None;
+    let mut persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+    let mut persistent_pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
+        std::collections::VecDeque::new();
+    let mut persistent_handled_steer_ids: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    let mut persistent_open_side_threads: HashMap<String, String> = HashMap::new();
+    let mut persistent_side_rounds: HashMap<String, usize> = HashMap::new();
+    let mut persistent_side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
@@ -5545,7 +14566,13 @@ async fn run_with_presence(
     // the dashboard / MCP between tasks. We subscribe to the bus here (not
     // just inside the drain) so actions still fire when the loop is idle,
     // waiting for the next task.
+    let local_session_id = session_log_id(&session_log);
     let mut outer_bus_rx = bus.subscribe();
+    // Turn controls (steer / interrupt) need to be subscribed before the
+    // turn-start RPC. Otherwise an immediate follow-up can land during the
+    // handoff and miss the running-turn drain entirely.
+    let mut turn_bus_rx = bus.subscribe();
+    let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
 
     // Outer loop: either a task envelope arrives (run the agent), a thread
     // action arrives (invoke it on the persistent agent), or the task
@@ -5553,6 +14580,7 @@ async fn run_with_presence(
     enum OuterSignal {
         Task(presence::TaskEnvelope),
         ThreadAction {
+            session_id: Option<String>,
             op: String,
             params: serde_json::Value,
         },
@@ -5584,8 +14612,25 @@ async fn run_with_presence(
                 None => OuterSignal::Done,
             },
             msg = outer_bus_rx.recv() => match msg {
-                Ok(AppEvent::CodexThreadActionRequested { action, params }) => {
-                    OuterSignal::ThreadAction { op: action, params }
+                Ok(AppEvent::CodexThreadActionRequested {
+                    request_id,
+                    session_id,
+                    action,
+                    params,
+                }) if event_targets_external_session_or_side(
+                    &session_id,
+                    &local_session_id,
+                    &persistent_thread.as_ref().map(|thread| thread.thread_id.clone()),
+                    &persistent_open_side_threads,
+                ) => {
+                    if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                        continue;
+                    }
+                    OuterSignal::ThreadAction {
+                        session_id,
+                        op: action,
+                        params,
+                    }
                 }
                 Ok(AppEvent::GeminiThreadActionRequested { action, params }) => {
                     OuterSignal::GeminiThreadAction { op: action, params }
@@ -5599,6 +14644,14 @@ async fn run_with_presence(
                     target_native_message_count,
                     turns_to_drop,
                 },
+                Ok(AppEvent::InterruptRequested { session_id })
+                    if event_targets_session(&session_id, &local_session_id) =>
+                {
+                    // Drop idle interrupts so an old Stop action cannot
+                    // interrupt the next task that happens to start later.
+                    turn_bus_rx = bus.subscribe();
+                    continue;
+                }
                 // Any other bus event: skip, keep selecting. Lagged /
                 // Closed also fall through — task_rx close is the
                 // authoritative "we're done" signal.
@@ -5608,7 +14661,209 @@ async fn run_with_presence(
         let envelope = match signal {
             OuterSignal::Task(e) => e,
             OuterSignal::Done => break,
-            OuterSignal::ThreadAction { op, params } => {
+            OuterSignal::ThreadAction {
+                session_id,
+                op,
+                params,
+            } => {
+                let mut action_params = params;
+                if let Some(request) = external_context_rewind_request_from_action(
+                    &op,
+                    &action_params,
+                    session_id.clone(),
+                ) {
+                    let request = match request {
+                        Ok(request) => request,
+                        Err(message) => {
+                            bus.send(AppEvent::CodexThreadActionResult {
+                                session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                                action: op,
+                                success: false,
+                                message,
+                            });
+                            turn_bus_rx = bus.subscribe();
+                            continue;
+                        }
+                    };
+                    let Some(ref mut agent) = persistent_agent else {
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                        });
+                        turn_bus_rx = bus.subscribe();
+                        continue;
+                    };
+                    let Some(thread) = persistent_thread.as_ref() else {
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active Codex thread — start a task first".to_string(),
+                        });
+                        turn_bus_rx = bus.subscribe();
+                        continue;
+                    };
+                    let drain_config = DrainConfig {
+                        bus: &bus,
+                        web_port,
+                        session_id: session_log_id(&session_log),
+                        alias_session_id: Some(thread.thread_id.clone()),
+                        autonomy: autonomy.clone(),
+                        session_log: &session_log,
+                        project_root: &project.root,
+                        log_dir: &log_dir,
+                        approval_registry: &approval_registry,
+                        json_approval: None,
+                        agent_source: Some("Codex".to_string()),
+                        suppress_agent_started: true,
+                        persist_model_responses_inline: false,
+                        headless: false,
+                        context_injection: &context_injection,
+                    };
+                    match apply_external_context_rewind(
+                        agent,
+                        &thread.thread_id,
+                        &request,
+                        &drain_config,
+                    )
+                    .await
+                    {
+                        Ok(Some(followup)) => {
+                            if let Some(event_rx) = persistent_event_rx.as_mut() {
+                                let mut side_session_state = ExternalSideSessionState {
+                                    open_side_threads: &mut persistent_open_side_threads,
+                                    side_rounds: &mut persistent_side_rounds,
+                                    side_turn_revisions: &mut persistent_side_turn_revisions,
+                                };
+                                match send_external_context_rewind_resume_turn(
+                                    agent,
+                                    thread,
+                                    followup,
+                                    ExternalContextRewindResume {
+                                        event_rx,
+                                        turn_bus_rx: &mut turn_bus_rx,
+                                        config: &drain_config,
+                                        stats: &mut cumulative_stats,
+                                        diff_tracker: &mut persistent_diff_tracker,
+                                        pending_runtime_steers:
+                                            &mut persistent_pending_runtime_steers,
+                                        handled_steer_ids: &mut persistent_handled_steer_ids,
+                                        codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
+                                        side_sessions: Some(&mut side_session_state),
+                                    },
+                                )
+                                .await
+                                {
+                                    Ok(DrainOutcome::TurnCompleted {
+                                        message,
+                                        turns_in_round,
+                                    }) => {
+                                        cumulative_stats.turns += 1;
+                                        cumulative_stats.rounds += 1;
+                                        bus.send(AppEvent::DoneSignal {
+                                            session_id: session_log_id(&session_log),
+                                            message: message.clone(),
+                                        });
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                    }
+                                    Ok(DrainOutcome::ContextRewindRequested {
+                                        request, ..
+                                    }) => {
+                                        emit_context_rewind_failure(
+                                            &request,
+                                            "nested context rewind during resumed turn is not supported yet"
+                                                .to_string(),
+                                            &drain_config,
+                                        );
+                                    }
+                                    Ok(DrainOutcome::RecoveryRequired {
+                                        message,
+                                        recovery_hint,
+                                        turns_in_round,
+                                    }) => {
+                                        cumulative_stats.rounds += 1;
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: session_log_id(&session_log),
+                                            round: cumulative_stats.rounds,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: recovery_required_message(
+                                                &message,
+                                                recovery_hint.as_deref(),
+                                            ),
+                                            level: Some(types::LogLevel::Warn),
+                                            turn: None,
+                                        });
+                                    }
+                                    Ok(DrainOutcome::Interrupted { reason }) => {
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "External agent interrupted during resumed context-rewind turn: {}",
+                                                reason
+                                            ),
+                                            level: None,
+                                            turn: None,
+                                        });
+                                    }
+                                    Ok(DrainOutcome::Terminated { reason, .. }) => {
+                                        bus.send(AppEvent::PresenceLog {
+                                            message: format!(
+                                                "External agent terminated: {}",
+                                                reason
+                                            ),
+                                            level: Some(types::LogLevel::Error),
+                                            turn: None,
+                                        });
+                                        persistent_agent = None;
+                                        persistent_thread = None;
+                                        persistent_event_rx = None;
+                                        persistent_diff_tracker =
+                                            ExternalDiffDeltaTracker::default();
+                                        persistent_pending_runtime_steers.clear();
+                                        persistent_handled_steer_ids.clear();
+                                        persistent_open_side_threads.clear();
+                                        persistent_side_rounds.clear();
+                                        persistent_side_turn_revisions.clear();
+                                    }
+                                    Ok(DrainOutcome::ChannelClosed) => {
+                                        persistent_agent = None;
+                                        persistent_thread = None;
+                                        persistent_event_rx = None;
+                                        persistent_diff_tracker =
+                                            ExternalDiffDeltaTracker::default();
+                                        persistent_pending_runtime_steers.clear();
+                                        persistent_handled_steer_ids.clear();
+                                        persistent_open_side_threads.clear();
+                                        persistent_side_rounds.clear();
+                                        persistent_side_turn_revisions.clear();
+                                    }
+                                    Err(message) => {
+                                        emit_context_rewind_failure(
+                                            &request,
+                                            message,
+                                            &drain_config,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(message) => {
+                            emit_context_rewind_failure(&request, message, &drain_config);
+                        }
+                    }
+                    turn_bus_rx = bus.subscribe();
+                    continue;
+                }
                 // `/new` is a daemon-side operation (not a Codex RPC): clear
                 // the persistent agent so the next task creates a fresh
                 // thread. Handled here — not inside dispatch_thread_action
@@ -5618,9 +14873,96 @@ async fn run_with_presence(
                     persistent_thread = None;
                     persistent_event_rx = None;
                     persistent_codex_config = None;
+                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                    persistent_open_side_threads.clear();
+                    persistent_side_rounds.clear();
+                    persistent_side_turn_revisions.clear();
                     Ok("agent torn down; next task will start a fresh thread".to_string())
+                } else if is_context_rewind_anchor_list_action(&op)
+                    || is_context_rewind_anchor_inspect_action(&op)
+                {
+                    let Some(ref mut agent) = persistent_agent else {
+                        turn_bus_rx = bus.subscribe();
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                        });
+                        continue;
+                    };
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    if is_context_rewind_anchor_list_action(&op) {
+                        apply_context_rewind_anchor_list_action(agent, &action_params).await
+                    } else {
+                        apply_context_rewind_anchor_inspect_action(agent, &action_params).await
+                    }
+                } else if is_context_rewind_backout_action(&op) {
+                    let Some(ref mut agent) = persistent_agent else {
+                        turn_bus_rx = bus.subscribe();
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                        });
+                        continue;
+                    };
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    let drain_config = DrainConfig {
+                        bus: &bus,
+                        web_port,
+                        session_id: session_log_id(&session_log),
+                        alias_session_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
+                        autonomy: autonomy.clone(),
+                        session_log: &session_log,
+                        project_root: &project.root,
+                        log_dir: &log_dir,
+                        approval_registry: &approval_registry,
+                        json_approval: None,
+                        agent_source: Some("Codex".to_string()),
+                        suppress_agent_started: true,
+                        persist_model_responses_inline: false,
+                        headless: false,
+                        context_injection: &context_injection,
+                    };
+                    apply_context_rewind_backout_action(agent, &op, &action_params, &drain_config)
+                        .await
                 } else if let Some(ref mut agent) = persistent_agent {
-                    agent.thread_action(&op, &params).await.map_err(|e| e.to_string())
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    agent
+                        .thread_action(&op, &action_params)
+                        .await
+                        .map_err(|e| e.to_string())
                 } else {
                     Err("no active agent — start a task first".to_string())
                 };
@@ -5628,6 +14970,7 @@ async fn run_with_presence(
                     Ok(msg) => (true, msg),
                     Err(e) => (false, e),
                 };
+                let result_session_id = session_id.or_else(|| local_session_id.clone());
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "Codex thread action /{}: {} — {}",
@@ -5637,10 +14980,155 @@ async fn run_with_presence(
                     ))
                 });
                 bus.send(AppEvent::CodexThreadActionResult {
-                    action: op,
+                    session_id: result_session_id.clone(),
+                    action: op.clone(),
                     success,
-                    message,
+                    message: message.clone(),
                 });
+                if success && op == "fast" {
+                    let service_tier = persistent_agent
+                        .as_ref()
+                        .and_then(|agent| agent.service_tier().map(str::to_string));
+                    let drain_config = DrainConfig {
+                        bus: &bus,
+                        web_port,
+                        session_id: local_session_id.clone(),
+                        alias_session_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
+                        autonomy: autonomy.clone(),
+                        session_log: &session_log,
+                        project_root: &project.root,
+                        log_dir: &log_dir,
+                        approval_registry: &approval_registry,
+                        json_approval: None,
+                        agent_source: Some("Codex".to_string()),
+                        suppress_agent_started: true,
+                        persist_model_responses_inline: false,
+                        headless: false,
+                        context_injection: &context_injection,
+                    };
+                    persist_codex_service_tier_for_drain(
+                        &drain_config,
+                        result_session_id.as_deref(),
+                        service_tier.as_deref(),
+                    );
+                    emit_codex_session_capabilities_for_drain(
+                        &drain_config,
+                        result_session_id.as_deref(),
+                        service_tier.as_deref(),
+                    );
+                }
+                if success && op == "fork" {
+                    if let Some(child_id) = forked_thread_id_from_message(&message) {
+                        emit_codex_fork_session_name(&bus, &child_id, &action_params);
+                        emit_session_relationship(
+                            &bus,
+                            result_session_id.as_deref(),
+                            &child_id,
+                            "fork",
+                            false,
+                        );
+                        bus.send(AppEvent::ControlCommand(event::ControlMsg::ResumeSession {
+                            source: "codex".to_string(),
+                            session_id: child_id.clone(),
+                            resume_id: Some(child_id),
+                            project_root: Some(project_root.to_string_lossy().to_string()),
+                            task: None,
+                            direct: Some(true),
+                            attachments: Vec::new(),
+                            agent_command: Some(project.config.agent.codex.command.clone()),
+                            codex_managed_context: Some(
+                                crate::project::normalize_codex_managed_context(
+                                    &project.config.agent.codex.managed_context,
+                                ),
+                            ),
+                            codex_context_archive: Some(
+                                crate::project::normalize_codex_context_archive(
+                                    &project.config.agent.codex.context_archive,
+                                ),
+                            ),
+                        }));
+                    }
+                }
+                if success && op == "side" {
+                    if let Some((parent_thread_id, child_thread_id)) =
+                        side_thread_ids_from_message(&message)
+                    {
+                        let side_prompt = side_session_prompt_from_params(&action_params);
+                        {
+                            let mut side_state = ExternalSideSessionState {
+                                open_side_threads: &mut persistent_open_side_threads,
+                                side_rounds: &mut persistent_side_rounds,
+                                side_turn_revisions: &mut persistent_side_turn_revisions,
+                            };
+                            side_state
+                                .record_started(parent_thread_id.clone(), child_thread_id.clone());
+                        }
+                        if let (Some(agent), Some(event_rx)) =
+                            (persistent_agent.as_mut(), persistent_event_rx.as_mut())
+                        {
+                            let drain_config = DrainConfig {
+                                bus: &bus,
+                                web_port,
+                                session_id: session_log_id(&session_log),
+                                alias_session_id: None,
+                                autonomy: autonomy.clone(),
+                                session_log: &session_log,
+                                project_root: &project.root,
+                                log_dir: &log_dir,
+                                approval_registry: &approval_registry,
+                                json_approval: None,
+                                agent_source: Some("Codex".to_string()),
+                                suppress_agent_started: true,
+                                persist_model_responses_inline: false,
+                                headless: false,
+                                context_injection: &context_injection,
+                            };
+                            emit_side_session_started(
+                                &drain_config,
+                                &parent_thread_id,
+                                &child_thread_id,
+                                side_prompt.as_deref(),
+                            );
+                            // `turn_bus_rx` was subscribed before the
+                            // `/side` request was broadcast, so it may still
+                            // contain the triggering CodexThreadActionRequested
+                            // event. Use a fresh receiver for the child drain
+                            // to avoid dispatching `/side` a second time.
+                            let mut side_bus_rx = bus.subscribe();
+                            drain_external_child_turn(
+                                agent,
+                                event_rx,
+                                &mut side_bus_rx,
+                                &drain_config,
+                                &mut cumulative_stats,
+                                &mut persistent_diff_tracker,
+                                &mut persistent_pending_runtime_steers,
+                                &mut persistent_handled_steer_ids,
+                                &mut codex_thread_action_dedupe,
+                                child_thread_id,
+                                "side",
+                            )
+                            .await;
+                        } else {
+                            slog(&session_log, |l| {
+                                l.warn("Codex side conversation started but no event receiver is available")
+                            });
+                        }
+                    }
+                } else if success && matches!(op.as_str(), "side-close" | "side_close") {
+                    if let Some(child_thread_id) = side_child_thread_id_from_params(&action_params)
+                    {
+                        let mut side_state = ExternalSideSessionState {
+                            open_side_threads: &mut persistent_open_side_threads,
+                            side_rounds: &mut persistent_side_rounds,
+                            side_turn_revisions: &mut persistent_side_turn_revisions,
+                        };
+                        side_state.record_closed(&child_thread_id);
+                    }
+                }
+                turn_bus_rx = bus.subscribe();
                 continue;
             }
             OuterSignal::GeminiThreadAction { op, params: _ } => {
@@ -5674,6 +15162,7 @@ async fn run_with_presence(
                     success,
                     message,
                 });
+                turn_bus_rx = bus.subscribe();
                 continue;
             }
             OuterSignal::ConversationRollback {
@@ -5691,10 +15180,7 @@ async fn run_with_presence(
                 // session reset (shut down, clear persistent state; the
                 // next task will re-initialize from scratch).
                 if let Some(ref mut agent) = persistent_agent {
-                    let backend_name = agent
-                        .name()
-                        .to_ascii_lowercase()
-                        .replace(' ', "-");
+                    let backend_name = agent.name().to_ascii_lowercase().replace(' ', "-");
                     match agent.rollback_turns(turns_to_drop).await {
                         Ok(()) => {
                             bus.send(AppEvent::ConversationRolledBack {
@@ -5758,6 +15244,7 @@ async fn run_with_presence(
                         method: "truncated".into(),
                     });
                 }
+                turn_bus_rx = bus.subscribe();
                 continue;
             }
         };
@@ -5786,23 +15273,24 @@ async fn run_with_presence(
         slog(&session_log, |l| {
             l.debug(&format!(
                 "{}task: {}",
-                if envelope.force_direct { "Direct " } else { "Presence dispatched " },
+                if envelope.force_direct {
+                    "Direct "
+                } else {
+                    "Presence dispatched "
+                },
                 envelope.task
             ));
         });
 
         // Resolve frame context_hints → images
-        let frame_images = resolve_frame_hints(
-            &envelope.context_hints, &frame_registry
-        ).await;
+        let frame_images = resolve_frame_hints(&envelope.context_hints, &frame_registry).await;
 
         // Resolve user-attached frames → images. These come from the dashboard's
         // "Attach" buttons (annotation toolbar / Video tab) and are appended to
         // the first user message of the agent conversation, in addition to
         // anything from `context_hints`.
-        let attachment_images = resolve_frame_ids(
-            &envelope.attachment_frame_ids, &frame_registry
-        ).await;
+        let attachment_images =
+            resolve_frame_ids(&envelope.attachment_frame_ids, &frame_registry).await;
         if !attachment_images.is_empty() {
             slog(&session_log, |l| {
                 l.debug(&format!(
@@ -5818,15 +15306,15 @@ async fn run_with_presence(
         slog(&session_log, |l| {
             l.debug(&format!(
                 "CU-first routing: force_direct={}, task={}",
-                envelope.force_direct, &envelope.task[..envelope.task.len().min(60)]
+                envelope.force_direct,
+                &envelope.task[..envelope.task.len().min(60)]
             ))
         });
 
         if !envelope.force_direct {
             // Auto-attach latest display frame(s) if none were explicitly provided
-            let mut reference_images = resolve_frame_ids(
-                &envelope.reference_frame_ids, &frame_registry
-            ).await;
+            let mut reference_images =
+                resolve_frame_ids(&envelope.reference_frame_ids, &frame_registry).await;
             if reference_images.is_empty() {
                 reference_images = auto_attach_display_frames(&frame_registry).await;
             }
@@ -5837,24 +15325,37 @@ async fn run_with_presence(
             cu_context_images.extend(attachment_images.iter().cloned());
 
             match try_cu_first(
-                &project_root, &reference_images, &cu_context_images,
-                &envelope.task, &session_log, &log_dir, &bus, &session_registry,
-            ).await {
+                &project_root,
+                &reference_images,
+                &cu_context_images,
+                &envelope.task,
+                &session_log,
+                &log_dir,
+                &bus,
+                &session_registry,
+            )
+            .await
+            {
                 Some(Ok(CuTaskResult::Completed(stats))) => {
                     cumulative_stats.turns += stats.turns;
                     bus.send(AppEvent::PresenceLog {
                         message: format!("CU task complete ({} turns)", stats.turns),
-                        level: None, turn: None,
+                        level: None,
+                        turn: None,
                     });
                     continue; // done
                 }
                 Some(Ok(CuTaskResult::Escalate { task })) => {
                     slog(&session_log, |l| {
-                        l.info(&format!("CU escalated to agent: {}", &task[..task.len().min(80)]))
+                        l.info(&format!(
+                            "CU escalated to agent: {}",
+                            &task[..task.len().min(80)]
+                        ))
                     });
                     bus.send(AppEvent::PresenceLog {
                         message: format!("Escalating to agent: {}", &task[..task.len().min(80)]),
-                        level: None, turn: None,
+                        level: None,
+                        turn: None,
                     });
                     task_for_agent = Some(task);
                 }
@@ -5888,18 +15389,16 @@ async fn run_with_presence(
         //  - backend changed (any agent)
         //  - backend is Codex and any of the Codex-locked fields differ
         //  - backend is Gemini and any of the Gemini-locked fields differ
-        let codex_config_changed = matches!(
-            agent_backend,
-            Some(external_agent::AgentBackend::Codex)
-        ) && persistent_codex_config
-            .as_ref()
-            .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
-        let gemini_config_changed = matches!(
-            agent_backend,
-            Some(external_agent::AgentBackend::GeminiCli)
-        ) && persistent_gemini_config
-            .as_ref()
-            .is_some_and(|prev| !gemini_runtime_config_equal(prev, &current_gemini_config));
+        let codex_config_changed =
+            matches!(agent_backend, Some(external_agent::AgentBackend::Codex))
+                && persistent_codex_config
+                    .as_ref()
+                    .is_some_and(|prev| !codex_runtime_config_equal(prev, &current_codex_config));
+        let gemini_config_changed =
+            matches!(agent_backend, Some(external_agent::AgentBackend::GeminiCli))
+                && persistent_gemini_config
+                    .as_ref()
+                    .is_some_and(|prev| !gemini_runtime_config_equal(prev, &current_gemini_config));
 
         if persistent_agent.is_some()
             && (agent_backend != persistent_agent_backend
@@ -5921,6 +15420,12 @@ async fn run_with_presence(
             persistent_event_rx = None;
             persistent_codex_config = None;
             persistent_gemini_config = None;
+            persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+            persistent_pending_runtime_steers.clear();
+            persistent_handled_steer_ids.clear();
+            persistent_open_side_threads.clear();
+            persistent_side_rounds.clear();
+            persistent_side_turn_revisions.clear();
         }
 
         if let Some(ref backend) = agent_backend {
@@ -5947,13 +15452,17 @@ async fn run_with_presence(
                 // authoritative "what the user just chose" source.
                 if matches!(backend, external_agent::AgentBackend::Codex) {
                     let cx = &mut proj.config.agent.codex;
+                    cx.command = current_codex_config.command.clone();
                     cx.sandbox = current_codex_config.sandbox.clone();
                     cx.approval_policy = current_codex_config.approval_policy.clone();
                     cx.model = current_codex_config.model.clone();
                     cx.reasoning_effort = current_codex_config.reasoning_effort.clone();
+                    cx.service_tier = current_codex_config.service_tier.clone();
                     cx.web_search = current_codex_config.web_search;
                     cx.network_access = current_codex_config.network_access;
                     cx.writable_roots = current_codex_config.writable_roots.clone();
+                    cx.managed_context = current_codex_config.managed_context.clone();
+                    cx.context_archive = current_codex_config.context_archive.clone();
                 }
                 if matches!(backend, external_agent::AgentBackend::GeminiCli) {
                     let gm = &mut proj.config.agent.gemini_cli;
@@ -5965,25 +15474,42 @@ async fn run_with_presence(
                     gm.include_directories = current_gemini_config.include_directories.clone();
                     gm.debug = current_gemini_config.debug;
                 }
-                let (agent, thread, event_rx) =
-                    match create_external_agent(backend, &proj, &session_log, web_port).await {
-                        Ok(result) => result,
-                        Err(e) => {
-                            bus.send(AppEvent::PresenceLog {
-                                message: format!("External agent error: {}", e),
-                                level: Some(types::LogLevel::Error),
-                                turn: None,
-                            });
-                            continue;
-                        }
-                    };
-                slog(&session_log, |l| l.debug(&format!(
-                    "Mode: external agent ({}) via presence, thread: {}",
-                    backend, thread.thread_id
-                )));
+                let (agent, thread, event_rx) = match create_external_agent(
+                    backend,
+                    &proj,
+                    &session_log,
+                    web_port,
+                    None,
+                    session_log_id(&session_log),
+                    None,
+                )
+                .await
+                {
+                    Ok(result) => result,
+                    Err(e) => {
+                        bus.send(AppEvent::PresenceLog {
+                            message: format!("External agent error: {}", e),
+                            level: Some(types::LogLevel::Error),
+                            turn: None,
+                        });
+                        continue;
+                    }
+                };
+                slog(&session_log, |l| {
+                    l.debug(&format!(
+                        "Mode: external agent ({}) via presence, thread: {}",
+                        backend, thread.thread_id
+                    ))
+                });
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
+                persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                persistent_pending_runtime_steers.clear();
+                persistent_handled_steer_ids.clear();
+                persistent_open_side_threads.clear();
+                persistent_side_rounds.clear();
+                persistent_side_turn_revisions.clear();
                 persistent_agent_backend = agent_backend.clone();
                 // Remember the Codex config this agent was spawned with so
                 // we can detect drift at the next task and rebuild.
@@ -6010,9 +15536,24 @@ async fn run_with_presence(
             // lines so the agent sees them in the same turn's input.
             let agent = persistent_agent.as_mut().unwrap();
             let thread = persistent_thread.as_ref().unwrap();
-            let merged_text =
-                drain_steer_queue_as_followup(&context_injection, &task_text, &bus)
-                    .unwrap_or_else(|| task_text.clone());
+            let merged_text = drain_steer_queue_as_followup(
+                &context_injection,
+                &task_text,
+                &bus,
+                session_log_id(&session_log).as_deref(),
+                None,
+            )
+            .unwrap_or_else(|| task_text.clone());
+            persistent_diff_tracker.seed_from_session_log(&project.root, &log_dir);
+            emit_external_turn_status(
+                &bus,
+                &autonomy,
+                session_log_id(&session_log).as_deref(),
+                cumulative_stats.rounds.saturating_add(1),
+                "thinking",
+                format!("{} turn in progress", agent.name()),
+            )
+            .await;
             let send_result = if envelope.attachment_frame_ids.is_empty() {
                 agent.send_message(thread, &merged_text).await
             } else {
@@ -6039,38 +15580,245 @@ async fn run_with_presence(
             if let Err(e) = send_result {
                 bus.send(AppEvent::PresenceLog {
                     message: format!("External agent send error: {}", e),
-                    level: Some(types::LogLevel::Error), turn: None,
+                    level: Some(types::LogLevel::Error),
+                    turn: None,
                 });
+                turn_bus_rx = bus.subscribe();
                 continue;
+            }
+            if let Some(id) = envelope.steer_id.as_deref() {
+                bus.send(AppEvent::SteerDelivered {
+                    session_id: session_log_id(&session_log),
+                    id: id.to_string(),
+                    mid_turn: false,
+                });
             }
 
             // Drain events until this turn completes
             let event_rx = persistent_event_rx.as_mut().unwrap();
             let drain_config = DrainConfig {
                 bus: &bus,
+                web_port,
+                session_id: session_log_id(&session_log),
+                alias_session_id: if matches!(backend, external_agent::AgentBackend::Codex) {
+                    persistent_thread
+                        .as_ref()
+                        .map(|thread| thread.thread_id.clone())
+                } else {
+                    None
+                },
                 autonomy: autonomy.clone(),
                 session_log: &session_log,
+                project_root: &project.root,
                 log_dir: &log_dir,
                 approval_registry: &approval_registry,
                 json_approval: None,
                 agent_source: Some(backend.to_string()),
                 suppress_agent_started: true,
+                persist_model_responses_inline: false,
                 headless: false,
                 context_injection: &context_injection,
             };
-            match drain_external_agent_events(agent, event_rx, &drain_config, &mut cumulative_stats).await {
-                DrainOutcome::TurnCompleted { message, turns_in_round } => {
+            let mut side_session_state = ExternalSideSessionState {
+                open_side_threads: &mut persistent_open_side_threads,
+                side_rounds: &mut persistent_side_rounds,
+                side_turn_revisions: &mut persistent_side_turn_revisions,
+            };
+            match drain_external_agent_events(
+                agent,
+                event_rx,
+                &mut turn_bus_rx,
+                &drain_config,
+                &mut cumulative_stats,
+                &mut persistent_diff_tracker,
+                &mut persistent_pending_runtime_steers,
+                &mut persistent_handled_steer_ids,
+                &mut codex_thread_action_dedupe,
+                Some(&mut side_session_state),
+            )
+            .await
+            {
+                DrainOutcome::TurnCompleted {
+                    message,
+                    turns_in_round,
+                } => {
                     cumulative_stats.turns += 1;
                     cumulative_stats.rounds += 1;
-                    bus.send(AppEvent::DoneSignal { message: message.clone() });
+                    bus.send(AppEvent::DoneSignal {
+                        session_id: session_log_id(&session_log),
+                        message: message.clone(),
+                    });
                     // External-agent rounds: no native conversation to snapshot.
                     // Conversation rollback will use the backend's native
                     // mechanism (Codex thread/rollback) or fall back to a
                     // session reset (CC, Gemini).
                     bus.send(AppEvent::RoundComplete {
+                        session_id: session_log_id(&session_log),
                         round: cumulative_stats.rounds,
                         turns_in_round,
                         native_message_count: None,
+                    });
+                }
+                DrainOutcome::ContextRewindRequested {
+                    request,
+                    message,
+                    turns_in_round,
+                } => {
+                    cumulative_stats.turns += 1;
+                    cumulative_stats.rounds += 1;
+                    bus.send(AppEvent::DoneSignal {
+                        session_id: session_log_id(&session_log),
+                        message: message.clone(),
+                    });
+                    bus.send(AppEvent::RoundComplete {
+                        session_id: session_log_id(&session_log),
+                        round: cumulative_stats.rounds,
+                        turns_in_round,
+                        native_message_count: None,
+                    });
+                    match apply_external_context_rewind(
+                        agent,
+                        &thread.thread_id,
+                        &request,
+                        &drain_config,
+                    )
+                    .await
+                    {
+                        Ok(Some(followup)) => {
+                            let mut resume_side_state = ExternalSideSessionState {
+                                open_side_threads: &mut persistent_open_side_threads,
+                                side_rounds: &mut persistent_side_rounds,
+                                side_turn_revisions: &mut persistent_side_turn_revisions,
+                            };
+                            match send_external_context_rewind_resume_turn(
+                                agent,
+                                thread,
+                                followup,
+                                ExternalContextRewindResume {
+                                    event_rx,
+                                    turn_bus_rx: &mut turn_bus_rx,
+                                    config: &drain_config,
+                                    stats: &mut cumulative_stats,
+                                    diff_tracker: &mut persistent_diff_tracker,
+                                    pending_runtime_steers: &mut persistent_pending_runtime_steers,
+                                    handled_steer_ids: &mut persistent_handled_steer_ids,
+                                    codex_thread_action_dedupe: &mut codex_thread_action_dedupe,
+                                    side_sessions: Some(&mut resume_side_state),
+                                },
+                            )
+                            .await
+                            {
+                                Ok(DrainOutcome::TurnCompleted {
+                                    message,
+                                    turns_in_round,
+                                }) => {
+                                    cumulative_stats.turns += 1;
+                                    cumulative_stats.rounds += 1;
+                                    bus.send(AppEvent::DoneSignal {
+                                        session_id: session_log_id(&session_log),
+                                        message: message.clone(),
+                                    });
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round: cumulative_stats.rounds,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                }
+                                Ok(DrainOutcome::ContextRewindRequested { request, .. }) => {
+                                    emit_context_rewind_failure(
+                                        &request,
+                                        "nested context rewind during resumed turn is not supported yet"
+                                            .to_string(),
+                                        &drain_config,
+                                    );
+                                }
+                                Ok(DrainOutcome::RecoveryRequired {
+                                    message,
+                                    recovery_hint,
+                                    turns_in_round,
+                                }) => {
+                                    cumulative_stats.rounds += 1;
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: session_log_id(&session_log),
+                                        round: cumulative_stats.rounds,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                    bus.send(AppEvent::PresenceLog {
+                                        message: recovery_required_message(
+                                            &message,
+                                            recovery_hint.as_deref(),
+                                        ),
+                                        level: Some(types::LogLevel::Warn),
+                                        turn: None,
+                                    });
+                                }
+                                Ok(DrainOutcome::Interrupted { reason }) => {
+                                    bus.send(AppEvent::PresenceLog {
+                                        message: format!(
+                                            "External agent interrupted during resumed context-rewind turn: {}",
+                                            reason
+                                        ),
+                                        level: None,
+                                        turn: None,
+                                    });
+                                    cumulative_stats.rounds += 1;
+                                }
+                                Ok(DrainOutcome::Terminated { reason, .. }) => {
+                                    bus.send(AppEvent::PresenceLog {
+                                        message: format!("External agent terminated: {}", reason),
+                                        level: Some(types::LogLevel::Error),
+                                        turn: None,
+                                    });
+                                    persistent_agent = None;
+                                    persistent_thread = None;
+                                    persistent_event_rx = None;
+                                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                                    persistent_pending_runtime_steers.clear();
+                                    persistent_handled_steer_ids.clear();
+                                    persistent_open_side_threads.clear();
+                                    persistent_side_rounds.clear();
+                                    persistent_side_turn_revisions.clear();
+                                }
+                                Ok(DrainOutcome::ChannelClosed) => {
+                                    persistent_agent = None;
+                                    persistent_thread = None;
+                                    persistent_event_rx = None;
+                                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                                    persistent_pending_runtime_steers.clear();
+                                    persistent_handled_steer_ids.clear();
+                                    persistent_open_side_threads.clear();
+                                    persistent_side_rounds.clear();
+                                    persistent_side_turn_revisions.clear();
+                                }
+                                Err(message) => {
+                                    emit_context_rewind_failure(&request, message, &drain_config);
+                                }
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(message) => {
+                            emit_context_rewind_failure(&request, message, &drain_config);
+                        }
+                    }
+                }
+                DrainOutcome::RecoveryRequired {
+                    message,
+                    recovery_hint,
+                    turns_in_round,
+                } => {
+                    cumulative_stats.rounds += 1;
+                    bus.send(AppEvent::RoundComplete {
+                        session_id: session_log_id(&session_log),
+                        round: cumulative_stats.rounds,
+                        turns_in_round,
+                        native_message_count: None,
+                    });
+                    bus.send(AppEvent::PresenceLog {
+                        message: recovery_required_message(&message, recovery_hint.as_deref()),
+                        level: Some(types::LogLevel::Warn),
+                        turn: None,
                     });
                 }
                 DrainOutcome::Interrupted { reason } => {
@@ -6087,20 +15835,34 @@ async fn run_with_presence(
                 DrainOutcome::Terminated { reason, .. } => {
                     bus.send(AppEvent::PresenceLog {
                         message: format!("External agent terminated: {}", reason),
-                        level: Some(types::LogLevel::Error), turn: None,
+                        level: Some(types::LogLevel::Error),
+                        turn: None,
                     });
                     // Agent is gone — clear persistent state so next task re-initializes
                     persistent_agent = None;
                     persistent_thread = None;
                     persistent_event_rx = None;
+                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                    persistent_pending_runtime_steers.clear();
+                    persistent_handled_steer_ids.clear();
+                    persistent_open_side_threads.clear();
+                    persistent_side_rounds.clear();
+                    persistent_side_turn_revisions.clear();
                 }
                 DrainOutcome::ChannelClosed => {
                     // Channel closed unexpectedly
                     persistent_agent = None;
                     persistent_thread = None;
                     persistent_event_rx = None;
+                    persistent_diff_tracker = ExternalDiffDeltaTracker::default();
+                    persistent_pending_runtime_steers.clear();
+                    persistent_handled_steer_ids.clear();
+                    persistent_open_side_threads.clear();
+                    persistent_side_rounds.clear();
+                    persistent_side_turn_revisions.clear();
                 }
             }
+            turn_bus_rx = bus.subscribe();
         } else {
             // ── Native agent path ──
             if persistent_conv.is_none() {
@@ -6135,7 +15897,8 @@ async fn run_with_presence(
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "Mode: direct (provider: {}, context: {})",
-                        task_provider.name(), task_provider.context_window()
+                        task_provider.name(),
+                        task_provider.context_window()
                     ));
                 });
 
@@ -6193,15 +15956,20 @@ async fn run_with_presence(
                 if combined_images.is_empty() {
                     conv.add_user(format!("[New Task] {}", task_text));
                 } else {
-                    conv.add_user_with_images(
-                        format!("[New Task] {}", task_text),
-                        combined_images,
-                    );
+                    conv.add_user_with_images(format!("[New Task] {}", task_text), combined_images);
                 }
             }
 
+            if let Some(id) = envelope.steer_id.as_deref() {
+                bus.send(AppEvent::SteerDelivered {
+                    session_id: session_log_id(&session_log),
+                    id: id.to_string(),
+                    mid_turn: false,
+                });
+            }
+
             // Run one round (agent loop until done/budget/error)
-            let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+            let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
             drop(follow_up_tx); // single-round per task dispatch
 
             let result = run_round_loop(
@@ -6218,8 +15986,9 @@ async fn run_with_presence(
                 None, // no JSON approval
                 &approval_registry,
                 &context_injection, // shared with presence
-                false, // not headless
-            ).await;
+                false,              // not headless
+            )
+            .await;
 
             match result {
                 Ok(stats) => {
@@ -6309,7 +16078,9 @@ fn tail_orchestrator_log(
                 }
             }
             "reasoning" => {
-                if message.is_empty() { continue; }
+                if message.is_empty() {
+                    continue;
+                }
                 format!("Reasoning: {}", message)
             }
             "agent_input" => {
@@ -6332,11 +16103,15 @@ fn tail_orchestrator_log(
                 format!("Output: {}", preview)
             }
             "info" | "debug" | "warn" | "error" => {
-                if message.is_empty() { continue; }
+                if message.is_empty() {
+                    continue;
+                }
                 message.to_string()
             }
             _ => {
-                if message.is_empty() { continue; }
+                if message.is_empty() {
+                    continue;
+                }
                 format!("{}: {}", event, message)
             }
         };
@@ -6412,7 +16187,9 @@ async fn run_user_mode(
                 // Extract session log path from "Session log: <path>"
                 if line.starts_with("Session log: ") {
                     let path = PathBuf::from(line.trim_start_matches("Session log: ").trim());
-                    *orch_log_path_writer.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
+                    *orch_log_path_writer
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner()) = Some(path);
                 }
                 slog(&session_log_stderr, |l| {
                     l.debug(&format!("orchestrator stderr: {}", line));
@@ -6526,6 +16303,7 @@ async fn run_user_mode(
         sub_agent::SubAgentStatus::Failed(reason) => format!("Orchestrator failed: {}", reason),
     };
     bus.send(AppEvent::TaskComplete {
+        session_id: session_log_id(&session_log),
         reason: reason.clone(),
         summary: Some(result.brief.clone()),
     });
@@ -6548,7 +16326,7 @@ async fn run_direct_mode(
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
     headless: bool,
-    attachment_images: Vec<conversation::ImageData>,
+    attachments: UserAttachments,
 ) -> Result<LoopStats, CallerError> {
     let role = sub_agent::SubAgentRole::Custom("direct".to_string());
     let system_prompt = if provider.use_tools() {
@@ -6574,6 +16352,7 @@ async fn run_direct_mode(
 
     // Try to resume from saved conversation if it exists in this session dir
     let conv_path = log_dir.join("conversation.jsonl");
+    let attachment_images = attachments.conversation_images();
     let mut conversation = if conv_path.exists() {
         match Conversation::load_from_file(&conv_path, provider.context_window()) {
             Ok(mut conv) => {
@@ -6585,7 +16364,8 @@ async fn run_direct_mode(
                     ))
                 });
                 // Append the new task as a continuation message
-                let resume_msg = format!("[Session resumed] Continue with: {}", task);
+                let resume_msg = attachments
+                    .text_with_file_prelude(&format!("[Session resumed] Continue with: {}", task));
                 if attachment_images.is_empty() {
                     conv.add_user(resume_msg);
                 } else {
@@ -6604,7 +16384,7 @@ async fn run_direct_mode(
                 setup_fresh_conversation_with_attachments(
                     &mut conv,
                     &project,
-                    &task,
+                    &attachments.text_with_file_prelude(&task),
                     attachment_images.clone(),
                 );
                 conv
@@ -6615,12 +16395,11 @@ async fn run_direct_mode(
         setup_fresh_conversation_with_attachments(
             &mut conv,
             &project,
-            &task,
+            &attachments.text_with_file_prelude(&task),
             attachment_images.clone(),
         );
         conv
     };
-    let _ = attachment_images; // moved into setup; declare consumed
 
     // Register MCP tools so providers include them in API requests
     if let Some(ref mgr) = mcp_mgr {
@@ -6663,115 +16442,1727 @@ async fn run_external_agent_mode(
     bus: EventBus,
     autonomy: SharedAutonomy,
     session_log: SharedSessionLog,
-    _log_dir: PathBuf,
+    log_dir: PathBuf,
     mut follow_up_rx: FollowUpReceiver,
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
     headless: bool,
     web_port: Option<u16>,
-    attachment_images: Vec<conversation::ImageData>,
+    attachments: UserAttachments,
+    resume_session: Option<String>,
+    codex_service_tier: Option<String>,
+    control_session_id: Option<String>,
+    emit_session_started_after_identity: bool,
+    ready_for_thread_actions: Option<tokio::sync::oneshot::Sender<()>>,
 ) -> Result<LoopStats, CallerError> {
     slog(&session_log, |l| {
         l.info(&format!("Mode: external agent ({})", backend));
     });
     if headless {
         println!("External agent: {}", backend);
-        println!("Task: {}", task);
+        if task.trim().is_empty() {
+            println!("Attached session; waiting for input");
+        } else {
+            println!("Task: {}", task);
+        }
         println!("---");
     }
 
     // Construct, initialize, and start a thread for the external agent
-    let (mut agent, thread, mut event_rx) =
-        create_external_agent(&backend, &project, &session_log, web_port).await?;
-
-    if attachment_images.is_empty() {
-        agent.send_message(&thread, &task).await?;
+    let resumed_external_session = resume_session.clone();
+    let persist_model_responses_inline = control_session_id.is_some();
+    let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
+    let effective_codex_service_tier = if backend == external_agent::AgentBackend::Codex {
+        codex_service_tier.clone().or_else(|| {
+            project::normalize_codex_service_tier(
+                project.config.agent.codex.service_tier.as_deref(),
+            )
+        })
     } else {
-        let attachments: Vec<external_agent::AgentImageAttachment> = attachment_images
-            .iter()
-            .map(external_agent::AgentImageAttachment::from_image_data)
-            .collect();
-        agent
-            .send_message_with_images(&thread, &task, &attachments)
-            .await?;
+        None
+    };
+    if backend == external_agent::AgentBackend::Codex {
+        emit_codex_session_capabilities_for_project(
+            &bus,
+            intendant_session_id.as_deref(),
+            &project,
+            effective_codex_service_tier.as_deref(),
+        );
+    }
+    let (mut agent, thread, mut event_rx) = match create_external_agent(
+        &backend,
+        &project,
+        &session_log,
+        web_port,
+        resume_session,
+        intendant_session_id.clone(),
+        effective_codex_service_tier,
+    )
+    .await
+    {
+        Ok(started) => started,
+        Err(e) => {
+            if emit_session_started_after_identity {
+                if let Some(session_id) = intendant_session_id.clone() {
+                    bus.send(AppEvent::SessionStarted {
+                        session_id,
+                        task: if task.trim().is_empty() {
+                            None
+                        } else {
+                            Some(task.clone())
+                        },
+                    });
+                }
+            }
+            return Err(e);
+        }
+    };
+    let codex_managed_context_enabled =
+        backend == external_agent::AgentBackend::Codex && agent.supports_item_anchor_rewind();
+    let backend_session_id = thread.thread_id.clone();
+    let mut session_agent_config = session_config::from_project(&backend, &project);
+    if backend == external_agent::AgentBackend::Codex {
+        session_agent_config.codex_service_tier = agent.service_tier().map(str::to_string);
+    }
+    if let Err(e) = session_config::write_log_dir_config(&log_dir, &session_agent_config) {
         slog(&session_log, |l| {
-            l.info(&format!(
-                "Initial task sent to external agent with {} attachment(s)",
-                attachments.len()
-            ))
+            l.debug(&format!("Persist session launch config failed: {e}"))
         });
     }
-    if attachment_images.is_empty() {
-        slog(&session_log, |l| l.info("Initial task sent to external agent"));
+    if backend.thread_id_is_canonical(&backend_session_id) {
+        if let Err(e) = session_config::write_external_overlay(
+            &platform::home_dir(),
+            backend.as_short_str(),
+            &backend_session_id,
+            &session_agent_config,
+        ) {
+            slog(&session_log, |l| {
+                l.debug(&format!("Persist external launch config failed: {e}"))
+            });
+        }
+    }
+    let live_session_id = if backend.thread_id_is_canonical(&backend_session_id) {
+        Some(backend_session_id.clone())
+    } else {
+        intendant_session_id.clone()
+    };
+    if let Some(session_id) = intendant_session_id.clone() {
+        bus.send(AppEvent::SessionIdentity {
+            session_id,
+            source: backend.as_short_str().to_string(),
+            backend_session_id: backend_session_id.clone(),
+        });
+    }
+    if backend == external_agent::AgentBackend::Codex {
+        let service_tier = agent.service_tier().map(str::to_string);
+        emit_codex_session_capabilities_for_project(
+            &bus,
+            intendant_session_id.as_deref(),
+            &project,
+            service_tier.as_deref(),
+        );
+        if live_session_id != intendant_session_id {
+            emit_codex_session_capabilities_for_project(
+                &bus,
+                live_session_id.as_deref(),
+                &project,
+                service_tier.as_deref(),
+            );
+        }
+    }
+    if emit_session_started_after_identity {
+        if let Some(session_id) = live_session_id.clone() {
+            bus.send(AppEvent::SessionStarted {
+                session_id,
+                task: if task.trim().is_empty() {
+                    None
+                } else {
+                    Some(task.clone())
+                },
+            });
+        }
     }
 
     // Event loop
-    let mut round = 1usize;
+    let mut user_turn_revisions = match (
+        &backend,
+        resumed_external_session.as_deref(),
+        backend_session_id.as_str(),
+    ) {
+        (external_agent::AgentBackend::Codex, Some(_), session_id) => {
+            codex_user_turn_state_from_history(session_id).unwrap_or_default()
+        }
+        _ => UserTurnRevisionState::default(),
+    };
+    let mut round = user_turn_revisions.active_count() as usize;
     let mut stats = LoopStats::default();
+    if backend == external_agent::AgentBackend::Codex {
+        stats.codex_subagent_parent_threads = codex_subagent_parent_threads_from_log(&log_dir);
+        for child_id in stats.codex_subagent_parent_threads.keys().cloned() {
+            stats.codex_subagent_rounds.entry(child_id).or_insert(0);
+        }
+    }
+    let mut diff_tracker = ExternalDiffDeltaTracker::default();
+    let mut pending_runtime_steers: std::collections::VecDeque<PendingRuntimeSteer> =
+        std::collections::VecDeque::new();
+    let mut handled_steer_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut open_side_threads: HashMap<String, String> = HashMap::new();
+    let mut side_rounds: HashMap<String, usize> = HashMap::new();
+    let mut side_turn_revisions: HashMap<String, UserTurnRevisionState> = HashMap::new();
+    let mut pending_managed_context_replays: std::collections::VecDeque<FollowUpMessage> =
+        std::collections::VecDeque::new();
+    let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
+    let mut next_turn = if task.trim().is_empty() {
+        None
+    } else {
+        Some(FollowUpMessage::with_attachments(task, attachments))
+    };
 
     let drain_config = DrainConfig {
         bus: &bus,
+        web_port,
+        session_id: live_session_id.clone(),
+        alias_session_id: if intendant_session_id != live_session_id {
+            intendant_session_id.clone()
+        } else {
+            None
+        },
         autonomy: autonomy.clone(),
         session_log: &session_log,
-        log_dir: &_log_dir,
+        project_root: &project.root,
+        log_dir: &log_dir,
         approval_registry: &approval_registry,
         json_approval: json_approval.as_ref(),
-        agent_source: None,
+        agent_source: Some(backend.to_string()),
         suppress_agent_started: false,
+        persist_model_responses_inline,
         headless,
         context_injection: &context_injection,
     };
+    // Use one control receiver across idle waits and active turn drains.
+    // A second parked receiver would retain mid-turn controls and replay them
+    // as new idle follow-ups after the turn completes.
+    let mut external_control_rx = bus.subscribe();
+    let mut codex_thread_action_dedupe = CodexThreadActionDedupe::default();
+    if let Some(ready_tx) = ready_for_thread_actions {
+        let _ = ready_tx.send(());
+    }
 
-    loop {
-        match drain_external_agent_events(&mut agent, &mut event_rx, &drain_config, &mut stats)
-            .await
+    'outer: loop {
+        let followup = match next_turn.take() {
+            Some(turn) => turn,
+            None => loop {
+                if has_queued_steers_for_session(
+                    &context_injection,
+                    live_session_id.as_deref(),
+                    drain_config.alias_session_id.as_deref(),
+                ) {
+                    break FollowUpMessage::text(String::new());
+                }
+                tokio::select! {
+                    maybe_followup = follow_up_rx.recv() => {
+                        match maybe_followup {
+                            Some(followup) => {
+                                if let Some(id) = followup.steer_id.as_deref() {
+                                    if steer_id_has_been_handled(&handled_steer_ids, id) {
+                                        slog(&session_log, |l| {
+                                            l.debug(&format!(
+                                                "Ignoring duplicate queued steer {} already consumed by another delivery path",
+                                                id
+                                            ))
+                                        });
+                                        continue;
+                                    }
+                                    mark_steer_id_handled(&mut handled_steer_ids, id);
+                                }
+                                break followup;
+                            }
+                            None => {
+                                slog(&session_log, |l| {
+                                    l.info("Follow-up channel closed, exiting")
+                                });
+                                break 'outer;
+                            }
+                        }
+                    }
+                    maybe_event = event_rx.recv() => {
+                        match maybe_event {
+                            Some(event) => {
+                                let (event_thread_id, _event_turn_id, event) = event.into_scope();
+                                if let Some(child_thread_id) =
+                                    scoped_event_codex_subagent_thread_id(&event_thread_id, &stats)
+                                {
+                                    handle_idle_codex_subagent_event(
+                                        &drain_config,
+                                        &mut stats,
+                                        child_thread_id,
+                                        event,
+                                    );
+                                    continue;
+                                }
+                                match event {
+                                    external_agent::AgentEvent::GoalUpdated { goal } => {
+                                        emit_external_session_goal(
+                                            &drain_config,
+                                            event_thread_id,
+                                            Some(goal),
+                                        );
+                                    }
+                                    external_agent::AgentEvent::GoalCleared => {
+                                        emit_external_session_goal(
+                                            &drain_config,
+                                            event_thread_id,
+                                            None,
+                                        );
+                                    }
+                                    external_agent::AgentEvent::Terminated { reason, exit_code } => {
+                                        let message = format!(
+                                            "{} terminated while idle: {} (exit code: {:?})",
+                                            agent.name(),
+                                            reason,
+                                            exit_code
+                                        );
+                                        slog(&session_log, |l| l.warn(&message));
+                                        bus.send(AppEvent::LoopError(message));
+                                        break 'outer;
+                                    }
+                                    _ => {}
+                                }
+                                continue;
+                            }
+                            None => {
+                                slog(&session_log, |l| {
+                                    l.info("External agent event channel closed, exiting")
+                                });
+                                break 'outer;
+                            }
+                        }
+                    }
+                    bus_event = external_control_rx.recv() => {
+                        match bus_event {
+                            Ok(AppEvent::SessionStopRequested { session_id, reason })
+                                if event_targets_external_session_or_side(
+                                    &session_id,
+                                    &live_session_id,
+                                    &drain_config.alias_session_id,
+                                    &open_side_threads,
+                                ) =>
+                            {
+                                slog(&session_log, |l| {
+                                    l.info(&format!("Stop requested while idle: {}", reason))
+                                });
+                                break 'outer;
+                            }
+                            Ok(AppEvent::SteerRequested {
+                                session_id,
+                                text,
+                                id,
+                            }) if event_targets_external_session_or_side(
+                                &session_id,
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                                &open_side_threads,
+                            ) => {
+                                if steer_id_has_been_handled(&handled_steer_ids, &id) {
+                                    slog(&session_log, |l| {
+                                        l.debug(&format!(
+                                            "Ignoring duplicate steer {} already consumed by another delivery path",
+                                            id
+                                        ))
+                                    });
+                                    continue;
+                                }
+                                mark_steer_id_handled(&mut handled_steer_ids, &id);
+                                if maybe_handle_codex_fast_slash_steer(
+                                    &mut agent,
+                                    &text,
+                                    session_id.clone(),
+                                    id.clone(),
+                                    &drain_config,
+                                )
+                                .await
+                                {
+                                    continue;
+                                }
+                                break FollowUpMessage::steer(
+                                    text,
+                                    UserAttachments::default(),
+                                    id,
+                                )
+                                .for_target(session_id);
+                            }
+                            Ok(AppEvent::ExternalFollowUpRequested {
+                                session_id,
+                                text,
+                                attachments,
+                                follow_up_id,
+                            }) if event_targets_external_session_or_side(
+                                &Some(session_id.clone()),
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                                &open_side_threads,
+                            ) => {
+                                break FollowUpMessage::with_attachments(
+                                    text,
+                                    UserAttachments::from_items(attachments),
+                                )
+                                .for_target(Some(session_id))
+                                .with_follow_up_id(follow_up_id);
+                            }
+                            Ok(AppEvent::CodexThreadActionRequested {
+                                request_id,
+                                session_id,
+                                action,
+                                params,
+                            }) if event_targets_external_session_or_side(
+                                &session_id,
+                                &live_session_id,
+                                &drain_config.alias_session_id,
+                                &open_side_threads,
+                            ) => {
+                                if !codex_thread_action_dedupe.mark_seen(&request_id) {
+                                    continue;
+                                }
+                                if let Some(request) =
+                                    external_context_rewind_request_from_action(
+                                        &action,
+                                        &params,
+                                        session_id.clone(),
+                                    )
+                                {
+                                    let request = match request {
+                                        Ok(request) => request,
+                                        Err(message) => {
+                                            bus.send(AppEvent::CodexThreadActionResult {
+                                                session_id: session_id.clone().or_else(|| live_session_id.clone()),
+                                                action,
+                                                success: false,
+                                                message,
+                                            });
+                                            continue;
+                                        }
+                                    };
+                                    if session_id
+                                        .as_deref()
+                                        .is_some_and(|id| open_side_threads.contains_key(id))
+                                    {
+                                        emit_context_rewind_failure(
+                                            &request,
+                                            "context rewind is not supported for side conversations".to_string(),
+                                            &drain_config,
+                                        );
+                                        continue;
+                                    }
+                                    match apply_external_context_rewind(
+                                        &mut agent,
+                                        &thread.thread_id,
+                                        &request,
+                                        &drain_config,
+                                    )
+                                    .await
+                                    {
+                                        Ok(Some(followup)) => {
+                                            break followup;
+                                        }
+                                        Ok(None) => {
+                                            continue;
+                                        }
+                                        Err(message) => {
+                                            emit_context_rewind_failure(
+                                                &request,
+                                                message,
+                                                &drain_config,
+                                            );
+                                            continue;
+                                        }
+                                    }
+                                }
+                                if let Some(side_thread_id) = session_id
+                                    .as_deref()
+                                    .filter(|id| open_side_threads.contains_key(*id))
+                                    .map(str::to_string)
+                                {
+                                    if action == "undo" {
+                                        handle_side_undo_thread_action(
+                                            &mut agent,
+                                            &mut side_rounds,
+                                            &mut side_turn_revisions,
+                                            &side_thread_id,
+                                            params,
+                                            &drain_config,
+                                        )
+                                        .await;
+                                        continue;
+                                    }
+                                }
+                                if action == "undo" {
+                                    handle_parent_undo_thread_action(
+                                        &mut agent,
+                                        &mut round,
+                                        &mut user_turn_revisions,
+                                        params,
+                                        &drain_config,
+                                    )
+                                    .await;
+                                    continue;
+                                }
+                                let effect = handle_external_thread_action(
+                                    &mut agent,
+                                    action,
+                                    params,
+                                    session_id,
+                                    &drain_config,
+                                )
+                                .await;
+                                if let ExternalThreadActionEffect::SideTurnStarted {
+                                    parent_thread_id,
+                                    child_thread_id,
+                                    prompt,
+                                } = effect
+                                {
+                                    open_side_threads.insert(
+                                        child_thread_id.clone(),
+                                        parent_thread_id.clone(),
+                                    );
+                                    side_rounds.entry(child_thread_id.clone()).or_insert(1);
+                                    side_turn_revisions
+                                        .entry(child_thread_id.clone())
+                                        .or_insert_with(|| {
+                                            let mut state = UserTurnRevisionState::default();
+                                            state.record_next_turn();
+                                            state
+                                        });
+                                    emit_side_session_started(
+                                        &drain_config,
+                                        &parent_thread_id,
+                                        &child_thread_id,
+                                        prompt.as_deref(),
+                                    );
+                                    drain_external_child_turn(
+                                        &mut agent,
+                                        &mut event_rx,
+                                        &mut external_control_rx,
+                                        &drain_config,
+                                        &mut stats,
+                                        &mut diff_tracker,
+                                        &mut pending_runtime_steers,
+                                        &mut handled_steer_ids,
+                                        &mut codex_thread_action_dedupe,
+                                        child_thread_id,
+                                        "side",
+                                    )
+                                    .await;
+                                } else if let ExternalThreadActionEffect::SideTurnClosed {
+                                    child_thread_id,
+                                } = effect
+                                {
+                                    open_side_threads.remove(&child_thread_id);
+                                    side_rounds.remove(&child_thread_id);
+                                    side_turn_revisions.remove(&child_thread_id);
+                                }
+                            }
+                            Ok(AppEvent::InterruptRequested { session_id })
+                                if event_targets_external_session_or_side(
+                                    &session_id,
+                                    &live_session_id,
+                                    &drain_config.alias_session_id,
+                                    &open_side_threads,
+                                ) =>
+                            {
+                                // Ignore idle interrupts; this shared receiver
+                                // consumed the event, so the next task will not
+                                // inherit a stale Stop request.
+                            }
+                            Ok(_) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
+                            Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                                slog(&session_log, |l| l.info("Event bus closed, exiting"));
+                                break 'outer;
+                            }
+                        }
+                    }
+                }
+            },
+        };
+        let turn_text = followup.text;
+        let attachments = followup.attachments;
+        let steer_id = followup.steer_id;
+        let follow_up_id = followup.follow_up_id;
+        let edit_user_turn_index = followup.edit_user_turn_index;
+        let edit_user_turn_revision = followup.edit_user_turn_revision;
+        let edit_original_text = followup.edit_original_text;
+        let unresolved_attachment_ids = followup.unresolved_attachment_ids;
+        let target_session_id = followup.target_session_id.clone();
+        let managed_context_recovery_kickstart = followup.managed_context_recovery_kickstart;
+
+        if let Some(side_thread_id) = target_session_id
+            .as_deref()
+            .filter(|id| open_side_threads.contains_key(*id))
+            .map(str::to_string)
+        {
+            let mut replacement_for_user_turn_index = None;
+            if let Some(user_turn_index) = edit_user_turn_index {
+                if !agent.supports_user_message_rewind() {
+                    let message = format!("{} does not support user-message rewind", agent.name());
+                    slog(&session_log, |l| l.warn(&message));
+                    bus.send(AppEvent::LoopError(message));
+                    continue;
+                }
+                let current_side_round = *side_rounds.entry(side_thread_id.clone()).or_insert(1);
+                let revisions = side_turn_revisions
+                    .entry(side_thread_id.clone())
+                    .or_default();
+                revisions.seed_active_turns_to(current_side_round as u32);
+                if let Err(message) =
+                    revisions.validate_expected_revision(user_turn_index, edit_user_turn_revision)
+                {
+                    slog(&session_log, |l| l.warn(&message));
+                    bus.send(AppEvent::LoopError(message));
+                    continue;
+                }
+                match rollback_side_thread_from_turn(
+                    &mut agent,
+                    &mut side_rounds,
+                    &mut side_turn_revisions,
+                    &side_thread_id,
+                    user_turn_index,
+                    &drain_config,
+                )
+                .await
+                {
+                    Ok(turns_to_drop) => {
+                        replacement_for_user_turn_index = Some(user_turn_index);
+                        let message = format!(
+                            "Edited side user turn {}; rolled back {} turn{}",
+                            user_turn_index,
+                            turns_to_drop,
+                            if turns_to_drop == 1 { "" } else { "s" }
+                        );
+                        slog(&session_log, |l| l.info(&message));
+                    }
+                    Err(message) => {
+                        slog(&session_log, |l| l.warn(&message));
+                        bus.send(AppEvent::LoopError(message));
+                        continue;
+                    }
+                }
+            }
+
+            let side_round = side_rounds.entry(side_thread_id.clone()).or_insert(0);
+            *side_round += 1;
+            let user_turn_revision = side_turn_revisions
+                .entry(side_thread_id.clone())
+                .or_default()
+                .record_active_turn(*side_round as u32);
+            emit_user_message_log(
+                &bus,
+                &session_log,
+                Some(&side_thread_id),
+                Some(*side_round as u32),
+                Some(user_turn_revision),
+                replacement_for_user_turn_index,
+                &turn_text,
+            );
+            let merged = drain_steer_queue_as_followup(
+                &context_injection,
+                &turn_text,
+                &bus,
+                Some(&side_thread_id),
+                None,
+            )
+            .unwrap_or_else(|| turn_text.clone());
+            let side_thread = external_agent::AgentThread {
+                thread_id: side_thread_id.clone(),
+            };
+            emit_external_turn_status(
+                &bus,
+                &autonomy,
+                Some(&side_thread_id),
+                *side_round,
+                "thinking",
+                format!("{} side turn in progress", agent.name()),
+            )
+            .await;
+            let send_result = if attachments.is_empty() {
+                agent.send_message(&side_thread, &merged).await
+            } else {
+                agent
+                    .send_message_with_attachments(&side_thread, &merged, &attachments.items)
+                    .await
+            };
+            if let Err(e) = send_result {
+                emit_follow_up_status(
+                    &bus,
+                    Some(&side_thread_id),
+                    &follow_up_id,
+                    Some(&turn_text),
+                    "failed",
+                    Some("failed to send side follow-up"),
+                );
+                bus.send(AppEvent::LoopError(format!(
+                    "Failed to send side follow-up: {}",
+                    e
+                )));
+                continue;
+            }
+            emit_follow_up_status(
+                &bus,
+                Some(&side_thread_id),
+                &follow_up_id,
+                Some(&turn_text),
+                "delivered",
+                None,
+            );
+            if let Some(id) = steer_id {
+                bus.send(AppEvent::SteerDelivered {
+                    session_id: Some(side_thread_id.clone()),
+                    id,
+                    mid_turn: false,
+                });
+            }
+            let parent_thread_id = open_side_threads.get(&side_thread_id).cloned();
+            drain_external_child_turn(
+                &mut agent,
+                &mut event_rx,
+                &mut external_control_rx,
+                &drain_config,
+                &mut stats,
+                &mut diff_tracker,
+                &mut pending_runtime_steers,
+                &mut handled_steer_ids,
+                &mut codex_thread_action_dedupe,
+                side_thread_id,
+                "side",
+            )
+            .await;
+            if let Some(parent_thread_id) = parent_thread_id {
+                if let Err(e) = agent.activate_thread(&parent_thread_id).await {
+                    let message = format!("Failed to restore Codex parent thread: {}", e);
+                    slog(&session_log, |l| l.warn(&message));
+                    bus.send(AppEvent::LoopError(message));
+                }
+            }
+            continue;
+        }
+
+        if let Some(subagent_thread_id) = target_session_id
+            .as_deref()
+            .filter(|id| stats.codex_subagent_parent_threads.contains_key(*id))
+            .map(str::to_string)
+        {
+            if edit_user_turn_index.is_some() {
+                let message = format!(
+                    "User-message rewind is not supported for Codex subagent session {}",
+                    subagent_thread_id.chars().take(8).collect::<String>()
+                );
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::LoopError(message));
+                continue;
+            }
+
+            let subagent_round = stats
+                .codex_subagent_rounds
+                .entry(subagent_thread_id.clone())
+                .or_insert(0);
+            *subagent_round += 1;
+            emit_user_message_log(
+                &bus,
+                &session_log,
+                Some(&subagent_thread_id),
+                Some(*subagent_round as u32),
+                None,
+                None,
+                &turn_text,
+            );
+            let merged = drain_steer_queue_as_followup(
+                &context_injection,
+                &turn_text,
+                &bus,
+                Some(&subagent_thread_id),
+                None,
+            )
+            .unwrap_or_else(|| turn_text.clone());
+            let subagent_thread = external_agent::AgentThread {
+                thread_id: subagent_thread_id.clone(),
+            };
+            let parent_thread_id = stats
+                .codex_subagent_parent_threads
+                .get(&subagent_thread_id)
+                .cloned()
+                .unwrap_or_else(|| thread.thread_id.clone());
+            emit_external_turn_status(
+                &bus,
+                &autonomy,
+                Some(&subagent_thread_id),
+                *subagent_round,
+                "thinking",
+                format!("{} subagent turn in progress", agent.name()),
+            )
+            .await;
+            let send_result = if attachments.is_empty() {
+                agent.send_message(&subagent_thread, &merged).await
+            } else {
+                agent
+                    .send_message_with_attachments(&subagent_thread, &merged, &attachments.items)
+                    .await
+            };
+            if let Err(e) = send_result {
+                let _ = agent.activate_thread(&parent_thread_id).await;
+                emit_follow_up_status(
+                    &bus,
+                    Some(&subagent_thread_id),
+                    &follow_up_id,
+                    Some(&turn_text),
+                    "failed",
+                    Some("failed to send subagent follow-up"),
+                );
+                bus.send(AppEvent::LoopError(format!(
+                    "Failed to send subagent follow-up: {}",
+                    e
+                )));
+                continue;
+            }
+            emit_follow_up_status(
+                &bus,
+                Some(&subagent_thread_id),
+                &follow_up_id,
+                Some(&turn_text),
+                "delivered",
+                None,
+            );
+            if let Some(id) = steer_id {
+                bus.send(AppEvent::SteerDelivered {
+                    session_id: Some(subagent_thread_id.clone()),
+                    id,
+                    mid_turn: false,
+                });
+            }
+            drain_external_child_turn(
+                &mut agent,
+                &mut event_rx,
+                &mut external_control_rx,
+                &drain_config,
+                &mut stats,
+                &mut diff_tracker,
+                &mut pending_runtime_steers,
+                &mut handled_steer_ids,
+                &mut codex_thread_action_dedupe,
+                subagent_thread_id,
+                "subagent",
+            )
+            .await;
+            if let Err(e) = agent.activate_thread(&parent_thread_id).await {
+                let message = format!("Failed to restore Codex parent thread: {}", e);
+                slog(&session_log, |l| l.warn(&message));
+                bus.send(AppEvent::LoopError(message));
+            }
+            continue;
+        }
+
+        if codex_managed_context_enabled && !managed_context_recovery_kickstart {
+            match agent.context_snapshot().await {
+                Ok(Some(snapshot)) => {
+                    if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
+                        let drop_original = managed_context_drop_original_for_recovery(
+                            &turn_text,
+                            !attachments.is_empty(),
+                            steer_id.is_some(),
+                            edit_user_turn_index.is_some(),
+                        );
+                        let held_user_input = !drop_original;
+                        if held_user_input {
+                            pending_managed_context_replays.push_back(FollowUpMessage {
+                                text: turn_text.clone(),
+                                attachments: attachments.clone(),
+                                steer_id: steer_id.clone(),
+                                follow_up_id: follow_up_id.clone(),
+                                edit_user_turn_index,
+                                edit_user_turn_revision,
+                                edit_original_text: edit_original_text.clone(),
+                                unresolved_attachment_ids: unresolved_attachment_ids.clone(),
+                                target_session_id: target_session_id.clone(),
+                                managed_context_recovery_kickstart: false,
+                            });
+                            emit_follow_up_status(
+                                &bus,
+                                live_session_id.as_deref(),
+                                &follow_up_id,
+                                None,
+                                "queued",
+                                Some(
+                                    "managed context is above the rewind-only threshold; recovering before sending this follow-up",
+                                ),
+                            );
+                        } else {
+                            emit_follow_up_status(
+                                &bus,
+                                live_session_id.as_deref(),
+                                &follow_up_id,
+                                Some(&turn_text),
+                                "queued",
+                                Some(
+                                    "managed context is above the rewind-only threshold; treating this as a recovery kickstart",
+                                ),
+                            );
+                        }
+
+                        let recovery_text =
+                            managed_context_recovery_kickstart_text(pressure, held_user_input);
+                        slog(&session_log, |l| {
+                            l.info(&format!(
+                                "Holding Codex follow-up during managed-context {} pressure ({}/{} tokens); sending recovery kickstart",
+                                pressure.status,
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit
+                            ))
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "info".to_string(),
+                            source: "Intendant".to_string(),
+                            content: format!(
+                                "Managed context is in rewind-only pressure ({}/{} tokens); {}.",
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit,
+                                if held_user_input {
+                                    "holding the user follow-up until recovery succeeds"
+                                } else {
+                                    "using the request as a recovery kickstart"
+                                }
+                            ),
+                            turn: None,
+                        });
+                        let mut recovery_followup = FollowUpMessage::text(recovery_text)
+                            .managed_context_recovery_kickstart();
+                        if !held_user_input {
+                            recovery_followup =
+                                recovery_followup.with_follow_up_id(follow_up_id.clone());
+                        }
+                        next_turn = Some(recovery_followup);
+                        continue 'outer;
+                    }
+                }
+                Ok(None) => {}
+                Err(e) => {
+                    slog(&session_log, |l| {
+                        l.debug(&format!(
+                            "Could not read Codex context snapshot before follow-up gate: {}",
+                            e
+                        ))
+                    });
+                }
+            }
+        }
+
+        let mut replacement_for_user_turn_index = None;
+        if let Some(user_turn_index) = edit_user_turn_index {
+            if !agent.supports_user_message_rewind() {
+                let message = format!("{} does not support user-message rewind", agent.name());
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    agent.name(),
+                    message,
+                );
+                continue;
+            }
+            if user_turn_index == 0 {
+                let message = format!(
+                    "Cannot edit user turn 0 in {} session {}",
+                    backend,
+                    live_session_id
+                        .as_deref()
+                        .map(|sid| sid.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| "unknown".to_string())
+                );
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    &backend.to_string(),
+                    message,
+                );
+                continue;
+            }
+            let active_edit_revision_ok = user_turn_index as usize <= round
+                && user_turn_revisions
+                    .validate_expected_revision(user_turn_index, edit_user_turn_revision)
+                    .is_ok();
+            let mut archived_edit_branch_not_found = false;
+            if !active_edit_revision_ok && codex_managed_context_enabled {
+                match fork_managed_context_edit_branch(
+                    &mut agent,
+                    &thread.thread_id,
+                    user_turn_index,
+                    edit_original_text.as_deref(),
+                    turn_text.clone(),
+                    unresolved_attachment_ids.clone(),
+                    &drain_config,
+                )
+                .await
+                {
+                    Ok(Some(message)) => {
+                        slog(&session_log, |l| l.info(&message));
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: live_session_id.clone(),
+                            action: "managed-edit-branch".to_string(),
+                            success: true,
+                            message: message.clone(),
+                        });
+                        emit_follow_up_status(
+                            &bus,
+                            live_session_id.as_deref(),
+                            &follow_up_id,
+                            Some(&turn_text),
+                            "queued",
+                            Some("created managed edit branch from archived context"),
+                        );
+                        continue 'outer;
+                    }
+                    Ok(None) => {
+                        archived_edit_branch_not_found = true;
+                    }
+                    Err(message) => {
+                        emit_external_session_loop_error(
+                            &bus,
+                            &session_log,
+                            live_session_id.as_deref(),
+                            &backend.to_string(),
+                            message,
+                        );
+                        continue;
+                    }
+                }
+            }
+            if user_turn_index as usize > round {
+                let message = format!(
+                    "Cannot edit user turn {} in {} session {}; current user turn count is {}",
+                    user_turn_index,
+                    backend,
+                    live_session_id
+                        .as_deref()
+                        .map(|sid| sid.chars().take(8).collect::<String>())
+                        .unwrap_or_else(|| "unknown".to_string()),
+                    round
+                );
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    &backend.to_string(),
+                    message,
+                );
+                continue;
+            }
+            if let Err(message) = user_turn_revisions
+                .validate_expected_revision(user_turn_index, edit_user_turn_revision)
+            {
+                let message = if archived_edit_branch_not_found {
+                    format!(
+                        "{message}. No matching managed-context archive was found for the clicked message text; the selected turn is no longer active and cannot be safely edited from this attach wrapper."
+                    )
+                } else {
+                    message
+                };
+                emit_external_session_loop_error(
+                    &bus,
+                    &session_log,
+                    live_session_id.as_deref(),
+                    &backend.to_string(),
+                    message,
+                );
+                continue;
+            }
+            let turns_to_drop = round as u32 - user_turn_index + 1;
+            let mut rollback_result = agent.rollback_turns(turns_to_drop).await;
+            if let Err(err) = rollback_result.as_ref() {
+                if backend == external_agent::AgentBackend::Codex
+                    && external_rollback_turn_in_progress(err)
+                {
+                    let message = format!(
+                        "Codex still has a turn in progress; pausing autonomous goal work and waiting before editing user turn {}",
+                        user_turn_index
+                    );
+                    slog(&session_log, |l| l.info(&message));
+                    bus.send(AppEvent::LogEntry {
+                        session_id: live_session_id.clone(),
+                        level: "info".to_string(),
+                        source: "Codex".to_string(),
+                        content: message,
+                        turn: None,
+                    });
+                    match agent.pause_autonomous_goal(&thread.thread_id).await {
+                        Ok(result) => {
+                            if let Some(goal) = result.goal {
+                                emit_external_session_goal(
+                                    &drain_config,
+                                    live_session_id.clone(),
+                                    Some(goal),
+                                );
+                            } else if result.goal_absent {
+                                emit_external_session_goal(
+                                    &drain_config,
+                                    live_session_id.clone(),
+                                    None,
+                                );
+                            }
+                        }
+                        Err(e) => {
+                            slog(&session_log, |l| {
+                                l.debug(&format!(
+                                    "Could not pause Codex goal before edit rollback retry: {}",
+                                    e
+                                ))
+                            });
+                        }
+                    }
+
+                    let mut side_session_state = ExternalSideSessionState {
+                        open_side_threads: &mut open_side_threads,
+                        side_rounds: &mut side_rounds,
+                        side_turn_revisions: &mut side_turn_revisions,
+                    };
+                    match drain_external_agent_events(
+                        &mut agent,
+                        &mut event_rx,
+                        &mut external_control_rx,
+                        &drain_config,
+                        &mut stats,
+                        &mut diff_tracker,
+                        &mut pending_runtime_steers,
+                        &mut handled_steer_ids,
+                        &mut codex_thread_action_dedupe,
+                        Some(&mut side_session_state),
+                    )
+                    .await
+                    {
+                        DrainOutcome::TurnCompleted {
+                            message,
+                            turns_in_round,
+                        } => {
+                            stats.rounds = round;
+                            record_external_done_and_round_inline(
+                                &session_log,
+                                persist_model_responses_inline,
+                                live_session_id.as_deref(),
+                                message.as_deref(),
+                                round,
+                                turns_in_round,
+                            );
+                            bus.send(AppEvent::DoneSignal {
+                                session_id: live_session_id.clone(),
+                                message: message.clone(),
+                            });
+                            bus.send(AppEvent::RoundComplete {
+                                session_id: live_session_id.clone(),
+                                round,
+                                turns_in_round,
+                                native_message_count: None,
+                            });
+                        }
+                        DrainOutcome::ContextRewindRequested {
+                            request,
+                            message,
+                            turns_in_round,
+                        } => {
+                            stats.rounds = round;
+                            record_external_done_and_round_inline(
+                                &session_log,
+                                persist_model_responses_inline,
+                                live_session_id.as_deref(),
+                                message.as_deref(),
+                                round,
+                                turns_in_round,
+                            );
+                            bus.send(AppEvent::DoneSignal {
+                                session_id: live_session_id.clone(),
+                                message: message.clone(),
+                            });
+                            bus.send(AppEvent::RoundComplete {
+                                session_id: live_session_id.clone(),
+                                round,
+                                turns_in_round,
+                                native_message_count: None,
+                            });
+                            emit_context_rewind_failure(
+                                &request,
+                                "user edit superseded the pending context rewind".to_string(),
+                                &drain_config,
+                            );
+                        }
+                        DrainOutcome::Interrupted { reason } => {
+                            stats.rounds = round;
+                            slog(&session_log, |l| {
+                                l.info(&format!(
+                                    "External agent interrupted before edit rollback: {}",
+                                    reason
+                                ))
+                            });
+                            record_external_round_inline(
+                                &session_log,
+                                persist_model_responses_inline,
+                                round,
+                                stats.turns,
+                            );
+                            bus.send(AppEvent::RoundComplete {
+                                session_id: live_session_id.clone(),
+                                round,
+                                turns_in_round: stats.turns,
+                                native_message_count: None,
+                            });
+                        }
+                        DrainOutcome::RecoveryRequired {
+                            message,
+                            recovery_hint,
+                            ..
+                        } => {
+                            let message =
+                                recovery_required_message(&message, recovery_hint.as_deref());
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                            continue;
+                        }
+                        DrainOutcome::Terminated { reason, exit_code } => {
+                            let message = format!(
+                                "{} terminated before edit rollback: {} (exit code: {:?})",
+                                agent.name(),
+                                reason,
+                                exit_code
+                            );
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                            continue;
+                        }
+                        DrainOutcome::ChannelClosed => {
+                            let message =
+                                "External agent event channel closed before edit rollback"
+                                    .to_string();
+                            slog(&session_log, |l| l.warn(&message));
+                            bus.send(AppEvent::LoopError(message));
+                            continue;
+                        }
+                    }
+                    rollback_result = agent.rollback_turns(turns_to_drop).await;
+                }
+            }
+            match rollback_result {
+                Ok(()) => {
+                    user_turn_revisions.rewind_from_turn(user_turn_index);
+                    round = user_turn_index.saturating_sub(1) as usize;
+                    replacement_for_user_turn_index = Some(user_turn_index);
+                    let message = format!(
+                        "Edited user turn {}; rolled back {} turn{}",
+                        user_turn_index,
+                        turns_to_drop,
+                        if turns_to_drop == 1 { "" } else { "s" }
+                    );
+                    slog(&session_log, |l| l.info(&message));
+                    bus.send(AppEvent::UserMessageRewind {
+                        session_id: live_session_id.clone(),
+                        user_turn_index,
+                        turns_removed: turns_to_drop,
+                    });
+                }
+                Err(e) => {
+                    let message = format!(
+                        "Cannot edit user turn {} in {} session: {}",
+                        user_turn_index, backend, e
+                    );
+                    emit_external_session_loop_error(
+                        &bus,
+                        &session_log,
+                        live_session_id.as_deref(),
+                        &backend.to_string(),
+                        message,
+                    );
+                    continue;
+                }
+            }
+        }
+
+        round += 1;
+        let user_turn_revision = user_turn_revisions.record_active_turn(round as u32);
+        stats.turns = 0;
+        let attachment_count = attachments.len();
+        let merged = drain_steer_queue_as_followup(
+            &context_injection,
+            &turn_text,
+            &bus,
+            live_session_id.as_deref(),
+            drain_config.alias_session_id.as_deref(),
+        )
+        .unwrap_or_else(|| turn_text.clone());
+        let user_log_text = if turn_text.trim().is_empty() {
+            &merged
+        } else {
+            &turn_text
+        };
+        emit_user_message_log(
+            &bus,
+            &session_log,
+            live_session_id.as_deref(),
+            Some(round as u32),
+            Some(user_turn_revision),
+            replacement_for_user_turn_index,
+            user_log_text,
+        );
+        slog(&session_log, |l| {
+            if round == 1 {
+                l.info(&format!(
+                    "Initial task sent to external agent{}",
+                    if attachment_count == 0 {
+                        String::new()
+                    } else {
+                        format!(" with {} attachment(s)", attachment_count)
+                    }
+                ));
+            } else {
+                l.info(&format!(
+                    "Follow-up round {}: {}{}",
+                    round,
+                    merged,
+                    if attachment_count == 0 {
+                        String::new()
+                    } else {
+                        format!(" ({} attachment(s))", attachment_count)
+                    }
+                ));
+            }
+        });
+        diff_tracker.seed_from_session_log(&project.root, &log_dir);
+        emit_external_turn_status(
+            &bus,
+            &autonomy,
+            live_session_id.as_deref(),
+            round,
+            "thinking",
+            format!("{} turn in progress", agent.name()),
+        )
+        .await;
+        let send_result = if attachments.is_empty() {
+            agent.send_message(&thread, &merged).await
+        } else {
+            agent
+                .send_message_with_attachments(&thread, &merged, &attachments.items)
+                .await
+        };
+        if let Err(e) = send_result {
+            emit_follow_up_status(
+                &bus,
+                live_session_id.as_deref(),
+                &follow_up_id,
+                Some(&turn_text),
+                "failed",
+                Some("failed to send follow-up"),
+            );
+            if round == 1 {
+                return Err(e);
+            }
+            bus.send(AppEvent::LoopError(format!(
+                "Failed to send follow-up: {}",
+                e
+            )));
+            break;
+        }
+        emit_follow_up_status(
+            &bus,
+            live_session_id.as_deref(),
+            &follow_up_id,
+            Some(&turn_text),
+            "delivered",
+            None,
+        );
+        if let Some(id) = steer_id {
+            bus.send(AppEvent::SteerDelivered {
+                session_id: live_session_id.clone(),
+                id,
+                mid_turn: false,
+            });
+        }
+
+        let mut side_session_state = ExternalSideSessionState {
+            open_side_threads: &mut open_side_threads,
+            side_rounds: &mut side_rounds,
+            side_turn_revisions: &mut side_turn_revisions,
+        };
+        match drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut external_control_rx,
+            &drain_config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut codex_thread_action_dedupe,
+            Some(&mut side_session_state),
+        )
+        .await
         {
             DrainOutcome::TurnCompleted {
                 message,
                 turns_in_round,
             } => {
                 stats.rounds = round;
+                if codex_managed_context_enabled {
+                    match agent.context_snapshot().await {
+                        Ok(Some(snapshot)) => {
+                            if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
+                            {
+                                managed_context_recovery_kickstarts_without_rewind =
+                                    managed_context_recovery_kickstarts_without_rewind
+                                        .saturating_add(1);
+                                if managed_context_recovery_kickstarts_without_rewind
+                                    < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
+                                {
+                                    let held_user_input =
+                                        !pending_managed_context_replays.is_empty();
+                                    let recovery_text = managed_context_recovery_kickstart_text(
+                                        pressure,
+                                        held_user_input,
+                                    );
+                                    let turn_kind = if managed_context_recovery_kickstart {
+                                        "recovery kickstart"
+                                    } else {
+                                        "managed Codex turn"
+                                    };
+                                    slog(&session_log, |l| {
+                                        l.warn(&format!(
+                                            "Managed-context {turn_kind} completed without a context rewind while pressure remains {}/{} tokens; retrying recovery",
+                                            pressure.used_tokens,
+                                            pressure.rewind_only_limit
+                                        ))
+                                    });
+                                    bus.send(AppEvent::LogEntry {
+                                        session_id: live_session_id.clone(),
+                                        level: "warn".to_string(),
+                                        source: "Intendant".to_string(),
+                                        content: format!(
+                                            "Managed-context {turn_kind} did not reduce context below the rewind-only threshold; context still reports {}/{} tokens. Retrying recovery before sending any normal follow-up.",
+                                            pressure.used_tokens,
+                                            pressure.rewind_only_limit
+                                        ),
+                                        turn: None,
+                                    });
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                    next_turn = Some(
+                                        FollowUpMessage::text(recovery_text)
+                                            .managed_context_recovery_kickstart(),
+                                    );
+                                    continue 'outer;
+                                } else {
+                                    let message = format!(
+                                        "Managed-context recovery completed without rewind_context while context remains above the rewind-only threshold ({}/{} tokens); refusing to send normal follow-ups.",
+                                        pressure.used_tokens,
+                                        pressure.rewind_only_limit
+                                    );
+                                    slog(&session_log, |l| l.warn(&message));
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                    bus.send(AppEvent::LoopError(message));
+                                    break;
+                                }
+                            } else {
+                                managed_context_recovery_kickstarts_without_rewind = 0;
+                                if let Some(replay) = pending_managed_context_replays.pop_front() {
+                                    slog(&session_log, |l| {
+                                        l.warn(
+                                            "Managed-context pressure cleared without a context rewind; replaying held follow-up",
+                                        )
+                                    });
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                    next_turn = Some(replay);
+                                    continue 'outer;
+                                }
+                            }
+                        }
+                        Ok(None) => {
+                            if managed_context_recovery_kickstart
+                                || !pending_managed_context_replays.is_empty()
+                            {
+                                let message = "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read; refusing to send normal follow-ups.".to_string();
+                                slog(&session_log, |l| l.warn(&message));
+                                record_external_round_inline(
+                                    &session_log,
+                                    persist_model_responses_inline,
+                                    round,
+                                    turns_in_round,
+                                );
+                                bus.send(AppEvent::RoundComplete {
+                                    session_id: live_session_id.clone(),
+                                    round,
+                                    turns_in_round,
+                                    native_message_count: None,
+                                });
+                                bus.send(AppEvent::LoopError(message));
+                                break;
+                            }
+                        }
+                        Err(e) => {
+                            if managed_context_recovery_kickstart
+                                || !pending_managed_context_replays.is_empty()
+                            {
+                                let message = format!(
+                                    "Managed-context recovery completed without rewind_context, and Codex context pressure could not be re-read: {}; refusing to send normal follow-ups.",
+                                    e
+                                );
+                                slog(&session_log, |l| l.warn(&message));
+                                record_external_round_inline(
+                                    &session_log,
+                                    persist_model_responses_inline,
+                                    round,
+                                    turns_in_round,
+                                );
+                                bus.send(AppEvent::RoundComplete {
+                                    session_id: live_session_id.clone(),
+                                    round,
+                                    turns_in_round,
+                                    native_message_count: None,
+                                });
+                                bus.send(AppEvent::LoopError(message));
+                                break;
+                            } else {
+                                slog(&session_log, |l| {
+                                    l.debug(&format!(
+                                        "Could not re-read Codex context pressure after managed turn: {}",
+                                        e
+                                    ))
+                                });
+                            }
+                        }
+                    }
+                }
 
+                record_external_done_and_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    live_session_id.as_deref(),
+                    message.as_deref(),
+                    round,
+                    turns_in_round,
+                );
                 bus.send(AppEvent::DoneSignal {
+                    session_id: live_session_id.clone(),
                     message: message.clone(),
                 });
                 bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
                     round,
                     turns_in_round,
                     native_message_count: None,
                 });
-                slog(&session_log, |l| l.round_complete(round, turns_in_round));
-
-                // Wait for follow-up or channel close
-                match follow_up_rx.recv().await {
-                    Some(followup) => {
-                        round += 1;
-                        stats.turns = 0;
-                        let merged = drain_steer_queue_as_followup(
-                            &context_injection,
-                            &followup,
-                            &bus,
-                        )
-                        .unwrap_or(followup);
-                        slog(&session_log, |l| {
-                            l.info(&format!("Follow-up round {}: {}", round, merged));
-                        });
-                        if let Err(e) = agent.send_message(&thread, &merged).await {
-                            bus.send(AppEvent::LoopError(format!(
-                                "Failed to send follow-up: {}",
-                                e
-                            )));
-                            break;
+            }
+            DrainOutcome::ContextRewindRequested {
+                request,
+                message,
+                turns_in_round,
+            } => {
+                managed_context_recovery_kickstarts_without_rewind = 0;
+                stats.rounds = round;
+                record_external_done_and_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    live_session_id.as_deref(),
+                    message.as_deref(),
+                    round,
+                    turns_in_round,
+                );
+                bus.send(AppEvent::DoneSignal {
+                    session_id: live_session_id.clone(),
+                    message: message.clone(),
+                });
+                bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
+                    round,
+                    turns_in_round,
+                    native_message_count: None,
+                });
+                match apply_external_context_rewind(
+                    &mut agent,
+                    &thread.thread_id,
+                    &request,
+                    &drain_config,
+                )
+                .await
+                {
+                    Ok(Some(followup)) => {
+                        if let Some(replay) = pending_managed_context_replays.pop_front() {
+                            slog(&session_log, |l| {
+                                l.info(
+                                    "Managed-context rewind succeeded; replaying held user follow-up instead of automatic resume",
+                                )
+                            });
+                            next_turn = Some(replay);
+                        } else {
+                            next_turn = Some(followup);
                         }
                     }
-                    None => {
+                    Ok(None) => {
+                        if let Some(replay) = pending_managed_context_replays.pop_front() {
+                            slog(&session_log, |l| {
+                                l.info(
+                                    "Managed-context rewind succeeded; replaying held user follow-up",
+                                )
+                            });
+                            next_turn = Some(replay);
+                        }
+                    }
+                    Err(message) => {
+                        emit_context_rewind_failure(&request, message, &drain_config);
+                    }
+                }
+            }
+            DrainOutcome::RecoveryRequired {
+                message,
+                recovery_hint,
+                turns_in_round,
+            } => {
+                stats.rounds = round;
+                if codex_managed_context_enabled {
+                    managed_context_recovery_kickstarts_without_rewind =
+                        managed_context_recovery_kickstarts_without_rewind.saturating_add(1);
+                    if managed_context_recovery_kickstarts_without_rewind
+                        < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
+                    {
+                        let pressure = match agent.context_snapshot().await {
+                            Ok(Some(snapshot)) => managed_context_recovery_pressure(&snapshot),
+                            Ok(None) => None,
+                            Err(e) => {
+                                slog(&session_log, |l| {
+                                    l.debug(&format!(
+                                        "Could not read Codex context snapshot after recovery-required outcome: {}",
+                                        e
+                                    ))
+                                });
+                                None
+                            }
+                        };
+                        let recovery_text = pressure
+                            .map(|pressure| {
+                                managed_context_recovery_kickstart_text(pressure, false)
+                            })
+                            .unwrap_or_else(|| {
+                                managed_context_backend_recovery_kickstart_text(
+                                    &message,
+                                    recovery_hint.as_deref(),
+                                )
+                            });
                         slog(&session_log, |l| {
-                            l.info("Follow-up channel closed, exiting")
+                            l.warn(&format!(
+                                "Managed Codex reported recovery required; sending managed-context recovery kickstart instead of ending the session"
+                            ))
                         });
+                        record_external_round_inline(
+                            &session_log,
+                            persist_model_responses_inline,
+                            round,
+                            turns_in_round,
+                        );
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: live_session_id.clone(),
+                            round,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "warn".to_string(),
+                            source: "Intendant".to_string(),
+                            content: "Managed Codex reported recovery required; sending a managed-context rewind kickstart instead of ending the session.".to_string(),
+                            turn: None,
+                        });
+                        next_turn = Some(
+                            FollowUpMessage::text(recovery_text)
+                                .managed_context_recovery_kickstart(),
+                        );
+                        continue 'outer;
+                    } else {
+                        let failure = format!(
+                            "Managed Codex still reports backend recovery required after {} recovery kickstarts without another successful rewind; refusing to mark the session complete.",
+                            managed_context_recovery_kickstarts_without_rewind
+                        );
+                        slog(&session_log, |l| l.warn(&failure));
+                        record_external_round_inline(
+                            &session_log,
+                            persist_model_responses_inline,
+                            round,
+                            turns_in_round,
+                        );
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: live_session_id.clone(),
+                            round,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "error".to_string(),
+                            source: "Intendant".to_string(),
+                            content: failure.clone(),
+                            turn: None,
+                        });
+                        bus.send(AppEvent::LoopError(failure));
                         break;
                     }
                 }
+                slog(&session_log, |l| {
+                    l.warn(&recovery_required_message(
+                        &message,
+                        recovery_hint.as_deref(),
+                    ))
+                });
+                record_external_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    round,
+                    turns_in_round,
+                );
+                bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
+                    round,
+                    turns_in_round,
+                    native_message_count: None,
+                });
+                bus.send(AppEvent::TaskComplete {
+                    session_id: live_session_id.clone(),
+                    reason: "recovery required".to_string(),
+                    summary: recovery_hint.or(Some(message)),
+                });
+                break;
             }
             DrainOutcome::Interrupted { reason } => {
                 // User-requested interrupt. Emit RoundComplete so the
@@ -6782,42 +18173,59 @@ async fn run_external_agent_mode(
                 slog(&session_log, |l| {
                     l.info(&format!("External agent interrupted: {}", reason))
                 });
+                record_external_round_inline(
+                    &session_log,
+                    persist_model_responses_inline,
+                    round,
+                    stats.turns,
+                );
                 bus.send(AppEvent::RoundComplete {
+                    session_id: live_session_id.clone(),
                     round,
                     turns_in_round: stats.turns,
                     native_message_count: None,
                 });
-                match follow_up_rx.recv().await {
-                    Some(followup) => {
-                        round += 1;
-                        stats.turns = 0;
-                        let merged = drain_steer_queue_as_followup(
-                            &context_injection,
-                            &followup,
-                            &bus,
-                        )
-                        .unwrap_or(followup);
-                        slog(&session_log, |l| {
-                            l.info(&format!("Follow-up round {}: {}", round, merged));
-                        });
-                        if let Err(e) = agent.send_message(&thread, &merged).await {
-                            bus.send(AppEvent::LoopError(format!(
-                                "Failed to send follow-up: {}",
-                                e
-                            )));
-                            break;
-                        }
-                    }
-                    None => {
-                        slog(&session_log, |l| {
-                            l.info("Follow-up channel closed after interrupt, exiting")
-                        });
-                        break;
-                    }
-                }
             }
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
+                if codex_managed_context_enabled {
+                    match agent.context_snapshot().await {
+                        Ok(Some(snapshot)) => {
+                            if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
+                            {
+                                let message = format!(
+                                    "Managed Codex terminated as {reason} while backend-reported pressure remains {}/{} tokens; refusing to mark the session complete.",
+                                    pressure.used_tokens,
+                                    pressure.rewind_only_limit
+                                );
+                                slog(&session_log, |l| l.warn(&message));
+                                record_external_round_inline(
+                                    &session_log,
+                                    persist_model_responses_inline,
+                                    round,
+                                    stats.turns,
+                                );
+                                bus.send(AppEvent::RoundComplete {
+                                    session_id: live_session_id.clone(),
+                                    round,
+                                    turns_in_round: stats.turns,
+                                    native_message_count: None,
+                                });
+                                bus.send(AppEvent::LoopError(message));
+                                break;
+                            }
+                        }
+                        Ok(None) => {}
+                        Err(e) => {
+                            slog(&session_log, |l| {
+                                l.debug(&format!(
+                                    "Could not re-read Codex context pressure after managed termination: {}",
+                                    e
+                                ))
+                            });
+                        }
+                    }
+                }
                 slog(&session_log, |l| {
                     l.info(&format!(
                         "External agent terminated: {} (exit code: {:?})",
@@ -6825,6 +18233,7 @@ async fn run_external_agent_mode(
                     ));
                 });
                 bus.send(AppEvent::TaskComplete {
+                    session_id: live_session_id.clone(),
                     reason: reason.clone(),
                     summary: stats.last_response.clone(),
                 });
@@ -6922,7 +18331,11 @@ async fn resolve_frame_hints(
     for hint in hints {
         if let Some(frame_list) = hint.strip_prefix("frames:") {
             let reg = registry.read().await;
-            for fid in frame_list.split(',').map(|s| s.trim()).filter(|s| !s.is_empty()) {
+            for fid in frame_list
+                .split(',')
+                .map(|s| s.trim())
+                .filter(|s| !s.is_empty())
+            {
                 match reg.read_hq(fid) {
                     Ok(data) => {
                         use base64::Engine;
@@ -7016,14 +18429,30 @@ async fn resolve_attachments(
     session_dir: &std::path::Path,
     project_root: &std::path::Path,
 ) -> Vec<external_agent::AgentAttachment> {
+    resolve_attachments_with_project_roots(
+        ids,
+        registry,
+        session_dir,
+        &[project_root.to_path_buf()],
+    )
+    .await
+}
+
+async fn resolve_attachments_with_project_roots(
+    ids: &[String],
+    registry: &Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    session_dir: &std::path::Path,
+    project_roots: &[PathBuf],
+) -> Vec<external_agent::AgentAttachment> {
     if ids.is_empty() {
         return Vec::new();
     }
     let mut out: Vec<external_agent::AgentAttachment> = Vec::with_capacity(ids.len());
-    let reg = registry.read().await;
     for raw in ids {
         if let Some(upload_id) = raw.strip_prefix("upload:") {
-            let Some(d) = upload_store::find_upload(upload_id, session_dir, project_root)
+            let Some(d) = project_roots
+                .iter()
+                .find_map(|root| upload_store::find_upload(upload_id, session_dir, root))
             else {
                 continue;
             };
@@ -7051,7 +18480,7 @@ async fn resolve_attachments(
                 out.push(external_agent::AgentAttachment::File(
                     external_agent::AgentFileAttachment {
                         local_path: d.path.clone(),
-                        name: d.name.clone(),
+                        name: d.original_name.clone().unwrap_or_else(|| d.name.clone()),
                         mime_type: d.mime.clone(),
                         size: d.size,
                     },
@@ -7063,10 +18492,15 @@ async fn resolve_attachments(
         // backward compatibility with dashboards that predate the upload
         // feature.
         let fid = raw.strip_prefix("frame:").unwrap_or(raw);
-        let Ok(data) = reg.read_hq(fid) else { continue };
+        let (data, path) = {
+            let reg = registry.read().await;
+            let Ok(data) = reg.read_hq(fid) else {
+                continue;
+            };
+            (data, reg.path_for(fid))
+        };
         use base64::Engine;
         let base64 = base64::engine::general_purpose::STANDARD.encode(&data);
-        let path = reg.path_for(fid);
         out.push(external_agent::AgentAttachment::Image(
             external_agent::AgentImageAttachment::from_frame_path(
                 path,
@@ -7131,7 +18565,13 @@ async fn capture_display_screenshot(
     } else {
         let display = std::env::var("DISPLAY").unwrap_or_else(|_| ":0".into());
         tokio::process::Command::new("import")
-            .args(["-window", "root", "-display", &display, &screenshot_path.to_string_lossy()])
+            .args([
+                "-window",
+                "root",
+                "-display",
+                &display,
+                &screenshot_path.to_string_lossy(),
+            ])
             .output()
             .await
             .map(|o| o.status.success())
@@ -7164,7 +18604,9 @@ async fn try_cu_first(
     slog(session_log, |l| {
         l.info(&format!(
             "try_cu_first: ref_images={}, frame_images={}, task={}",
-            reference_images.len(), frame_images.len(), &task[..task.len().min(60)]
+            reference_images.len(),
+            frame_images.len(),
+            &task[..task.len().min(60)]
         ))
     });
 
@@ -7232,7 +18674,9 @@ async fn try_cu_first(
     slog(session_log, |l| {
         l.info(&format!(
             "CU-first: {} (provider: {}, model: {})",
-            &task[..task.len().min(80)], cu_provider.name(), cu_provider.model()
+            &task[..task.len().min(80)],
+            cu_provider.name(),
+            cu_provider.model()
         ))
     });
     bus.send(event::AppEvent::PresenceLog {
@@ -7241,17 +18685,20 @@ async fn try_cu_first(
         turn: None,
     });
 
-    Some(run_cu_task(
-        cu_provider.as_ref(),
-        task,
-        reference_images.to_vec(),
-        frame_images.to_vec(),
-        session_log,
-        log_dir,
-        bus,
-        &proj.config.computer_use,
-        None, // auto-resolve display target
-    ).await)
+    Some(
+        run_cu_task(
+            cu_provider.as_ref(),
+            task,
+            reference_images.to_vec(),
+            frame_images.to_vec(),
+            session_log,
+            log_dir,
+            bus,
+            &proj.config.computer_use,
+            None, // auto-resolve display target
+        )
+        .await,
+    )
 }
 
 /// Spawn a listener that reacts to display grant/revoke events.
@@ -7267,12 +18714,21 @@ pub fn spawn_user_display_listener(
         loop {
             match rx.recv().await {
                 Ok(AppEvent::UserDisplayGranted { display_id }) => {
-                    activate_user_display(&bus, &session_registry, frame_registry.clone(), display_id).await;
+                    activate_user_display(
+                        &bus,
+                        &session_registry,
+                        frame_registry.clone(),
+                        display_id,
+                    )
+                    .await;
                 }
                 Ok(AppEvent::UserDisplayRevoked { display_id, .. }) => {
                     deactivate_user_display(&session_registry, display_id).await;
                 }
-                Ok(AppEvent::DisplayCaptureLost { display_id, ref reason }) => {
+                Ok(AppEvent::DisplayCaptureLost {
+                    display_id,
+                    ref reason,
+                }) => {
                     // Capture backend stopped unexpectedly (portal session
                     // ended, backend crashed, etc.).  Remove the session from
                     // the registry so a re-grant creates a fresh one.
@@ -7305,13 +18761,28 @@ pub fn spawn_user_display_listener(
 /// cycle serialized behind `session.stop().await` — "turn on, wait
 /// 20+s, turn on is instant" mapped exactly to "the old stop finally
 /// finished and the listener got to the new grant".
-async fn deactivate_user_display(session_registry: &display::SharedSessionRegistry, display_id: u32) {
+async fn deactivate_user_display(
+    session_registry: &display::SharedSessionRegistry,
+    display_id: u32,
+) {
     if let Some(session) = session_registry.write().await.remove(display_id) {
-        eprintln!("[user_display] Stopping display session for :{}", display_id);
+        eprintln!(
+            "[user_display] Stopping display session for :{}",
+            display_id
+        );
         tokio::spawn(async move {
             session.stop().await;
         });
     }
+}
+
+fn reject_user_display_activation(bus: &EventBus, display_id: u32, reason: impl Into<String>) {
+    let reason = reason.into();
+    eprintln!("[user_display] {reason}");
+    bus.send(AppEvent::UserDisplayRevoked {
+        display_id,
+        note: Some(reason),
+    });
 }
 
 /// Handle user display grant: create a `DisplaySession` and emit
@@ -7327,7 +18798,6 @@ async fn activate_user_display(
     target_display_id: u32,
 ) {
     let display_id: u32 = target_display_id;
-    let (width, height) = query_display_resolution(display_id);
 
     // On Wayland: create a DisplaySession with WaylandBackend.
     // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
@@ -7336,7 +18806,10 @@ async fn activate_user_display(
     if std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some() {
         if let Some(socket) = detect_wayland_socket() {
             if std::env::var("WAYLAND_DISPLAY").is_err() {
-                eprintln!("[user_display] WAYLAND_DISPLAY not set, detected socket: {}", socket);
+                eprintln!(
+                    "[user_display] WAYLAND_DISPLAY not set, detected socket: {}",
+                    socket
+                );
                 std::env::set_var("WAYLAND_DISPLAY", &socket);
             }
             if std::env::var("XDG_RUNTIME_DIR").is_err() {
@@ -7345,9 +18818,7 @@ async fn activate_user_display(
                 std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
             }
         }
-        eprintln!(
-            "[user_display] Requesting Wayland screen capture via XDG portal..."
-        );
+        eprintln!("[user_display] Requesting Wayland screen capture via XDG portal...");
         eprintln!(
             "[user_display] A screen-sharing dialog should appear on the display — \
              approve it to enable video capture"
@@ -7376,7 +18847,11 @@ async fn activate_user_display(
                 let session = Arc::new(session);
                 session.spawn_metrics_logger(Some(bus.clone()));
                 session_registry.write().await.insert(display_id, session);
-                bus.send(AppEvent::DisplayReady { display_id, width, height });
+                bus.send(AppEvent::DisplayReady {
+                    display_id,
+                    width,
+                    height,
+                });
                 return;
             }
             Ok(Err(e)) => {
@@ -7395,8 +18870,7 @@ async fn activate_user_display(
     // X11: detect display and create a DisplaySession with X11Backend.
     #[cfg(target_os = "linux")]
     {
-        let has_x11 = std::env::var("DISPLAY").is_ok()
-            || vision::detect_x11_display().is_some();
+        let has_x11 = std::env::var("DISPLAY").is_ok() || vision::detect_x11_display().is_some();
         if has_x11 {
             // Ensure DISPLAY is set for downstream tools (xdotool, import, etc.)
             if std::env::var("DISPLAY").is_err() {
@@ -7436,14 +18910,21 @@ async fn activate_user_display(
             };
             if let Ok(backend) = backend {
                 let session = display::DisplaySession::new(display_id, Arc::new(backend));
-                if let Err(e) = session.start(30, frame_registry.clone(), Some(bus.clone())).await {
+                if let Err(e) = session
+                    .start(30, frame_registry.clone(), Some(bus.clone()))
+                    .await
+                {
                     eprintln!("[user_display] X11 display session failed: {}", e);
                 } else {
                     let (width, height) = session.resolution();
                     let session = Arc::new(session);
                     session.spawn_metrics_logger(Some(bus.clone()));
                     session_registry.write().await.insert(display_id, session);
-                    bus.send(AppEvent::DisplayReady { display_id, width, height });
+                    bus.send(AppEvent::DisplayReady {
+                        display_id,
+                        width,
+                        height,
+                    });
                     return;
                 }
             }
@@ -7459,29 +18940,123 @@ async fn activate_user_display(
             if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
                 display::macos::MacOSBackend::with_display_id(info.platform_id as u32)
             } else {
-                eprintln!("[user_display] display_id {} not found, falling back to primary", target_display_id);
-                display::macos::MacOSBackend::new()
+                reject_user_display_activation(
+                    bus,
+                    display_id,
+                    format!("display {target_display_id} is not available on this Mac"),
+                );
+                return;
             }
         } else {
             display::macos::MacOSBackend::new()
         };
         let session = display::DisplaySession::new(display_id, Arc::new(backend));
         if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
-            eprintln!("[user_display] macOS display session failed: {}", e);
+            reject_user_display_activation(
+                bus,
+                display_id,
+                format!("macOS display session failed: {e}"),
+            );
+            return;
         } else {
             let (width, height) = session.resolution();
             let session = Arc::new(session);
             session.spawn_metrics_logger(Some(bus.clone()));
             session_registry.write().await.insert(display_id, session);
-            bus.send(AppEvent::DisplayReady { display_id, width, height });
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            });
+            return;
+        }
+    }
+
+    #[cfg(target_os = "windows")]
+    {
+        // If a specific display was requested, resolve its platform_id (DXGI
+        // output ordinal) from the enumerated list; otherwise capture the
+        // primary output. Mirrors the macOS arm.
+        let backend = if target_display_id != 0 {
+            let displays = display::enumerate_displays().await;
+            if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
+                display::windows::WindowsBackend::with_output_index(info.platform_id as u32)
+            } else {
+                reject_user_display_activation(
+                    bus,
+                    display_id,
+                    format!("display {target_display_id} is not available on this Windows host"),
+                );
+                return;
+            }
+        } else {
+            display::windows::WindowsBackend::new()
+        };
+        let session = display::DisplaySession::new(display_id, Arc::new(backend));
+        if let Err(e) = session.start(30, frame_registry, Some(bus.clone())).await {
+            reject_user_display_activation(
+                bus,
+                display_id,
+                format!("Windows display session failed: {e}"),
+            );
+            return;
+        } else {
+            let (width, height) = session.resolution();
+            let session = Arc::new(session);
+            session.spawn_metrics_logger(Some(bus.clone()));
+            session_registry.write().await.insert(display_id, session);
+            bus.send(AppEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            });
             return;
         }
     }
 
     #[allow(unreachable_code)]
     {
-        eprintln!("[user_display] No supported display backend detected");
+        reject_user_display_activation(bus, display_id, "no supported display backend detected");
     }
+}
+
+/// Auto-register the Windows desktop as an active display at web-daemon
+/// startup, so the dashboard's Video tab streams it on connect — no grant
+/// click and no running agent required.
+///
+/// On macOS and Linux the screen is shared behind a consent gate (TCC, the
+/// Wayland portal dialog) or a virtual display is launched on demand, so
+/// those platforms keep activating the user display only on an explicit
+/// grant. Windows has no such per-session consent step: in the headless /
+/// RDP server scenario the existing desktop *is* the always-on stream, and
+/// the OS-level capture permission is implicit. We therefore mirror the
+/// macOS *end state* (a live `DisplaySession` already in the registry, so a
+/// fresh browser connect replays `display_ready` and auto-streams) by
+/// activating display 0 up front, reusing the same [`activate_user_display`]
+/// machinery — which on Windows captures the existing desktop via
+/// `WindowsBackend` (DXGI Desktop Duplication), NOT a virtual Xvfb display.
+///
+/// The autonomy grant flag and `INTENDANT_USER_DISPLAY_GRANTED` env are set
+/// to match a real grant, so the dashboard's "your display" toggle, CU
+/// display targeting, and agent subprocesses all observe a consistent
+/// "granted" state. Activation degrades gracefully — if the capture backend
+/// can't start (no interactive desktop, etc.) `activate_user_display` logs
+/// and returns without registering, leaving the dashboard at "No displays
+/// active" rather than failing startup.
+#[cfg(target_os = "windows")]
+async fn auto_activate_windows_user_display(
+    bus: &EventBus,
+    session_registry: &display::SharedSessionRegistry,
+    frame_registry: Option<std::sync::Arc<tokio::sync::RwLock<frames::FrameRegistry>>>,
+    autonomy: &SharedAutonomy,
+) {
+    eprintln!("[user_display] Windows: auto-registering desktop as active display (display 0)");
+    {
+        let mut guard = autonomy.write().await;
+        guard.user_display_granted = true;
+    }
+    std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
+    activate_user_display(bus, session_registry, frame_registry, 0).await;
 }
 
 /// Detect a Wayland compositor socket even when WAYLAND_DISPLAY is not set.
@@ -7589,7 +19164,8 @@ async fn run_cu_task(
     let display_target = target_override.unwrap_or_else(resolve_cu_display_target);
 
     // CU-first system prompt: handle display tasks or escalate
-    let system_prompt = "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
+    let system_prompt =
+        "You are a fast computer-use agent. You can see and interact with a desktop display.\n\n\
         ROUTING:\n\
         - If the task involves the display (clicking, typing, scrolling, pressing buttons, \
           opening apps, interacting with GUI elements), handle it with your computer use tools.\n\
@@ -7604,12 +19180,17 @@ async fn run_cu_task(
         RULES:\n\
         - Perform ONLY the requested task, nothing else.\n\
         - Once done, STOP. Do not take additional actions.\n\
-        - Be precise with coordinates. Act efficiently.".to_string();
+        - Be precise with coordinates. Act efficiently."
+            .to_string();
 
     // No display frames at all → escalate immediately without API call
     if reference_images.is_empty() && context_images.is_empty() {
-        slog(session_log, |l| l.info("CU: no display frames available, escalating"));
-        return Ok(CuTaskResult::Escalate { task: task.to_string() });
+        slog(session_log, |l| {
+            l.info("CU: no display frames available, escalating")
+        });
+        return Ok(CuTaskResult::Escalate {
+            task: task.to_string(),
+        });
     }
 
     let ref_image_count = reference_images.len();
@@ -7621,15 +19202,14 @@ async fn run_cu_task(
             "The user was looking at this screen when they made their request:".to_string(),
             reference_images,
         );
-        conv.add_assistant("I can see the reference screen. I'll compare this with the current state.".to_string());
+        conv.add_assistant(
+            "I can see the reference screen. I'll compare this with the current state.".to_string(),
+        );
     }
 
     // Inject context images
     if !context_images.is_empty() {
-        conv.add_user_with_images(
-            "Additional context:".to_string(),
-            context_images,
-        );
+        conv.add_user_with_images("Additional context:".to_string(), context_images);
         conv.add_assistant("Noted.".to_string());
     }
 
@@ -7650,11 +19230,12 @@ async fn run_cu_task(
     for turn in 1..=CU_TASK_MAX_TURNS {
         stats.turns = turn;
 
-        slog(session_log, |l| l.info(&format!("CU turn {} starting", turn)));
+        slog(session_log, |l| {
+            l.info(&format!("CU turn {} starting", turn))
+        });
 
-        let response = provider.chat_stream(
-            conv.messages(),
-            &|event| {
+        let response = provider
+            .chat_stream(conv.messages(), &|event| {
                 if let provider::StreamEvent::Delta(ref delta) = event {
                     bus.send(AppEvent::PresenceLog {
                         message: format!("[CU] {}", delta),
@@ -7662,8 +19243,8 @@ async fn run_cu_task(
                         turn: Some(turn),
                     });
                 }
-            },
-        ).await?;
+            })
+            .await?;
 
         conv.set_usage(response.usage.clone());
 
@@ -7675,7 +19256,11 @@ async fn run_cu_task(
                 .flat_map(|cu| cu.actions.iter().map(|a| format!("{:?}", a)))
                 .collect();
             for tc in &response.tool_calls {
-                actions_desc.push(format!("{}({})", tc.name, &tc.arguments[..tc.arguments.len().min(100)]));
+                actions_desc.push(format!(
+                    "{}({})",
+                    tc.name,
+                    &tc.arguments[..tc.arguments.len().min(100)]
+                ));
             }
             slog(session_log, |l| {
                 l.cu_turn(
@@ -7699,11 +19284,20 @@ async fn run_cu_task(
             });
         }
         // Check for escalation before processing anything else
-        if let Some(esc_call) = response.tool_calls.iter().find(|tc| tc.name == "escalate_to_agent") {
-            let args: serde_json::Value = serde_json::from_str(&esc_call.arguments).unwrap_or_default();
+        if let Some(esc_call) = response
+            .tool_calls
+            .iter()
+            .find(|tc| tc.name == "escalate_to_agent")
+        {
+            let args: serde_json::Value =
+                serde_json::from_str(&esc_call.arguments).unwrap_or_default();
             let escalated_task = args["task"].as_str().unwrap_or(task).to_string();
-            slog(session_log, |l| l.cu_task_error("escalated", Some(&escalated_task)));
-            return Ok(CuTaskResult::Escalate { task: escalated_task });
+            slog(session_log, |l| {
+                l.cu_task_error("escalated", Some(&escalated_task))
+            });
+            return Ok(CuTaskResult::Escalate {
+                task: escalated_task,
+            });
         }
 
         // Handle unrecognized function tool calls: return error results so the
@@ -7805,15 +19399,12 @@ async fn run_cu_task(
                 )
                 .await;
 
-                let last_screenshot =
-                    results.iter().rev().find_map(|r| r.screenshot.as_ref());
+                let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
                 let output = if results.iter().all(|r| r.success) {
                     "Actions executed successfully.".to_string()
                 } else {
-                    let errors: Vec<&str> = results
-                        .iter()
-                        .filter_map(|r| r.error.as_deref())
-                        .collect();
+                    let errors: Vec<&str> =
+                        results.iter().filter_map(|r| r.error.as_deref()).collect();
                     format!("Some actions failed: {}", errors.join("; "))
                 };
 
@@ -7840,7 +19431,9 @@ async fn run_cu_task(
             });
         }
         if turn >= CU_TASK_MAX_TURNS {
-            slog(session_log, |l| l.cu_task_error("CU task hit max turns", None));
+            slog(session_log, |l| {
+                l.cu_task_error("CU task hit max turns", None)
+            });
         }
     }
 
@@ -7867,19 +19460,37 @@ async fn execute_cu_calls(
 
     for cu_call in cu_calls {
         // Build human-readable description of CU actions
-        let action_descs: Vec<String> = cu_call.actions.iter().map(|a| {
-            match a {
-                computer_use::CuAction::Click { x, y, button } => format!("click({},{} {:?})", x, y, button),
-                computer_use::CuAction::DoubleClick { x, y, .. } => format!("double_click({},{})", x, y),
-                computer_use::CuAction::Type { text } => format!("type(\"{}\")", &text[..text.len().min(50)]),
+        let action_descs: Vec<String> = cu_call
+            .actions
+            .iter()
+            .map(|a| match a {
+                computer_use::CuAction::Click { x, y, button } => {
+                    format!("click({},{} {:?})", x, y, button)
+                }
+                computer_use::CuAction::DoubleClick { x, y, .. } => {
+                    format!("double_click({},{})", x, y)
+                }
+                computer_use::CuAction::Type { text } => {
+                    format!("type(\"{}\")", &text[..text.len().min(50)])
+                }
                 computer_use::CuAction::Key { key } => format!("key({})", key),
-                computer_use::CuAction::Scroll { x, y, direction, amount } => format!("scroll({},{} {:?} {})", x, y, direction, amount),
+                computer_use::CuAction::Scroll {
+                    x,
+                    y,
+                    direction,
+                    amount,
+                } => format!("scroll({},{} {:?} {})", x, y, direction, amount),
                 computer_use::CuAction::MoveMouse { x, y } => format!("move({},{})", x, y),
-                computer_use::CuAction::Drag { start_x, start_y, end_x, end_y } => format!("drag({},{}->{},{})", start_x, start_y, end_x, end_y),
+                computer_use::CuAction::Drag {
+                    start_x,
+                    start_y,
+                    end_x,
+                    end_y,
+                } => format!("drag({},{}->{},{})", start_x, start_y, end_x, end_y),
                 computer_use::CuAction::Screenshot => "screenshot".to_string(),
                 computer_use::CuAction::Wait { ms } => format!("wait({}ms)", ms),
-            }
-        }).collect();
+            })
+            .collect();
         let desc = action_descs.join(" → ");
         slog(session_log, |l| l.info(&format!("CU: {}", desc)));
 
@@ -7892,16 +19503,15 @@ async fn execute_cu_calls(
             counter,
             &None,
             None,
-        ).await;
+        )
+        .await;
 
         // Find the last screenshot from results
         let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
         let output = if results.iter().all(|r| r.success) {
             "Actions executed successfully.".to_string()
         } else {
-            let errors: Vec<&str> = results.iter()
-                .filter_map(|r| r.error.as_deref())
-                .collect();
+            let errors: Vec<&str> = results.iter().filter_map(|r| r.error.as_deref()).collect();
             format!("Some actions failed: {}", errors.join("; "))
         };
 
@@ -8018,7 +19628,8 @@ async fn main() -> Result<(), CallerError> {
             // app-backend.log or stderr captures.
             if let Some(dir) = PANIC_LOG_DIR.get() {
                 let panic_path = dir.join("panic.log");
-                let msg = format!("{}\n\nBacktrace:\n{:?}\n",
+                let msg = format!(
+                    "{}\n\nBacktrace:\n{:?}\n",
                     info,
                     std::backtrace::Backtrace::force_capture(),
                 );
@@ -8034,10 +19645,48 @@ async fn main() -> Result<(), CallerError> {
 
     // Intercept `intendant lan <action>` before the main runtime setup —
     // the lan subcommand is a pure system-setup path with no project,
-    // no .env, no provider selection.
+    // no .env, no provider selection. The subcommand's cert machinery
+    // (OpenSSL + nginx) is deferred on Windows (Tier-0), so there it
+    // reports unsupported and exits rather than calling the gated path.
     if env::args().nth(1).as_deref() == Some("lan") {
+        #[cfg(not(target_os = "windows"))]
+        {
+            let argv: Vec<String> = env::args().skip(2).collect();
+            return match lan::run(argv).await {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    eprintln!("error: {e}");
+                    std::process::exit(1);
+                }
+            };
+        }
+        #[cfg(target_os = "windows")]
+        {
+            eprintln!("error: `intendant lan` is not supported on Windows yet");
+            std::process::exit(1);
+        }
+    }
+
+    // Intercept `intendant setup <action>` before normal project/provider
+    // initialization. These are host setup/repair commands and must not need
+    // an API key or a detected project.
+    if env::args().nth(1).as_deref() == Some("setup") {
         let argv: Vec<String> = env::args().skip(2).collect();
-        return match lan::run(argv).await {
+        return match setup::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
+    // Intercept `intendant ctl <command>` before normal project/provider
+    // initialization. The ctl namespace talks to a running daemon over MCP and
+    // should stay a lightweight agent-facing control surface.
+    if env::args().nth(1).as_deref() == Some("ctl") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match ctl::run(argv).await {
             Ok(()) => Ok(()),
             Err(e) => {
                 eprintln!("error: {e}");
@@ -8152,8 +19801,9 @@ async fn main() -> Result<(), CallerError> {
     }
 
     // Create shared frame registry for video frame storage.
-    let frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>> =
-        Arc::new(tokio::sync::RwLock::new(frames::FrameRegistry::new(&log_dir)));
+    let frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>> = Arc::new(
+        tokio::sync::RwLock::new(frames::FrameRegistry::new(&log_dir)),
+    );
 
     // Create recording registry (listener spawned after bus creation in each mode).
     if project.config.recording.enabled && !recording::is_ffmpeg_available() {
@@ -8201,6 +19851,22 @@ async fn main() -> Result<(), CallerError> {
                 if let Ok(mut log) = signal_session_log.lock() {
                     log.mark_interrupted();
                 }
+                let interrupted_session_logs =
+                    session_log::mark_registered_session_logs_interrupted_now();
+                if !interrupted_session_logs.is_empty() {
+                    eprintln!(
+                        "Marked open session logs interrupted during signal shutdown: {:?}",
+                        interrupted_session_logs
+                    );
+                }
+                let cleaned_external_children =
+                    external_agent::cleanup_spawned_child_processes_now();
+                if !cleaned_external_children.is_empty() {
+                    eprintln!(
+                        "Cleaned up external-agent child processes during signal shutdown: {:?}",
+                        cleaned_external_children
+                    );
+                }
                 // Clean up control socket
                 control::cleanup();
                 // Restore terminal (best-effort) so the shell isn't left in raw mode
@@ -8223,6 +19889,16 @@ async fn main() -> Result<(), CallerError> {
     // in MCP/JSON modes that own stdio.
     let use_web = !flags.no_web && !flags.mcp && !flags.json_output;
 
+    // Resolve CLI/config external-agent choice once and share the effective
+    // runtime value with dashboard APIs. This intentionally happens before
+    // provider selection so `--agent codex` runs do not warn as if no worker is
+    // available when only native provider API keys are missing.
+    let initial_agent_backend =
+        resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
+    let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
+        Arc::new(tokio::sync::RwLock::new(initial_agent_backend.clone()));
+    let runtime_presence_enabled = !flags.no_presence && project.config.presence.enabled;
+
     // Resolve web port via auto-discovery, keeping the listener alive (no TOCTOU).
     let (web_port, mut web_listener) = if use_web {
         let (port, listener) = find_available_port(flags.web_port).await?;
@@ -8232,6 +19908,24 @@ async fn main() -> Result<(), CallerError> {
     };
     // Only expose the web port to external agents when the web gateway is actually running.
     let web_port_for_agent: Option<u16> = if use_web { Some(web_port) } else { None };
+
+    // Build the dashboard's TLS acceptor once (cheap to clone into each
+    // gateway spawn site). Off unless `--tls` / `[server.tls] enabled`.
+    // A misconfiguration (bad cert/key, half-specified pair) fails startup
+    // here rather than silently degrading to plain HTTP. The bind address
+    // feeds the self-signed cert's SAN list.
+    let web_tls_acceptor = if use_web {
+        let bind_addr = web_listener.as_ref().and_then(|l| l.local_addr().ok());
+        build_web_tls_acceptor(&flags, &project.config.server.tls, bind_addr)?
+    } else {
+        None
+    };
+    if web_tls_acceptor.is_some() {
+        eprintln!(
+            "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
+             (cleartext HTTP/WS connections are refused)"
+        );
+    }
 
     let provider_result = provider::select_provider();
     let provider = match provider_result {
@@ -8246,13 +19940,29 @@ async fn main() -> Result<(), CallerError> {
             // No API keys — start the dashboard anyway.
             // Display control, session browsing, annotations, and clipping
             // all work without inference.
-            eprintln!(
-                "Warning: {} AI features will be unavailable. \
-                 The web dashboard is starting without a model provider.",
-                e
-            );
+            if let Some(backend) = &initial_agent_backend {
+                eprintln!(
+                    "Warning: no native model provider: {}. Native-provider features are unavailable, \
+                     but the {} external agent can run with its own authentication.",
+                    e,
+                    backend
+                );
+            } else {
+                eprintln!(
+                    "Warning: {} AI features will be unavailable. \
+                     The web dashboard is starting without a model provider.",
+                    e
+                );
+            }
             slog(&session_log, |l| {
-                l.warn(&format!("No AI provider: {}", e));
+                if let Some(backend) = &initial_agent_backend {
+                    l.warn(&format!(
+                        "No native model provider: {}; external agent configured: {}",
+                        e, backend
+                    ));
+                } else {
+                    l.warn(&format!("No AI provider: {}", e));
+                }
             });
             None
         }
@@ -8265,24 +19975,32 @@ async fn main() -> Result<(), CallerError> {
 
     // Check if running as a sub-agent (headless, no TUI)
     if let Some((id, role)) = sub_agent::detect_sub_agent_mode() {
-        let provider = provider.ok_or_else(|| {
-            CallerError::Config("Sub-agent mode requires an API key".to_string())
-        })?;
+        let provider = provider
+            .ok_or_else(|| CallerError::Config("Sub-agent mode requires an API key".to_string()))?;
         run_sub_agent_mode(provider, id, role, session_log, log_dir).await?;
         return Ok(());
     }
 
     // Determine whether to use TUI (needed early for task resolution).
-    // Web gateway forces TUI mode (served via web) even without a real terminal.
-    let use_tui = use_web
-        || (!flags.no_tui && !flags.mcp && io::stdin().is_terminal() && io::stdout().is_terminal());
+    // Idle web/dashboard startup defaults to the daemon path: no terminal TUI,
+    // and the session supervisor owns all launches. `--no-web` keeps the
+    // terminal TUI available for interactive local use.
+    let web_daemon_requested = should_start_idle_web_daemon(use_web, &flags);
+    let use_tui = !web_daemon_requested
+        && (use_web
+            || (!flags.no_tui
+                && !flags.mcp
+                && io::stdin().is_terminal()
+                && io::stdout().is_terminal()));
 
     // Task resolution: MCP and TUI modes allow starting without a task.
     // MCP mode must NOT call get_task_from_flags_or_env() because it would
     // print to stdout and read from stdin, both reserved for JSON-RPC.
     // TUI mode can accept a task later via the follow-up input panel.
     // Headless mode still requires a task upfront.
-    let task = if flags.mcp {
+    let task = if web_daemon_requested {
+        None
+    } else if flags.mcp {
         flags.task.clone().filter(|t| !t.is_empty())
     } else if use_tui {
         flags.task.clone().filter(|t| !t.is_empty())
@@ -8302,6 +20020,205 @@ async fn main() -> Result<(), CallerError> {
     let autonomy_state = AutonomyState::new(flags.autonomy, project.config.approval.clone());
     let autonomy = autonomy::shared_autonomy(autonomy_state);
 
+    if web_daemon_requested {
+        let bus = EventBus::new();
+        let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
+        let _recording_listener = recording::spawn_recording_listener(
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
+        );
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
+        // Windows: auto-register the existing desktop as an active display so
+        // the dashboard streams it on connect (mirrors the macOS end state of
+        // a live session sitting in the registry). macOS/Linux compile this
+        // out and keep activating only on an explicit grant.
+        #[cfg(target_os = "windows")]
+        auto_activate_windows_user_display(
+            &bus,
+            &session_registry,
+            Some(frame_registry.clone()),
+            &autonomy,
+        )
+        .await;
+        start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
+        let _debug_handler = Some(debug::spawn_debug_screen_handler(
+            bus.subscribe(),
+            project.config.recording.clone(),
+            web_port,
+            bus.clone(),
+        ));
+
+        let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
+        let _outbound_broadcaster =
+            event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
+
+        let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
+            let snapshot_dir = log_dir.join("file_snapshots");
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
+                Ok(watcher) => {
+                    let (fw, wh, rh) = watcher.start_shared();
+                    (Some(fw), Some(wh), Some(rh))
+                }
+                Err(e) => {
+                    eprintln!("[file_watcher] Failed to start: {}", e);
+                    (None, None, None)
+                }
+            }
+        };
+
+        let transcriber: Option<std::sync::Arc<dyn transcription::Transcriber>> =
+            if project.config.transcription.enabled {
+                match transcription::WhisperTranscriber::new(&project.config.transcription) {
+                    Ok(t) => Some(std::sync::Arc::new(t)),
+                    Err(e) => {
+                        eprintln!("Transcription init failed: {}", e);
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+        let mut web_config = web_gateway::build_config(
+            project.config.presence.live_provider.as_deref(),
+            project.config.presence.live_model.as_deref(),
+            project.config.transcription.enabled,
+            project.config.webrtc.to_ice_config(),
+            project.config.webrtc.federation_allow_h264,
+        );
+        web_config.presence_enabled = runtime_presence_enabled;
+        web_config.external_agent = initial_agent_backend
+            .as_ref()
+            .map(|backend| backend.as_short_str().to_string());
+        let shared_session = Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+            daemon_session_id: session_log_id(&session_log),
+            query_ctx: None,
+            frame_registry: Some(frame_registry.clone()),
+            session_log: None,
+            recording_registry: Some(recording_registry.clone()),
+            session_registry: Some(session_registry.clone()),
+            snapshot_dir: Some(log_dir.join("file_snapshots")),
+            project_root_for_changes: Some(project.root.clone()),
+            runtime_settings: web_gateway::RuntimeSettingsState {
+                external_agent: Some(shared_external_agent.clone()),
+                presence_enabled: Some(runtime_presence_enabled),
+            },
+            file_watcher: shared_file_watcher.clone(),
+        }));
+        let mut mcp_http_state = mcp::McpAppState::new(
+            "none".into(),
+            "none".into(),
+            autonomy.clone(),
+            log_dir.clone(),
+        );
+        mcp_http_state.codex_managed_context =
+            project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+        mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
+        mcp_http_state.frame_registry = Some(frame_registry.clone());
+        mcp_http_state.session_registry = Some(session_registry.clone());
+        mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
+        let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
+            Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+            bus.clone(),
+        )));
+        let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
+        let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
+        let _web_handle = web_gateway::spawn_web_gateway(
+            web_listener
+                .take()
+                .expect("web listener must exist when use_web"),
+            bus.clone(),
+            outbound_tx.clone(),
+            web_config,
+            shared_session.clone(),
+            transcriber,
+            None,
+            None,
+            Some(project.root.clone()),
+            mcp_http_server,
+            Some(peer_registry),
+            advertise_urls,
+            project.config.server.auth.bearer_token.clone(),
+            build_local_advertised_auth(
+                &project.config.server.auth,
+                &lan::backend::select_backend().cert_dir(),
+            )?,
+            web_tls_acceptor.clone(),
+        );
+        eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
+
+        let shared_codex_config: control_plane::SharedCodexConfig = {
+            let cfg = &project.config.agent.codex;
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::CodexRuntimeConfig {
+                    command: cfg.command.clone(),
+                    sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                    approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                    model: cfg.model.clone(),
+                    reasoning_effort: project::normalize_reasoning_effort(
+                        cfg.reasoning_effort.as_deref(),
+                    ),
+                    service_tier: project::normalize_codex_service_tier(
+                        cfg.service_tier.as_deref(),
+                    ),
+                    web_search: cfg.web_search,
+                    network_access: cfg.network_access,
+                    writable_roots: cfg.writable_roots.clone(),
+                    managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+                    context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
+                },
+            ))
+        };
+        let shared_gemini_config: control_plane::SharedGeminiConfig = {
+            let cfg = &project.config.agent.gemini_cli;
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::GeminiRuntimeConfig {
+                    model: cfg.model.clone(),
+                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                    sandbox: cfg.sandbox,
+                    extensions: cfg.extensions.clone(),
+                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                    include_directories: cfg.include_directories.clone(),
+                    debug: cfg.debug,
+                },
+            ))
+        };
+        let _control_plane_handle = control_plane::spawn(
+            bus.subscribe(),
+            control_plane::ControlPlaneState {
+                autonomy: autonomy.clone(),
+                external_agent: shared_external_agent.clone(),
+                codex_config: shared_codex_config.clone(),
+                gemini_config: shared_gemini_config.clone(),
+                bus: bus.clone(),
+                project_root: Some(project.root.clone()),
+            },
+        );
+
+        session_supervisor::SessionSupervisor::new(session_supervisor::SessionSupervisorConfig {
+            bus,
+            project_root: project.root.clone(),
+            autonomy,
+            shared_external_agent,
+            shared_codex_config,
+            shared_gemini_config,
+            frame_registry,
+            web_port: web_port_for_agent,
+            flags_direct: flags.direct,
+            shared_session: Some(shared_session),
+        })
+        .run()
+        .await;
+        return Ok(());
+    }
+
     if flags.mcp {
         // MCP mode — speaks Model Context Protocol on stdio.
         // This is architecturally a peer of the TUI: same EventBus, same UserAction contract.
@@ -8312,9 +20229,16 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_human_question_monitor(bus.clone(), human_question_path.clone());
         let _tick_handle = event::spawn_tick_timer(bus.clone(), 1000);
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
@@ -8356,23 +20280,17 @@ async fn main() -> Result<(), CallerError> {
 
         // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
         // shared broadcast channel.
-        let _outbound_broadcaster = event::spawn_outbound_broadcaster(
-            bus.subscribe(),
-            outbound_tx.clone(),
-        );
+        let _outbound_broadcaster =
+            event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
 
         // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer = event::spawn_session_log_writer(
-            bus.subscribe(),
-            session_log.clone(),
-        );
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(
-                project.root.clone(), snapshot_dir, bus.clone(),
-            ) {
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
                     let (fw, wh, rh) = watcher.start_shared();
                     (Some(fw), Some(wh), Some(rh))
@@ -8399,15 +20317,21 @@ async fn main() -> Result<(), CallerError> {
                 } else {
                     None
                 };
-            let config = web_gateway::build_config(
+            let mut config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
+                project.config.webrtc.federation_allow_h264,
             );
+            config.presence_enabled = runtime_presence_enabled;
+            config.external_agent = initial_agent_backend
+                .as_ref()
+                .map(|backend| backend.as_short_str().to_string());
             let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session = Arc::new(tokio::sync::RwLock::new(
-                web_gateway::ActiveSessionState {
+            let shared_session =
+                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+                    daemon_session_id: session_log_id(&session_log),
                     query_ctx: None,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -8415,25 +20339,34 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    runtime_settings: web_gateway::RuntimeSettingsState {
+                        external_agent: Some(shared_external_agent.clone()),
+                        presence_enabled: Some(runtime_presence_enabled),
+                    },
                     file_watcher: shared_file_watcher.clone(),
-                },
-            ));
+                }));
             let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+                "none".into(),
+                "none".into(),
+                autonomy.clone(),
+                log_dir.clone(),
             );
+            mcp_http_state.codex_managed_context =
+                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+                bus.clone(),
             )));
-            let peer_registry = build_and_hydrate_peer_registry(
-                &log_dir,
-                &project.config.peers,
-            );
+            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
             let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let handle = web_gateway::spawn_web_gateway(
-                web_listener.take().expect("web listener must exist when use_web"),
+                web_listener
+                    .take()
+                    .expect("web listener must exist when use_web"),
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -8450,30 +20383,39 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             slog(&session_log, |l| {
-                l.info(&format!(
-                    "Web TUI: http://0.0.0.0:{}",
-                    web_port
-                ))
+                l.info(&format!("Web TUI: http://0.0.0.0:{}", web_port))
             });
-            eprintln!(
-                "Web TUI: http://0.0.0.0:{}",
-                web_port
-            );
+            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
             Some(handle)
         } else {
             None
         };
 
         let mut mcp_app_state = mcp::McpAppState::new(
-            provider.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| "none".to_string()),
-            provider.as_ref().map(|p| p.model().to_string()).unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.model().to_string())
+                .unwrap_or_else(|| "none".to_string()),
             autonomy.clone(),
             log_dir.clone(),
         );
+        mcp_app_state.external_agent = initial_agent_backend.clone();
+        mcp_app_state.codex_managed_context =
+            project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+        mcp_app_state.configured_codex_managed_context = mcp_app_state.codex_managed_context;
         mcp_app_state.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
-        mcp_app_state.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
+        mcp_app_state.hard_context_window = provider.as_ref().map(|p| p.context_window());
+        mcp_app_state.session_id = session_log
+            .lock()
+            .map(|l| l.session_id().to_string())
+            .unwrap_or_default();
         mcp_app_state.task_description = task.clone().unwrap_or_default();
         mcp_app_state.frame_registry = Some(frame_registry.clone());
         mcp_app_state.session_registry = Some(session_registry.clone());
@@ -8556,7 +20498,7 @@ async fn main() -> Result<(), CallerError> {
                 };
 
                 // Create follow-up channel for multi-round support
-                let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+                let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
                 {
                     let mut s = mcp_state.write().await;
                     s.follow_up_tx = Some(follow_up_tx);
@@ -8589,7 +20531,12 @@ async fn main() -> Result<(), CallerError> {
                             event::ContextInjectionQueue::default(),
                             false,
                             web_port_for_agent,
-                            vec![],
+                            UserAttachments::default(),
+                            None,
+                            None,
+                            None,
+                            false,
+                            None,
                         )
                         .await
                     } else if use_orchestration {
@@ -8617,7 +20564,7 @@ async fn main() -> Result<(), CallerError> {
                             approval_registry,
                             event::ContextInjectionQueue::default(),
                             false, // not headless — MCP has interactive approval
-                            vec![],
+                            UserAttachments::default(),
                         )
                         .await
                     };
@@ -8672,19 +20619,10 @@ async fn main() -> Result<(), CallerError> {
         }
 
         // Run the MCP server on stdio (blocks until client disconnects or quit)
-        let reloaded = env::var("INTENDANT_MCP_RELOAD").is_ok();
-        if reloaded {
-            // Clear the flag so a subsequent reload doesn't think it's still reloading
-            env::remove_var("INTENDANT_MCP_RELOAD");
-            slog(&session_log, |l| {
-                l.info("MCP server reloaded via exec (injecting synthetic init)");
-            });
-        }
         if let Err(e) = mcp::run_mcp_server(
             mcp_state,
             bus,
             event_rx,
-            reloaded,
             Some(human_question_path),
             mcp_control_tx,
         )
@@ -8717,9 +20655,16 @@ async fn main() -> Result<(), CallerError> {
             event::shared_question_path(log_dir.join("human_question")),
         );
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
@@ -8737,13 +20682,22 @@ async fn main() -> Result<(), CallerError> {
 
         // Create app state
         let mut app = tui::app::App::new(
-            provider.as_ref().map(|p| p.name().to_string()).unwrap_or_else(|| "none".to_string()),
-            provider.as_ref().map(|p| p.model().to_string()).unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.name().to_string())
+                .unwrap_or_else(|| "none".to_string()),
+            provider
+                .as_ref()
+                .map(|p| p.model().to_string())
+                .unwrap_or_else(|| "none".to_string()),
             autonomy.clone(),
             log_dir.clone(),
         );
         app.context_window = provider.as_ref().map(|p| p.context_window()).unwrap_or(0);
-        app.session_id = session_log.lock().map(|l| l.session_id().to_string()).unwrap_or_default();
+        app.session_id = session_log
+            .lock()
+            .map(|l| l.session_id().to_string())
+            .unwrap_or_default();
         app.task_description = task.clone().unwrap_or_default();
         app.project_root = Some(project.root.clone());
         app.knowledge_path = Some(project.memory_path());
@@ -8787,23 +20741,22 @@ async fn main() -> Result<(), CallerError> {
         // Wire outbound broadcaster: converts AppEvents to OutboundEvents on the
         // shared broadcast channel (control socket / web gateway).
         let _outbound_broadcaster = if let Some(ref tx) = app.control_tx {
-            Some(event::spawn_outbound_broadcaster(bus.subscribe(), tx.clone()))
+            Some(event::spawn_outbound_broadcaster(
+                bus.subscribe(),
+                tx.clone(),
+            ))
         } else {
             None
         };
 
         // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer = event::spawn_session_log_writer(
-            bus.subscribe(),
-            session_log.clone(),
-        );
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(
-                project.root.clone(), snapshot_dir, bus.clone(),
-            ) {
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
                     let (fw, wh, rh) = watcher.start_shared();
                     (Some(fw), Some(wh), Some(rh))
@@ -8822,22 +20775,21 @@ async fn main() -> Result<(), CallerError> {
         // Determine if presence layer should be active.
         // Note: --direct only forces single-agent mode for the worker; it does
         // NOT disable presence.  Use --no-presence to disable presence.
-        let use_presence = !flags.no_presence
-            && project.config.presence.enabled;
+        let use_presence = !flags.no_presence && project.config.presence.enabled;
 
         // Create follow-up channel for multi-round support.
         // When there is no initial task, the follow-up channel also delivers
         // the very first task from the input panel. Owned by the task
         // dispatcher (spawned below), not the TUI — the TUI emits
         // ControlCommand on the bus, the dispatcher routes.
-        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<String>(4);
+        let (follow_up_tx, mut follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(4);
 
         // If no task was provided, start in follow-up mode so the user sees
         // the input panel immediately.
         if task.is_none() {
             app.current_phase = types::Phase::WaitingFollowUp;
             app.mode = tui::app::AppMode::FollowUp;
-            let mut textarea = tui_textarea::TextArea::default();
+            let mut textarea = ratatui_textarea::TextArea::default();
             textarea.set_cursor_line_style(ratatui::style::Style::default());
             app.follow_up_textarea = Some(textarea);
             app.log(
@@ -8850,9 +20802,13 @@ async fn main() -> Result<(), CallerError> {
         // and the shared agent state snapshot. The presence_tx sender is owned by
         // the task dispatcher (spawned below), which routes non-direct user text
         // through the presence LLM.
-        let (presence_user_rx, presence_event_rx_for_task, presence_agent_state, presence_tx_for_dispatch) = if use_presence {
-            let (presence_tx, presence_user_rx) =
-                tokio::sync::mpsc::channel::<String>(4);
+        let (
+            presence_user_rx,
+            presence_event_rx_for_task,
+            presence_agent_state,
+            presence_tx_for_dispatch,
+        ) = if use_presence {
+            let (presence_tx, presence_user_rx) = tokio::sync::mpsc::channel::<String>(4);
 
             // Create presence event channel: TUI forwards filtered events here
             let (presence_event_tx, presence_event_rx) =
@@ -8860,23 +20816,36 @@ async fn main() -> Result<(), CallerError> {
             app.set_presence_event_sender(presence_event_tx);
 
             // Shared agent state: updated by TUI (via forward_to_presence), read by presence tools
-            let agent_state = Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default()));
+            let agent_state = Arc::new(std::sync::Mutex::new(
+                presence::AgentStateSnapshot::default(),
+            ));
             app.set_presence_agent_state(agent_state.clone());
 
-            app.log_sourced(types::LogLevel::Info, "Presence layer active".to_string(), tui::app::LogSource::Presence, None);
+            app.log_sourced(
+                types::LogLevel::Info,
+                "Presence layer active".to_string(),
+                tui::app::LogSource::Presence,
+                None,
+            );
             // If there's an initial task, set the phase to Thinking immediately
             // so the TUI doesn't sit at "Idle" during the presence API call.
             if task.is_some() {
                 app.current_phase = types::Phase::Thinking;
             }
-            (Some(presence_user_rx), Some(presence_event_rx), Some(agent_state), Some(presence_tx))
+            (
+                Some(presence_user_rx),
+                Some(presence_event_rx),
+                Some(agent_state),
+                Some(presence_tx),
+            )
         } else {
             (None, None, None, None)
         };
 
         // Create the shared PresenceSession for event replay and checkpoints
         let presence_session = {
-            let sid = session_log.lock()
+            let sid = session_log
+                .lock()
                 .map(|l| l.session_id().to_string())
                 .unwrap_or_default();
             Arc::new(Mutex::new(presence::PresenceSession::new(sid)))
@@ -8893,8 +20862,7 @@ async fn main() -> Result<(), CallerError> {
         // `follow_up_tx` instead, which is consumed by
         // `run_external_agent_mode` / `run_direct_mode`.
         let (task_tx, task_rx) = if use_presence {
-            let (tx, rx) =
-                tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
+            let (tx, rx) = tokio::sync::mpsc::channel::<presence::TaskEnvelope>(4);
             (Some(tx), Some(rx))
         } else {
             (None, None)
@@ -8907,6 +20875,10 @@ async fn main() -> Result<(), CallerError> {
             presence_tx: presence_tx_for_dispatch,
             task_tx: task_tx.clone(),
             follow_up_tx: Some(follow_up_tx.clone()),
+            primary_session_id: session_log
+                .lock()
+                .map(|log| log.session_id().to_string())
+                .ok(),
         }
         .spawn(bus.clone());
 
@@ -8917,10 +20889,13 @@ async fn main() -> Result<(), CallerError> {
         // injections still reach the agent loop in --no-presence mode.
         // When presence is disabled, agent_state is a fresh empty snapshot
         // (no live updates), but context_injection is still wired through.
+        let mut web_shared_session_for_supervisor: Option<web_gateway::SharedActiveSession> = None;
         let _web_handle = if let Some(broadcast_tx) = web_broadcast_tx {
-            let query_ctx_agent_state = presence_agent_state
-                .clone()
-                .unwrap_or_else(|| Arc::new(std::sync::Mutex::new(presence::AgentStateSnapshot::default())));
+            let query_ctx_agent_state = presence_agent_state.clone().unwrap_or_else(|| {
+                Arc::new(std::sync::Mutex::new(
+                    presence::AgentStateSnapshot::default(),
+                ))
+            });
             let query_ctx = Some(web_gateway::WebQueryCtx {
                 agent_state: query_ctx_agent_state,
                 project_root: project.root.clone(),
@@ -8934,22 +20909,31 @@ async fn main() -> Result<(), CallerError> {
                     match transcription::WhisperTranscriber::new(&project.config.transcription) {
                         Ok(t) => Some(std::sync::Arc::new(t)),
                         Err(e) => {
-                            app.log(types::LogLevel::Warn, format!("Transcription init failed: {}", e));
+                            app.log(
+                                types::LogLevel::Warn,
+                                format!("Transcription init failed: {}", e),
+                            );
                             None
                         }
                     }
                 } else {
                     None
                 };
-            let config = web_gateway::build_config(
+            let mut config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
+                project.config.webrtc.federation_allow_h264,
             );
+            config.presence_enabled = runtime_presence_enabled;
+            config.external_agent = initial_agent_backend
+                .as_ref()
+                .map(|backend| backend.as_short_str().to_string());
             let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session = Arc::new(tokio::sync::RwLock::new(
-                web_gateway::ActiveSessionState {
+            let shared_session =
+                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+                    daemon_session_id: session_log_id(&session_log),
                     query_ctx,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -8957,29 +20941,39 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    runtime_settings: web_gateway::RuntimeSettingsState {
+                        external_agent: Some(shared_external_agent.clone()),
+                        presence_enabled: Some(runtime_presence_enabled),
+                    },
                     file_watcher: shared_file_watcher.clone(),
-                },
-            ));
+                }));
+            web_shared_session_for_supervisor = Some(shared_session.clone());
             // Create MCP server for HTTP transport (display/CU tools for external agents)
             let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+                "none".into(),
+                "none".into(),
+                autonomy.clone(),
+                log_dir.clone(),
             );
+            mcp_http_state.codex_managed_context =
+                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+                bus.clone(),
             )));
-            let peer_registry = build_and_hydrate_peer_registry(
-                &log_dir,
-                &project.config.peers,
-            );
+            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
             // Browser-voice SubmitTask actions go via the EventBus → dispatcher
             // path (task_tx=None triggers the fallback at web_gateway.rs),
             // keeping a single routing authority.
             let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let handle = web_gateway::spawn_web_gateway(
-                web_listener.take().expect("web listener must exist when use_web"),
+                web_listener
+                    .take()
+                    .expect("web listener must exist when use_web"),
                 bus.clone(),
                 broadcast_tx,
                 config,
@@ -8996,6 +20990,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
             app.log(
                 types::LogLevel::Info,
@@ -9025,41 +21020,47 @@ async fn main() -> Result<(), CallerError> {
             None
         };
         let force_direct = flags.direct;
-        // Resolve external agent backend: CLI flag > config default > None
-        let agent_backend =
-            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
-        // Shared state for dynamic external agent selection from the web UI.
-        // Seeded with the resolved CLI/config value; updated by SetExternalAgent ControlMsg.
-        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
-            Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        // External agent backend resolved at startup; the shared runtime handle
+        // above is kept in sync by ControlPlane SetExternalAgent messages.
+        let agent_backend = initial_agent_backend.clone();
         // Live Codex config — seeded from TOML, updated by SetCodex* ControlMsgs.
         // The daemon loop reads this at the start of each task so a Control-tab
         // toggle takes effect on the next task without needing a restart.
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
-            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
-                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-                model: cfg.model.clone(),
-                reasoning_effort: project::normalize_reasoning_effort(
-                    cfg.reasoning_effort.as_deref(),
-                ),
-                web_search: cfg.web_search,
-                network_access: cfg.network_access,
-                writable_roots: cfg.writable_roots.clone(),
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::CodexRuntimeConfig {
+                    command: cfg.command.clone(),
+                    sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                    approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                    model: cfg.model.clone(),
+                    reasoning_effort: project::normalize_reasoning_effort(
+                        cfg.reasoning_effort.as_deref(),
+                    ),
+                    service_tier: project::normalize_codex_service_tier(
+                        cfg.service_tier.as_deref(),
+                    ),
+                    web_search: cfg.web_search,
+                    network_access: cfg.network_access,
+                    writable_roots: cfg.writable_roots.clone(),
+                    managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+                    context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
+                },
+            ))
         };
         let shared_gemini_config: control_plane::SharedGeminiConfig = {
             let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
-                model: cfg.model.clone(),
-                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                sandbox: cfg.sandbox,
-                extensions: cfg.extensions.clone(),
-                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                include_directories: cfg.include_directories.clone(),
-                debug: cfg.debug,
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::GeminiRuntimeConfig {
+                    model: cfg.model.clone(),
+                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                    sandbox: cfg.sandbox,
+                    extensions: cfg.extensions.clone(),
+                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                    include_directories: cfg.include_directories.clone(),
+                    debug: cfg.debug,
+                },
+            ))
         };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
@@ -9072,6 +21073,27 @@ async fn main() -> Result<(), CallerError> {
                 project_root: Some(project.root.clone()),
             },
         );
+        let _resume_listener_handle = if use_web {
+            Some(
+                session_supervisor::SessionSupervisor::new(
+                    session_supervisor::SessionSupervisorConfig {
+                        bus: bus.clone(),
+                        project_root: project.root.clone(),
+                        autonomy: autonomy.clone(),
+                        shared_external_agent: shared_external_agent.clone(),
+                        shared_codex_config: shared_codex_config.clone(),
+                        shared_gemini_config: shared_gemini_config.clone(),
+                        frame_registry: frame_registry.clone(),
+                        web_port: web_port_for_agent,
+                        flags_direct: flags.direct,
+                        shared_session: web_shared_session_for_supervisor.clone(),
+                    },
+                )
+                .spawn_resume_listener(),
+            )
+        } else {
+            None
+        };
         let mut loop_handle = if use_presence {
             // Presence mode: the presence layer mediates between user and agent
             let presence_user_rx = presence_user_rx.unwrap();
@@ -9080,8 +21102,7 @@ async fn main() -> Result<(), CallerError> {
             // task_tx/task_rx are Some when use_presence is true (see above).
             let task_tx = task_tx.expect("task_tx created in presence mode");
             let task_rx = task_rx.expect("task_rx created in presence mode");
-            let (response_tx, mut response_rx) =
-                tokio::sync::mpsc::channel::<String>(8);
+            let (response_tx, mut response_rx) = tokio::sync::mpsc::channel::<String>(8);
 
             // Shared paused ref-count: incremented by PresenceConnected, decremented by PresenceDisconnected.
             // Server-side presence is paused when count > 0 (any browser has active voice).
@@ -9093,7 +21114,9 @@ async fn main() -> Result<(), CallerError> {
             let _response_forwarder = tokio::spawn(async move {
                 while let Some(response) = response_rx.recv().await {
                     if !response.is_empty() {
-                        if response.starts_with("Presence error:") || response.starts_with("Presence provider timed out") {
+                        if response.starts_with("Presence error:")
+                            || response.starts_with("Presence provider timed out")
+                        {
                             bus_for_responses.send(AppEvent::LoopError(response));
                         } else {
                             // Log presence response as a visible PresenceLog entry
@@ -9154,11 +21177,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     Err(e) => {
                         slog(&session_log_summary, |l| {
-                            l.write_summary(
-                                "(presence)",
-                                &format!("error: {}", e),
-                                0,
-                            )
+                            l.write_summary("(presence)", &format!("error: {}", e), 0)
                         });
                         bus_clone.send(AppEvent::LoopError(e.to_string()));
                     }
@@ -9176,14 +21195,15 @@ async fn main() -> Result<(), CallerError> {
                     match follow_up_rx.recv().await {
                         Some(first_task) => {
                             slog(&session_log_clone, |l| {
-                                l.info(&format!("Task (from input): {}", first_task))
+                                l.info(&format!("Task (from input): {}", first_task.text))
                             });
                             bus_clone.send(AppEvent::TurnStarted {
+                                session_id: session_log_id(&session_log_clone),
                                 turn: 0,
                                 budget_pct: 0.0,
                                 remaining: 0,
                             });
-                            (first_task, follow_up_rx)
+                            (first_task.text, follow_up_rx)
                         }
                         None => return, // channel closed before a task arrived
                     }
@@ -9204,7 +21224,12 @@ async fn main() -> Result<(), CallerError> {
                         context_injection_clone.clone(),
                         false, // not headless — TUI handles approval
                         web_port_for_agent,
-                        vec![],
+                        UserAttachments::default(),
+                        None,
+                        None,
+                        None,
+                        false,
+                        None,
                     )
                     .await
                 } else {
@@ -9234,7 +21259,7 @@ async fn main() -> Result<(), CallerError> {
                             approval_registry_clone,
                             context_injection_clone,
                             false, // not headless — TUI handles approval
-                            vec![],
+                            UserAttachments::default(),
                         )
                         .await
                     } else {
@@ -9263,11 +21288,7 @@ async fn main() -> Result<(), CallerError> {
                     }
                     Err(e) => {
                         slog(&session_log_summary, |l| {
-                            l.write_summary(
-                                "(tui)",
-                                &format!("error: {}", e),
-                                0,
-                            )
+                            l.write_summary("(tui)", &format!("error: {}", e), 0)
                         });
                         bus_clone.send(AppEvent::LoopError(e.to_string()));
                     }
@@ -9303,7 +21324,7 @@ async fn main() -> Result<(), CallerError> {
         // Give the agent task a moment to finish writing the session summary.
         // If it doesn't finish in time (e.g. stuck on an API call), abort it.
         match tokio::time::timeout(std::time::Duration::from_secs(5), &mut loop_handle).await {
-            Ok(_) => {} // task finished naturally
+            Ok(_) => {}                    // task finished naturally
             Err(_) => loop_handle.abort(), // timed out — force stop
         }
 
@@ -9314,17 +21335,23 @@ async fn main() -> Result<(), CallerError> {
             });
             // Daemon mode: keep web gateway alive after TUI quits.
             // Fall through to a headless daemon loop (TUI is not re-created).
-            eprintln!("TUI exited. Web gateway still running on port {}. Waiting for new tasks...", web_port);
+            eprintln!(
+                "TUI exited. Web gateway still running on port {}. Waiting for new tasks...",
+                web_port
+            );
             run_daemon_loop(DaemonConfig {
                 bus: bus.clone(),
                 project_root: project_root.clone(),
                 autonomy: autonomy.clone(),
                 shared_external_agent: shared_external_agent.clone(),
+                shared_codex_config: shared_codex_config.clone(),
+                shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry_for_events.clone(),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: None,
-            }).await;
+            })
+            .await;
         }
 
         control::cleanup();
@@ -9335,9 +21362,16 @@ async fn main() -> Result<(), CallerError> {
         // Headless mode (--no-tui or non-TTY)
         let bus = EventBus::new();
         let _recording_listener = recording::spawn_recording_listener(
-            bus.subscribe(), recording_registry.clone(), bus.clone(), Some(session_registry.clone()),
+            bus.subscribe(),
+            recording_registry.clone(),
+            bus.clone(),
+            Some(session_registry.clone()),
         );
-        let _user_display_listener = spawn_user_display_listener(bus.clone(), session_registry.clone(), Some(frame_registry.clone()));
+        let _user_display_listener = spawn_user_display_listener(
+            bus.clone(),
+            session_registry.clone(),
+            Some(frame_registry.clone()),
+        );
         start_external_display_recordings(&flags.record_displays, &recording_registry, &bus).await;
         let _debug_handler = if use_web {
             Some(debug::spawn_debug_screen_handler(
@@ -9354,23 +21388,17 @@ async fn main() -> Result<(), CallerError> {
         let (outbound_tx, _) = tokio::sync::broadcast::channel::<String>(256);
 
         // Wire outbound broadcaster: converts AppEvents to OutboundEvents
-        let _outbound_broadcaster = event::spawn_outbound_broadcaster(
-            bus.subscribe(),
-            outbound_tx.clone(),
-        );
+        let _outbound_broadcaster =
+            event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
 
         // Wire session log writer: persists bus events that aren't logged inline.
-        let _session_log_writer = event::spawn_session_log_writer(
-            bus.subscribe(),
-            session_log.clone(),
-        );
+        let _session_log_writer =
+            event::spawn_session_log_writer(bus.subscribe(), session_log.clone());
 
         // File watcher: observes project directory for changes, emits FileChanged events.
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
-            match file_watcher::FileWatcher::new(
-                project.root.clone(), snapshot_dir, bus.clone(),
-            ) {
+            match file_watcher::FileWatcher::new(project.root.clone(), snapshot_dir, bus.clone()) {
                 Ok(watcher) => {
                     let (fw, wh, rh) = watcher.start_shared();
                     (Some(fw), Some(wh), Some(rh))
@@ -9388,7 +21416,9 @@ async fn main() -> Result<(), CallerError> {
             tokio::spawn(async move {
                 loop {
                     match json_rx.recv().await {
-                        Ok(line) => { println!("{}", line); }
+                        Ok(line) => {
+                            println!("{}", line);
+                        }
                         Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
                     }
@@ -9410,15 +21440,21 @@ async fn main() -> Result<(), CallerError> {
                 } else {
                     None
                 };
-            let config = web_gateway::build_config(
+            let mut config = web_gateway::build_config(
                 project.config.presence.live_provider.as_deref(),
                 project.config.presence.live_model.as_deref(),
                 project.config.transcription.enabled,
                 project.config.webrtc.to_ice_config(),
+                project.config.webrtc.federation_allow_h264,
             );
+            config.presence_enabled = runtime_presence_enabled;
+            config.external_agent = initial_agent_backend
+                .as_ref()
+                .map(|backend| backend.as_short_str().to_string());
             let snapshot_dir = log_dir.join("file_snapshots");
-            let shared_session = Arc::new(tokio::sync::RwLock::new(
-                web_gateway::ActiveSessionState {
+            let shared_session =
+                Arc::new(tokio::sync::RwLock::new(web_gateway::ActiveSessionState {
+                    daemon_session_id: session_log_id(&session_log),
                     query_ctx: None,
                     frame_registry: Some(frame_registry.clone()),
                     session_log: Some(session_log.clone()),
@@ -9426,25 +21462,34 @@ async fn main() -> Result<(), CallerError> {
                     session_registry: Some(session_registry.clone()),
                     snapshot_dir: Some(snapshot_dir.clone()),
                     project_root_for_changes: Some(project.root.clone()),
+                    runtime_settings: web_gateway::RuntimeSettingsState {
+                        external_agent: Some(shared_external_agent.clone()),
+                        presence_enabled: Some(runtime_presence_enabled),
+                    },
                     file_watcher: shared_file_watcher.clone(),
-                },
-            ));
+                }));
             let mut mcp_http_state = mcp::McpAppState::new(
-                "none".into(), "none".into(), autonomy.clone(), log_dir.clone(),
+                "none".into(),
+                "none".into(),
+                autonomy.clone(),
+                log_dir.clone(),
             );
+            mcp_http_state.codex_managed_context =
+                project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
+            mcp_http_state.configured_codex_managed_context = mcp_http_state.codex_managed_context;
             mcp_http_state.frame_registry = Some(frame_registry.clone());
             mcp_http_state.session_registry = Some(session_registry.clone());
             mcp_http_state.screenshot_dir = Some(log_dir.join("screenshots"));
-            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new(
-                Arc::new(tokio::sync::RwLock::new(mcp_http_state)), bus.clone(),
+            let mcp_http_server = Some(Arc::new(mcp::IntendantServer::new_http(
+                Arc::new(tokio::sync::RwLock::new(mcp_http_state)),
+                bus.clone(),
             )));
-            let peer_registry = build_and_hydrate_peer_registry(
-                &log_dir,
-                &project.config.peers,
-            );
+            let peer_registry = build_and_hydrate_peer_registry(&log_dir, &project.config.peers);
             let advertise_urls = resolve_advertise_urls_from_flags_and_config(&flags, &project);
             let _web_handle = web_gateway::spawn_web_gateway(
-                web_listener.take().expect("web listener must exist when use_web"),
+                web_listener
+                    .take()
+                    .expect("web listener must exist when use_web"),
                 bus.clone(),
                 outbound_tx.clone(),
                 config,
@@ -9461,11 +21506,9 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &lan::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_acceptor.clone(),
             );
-            eprintln!(
-                "Web TUI: http://0.0.0.0:{}",
-                web_port
-            );
+            eprintln!("Web TUI: http://0.0.0.0:{}", web_port);
             Some(shared_session)
         } else {
             None
@@ -9480,7 +21523,7 @@ async fn main() -> Result<(), CallerError> {
         // Create follow-up channel. In JSON mode, spawn a stdin reader to enable
         // follow-up via stdin lines and JSON commands (approve, deny, input, etc.).
         // Otherwise, drop the sender immediately so recv() returns None → single-round.
-        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<String>(1);
+        let (follow_up_tx, follow_up_rx) = tokio::sync::mpsc::channel::<FollowUpMessage>(1);
         let json_approval_slot = if flags.json_output {
             Some(new_json_approval_slot())
         } else {
@@ -9530,16 +21573,21 @@ async fn main() -> Result<(), CallerError> {
                                 }
                                 event::ControlMsg::Input { text } => {
                                     // Write human_response file for askHuman IPC
-                                    let resp_path =
-                                        log_dir_for_stdin.join("human_response");
+                                    let resp_path = log_dir_for_stdin.join("human_response");
                                     let _ = std::fs::write(&resp_path, text.as_bytes());
                                 }
-                                event::ControlMsg::FollowUp { text, direct: _ } => {
+                                event::ControlMsg::FollowUp {
+                                    text, direct: _, ..
+                                } => {
                                     // This stdin handler only exists in
                                     // the headless `--json` path where
                                     // there's no presence layer, so the
                                     // direct bit is implicitly always on.
-                                    if follow_up_tx.send(text).await.is_err() {
+                                    if follow_up_tx
+                                        .send(FollowUpMessage::text(text))
+                                        .await
+                                        .is_err()
+                                    {
                                         break;
                                     }
                                 }
@@ -9551,7 +21599,11 @@ async fn main() -> Result<(), CallerError> {
                         }
                     }
                     // Plain text → follow-up message
-                    if follow_up_tx.send(line).await.is_err() {
+                    if follow_up_tx
+                        .send(FollowUpMessage::text(line))
+                        .await
+                        .is_err()
+                    {
                         break; // receiver dropped
                     }
                 }
@@ -9575,37 +21627,44 @@ async fn main() -> Result<(), CallerError> {
         let project_root = project.root.clone();
         let autonomy_for_daemon = autonomy.clone();
 
-        // Resolve external agent backend: CLI flag > config default > None
-        let agent_backend =
-            resolve_agent_backend_from_config(flags.agent_backend.clone(), &project);
-        // Shared state for dynamic external agent selection from the web UI (headless mode).
-        let shared_external_agent: Arc<tokio::sync::RwLock<Option<external_agent::AgentBackend>>> =
-            Arc::new(tokio::sync::RwLock::new(agent_backend.clone()));
+        // External agent backend resolved at startup; the shared runtime handle
+        // above is kept in sync by ControlPlane SetExternalAgent messages.
+        let agent_backend = initial_agent_backend.clone();
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
-            Arc::new(tokio::sync::RwLock::new(control_plane::CodexRuntimeConfig {
-                sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
-                approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
-                model: cfg.model.clone(),
-                reasoning_effort: project::normalize_reasoning_effort(
-                    cfg.reasoning_effort.as_deref(),
-                ),
-                web_search: cfg.web_search,
-                network_access: cfg.network_access,
-                writable_roots: cfg.writable_roots.clone(),
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::CodexRuntimeConfig {
+                    command: cfg.command.clone(),
+                    sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
+                    approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
+                    model: cfg.model.clone(),
+                    reasoning_effort: project::normalize_reasoning_effort(
+                        cfg.reasoning_effort.as_deref(),
+                    ),
+                    service_tier: project::normalize_codex_service_tier(
+                        cfg.service_tier.as_deref(),
+                    ),
+                    web_search: cfg.web_search,
+                    network_access: cfg.network_access,
+                    writable_roots: cfg.writable_roots.clone(),
+                    managed_context: project::normalize_codex_managed_context(&cfg.managed_context),
+                    context_archive: project::normalize_codex_context_archive(&cfg.context_archive),
+                },
+            ))
         };
         let shared_gemini_config: control_plane::SharedGeminiConfig = {
             let cfg = &project.config.agent.gemini_cli;
-            Arc::new(tokio::sync::RwLock::new(control_plane::GeminiRuntimeConfig {
-                model: cfg.model.clone(),
-                approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
-                sandbox: cfg.sandbox,
-                extensions: cfg.extensions.clone(),
-                allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
-                include_directories: cfg.include_directories.clone(),
-                debug: cfg.debug,
-            }))
+            Arc::new(tokio::sync::RwLock::new(
+                control_plane::GeminiRuntimeConfig {
+                    model: cfg.model.clone(),
+                    approval_mode: project::normalize_gemini_approval_mode(&cfg.approval_mode),
+                    sandbox: cfg.sandbox,
+                    extensions: cfg.extensions.clone(),
+                    allowed_mcp_servers: cfg.allowed_mcp_servers.clone(),
+                    include_directories: cfg.include_directories.clone(),
+                    debug: cfg.debug,
+                },
+            ))
         };
         let _control_plane_handle = control_plane::spawn(
             bus.subscribe(),
@@ -9634,7 +21693,12 @@ async fn main() -> Result<(), CallerError> {
                 event::ContextInjectionQueue::default(),
                 true, // headless mode
                 web_port_for_agent,
-                vec![],
+                UserAttachments::default(),
+                None,
+                None,
+                None,
+                false,
+                None,
             )
             .await
         } else {
@@ -9656,7 +21720,7 @@ async fn main() -> Result<(), CallerError> {
                     event::ApprovalRegistry::default(),
                     event::ContextInjectionQueue::default(),
                     true, // headless mode
-                    vec![],
+                    UserAttachments::default(),
                 )
                 .await
             } else {
@@ -9703,18 +21767,24 @@ async fn main() -> Result<(), CallerError> {
                     // Keep frame_registry and recording_registry alive
                 }
             }
-            eprintln!("Session ended ({}). Web gateway running on port {}. Waiting for new tasks...", reason, web_port);
+            eprintln!(
+                "Session ended ({}). Web gateway running on port {}. Waiting for new tasks...",
+                reason, web_port
+            );
 
             run_daemon_loop(DaemonConfig {
                 bus: bus.clone(),
                 project_root: project_root.clone(),
                 autonomy: autonomy_for_daemon.clone(),
                 shared_external_agent: shared_external_agent.clone(),
+                shared_codex_config: shared_codex_config.clone(),
+                shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry.clone(),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: headless_shared_session.clone(),
-            }).await;
+            })
+            .await;
         } else {
             result?;
         }

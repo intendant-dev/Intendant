@@ -1,5 +1,7 @@
 .DS_Store
 target/
+__pycache__/
+*.py[cod]
 .intendant/
 .env
 .env.*
@@ -10,4 +12,5 @@ docs/book/
 intendant.toml
 .codex
 .gemini/
-AGENTS.md
+/.worktrees/
+/workspace_files/

@@ -53,7 +53,12 @@ pub fn sanitize_session_id(raw: &str) -> Option<String> {
 /// already uses).
 pub fn visual_freshness_path(session_id: &str) -> Option<PathBuf> {
     let slug = sanitize_session_id(session_id)?;
-    Some(intendant_state_dir().join("diagnostics/visual-freshness").join(format!("{slug}.ndjson")))
+    Some(
+        intendant_state_dir()
+            .join("diagnostics")
+            .join("visual-freshness")
+            .join(format!("{slug}.ndjson")),
+    )
 }
 
 /// Append `body` verbatim to the visual-freshness transcript file for
@@ -86,13 +91,13 @@ pub fn append_visual_freshness_record(session_id: &str, body: &[u8]) -> std::io:
     Ok(body.len())
 }
 
-/// Resolve the Intendant state directory (`$HOME/.intendant`) with the
-/// same fallback the session-log writer uses (`/tmp/.intendant` when
-/// HOME is unset). Pulled into its own helper so test code can override
-/// HOME and verify path construction without touching production calls.
+/// Resolve the Intendant state directory (`~/.intendant`) via the shared
+/// cross-platform `platform::home_dir()` helper (honoring `$HOME` on Unix,
+/// `%USERPROFILE%` on Windows). Pulled into its own helper so test code can
+/// override the home env and verify path construction without touching
+/// production calls.
 fn intendant_state_dir() -> PathBuf {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    Path::new(&home).join(".intendant")
+    crate::platform::home_dir().join(".intendant")
 }
 
 #[cfg(test)]
@@ -140,14 +145,18 @@ mod tests {
     #[test]
     fn visual_freshness_path_uses_intendant_state_dir() {
         let p = visual_freshness_path("abc-123").expect("non-empty after sanitize");
-        let s = p.to_string_lossy();
+        // Assert on path components rather than a hardcoded '/'-joined
+        // string so the test holds on Windows (separator '\\') as well as
+        // POSIX. `visual_freshness_path` builds the path with `PathBuf::join`,
+        // so it is already platform-correct.
+        let expected_tail: PathBuf = ["diagnostics", "visual-freshness", "abc-123.ndjson"]
+            .iter()
+            .collect();
+        assert!(p.ends_with(&expected_tail), "unexpected path tail: {p:?}");
         assert!(
-            s.ends_with("/diagnostics/visual-freshness/abc-123.ndjson"),
-            "unexpected path tail: {s}"
-        );
-        assert!(
-            s.contains("/.intendant/"),
-            "path should be under .intendant state dir: {s}"
+            p.components()
+                .any(|c| c.as_os_str() == std::ffi::OsStr::new(".intendant")),
+            "path should be under .intendant state dir: {p:?}"
         );
     }
 

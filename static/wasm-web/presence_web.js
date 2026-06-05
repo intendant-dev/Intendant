@@ -279,6 +279,17 @@ export class PresenceWeb {
         wasm.presenceweb_revoke_user_display_with_id(this.__wbg_ptr, display_id);
     }
     /**
+     * Select the session whose scoped events should update global UI state.
+     * @param {string} session_id
+     * @returns {any}
+     */
+    select_session(session_id) {
+        const ptr0 = passStringToWasm0(session_id, wasm.__wbindgen_malloc, wasm.__wbindgen_realloc);
+        const len0 = WASM_VECTOR_LEN;
+        const ret = wasm.presenceweb_select_session(this.__wbg_ptr, ptr0, len0);
+        return ret;
+    }
+    /**
      * Approve/skip/deny/approve_all a pending action.
      * Returns `UiCommand[]` for UI updates. Sends the action to the server.
      * @param {string} action
@@ -370,17 +381,6 @@ export class PresenceWeb {
         wasm.presenceweb_send_key(this.__wbg_ptr, ptr0, len0, ctrl, alt, shift);
     }
     /**
-     * Send live model usage to the server for tracking/broadcast.
-     * @param {bigint} input
-     * @param {bigint} output
-     * @param {bigint} cached
-     * @param {bigint} total
-     * @param {bigint} thinking
-     */
-    send_live_usage(input, output, cached, total, thinking) {
-        wasm.presenceweb_send_live_usage(this.__wbg_ptr, input, output, cached, total, thinking);
-    }
-    /**
      * Request to become the active voice owner (triggers handover from current active).
      * @returns {boolean}
      */
@@ -426,8 +426,9 @@ export class PresenceWeb {
     /**
      * Inject a user message into the currently running turn. Sends
      * ControlMsg::Steer via the WebSocket with a client-generated id so
-     * the backend can echo it back on SteerRequested/SteerQueued/
-     * SteerDelivered events and the UI can correlate delivery state.
+     * the backend can echo it back on SteerRequested/SteerAccepted/
+     * SteerQueued/SteerDelivered events and the UI can correlate
+     * delivery state.
      *
      * Returns the generated id as a JsValue string so the caller can
      * attach it to the pending-steer row in the activity log.
@@ -638,6 +639,18 @@ export class PresenceWeb {
      */
     set_on_term(f) {
         wasm.presenceweb_set_on_term(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_terminal_exited(f) {
+        wasm.presenceweb_set_on_terminal_exited(this.__wbg_ptr, f);
+    }
+    /**
+     * @param {Function} f
+     */
+    set_on_terminal_output(f) {
+        wasm.presenceweb_set_on_terminal_output(this.__wbg_ptr, f);
     }
     /**
      * @param {Function} f
@@ -971,6 +984,10 @@ function __wbg_get_imports() {
             const ret = arg0.call(arg1, arg2, arg3);
             return ret;
         }, arguments); },
+        __wbg_call_e8c868596c950cf6: function() { return handleError(function (arg0, arg1, arg2, arg3, arg4) {
+            const ret = arg0.call(arg1, arg2, arg3, arg4);
+            return ret;
+        }, arguments); },
         __wbg_close_1d08eaf57ed325c0: function() { return handleError(function (arg0) {
             arg0.close();
         }, arguments); },
@@ -1192,18 +1209,18 @@ function __wbg_get_imports() {
             console.warn(arg0);
         },
         __wbindgen_cast_0000000000000001: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 109, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h4473cb2a2a923a88, wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 102, function: Function { arguments: [NamedExternref("CloseEvent")], shim_idx: 105, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h432d6732f953cd2d, wasm_bindgen__convert__closures_____invoke__h3b3b2f13817d2e95);
             return ret;
         },
         __wbindgen_cast_0000000000000002: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 109, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h4473cb2a2a923a88, wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 102, function: Function { arguments: [NamedExternref("MessageEvent")], shim_idx: 105, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h432d6732f953cd2d, wasm_bindgen__convert__closures_____invoke__h3b3b2f13817d2e95);
             return ret;
         },
         __wbindgen_cast_0000000000000003: function(arg0, arg1) {
-            // Cast intrinsic for `Closure(Closure { dtor_idx: 108, function: Function { arguments: [], shim_idx: 111, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
-            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h4473cb2a2a923a88, wasm_bindgen__convert__closures_____invoke__h5974ec181d3c6728);
+            // Cast intrinsic for `Closure(Closure { dtor_idx: 102, function: Function { arguments: [], shim_idx: 103, ret: Unit, inner_ret: Some(Unit) }, mutable: true }) -> Externref`.
+            const ret = makeMutClosure(arg0, arg1, wasm.wasm_bindgen__closure__destroy__h432d6732f953cd2d, wasm_bindgen__convert__closures_____invoke__hfa31da72a2e78277);
             return ret;
         },
         __wbindgen_cast_0000000000000004: function(arg0) {
@@ -1242,12 +1259,12 @@ function __wbg_get_imports() {
     };
 }
 
-function wasm_bindgen__convert__closures_____invoke__h5974ec181d3c6728(arg0, arg1) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h5974ec181d3c6728(arg0, arg1);
+function wasm_bindgen__convert__closures_____invoke__hfa31da72a2e78277(arg0, arg1) {
+    wasm.wasm_bindgen__convert__closures_____invoke__hfa31da72a2e78277(arg0, arg1);
 }
 
-function wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7(arg0, arg1, arg2) {
-    wasm.wasm_bindgen__convert__closures_____invoke__h5670f985d4d92ec7(arg0, arg1, arg2);
+function wasm_bindgen__convert__closures_____invoke__h3b3b2f13817d2e95(arg0, arg1, arg2) {
+    wasm.wasm_bindgen__convert__closures_____invoke__h3b3b2f13817d2e95(arg0, arg1, arg2);
 }
 
 

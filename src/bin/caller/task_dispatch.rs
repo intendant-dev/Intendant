@@ -16,7 +16,7 @@
 //!   2. Else if `task_tx` is available: wrap in `TaskEnvelope` and send.
 //!      `force_direct` is derived from the `direct` flag (plus legacy
 //!      `orchestrate == Some(false)` for StartTask).
-//!   3. Else if `follow_up_tx` is available: send text only. Metadata is
+//!   3. Else if `follow_up_tx` is available: send a follow-up message. Metadata is
 //!      dropped (non-presence mode has no CU-first routing anyway).
 //!   4. Else: warn and drop.
 //!
@@ -30,6 +30,7 @@ use tokio::sync::mpsc;
 use tokio::task::JoinHandle;
 
 use crate::event::{AppEvent, ControlMsg, EventBus};
+use crate::FollowUpMessage;
 
 /// Senders the dispatcher owns. Clone to populate these from the channels
 /// already created in `main.rs` (e.g. for presence task loop / agent loop).
@@ -41,9 +42,12 @@ pub struct Dispatcher {
     /// Task envelope channel consumed by `run_with_presence`. When `Some`,
     /// direct tasks go here (full metadata preserved).
     pub task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
-    /// Text follow-up channel consumed by `run_direct_mode` /
+    /// Follow-up channel consumed by `run_direct_mode` /
     /// `run_external_agent_mode` in non-presence mode.
-    pub follow_up_tx: Option<mpsc::Sender<String>>,
+    pub follow_up_tx: Option<mpsc::Sender<FollowUpMessage>>,
+    /// Session id owned by the legacy single-session loop. When set, targeted
+    /// commands for any other session are left for the session supervisor.
+    pub primary_session_id: Option<String>,
 }
 
 impl Dispatcher {
@@ -74,14 +78,29 @@ impl Dispatcher {
     }
 
     async fn route(&self, msg: ControlMsg, bus: &EventBus) {
+        if let Some(target_session_id) = control_target_session_id(&msg) {
+            if !self.handles_target_session(target_session_id) {
+                return;
+            }
+        }
+
         match msg {
+            ControlMsg::CreateSession { .. } => {
+                // New sessions are owned by SessionSupervisor. The legacy
+                // single-session dispatcher only routes work into channels it
+                // already owns, so accepting this here would collapse a
+                // parallel-session request back into the active session.
+            }
+
             ControlMsg::StartTask {
+                session_id: _,
                 task,
                 orchestrate,
                 direct,
                 reference_frame_ids,
                 display_target,
                 attachments,
+                follow_up_id,
             } => {
                 let is_direct = direct.unwrap_or(false) || orchestrate == Some(false);
                 let has_metadata = !reference_frame_ids.is_empty()
@@ -110,6 +129,7 @@ impl Dispatcher {
                         reference_frame_ids,
                         display_target,
                         attachment_frame_ids: attachments,
+                        steer_id: None,
                     };
                     if tx.try_send(envelope).is_ok() {
                         return;
@@ -117,7 +137,13 @@ impl Dispatcher {
                 }
 
                 if let Some(ref tx) = self.follow_up_tx {
-                    if tx.try_send(task.clone()).is_ok() {
+                    if tx
+                        .try_send(
+                            FollowUpMessage::text(task.clone())
+                                .with_follow_up_id(follow_up_id.clone()),
+                        )
+                        .is_ok()
+                    {
                         return;
                     }
                 }
@@ -125,7 +151,17 @@ impl Dispatcher {
                 self.warn_drop(bus, "StartTask", &task);
             }
 
-            ControlMsg::FollowUp { text, direct } => {
+            ControlMsg::ResumeSession { .. } => {
+                // The daemon loop owns session reattachment because it needs
+                // to choose the log dir, project root, and backend-native id.
+            }
+
+            ControlMsg::FollowUp {
+                text,
+                direct,
+                follow_up_id,
+                ..
+            } => {
                 let is_direct = direct.unwrap_or(false);
 
                 if !is_direct {
@@ -144,6 +180,7 @@ impl Dispatcher {
                         reference_frame_ids: vec![],
                         display_target: None,
                         attachment_frame_ids: vec![],
+                        steer_id: None,
                     };
                     if tx.try_send(envelope).is_ok() {
                         return;
@@ -151,7 +188,13 @@ impl Dispatcher {
                 }
 
                 if let Some(ref tx) = self.follow_up_tx {
-                    if tx.try_send(text.clone()).is_ok() {
+                    if tx
+                        .try_send(
+                            FollowUpMessage::text(text.clone())
+                                .with_follow_up_id(follow_up_id.clone()),
+                        )
+                        .is_ok()
+                    {
                         return;
                     }
                 }
@@ -159,20 +202,57 @@ impl Dispatcher {
                 self.warn_drop(bus, "FollowUp", &text);
             }
 
-            ControlMsg::Interrupt { expected_turn: _ } => {
+            ControlMsg::Interrupt {
+                session_id,
+                expected_turn: _,
+            } => {
                 // Re-emit as AppEvent::InterruptRequested so agent loops can subscribe
                 // and cancel their own work. The dispatcher itself doesn't hold loop
                 // handles — loops register interest via the bus.
-                bus.send(AppEvent::InterruptRequested);
+                bus.send(AppEvent::InterruptRequested { session_id });
             }
 
-            ControlMsg::Steer { text, id } => {
+            ControlMsg::Steer {
+                session_id,
+                text,
+                id,
+                attachments,
+            } => {
+                if !attachments.is_empty() {
+                    if let Some(ref tx) = self.task_tx {
+                        let steer_id = id.unwrap_or_default();
+                        let envelope = presence_core::TaskEnvelope {
+                            task: text.clone(),
+                            force_direct: true,
+                            context_hints: vec![],
+                            reference_frame_ids: vec![],
+                            display_target: None,
+                            attachment_frame_ids: attachments,
+                            steer_id: if steer_id.is_empty() {
+                                None
+                            } else {
+                                Some(steer_id.clone())
+                            },
+                        };
+                        if tx.try_send(envelope).is_ok() {
+                            bus.send(AppEvent::SteerQueued {
+                                session_id,
+                                id: steer_id,
+                                reason: "attachments are queued for the next turn".to_string(),
+                            });
+                            return;
+                        }
+                    }
+                    self.warn_drop(bus, "Steer", &text);
+                    return;
+                }
                 // Re-emit as AppEvent::SteerRequested so agent loops can
                 // subscribe and either inject the text into the active turn
                 // (native mid-turn steering) or queue it onto
                 // `context_injection` for the next turn. `id` defaults to
                 // "" so downstream consumers never have to handle an Option.
                 bus.send(AppEvent::SteerRequested {
+                    session_id,
                     text,
                     id: id.unwrap_or_default(),
                 });
@@ -187,14 +267,37 @@ impl Dispatcher {
     fn warn_drop(&self, bus: &EventBus, kind: &str, preview: &str) {
         let trunc: String = preview.chars().take(80).collect();
         bus.send(AppEvent::LogEntry {
+            session_id: None,
             level: "warn".to_string(),
             source: "system".to_string(),
-            content: format!(
-                "{} dropped (no dispatch target available): {}",
-                kind, trunc
-            ),
+            content: format!("{} dropped (no dispatch target available): {}", kind, trunc),
             turn: None,
         });
+    }
+
+    fn handles_target_session(&self, session_id: &str) -> bool {
+        self.primary_session_id
+            .as_deref()
+            .map(|primary| primary == session_id)
+            .unwrap_or(true)
+    }
+}
+
+fn control_target_session_id(msg: &ControlMsg) -> Option<&str> {
+    match msg {
+        ControlMsg::Status { session_id }
+        | ControlMsg::Approve { session_id, .. }
+        | ControlMsg::Deny { session_id, .. }
+        | ControlMsg::Skip { session_id, .. }
+        | ControlMsg::ApproveAll { session_id, .. }
+        | ControlMsg::Interrupt { session_id, .. }
+        | ControlMsg::Steer { session_id, .. }
+        | ControlMsg::StartTask { session_id, .. }
+        | ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
+        ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),
+        ControlMsg::StopSession { session_id } => Some(session_id.as_str()),
+        ControlMsg::ResumeSession { .. } | ControlMsg::RestartSession { .. } => None,
+        _ => None,
     }
 }
 
@@ -211,31 +314,33 @@ mod tests {
     async fn start_task_with_metadata_prefers_task_tx() {
         let (task_tx, mut task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(4);
         let (presence_tx, mut presence_rx) = mpsc::channel::<String>(4);
-        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<String>(4);
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
         let bus = make_test_bus();
 
         let dispatcher = Dispatcher {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: Some(follow_up_tx),
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "do thing".into(),
             orchestrate: None,
             direct: None,
             reference_frame_ids: vec!["f1".into()],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.task, "do thing");
         assert_eq!(envelope.reference_frame_ids, vec!["f1".to_string()]);
         assert!(!envelope.force_direct);
@@ -255,24 +360,26 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "chat with me".into(),
             orchestrate: None,
             direct: None,
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
-        let text =
-            tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let text = tokio::time::timeout(std::time::Duration::from_millis(200), presence_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(text, "chat with me");
         assert!(task_rx.try_recv().is_err());
     }
@@ -287,24 +394,26 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "code thing".into(),
             orchestrate: None,
             direct: Some(true),
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.task, "code thing");
         assert!(envelope.force_direct);
         assert!(presence_rx.try_recv().is_err());
@@ -320,48 +429,81 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::FollowUp {
+            session_id: None,
             text: "more please".into(),
             direct: Some(true),
+            follow_up_id: None,
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(envelope.task, "more please");
         assert!(envelope.force_direct);
     }
 
     #[tokio::test]
     async fn follow_up_non_presence_goes_to_follow_up_tx() {
-        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<String>(4);
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
         let bus = make_test_bus();
 
         let dispatcher = Dispatcher {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: Some(follow_up_tx),
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::FollowUp {
+            session_id: None,
             text: "keep going".into(),
             direct: None,
+            follow_up_id: None,
         }));
 
-        let text =
-            tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
-        assert_eq!(text, "keep going");
+        let msg = tokio::time::timeout(std::time::Duration::from_millis(200), follow_up_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(msg.text, "keep going");
+        assert!(msg.attachments.is_empty());
+    }
+
+    #[tokio::test]
+    async fn targeted_task_for_non_primary_session_is_left_to_supervisor() {
+        let (follow_up_tx, mut follow_up_rx) = mpsc::channel::<FollowUpMessage>(4);
+        let bus = make_test_bus();
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: None,
+            follow_up_tx: Some(follow_up_tx),
+            primary_session_id: Some("primary".to_string()),
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: Some("external".into()),
+            task: "continue there".into(),
+            orchestrate: None,
+            direct: Some(true),
+            reference_frame_ids: vec![],
+            display_target: None,
+            attachments: vec![],
+            follow_up_id: None,
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(follow_up_rx.try_recv().is_err());
     }
 
     #[tokio::test]
@@ -374,24 +516,26 @@ mod tests {
             presence_tx: Some(presence_tx),
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::StartTask {
+            session_id: None,
             task: "legacy direct".into(),
             orchestrate: Some(false),
             direct: None,
             reference_frame_ids: vec![],
             display_target: None,
             attachments: vec![],
+            follow_up_id: None,
         }));
 
-        let envelope =
-            tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
-                .await
-                .unwrap()
-                .unwrap();
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
         assert!(envelope.force_direct);
         assert!(presence_rx.try_recv().is_err());
     }
@@ -405,11 +549,14 @@ mod tests {
             presence_tx: None,
             task_tx: Some(task_tx),
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::Status));
+        bus.send(AppEvent::ControlCommand(ControlMsg::Status {
+            session_id: None,
+        }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(task_rx.try_recv().is_err());
     }
@@ -423,11 +570,13 @@ mod tests {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::Interrupt {
+            session_id: Some("sess-a".into()),
             expected_turn: None,
         }));
 
@@ -437,7 +586,8 @@ mod tests {
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(AppEvent::InterruptRequested)) => {
+                Ok(Ok(AppEvent::InterruptRequested { session_id })) => {
+                    assert_eq!(session_id.as_deref(), Some("sess-a"));
                     saw_interrupt_requested = true;
                     break;
                 }
@@ -464,22 +614,29 @@ mod tests {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: Some("sess-b".into()),
             text: "use SQLite instead".into(),
+            attachments: vec![],
             id: Some("s1".into()),
         }));
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-        let mut seen: Option<(String, String)> = None;
+        let mut seen: Option<(Option<String>, String, String)> = None;
         while std::time::Instant::now() < deadline {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             match tokio::time::timeout(remaining, rx.recv()).await {
-                Ok(Ok(AppEvent::SteerRequested { text, id })) => {
-                    seen = Some((text, id));
+                Ok(Ok(AppEvent::SteerRequested {
+                    session_id,
+                    text,
+                    id,
+                })) => {
+                    seen = Some((session_id, text, id));
                     break;
                 }
                 Ok(Ok(_)) => continue,
@@ -487,7 +644,8 @@ mod tests {
                 Err(_) => break,
             }
         }
-        let (text, id) = seen.expect("expected AppEvent::SteerRequested");
+        let (session_id, text, id) = seen.expect("expected AppEvent::SteerRequested");
+        assert_eq!(session_id.as_deref(), Some("sess-b"));
         assert_eq!(text, "use SQLite instead");
         assert_eq!(id, "s1");
     }
@@ -501,12 +659,15 @@ mod tests {
             presence_tx: None,
             task_tx: None,
             follow_up_tx: None,
+            primary_session_id: None,
         };
         let _h = dispatcher.spawn(bus.clone());
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
         bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: None,
             text: "never mind".into(),
+            attachments: vec![],
             id: None,
         }));
 
@@ -525,5 +686,54 @@ mod tests {
             }
         }
         assert_eq!(seen_id.as_deref(), Some(""));
+    }
+
+    #[tokio::test]
+    async fn steer_with_attachments_routes_task_envelope() {
+        let bus = make_test_bus();
+        let mut rx = bus.subscribe();
+        let (task_tx, mut task_rx) = mpsc::channel::<presence_core::TaskEnvelope>(4);
+
+        let dispatcher = Dispatcher {
+            presence_tx: None,
+            task_tx: Some(task_tx),
+            follow_up_tx: None,
+            primary_session_id: None,
+        };
+        let _h = dispatcher.spawn(bus.clone());
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::Steer {
+            session_id: Some("sess-c".into()),
+            text: "look at this screenshot".into(),
+            attachments: vec!["frame:latest".into()],
+            id: Some("s2".into()),
+        }));
+
+        let envelope = tokio::time::timeout(std::time::Duration::from_millis(200), task_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(envelope.task, "look at this screenshot");
+        assert!(envelope.force_direct);
+        assert_eq!(envelope.attachment_frame_ids, vec!["frame:latest"]);
+        assert_eq!(envelope.steer_id.as_deref(), Some("s2"));
+
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+        let mut saw_queued = false;
+        while std::time::Instant::now() < deadline {
+            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+            match tokio::time::timeout(remaining, rx.recv()).await {
+                Ok(Ok(AppEvent::SteerQueued { id, .. })) => {
+                    assert_eq!(id, "s2");
+                    saw_queued = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+        assert!(saw_queued, "expected SteerQueued for attached steer");
     }
 }

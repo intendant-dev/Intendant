@@ -90,23 +90,47 @@ pub struct TaskEnvelope {
     /// `context_hints` (which are `frames:`-prefixed strings used by presence).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub attachment_frame_ids: Vec<String>,
+    /// Optional dashboard steer correlation id. Present when a mid-turn steer
+    /// had attachments and was forced through the next-turn task path so the
+    /// frontend can retire its queued steer row after delivery.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub steer_id: Option<String>,
 }
 
 /// Filtered events pushed to the presence layer from the agent loop.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum PresenceEvent {
-    PhaseChanged { phase: String },
+    PhaseChanged {
+        phase: String,
+    },
     TaskComplete {
         reason: String,
         #[serde(default)]
         summary: Option<String>,
     },
-    ApprovalNeeded { id: u64, preview: String, category: String },
-    ApprovalResolved { id: u64, action: String },
-    HumanQuestion { question: String },
-    BudgetWarning { pct: f64, remaining: u64 },
-    RoundComplete { round: usize, turns_in_round: usize },
-    Error { message: String },
+    ApprovalNeeded {
+        id: u64,
+        preview: String,
+        category: String,
+    },
+    ApprovalResolved {
+        id: u64,
+        action: String,
+    },
+    HumanQuestion {
+        question: String,
+    },
+    BudgetWarning {
+        pct: f64,
+        remaining: u64,
+    },
+    RoundComplete {
+        round: usize,
+        turns_in_round: usize,
+    },
+    Error {
+        message: String,
+    },
     /// A display became available.
     DisplayReady {
         display_id: u32,
@@ -258,7 +282,10 @@ impl AgentStateSnapshot {
                 })
             }
             "error" => {
-                let message = event["message"].as_str().unwrap_or("unknown error").to_string();
+                let message = event["message"]
+                    .as_str()
+                    .unwrap_or("unknown error")
+                    .to_string();
                 Some(PresenceEvent::Error { message })
             }
             _ => None,
@@ -471,6 +498,7 @@ mod tests {
             reference_frame_ids: vec!["display:99-f00012".to_string()],
             display_target: Some("user_session".to_string()),
             attachment_frame_ids: vec!["ann-recording-3".to_string()],
+            steer_id: Some("steer-1".to_string()),
         };
         let json = serde_json::to_string(&envelope).unwrap();
         let back: TaskEnvelope = serde_json::from_str(&json).unwrap();
@@ -481,6 +509,7 @@ mod tests {
         assert_eq!(back.display_target.as_deref(), Some("user_session"));
         assert_eq!(back.attachment_frame_ids.len(), 1);
         assert_eq!(back.attachment_frame_ids[0], "ann-recording-3");
+        assert_eq!(back.steer_id.as_deref(), Some("steer-1"));
     }
 
     #[test]
@@ -493,7 +522,11 @@ mod tests {
         let json = serde_json::to_string(&event).unwrap();
         let back: PresenceEvent = serde_json::from_str(&json).unwrap();
         match back {
-            PresenceEvent::ApprovalNeeded { id, preview, category } => {
+            PresenceEvent::ApprovalNeeded {
+                id,
+                preview,
+                category,
+            } => {
                 assert_eq!(id, 42);
                 assert_eq!(preview, "exec: rm -rf /tmp");
                 assert_eq!(category, "Destructive");

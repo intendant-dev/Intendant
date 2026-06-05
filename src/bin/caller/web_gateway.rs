@@ -3,10 +3,12 @@ use crate::presence::{self, AgentStateSnapshot};
 use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::borrow::Cow;
+use std::collections::{HashMap, HashSet};
+use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 // Phase 5a.1: the display input authority map is read from a synchronous
 // `Fn() -> bool` closure on the WebRTC data-channel input hot path, so
 // it can't live behind a `tokio::sync::RwLock` (no `.read().await` from
@@ -15,14 +17,180 @@ use std::sync::{Arc, Mutex};
 // uses in this file.  All access goes through `unwrap_or_else(|e| e.into_inner())`
 // to remain poison-tolerant, matching the rest of the file's std-lock idiom.
 use std::sync::RwLock as StdRwLock;
+use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::net::TcpListener;
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
+
+/// Unified read/write surface for a demuxed dashboard connection.
+///
+/// After the per-connection demux peels off raw ICE-TCP (which stays a
+/// concrete `TcpStream`), the surviving connection is either a plain
+/// `TcpStream` or a TLS-wrapped `tokio_rustls::server::TlsStream<TcpStream>`.
+/// Both implement `AsyncRead + AsyncWrite + Unpin + Send`, so the WebSocket
+/// and HTTP handling that follows operates through this boxed trait object
+/// — identical code path for HTTP and HTTPS, plain WS and WSS. The
+/// `tokio_tungstenite::accept_async` upgrade and every `read_exact` /
+/// `write_all` call are already generic over these trait bounds; only the
+/// three small body-reading helpers had to be made generic to match.
+trait AsyncReadWrite: AsyncRead + AsyncWrite + Unpin + Send {}
+impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
+
+/// Boxed demuxed connection (plain TCP or TLS), used for all post-demux
+/// HTTP/WebSocket handling.
+type DemuxStream = std::pin::Pin<Box<dyn AsyncReadWrite>>;
+
+/// Finalize a one-shot HTTP response on a demuxed stream before it drops.
+///
+/// Every dashboard HTTP reply is a single buffered response sent with
+/// `Connection: close`, after which the connection task returns and the
+/// boxed [`DemuxStream`] is dropped. For a plain `TcpStream` that's fine —
+/// the kernel keeps queued bytes and flushes them on close. But the TLS
+/// path's stream is a `tokio_rustls::server::TlsStream`, which buffers
+/// *ciphertext* inside the rustls session: `write_all` only guarantees the
+/// plaintext was accepted into that buffer, not that the encrypted records
+/// reached the socket. Dropping the `TlsStream` without flushing discards
+/// the unwritten tail records, truncating large bodies (e.g. the ~871 KB
+/// `app.html` arrived ~19.5 KB short over HTTPS).
+///
+/// Calling `flush` drives rustls to emit all buffered ciphertext to the
+/// TCP socket; `shutdown` then writes the TLS `close_notify` and the TCP
+/// FIN, closing the session cleanly. On the plain path both delegate
+/// straight through to the `TcpStream` (flush is a no-op, shutdown sends
+/// the FIN we'd send on drop anyway), so behavior there is unchanged.
+async fn finalize_http_stream(stream: &mut DemuxStream) {
+    use tokio::io::AsyncWriteExt;
+    let _ = stream.flush().await;
+    let _ = stream.shutdown().await;
+}
 
 /// Monotonically increasing counter for assigning unique peer IDs to WebSocket
 /// connections.  Used for WebRTC signaling so that each browser tab gets a
 /// stable identity within a display session.
 static NEXT_PEER_ID: AtomicU64 = AtomicU64::new(1);
+static SESSION_SEARCH_IN_FLIGHT: AtomicBool = AtomicBool::new(false);
+static EXTERNAL_TRANSCRIPT_CACHE: OnceLock<Mutex<HashMap<String, ExternalTranscriptCacheEntry>>> =
+    OnceLock::new();
+static SESSION_LIST_RESPONSE_CACHE: OnceLock<Mutex<Option<SessionListResponseCacheEntry>>> =
+    OnceLock::new();
+static SESSION_LIST_ROW_CACHE: OnceLock<Mutex<HashMap<String, SessionListRowCacheEntry>>> =
+    OnceLock::new();
+static CODEX_SESSION_LIST_CACHE: OnceLock<Mutex<HashMap<String, CodexSessionListCacheEntry>>> =
+    OnceLock::new();
+static INTENDANT_SESSION_LIST_CACHE: OnceLock<
+    Mutex<HashMap<String, IntendantSessionListCacheEntry>>,
+> = OnceLock::new();
+
+const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
+const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
+const WORKTREE_OBSERVED_SESSION_FILE_LIMIT: usize = 1_000;
+const WORKTREE_OBSERVED_HINT_LIMIT: usize = 1_000;
+const WORKTREE_OBSERVED_PATHS_PER_SESSION: usize = 32;
+const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
+const EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS: i64 = 2_000;
+const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
+const SESSION_LIST_LIMIT: usize = 5_000;
+const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 2;
+const SESSION_SOURCE_FLOOR: usize = 100;
+const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
+const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
+const DELETED_EXTERNAL_SESSIONS_FILE: &str = "deleted_external_sessions.json";
+const MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT: usize = 64;
+const MANAGED_CONTEXT_ANCHOR_LIMIT: usize = 40;
+const EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT: usize = 16;
+const CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES: u64 = 512 * 1024;
+const FS_LIST_LIMIT: usize = 500;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ExternalTranscriptCacheKey {
+    source: String,
+    session_id: String,
+    path: String,
+    len: u64,
+    mtime_nanos: u128,
+}
+
+#[derive(Clone, Debug)]
+struct ExternalTranscriptCacheEntry {
+    key: ExternalTranscriptCacheKey,
+    entries: Vec<serde_json::Value>,
+}
+
+#[derive(Clone, Debug)]
+struct SessionListResponseCacheEntry {
+    generated_at: std::time::Instant,
+    body: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionListCacheKey {
+    namespace: &'static str,
+    path: String,
+    len: u64,
+    mtime_nanos: u128,
+    ctime_nanos: i128,
+    dev: u64,
+    ino: u64,
+    extra: String,
+}
+
+#[derive(Clone, Debug)]
+struct SessionListRowCacheEntry {
+    key: SessionListCacheKey,
+    row: serde_json::Value,
+}
+
+#[derive(Clone, Debug)]
+struct CodexSessionListSummary {
+    id: String,
+    created_at: Option<String>,
+    session_cwd: Option<String>,
+    effective_cwd: Option<String>,
+    model: Option<String>,
+    parent_id: Option<String>,
+    provider: Option<String>,
+    usage: SessionUsage,
+    usage_events: Vec<CodexUsageEvent>,
+    task: Option<String>,
+    turns: u64,
+    file_updated_at: Option<String>,
+    bytes: u64,
+}
+
+#[derive(Clone, Debug)]
+struct CodexUsageEvent {
+    timestamp: Option<String>,
+    usage: SessionUsage,
+}
+
+#[derive(Clone, Debug)]
+struct CodexSessionListCacheEntry {
+    key: SessionListCacheKey,
+    summary: CodexSessionListSummary,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionDirFingerprint {
+    path: String,
+    entries: Vec<SessionFileFingerprint>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionFileFingerprint {
+    rel: String,
+    len: u64,
+    mtime_nanos: u128,
+    ctime_nanos: i128,
+    dev: u64,
+    ino: u64,
+    is_dir: bool,
+}
+
+#[derive(Clone, Debug)]
+struct IntendantSessionListCacheEntry {
+    fingerprint: SessionDirFingerprint,
+    row: serde_json::Value,
+}
 
 /// Tracks which WebSocket connection currently owns the voice model (is "active").
 /// Only one connection can be active at a time; all others are "passive" (TUI-only).
@@ -1062,15 +1230,28 @@ async fn mint_session_token(provider: &str, model: &str) -> Result<String, Strin
 
 const APP_HTML: &str = include_str!("../../../static/app.html");
 const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.js");
+const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
 const WASM_STATION_BIN: &[u8] = include_bytes!("../../../static/wasm-station/station_web_bg.wasm");
+const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
+const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const DASHBOARD_IMAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
+// 0 means replay every renderable entry from the external audit transcript.
+// External activity replay intentionally includes only user/assistant messages
+// and explicit context-rewind markers, not tool events or tool output.
+const EXTERNAL_ACTIVITY_REPLAY_LIMIT: usize = 0;
+const EXTERNAL_TRANSCRIPT_SEMANTICS: &str = "full_audit_transcript";
 
 /// Session-specific state that changes when a new agent session starts.
 /// Wrapped in `Arc<tokio::sync::RwLock<...>>` so the web gateway can observe
 /// session changes without restarting.
 pub struct ActiveSessionState {
+    /// Stable identity for the long-lived Intendant process. This is distinct
+    /// from `session_log`, which may point at a currently active worker session
+    /// and may be cleared while the dashboard waits for new tasks.
+    pub daemon_session_id: Option<String>,
     pub query_ctx: Option<WebQueryCtx>,
     pub frame_registry: Option<Arc<tokio::sync::RwLock<crate::frames::FrameRegistry>>>,
     pub session_log: Option<Arc<Mutex<crate::session_log::SessionLog>>>,
@@ -1078,6 +1259,10 @@ pub struct ActiveSessionState {
     pub session_registry: Option<crate::display::SharedSessionRegistry>,
     pub snapshot_dir: Option<PathBuf>,
     pub project_root_for_changes: Option<PathBuf>,
+    /// Runtime-only daemon settings that may differ from persisted
+    /// `intendant.toml` because of CLI flags such as `--agent` or
+    /// `--no-presence`.
+    pub runtime_settings: RuntimeSettingsState,
     /// Shared handle to the live `FileWatcher`, used to serve the per-round
     /// history endpoints (GET history, POST rollback/redo/prune). The same
     /// mutex guards snapshot creation so concurrent rollback from the web
@@ -1088,6 +1273,7 @@ pub struct ActiveSessionState {
 impl ActiveSessionState {
     pub fn empty() -> SharedActiveSession {
         Arc::new(tokio::sync::RwLock::new(Self {
+            daemon_session_id: None,
             query_ctx: None,
             frame_registry: None,
             session_log: None,
@@ -1095,12 +1281,20 @@ impl ActiveSessionState {
             session_registry: None,
             snapshot_dir: None,
             project_root_for_changes: None,
+            runtime_settings: RuntimeSettingsState::default(),
             file_watcher: None,
         }))
     }
 }
 
 pub type SharedActiveSession = Arc<tokio::sync::RwLock<ActiveSessionState>>;
+
+#[derive(Clone, Default)]
+pub struct RuntimeSettingsState {
+    pub external_agent:
+        Option<Arc<tokio::sync::RwLock<Option<crate::external_agent::AgentBackend>>>>,
+    pub presence_enabled: Option<bool>,
+}
 
 /// Context for answering presence tool queries from browser-side live models.
 /// Shared across all WebSocket connections (read-only for query tools).
@@ -1114,6 +1308,36 @@ pub struct WebQueryCtx {
     pub presence_session: Option<Arc<Mutex<crate::presence::PresenceSession>>>,
     /// Shared context injection queue for mid-task interjections.
     pub context_injection: Option<crate::event::ContextInjectionQueue>,
+}
+
+#[derive(Debug, Serialize)]
+struct FsPathStatus {
+    input: String,
+    path: String,
+    exists: bool,
+    is_dir: bool,
+    is_file: bool,
+    readable: bool,
+    parent: Option<String>,
+    parent_exists: bool,
+    parent_is_dir: bool,
+    nearest_existing_parent: Option<String>,
+    can_create: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct FsListEntry {
+    name: String,
+    path: String,
+    is_dir: bool,
+    is_file: bool,
+    is_symlink: bool,
+    hidden: bool,
+}
+
+#[derive(Debug, Deserialize)]
+struct FsMkdirRequest {
+    path: String,
 }
 
 /// Debug state for the voice model, tracked server-side from WebSocket messages.
@@ -1138,6 +1362,15 @@ pub struct VoiceDebugState {
 pub struct WebGatewayConfig {
     pub provider: String,
     pub model: String,
+    /// Effective server-side presence state for this running daemon. This is
+    /// intentionally runtime-scoped, because `--no-presence` can override the
+    /// persisted `[presence] enabled` setting.
+    #[serde(default)]
+    pub presence_enabled: bool,
+    /// Effective external-agent backend selected for this daemon at startup.
+    /// The voice provider/model above remain scoped to browser live audio.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub external_agent: Option<String>,
     pub input_sample_rate: u32,
     pub output_sample_rate: u32,
     /// Whether server-side transcription is enabled (browser should send user_audio).
@@ -1147,6 +1380,16 @@ pub struct WebGatewayConfig {
     /// Empty by default (local-only).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ice_servers: Vec<crate::display::IceServer>,
+    /// Whether the *federated* (peer-to-peer) display path may negotiate
+    /// H.264. Default false ⇒ the browser pins VP8 for federation (the
+    /// safe default for lossy TURN-relayed paths). When true the browser
+    /// skips the VP8 pin and lets codec order default, allowing the peer's
+    /// H.264 encoder (intra-refresh libx264 / NVENC) to be selected. Does
+    /// NOT affect the *local* DisplaySlot path, which already defaults
+    /// codec order. Sourced from `[webrtc].federation_allow_h264` in
+    /// intendant.toml.
+    #[serde(default)]
+    pub federation_allow_h264: bool,
 }
 
 impl Default for WebGatewayConfig {
@@ -1154,10 +1397,13 @@ impl Default for WebGatewayConfig {
         Self {
             provider: "gemini".to_string(),
             model: "gemini-2.5-flash-native-audio-preview-12-2025".to_string(),
+            presence_enabled: false,
+            external_agent: None,
             input_sample_rate: 16000,
             output_sample_rate: 24000,
             transcription_enabled: false,
             ice_servers: Vec::new(),
+            federation_allow_h264: false,
         }
     }
 }
@@ -1167,6 +1413,7 @@ impl Default for WebGatewayConfig {
 /// - `GET /config` returns a JSON `WebGatewayConfig` (voice/runtime only).
 /// - `GET /.well-known/agent-card.json` returns a JSON `AgentCard` with
 ///   this daemon's identity, capabilities, transports, and auth scheme.
+/// - `GET /icon-128.png` and `GET /favicon.ico` return the dashboard icon.
 /// - `GET /` (and any other path) returns the web TUI page.
 /// - WebSocket connections are bridged to the EventBus (inbound control
 ///   messages) and broadcast channel (outbound events), mirroring the
@@ -1229,7 +1476,32 @@ fn replay_jsonl_to_outbound_entries(
     contents: &str,
     log_dir: &std::path::Path,
 ) -> Vec<serde_json::Value> {
+    replay_jsonl_to_outbound_entries_inner(contents, log_dir, false)
+}
+
+fn replay_jsonl_to_browser_entries(
+    contents: &str,
+    log_dir: &std::path::Path,
+) -> Vec<serde_json::Value> {
+    replay_jsonl_to_outbound_entries_inner(contents, log_dir, true)
+}
+
+fn replay_jsonl_to_outbound_entries_inner(
+    contents: &str,
+    log_dir: &std::path::Path,
+    compact_historical_context: bool,
+) -> Vec<serde_json::Value> {
     let (provider, model, autonomy) = scan_replay_status(contents);
+    let external_replay_session_id = external_backend_session_id_from_replay(contents);
+    let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
+    let replay_session_id = external_replay_session_id
+        .clone()
+        .or_else(|| wrapper_replay_session_id.clone());
+    let context_files_to_load = if compact_historical_context {
+        latest_context_snapshot_files_by_session(contents, replay_session_id.as_deref())
+    } else {
+        HashSet::new()
+    };
 
     let mut entries: Vec<serde_json::Value> = Vec::new();
     entries.push(serde_json::json!({
@@ -1247,6 +1519,31 @@ fn replay_jsonl_to_outbound_entries(
         let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
             continue;
         };
+        if compact_historical_context
+            && entry_json.get("event").and_then(|v| v.as_str()) == Some("context_snapshot")
+        {
+            let file = entry_json.get("file").and_then(|v| v.as_str());
+            if !file.is_some_and(|file| context_files_to_load.contains(file))
+                || context_snapshot_raw_file_too_large_for_replay(&entry_json, log_dir)
+            {
+                let Some(mut value) = context_snapshot_replay_entry_without_raw(
+                    &entry_json,
+                    replay_session_id.as_deref(),
+                ) else {
+                    continue;
+                };
+                inject_replay_entry_metadata(
+                    &mut value,
+                    &entry_json,
+                    replay_session_id.as_deref(),
+                    external_replay_session_id.as_deref(),
+                    wrapper_replay_session_id.as_deref(),
+                );
+                entries.push(value);
+                continue;
+            }
+        }
+
         let Some(app_event) =
             crate::session_log::session_log_entry_to_app_event(&entry_json, log_dir)
         else {
@@ -1258,24 +1555,1105 @@ fn replay_jsonl_to_outbound_entries(
         let Ok(mut value) = serde_json::to_value(&outbound) else {
             continue;
         };
-        // Inject the historical timestamp so WASM's handle_event uses it
-        // instead of wallclock when rendering log entries.
-        if let Some(obj) = value.as_object_mut() {
-            let ts = entry_json
-                .get("ts")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
-                .to_string();
-            obj.insert("ts".to_string(), serde_json::Value::String(ts));
+        if compact_historical_context {
+            compact_context_snapshot_raw_for_replay(&mut value);
         }
+        inject_replay_entry_metadata(
+            &mut value,
+            &entry_json,
+            replay_session_id.as_deref(),
+            external_replay_session_id.as_deref(),
+            wrapper_replay_session_id.as_deref(),
+        );
         entries.push(value);
     }
 
     entries
 }
 
+fn inject_replay_entry_metadata(
+    value: &mut serde_json::Value,
+    entry_json: &serde_json::Value,
+    replay_session_id: Option<&str>,
+    external_replay_session_id: Option<&str>,
+    wrapper_replay_session_id: Option<&str>,
+) {
+    let Some(obj) = value.as_object_mut() else {
+        return;
+    };
+    let ts = entry_json
+        .get("ts")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    obj.insert("ts".to_string(), serde_json::Value::String(ts));
+    if obj.get("event").and_then(|v| v.as_str()) == Some("context_snapshot") {
+        if let Some(file) = entry_json.get("file").and_then(|v| v.as_str()) {
+            obj.insert(
+                "snapshot_file".to_string(),
+                serde_json::Value::String(file.to_string()),
+            );
+            obj.insert(
+                "exact_replay_available".to_string(),
+                serde_json::Value::Bool(true),
+            );
+            if let Some(raw) = obj.get_mut("raw") {
+                annotate_context_snapshot_raw_value_exact_replay(raw, file);
+            }
+        }
+    }
+    if !obj.contains_key("session_id") {
+        if let Some(session_id) = replay_session_id {
+            obj.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+    } else if let (Some(external_id), Some(wrapper_id)) =
+        (external_replay_session_id, wrapper_replay_session_id)
+    {
+        let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let session_id = obj.get("session_id").and_then(|v| v.as_str());
+        if event != "session_identity" && session_id == Some(wrapper_id) {
+            obj.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(external_id.to_string()),
+            );
+        }
+    }
+}
+
+fn latest_context_snapshot_files_by_session(
+    contents: &str,
+    replay_session_id: Option<&str>,
+) -> HashSet<String> {
+    let mut latest_by_session = HashMap::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry_json.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+            continue;
+        }
+        let Some(file) = entry_json.get("file").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let session_id = entry_json
+            .get("data")
+            .and_then(|data| data.get("session_id"))
+            .and_then(|v| v.as_str())
+            .or(replay_session_id)
+            .unwrap_or("__global__");
+        latest_by_session.insert(session_id.to_string(), file.to_string());
+    }
+    latest_by_session.into_values().collect()
+}
+
+fn context_snapshot_raw_file_size(entry_json: &serde_json::Value, log_dir: &Path) -> Option<u64> {
+    let file = entry_json.get("file").and_then(|v| v.as_str())?;
+    if file.trim().is_empty() {
+        return None;
+    }
+    let relative = Path::new(file);
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return None;
+    }
+    std::fs::metadata(log_dir.join(relative))
+        .ok()
+        .map(|m| m.len())
+}
+
+fn context_snapshot_raw_file_too_large_for_replay(
+    entry_json: &serde_json::Value,
+    log_dir: &Path,
+) -> bool {
+    context_snapshot_raw_file_size(entry_json, log_dir)
+        .is_some_and(|bytes| bytes > CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES)
+}
+
+fn context_snapshot_replay_entry_from_log_entry(
+    entry_json: &serde_json::Value,
+    log_dir: &Path,
+    replay_session_id: Option<&str>,
+    external_replay_session_id: Option<&str>,
+    wrapper_replay_session_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    if context_snapshot_raw_file_too_large_for_replay(entry_json, log_dir) {
+        let mut value = context_snapshot_replay_entry_without_raw(entry_json, replay_session_id)?;
+        inject_replay_entry_metadata(
+            &mut value,
+            entry_json,
+            replay_session_id,
+            external_replay_session_id,
+            wrapper_replay_session_id,
+        );
+        return Some(value);
+    }
+
+    let app_event = crate::session_log::session_log_entry_to_app_event(entry_json, log_dir)?;
+    let outbound = crate::event::app_event_to_outbound(&app_event)?;
+    let mut value = serde_json::to_value(&outbound).ok()?;
+    compact_context_snapshot_raw_for_replay(&mut value);
+    inject_replay_entry_metadata(
+        &mut value,
+        entry_json,
+        replay_session_id,
+        external_replay_session_id,
+        wrapper_replay_session_id,
+    );
+    Some(value)
+}
+
+fn context_snapshot_replay_entry_without_raw(
+    entry_json: &serde_json::Value,
+    replay_session_id: Option<&str>,
+) -> Option<serde_json::Value> {
+    let data = entry_json.get("data");
+    let source = data
+        .and_then(|d| d.get("source"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("model")
+        .to_string();
+    let label = data
+        .and_then(|d| d.get("label"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("Model context")
+        .to_string();
+    let format = data
+        .and_then(|d| d.get("format"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let request_id = data
+        .and_then(|d| d.get("request_id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let request_index = data
+        .and_then(|d| d.get("request_index"))
+        .and_then(|v| v.as_u64());
+    let token_count = data
+        .and_then(|d| d.get("token_count"))
+        .and_then(|v| v.as_u64());
+    let token_count_kind = data
+        .and_then(|d| d.get("token_count_kind"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let context_window = data
+        .and_then(|d| d.get("context_window"))
+        .and_then(|v| v.as_u64());
+    let hard_context_window = data
+        .and_then(|d| d.get("hard_context_window"))
+        .and_then(|v| v.as_u64());
+    let item_count = data
+        .and_then(|d| d.get("item_count"))
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let session_id = data
+        .and_then(|d| d.get("session_id"))
+        .and_then(|v| v.as_str())
+        .or(replay_session_id)
+        .map(|s| s.to_string());
+    let turn = entry_json
+        .get("turn")
+        .and_then(|v| v.as_u64())
+        .map(|v| v as usize);
+    let raw = context_snapshot_omitted_raw(
+        request_id.as_deref(),
+        request_index,
+        format.as_str(),
+        item_count,
+        entry_json.get("file").and_then(|v| v.as_str()),
+    );
+    serde_json::to_value(crate::types::OutboundEvent::ContextSnapshot {
+        session_id,
+        source,
+        label,
+        request_id,
+        request_index,
+        turn,
+        format,
+        token_count,
+        token_count_kind,
+        context_window,
+        hard_context_window,
+        item_count,
+        raw,
+    })
+    .ok()
+}
+
+fn context_snapshot_omitted_raw(
+    request_id: Option<&str>,
+    request_index: Option<u64>,
+    format: &str,
+    item_count: Option<usize>,
+    snapshot_file: Option<&str>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "_intendant_context": {
+            "archive_mode": "summary",
+            "raw_archived": true,
+            "raw_omitted": true,
+            "exact_replay_available": snapshot_file.is_some(),
+            "snapshot_file": snapshot_file,
+            "request_id": request_id,
+            "request_index": request_index,
+            "format": format,
+        },
+        "summary": {
+            "kind": "compact_context_snapshot",
+            "raw_omitted": true,
+            "exact_replay_available": snapshot_file.is_some(),
+            "part_count": 0,
+            "item_count": item_count,
+        },
+        "summary_parts": [],
+    })
+}
+
+fn external_backend_session_from_replay(contents: &str) -> Option<(String, String)> {
+    let mut found_source: Option<String> = None;
+    let mut found_id: Option<String> = None;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if entry_json.get("event").and_then(|v| v.as_str()) == Some("session_identity") {
+            let data = entry_json.get("data");
+            let source = data
+                .and_then(|d| d.get("source"))
+                .and_then(|v| v.as_str())
+                .map(crate::session_names::normalize_source)
+                .unwrap_or_default();
+            if !source.is_empty() && source != "intendant" {
+                if let Some(id) = data
+                    .and_then(|d| d.get("backend_session_id"))
+                    .and_then(|v| v.as_str())
+                    .and_then(clean_external_thread_id)
+                {
+                    return Some((source, id));
+                }
+            }
+        }
+        if let Some(message) = entry_json.get("message").and_then(|v| v.as_str()) {
+            if found_source.is_none() {
+                found_source = external_agent_source_from_message(message);
+            }
+            if found_id.is_none() {
+                found_id = external_agent_thread_id_from_message(message);
+            }
+            if let (Some(source), Some(id)) = (found_source.as_ref(), found_id.as_ref()) {
+                return Some((source.clone(), id.clone()));
+            }
+        }
+    }
+    None
+}
+
+fn external_backend_session_id_from_replay(contents: &str) -> Option<String> {
+    if let Some((_, id)) = external_backend_session_from_replay(contents) {
+        return Some(id);
+    }
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if let Some(message) = entry_json.get("message").and_then(|v| v.as_str()) {
+            if let Some(id) = external_agent_thread_id_from_message(message) {
+                return Some(id);
+            }
+        }
+    }
+    None
+}
+
+fn home_from_intendant_log_dir(log_dir: &std::path::Path) -> Option<PathBuf> {
+    let logs_dir = log_dir.parent()?;
+    if logs_dir.file_name().and_then(|name| name.to_str()) != Some("logs") {
+        return None;
+    }
+    let intendant_dir = logs_dir.parent()?;
+    if intendant_dir.file_name().and_then(|name| name.to_str()) != Some(".intendant") {
+        return None;
+    }
+    intendant_dir.parent().map(Path::to_path_buf)
+}
+
+fn annotate_replay_user_turns_from_external_transcript(
+    entries: &mut [serde_json::Value],
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) {
+    let Some(transcript) = external_session_entries_from_home(home, source, session_id) else {
+        return;
+    };
+    let user_turns: Vec<serde_json::Value> = transcript
+        .into_iter()
+        .filter(|entry| entry.get("source").and_then(|v| v.as_str()) == Some("user"))
+        .filter(|entry| {
+            entry
+                .get("user_turn_index")
+                .and_then(|v| v.as_u64())
+                .is_some()
+                && entry
+                    .get("user_turn_revision")
+                    .and_then(|v| v.as_u64())
+                    .is_some()
+        })
+        .collect();
+    if user_turns.is_empty() {
+        return;
+    }
+
+    let mut next_user_turn = 0usize;
+    for entry in entries {
+        if entry.get("event").and_then(|v| v.as_str()) != Some("log_entry") {
+            continue;
+        }
+        if entry.get("session_id").and_then(|v| v.as_str()) != Some(session_id) {
+            continue;
+        }
+        let source = entry
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim()
+            .to_ascii_lowercase();
+        if source != "user" {
+            continue;
+        }
+        let content = entry
+            .get("content")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if content.is_empty() {
+            continue;
+        }
+
+        let Some((matched_offset, turn)) =
+            user_turns[next_user_turn..]
+                .iter()
+                .enumerate()
+                .find(|(_, turn)| {
+                    turn.get("content")
+                        .and_then(|v| v.as_str())
+                        .map(|candidate| candidate.trim() == content)
+                        .unwrap_or(false)
+                })
+        else {
+            continue;
+        };
+        next_user_turn += matched_offset + 1;
+
+        if let Some(obj) = entry.as_object_mut() {
+            for key in [
+                "user_turn_index",
+                "user_turn_revision",
+                "replacement_for_user_turn_index",
+                "superseded",
+                "superseded_reason",
+            ] {
+                if let Some(value) = turn.get(key) {
+                    obj.insert(key.to_string(), value.clone());
+                }
+            }
+        }
+    }
+}
+
+fn session_log_replay_entries_from_dir(
+    log_dir: &std::path::Path,
+) -> Option<(Vec<serde_json::Value>, Option<String>)> {
+    let session_jsonl = log_dir.join("session.jsonl");
+    let contents = std::fs::read_to_string(&session_jsonl).ok()?;
+    let external_session = external_backend_session_from_replay(&contents);
+    let external_session_id = external_session
+        .as_ref()
+        .map(|(_, id)| id.clone())
+        .or_else(|| external_backend_session_id_from_replay(&contents));
+    let mut entries = replay_jsonl_to_browser_entries(&contents, log_dir);
+    if let Some((source, session_id)) = external_session.as_ref() {
+        let home = home_from_intendant_log_dir(log_dir).unwrap_or_else(crate::platform::home_dir);
+        annotate_replay_user_turns_from_external_transcript(
+            &mut entries,
+            &home,
+            source,
+            session_id,
+        );
+    }
+    Some((entries, external_session_id))
+}
+
+fn context_snapshot_raw_is_compact(raw: &serde_json::Value) -> bool {
+    raw.pointer("/_intendant_context/archive_mode")
+        .and_then(|v| v.as_str())
+        == Some("summary")
+        || raw.pointer("/summary/kind").and_then(|v| v.as_str()) == Some("compact_context_snapshot")
+        || raw.get("summary_parts").is_some()
+}
+
+fn compact_context_snapshot_raw_for_replay(entry: &mut serde_json::Value) {
+    if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+        return;
+    }
+    let snapshot_file = entry
+        .get("snapshot_file")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let request_id = entry
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("replay")
+        .to_string();
+    let request_index = entry
+        .get("request_index")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let format = entry
+        .get("format")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.trim().is_empty())
+        .unwrap_or("unknown")
+        .to_string();
+
+    let Some(raw) = entry.get_mut("raw") else {
+        return;
+    };
+    if raw.is_null() || context_snapshot_raw_is_compact(raw) {
+        return;
+    }
+
+    let raw_payload = std::mem::take(raw);
+    *raw = crate::external_agent::codex::codex_context_archive_payload(
+        raw_payload,
+        &request_id,
+        request_index,
+        &format,
+        false,
+    );
+    if let Some(snapshot_file) = snapshot_file.as_deref() {
+        annotate_context_snapshot_raw_exact_replay(entry, snapshot_file);
+    }
+}
+
+fn compact_context_snapshot_entries_for_replay(entries: &mut [serde_json::Value]) {
+    for entry in entries {
+        compact_context_snapshot_raw_for_replay(entry);
+    }
+}
+
+fn annotate_context_snapshot_raw_exact_replay(entry: &mut serde_json::Value, snapshot_file: &str) {
+    let Some(raw) = entry.get_mut("raw") else {
+        return;
+    };
+    annotate_context_snapshot_raw_value_exact_replay(raw, snapshot_file);
+}
+
+fn annotate_context_snapshot_raw_value_exact_replay(
+    raw: &mut serde_json::Value,
+    snapshot_file: &str,
+) {
+    if let Some(context) = raw
+        .get_mut("_intendant_context")
+        .and_then(|value| value.as_object_mut())
+    {
+        context.insert(
+            "snapshot_file".to_string(),
+            serde_json::Value::String(snapshot_file.to_string()),
+        );
+        context.insert(
+            "exact_replay_available".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+    if let Some(summary) = raw
+        .get_mut("summary")
+        .and_then(|value| value.as_object_mut())
+    {
+        summary.insert(
+            "exact_replay_available".to_string(),
+            serde_json::Value::Bool(true),
+        );
+    }
+}
+
+fn session_log_replay_payload_from_dir(
+    log_dir: &std::path::Path,
+) -> Option<(String, Option<String>)> {
+    let (mut entries, external_session_id) = session_log_replay_entries_from_dir(log_dir)?;
+    compact_context_snapshot_entries_for_replay(&mut entries);
+    Some((
+        serde_json::json!({
+            "t": "log_replay",
+            "entries": entries,
+        })
+        .to_string(),
+        external_session_id,
+    ))
+}
+
+fn replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
+    std::fs::read_to_string(log_dir.join("session_meta.json"))
+        .ok()
+        .and_then(|meta| serde_json::from_str::<crate::session_log::SessionMeta>(&meta).ok())
+        .map(|meta| meta.session_id)
+        .filter(|session_id| !session_id.trim().is_empty())
+        .or_else(|| {
+            log_dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .filter(|session_id| !session_id.trim().is_empty())
+        })
+}
+
+fn session_log_id(session_log: &Arc<Mutex<crate::session_log::SessionLog>>) -> Option<String> {
+    session_log
+        .lock()
+        .ok()
+        .map(|log| log.session_id().to_string())
+        .filter(|id| !id.trim().is_empty())
+}
+
+fn session_log_replay_from_dir(log_dir: &std::path::Path) -> Option<String> {
+    session_log_replay_payload_from_dir(log_dir).map(|(payload, _)| payload)
+}
+
+fn agent_output_chunks_with_fallback(
+    primary_log_dir: &Path,
+    ids: &[String],
+    fallback_logs_dir: Option<&Path>,
+) -> Vec<crate::session_log::AgentOutputChunk> {
+    let mut found: HashMap<String, crate::session_log::AgentOutputChunk> = HashMap::new();
+
+    for chunk in crate::session_log::agent_output_chunks_by_id(primary_log_dir, ids) {
+        found.entry(chunk.output_id.clone()).or_insert(chunk);
+    }
+
+    if found.len() < ids.len() {
+        if let Some(logs_dir) = fallback_logs_dir {
+            let mut dirs = Vec::new();
+            if let Ok(entries) = std::fs::read_dir(logs_dir) {
+                for entry in entries.flatten() {
+                    let path = entry.path();
+                    if path.is_dir()
+                        && path.join("session.jsonl").is_file()
+                        && !same_path(&path, primary_log_dir)
+                    {
+                        dirs.push(path);
+                    }
+                }
+            }
+            dirs.sort_by(|a, b| session_log_mtime(b).cmp(&session_log_mtime(a)));
+
+            for dir in dirs {
+                let missing: Vec<String> = ids
+                    .iter()
+                    .filter(|id| !found.contains_key(id.as_str()))
+                    .cloned()
+                    .collect();
+                if missing.is_empty() {
+                    break;
+                }
+                for chunk in crate::session_log::agent_output_chunks_by_id(&dir, &missing) {
+                    found.entry(chunk.output_id.clone()).or_insert(chunk);
+                }
+            }
+        }
+    }
+
+    ids.iter().filter_map(|id| found.remove(id)).collect()
+}
+
+fn same_path(a: &Path, b: &Path) -> bool {
+    if a == b {
+        return true;
+    }
+    match (std::fs::canonicalize(a), std::fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+fn session_log_mtime(path: &Path) -> std::time::SystemTime {
+    std::fs::metadata(path.join("session.jsonl"))
+        .or_else(|_| std::fs::metadata(path))
+        .and_then(|m| m.modified())
+        .unwrap_or(std::time::UNIX_EPOCH)
+}
+
+fn is_valid_agent_output_id(id: &str) -> bool {
+    !id.is_empty()
+        && id.len() <= 128
+        && id
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '.'))
+}
+
+fn current_agent_output_response_for_ids(ids: Vec<String>, log_dir: &Path) -> String {
+    if ids.is_empty() {
+        return upload_error_response("400 Bad Request", "missing output ids");
+    }
+
+    let fallback_logs_dir = Some(crate::platform::home_dir().join(".intendant").join("logs"));
+    let chunks = agent_output_chunks_with_fallback(log_dir, &ids, fallback_logs_dir.as_deref());
+    let found: HashSet<&str> = chunks
+        .iter()
+        .map(|chunk| chunk.output_id.as_str())
+        .collect();
+    let missing: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !found.contains(id))
+        .collect();
+    let body = serde_json::json!({
+        "outputs": chunks,
+        "missing": missing,
+    })
+    .to_string();
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    )
+}
+
+fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>, String> {
+    let parsed: serde_json::Value =
+        serde_json::from_str(body).map_err(|e| format!("invalid JSON body: {e}"))?;
+    let Some(ids) = parsed.get("ids").and_then(|ids| ids.as_array()) else {
+        return Err("missing output ids".to_string());
+    };
+    let ids: Vec<String> = ids
+        .iter()
+        .filter_map(|id| id.as_str())
+        .map(str::trim)
+        .filter(|id| is_valid_agent_output_id(id))
+        .map(ToString::to_string)
+        .collect();
+    if ids.is_empty() {
+        return Err("missing output ids".to_string());
+    }
+    Ok(ids)
+}
+
+fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
+    match agent_output_ids_from_json_body(body) {
+        Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
+        Err(e) => upload_error_response("400 Bad Request", &e),
+    }
+}
+
+fn intendant_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if session_id.contains('/') {
+        let dir = PathBuf::from(session_id);
+        return dir.is_dir().then_some(dir);
+    }
+
+    let logs_dir = home.join(".intendant").join("logs");
+    let direct = logs_dir.join(session_id);
+    if direct.is_dir() {
+        return Some(direct);
+    }
+
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(session_id) {
+            return Some(path);
+        }
+        let meta_path = path.join("session_meta.json");
+        let Ok(meta_str) = std::fs::read_to_string(meta_path) else {
+            continue;
+        };
+        let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) else {
+            continue;
+        };
+        let Some(meta_id) = meta.get("session_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        if meta_id == session_id || meta_id.starts_with(session_id) {
+            return Some(path);
+        }
+    }
+
+    None
+}
+
+#[derive(Debug, Clone, Default)]
+struct ExternalSessionContext {
+    project_root: Option<String>,
+    cwd: Option<String>,
+    source: Option<String>,
+    source_label: Option<String>,
+    name: Option<String>,
+}
+
+fn external_session_context_by_id(
+    sessions: &[serde_json::Value],
+) -> HashMap<String, ExternalSessionContext> {
+    let mut out = HashMap::new();
+    for session in sessions {
+        let context = ExternalSessionContext {
+            project_root: value_str(session, "project_root"),
+            cwd: value_str(session, "cwd"),
+            source: value_str(session, "source"),
+            source_label: value_str(session, "source_label"),
+            name: value_str(session, "name"),
+        };
+        if context.project_root.is_none()
+            && context.cwd.is_none()
+            && context.source.is_none()
+            && context.source_label.is_none()
+            && context.name.is_none()
+        {
+            continue;
+        }
+        for key in [
+            value_str(session, "session_id"),
+            value_str(session, "resume_id"),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            out.entry(key).or_insert_with(|| context.clone());
+        }
+    }
+    out
+}
+
+fn session_value_matches_external_id(session: &serde_json::Value, external_id: &str) -> bool {
+    ["session_id", "resume_id", "backend_session_id"]
+        .into_iter()
+        .any(|key| session.get(key).and_then(|v| v.as_str()) == Some(external_id))
+}
+
+fn external_session_row_matches(
+    session: &serde_json::Value,
+    source: &str,
+    external_id: &str,
+) -> bool {
+    let source = crate::session_names::normalize_source(source);
+    if !session_value_matches_external_id(session, external_id) {
+        return false;
+    }
+    let row_source = session
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(crate::session_names::normalize_source);
+    let row_backend_source = session
+        .get("backend_source")
+        .and_then(|v| v.as_str())
+        .map(crate::session_names::normalize_source);
+    row_source.as_deref() == Some(source.as_str())
+        || row_backend_source.as_deref() == Some(source.as_str())
+}
+
+fn merge_intendant_wrapper_into_external_session(
+    external: &mut serde_json::Value,
+    wrapper: &serde_json::Value,
+) {
+    let Some(obj) = external.as_object_mut() else {
+        return;
+    };
+    let Some(wrapper_obj) = wrapper.as_object() else {
+        return;
+    };
+
+    for (target_key, wrapper_key) in [
+        ("intendant_session_id", "session_id"),
+        ("intendant_session_path", "path"),
+        ("backend_source", "backend_source"),
+        ("backend_source_label", "backend_source_label"),
+        ("backend_session_id", "backend_session_id"),
+        ("capabilities", "capabilities"),
+        ("agent_command", "agent_command"),
+        ("codex_command", "codex_command"),
+        ("codex_managed_context", "codex_managed_context"),
+    ] {
+        if let Some(value) = wrapper_obj.get(wrapper_key) {
+            obj.insert(target_key.to_string(), value.clone());
+        }
+    }
+
+    for key in ["name", "task", "project_root", "cwd", "provider", "model"] {
+        let current_is_empty = obj
+            .get(key)
+            .and_then(|v| v.as_str())
+            .map(str::is_empty)
+            .unwrap_or(true);
+        if current_is_empty {
+            if let Some(value) = wrapper_obj.get(key).filter(|v| !v.is_null()) {
+                obj.insert(key.to_string(), value.clone());
+            }
+        }
+    }
+
+    for key in [
+        "recordings",
+        "recording_bytes",
+        "annotations",
+        "clips",
+        "frames_bytes",
+        "turns_bytes",
+        "logs_bytes",
+        "total_bytes",
+    ] {
+        if let Some(value) = wrapper_obj.get(key) {
+            obj.insert(format!("intendant_{key}"), value.clone());
+        }
+    }
+    if let Some(value) = wrapper_obj.get("status") {
+        obj.insert("intendant_status".to_string(), value.clone());
+    }
+    obj.insert(
+        "can_delete_intendant_log".to_string(),
+        serde_json::json!(true),
+    );
+    if let Some(value) = wrapper_obj.get("relationships") {
+        if let Some(existing) = obj.get_mut("relationships").and_then(|v| v.as_array_mut()) {
+            if let Some(items) = value.as_array() {
+                for item in items {
+                    if !existing.contains(item) {
+                        existing.push(item.clone());
+                    }
+                }
+            }
+        } else {
+            obj.insert("relationships".to_string(), value.clone());
+        }
+    }
+
+    if let (Some(current), Some(wrapper_updated)) = (
+        obj.get("updated_at").and_then(|v| v.as_str()),
+        wrapper_obj.get("updated_at").and_then(|v| v.as_str()),
+    ) {
+        if timestamp_sort_secs(wrapper_updated) > timestamp_sort_secs(current) {
+            obj.insert(
+                "updated_at".to_string(),
+                serde_json::Value::String(wrapper_updated.to_string()),
+            );
+        }
+    }
+}
+
+fn external_session_source_and_id(session: &serde_json::Value) -> Option<(String, String)> {
+    let source = value_str(session, "backend_source")
+        .or_else(|| value_str(session, "source"))
+        .map(|source| crate::session_names::normalize_source(&source))?;
+    if source.is_empty() || source == "intendant" {
+        return None;
+    }
+    let session_id = value_str(session, "backend_session_id")
+        .or_else(|| value_str(session, "resume_id"))
+        .or_else(|| value_str(session, "session_id"))?;
+    if !crate::external_agent::source_session_id_is_canonical(&source, &session_id) {
+        return None;
+    }
+    Some((source, session_id))
+}
+
+fn index_external_wrapper_session_row(home: &Path, session: &serde_json::Value) {
+    let Some(source) = value_str(session, "backend_source") else {
+        return;
+    };
+    let Some(backend_session_id) = value_str(session, "backend_session_id") else {
+        return;
+    };
+    let Some(intendant_session_id) =
+        value_str(session, "intendant_session_id").or_else(|| value_str(session, "session_id"))
+    else {
+        return;
+    };
+    let Some(log_path) =
+        value_str(session, "intendant_session_path").or_else(|| value_str(session, "path"))
+    else {
+        return;
+    };
+    let project_root = value_str(session, "project_root").map(PathBuf::from);
+    let _ = crate::external_wrapper_index::upsert(
+        home,
+        &source,
+        &backend_session_id,
+        &intendant_session_id,
+        Path::new(&log_path),
+        project_root.as_deref(),
+    );
+}
+
+fn apply_external_wrapper_index_to_session(home: &Path, session: &mut serde_json::Value) {
+    if value_str(session, "source")
+        .map(|source| crate::session_names::normalize_source(&source))
+        .as_deref()
+        == Some("intendant")
+    {
+        return;
+    }
+    let Some((source, backend_session_id)) = external_session_source_and_id(session) else {
+        return;
+    };
+    let wrappers = crate::external_wrapper_index::wrappers_for(home, &source, &backend_session_id);
+    if wrappers.is_empty() {
+        return;
+    }
+    let Some(obj) = session.as_object_mut() else {
+        return;
+    };
+    let latest = &wrappers[0];
+    obj.insert(
+        "intendant_session_id".to_string(),
+        serde_json::Value::String(latest.intendant_session_id.clone()),
+    );
+    obj.insert(
+        "intendant_session_path".to_string(),
+        serde_json::Value::String(latest.log_path.clone()),
+    );
+    obj.insert(
+        "intendant_wrappers".to_string(),
+        serde_json::Value::Array(
+            wrappers
+                .iter()
+                .map(crate::external_wrapper_index::record_to_json)
+                .collect(),
+        ),
+    );
+    obj.insert(
+        "can_delete_intendant_log".to_string(),
+        serde_json::json!(true),
+    );
+}
+
+fn apply_external_wrapper_index_to_sessions(home: &Path, sessions: &mut [serde_json::Value]) {
+    for session in sessions {
+        apply_external_wrapper_index_to_session(home, session);
+    }
+}
+
+fn external_agent_thread_id_from_message(message: &str) -> Option<String> {
+    if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
+        return clean_external_thread_id(thread_id);
+    }
+    if message.starts_with("Mode: external agent") {
+        if let Some((_, thread_id)) = message.rsplit_once("thread: ") {
+            return clean_external_thread_id(thread_id);
+        }
+    }
+    None
+}
+
+fn external_agent_source_from_message(message: &str) -> Option<String> {
+    let mode = message.strip_prefix("Mode: external agent (")?;
+    let (source, _) = mode.split_once(')')?;
+    let source = crate::session_names::normalize_source(source);
+    (!source.is_empty()).then_some(source)
+}
+
+fn pretty_external_source_label(source: &str) -> String {
+    match crate::session_names::normalize_source(source).as_str() {
+        "codex" => "Codex".to_string(),
+        "claude-code" => "Claude Code".to_string(),
+        "gemini" => "Gemini CLI".to_string(),
+        "intendant" => "Intendant".to_string(),
+        other => other.to_string(),
+    }
+}
+
+fn clean_external_thread_id(thread_id: &str) -> Option<String> {
+    let thread_id = thread_id
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, '"' | '\'' | ',' | ';'));
+    if thread_id.is_empty() || thread_id.chars().any(char::is_whitespace) {
+        None
+    } else {
+        Some(thread_id.to_string())
+    }
+}
+
+fn resume_session_activity_replay(
+    source: &str,
+    session_id: &str,
+    resume_id: Option<&str>,
+    task: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    resume_session_activity_replay_from_home(
+        &crate::platform::home_dir(),
+        source,
+        session_id,
+        resume_id,
+        task,
+        limit,
+    )
+}
+
+fn resume_session_activity_replay_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    resume_id: Option<&str>,
+    task: Option<&str>,
+    limit: usize,
+) -> Option<String> {
+    if task.map(str::trim).is_some_and(|task| !task.is_empty()) {
+        return None;
+    }
+
+    let source_norm = source.trim().to_lowercase();
+    if source_norm == "intendant" {
+        let log_dir = intendant_session_dir_from_home(home, session_id)?;
+        return session_log_replay_from_dir(&log_dir);
+    }
+
+    let replay_id = resume_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(session_id);
+    if let Some(log_dir) = intendant_session_dir_from_home(home, session_id) {
+        if let Some((payload, external_id)) = session_log_replay_payload_from_dir(&log_dir) {
+            if external_id.as_deref() == Some(replay_id) {
+                return Some(payload);
+            }
+        }
+    }
+    external_session_activity_replay_from_home_with_attach(
+        home,
+        &source_norm,
+        replay_id,
+        limit,
+        false,
+    )
+}
+
 /// Compute a short content hash for cache-busting embedded static assets.
-/// When the WASM or JS changes (i.e. a new build), the hash changes,
+/// When the WASM, JS, or favicon changes (i.e. a new build), the hash changes,
 /// the URL changes, and browsers fetch the new version.
 fn asset_version_hash() -> String {
     use std::hash::{Hash, Hasher};
@@ -1284,6 +2662,7 @@ fn asset_version_hash() -> String {
     WASM_WEB_JS.hash(&mut hasher);
     WASM_STATION_BIN.hash(&mut hasher);
     WASM_STATION_JS.hash(&mut hasher);
+    ICON_128_PNG.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
 
@@ -1345,6 +2724,15 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
         .finish()
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
     Ok(cursor.into_inner())
+}
+
+fn current_session_log_dir(
+    session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
+    query_ctx: Option<&WebQueryCtx>,
+) -> Option<PathBuf> {
+    session_log
+        .and_then(|slog| slog.lock().ok().map(|log| log.dir().to_path_buf()))
+        .or_else(|| query_ctx.map(|ctx| ctx.log_dir.clone()))
 }
 
 /// Parse a raw HTTP request blob for the `Host:` header and return its
@@ -1460,9 +2848,21 @@ mod host_header_tests {
 /// for each session (newest first, capped at 100).
 /// Return session detail: replayed log entries + metadata for a single session.
 /// Resolve a session directory by exact ID or prefix match.
-fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
+fn session_lookup_id_is_safe(session_id: &str) -> bool {
+    !session_id.is_empty()
+        && session_id.trim() == session_id
+        && session_id != "."
+        && !session_id.contains("..")
+        && !session_id.contains('/')
+        && !session_id.contains('\\')
+}
+
+fn resolve_session_dir_from_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+    if !session_lookup_id_is_safe(session_id) {
+        return None;
+    }
+
+    let logs_dir = home.join(".intendant").join("logs");
 
     if logs_dir.join(session_id).is_dir() {
         return Some(logs_dir.join(session_id));
@@ -1476,7 +2876,155 @@ fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
             }
         }
     }
+    resolve_session_dir_from_listed_external_row(home, session_id)
+}
+
+fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_default();
+    for session in sessions {
+        let matches = [
+            "session_id",
+            "resume_id",
+            "backend_session_id",
+            "intendant_session_id",
+        ]
+        .into_iter()
+        .any(|key| session.get(key).and_then(|v| v.as_str()) == Some(session_id));
+        if !matches {
+            continue;
+        }
+        for key in ["intendant_session_path", "path"] {
+            let Some(path) = session.get(key).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            if path.is_dir() {
+                return Some(path);
+            }
+        }
+    }
     None
+}
+
+fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
+    resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
+}
+
+fn deleted_external_sessions_path(home: &Path) -> PathBuf {
+    home.join(".intendant").join(DELETED_EXTERNAL_SESSIONS_FILE)
+}
+
+fn read_deleted_external_sessions(home: &Path) -> HashSet<(String, String)> {
+    let path = deleted_external_sessions_path(home);
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return HashSet::new();
+    };
+    let Ok(serde_json::Value::Object(root)) = serde_json::from_str::<serde_json::Value>(&contents)
+    else {
+        return HashSet::new();
+    };
+
+    let mut deleted = HashSet::new();
+    for (source, ids) in root {
+        let source = crate::session_names::normalize_source(&source);
+        let Some(ids) = ids.as_array() else {
+            continue;
+        };
+        for id in ids.iter().filter_map(|id| id.as_str()) {
+            let id = id.trim();
+            if !source.is_empty() && !id.is_empty() {
+                deleted.insert((source.clone(), id.to_string()));
+            }
+        }
+    }
+    deleted
+}
+
+fn write_deleted_external_sessions(
+    home: &Path,
+    deleted: &HashSet<(String, String)>,
+) -> Result<(), String> {
+    let mut by_source: HashMap<String, Vec<String>> = HashMap::new();
+    for (source, id) in deleted {
+        by_source
+            .entry(source.clone())
+            .or_default()
+            .push(id.clone());
+    }
+    let mut root = serde_json::Map::new();
+    for (source, mut ids) in by_source {
+        ids.sort();
+        ids.dedup();
+        root.insert(source, serde_json::json!(ids));
+    }
+
+    let path = deleted_external_sessions_path(home);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create tombstone dir: {e}"))?;
+    }
+    let body = serde_json::to_string_pretty(&serde_json::Value::Object(root))
+        .map_err(|e| format!("serialize tombstones: {e}"))?;
+    std::fs::write(path, body).map_err(|e| format!("write tombstones: {e}"))
+}
+
+fn mark_external_session_deleted(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Result<(), String> {
+    let source = crate::session_names::normalize_source(source);
+    let session_id = session_id.trim();
+    if source.is_empty() || session_id.is_empty() {
+        return Ok(());
+    }
+    let mut deleted = read_deleted_external_sessions(home);
+    if !deleted.insert((source, session_id.to_string())) {
+        return Ok(());
+    }
+    write_deleted_external_sessions(home, &deleted)
+}
+
+fn session_matches_deleted_external(
+    session: &serde_json::Value,
+    deleted: &HashSet<(String, String)>,
+) -> bool {
+    if deleted.is_empty() {
+        return false;
+    }
+    let sources: Vec<String> = ["source", "backend_source"]
+        .into_iter()
+        .filter_map(|key| value_str(session, key))
+        .map(|source| crate::session_names::normalize_source(&source))
+        .filter(|source| !source.is_empty())
+        .collect();
+    let ids: Vec<String> = ["session_id", "resume_id", "backend_session_id"]
+        .into_iter()
+        .filter_map(|key| value_str(session, key))
+        .filter(|id| !id.is_empty())
+        .collect();
+
+    sources.iter().any(|source| {
+        ids.iter()
+            .any(|id| deleted.contains(&(source.clone(), id.clone())))
+    })
+}
+
+fn external_delete_target_for_intendant_session_dir(dir: &Path) -> Option<(String, String)> {
+    let session_id = dir.file_name()?.to_string_lossy().to_string();
+    let row = intendant_session_list_row_from_dir(dir, &session_id)?;
+    let source = value_str(&row, "backend_source")?;
+    let external_id = value_str(&row, "backend_session_id")?;
+    if !crate::external_agent::source_session_id_is_canonical(&source, &external_id) {
+        return None;
+    }
+    Some((source, external_id))
+}
+
+fn invalidate_session_list_response_cache() {
+    if let Some(cache) = SESSION_LIST_RESPONSE_CACHE.get() {
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
 }
 
 /// List recording streams from a recordings directory on disk.
@@ -1497,6 +3045,11 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
                 &stream_dir.join("segments.csv"),
                 &stream_dir,
             );
+            if segments.is_empty()
+                || !crate::recording::recording_dir_has_playable_segments(&stream_dir)
+            {
+                continue;
+            }
             let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
             let seg_json: Vec<serde_json::Value> = segments
                 .iter()
@@ -1519,18 +3072,71 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
     entries
 }
 
-fn get_session_detail(session_id: &str) -> String {
-    let session_dir = match resolve_session_dir(session_id) {
+fn session_relationships_from_log_dir(session_dir: &Path) -> Vec<serde_json::Value> {
+    let Ok(contents) = std::fs::read_to_string(session_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+
+    contents
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_relationship"))
+        .filter_map(|entry| {
+            let data = entry.get("data")?;
+            let parent_session_id = data
+                .get("parent_session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let child_session_id = data
+                .get("child_session_id")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim();
+            let relationship = data
+                .get("relationship")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .trim()
+                .to_ascii_lowercase();
+            if parent_session_id.is_empty()
+                || child_session_id.is_empty()
+                || parent_session_id == child_session_id
+                || !matches!(relationship.as_str(), "side" | "subagent" | "fork")
+            {
+                return None;
+            }
+            Some(serde_json::json!({
+                "parent_session_id": parent_session_id,
+                "child_session_id": child_session_id,
+                "relationship": relationship,
+                "ephemeral": data.get("ephemeral").and_then(|v| v.as_bool()).unwrap_or(false),
+            }))
+        })
+        .collect()
+}
+
+fn session_detail_http_status(body: &str) -> &'static str {
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(body) else {
+        return "200 OK";
+    };
+    if value.get("error").and_then(|v| v.as_str()) == Some("session not found") {
+        "404 Not Found"
+    } else {
+        "200 OK"
+    }
+}
+
+fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
+    let session_dir = match resolve_session_dir_from_home(home, session_id) {
         Some(d) => d,
         None => return serde_json::json!({"error": "session not found"}).to_string(),
     };
 
-    let jsonl_path = session_dir.join("session.jsonl");
-    let entries = if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
-        replay_jsonl_to_outbound_entries(&contents, &session_dir)
-    } else {
-        Vec::new()
-    };
+    let mut entries = session_log_replay_entries_from_dir(&session_dir)
+        .map(|(entries, _)| entries)
+        .unwrap_or_default();
+    compact_context_snapshot_entries_for_replay(&mut entries);
 
     // Check for screenshot frames
     let frames_dir = session_dir.join("frames");
@@ -1551,15 +3157,4491 @@ fn get_session_detail(session_id: &str) -> String {
         "session_id": session_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
         "entries": entries,
         "frames": frames,
+        "relationships": session_relationships_from_log_dir(&session_dir),
     }).to_string()
 }
 
+#[derive(Default)]
+struct ContextSnapshotSelector {
+    file: Option<String>,
+    request_id: Option<String>,
+    request_index: Option<u64>,
+    ts: Option<String>,
+}
+
+impl ContextSnapshotSelector {
+    fn is_empty(&self) -> bool {
+        self.file.is_none()
+            && self.request_id.is_none()
+            && self.request_index.is_none()
+            && self.ts.is_none()
+    }
+}
+
+fn context_snapshot_file_selector_is_safe(file: &str) -> bool {
+    if file.is_empty() || file.len() > 512 || file.contains('\\') {
+        return false;
+    }
+    let path = Path::new(file);
+    !path.is_absolute()
+        && path
+            .components()
+            .all(|component| matches!(component, std::path::Component::Normal(_)))
+}
+
+fn context_snapshot_selector_from_request(
+    request_line: &str,
+) -> Result<ContextSnapshotSelector, String> {
+    let file = query_param(request_line, "file").filter(|value| !value.trim().is_empty());
+    if file
+        .as_deref()
+        .is_some_and(|file| !context_snapshot_file_selector_is_safe(file))
+    {
+        return Err("invalid snapshot file".to_string());
+    }
+    let request_index =
+        match query_param(request_line, "request_index").filter(|value| !value.trim().is_empty()) {
+            Some(value) => Some(
+                value
+                    .parse::<u64>()
+                    .map_err(|_| "invalid request_index".to_string())?,
+            ),
+            None => None,
+        };
+    let selector = ContextSnapshotSelector {
+        file,
+        request_id: query_param(request_line, "request_id")
+            .filter(|value| !value.trim().is_empty()),
+        request_index,
+        ts: query_param(request_line, "ts").filter(|value| !value.trim().is_empty()),
+    };
+    if selector.is_empty() {
+        return Err("missing snapshot selector".to_string());
+    }
+    Ok(selector)
+}
+
+fn context_snapshot_candidate_log_dirs(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    let push = |dirs: &mut Vec<PathBuf>, seen: &mut HashSet<String>, path: PathBuf| {
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        if seen.insert(key) {
+            dirs.push(path);
+        }
+    };
+
+    if let Some(dir) = resolve_session_dir_from_home(home, session_id) {
+        push(&mut dirs, &mut seen, dir);
+    }
+    let source = crate::session_names::normalize_source(source);
+    if source != "intendant" {
+        for record in crate::external_wrapper_index::wrappers_for(home, &source, session_id) {
+            push(&mut dirs, &mut seen, PathBuf::from(record.log_path));
+        }
+        for dir in cached_intendant_log_dirs_for_session_id(session_id) {
+            push(&mut dirs, &mut seen, dir);
+        }
+        if dirs.is_empty() {
+            for dir in recent_intendant_log_dirs(home, EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT) {
+                if managed_context_log_dir_mentions_session(&dir, session_id) {
+                    push(&mut dirs, &mut seen, dir);
+                }
+            }
+        }
+    } else if dirs.is_empty() {
+        for dir in managed_context_candidate_log_dirs(home, None, Some(session_id), None) {
+            push(&mut dirs, &mut seen, dir);
+        }
+    }
+    dirs
+}
+
+fn context_snapshot_log_entry_matches_selector(
+    entry: &serde_json::Value,
+    selector: &ContextSnapshotSelector,
+) -> bool {
+    if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+        return false;
+    }
+    if let Some(file) = selector.file.as_deref() {
+        if entry.get("file").and_then(|v| v.as_str()) != Some(file) {
+            return false;
+        }
+    }
+    if let Some(request_id) = selector.request_id.as_deref() {
+        if entry
+            .get("data")
+            .and_then(|data| data.get("request_id"))
+            .and_then(|v| v.as_str())
+            != Some(request_id)
+        {
+            return false;
+        }
+    }
+    if let Some(request_index) = selector.request_index {
+        if entry
+            .get("data")
+            .and_then(|data| data.get("request_index"))
+            .and_then(|v| v.as_u64())
+            != Some(request_index)
+        {
+            return false;
+        }
+    }
+    if let Some(ts) = selector.ts.as_deref() {
+        if entry.get("ts").and_then(|v| v.as_str()) != Some(ts) {
+            return false;
+        }
+    }
+    true
+}
+
+fn context_snapshot_log_entry_matches_session(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    session_id: &str,
+    source: &str,
+) -> bool {
+    let data_session = entry
+        .get("data")
+        .and_then(|data| data.get("session_id"))
+        .and_then(|v| v.as_str());
+    if data_session == Some(session_id) {
+        return true;
+    }
+    let source = crate::session_names::normalize_source(source);
+    if source == "intendant" {
+        return data_session.is_none()
+            || replay_session_id_from_dir(log_dir).as_deref() == Some(session_id);
+    }
+    data_session.is_none() && replay_session_id_from_dir(log_dir).as_deref() == Some(session_id)
+}
+
+fn exact_context_snapshot_from_log_entry(
+    entry: &serde_json::Value,
+    log_dir: &Path,
+    contents: &str,
+) -> Option<serde_json::Value> {
+    let app_event = crate::session_log::session_log_entry_to_app_event(entry, log_dir)?;
+    let outbound = crate::event::app_event_to_outbound(&app_event)?;
+    let mut value = serde_json::to_value(&outbound).ok()?;
+    let external_replay_session_id = external_backend_session_id_from_replay(contents);
+    let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
+    let replay_session_id = external_replay_session_id
+        .clone()
+        .or_else(|| wrapper_replay_session_id.clone());
+    inject_replay_entry_metadata(
+        &mut value,
+        entry,
+        replay_session_id.as_deref(),
+        external_replay_session_id.as_deref(),
+        wrapper_replay_session_id.as_deref(),
+    );
+    Some(value)
+}
+
+fn get_session_context_snapshot_from_home(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+    request_line: &str,
+) -> (&'static str, String) {
+    if !session_lookup_id_is_safe(session_id) {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "invalid session id"}).to_string(),
+        );
+    }
+    let selector = match context_snapshot_selector_from_request(request_line) {
+        Ok(selector) => selector,
+        Err(error) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": error}).to_string(),
+            );
+        }
+    };
+    for log_dir in context_snapshot_candidate_log_dirs(home, session_id, source) {
+        let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if !context_snapshot_log_entry_matches_selector(&entry, &selector)
+                || !context_snapshot_log_entry_matches_session(&entry, &log_dir, session_id, source)
+            {
+                continue;
+            }
+            let Some(snapshot) = exact_context_snapshot_from_log_entry(&entry, &log_dir, &contents)
+            else {
+                continue;
+            };
+            return (
+                "200 OK",
+                serde_json::json!({
+                    "ok": true,
+                    "snapshot": snapshot,
+                })
+                .to_string(),
+            );
+        }
+    }
+    (
+        "404 Not Found",
+        serde_json::json!({"error": "context snapshot not found"}).to_string(),
+    )
+}
+
+fn session_log_search_from_request(request_line: &str) -> String {
+    let home_path = crate::platform::home_dir();
+    let query = query_param(request_line, "q").unwrap_or_default();
+    let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
+    let mode = query_param(request_line, "mode").unwrap_or_default();
+    let project_filter = session_project_filter_from_request(request_line);
+    session_log_search_from_home_with_projects(
+        &home_path,
+        &query,
+        &source_filter,
+        &mode,
+        &project_filter,
+    )
+}
+
+fn session_log_search_from_home(
+    home: &Path,
+    query: &str,
+    source_filter: &str,
+    mode: &str,
+) -> String {
+    session_log_search_from_home_with_projects(home, query, source_filter, mode, &[])
+}
+
+fn session_log_search_from_home_with_projects(
+    home: &Path,
+    query: &str,
+    source_filter: &str,
+    mode: &str,
+    project_filter: &[String],
+) -> String {
+    let mode = SessionLogSearchMode::from_query(mode);
+    let terms = session_log_search_terms(query);
+    if !mode.has_search_input(query, &terms) {
+        return serde_json::json!({
+            "query": query,
+            "mode": mode.as_str(),
+            "source_filter": normalize_session_source_filter(source_filter),
+            "searched": 0,
+            "truncated": false,
+            "exhaustive": true,
+            "truncated_files": 0,
+            "results": [],
+        })
+        .to_string();
+    }
+
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_for_deep_search_from_home(home))
+            .unwrap_or_else(|_| Vec::new());
+    let deleted_external_sessions = read_deleted_external_sessions(home);
+    let source_filter = normalize_session_source_filter(source_filter);
+    let project_filter = normalize_session_project_filter(project_filter);
+    let mut results = Vec::new();
+    let mut searched = 0usize;
+
+    for session in sessions {
+        let source = session
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("intendant");
+        if !session_source_matches_filter(source, &source_filter) {
+            continue;
+        }
+        if !session_project_matches_filter(&session, &project_filter) {
+            continue;
+        }
+
+        let Some(session_id) = session.get("session_id").and_then(|v| v.as_str()) else {
+            continue;
+        };
+
+        let session_path = session
+            .get("path")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+        let Some(search_path) =
+            session_log_search_file_path(home, source, session_id, session_path.as_deref())
+        else {
+            continue;
+        };
+        let Some((matches, snippets)) = search_session_log_file(
+            &search_path,
+            query,
+            &terms,
+            mode,
+            &deleted_external_sessions,
+        ) else {
+            continue;
+        };
+        searched += 1;
+        if matches == 0 {
+            continue;
+        }
+        results.push(serde_json::json!({
+            "key": format!("{source}:{session_id}"),
+            "source": source,
+            "session_id": session_id,
+            "matches": matches,
+            "snippets": snippets,
+            "session": session,
+        }));
+    }
+
+    serde_json::json!({
+        "query": query,
+        "mode": mode.as_str(),
+        "source_filter": source_filter,
+        "searched": searched,
+        "truncated": false,
+        "exhaustive": true,
+        "truncated_files": 0,
+        "results": results,
+    })
+    .to_string()
+}
+
+fn session_project_filter_from_request(request_line: &str) -> Vec<String> {
+    let Some(raw) = query_param(request_line, "projects") else {
+        return Vec::new();
+    };
+    match serde_json::from_str::<Vec<String>>(&raw) {
+        Ok(values) => values,
+        Err(_) => vec![raw],
+    }
+}
+
+fn normalize_session_project_filter(project_filter: &[String]) -> HashSet<String> {
+    project_filter
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn session_project_directory_value(session: &serde_json::Value) -> Option<String> {
+    for key in [
+        "project_root",
+        "projectRoot",
+        "project_dir",
+        "projectDir",
+        "project",
+        "cwd",
+        "workdir",
+        "workDir",
+    ] {
+        let Some(value) = value_str(session, key) else {
+            continue;
+        };
+        let trimmed = value.trim();
+        if !trimmed.is_empty() {
+            return Some(trimmed.to_string());
+        }
+    }
+    None
+}
+
+fn session_project_matches_filter(
+    session: &serde_json::Value,
+    project_filter: &HashSet<String>,
+) -> bool {
+    if project_filter.is_empty() {
+        return true;
+    }
+    match session_project_directory_value(session) {
+        Some(path) => project_filter.contains(&path),
+        None => false,
+    }
+}
+
+fn session_log_search_file_path(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    session_path: Option<&Path>,
+) -> Option<PathBuf> {
+    if let Some(path) = session_path {
+        if source == "intendant" && path.is_dir() {
+            return Some(path.join("session.jsonl"));
+        }
+        if path.is_file() {
+            return Some(path.to_path_buf());
+        }
+    }
+
+    match source {
+        "intendant" => Some(resolve_session_dir_from_home(home, session_id)?.join("session.jsonl")),
+        "codex" => find_codex_session_file(home, session_id),
+        "claude-code" => find_claude_session_file(home, session_id),
+        "gemini" => find_gemini_session_file(home, session_id),
+        _ => None,
+    }
+}
+
+fn find_claude_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
+    collect_recent_files(
+        &home.join(".claude").join("projects"),
+        ".jsonl",
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    )
+    .into_iter()
+    .find(|path| path.file_stem().and_then(|n| n.to_str()) == Some(session_id))
+}
+
+fn find_gemini_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
+    collect_recent_files(
+        &home.join(".gemini").join("tmp"),
+        ".json",
+        EXTERNAL_SESSION_SCAN_LIMIT,
+    )
+    .into_iter()
+    .filter(|path| {
+        path.parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            == Some("chats")
+    })
+    .find(|path| {
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&contents)
+            .ok()
+            .and_then(|obj| value_str(&obj, "sessionId"))
+            .as_deref()
+            == Some(session_id)
+    })
+}
+
+fn search_session_log_file(
+    path: &Path,
+    query: &str,
+    terms: &[String],
+    mode: SessionLogSearchMode,
+    deleted_external_sessions: &HashSet<(String, String)>,
+) -> Option<(usize, Vec<serde_json::Value>)> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let candidates = reader
+        .lines()
+        .filter_map(Result::ok)
+        .filter_map(|line| session_log_search_candidate_from_line(&line));
+    Some(search_session_log_candidates(
+        candidates,
+        query,
+        terms,
+        mode,
+        deleted_external_sessions,
+    ))
+}
+
+fn normalize_session_source_filter(source_filter: &str) -> String {
+    let value = source_filter.trim().to_ascii_lowercase();
+    match value.as_str() {
+        "" | "all" => "all".to_string(),
+        "external" => "external".to_string(),
+        "intendant" | "codex" | "claude-code" | "gemini" => value,
+        "claude" => "claude-code".to_string(),
+        _ => "all".to_string(),
+    }
+}
+
+fn session_source_matches_filter(source: &str, source_filter: &str) -> bool {
+    match source_filter {
+        "all" => true,
+        "external" => source != "intendant",
+        "claude" | "claude-code" => source == "claude-code",
+        other => source == other,
+    }
+}
+
+fn session_log_search_terms(query: &str) -> Vec<String> {
+    query
+        .split_whitespace()
+        .map(|term| term.trim().to_ascii_lowercase())
+        .filter(|term| !term.is_empty())
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionLogSearchMode {
+    AllKeywords,
+    ExactPhrase,
+    AnyKeywordSession,
+    UserMessageAllKeywords,
+}
+
+impl SessionLogSearchMode {
+    fn from_query(value: &str) -> Self {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "exact" | "exact_phrase" | "phrase" => Self::ExactPhrase,
+            "any" | "any_keyword" | "any_keyword_session" => Self::AnyKeywordSession,
+            "user" | "user_message" | "user_message_all_keywords" => Self::UserMessageAllKeywords,
+            _ => Self::AllKeywords,
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::AllKeywords => "all_keywords",
+            Self::ExactPhrase => "exact_phrase",
+            Self::AnyKeywordSession => "any_keyword_session",
+            Self::UserMessageAllKeywords => "user_message_all_keywords",
+        }
+    }
+
+    fn has_search_input(self, query: &str, terms: &[String]) -> bool {
+        match self {
+            Self::ExactPhrase => !query.trim().is_empty(),
+            _ => !terms.is_empty(),
+        }
+    }
+}
+
+fn search_session_log_candidates<I>(
+    candidates: I,
+    query: &str,
+    terms: &[String],
+    mode: SessionLogSearchMode,
+    deleted_external_sessions: &HashSet<(String, String)>,
+) -> (usize, Vec<serde_json::Value>)
+where
+    I: IntoIterator<Item = SessionLogSearchCandidate>,
+{
+    let mut matches = 0usize;
+    let mut snippets = Vec::new();
+    let snippet_needles = if mode == SessionLogSearchMode::ExactPhrase {
+        vec![query.trim().to_ascii_lowercase()]
+    } else {
+        terms.to_vec()
+    };
+
+    for candidate in candidates {
+        if session_log_candidate_is_deleted_external_reference(
+            &candidate,
+            deleted_external_sessions,
+        ) {
+            continue;
+        }
+        if candidate.text.trim().is_empty()
+            || !session_log_candidate_matches(&candidate, query, terms, mode)
+        {
+            continue;
+        }
+        matches += 1;
+        if snippets.len() < SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION {
+            snippets.push(serde_json::json!({
+                "ts": candidate.ts,
+                "source": candidate.source,
+                "level": candidate.level,
+                "event": candidate.event,
+                "content": session_log_match_snippet(
+                    &candidate.text,
+                    &snippet_needles,
+                    SESSION_LOG_SEARCH_SNIPPET_CHARS
+                ),
+            }));
+        }
+    }
+
+    (matches, snippets)
+}
+
+fn session_log_candidate_is_deleted_external_reference(
+    candidate: &SessionLogSearchCandidate,
+    deleted_external_sessions: &HashSet<(String, String)>,
+) -> bool {
+    if deleted_external_sessions.is_empty() {
+        return false;
+    }
+
+    if candidate.event == "presence_log"
+        && candidate.text.contains("ControlMsg:")
+        && candidate.text.contains("CreateSession")
+    {
+        return true;
+    }
+
+    deleted_external_sessions
+        .iter()
+        .any(|(_source, id)| !id.is_empty() && candidate.text.contains(id))
+}
+
+fn session_log_candidate_matches(
+    candidate: &SessionLogSearchCandidate,
+    query: &str,
+    terms: &[String],
+    mode: SessionLogSearchMode,
+) -> bool {
+    match mode {
+        SessionLogSearchMode::AllKeywords => text_matches_session_terms(&candidate.text, terms),
+        SessionLogSearchMode::ExactPhrase => text_contains_session_phrase(&candidate.text, query),
+        SessionLogSearchMode::AnyKeywordSession => {
+            text_matches_any_session_term(&candidate.text, terms)
+        }
+        SessionLogSearchMode::UserMessageAllKeywords => {
+            candidate.is_user && text_matches_session_terms(&candidate.text, terms)
+        }
+    }
+}
+
+struct SessionLogSearchCandidate {
+    ts: String,
+    source: String,
+    level: String,
+    event: String,
+    text: String,
+    is_user: bool,
+}
+
+fn session_log_search_candidate_from_line(line: &str) -> Option<SessionLogSearchCandidate> {
+    let trimmed = line.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let Ok(value) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+        return Some(SessionLogSearchCandidate {
+            ts: String::new(),
+            source: String::new(),
+            level: String::new(),
+            event: String::new(),
+            text: trimmed.to_string(),
+            is_user: false,
+        });
+    };
+
+    let mut parts = Vec::new();
+    collect_session_log_search_strings(&value, &mut parts);
+    let text = if parts.is_empty() {
+        trimmed.to_string()
+    } else {
+        parts.join("\n")
+    };
+
+    Some(SessionLogSearchCandidate {
+        ts: value
+            .get("ts")
+            .or_else(|| value.get("timestamp"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        source: value
+            .get("source")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        level: value
+            .get("level")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        event: value
+            .get("event")
+            .or_else(|| value.get("type"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string(),
+        text,
+        is_user: session_log_json_is_user_message(&value),
+    })
+}
+
+fn session_log_json_is_user_message(value: &serde_json::Value) -> bool {
+    [
+        value.get("source"),
+        value.get("role"),
+        value.get("type"),
+        value.pointer("/payload/source"),
+        value.pointer("/payload/role"),
+        value.pointer("/payload/type"),
+        value.pointer("/message/role"),
+        value.pointer("/message/type"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|v| v.as_str())
+    .any(|value| matches!(value.to_ascii_lowercase().as_str(), "user" | "user_message"))
+}
+
+fn collect_session_log_search_strings(value: &serde_json::Value, out: &mut Vec<String>) {
+    match value {
+        serde_json::Value::String(value) => {
+            if value.trim().is_empty() {
+                return;
+            }
+            out.push(value.to_string());
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                collect_session_log_search_strings(item, out);
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for value in map.values() {
+                collect_session_log_search_strings(value, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn text_matches_session_terms(text: &str, terms: &[String]) -> bool {
+    let haystack = text.to_ascii_lowercase();
+    terms.iter().all(|term| haystack.contains(term))
+}
+
+fn text_matches_any_session_term(text: &str, terms: &[String]) -> bool {
+    let haystack = text.to_ascii_lowercase();
+    terms.iter().any(|term| haystack.contains(term))
+}
+
+fn text_contains_session_phrase(text: &str, phrase: &str) -> bool {
+    let phrase = phrase.trim().to_ascii_lowercase();
+    !phrase.is_empty() && text.to_ascii_lowercase().contains(&phrase)
+}
+
+fn session_log_match_snippet(text: &str, terms: &[String], max_chars: usize) -> String {
+    let compact = text.split_whitespace().collect::<Vec<_>>().join(" ");
+    let total_chars = compact.chars().count();
+    if total_chars <= max_chars {
+        return compact;
+    }
+
+    let lower = compact.to_ascii_lowercase();
+    let match_byte = terms
+        .iter()
+        .filter_map(|term| lower.find(term))
+        .min()
+        .unwrap_or(0);
+    let match_char = compact[..match_byte].chars().count();
+    let start_char = match_char.saturating_sub(max_chars / 3);
+    let end_char = (start_char + max_chars).min(total_chars);
+    let mut snippet: String = compact
+        .chars()
+        .skip(start_char)
+        .take(end_char - start_char)
+        .collect();
+    if start_char > 0 {
+        snippet.insert_str(0, "...");
+    }
+    if end_char < total_chars {
+        snippet.push_str("...");
+    }
+    snippet
+}
+
+fn value_str(v: &serde_json::Value, key: &str) -> Option<String> {
+    v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
+}
+
+fn codex_exec_command_workdir(payload: &serde_json::Value) -> Option<String> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("function_call")
+        || payload.get("name").and_then(|v| v.as_str()) != Some("exec_command")
+    {
+        return None;
+    }
+
+    let arguments = payload.get("arguments")?;
+    let parsed_arguments;
+    let arguments = if let Some(raw) = arguments.as_str() {
+        parsed_arguments = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+        &parsed_arguments
+    } else {
+        arguments
+    };
+
+    value_str(arguments, "workdir")
+        .or_else(|| value_str(arguments, "cwd"))
+        .filter(|value| !value.trim().is_empty())
+}
+
+fn compact_text(s: &str, max: usize) -> String {
+    let one_line = s.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.chars().count() <= max {
+        one_line
+    } else {
+        let mut out = one_line
+            .chars()
+            .take(max.saturating_sub(1))
+            .collect::<String>();
+        out.push_str("...");
+        out
+    }
+}
+
+fn preview_text(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut out: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        out.push_str("...");
+    }
+    out
+}
+
+fn message_content_text(content: &serde_json::Value) -> Option<String> {
+    match content {
+        serde_json::Value::String(s) => Some(s.clone()),
+        serde_json::Value::Array(items) => {
+            let parts: Vec<String> = items
+                .iter()
+                .filter_map(|item| {
+                    item.get("text")
+                        .and_then(|v| v.as_str())
+                        .or_else(|| item.get("content").and_then(|v| v.as_str()))
+                        .map(|s| s.to_string())
+                })
+                .collect();
+            if parts.is_empty() {
+                None
+            } else {
+                Some(parts.join("\n"))
+            }
+        }
+        _ => None,
+    }
+}
+
+#[derive(Deserialize)]
+struct ExternalJsonLineKind<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+    #[serde(borrow)]
+    payload: Option<ExternalJsonPayloadKind<'a>>,
+}
+
+#[derive(Deserialize)]
+struct ExternalJsonPayloadKind<'a> {
+    #[serde(rename = "type", borrow)]
+    kind: Option<Cow<'a, str>>,
+}
+
+fn codex_line_may_affect_replay(line: &str) -> bool {
+    let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(line) else {
+        return true;
+    };
+    let payload_kind = kind
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.kind.as_deref());
+    match (kind.kind.as_deref(), payload_kind) {
+        (_, Some("thread_rolled_back" | "user_message" | "agent_message" | "message")) => true,
+        // All response items must reach the parser so item-anchor rewinds can locate
+        // their anchor — including non-message items (function_call, reasoning) that
+        // render no transcript entry but are the usual targets of a noise-trim rewind.
+        (Some("response_item"), _) => true,
+        (Some("event_msg"), None) => true,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
+/// Item id carried by a `response_item` rollout line (the id an item-anchor rewind
+/// targets), or `None` for other line kinds / items without an id.
+fn codex_response_item_id(obj: &serde_json::Value) -> Option<String> {
+    if obj.get("type").and_then(|v| v.as_str()) != Some("response_item") {
+        return None;
+    }
+    obj.get("payload")
+        .and_then(|payload| payload.get("id"))
+        .or_else(|| obj.get("id"))
+        .and_then(|v| v.as_str())
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn codex_line_may_affect_session_list(line: &str) -> bool {
+    let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(line) else {
+        return true;
+    };
+    let payload_kind = kind
+        .payload
+        .as_ref()
+        .and_then(|payload| payload.kind.as_deref());
+    match (kind.kind.as_deref(), payload_kind) {
+        (Some("session_meta" | "turn_context"), _) => true,
+        (Some("event_msg"), _) => true,
+        (Some("response_item"), Some("message" | "function_call")) => true,
+        (Some("response_item"), None) => true,
+        (None, _) => true,
+        _ => false,
+    }
+}
+
+fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("message") {
+        return None;
+    }
+    let role = payload
+        .get("role")
+        .and_then(|v| v.as_str())
+        .unwrap_or("message")
+        .to_string();
+    let content = payload.get("content")?;
+    message_content_text(content).map(|text| (role, text))
+}
+
+fn codex_event_message_text(payload: &serde_json::Value) -> Option<(String, String)> {
+    match payload.get("type").and_then(|v| v.as_str())? {
+        "user_message" => value_str(payload, "message").map(|text| ("user".to_string(), text)),
+        "agent_message" => {
+            value_str(payload, "message").map(|text| ("assistant".to_string(), text))
+        }
+        _ => None,
+    }
+}
+
+fn codex_thread_rollback_anchor(payload: &serde_json::Value) -> Option<(String, String)> {
+    let anchor = payload.get("anchor")?;
+    let item_id = value_str(anchor, "itemId")
+        .or_else(|| value_str(anchor, "item_id"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())?;
+    let position = value_str(anchor, "position")
+        .map(|s| s.trim().to_ascii_lowercase())
+        .filter(|s| s == "before" || s == "after")
+        .unwrap_or_else(|| "after".to_string());
+    Some((item_id, position))
+}
+
+fn is_codex_injected_user_text(text: &str) -> bool {
+    let trimmed = text.trim_start();
+    trimmed.starts_with("# AGENTS.md instructions for ")
+        || trimmed.starts_with("<turn_aborted>")
+        || trimmed.starts_with("<subagent_notification>")
+        || trimmed.starts_with("<environment_context>")
+        || trimmed.starts_with("<task-notification>")
+        || trimmed.starts_with("<command-name>")
+        || trimmed.starts_with("<command-message>")
+        || trimmed.starts_with("<local-command-stdout>")
+        || trimmed.starts_with("<bash-input>")
+        || trimmed.starts_with("<bash-stdout>")
+        || trimmed.starts_with("<bash-stderr>")
+        || trimmed.starts_with("<user_shell_command>")
+}
+
+fn codex_thread_display_name(value: Option<String>) -> Option<String> {
+    value
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+        .filter(|s| !is_codex_injected_user_text(s))
+        .map(|s| compact_text(&s, 180))
+}
+
+fn push_external_transcript_entry(
+    entries: &mut Vec<serde_json::Value>,
+    provider_source: &str,
+    ts: &str,
+    role: &str,
+    text: String,
+) -> bool {
+    let role = match role.trim().to_lowercase().as_str() {
+        "model" => "assistant".to_string(),
+        other => other.to_string(),
+    };
+    if role != "user" && role != "assistant" {
+        return false;
+    }
+    if text.trim().is_empty() {
+        return false;
+    }
+    if role == "user" && is_codex_injected_user_text(&text) {
+        return false;
+    }
+    if entries.last().is_some_and(|entry| {
+        external_transcript_entry_role(entry) == Some(role.as_str())
+            && entry.get("content").and_then(|v| v.as_str()) == Some(text.as_str())
+            && external_transcript_entries_are_temporal_duplicates(
+                entry.get("ts").and_then(|v| v.as_str()),
+                ts,
+            )
+    }) {
+        return false;
+    }
+    entries.push(serde_json::json!({
+        "ts": ts,
+        "level": if role == "assistant" || role == "model" { "model" } else { "info" },
+        "source": external_transcript_source(provider_source, &role),
+        "content": text,
+    }));
+    true
+}
+
+fn external_transcript_entries_are_temporal_duplicates(
+    previous_ts: Option<&str>,
+    current_ts: &str,
+) -> bool {
+    let Some(previous_ts) = previous_ts else {
+        return false;
+    };
+    if previous_ts == current_ts {
+        return true;
+    }
+    let Ok(previous) = chrono::DateTime::parse_from_rfc3339(previous_ts) else {
+        return false;
+    };
+    let Ok(current) = chrono::DateTime::parse_from_rfc3339(current_ts) else {
+        return false;
+    };
+    previous
+        .timestamp_millis()
+        .abs_diff(current.timestamp_millis())
+        <= EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS as u64
+}
+
+fn external_transcript_entry_role(entry: &serde_json::Value) -> Option<&'static str> {
+    if entry.get("source").and_then(|v| v.as_str()) == Some("user") {
+        Some("user")
+    } else if entry.get("level").and_then(|v| v.as_str()) == Some("model") {
+        Some("assistant")
+    } else {
+        None
+    }
+}
+
+/// Mark every transcript entry at or after `start_index` superseded (skipping
+/// rollback markers and already-superseded entries). Used for item-anchor rewinds,
+/// which discard the tail after the anchored item. Returns the user-turn indices
+/// that were superseded so caller can keep revision bookkeeping consistent.
+fn mark_external_entries_superseded_from(
+    entries: &mut [serde_json::Value],
+    start_index: usize,
+    rollback_ts: &str,
+) -> Vec<u32> {
+    let mut superseded_user_turns = Vec::new();
+    for idx in start_index..entries.len() {
+        let entry = &entries[idx];
+        if entry
+            .get("superseded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if entry.get("kind").and_then(|v| v.as_str()) == Some("rollback_marker") {
+            continue;
+        }
+        let Some(role) = external_transcript_entry_role(entry) else {
+            continue;
+        };
+        let user_turn_index = entry
+            .get("user_turn_index")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        if let Some(obj) = entries[idx].as_object_mut() {
+            obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "superseded_at".to_string(),
+                serde_json::Value::String(rollback_ts.to_string()),
+            );
+            obj.insert(
+                "superseded_reason".to_string(),
+                serde_json::Value::String("thread_rollback".to_string()),
+            );
+        }
+        if role == "user" {
+            if let Some(turn) = user_turn_index {
+                superseded_user_turns.push(turn);
+            }
+        }
+    }
+    superseded_user_turns
+}
+
+fn mark_latest_external_turn_superseded(
+    entries: &mut [serde_json::Value],
+    rollback_ts: &str,
+) -> Option<u32> {
+    for idx in (0..entries.len()).rev() {
+        let entry = &entries[idx];
+        if entry
+            .get("superseded")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        if entry.get("kind").and_then(|v| v.as_str()) == Some("rollback_marker") {
+            continue;
+        }
+        let Some(role) = external_transcript_entry_role(entry) else {
+            continue;
+        };
+        let user_turn_index = entry
+            .get("user_turn_index")
+            .and_then(|v| v.as_u64())
+            .and_then(|v| u32::try_from(v).ok());
+        if let Some(obj) = entries[idx].as_object_mut() {
+            obj.insert("superseded".to_string(), serde_json::Value::Bool(true));
+            obj.insert(
+                "superseded_at".to_string(),
+                serde_json::Value::String(rollback_ts.to_string()),
+            );
+            obj.insert(
+                "superseded_reason".to_string(),
+                serde_json::Value::String("thread_rollback".to_string()),
+            );
+        }
+        if role == "user" {
+            return user_turn_index;
+        }
+    }
+    None
+}
+
+fn collect_files(root: &Path, suffix: &str, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, suffix, out);
+        } else if path
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(suffix))
+            .unwrap_or(false)
+        {
+            out.push(path);
+        }
+    }
+}
+
+fn file_mtime_secs(path: &Path) -> u64 {
+    std::fs::metadata(path)
+        .map(|m| metadata_mtime_secs(&m))
+        .unwrap_or(0)
+}
+
+fn metadata_mtime_secs(metadata: &std::fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn metadata_mtime_nanos(metadata: &std::fs::Metadata) -> u128 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|d| d.as_nanos())
+        .unwrap_or(0)
+}
+
+fn metadata_ctime_nanos(metadata: &std::fs::Metadata) -> i128 {
+    crate::platform::metadata_ctime_nanos(metadata)
+}
+
+fn session_list_path_key(path: &Path) -> String {
+    let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalized.to_string_lossy().to_string()
+}
+
+fn file_dependency_fingerprint(path: &Path) -> String {
+    let path_key = session_list_path_key(path);
+    match std::fs::metadata(path) {
+        Ok(metadata) => {
+            let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+            format!(
+                "{path_key}\0{}\0{}\0{}\0{}\0{}",
+                metadata.len(),
+                metadata_mtime_nanos(&metadata),
+                metadata_ctime_nanos(&metadata),
+                dev,
+                ino
+            )
+        }
+        Err(_) => format!("{path_key}\0missing"),
+    }
+}
+
+fn session_list_cache_key(
+    namespace: &'static str,
+    path: &Path,
+    extra: impl Into<String>,
+) -> Option<SessionListCacheKey> {
+    let metadata = std::fs::metadata(path).ok()?;
+    if !metadata.is_file() {
+        return None;
+    }
+    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+    Some(SessionListCacheKey {
+        namespace,
+        path: session_list_path_key(path),
+        len: metadata.len(),
+        mtime_nanos: metadata_mtime_nanos(&metadata),
+        ctime_nanos: metadata_ctime_nanos(&metadata),
+        dev,
+        ino,
+        extra: extra.into(),
+    })
+}
+
+fn session_list_cache_slot(key: &SessionListCacheKey) -> String {
+    format!("{}\0{}\0{}", key.namespace, key.path, key.extra)
+}
+
+fn session_list_row_cache() -> &'static Mutex<HashMap<String, SessionListRowCacheEntry>> {
+    SESSION_LIST_ROW_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_session_list_row(key: &SessionListCacheKey) -> Option<serde_json::Value> {
+    let slot = session_list_cache_slot(key);
+    let cache = session_list_row_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&slot)
+        .filter(|entry| &entry.key == key)
+        .map(|entry| entry.row.clone())
+}
+
+fn store_session_list_row(key: SessionListCacheKey, row: &serde_json::Value) {
+    let slot = session_list_cache_slot(&key);
+    let mut cache = session_list_row_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        SessionListRowCacheEntry {
+            key,
+            row: row.clone(),
+        },
+    );
+}
+
+fn codex_session_list_cache() -> &'static Mutex<HashMap<String, CodexSessionListCacheEntry>> {
+    CODEX_SESSION_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_codex_session_list_entry(
+    key: &SessionListCacheKey,
+) -> Option<CodexSessionListCacheEntry> {
+    let slot = session_list_cache_slot(key);
+    let cache = codex_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.get(&slot).filter(|entry| &entry.key == key).cloned()
+}
+
+fn store_codex_session_list_entry(key: SessionListCacheKey, summary: CodexSessionListSummary) {
+    let slot = session_list_cache_slot(&key);
+    let mut cache = codex_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(slot, CodexSessionListCacheEntry { key, summary });
+}
+
+fn intendant_session_list_cache() -> &'static Mutex<HashMap<String, IntendantSessionListCacheEntry>>
+{
+    INTENDANT_SESSION_LIST_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn cached_intendant_session_list_row(
+    fingerprint: &SessionDirFingerprint,
+) -> Option<serde_json::Value> {
+    let cache = intendant_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&fingerprint.path)
+        .filter(|entry| &entry.fingerprint == fingerprint)
+        .map(|entry| entry.row.clone())
+}
+
+fn store_intendant_session_list_row(fingerprint: SessionDirFingerprint, row: &serde_json::Value) {
+    let slot = fingerprint.path.clone();
+    let mut cache = intendant_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        IntendantSessionListCacheEntry {
+            fingerprint,
+            row: row.clone(),
+        },
+    );
+}
+
+fn collect_recent_files(root: &Path, suffix: &str, limit: usize) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(root, suffix, &mut files);
+    let mut seen = HashSet::new();
+    files.retain(|path| {
+        std::fs::canonicalize(path)
+            .map(|canonical| seen.insert(canonical))
+            .unwrap_or(true)
+    });
+    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.truncate(limit);
+    files
+}
+
+fn derive_project_root_from_cwd(cwd: Option<&str>) -> Option<String> {
+    let cwd = cwd?.trim();
+    if cwd.is_empty() {
+        return None;
+    }
+
+    let mut current = PathBuf::from(cwd);
+    if !current.is_absolute() {
+        return Some(cwd.to_string());
+    }
+    if current.is_file() {
+        current.pop();
+    }
+
+    loop {
+        if current.join(".git").exists() {
+            return Some(current.to_string_lossy().to_string());
+        }
+        if !current.pop() {
+            break;
+        }
+    }
+
+    Some(cwd.to_string())
+}
+
+fn read_text_head_tail(path: &Path, head_bytes: u64, tail_bytes: u64) -> Option<String> {
+    let mut file = std::fs::File::open(path).ok()?;
+    let len = file.metadata().ok().map(|m| m.len()).unwrap_or(0);
+    if len <= head_bytes.saturating_add(tail_bytes) {
+        let mut buf = Vec::new();
+        file.read_to_end(&mut buf).ok()?;
+        return Some(String::from_utf8_lossy(&buf).to_string());
+    }
+
+    let mut head = vec![0; head_bytes as usize];
+    let head_len = file.read(&mut head).ok()?;
+    head.truncate(head_len);
+
+    file.seek(SeekFrom::End(-(tail_bytes as i64))).ok()?;
+    let mut tail = Vec::new();
+    file.read_to_end(&mut tail).ok()?;
+
+    let mut out = String::from_utf8_lossy(&head).to_string();
+    out.push('\n');
+    out.push_str(&String::from_utf8_lossy(&tail));
+    Some(out)
+}
+
+fn file_mtime_string(path: &Path) -> Option<String> {
+    mtime_secs_to_string(file_mtime_secs(path))
+}
+
+fn mtime_secs_to_string(secs: u64) -> Option<String> {
+    if secs == 0 {
+        return None;
+    }
+    let t = std::time::UNIX_EPOCH + std::time::Duration::from_secs(secs);
+    let dt: chrono::DateTime<chrono::Local> = t.into();
+    Some(dt.format("%Y-%m-%d %H:%M:%S").to_string())
+}
+
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct SessionUsage {
+    total_tokens: u64,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    cache_creation_tokens: u64,
+    cached_tokens: u64,
+}
+
+impl SessionUsage {
+    fn is_empty(self) -> bool {
+        self.total_tokens == 0
+            && self.prompt_tokens == 0
+            && self.completion_tokens == 0
+            && self.cache_creation_tokens == 0
+            && self.cached_tokens == 0
+    }
+
+    fn add(&mut self, other: SessionUsage) {
+        self.total_tokens += other.total_tokens;
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.cache_creation_tokens += other.cache_creation_tokens;
+        self.cached_tokens += other.cached_tokens;
+    }
+
+    fn saturating_sub(self, baseline: SessionUsage) -> SessionUsage {
+        SessionUsage {
+            total_tokens: self.total_tokens.saturating_sub(baseline.total_tokens),
+            prompt_tokens: self.prompt_tokens.saturating_sub(baseline.prompt_tokens),
+            completion_tokens: self
+                .completion_tokens
+                .saturating_sub(baseline.completion_tokens),
+            cache_creation_tokens: self
+                .cache_creation_tokens
+                .saturating_sub(baseline.cache_creation_tokens),
+            cached_tokens: self.cached_tokens.saturating_sub(baseline.cached_tokens),
+        }
+    }
+}
+
+fn value_u64_at(value: &serde_json::Value, paths: &[&str]) -> Option<u64> {
+    paths
+        .iter()
+        .find_map(|path| value.pointer(path).and_then(|v| v.as_u64()))
+}
+
+fn apply_session_usage(session: &mut serde_json::Value, usage: SessionUsage, model: Option<&str>) {
+    if usage.is_empty() {
+        return;
+    }
+    let estimated_cost = model.and_then(|m| {
+        crate::app_state_pricing::estimate_session_cost(
+            m,
+            usage.prompt_tokens,
+            usage.completion_tokens,
+            usage.cached_tokens,
+            usage.cache_creation_tokens,
+        )
+    });
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert(
+            "total_tokens".to_string(),
+            serde_json::json!(usage.total_tokens),
+        );
+        obj.insert(
+            "prompt_tokens".to_string(),
+            serde_json::json!(usage.prompt_tokens),
+        );
+        obj.insert(
+            "completion_tokens".to_string(),
+            serde_json::json!(usage.completion_tokens),
+        );
+        obj.insert(
+            "cached_tokens".to_string(),
+            serde_json::json!(usage.cached_tokens),
+        );
+        obj.insert(
+            "cache_creation_tokens".to_string(),
+            serde_json::json!(usage.cache_creation_tokens),
+        );
+        obj.insert(
+            "estimated_cost".to_string(),
+            serde_json::json!(estimated_cost.unwrap_or(0.0)),
+        );
+        obj.insert(
+            "pricing_known".to_string(),
+            serde_json::json!(estimated_cost.is_some()),
+        );
+    }
+}
+
+fn session_usage_from_json(session: &serde_json::Value) -> SessionUsage {
+    SessionUsage {
+        total_tokens: session
+            .get("total_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        prompt_tokens: session
+            .get("prompt_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        completion_tokens: session
+            .get("completion_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cached_tokens: session
+            .get("cached_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+        cache_creation_tokens: session
+            .get("cache_creation_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0),
+    }
+}
+
+fn apply_session_model_and_reprice(session: &mut serde_json::Value, model: &str) {
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert("model".to_string(), serde_json::json!(model));
+    }
+    apply_session_usage(session, session_usage_from_json(session), Some(model));
+}
+
+fn external_session_json(
+    source: &str,
+    label: &str,
+    session_id: String,
+    resume_id: String,
+    created_at: Option<String>,
+    updated_at: Option<String>,
+    name: Option<String>,
+    task: Option<String>,
+    provider: &str,
+    model: Option<String>,
+    turns: u64,
+    project_root: Option<String>,
+    cwd: Option<String>,
+    path: Option<String>,
+    bytes: u64,
+) -> serde_json::Value {
+    let created_at = created_at.unwrap_or_default();
+    let updated_at = updated_at.unwrap_or_else(|| created_at.clone());
+    let cwd = cwd.or_else(|| project_root.clone());
+    serde_json::json!({
+        "source": source,
+        "source_label": label,
+        "session_id": session_id,
+        "resume_id": resume_id,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "name": name,
+        "task": task,
+        "provider": provider,
+        "model": model,
+        "turns": turns,
+        "status": "external",
+        "total_tokens": 0,
+        "prompt_tokens": 0,
+        "completion_tokens": 0,
+        "cached_tokens": 0,
+        "cache_creation_tokens": 0,
+        "estimated_cost": 0.0,
+        "pricing_known": false,
+        "role": null,
+        "recordings": 0,
+        "recording_bytes": 0,
+        "annotations": 0,
+        "clips": 0,
+        "frames_bytes": 0,
+        "turns_bytes": bytes,
+        "logs_bytes": bytes,
+        "total_bytes": bytes,
+        "cwd": cwd,
+        "project_root": project_root,
+        "path": path,
+        "can_delete": false,
+        "can_resume": true,
+    })
+}
+
+fn timestamp_sort_secs(value: &str) -> i64 {
+    if let Ok(dt) = chrono::DateTime::parse_from_rfc3339(value) {
+        return dt.timestamp();
+    }
+    for format in ["%Y-%m-%dT%H:%M:%S", "%Y-%m-%d %H:%M:%S"] {
+        if let Ok(dt) = chrono::NaiveDateTime::parse_from_str(value, format) {
+            if let Some(dt) = dt.and_local_timezone(chrono::Local).single() {
+                return dt.timestamp();
+            }
+        }
+    }
+    0
+}
+
+fn session_created_sort_key(session: &serde_json::Value) -> i64 {
+    session
+        .get("created_at")
+        .and_then(|v| v.as_str())
+        .map(timestamp_sort_secs)
+        .unwrap_or(0)
+}
+
+fn session_changed_sort_key(session: &serde_json::Value) -> i64 {
+    session
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(timestamp_sort_secs)
+        .unwrap_or_else(|| session_created_sort_key(session))
+}
+
+fn sort_sessions_newest_first(sessions: &mut Vec<serde_json::Value>) {
+    sessions.sort_by(|a, b| session_changed_sort_key(b).cmp(&session_changed_sort_key(a)));
+}
+
+fn session_source(session: &serde_json::Value) -> &str {
+    session
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("intendant")
+}
+
+fn session_unique_key(session: &serde_json::Value) -> String {
+    let source = session_source(session);
+    let session_id = session
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    format!("{source}:{session_id}")
+}
+
+fn push_unique_session(
+    out: &mut Vec<serde_json::Value>,
+    seen: &mut HashSet<String>,
+    session: &serde_json::Value,
+) {
+    if seen.insert(session_unique_key(session)) {
+        out.push(session.clone());
+    }
+}
+
+fn truncate_sessions_preserving_sources(sessions: &mut Vec<serde_json::Value>) {
+    if sessions.len() <= SESSION_LIST_LIMIT {
+        return;
+    }
+
+    let mut out = Vec::with_capacity(SESSION_LIST_LIMIT);
+    let mut seen = HashSet::new();
+    for source in ["intendant", "codex", "claude-code", "gemini"] {
+        for session in sessions
+            .iter()
+            .filter(|session| session_source(session) == source)
+            .take(SESSION_SOURCE_FLOOR)
+        {
+            push_unique_session(&mut out, &mut seen, session);
+        }
+    }
+
+    for session in sessions.iter() {
+        if out.len() >= SESSION_LIST_LIMIT {
+            break;
+        }
+        push_unique_session(&mut out, &mut seen, session);
+    }
+
+    sort_sessions_newest_first(&mut out);
+    *sessions = out;
+}
+
+fn codex_usage_bucket<'a>(
+    value: &'a serde_json::Value,
+    names: &[&str],
+) -> Option<&'a serde_json::Value> {
+    for name in names {
+        if let Some(v) = value.get(*name) {
+            return Some(v);
+        }
+        if let Some(info) = value.get("info") {
+            if let Some(v) = info.get(*name) {
+                return Some(v);
+            }
+        }
+    }
+    None
+}
+
+fn codex_session_usage_from_payload(payload: &serde_json::Value) -> Option<SessionUsage> {
+    let info = payload
+        .get("info")
+        .or_else(|| payload.get("tokenUsage"))
+        .unwrap_or(payload);
+    if info.is_null() {
+        return None;
+    }
+    let total = codex_usage_bucket(info, &["total_token_usage", "total"]).unwrap_or(info);
+    let prompt_tokens = value_u64_at(total, &["/input_tokens", "/inputTokens"])?;
+    let completion_tokens = value_u64_at(total, &["/output_tokens", "/outputTokens"]).unwrap_or(0);
+    let cached_tokens = value_u64_at(
+        total,
+        &[
+            "/cached_input_tokens",
+            "/cachedInputTokens",
+            "/cached_tokens",
+            "/cachedTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let total_tokens = value_u64_at(total, &["/total_tokens", "/totalTokens"])
+        .unwrap_or_else(|| prompt_tokens + completion_tokens);
+    Some(SessionUsage {
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cache_creation_tokens: 0,
+        cached_tokens,
+    })
+}
+
+fn claude_usage_from_message_usage(usage: &serde_json::Value) -> Option<SessionUsage> {
+    let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64())?;
+    let cache_creation = usage
+        .get("cache_creation_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let cache_read = usage
+        .get("cache_read_input_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = usage
+        .get("output_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let prompt_tokens = input_tokens + cache_creation + cache_read;
+    Some(SessionUsage {
+        total_tokens: prompt_tokens + completion_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cache_creation_tokens: cache_creation,
+        cached_tokens: cache_read,
+    })
+}
+
+fn gemini_usage_from_tokens(tokens: &serde_json::Value) -> Option<SessionUsage> {
+    let prompt_tokens = value_u64_at(
+        tokens,
+        &[
+            "/input",
+            "/input_tokens",
+            "/inputTokens",
+            "/prompt",
+            "/prompt_tokens",
+            "/promptTokens",
+        ],
+    )?;
+    let output_tokens = value_u64_at(
+        tokens,
+        &[
+            "/output",
+            "/output_tokens",
+            "/outputTokens",
+            "/completion",
+            "/completion_tokens",
+            "/completionTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let thinking_tokens = value_u64_at(
+        tokens,
+        &[
+            "/thoughts",
+            "/thought_tokens",
+            "/thoughtTokens",
+            "/thinking",
+            "/thinking_tokens",
+            "/thinkingTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let tool_tokens = value_u64_at(tokens, &["/tool", "/tool_tokens", "/toolTokens"]).unwrap_or(0);
+    let cached_tokens = value_u64_at(
+        tokens,
+        &[
+            "/cached",
+            "/cached_tokens",
+            "/cachedTokens",
+            "/cached_input_tokens",
+            "/cachedInputTokens",
+        ],
+    )
+    .unwrap_or(0);
+    let completion_tokens = output_tokens + thinking_tokens + tool_tokens;
+    let total_tokens = value_u64_at(tokens, &["/total", "/total_tokens", "/totalTokens"])
+        .unwrap_or_else(|| prompt_tokens + completion_tokens);
+    Some(SessionUsage {
+        total_tokens,
+        prompt_tokens,
+        completion_tokens,
+        cache_creation_tokens: 0,
+        cached_tokens,
+    })
+}
+
+fn resolve_codex_inherited_model(
+    session_id: &str,
+    model_by_id: &HashMap<String, String>,
+    parent_by_id: &HashMap<String, String>,
+) -> Option<String> {
+    let mut seen = HashSet::new();
+    let mut current = session_id.to_string();
+    while seen.insert(current.clone()) {
+        let parent = parent_by_id.get(&current)?;
+        if let Some(model) = model_by_id.get(parent) {
+            return Some(model.clone());
+        }
+        current = parent.clone();
+    }
+    None
+}
+
+fn codex_usage_at_or_before(
+    events: &[CodexUsageEvent],
+    timestamp: Option<&str>,
+) -> Option<SessionUsage> {
+    let cutoff = timestamp.map(timestamp_sort_secs).unwrap_or(0);
+    if cutoff <= 0 {
+        return None;
+    }
+
+    let mut selected = None;
+    for event in events {
+        let event_ts = event
+            .timestamp
+            .as_deref()
+            .map(timestamp_sort_secs)
+            .unwrap_or(0);
+        if event_ts > 0 && event_ts <= cutoff {
+            selected = Some(event.usage);
+        }
+    }
+    selected
+}
+
+fn codex_incremental_session_usage(
+    summary: &CodexSessionListSummary,
+    usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
+) -> SessionUsage {
+    let Some(parent_id) = summary.parent_id.as_deref() else {
+        return summary.usage;
+    };
+    let Some(parent_events) = usage_events_by_id.get(parent_id) else {
+        return summary.usage;
+    };
+    let Some(baseline) = codex_usage_at_or_before(parent_events, summary.created_at.as_deref())
+    else {
+        return summary.usage;
+    };
+    summary.usage.saturating_sub(baseline)
+}
+
+fn codex_session_list_summary_from_file(path: &Path) -> Option<CodexSessionListSummary> {
+    let key = session_list_cache_key("codex", path, "")?;
+    if let Some(entry) = cached_codex_session_list_entry(&key) {
+        return Some(entry.summary);
+    }
+
+    let contents = read_text_head_tail(
+        path,
+        EXTERNAL_SESSION_READ_LIMIT,
+        EXTERNAL_SESSION_READ_LIMIT,
+    )?;
+    let mut id = None;
+    let mut created_at = None;
+    let mut session_cwd = None;
+    let mut turn_cwd = None;
+    let mut command_cwd = None;
+    let mut model = None;
+    let mut forked_from_id = None;
+    let mut provider = Some("Codex".to_string());
+    let mut usage = SessionUsage::default();
+    let mut usage_events = Vec::new();
+    let mut task_started_turns = 0u64;
+    let mut saw_user_message_event = false;
+    let mut event_user_turns: Vec<Option<String>> = Vec::new();
+    let mut fallback_user_turns: Vec<Option<String>> = Vec::new();
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || !codex_line_may_affect_session_list(line) {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "session_meta" => {
+                if let Some(payload) = obj.get("payload") {
+                    id = id.or_else(|| value_str(payload, "id"));
+                    forked_from_id =
+                        forked_from_id.or_else(|| value_str(payload, "forked_from_id"));
+                    created_at = created_at.or_else(|| value_str(payload, "timestamp"));
+                    if let Some(value) = value_str(payload, "cwd") {
+                        if session_cwd.is_none() {
+                            session_cwd = Some(value);
+                        }
+                    }
+                    model = model.or_else(|| value_str(payload, "model"));
+                    provider = value_str(payload, "model_provider").or(provider);
+                }
+            }
+            "turn_context" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = value_str(payload, "cwd") {
+                        if session_cwd.is_none() {
+                            session_cwd = Some(value.clone());
+                        }
+                        turn_cwd = Some(value);
+                    }
+                    model = model.or_else(|| value_str(payload, "model"));
+                }
+            }
+            "event_msg" => {
+                if let Some(payload) = obj.get("payload") {
+                    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if payload_type.starts_with("exec_command") {
+                        if let Some(value) = value_str(payload, "cwd") {
+                            command_cwd = Some(value);
+                        }
+                    }
+                    match payload_type {
+                        "task_started" => {
+                            task_started_turns += 1;
+                        }
+                        "token_count" => {
+                            if let Some(parsed) = codex_session_usage_from_payload(payload) {
+                                usage = parsed;
+                                usage_events.push(CodexUsageEvent {
+                                    timestamp: value_str(&obj, "timestamp"),
+                                    usage: parsed,
+                                });
+                            }
+                        }
+                        "user_message" => {
+                            saw_user_message_event = true;
+                            let text = value_str(payload, "message")
+                                .filter(|s| !s.trim().is_empty())
+                                .map(|s| compact_text(&s, 180));
+                            event_user_turns.push(text);
+                        }
+                        "thread_rolled_back" => {
+                            let num_turns = payload
+                                .get("num_turns")
+                                .and_then(|v| v.as_u64())
+                                .unwrap_or(0);
+                            for _ in 0..num_turns {
+                                let _ = event_user_turns.pop();
+                                let _ = fallback_user_turns.pop();
+                            }
+                            task_started_turns = task_started_turns.saturating_sub(num_turns);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = codex_exec_command_workdir(payload) {
+                        command_cwd = Some(value);
+                    }
+                    if let Some((role, text)) = codex_payload_text(payload) {
+                        if role == "user" && !is_codex_injected_user_text(&text) {
+                            fallback_user_turns.push(Some(compact_text(&text, 180)));
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    let id = id?;
+    let task = event_user_turns
+        .iter()
+        .find_map(|t| t.clone())
+        .or_else(|| fallback_user_turns.iter().find_map(|t| t.clone()));
+    let turns = if saw_user_message_event {
+        event_user_turns.len() as u64
+    } else if task_started_turns > 0 {
+        task_started_turns
+    } else if !fallback_user_turns.is_empty() {
+        fallback_user_turns.len() as u64
+    } else {
+        0
+    };
+    let effective_cwd = command_cwd.or(turn_cwd).or_else(|| session_cwd.clone());
+    let summary = CodexSessionListSummary {
+        id,
+        created_at,
+        session_cwd,
+        effective_cwd,
+        model,
+        parent_id: forked_from_id,
+        provider,
+        usage,
+        usage_events,
+        task,
+        turns,
+        file_updated_at: file_mtime_string(path),
+        bytes: file_size(path),
+    };
+    store_codex_session_list_entry(key, summary.clone());
+    Some(summary)
+}
+
+/// Resolve Codex's home directory: `$CODEX_HOME` if set (non-empty), else
+/// `<home>/.codex`. Codex writes its session rollouts under `CODEX_HOME` when
+/// that env var is set (common on managed/headless installs), so the dashboard
+/// session scan must honor it rather than assuming `~/.codex` — otherwise
+/// codex sessions never appear in the listing.
+fn codex_dir(home: &Path) -> PathBuf {
+    std::env::var_os("CODEX_HOME")
+        .map(PathBuf::from)
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| home.join(".codex"))
+}
+
+fn list_codex_sessions(home: &Path) -> Vec<serde_json::Value> {
+    list_codex_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_json::Value> {
+    let codex = codex_dir(home);
+    let mut rows: HashMap<String, serde_json::Value> = HashMap::new();
+    let mut model_by_id: HashMap<String, String> = HashMap::new();
+    let mut parent_by_id: HashMap<String, String> = HashMap::new();
+    let mut usage_events_by_id: HashMap<String, Vec<CodexUsageEvent>> = HashMap::new();
+    let index_path = codex.join("session_index.jsonl");
+    if let Ok(contents) = std::fs::read_to_string(&index_path) {
+        for line in contents.lines() {
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+                continue;
+            };
+            let Some(id) = value_str(&obj, "id") else {
+                continue;
+            };
+            let updated_at = value_str(&obj, "updated_at");
+            let name = codex_thread_display_name(value_str(&obj, "thread_name"));
+            rows.insert(
+                id.clone(),
+                external_session_json(
+                    "codex",
+                    "Codex",
+                    id.clone(),
+                    id,
+                    None,
+                    updated_at,
+                    name,
+                    None,
+                    "Codex",
+                    None,
+                    0,
+                    None,
+                    None,
+                    Some(index_path.to_string_lossy().to_string()),
+                    file_size(&index_path),
+                ),
+            );
+        }
+    }
+
+    let mut files = collect_recent_files(&codex.join("sessions"), ".jsonl", scan_limit);
+    files.extend(collect_recent_files(
+        &codex.join("archived_sessions"),
+        ".jsonl",
+        scan_limit,
+    ));
+    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.truncate(scan_limit);
+    let mut summaries = Vec::new();
+    for path in files {
+        let Some(summary) = codex_session_list_summary_from_file(&path) else {
+            continue;
+        };
+        let id = summary.id.clone();
+        if let Some(model) = summary.model.clone() {
+            model_by_id.insert(id.clone(), model);
+        }
+        if let Some(parent_id) = summary.parent_id.clone() {
+            parent_by_id.insert(id.clone(), parent_id);
+        }
+        usage_events_by_id.insert(id, summary.usage_events.clone());
+        summaries.push((path, summary));
+    }
+
+    for (path, summary) in summaries {
+        let id = summary.id.clone();
+        let existing = rows.get(&id);
+        let existing_task = existing
+            .and_then(|v| value_str(v, "task"))
+            .filter(|s| !is_codex_injected_user_text(s));
+        let existing_name = existing.and_then(|v| value_str(v, "name"));
+        let existing_updated_at = existing.and_then(|v| value_str(v, "updated_at"));
+        let created_at = summary
+            .created_at
+            .clone()
+            .or_else(|| summary.file_updated_at.clone());
+        let updated_at = summary
+            .file_updated_at
+            .clone()
+            .or(existing_updated_at)
+            .or_else(|| created_at.clone());
+        let project_root = derive_project_root_from_cwd(
+            summary
+                .session_cwd
+                .as_deref()
+                .or(summary.effective_cwd.as_deref()),
+        );
+        let mut session = external_session_json(
+            "codex",
+            "Codex",
+            id.clone(),
+            id.clone(),
+            created_at,
+            updated_at,
+            existing_name,
+            summary.task.clone().or(existing_task),
+            summary.provider.as_deref().unwrap_or("Codex"),
+            summary.model.clone(),
+            summary.turns,
+            project_root,
+            summary.effective_cwd.clone(),
+            Some(path.to_string_lossy().to_string()),
+            summary.bytes,
+        );
+        let usage = codex_incremental_session_usage(&summary, &usage_events_by_id);
+        apply_session_usage(&mut session, usage, summary.model.as_deref());
+        rows.insert(id, session);
+    }
+
+    let ids_missing_model = rows
+        .iter()
+        .filter_map(|(id, session)| {
+            if value_str(session, "model").is_none() {
+                Some(id.clone())
+            } else {
+                None
+            }
+        })
+        .collect::<Vec<_>>();
+    for id in ids_missing_model {
+        let Some(model) = resolve_codex_inherited_model(&id, &model_by_id, &parent_by_id) else {
+            continue;
+        };
+        if let Some(session) = rows.get_mut(&id) {
+            apply_session_model_and_reprice(session, &model);
+        }
+    }
+
+    rows.into_values().collect()
+}
+
+fn claude_session_list_row_from_file(path: &Path) -> Option<serde_json::Value> {
+    let key = session_list_cache_key("claude-code", path, "")?;
+    if let Some(row) = cached_session_list_row(&key) {
+        return Some(row);
+    }
+
+    let session_id = path
+        .file_stem()
+        .and_then(|n| n.to_str())
+        .unwrap_or_default()
+        .to_string();
+    if session_id.is_empty() {
+        return None;
+    }
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut created_at = None;
+    let mut updated_at = None;
+    let mut session_cwd = None;
+    let mut cwd = None;
+    let mut task = None;
+    let mut model = None;
+    let mut usage = SessionUsage::default();
+    let mut seen_usage = HashSet::new();
+    let mut turns = 0u64;
+    for (line_idx, line_result) in reader.lines().enumerate() {
+        let Ok(line) = line_result else {
+            continue;
+        };
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        created_at = created_at.or_else(|| value_str(&obj, "timestamp"));
+        updated_at = value_str(&obj, "timestamp").or(updated_at);
+        if let Some(value) = value_str(&obj, "cwd") {
+            if session_cwd.is_none() {
+                session_cwd = Some(value.clone());
+            }
+            cwd = Some(value);
+        }
+        if obj.get("type").and_then(|v| v.as_str()) == Some("user") {
+            turns += 1;
+            if task.is_none() {
+                if let Some(msg) = obj.get("message") {
+                    if let Some(content) = msg.get("content").and_then(message_content_text) {
+                        task = Some(compact_text(&content, 180));
+                    }
+                }
+            }
+        }
+        if let Some(msg) = obj.get("message") {
+            if model.is_none() {
+                model = msg
+                    .get("model")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            }
+            if let Some(parsed) = msg.get("usage").and_then(claude_usage_from_message_usage) {
+                let key = value_str(&obj, "requestId")
+                    .or_else(|| value_str(msg, "id"))
+                    .unwrap_or_else(|| format!("line-{line_idx}"));
+                if seen_usage.insert(key) {
+                    usage.add(parsed);
+                }
+            }
+        }
+    }
+    let effective_cwd = cwd.or_else(|| session_cwd.clone());
+    let project_root =
+        derive_project_root_from_cwd(session_cwd.as_deref().or(effective_cwd.as_deref()));
+    let mut session = external_session_json(
+        "claude-code",
+        "Claude Code",
+        session_id.clone(),
+        session_id,
+        created_at
+            .or_else(|| updated_at.clone())
+            .or_else(|| file_mtime_string(path)),
+        file_mtime_string(path).or(updated_at),
+        None,
+        task,
+        "Claude Code",
+        model.clone(),
+        turns,
+        project_root,
+        effective_cwd,
+        Some(path.to_string_lossy().to_string()),
+        file_size(path),
+    );
+    apply_session_usage(&mut session, usage, model.as_deref());
+    store_session_list_row(key, &session);
+    Some(session)
+}
+
+fn list_claude_sessions(home: &Path) -> Vec<serde_json::Value> {
+    list_claude_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_claude_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_json::Value> {
+    let files = collect_recent_files(&home.join(".claude").join("projects"), ".jsonl", scan_limit);
+    let mut rows = Vec::new();
+    for path in files {
+        if let Some(session) = claude_session_list_row_from_file(&path) {
+            rows.push(session);
+        }
+    }
+    rows
+}
+
+fn gemini_project_roots(home: &Path) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let path = home.join(".gemini").join("projects.json");
+    let Ok(contents) = std::fs::read_to_string(path) else {
+        return out;
+    };
+    let Ok(obj) = serde_json::from_str::<serde_json::Value>(&contents) else {
+        return out;
+    };
+    let Some(projects) = obj.get("projects").and_then(|v| v.as_object()) else {
+        return out;
+    };
+    for (root, alias) in projects {
+        if let Some(alias) = alias.as_str() {
+            out.insert(alias.to_string(), root.to_string());
+        }
+    }
+    out
+}
+
+fn gemini_session_list_row_from_file(
+    path: &Path,
+    roots: &HashMap<String, String>,
+    roots_fingerprint: &str,
+) -> Option<serde_json::Value> {
+    if path
+        .parent()
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        != Some("chats")
+    {
+        return None;
+    }
+    let key = session_list_cache_key("gemini", path, roots_fingerprint)?;
+    if let Some(row) = cached_session_list_row(&key) {
+        return Some(row);
+    }
+
+    let contents = std::fs::read_to_string(path).ok()?;
+    let obj = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    let session_id = value_str(&obj, "sessionId")?;
+    let alias = path
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.file_name())
+        .and_then(|n| n.to_str())
+        .map(|s| s.to_string());
+    let mut task = None;
+    let mut turns = 0u64;
+    let mut model = value_str(&obj, "model");
+    let mut usage = SessionUsage::default();
+    if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            model = model.or_else(|| value_str(msg, "model"));
+            if let Some(parsed) = msg.get("tokens").and_then(gemini_usage_from_tokens) {
+                usage.add(parsed);
+            }
+            let role = msg
+                .get("role")
+                .or_else(|| msg.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            if role == "user" {
+                turns += 1;
+                if task.is_none() {
+                    let text = msg
+                        .get("text")
+                        .or_else(|| msg.get("message"))
+                        .or_else(|| msg.get("content"))
+                        .and_then(message_content_text);
+                    if let Some(text) = text {
+                        task = Some(compact_text(&text, 180));
+                    }
+                }
+            }
+        }
+    }
+    let project_root = alias.as_ref().and_then(|a| roots.get(a).cloned());
+    let cwd = project_root.clone();
+    let mut session = external_session_json(
+        "gemini",
+        "Gemini CLI",
+        session_id.clone(),
+        session_id,
+        value_str(&obj, "startTime").or_else(|| file_mtime_string(path)),
+        file_mtime_string(path),
+        None,
+        task,
+        "Gemini CLI",
+        model.clone(),
+        turns,
+        project_root,
+        cwd,
+        Some(path.to_string_lossy().to_string()),
+        file_size(path),
+    );
+    apply_session_usage(&mut session, usage, model.as_deref());
+    store_session_list_row(key, &session);
+    Some(session)
+}
+
+fn list_gemini_sessions(home: &Path) -> Vec<serde_json::Value> {
+    list_gemini_sessions_with_limit(home, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_gemini_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_json::Value> {
+    let roots = gemini_project_roots(home);
+    let roots_fingerprint =
+        file_dependency_fingerprint(&home.join(".gemini").join("projects.json"));
+    let files = collect_recent_files(&home.join(".gemini").join("tmp"), ".json", scan_limit);
+    let mut rows = Vec::new();
+    for path in files {
+        if let Some(session) = gemini_session_list_row_from_file(&path, &roots, &roots_fingerprint)
+        {
+            rows.push(session);
+        }
+    }
+    rows
+}
+
+fn codex_session_file_id(path: &Path) -> Option<String> {
+    let file = std::fs::File::open(path).ok()?;
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line).ok()?;
+        if bytes == 0 {
+            return None;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("session_meta") {
+            return obj
+                .get("payload")
+                .and_then(|payload| value_str(payload, "id"));
+        }
+    }
+}
+
+fn find_codex_session_file(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let codex = codex_dir(home);
+    let mut files = Vec::new();
+    collect_files(&codex.join("sessions"), ".jsonl", &mut files);
+    collect_files(&codex.join("archived_sessions"), ".jsonl", &mut files);
+
+    if let Some(path) = files
+        .iter()
+        .find(|path| {
+            path.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.contains(session_id))
+                && codex_session_file_id(path).as_deref() == Some(session_id)
+        })
+        .cloned()
+    {
+        return Some(path);
+    }
+
+    files
+        .into_iter()
+        .find(|path| codex_session_file_id(path).as_deref() == Some(session_id))
+}
+
+fn external_session_detail_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Option<String> {
+    let entries = external_session_entries_from_home(home, source, session_id)?;
+
+    Some(
+        serde_json::json!({
+            "session_id": session_id,
+            "transcript_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+            "entries": entries,
+            "frames": [],
+        })
+        .to_string(),
+    )
+}
+
+fn external_transcript_source(provider_source: &str, role: &str) -> String {
+    let role = role.trim().to_lowercase();
+    if role == "user" {
+        "user".to_string()
+    } else {
+        provider_source.to_string()
+    }
+}
+
+fn external_transcript_cache() -> &'static Mutex<HashMap<String, ExternalTranscriptCacheEntry>> {
+    EXTERNAL_TRANSCRIPT_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn external_transcript_path_key(path: &Path) -> String {
+    let normalized = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    normalized.to_string_lossy().to_string()
+}
+
+fn external_transcript_cache_key(
+    source: &str,
+    session_id: &str,
+    path: &Path,
+) -> Option<ExternalTranscriptCacheKey> {
+    let metadata = std::fs::metadata(path).ok()?;
+    Some(ExternalTranscriptCacheKey {
+        source: source.to_string(),
+        session_id: session_id.to_string(),
+        path: external_transcript_path_key(path),
+        len: metadata.len(),
+        mtime_nanos: metadata_mtime_nanos(&metadata),
+    })
+}
+
+fn external_transcript_cache_slot(key: &ExternalTranscriptCacheKey) -> String {
+    format!("{}\0{}\0{}", key.source, key.session_id, key.path)
+}
+
+fn cached_external_transcript_entries(
+    key: &ExternalTranscriptCacheKey,
+) -> Option<Vec<serde_json::Value>> {
+    let slot = external_transcript_cache_slot(key);
+    let cache = external_transcript_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .get(&slot)
+        .filter(|entry| &entry.key == key)
+        .map(|entry| entry.entries.clone())
+}
+
+fn store_external_transcript_entries(
+    key: ExternalTranscriptCacheKey,
+    entries: &[serde_json::Value],
+) {
+    let slot = external_transcript_cache_slot(&key);
+    let mut cache = external_transcript_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    if cache.len() >= EXTERNAL_TRANSCRIPT_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        ExternalTranscriptCacheEntry {
+            key,
+            entries: entries.to_vec(),
+        },
+    );
+}
+
+#[derive(Debug, Default)]
+struct ReplayUserTurnRevisionState {
+    active_count: u32,
+    latest_revision_by_turn: HashMap<u32, u32>,
+}
+
+impl ReplayUserTurnRevisionState {
+    fn record_next_turn(&mut self) -> (u32, u32) {
+        let turn = self.active_count.saturating_add(1);
+        let revision = self
+            .latest_revision_by_turn
+            .get(&turn)
+            .copied()
+            .unwrap_or(0)
+            .saturating_add(1);
+        self.latest_revision_by_turn.insert(turn, revision);
+        self.active_count = turn;
+        (turn, revision)
+    }
+
+    fn rewind_from_turn(&mut self, first_user_turn_index: u32) {
+        if first_user_turn_index == 0 || first_user_turn_index > self.active_count {
+            return;
+        }
+        self.active_count = first_user_turn_index.saturating_sub(1);
+    }
+}
+
+fn push_codex_transcript_message(
+    entries: &mut Vec<serde_json::Value>,
+    user_turn_revisions: &mut ReplayUserTurnRevisionState,
+    pending_replacement_for_user_turn: &mut Option<u32>,
+    ts: &str,
+    role: &str,
+    text: String,
+) {
+    if push_external_transcript_entry(entries, "codex", ts, role, text) && role == "user" {
+        let (user_turn_index, user_turn_revision) = user_turn_revisions.record_next_turn();
+        if let Some(entry) = entries.last_mut() {
+            entry["user_turn_index"] = serde_json::json!(user_turn_index);
+            entry["user_turn_revision"] = serde_json::json!(user_turn_revision);
+            if let Some(turn) = pending_replacement_for_user_turn.take() {
+                entry["replacement_for_user_turn_index"] = serde_json::json!(turn);
+            }
+        }
+    }
+}
+
+fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut entries: Vec<serde_json::Value> = Vec::new();
+    let mut user_turn_revisions = ReplayUserTurnRevisionState::default();
+    let mut pending_replacement_for_user_turn: Option<u32> = None;
+    let canonical_user_message_events = codex_session_has_user_message_events(path);
+    // (count_before, count_after) entry-count boundaries for each rollout item id,
+    // so an item-anchor rewind can supersede exactly the entries after the anchor.
+    let mut item_entry_boundaries: std::collections::HashMap<String, (usize, usize)> =
+        std::collections::HashMap::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !codex_line_may_affect_replay(trimmed) {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg") {
+            if let Some(payload) = obj.get("payload") {
+                if payload.get("type").and_then(|v| v.as_str()) == Some("thread_rolled_back") {
+                    let turns = payload
+                        .get("num_turns")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0);
+                    let anchor = codex_thread_rollback_anchor(payload);
+                    let ts = value_str(&obj, "timestamp").unwrap_or_default();
+                    let mut superseded_user_turns = Vec::new();
+                    // `num_turns` is read from an untrusted on-disk rollout; bound the
+                    // loop by the actual transcript size by breaking as soon as there
+                    // is no further user turn to supersede, so a corrupt/huge count
+                    // (e.g. u64::MAX) can't spin the request thread.
+                    for _ in 0..turns {
+                        match mark_latest_external_turn_superseded(&mut entries, &ts) {
+                            Some(turn) => {
+                                superseded_user_turns.push(turn);
+                                user_turn_revisions.rewind_from_turn(turn);
+                            }
+                            None => break,
+                        }
+                    }
+                    // Item-anchor rewinds (often num_turns == 0) discard the tail after
+                    // the anchored item. If the anchor item was seen in this rollout,
+                    // supersede every entry past its boundary so the transcript stops
+                    // showing discarded entries as live.
+                    if let Some((anchor_item_id, anchor_position)) = anchor.as_ref() {
+                        if let Some(&(before, after)) =
+                            item_entry_boundaries.get(anchor_item_id.as_str())
+                        {
+                            let start = if anchor_position == "before" {
+                                before
+                            } else {
+                                after
+                            };
+                            for turn in
+                                mark_external_entries_superseded_from(&mut entries, start, &ts)
+                            {
+                                user_turn_revisions.rewind_from_turn(turn);
+                                superseded_user_turns.push(turn);
+                            }
+                        }
+                    }
+                    if let Some(replacement_turn) = superseded_user_turns.iter().copied().min() {
+                        pending_replacement_for_user_turn = Some(replacement_turn);
+                    }
+                    if turns > 0 || anchor.is_some() {
+                        let content = match (turns, anchor.as_ref()) {
+                            // Item-anchor rewinds carry num_turns==0 and do not mark
+                            // any rendered entry superseded (entries are not item-id
+                            // correlated), so the marker must not claim entries were
+                            // retired — that would contradict the still-live transcript.
+                            (0, Some((item_id, position))) => format!(
+                                "Rewound to {position} item {item_id}."
+                            ),
+                            (1, Some((item_id, position))) => format!(
+                                "Rewound 1 user turn and trimmed to {position} item {item_id}; overwritten entries are no longer active context."
+                            ),
+                            (_, Some((item_id, position))) => format!(
+                                "Rewound {turns} user turns and trimmed to {position} item {item_id}; overwritten entries are no longer active context."
+                            ),
+                            (1, None) => {
+                                "Rewound 1 user turn; overwritten entries are no longer active context."
+                                    .to_string()
+                            }
+                            (_, None) => format!(
+                                "Rewound {turns} user turns; overwritten entries are no longer active context."
+                            ),
+                        };
+                        let mut marker = serde_json::json!({
+                            "ts": ts,
+                            "level": "warn",
+                            "source": "system",
+                            "content": content,
+                            "kind": "rollback_marker",
+                            "rollback_turns": turns,
+                        });
+                        if let Some((item_id, position)) = anchor {
+                            marker["rollback_anchor_item_id"] = serde_json::json!(item_id);
+                            marker["rollback_anchor_position"] = serde_json::json!(position);
+                        }
+                        entries.push(marker);
+                    }
+                    continue;
+                }
+            }
+        }
+        let ts = value_str(&obj, "timestamp").unwrap_or_default();
+        let response_item_id = codex_response_item_id(&obj);
+        let entries_before = entries.len();
+        if let Some(payload) = obj.get("payload") {
+            if let Some((role, text)) = codex_event_message_text(payload) {
+                push_codex_transcript_message(
+                    &mut entries,
+                    &mut user_turn_revisions,
+                    &mut pending_replacement_for_user_turn,
+                    &ts,
+                    &role,
+                    text,
+                );
+            }
+            if let Some((role, text)) = codex_payload_text(payload) {
+                if canonical_user_message_events && role == "user" {
+                    if let Some(item_id) = response_item_id {
+                        item_entry_boundaries.insert(item_id, (entries_before, entries.len()));
+                    }
+                    continue;
+                }
+                push_codex_transcript_message(
+                    &mut entries,
+                    &mut user_turn_revisions,
+                    &mut pending_replacement_for_user_turn,
+                    &ts,
+                    &role,
+                    text,
+                );
+            }
+        }
+        // Record where this item sits in the entry stream so a later item-anchor
+        // rewind targeting it can supersede entries before/after it precisely.
+        if let Some(item_id) = response_item_id {
+            item_entry_boundaries.insert(item_id, (entries_before, entries.len()));
+        }
+    }
+
+    Some(entries)
+}
+
+fn codex_session_has_user_message_events(path: &Path) -> bool {
+    let Ok(file) = std::fs::File::open(path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() || !trimmed.contains("\"user_message\"") {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        if obj.get("type").and_then(|v| v.as_str()) == Some("event_msg")
+            && obj
+                .get("payload")
+                .and_then(|payload| payload.get("type"))
+                .and_then(|v| v.as_str())
+                == Some("user_message")
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn parse_claude_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
+    let file = std::fs::File::open(path).ok()?;
+    let reader = std::io::BufReader::new(file);
+    let mut entries = Vec::new();
+
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let Ok(kind) = serde_json::from_str::<ExternalJsonLineKind<'_>>(trimmed) else {
+            continue;
+        };
+        let typ = kind.kind.as_deref().unwrap_or("");
+        if typ != "user" && typ != "assistant" {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(trimmed) else {
+            continue;
+        };
+        let text = obj
+            .get("message")
+            .and_then(|m| m.get("content"))
+            .and_then(message_content_text)
+            .unwrap_or_default();
+        if text.is_empty() {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "ts": value_str(&obj, "timestamp").unwrap_or_default(),
+            "level": if typ == "assistant" { "model" } else { "info" },
+            "source": external_transcript_source("claude", typ),
+            "content": text,
+        }));
+    }
+
+    Some(entries)
+}
+
+fn parse_gemini_session_entries(path: &Path, session_id: &str) -> Option<Vec<serde_json::Value>> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    let obj = serde_json::from_str::<serde_json::Value>(&contents).ok()?;
+    if value_str(&obj, "sessionId").as_deref() != Some(session_id) {
+        return None;
+    }
+
+    let mut entries = Vec::new();
+    if let Some(messages) = obj.get("messages").and_then(|v| v.as_array()) {
+        for msg in messages {
+            let role = msg
+                .get("role")
+                .or_else(|| msg.get("type"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("message");
+            let text = msg
+                .get("text")
+                .or_else(|| msg.get("message"))
+                .or_else(|| msg.get("content"))
+                .and_then(message_content_text)
+                .unwrap_or_default();
+            if text.is_empty() {
+                continue;
+            }
+            entries.push(serde_json::json!({
+                "ts": value_str(msg, "timestamp").unwrap_or_default(),
+                "level": if role == "assistant" || role == "model" { "model" } else { "info" },
+                "source": external_transcript_source("gemini", role),
+                "content": text,
+            }));
+        }
+    }
+
+    Some(entries)
+}
+
+fn find_claude_session_file_for_transcript(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(&home.join(".claude").join("projects"), ".jsonl", &mut files);
+    files
+        .into_iter()
+        .find(|path| path.file_stem().and_then(|n| n.to_str()) == Some(session_id))
+}
+
+fn find_gemini_session_file_for_transcript(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let mut files = Vec::new();
+    collect_files(&home.join(".gemini").join("tmp"), ".json", &mut files);
+    files.into_iter().find(|path| {
+        if path
+            .parent()
+            .and_then(|p| p.file_name())
+            .and_then(|n| n.to_str())
+            != Some("chats")
+        {
+            return false;
+        }
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            return false;
+        };
+        serde_json::from_str::<serde_json::Value>(&contents)
+            .ok()
+            .and_then(|obj| value_str(&obj, "sessionId"))
+            .as_deref()
+            == Some(session_id)
+    })
+}
+
+fn parse_external_session_entries_from_file(
+    source: &str,
+    session_id: &str,
+    path: &Path,
+) -> Option<Vec<serde_json::Value>> {
+    match source {
+        "codex" => parse_codex_session_entries(path),
+        "claude-code" => parse_claude_session_entries(path),
+        "gemini" => parse_gemini_session_entries(path, session_id),
+        _ => None,
+    }
+}
+
+fn external_session_entries_from_file(
+    source: &str,
+    session_id: &str,
+    path: &Path,
+) -> Option<Vec<serde_json::Value>> {
+    let key = external_transcript_cache_key(source, session_id, path)?;
+    if let Some(entries) = cached_external_transcript_entries(&key) {
+        return Some(entries);
+    }
+
+    let entries = parse_external_session_entries_from_file(source, session_id, path)?;
+    store_external_transcript_entries(key, &entries);
+    Some(entries)
+}
+
+pub(crate) fn external_session_entries_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Option<Vec<serde_json::Value>> {
+    let source = crate::session_names::normalize_source(source);
+    let path = match source.as_str() {
+        "codex" => find_codex_session_file(home, session_id),
+        "claude-code" => find_claude_session_file_for_transcript(home, session_id),
+        "gemini" => find_gemini_session_file_for_transcript(home, session_id),
+        _ => None,
+    }?;
+
+    external_session_entries_from_file(&source, session_id, &path)
+}
+
+fn external_session_activity_replay(
+    source: &str,
+    session_id: &str,
+    limit: usize,
+) -> Option<String> {
+    external_session_activity_replay_from_home(
+        &crate::platform::home_dir(),
+        source,
+        session_id,
+        limit,
+    )
+}
+
+fn external_session_activity_replay_from_home(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    limit: usize,
+) -> Option<String> {
+    external_session_activity_replay_from_home_with_attach(home, source, session_id, limit, true)
+}
+
+fn external_session_activity_replay_from_home_with_attach(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    limit: usize,
+    include_attached: bool,
+) -> Option<String> {
+    let source = crate::session_names::normalize_source(source);
+    let mut transcript = external_session_entries_from_home(home, &source, session_id)?;
+    if limit > 0 && transcript.len() > limit {
+        transcript = transcript.split_off(transcript.len() - limit);
+    }
+
+    let mut entries = Vec::with_capacity(transcript.len() + 2);
+    entries.push(serde_json::json!({
+        "event": "replay_start",
+        "session_id": session_id,
+        "source": source,
+        "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+    }));
+    if include_attached {
+        entries.push(serde_json::json!({
+            "event": "session_attached",
+            "session_id": session_id,
+            "source": source,
+            "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+        }));
+    }
+
+    for entry in transcript {
+        let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        if content.is_empty() {
+            continue;
+        }
+        entries.push(serde_json::json!({
+            "event": "log_entry",
+            "session_id": session_id,
+            "ts": entry.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
+            "level": entry.get("level").and_then(|v| v.as_str()).unwrap_or("info"),
+            "source": entry.get("source").and_then(|v| v.as_str()).unwrap_or(source.as_str()),
+            "content": content,
+            "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+            "user_turn_index": entry.get("user_turn_index").and_then(|v| v.as_u64()),
+            "user_turn_revision": entry
+                .get("user_turn_revision")
+                .and_then(|v| v.as_u64()),
+            "replacement_for_user_turn_index": entry
+                .get("replacement_for_user_turn_index")
+                .and_then(|v| v.as_u64()),
+            "superseded": entry
+                .get("superseded")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            "superseded_reason": entry
+                .get("superseded_reason")
+                .and_then(|v| v.as_str()),
+            "kind": entry.get("kind").and_then(|v| v.as_str()),
+            "rollback_turns": entry.get("rollback_turns").and_then(|v| v.as_u64()),
+            "rollback_anchor_item_id": entry
+                .get("rollback_anchor_item_id")
+                .and_then(|v| v.as_str()),
+            "rollback_anchor_position": entry
+                .get("rollback_anchor_position")
+                .and_then(|v| v.as_str()),
+        }));
+    }
+    append_external_context_snapshot_replay_entries(home, &source, session_id, &mut entries);
+    compact_context_snapshot_entries_for_replay(&mut entries);
+
+    Some(
+        serde_json::json!({
+            "t": "log_replay",
+            "replay_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
+            "entries": entries,
+        })
+        .to_string(),
+    )
+}
+
+fn append_external_context_snapshot_replay_entries(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    entries: &mut Vec<serde_json::Value>,
+) {
+    if crate::session_names::normalize_source(source) != "codex" {
+        return;
+    }
+    let mut seen = HashSet::new();
+    let mut snapshot_entries = Vec::new();
+    for dir in external_context_snapshot_replay_log_dirs(home, source, session_id) {
+        let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
+            if seen.is_empty() {
+                append_external_context_trace_replay_entries(
+                    &dir,
+                    session_id,
+                    &mut seen,
+                    &mut snapshot_entries,
+                );
+            }
+            continue;
+        };
+        let external_replay_session_id = external_backend_session_id_from_replay(&contents);
+        let wrapper_replay_session_id = replay_session_id_from_dir(&dir);
+        let replay_session_id = external_replay_session_id
+            .clone()
+            .or_else(|| wrapper_replay_session_id.clone());
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(entry_json) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            if entry_json.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+                continue;
+            }
+            let Some(entry) = context_snapshot_replay_entry_from_log_entry(
+                &entry_json,
+                &dir,
+                replay_session_id.as_deref(),
+                external_replay_session_id.as_deref(),
+                wrapper_replay_session_id.as_deref(),
+            ) else {
+                continue;
+            };
+            if entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot") {
+                continue;
+            }
+            if !context_snapshot_replay_entry_matches_session(&entry, session_id) {
+                continue;
+            }
+            let key = context_snapshot_replay_entry_key(&entry);
+            if seen.insert(key) {
+                snapshot_entries.push(entry);
+            }
+        }
+        if seen.is_empty() {
+            append_external_context_trace_replay_entries(
+                &dir,
+                session_id,
+                &mut seen,
+                &mut snapshot_entries,
+            );
+        }
+    }
+    snapshot_entries.sort_by_key(context_snapshot_replay_entry_sort_key);
+    entries.extend(snapshot_entries);
+}
+
+fn external_context_snapshot_replay_log_dirs(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen_dirs = HashSet::new();
+
+    if let Some(path) = managed_context_named_log_dir(home, session_id) {
+        push_external_context_replay_log_dir(&mut dirs, &mut seen_dirs, path);
+    }
+    for record in crate::external_wrapper_index::wrappers_for(home, source, session_id) {
+        push_external_context_replay_log_dir(
+            &mut dirs,
+            &mut seen_dirs,
+            PathBuf::from(record.log_path),
+        );
+    }
+    for path in cached_intendant_log_dirs_for_session_id(session_id) {
+        push_external_context_replay_log_dir(&mut dirs, &mut seen_dirs, path);
+    }
+
+    if dirs.is_empty() {
+        for path in recent_intendant_log_dirs(home, EXTERNAL_CONTEXT_REPLAY_LOG_SCAN_LIMIT) {
+            if managed_context_log_dir_mentions_session(&path, session_id) {
+                push_external_context_replay_log_dir(&mut dirs, &mut seen_dirs, path);
+            }
+        }
+    }
+
+    dirs
+}
+
+fn push_external_context_replay_log_dir(
+    dirs: &mut Vec<PathBuf>,
+    seen_dirs: &mut HashSet<String>,
+    path: PathBuf,
+) {
+    let key = std::fs::canonicalize(&path)
+        .unwrap_or_else(|_| path.clone())
+        .to_string_lossy()
+        .to_string();
+    if seen_dirs.insert(key) {
+        dirs.push(path);
+    }
+}
+
+fn recent_intendant_log_dirs(home: &Path, limit: usize) -> Vec<PathBuf> {
+    if limit == 0 {
+        return Vec::new();
+    }
+    let logs_dir = home.join(".intendant").join("logs");
+    let Ok(entries) = std::fs::read_dir(logs_dir) else {
+        return Vec::new();
+    };
+    let mut dirs: Vec<(u64, PathBuf)> = entries
+        .flatten()
+        .filter_map(|entry| {
+            let path = entry.path();
+            if !path.is_dir() {
+                return None;
+            }
+            let mtime = file_mtime_secs(&path.join("session.jsonl")).max(file_mtime_secs(&path));
+            Some((mtime, path))
+        })
+        .collect();
+    dirs.sort_by(|a, b| b.0.cmp(&a.0));
+    dirs.truncate(limit);
+    dirs.into_iter().map(|(_, path)| path).collect()
+}
+
+fn append_external_context_trace_replay_entries(
+    log_dir: &Path,
+    session_id: &str,
+    seen: &mut HashSet<String>,
+    entries: &mut Vec<serde_json::Value>,
+) {
+    let trace_root = log_dir.join("model-request-traces");
+    if !trace_root.is_dir() {
+        return;
+    }
+    let Ok(snapshots) = crate::external_agent::codex::context_snapshots_from_trace_archive(
+        &trace_root,
+        session_id,
+        false,
+    ) else {
+        return;
+    };
+    for snapshot in snapshots {
+        let entry = external_context_snapshot_replay_entry_from_trace(session_id, snapshot);
+        let key = context_snapshot_replay_entry_key(&entry);
+        if seen.insert(key) {
+            entries.push(entry);
+        }
+    }
+}
+
+fn external_context_snapshot_replay_entry_from_trace(
+    session_id: &str,
+    snapshot: crate::external_agent::AgentContextSnapshot,
+) -> serde_json::Value {
+    serde_json::to_value(crate::types::OutboundEvent::ContextSnapshot {
+        session_id: Some(session_id.to_string()),
+        source: snapshot.source,
+        label: snapshot.label,
+        request_id: snapshot.request_id,
+        request_index: snapshot.request_index,
+        turn: None,
+        format: snapshot.format,
+        token_count: snapshot.token_count,
+        token_count_kind: snapshot
+            .token_count_kind
+            .map(|kind| kind.as_str().to_string()),
+        context_window: snapshot.context_window,
+        hard_context_window: snapshot.hard_context_window,
+        item_count: snapshot.item_count,
+        raw: snapshot.raw,
+    })
+    .unwrap_or_else(|_| {
+        serde_json::json!({
+            "event": "context_snapshot",
+            "session_id": session_id,
+            "source": "codex",
+            "label": "Codex request payload",
+            "format": "codex.inference_request_payload.v1",
+            "raw": serde_json::json!({}),
+        })
+    })
+}
+
+fn context_snapshot_replay_entry_matches_session(
+    entry: &serde_json::Value,
+    session_id: &str,
+) -> bool {
+    entry.get("session_id").and_then(|v| v.as_str()) == Some(session_id)
+        || entry
+            .pointer("/raw/_intendant_context/thread_id")
+            .and_then(|v| v.as_str())
+            == Some(session_id)
+}
+
+fn context_snapshot_replay_entry_key(entry: &serde_json::Value) -> String {
+    if let Some(request_id) = entry.get("request_id").and_then(|v| v.as_str()) {
+        return format!("request:{request_id}");
+    }
+    if let Some(request_index) = entry.get("request_index").and_then(|v| v.as_u64()) {
+        let session_id = entry
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or_default();
+        return format!("index:{session_id}:{request_index}");
+    }
+    serde_json::to_string(entry).unwrap_or_else(|_| format!("{entry:?}"))
+}
+
+fn context_snapshot_replay_entry_sort_key(entry: &serde_json::Value) -> (u64, String) {
+    (
+        entry
+            .get("request_index")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(u64::MAX),
+        context_snapshot_replay_entry_key(entry),
+    )
+}
+
+fn external_attached_session_from_wire(line: &str) -> Option<(String, String)> {
+    let parsed = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if parsed.get("event").and_then(|v| v.as_str()) != Some("session_attached") {
+        return None;
+    }
+    let session_id = parsed.get("session_id").and_then(|v| v.as_str())?;
+    let source = parsed
+        .get("source")
+        .and_then(|v| v.as_str())
+        .map(crate::session_names::normalize_source)?;
+    if session_id.trim().is_empty() || source.is_empty() || source == "intendant" {
+        return None;
+    }
+    Some((session_id.to_string(), source))
+}
+
+fn update_external_attached_sessions_from_wire(sessions: &mut HashMap<String, String>, line: &str) {
+    if let Some((session_id, source)) = external_attached_session_from_wire(line) {
+        sessions.insert(session_id, source);
+        return;
+    }
+    if let Some(ended_id) = session_ended_id_from_wire(line) {
+        sessions.remove(&ended_id);
+    }
+}
+
+fn session_ended_id_from_wire(line: &str) -> Option<String> {
+    let parsed = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if parsed.get("event").and_then(|v| v.as_str()) != Some("session_ended") {
+        return None;
+    }
+    parsed
+        .get("session_id")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string)
+}
+
 fn list_sessions() -> String {
-    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
-    let logs_dir = PathBuf::from(format!("{}/.intendant/logs", home));
-    if !logs_dir.is_dir() {
+    list_sessions_from_home(&crate::platform::home_dir())
+}
+
+fn cached_list_sessions() -> String {
+    let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(entry) = guard.as_ref() {
+        if entry.generated_at.elapsed()
+            <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
+        {
+            return entry.body.clone();
+        }
+    }
+
+    let body = list_sessions();
+    *guard = Some(SessionListResponseCacheEntry {
+        generated_at: std::time::Instant::now(),
+        body: body.clone(),
+    });
+    body
+}
+
+fn cached_session_list_snapshot() -> Option<String> {
+    let cache = SESSION_LIST_RESPONSE_CACHE.get()?;
+    let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+    guard.as_ref().map(|entry| entry.body.clone())
+}
+
+fn session_ids_filter_from_request(request_line: &str) -> Option<Vec<String>> {
+    query_param(request_line, "ids").map(|raw| {
+        raw.split(',')
+            .map(str::trim)
+            .filter(|id| !id.is_empty() && session_lookup_id_is_safe(id))
+            .map(ToString::to_string)
+            .collect()
+    })
+}
+
+fn session_row_matches_any_id(row: &serde_json::Value, ids: &HashSet<String>) -> bool {
+    if ids.is_empty() {
+        return true;
+    }
+    [
+        "session_id",
+        "resume_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .filter_map(|key| row.get(key).and_then(|v| v.as_str()))
+    .any(|id| ids.contains(id))
+}
+
+fn filter_session_list_by_ids(body: &str, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return body.to_string();
+    }
+    let wanted: HashSet<String> = ids.iter().cloned().collect();
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(body) else {
+        return body.to_string();
+    };
+    let filtered: Vec<serde_json::Value> = rows
+        .into_iter()
+        .filter(|row| session_row_matches_any_id(row, &wanted))
+        .collect();
+    serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn cached_list_sessions_for_ids(ids: &[String]) -> String {
+    if ids.is_empty() {
         return "[]".to_string();
     }
+    let body = cached_list_sessions();
+    filter_session_list_by_ids(&body, ids)
+}
+
+fn cached_intendant_log_dirs_for_session_id(session_id: &str) -> Vec<PathBuf> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return Vec::new();
+    }
+    let Some(body) = cached_session_list_snapshot() else {
+        return Vec::new();
+    };
+    let Ok(rows) = serde_json::from_str::<Vec<serde_json::Value>>(&body) else {
+        return Vec::new();
+    };
+    let wanted = std::iter::once(session_id.to_string()).collect::<HashSet<_>>();
+    let mut dirs = Vec::new();
+    let mut seen = HashSet::new();
+    for row in rows {
+        if !session_row_matches_any_id(&row, &wanted) {
+            continue;
+        }
+        for key in ["intendant_session_path", "path"] {
+            let Some(path) = row.get(key).and_then(|v| v.as_str()) else {
+                continue;
+            };
+            let path = PathBuf::from(path);
+            if !path.is_dir() {
+                continue;
+            }
+            let fingerprint = std::fs::canonicalize(&path)
+                .unwrap_or_else(|_| path.clone())
+                .to_string_lossy()
+                .to_string();
+            if seen.insert(fingerprint) {
+                dirs.push(path);
+            }
+        }
+    }
+    dirs
+}
+
+fn empty_worktree_inventory_response() -> String {
+    serde_json::to_string(&crate::worktree_inventory::empty_scan())
+        .unwrap_or_else(|_| "{}".to_string())
+}
+
+fn scan_worktree_inventory_response(home: &Path, project_root: Option<&Path>) -> String {
+    let hints = worktree_session_hints_from_home(home);
+    let scan = crate::worktree_inventory::scan_worktrees(home, project_root, &hints);
+    serde_json::to_string(&scan).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn remove_worktree_inventory_response(home: &Path, body_text: &str) -> (&'static str, String) {
+    let request =
+        match serde_json::from_str::<crate::worktree_inventory::WorktreeRemoveRequest>(body_text) {
+            Ok(request) => request,
+            Err(e) => {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({
+                        "ok": false,
+                        "error": format!("invalid worktree removal request: {e}")
+                    })
+                    .to_string(),
+                );
+            }
+        };
+    let hints = worktree_session_hints_from_home(home);
+    match crate::worktree_inventory::remove_worktree_if_safe(request, &hints) {
+        Ok(response) => (
+            "200 OK",
+            serde_json::to_string(&response).unwrap_or_else(|_| "{}".to_string()),
+        ),
+        Err(e) => (
+            "409 Conflict",
+            serde_json::json!({
+                "ok": false,
+                "error": e
+            })
+            .to_string(),
+        ),
+    }
+}
+
+fn worktree_session_hints_from_home(
+    home: &Path,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_default();
+    let mut hints = Vec::new();
+    let mut status_by_session = HashMap::new();
+    for session in &sessions {
+        let Some(hint) = worktree_session_hint_from_json(session) else {
+            continue;
+        };
+        status_by_session.insert(
+            (hint.source.clone(), hint.session_id.clone()),
+            (hint.status.clone(), hint.updated_at.clone()),
+        );
+        hints.push(hint);
+    }
+
+    let mut observed =
+        agent_observed_worktree_session_hints_from_home(home, &sessions, &status_by_session);
+    observed.extend(hints);
+    dedupe_worktree_session_hints(observed)
+}
+
+type WorktreeHintStatusMap = HashMap<(String, String), (String, Option<String>)>;
+
+fn worktree_session_hint_from_json(
+    session: &serde_json::Value,
+) -> Option<crate::worktree_inventory::WorktreeSessionHint> {
+    let session_id = session.get("session_id")?.as_str()?.to_string();
+    let source = session
+        .get("source")
+        .and_then(|v| v.as_str())
+        .unwrap_or("intendant")
+        .to_string();
+    let status = session
+        .get("status")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+    let project_root = session
+        .get("project_root")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let cwd = session
+        .get("cwd")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(PathBuf::from);
+    let updated_at = session
+        .get("updated_at")
+        .and_then(|v| v.as_str())
+        .map(ToString::to_string);
+    Some(crate::worktree_inventory::WorktreeSessionHint {
+        session_id,
+        source,
+        status,
+        project_root,
+        cwd,
+        updated_at,
+    })
+}
+
+fn agent_observed_worktree_session_hints_from_home(
+    home: &Path,
+    sessions: &[serde_json::Value],
+    status_by_session: &WorktreeHintStatusMap,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let mut hints = Vec::new();
+    extend_codex_observed_worktree_session_hints(home, sessions, status_by_session, &mut hints);
+    extend_claude_observed_worktree_session_hints(home, sessions, status_by_session, &mut hints);
+    extend_gemini_observed_worktree_session_hints(home, &mut hints);
+    hints
+}
+
+fn extend_codex_observed_worktree_session_hints(
+    home: &Path,
+    sessions: &[serde_json::Value],
+    status_by_session: &WorktreeHintStatusMap,
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) {
+    let mut files = agent_session_files_from_rows(
+        sessions,
+        "codex",
+        ".jsonl",
+        WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+    );
+    if files.is_empty() {
+        let codex = codex_dir(home);
+        files = collect_recent_files(
+            &codex.join("sessions"),
+            ".jsonl",
+            WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+        );
+        files.extend(collect_recent_files(
+            &codex.join("archived_sessions"),
+            ".jsonl",
+            WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+        ));
+        files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+        files.truncate(WORKTREE_OBSERVED_SESSION_FILE_LIMIT);
+    }
+
+    for path in files {
+        if hints.len() >= WORKTREE_OBSERVED_HINT_LIMIT {
+            break;
+        }
+        hints.extend(codex_observed_worktree_session_hints_from_file(
+            home,
+            &path,
+            status_by_session,
+        ));
+    }
+}
+
+fn extend_claude_observed_worktree_session_hints(
+    home: &Path,
+    sessions: &[serde_json::Value],
+    status_by_session: &WorktreeHintStatusMap,
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) {
+    let mut files = agent_session_files_from_rows(
+        sessions,
+        "claude-code",
+        ".jsonl",
+        WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+    );
+    if files.is_empty() {
+        files = collect_recent_files(
+            &home.join(".claude").join("projects"),
+            ".jsonl",
+            WORKTREE_OBSERVED_SESSION_FILE_LIMIT,
+        );
+    }
+    for path in files {
+        if hints.len() >= WORKTREE_OBSERVED_HINT_LIMIT {
+            break;
+        }
+        hints.extend(claude_observed_worktree_session_hints_from_file(
+            home,
+            &path,
+            status_by_session,
+        ));
+    }
+}
+
+fn agent_session_files_from_rows(
+    sessions: &[serde_json::Value],
+    source: &str,
+    suffix: &str,
+    limit: usize,
+) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    let mut seen = HashSet::new();
+    for session in sessions {
+        if session.get("source").and_then(|v| v.as_str()) != Some(source) {
+            continue;
+        }
+        let Some(path) = session
+            .get("path")
+            .and_then(|v| v.as_str())
+            .filter(|s| s.ends_with(suffix))
+            .map(PathBuf::from)
+        else {
+            continue;
+        };
+        if !path.is_file() {
+            continue;
+        }
+        let key = worktree_hint_path_key(&path);
+        if seen.insert(key) {
+            files.push(path);
+        }
+    }
+    files.sort_by(|a, b| file_mtime_secs(b).cmp(&file_mtime_secs(a)));
+    files.truncate(limit);
+    files
+}
+
+fn extend_gemini_observed_worktree_session_hints(
+    home: &Path,
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) {
+    for (alias, root) in gemini_project_roots(home) {
+        if hints.len() >= WORKTREE_OBSERVED_HINT_LIMIT {
+            break;
+        }
+        let mut seen_paths = HashSet::new();
+        push_agent_observed_worktree_hint(
+            hints,
+            home,
+            "gemini",
+            &format!("gemini-project:{alias}"),
+            "external",
+            None,
+            &root,
+            &mut seen_paths,
+        );
+    }
+}
+
+fn codex_observed_worktree_session_hints_from_file(
+    home: &Path,
+    path: &Path,
+    status_by_session: &WorktreeHintStatusMap,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let contents = match read_text_head_tail(
+        path,
+        EXTERNAL_SESSION_READ_LIMIT,
+        EXTERNAL_SESSION_READ_LIMIT,
+    ) {
+        Some(contents) => contents,
+        None => return Vec::new(),
+    };
+    let mut session_id = None;
+    let mut updated_at = file_mtime_string(path);
+    let mut observed_paths = Vec::new();
+
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || !codex_line_may_affect_session_list(line) {
+            continue;
+        }
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        updated_at = value_str(&obj, "timestamp").or(updated_at);
+        match obj.get("type").and_then(|v| v.as_str()).unwrap_or("") {
+            "session_meta" => {
+                if let Some(payload) = obj.get("payload") {
+                    session_id = session_id.or_else(|| value_str(payload, "id"));
+                    if let Some(value) = value_str(payload, "cwd") {
+                        observed_paths.push(value);
+                    }
+                }
+            }
+            "turn_context" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = value_str(payload, "cwd") {
+                        observed_paths.push(value);
+                    }
+                }
+            }
+            "event_msg" => {
+                if let Some(payload) = obj.get("payload") {
+                    let payload_type = payload.get("type").and_then(|v| v.as_str()).unwrap_or("");
+                    if payload_type.starts_with("exec_command") {
+                        if let Some(value) =
+                            value_str(payload, "workdir").or_else(|| value_str(payload, "cwd"))
+                        {
+                            observed_paths.push(value);
+                        }
+                    }
+                }
+            }
+            "response_item" => {
+                if let Some(payload) = obj.get("payload") {
+                    if let Some(value) = codex_exec_command_workdir(payload) {
+                        observed_paths.push(value);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    let session_id = session_id
+        .or_else(|| codex_session_file_id(path))
+        .or_else(|| {
+            path.file_stem()
+                .and_then(|name| name.to_str())
+                .map(ToString::to_string)
+        });
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let (status, updated_at) =
+        worktree_hint_status("codex", &session_id, status_by_session, updated_at);
+    let mut hints = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for observed_path in observed_paths {
+        if seen_paths.len() >= WORKTREE_OBSERVED_PATHS_PER_SESSION {
+            break;
+        }
+        push_agent_observed_worktree_hint(
+            &mut hints,
+            home,
+            "codex",
+            &session_id,
+            &status,
+            updated_at.as_deref(),
+            &observed_path,
+            &mut seen_paths,
+        );
+    }
+    hints
+}
+
+fn claude_observed_worktree_session_hints_from_file(
+    home: &Path,
+    path: &Path,
+    status_by_session: &WorktreeHintStatusMap,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let contents = match read_text_head_tail(
+        path,
+        EXTERNAL_SESSION_READ_LIMIT,
+        EXTERNAL_SESSION_READ_LIMIT,
+    ) {
+        Some(contents) => contents,
+        None => return Vec::new(),
+    };
+    let Some(session_id) = path
+        .file_stem()
+        .and_then(|name| name.to_str())
+        .map(ToString::to_string)
+    else {
+        return Vec::new();
+    };
+    let mut updated_at = file_mtime_string(path);
+    let mut observed_paths = Vec::new();
+
+    for line in contents.lines() {
+        let Ok(obj) = serde_json::from_str::<serde_json::Value>(line.trim()) else {
+            continue;
+        };
+        updated_at = value_str(&obj, "timestamp").or(updated_at);
+        if let Some(value) = value_str(&obj, "cwd") {
+            observed_paths.push(value);
+        }
+        if let Some(message) = obj.get("message") {
+            if let Some(value) = value_str(message, "cwd") {
+                observed_paths.push(value);
+            }
+        }
+    }
+
+    let (status, updated_at) =
+        worktree_hint_status("claude-code", &session_id, status_by_session, updated_at);
+    let mut hints = Vec::new();
+    let mut seen_paths = HashSet::new();
+    for observed_path in observed_paths {
+        if seen_paths.len() >= WORKTREE_OBSERVED_PATHS_PER_SESSION {
+            break;
+        }
+        push_agent_observed_worktree_hint(
+            &mut hints,
+            home,
+            "claude-code",
+            &session_id,
+            &status,
+            updated_at.as_deref(),
+            &observed_path,
+            &mut seen_paths,
+        );
+    }
+    hints
+}
+
+fn worktree_hint_status(
+    source: &str,
+    session_id: &str,
+    status_by_session: &WorktreeHintStatusMap,
+    fallback_updated_at: Option<String>,
+) -> (String, Option<String>) {
+    if let Some((status, updated_at)) =
+        status_by_session.get(&(source.to_string(), session_id.to_string()))
+    {
+        (status.clone(), updated_at.clone().or(fallback_updated_at))
+    } else {
+        ("external".to_string(), fallback_updated_at)
+    }
+}
+
+fn push_agent_observed_worktree_hint(
+    hints: &mut Vec<crate::worktree_inventory::WorktreeSessionHint>,
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    status: &str,
+    updated_at: Option<&str>,
+    observed_path: &str,
+    seen_paths: &mut HashSet<String>,
+) {
+    let Some((project_root, cwd)) = normalize_agent_observed_git_path(home, observed_path) else {
+        return;
+    };
+    let key = format!(
+        "{}\0{}",
+        worktree_hint_path_key(&project_root),
+        worktree_hint_path_key(&cwd)
+    );
+    if !seen_paths.insert(key) {
+        return;
+    }
+    hints.push(crate::worktree_inventory::WorktreeSessionHint {
+        session_id: session_id.to_string(),
+        source: source.to_string(),
+        status: status.to_string(),
+        project_root: Some(project_root),
+        cwd: Some(cwd),
+        updated_at: updated_at.map(ToString::to_string),
+    });
+}
+
+fn normalize_agent_observed_git_path(home: &Path, raw_path: &str) -> Option<(PathBuf, PathBuf)> {
+    let trimmed = raw_path.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let path = PathBuf::from(trimmed);
+    if !path.is_absolute() || should_skip_agent_observed_path(home, &path) {
+        return None;
+    }
+
+    let mut cwd = path;
+    while !cwd.exists() {
+        if !cwd.pop() {
+            return None;
+        }
+    }
+    if cwd.is_file() {
+        cwd.pop();
+    }
+    let mut project_root = cwd.clone();
+    loop {
+        if project_root.join(".git").exists() {
+            return Some((project_root, cwd));
+        }
+        if !project_root.pop() {
+            return None;
+        }
+    }
+}
+
+fn should_skip_agent_observed_path(home: &Path, path: &Path) -> bool {
+    if worktree_hint_path_key(home) == worktree_hint_path_key(path) {
+        return true;
+    }
+    if path.parent().is_none() {
+        return true;
+    }
+    matches!(
+        path.to_string_lossy().as_ref(),
+        "/" | "/tmp" | "/private/tmp" | "/var/tmp"
+    )
+}
+
+fn dedupe_worktree_session_hints(
+    hints: Vec<crate::worktree_inventory::WorktreeSessionHint>,
+) -> Vec<crate::worktree_inventory::WorktreeSessionHint> {
+    let mut out = Vec::new();
+    let mut seen = HashSet::new();
+    for hint in hints {
+        let project_root = hint
+            .project_root
+            .as_ref()
+            .map(|path| worktree_hint_path_key(path))
+            .unwrap_or_default();
+        let cwd = hint
+            .cwd
+            .as_ref()
+            .map(|path| worktree_hint_path_key(path))
+            .unwrap_or_default();
+        let key = format!(
+            "{}\0{}\0{}\0{}",
+            hint.source, hint.session_id, project_root, cwd
+        );
+        if seen.insert(key) {
+            out.push(hint);
+        }
+    }
+    out
+}
+
+fn worktree_hint_path_key(path: &Path) -> String {
+    path.canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn push_session_file_fingerprint(
+    entries: &mut Vec<SessionFileFingerprint>,
+    base: &Path,
+    path: &Path,
+    is_dir: bool,
+) {
+    let Ok(metadata) = std::fs::metadata(path) else {
+        return;
+    };
+    if metadata.is_dir() != is_dir {
+        return;
+    }
+    let rel = path
+        .strip_prefix(base)
+        .unwrap_or(path)
+        .to_string_lossy()
+        .to_string();
+    let (dev, ino) = crate::platform::metadata_dev_ino(&metadata);
+    entries.push(SessionFileFingerprint {
+        rel,
+        len: metadata.len(),
+        mtime_nanos: metadata_mtime_nanos(&metadata),
+        ctime_nanos: metadata_ctime_nanos(&metadata),
+        dev,
+        ino,
+        is_dir,
+    });
+}
+
+fn intendant_session_dir_fingerprint(dir: &Path) -> Option<SessionDirFingerprint> {
+    let mut entries = Vec::new();
+    push_session_file_fingerprint(&mut entries, dir, dir, true);
+
+    for name in [
+        "session.jsonl",
+        "session_meta.json",
+        crate::session_config::SESSION_AGENT_CONFIG_FILE,
+        "summary.json",
+        "conversation.jsonl",
+    ] {
+        let path = dir.join(name);
+        if path.is_file() {
+            push_session_file_fingerprint(&mut entries, dir, &path, false);
+        }
+    }
+
+    let recordings_dir = dir.join("recordings");
+    if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
+        for re in rd.flatten() {
+            let recording_dir = re.path();
+            if !recording_dir.is_dir() {
+                continue;
+            }
+            push_session_file_fingerprint(&mut entries, dir, &recording_dir, true);
+            if let Ok(files) = std::fs::read_dir(&recording_dir) {
+                for file in files.flatten() {
+                    let path = file.path();
+                    let name = file.file_name().to_string_lossy().to_string();
+                    if name.starts_with("seg_") && path.is_file() {
+                        push_session_file_fingerprint(&mut entries, dir, &path, false);
+                    }
+                }
+            }
+        }
+    }
+
+    let frames_dir = dir.join("frames");
+    if let Ok(fd) = std::fs::read_dir(&frames_dir) {
+        for fe in fd.flatten() {
+            let path = fe.path();
+            if path.is_file() {
+                push_session_file_fingerprint(&mut entries, dir, &path, false);
+            }
+        }
+    }
+
+    let turns_dir = dir.join("turns");
+    if let Ok(td) = std::fs::read_dir(&turns_dir) {
+        for te in td.flatten() {
+            let path = te.path();
+            if path.is_file() {
+                push_session_file_fingerprint(&mut entries, dir, &path, false);
+            }
+        }
+    }
+
+    if entries.is_empty() {
+        return None;
+    }
+    entries.sort_by(|a, b| a.rel.cmp(&b.rel).then_with(|| a.is_dir.cmp(&b.is_dir)));
+    Some(SessionDirFingerprint {
+        path: session_list_path_key(dir),
+        entries,
+    })
+}
+
+fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<serde_json::Value> {
+    let fingerprint = intendant_session_dir_fingerprint(dir)?;
+    if let Some(row) = cached_intendant_session_list_row(&fingerprint) {
+        return Some(row);
+    }
+
+    let meta_path = dir.join("session_meta.json");
+    let mut name: Option<String> = None;
+    let mut task: Option<String> = None;
+    let mut created_at: Option<String> = None;
+    let mut project_root: Option<String> = None;
+    let cwd: Option<String> = None;
+    let mut provider: Option<String> = None;
+    let mut model: Option<String> = None;
+    let mut status = "in_progress".to_string();
+    let mut turns: u64 = 0;
+    let mut total_tokens: u64 = 0;
+    let mut prompt_tokens: u64 = 0;
+    let mut completion_tokens: u64 = 0;
+    let mut cached_tokens: u64 = 0;
+    let mut role: Option<String> = None;
+    let mut external_resume_id: Option<String> = None;
+    let mut external_source: Option<String> = None;
+    let mut capabilities: Option<serde_json::Value> = None;
+    let mut session_agent_config = crate::session_config::read_log_dir_config(dir);
+    let mut updated_at_secs = file_mtime_secs(dir);
+
+    if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
+        if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
+            task = meta
+                .get("task")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            created_at = meta
+                .get("created_at")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            project_root = meta
+                .get("project_root")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+            name = meta
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| compact_text(s, 180));
+            if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
+                status = s.to_string();
+            }
+            if let Some(t) = meta.get("last_turn").and_then(|v| v.as_u64()) {
+                turns = t;
+            }
+            role = meta
+                .get("role")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_string());
+        }
+    }
+
+    let jsonl_path = dir.join("session.jsonl");
+    if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
+        for line in contents.lines() {
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
+            let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
+
+            match event {
+                "session_start" => {
+                    if created_at.is_none() {
+                        created_at = obj
+                            .get("ts")
+                            .and_then(|v| v.as_str())
+                            .map(|s| s.to_string());
+                    }
+                }
+                "info" | "debug" => {
+                    if event == "info" {
+                        if message.starts_with("Provider: ") && provider.is_none() {
+                            provider = Some(message.trim_start_matches("Provider: ").to_string());
+                        } else if message.starts_with("Model: ") && model.is_none() {
+                            model = Some(message.trim_start_matches("Model: ").to_string());
+                        } else if message.starts_with("Task: ") && task.is_none() {
+                            task = Some(message.trim_start_matches("Task: ").to_string());
+                        } else if message.starts_with("Interrupted: ")
+                            || message.starts_with("External agent interrupted: ")
+                        {
+                            status = "interrupted".to_string();
+                        }
+                    }
+                    if external_resume_id.is_none() {
+                        external_resume_id = external_agent_thread_id_from_message(message);
+                    }
+                    if external_source.is_none() {
+                        external_source = external_agent_source_from_message(message);
+                    }
+                }
+                "turn_start" => {
+                    status = "in_progress".to_string();
+                    if let Some(t) = obj.get("turn").and_then(|v| v.as_u64()) {
+                        if t > turns {
+                            turns = t;
+                        }
+                    }
+                }
+                "model_response" => {
+                    if let Some(tok) = obj.get("data").and_then(|d| d.get("tokens")) {
+                        if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
+                            total_tokens += t;
+                        }
+                        if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64()) {
+                            prompt_tokens += p;
+                        }
+                        if let Some(c) = tok.get("completion").and_then(|v| v.as_u64()) {
+                            completion_tokens += c;
+                        }
+                        if let Some(cached) = tok.get("cached").and_then(|v| v.as_u64()) {
+                            cached_tokens += cached;
+                        }
+                    }
+                }
+                "task_complete" | "session_end" | "session_ended" => {
+                    status = "completed".to_string();
+                }
+                "session_capabilities" => {
+                    capabilities = obj
+                        .get("data")
+                        .and_then(|data| data.get("capabilities"))
+                        .cloned();
+                    if session_agent_config.is_none() {
+                        let source = external_source.as_deref().or(Some("codex"));
+                        let command = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_command"))
+                            .and_then(|v| v.as_str());
+                        let mode = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_managed_context"))
+                            .and_then(|v| v.as_str());
+                        let archive = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_context_archive"))
+                            .and_then(|v| v.as_str());
+                        let service_tier = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_service_tier"))
+                            .and_then(|v| v.as_str());
+                        session_agent_config = Some(crate::session_config::from_wire(
+                            source,
+                            command,
+                            mode,
+                            archive,
+                            service_tier,
+                        ));
+                    }
+                }
+                "round_complete" => {
+                    if status != "interrupted" {
+                        status = "idle".to_string();
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
+    if status != "completed" && dir.join("summary.json").exists() {
+        status = "completed".to_string();
+    }
+
+    let mut recording_count: u64 = 0;
+    let mut recording_bytes: u64 = 0;
+    let mut annotation_count: u64 = 0;
+    let mut clip_count: u64 = 0;
+    let mut frames_bytes: u64 = 0;
+    let mut turns_bytes: u64 = 0;
+    let mut logs_bytes: u64 = 0;
+
+    let recordings_dir = dir.join("recordings");
+    if recordings_dir.is_dir() {
+        if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
+            for re in rd.flatten() {
+                if re.path().is_dir() {
+                    recording_count += 1;
+                    if let Ok(files) = std::fs::read_dir(re.path()) {
+                        for f in files.flatten() {
+                            let name = f.file_name().to_string_lossy().to_string();
+                            if name.starts_with("seg_") {
+                                if let Ok(m) = f.metadata() {
+                                    if m.is_file() {
+                                        updated_at_secs =
+                                            updated_at_secs.max(metadata_mtime_secs(&m));
+                                        recording_bytes += m.len();
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    let frames_dir = dir.join("frames");
+    if frames_dir.is_dir() {
+        if let Ok(fd) = std::fs::read_dir(&frames_dir) {
+            let mut clip_ids: std::collections::HashSet<String> = std::collections::HashSet::new();
+            for fe in fd.flatten() {
+                let name = fe.file_name().to_string_lossy().to_string();
+                if name.starts_with("ann-") && name.ends_with(".jpg") {
+                    annotation_count += 1;
+                } else if name.starts_with("clip-") && name.ends_with(".jpg") {
+                    if let Some(pos) = name.rfind("-f") {
+                        clip_ids.insert(name[..pos].to_string());
+                    }
+                }
+                if let Ok(m) = fe.metadata() {
+                    if m.is_file() {
+                        updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
+                        frames_bytes += m.len();
+                    }
+                }
+            }
+            clip_count = clip_ids.len() as u64;
+        }
+    }
+
+    let turns_dir = dir.join("turns");
+    if turns_dir.is_dir() {
+        if let Ok(td) = std::fs::read_dir(&turns_dir) {
+            for te in td.flatten() {
+                if let Ok(m) = te.metadata() {
+                    if m.is_file() {
+                        updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
+                        turns_bytes += m.len();
+                    }
+                }
+            }
+        }
+    }
+
+    for name in [
+        "session.jsonl",
+        "session_meta.json",
+        crate::session_config::SESSION_AGENT_CONFIG_FILE,
+        "summary.json",
+        "conversation.jsonl",
+    ] {
+        if let Ok(m) = std::fs::metadata(dir.join(name)) {
+            if m.is_file() {
+                updated_at_secs = updated_at_secs.max(metadata_mtime_secs(&m));
+                logs_bytes += m.len();
+            }
+        }
+    }
+
+    let total_bytes = recording_bytes + frames_bytes + turns_bytes + logs_bytes;
+
+    if status != "completed" {
+        let has_model_work = turns > 0 || total_tokens > 0;
+        if !has_model_work {
+            let has_media = recording_count > 0 || annotation_count > 0 || clip_count > 0;
+            if task.is_some() || has_media {
+                status = "idle".to_string();
+            } else {
+                status = "abandoned".to_string();
+            }
+        }
+    }
+
+    if created_at.is_none() {
+        created_at = mtime_secs_to_string(file_mtime_secs(dir));
+    }
+
+    let estimated_cost = model.as_deref().and_then(|m| {
+        crate::app_state_pricing::estimate_session_cost(
+            m,
+            prompt_tokens,
+            completion_tokens,
+            cached_tokens,
+            0,
+        )
+    });
+
+    let created_at = created_at.unwrap_or_default();
+    let updated_at = mtime_secs_to_string(updated_at_secs).unwrap_or_else(|| created_at.clone());
+    let backend_source_label: Option<String> = None;
+    let relationships = session_relationships_from_log_dir(dir);
+
+    let mut wrapper_session = serde_json::json!({
+        "source": "intendant",
+        "source_label": "Intendant",
+        "session_id": session_id,
+        "resume_id": session_id,
+        "backend_source": external_source.clone(),
+        "backend_source_label": backend_source_label,
+        "backend_session_id": external_resume_id.clone(),
+        "capabilities": capabilities,
+        "created_at": created_at,
+        "updated_at": updated_at,
+        "name": name,
+        "task": task,
+        "provider": provider,
+        "model": model,
+        "turns": turns,
+        "status": status,
+        "total_tokens": total_tokens,
+        "prompt_tokens": prompt_tokens,
+        "completion_tokens": completion_tokens,
+        "cached_tokens": cached_tokens,
+        "cache_creation_tokens": 0,
+        "estimated_cost": estimated_cost.unwrap_or(0.0),
+        "pricing_known": estimated_cost.is_some(),
+        "role": role,
+        "recordings": recording_count,
+        "recording_bytes": recording_bytes,
+        "annotations": annotation_count,
+        "clips": clip_count,
+        "frames_bytes": frames_bytes,
+        "turns_bytes": turns_bytes,
+        "logs_bytes": logs_bytes,
+        "total_bytes": total_bytes,
+        "cwd": cwd.clone().or_else(|| project_root.clone()),
+        "project_root": project_root.clone(),
+        "path": dir.to_string_lossy().to_string(),
+        "can_delete": true,
+        "can_resume": true,
+        "relationships": relationships,
+    });
+    if let Some(config) = session_agent_config.as_ref() {
+        crate::session_config::apply_config_to_session_json(&mut wrapper_session, config);
+    }
+
+    store_intendant_session_list_row(fingerprint, &wrapper_session);
+    Some(wrapper_session)
+}
+
+fn json_string_missing_or_empty(session: &serde_json::Value, key: &str) -> bool {
+    session
+        .get(key)
+        .and_then(|v| v.as_str())
+        .map(str::is_empty)
+        .unwrap_or(true)
+}
+
+fn insert_optional_string(session: &mut serde_json::Value, key: &str, value: Option<String>) {
+    if let Some(obj) = session.as_object_mut() {
+        obj.insert(
+            key.to_string(),
+            value
+                .map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null),
+        );
+    }
+}
+
+fn apply_external_context_to_intendant_wrapper(
+    wrapper_session: &mut serde_json::Value,
+    external_context_by_id: &HashMap<String, ExternalSessionContext>,
+) {
+    let external_resume_id = value_str(wrapper_session, "backend_session_id");
+    if let Some(external_id) = external_resume_id.as_deref() {
+        if let Some(context) = external_context_by_id.get(external_id) {
+            if json_string_missing_or_empty(wrapper_session, "project_root") {
+                insert_optional_string(
+                    wrapper_session,
+                    "project_root",
+                    context.project_root.clone(),
+                );
+            }
+            if json_string_missing_or_empty(wrapper_session, "cwd") {
+                insert_optional_string(
+                    wrapper_session,
+                    "cwd",
+                    context.cwd.clone().or_else(|| context.project_root.clone()),
+                );
+            }
+            if json_string_missing_or_empty(wrapper_session, "name") {
+                insert_optional_string(wrapper_session, "name", context.name.clone());
+            }
+            if json_string_missing_or_empty(wrapper_session, "backend_source") {
+                insert_optional_string(wrapper_session, "backend_source", context.source.clone());
+            }
+        }
+    }
+
+    let backend_source_label = value_str(wrapper_session, "backend_source").and_then(|source| {
+        external_resume_id
+            .as_deref()
+            .and_then(|external_id| external_context_by_id.get(external_id))
+            .and_then(|context| context.source_label.clone())
+            .or_else(|| Some(pretty_external_source_label(&source)))
+    });
+    insert_optional_string(
+        wrapper_session,
+        "backend_source_label",
+        backend_source_label,
+    );
+}
+
+fn list_sessions_from_home(home_path: &Path) -> String {
+    list_sessions_from_home_impl(home_path, true, EXTERNAL_SESSION_SCAN_LIMIT)
+}
+
+fn list_sessions_for_deep_search_from_home(home_path: &Path) -> String {
+    list_sessions_from_home_impl(home_path, false, usize::MAX)
+}
+
+fn list_sessions_from_home_impl(
+    home_path: &Path,
+    truncate_for_list_view: bool,
+    external_scan_limit: usize,
+) -> String {
+    let logs_dir = home_path.join(".intendant").join("logs");
+    let mut external_sessions = Vec::new();
+    external_sessions.extend(list_codex_sessions_with_limit(
+        home_path,
+        external_scan_limit,
+    ));
+    external_sessions.extend(list_claude_sessions_with_limit(
+        home_path,
+        external_scan_limit,
+    ));
+    external_sessions.extend(list_gemini_sessions_with_limit(
+        home_path,
+        external_scan_limit,
+    ));
+    let deleted_external_sessions = read_deleted_external_sessions(home_path);
+    if !deleted_external_sessions.is_empty() {
+        external_sessions.retain(|session| {
+            !session_matches_deleted_external(session, &deleted_external_sessions)
+        });
+    }
+    crate::session_names::apply_session_name_overlays(home_path, &mut external_sessions);
+    crate::session_config::apply_overlays_to_sessions(home_path, &mut external_sessions);
+    if !logs_dir.is_dir() {
+        sort_sessions_newest_first(&mut external_sessions);
+        if truncate_for_list_view {
+            truncate_sessions_preserving_sources(&mut external_sessions);
+        }
+        return serde_json::to_string(&external_sessions).unwrap_or_else(|_| "[]".to_string());
+    }
+    let external_context_by_id = external_session_context_by_id(&external_sessions);
 
     let mut sessions: Vec<serde_json::Value> = Vec::new();
 
@@ -1578,267 +7660,44 @@ fn list_sessions() -> String {
             .map(|n| n.to_string_lossy().to_string())
             .unwrap_or_default();
 
-        // Try to read session_meta.json first (fast path)
-        let meta_path = dir.join("session_meta.json");
-        let mut task: Option<String> = None;
-        let mut created_at: Option<String> = None;
-        let mut provider: Option<String> = None;
-        let mut model: Option<String> = None;
-        let mut status = "in_progress".to_string();
-        let mut turns: u64 = 0;
-        let mut total_tokens: u64 = 0;
-        let mut prompt_tokens: u64 = 0;
-        let mut completion_tokens: u64 = 0;
-        let mut cached_tokens: u64 = 0;
-        let mut role: Option<String> = None;
+        if let Some(mut wrapper_session) = intendant_session_list_row_from_dir(&dir, &session_id) {
+            index_external_wrapper_session_row(home_path, &wrapper_session);
+            apply_external_context_to_intendant_wrapper(
+                &mut wrapper_session,
+                &external_context_by_id,
+            );
+            let external_source = value_str(&wrapper_session, "backend_source");
+            let external_resume_id = value_str(&wrapper_session, "backend_session_id");
+            let merged_into_external = external_source
+                .as_deref()
+                .zip(external_resume_id.as_deref())
+                .filter(|(source, external_id)| {
+                    crate::external_agent::source_session_id_is_canonical(source, external_id)
+                })
+                .and_then(|(source, external_id)| {
+                    external_sessions
+                        .iter_mut()
+                        .find(|session| external_session_row_matches(session, source, external_id))
+                })
+                .map(|external| {
+                    merge_intendant_wrapper_into_external_session(external, &wrapper_session);
+                })
+                .is_some();
 
-        if let Ok(meta_str) = std::fs::read_to_string(&meta_path) {
-            if let Ok(meta) = serde_json::from_str::<serde_json::Value>(&meta_str) {
-                task = meta
-                    .get("task")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                created_at = meta
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                if let Some(s) = meta.get("status").and_then(|v| v.as_str()) {
-                    status = s.to_string();
-                }
-                if let Some(t) = meta.get("last_turn").and_then(|v| v.as_u64()) {
-                    turns = t;
-                }
-                role = meta
-                    .get("role")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
+            if !merged_into_external {
+                sessions.push(wrapper_session);
             }
+            continue;
         }
-
-        // Parse session.jsonl for provider, model, token totals, and any missing fields
-        let jsonl_path = dir.join("session.jsonl");
-        if let Ok(contents) = std::fs::read_to_string(&jsonl_path) {
-            for line in contents.lines() {
-                let line = line.trim();
-                if line.is_empty() {
-                    continue;
-                }
-                let Ok(obj) = serde_json::from_str::<serde_json::Value>(line) else {
-                    continue;
-                };
-                let event = obj.get("event").and_then(|v| v.as_str()).unwrap_or("");
-                let message = obj.get("message").and_then(|v| v.as_str()).unwrap_or("");
-
-                match event {
-                    "session_start" => {
-                        if created_at.is_none() {
-                            created_at = obj
-                                .get("ts")
-                                .and_then(|v| v.as_str())
-                                .map(|s| s.to_string());
-                        }
-                    }
-                    "info" => {
-                        if message.starts_with("Provider: ") && provider.is_none() {
-                            provider = Some(message.trim_start_matches("Provider: ").to_string());
-                        } else if message.starts_with("Model: ") && model.is_none() {
-                            model = Some(message.trim_start_matches("Model: ").to_string());
-                        } else if message.starts_with("Task: ") && task.is_none() {
-                            task = Some(message.trim_start_matches("Task: ").to_string());
-                        }
-                    }
-                    "turn_start" => {
-                        if let Some(t) = obj.get("turn").and_then(|v| v.as_u64()) {
-                            if t > turns {
-                                turns = t;
-                            }
-                        }
-                    }
-                    "model_response" => {
-                        if let Some(tok) = obj.get("data").and_then(|d| d.get("tokens")) {
-                            if let Some(t) = tok.get("total").and_then(|v| v.as_u64()) {
-                                total_tokens += t;
-                            }
-                            if let Some(p) = tok.get("prompt").and_then(|v| v.as_u64()) {
-                                prompt_tokens += p;
-                            }
-                            if let Some(c) = tok.get("completion").and_then(|v| v.as_u64()) {
-                                completion_tokens += c;
-                            }
-                            if let Some(cached) = tok.get("cached").and_then(|v| v.as_u64()) {
-                                cached_tokens += cached;
-                            }
-                        }
-                    }
-                    "task_complete" | "session_end" | "round_complete" => {
-                        status = "completed".to_string();
-                    }
-                    "interrupted" => {
-                        status = "interrupted".to_string();
-                    }
-                    _ => {}
-                }
-            }
-        }
-
-        // Check for summary.json (written on clean exit)
-        if status != "completed" && dir.join("summary.json").exists() {
-            status = "completed".to_string();
-        }
-
-        // Recording / annotation / clip stats from disk
-        let mut recording_count: u64 = 0;
-        let mut recording_bytes: u64 = 0;
-        let mut annotation_count: u64 = 0;
-        let mut clip_count: u64 = 0;
-        let mut frames_bytes: u64 = 0;
-        let mut turns_bytes: u64 = 0;
-        let mut logs_bytes: u64 = 0;
-
-        let recordings_dir = dir.join("recordings");
-        if recordings_dir.is_dir() {
-            if let Ok(rd) = std::fs::read_dir(&recordings_dir) {
-                for re in rd.flatten() {
-                    if re.path().is_dir() {
-                        recording_count += 1;
-                        if let Ok(files) = std::fs::read_dir(re.path()) {
-                            for f in files.flatten() {
-                                let name = f.file_name().to_string_lossy().to_string();
-                                if name.starts_with("seg_") {
-                                    if let Ok(m) = f.metadata() {
-                                        recording_bytes += m.len();
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
-        let frames_dir = dir.join("frames");
-        if frames_dir.is_dir() {
-            if let Ok(fd) = std::fs::read_dir(&frames_dir) {
-                let mut clip_ids: std::collections::HashSet<String> =
-                    std::collections::HashSet::new();
-                for fe in fd.flatten() {
-                    let name = fe.file_name().to_string_lossy().to_string();
-                    if name.starts_with("ann-") && name.ends_with(".jpg") {
-                        annotation_count += 1;
-                    } else if name.starts_with("clip-") && name.ends_with(".jpg") {
-                        if let Some(pos) = name.rfind("-f") {
-                            clip_ids.insert(name[..pos].to_string());
-                        }
-                    }
-                    if let Ok(m) = fe.metadata() {
-                        if m.is_file() {
-                            frames_bytes += m.len();
-                        }
-                    }
-                }
-                clip_count = clip_ids.len() as u64;
-            }
-        }
-
-        // Turns directory size
-        let turns_dir = dir.join("turns");
-        if turns_dir.is_dir() {
-            if let Ok(td) = std::fs::read_dir(&turns_dir) {
-                for te in td.flatten() {
-                    if let Ok(m) = te.metadata() {
-                        if m.is_file() {
-                            turns_bytes += m.len();
-                        }
-                    }
-                }
-            }
-        }
-
-        // Root-level log files size
-        for name in &[
-            "session.jsonl",
-            "session_meta.json",
-            "summary.json",
-            "conversation.jsonl",
-        ] {
-            if let Ok(m) = std::fs::metadata(dir.join(name)) {
-                if m.is_file() {
-                    logs_bytes += m.len();
-                }
-            }
-        }
-
-        let total_bytes = recording_bytes + frames_bytes + turns_bytes + logs_bytes;
-
-        // Refine status for sessions that never did model work:
-        // - "idle": had some activity (recordings, display, task) but no model turns
-        // - "abandoned": no turns, no task, no media — MCP probes, brief connections
-        // Also override "interrupted" → "idle" when no model work happened
-        // (process was killed before any model interaction — nothing was interrupted)
-        if status != "completed" {
-            let has_model_work = turns > 0 || total_tokens > 0;
-            if !has_model_work {
-                let has_media = recording_count > 0 || annotation_count > 0 || clip_count > 0;
-                if task.is_some() || has_media {
-                    status = "idle".to_string();
-                } else {
-                    status = "abandoned".to_string();
-                }
-            }
-        }
-
-        // Fall back to directory mtime for created_at
-        if created_at.is_none() {
-            if let Ok(metadata) = std::fs::metadata(&dir) {
-                if let Ok(modified) = metadata.modified() {
-                    let dt: chrono::DateTime<chrono::Local> = modified.into();
-                    created_at = Some(dt.format("%Y-%m-%d %H:%M:%S").to_string());
-                }
-            }
-        }
-
-        // Estimate cost using the model's pricing (blended rate without cache info)
-        let estimated_cost = model
-            .as_deref()
-            .and_then(|m| {
-                crate::app_state_pricing::estimate_session_cost(m, prompt_tokens, completion_tokens)
-            })
-            .unwrap_or(0.0);
-
-        sessions.push(serde_json::json!({
-            "session_id": session_id,
-            "created_at": created_at.unwrap_or_default(),
-            "task": task,
-            "provider": provider,
-            "model": model,
-            "turns": turns,
-            "status": status,
-            "total_tokens": total_tokens,
-            "prompt_tokens": prompt_tokens,
-            "completion_tokens": completion_tokens,
-            "cached_tokens": cached_tokens,
-            "estimated_cost": estimated_cost,
-            "role": role,
-            "recordings": recording_count,
-            "recording_bytes": recording_bytes,
-            "annotations": annotation_count,
-            "clips": clip_count,
-            "frames_bytes": frames_bytes,
-            "turns_bytes": turns_bytes,
-            "logs_bytes": logs_bytes,
-            "total_bytes": total_bytes,
-        }));
     }
 
-    // Sort newest first by created_at
-    sessions.sort_by(|a, b| {
-        let a_ts = a.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-        let b_ts = b.get("created_at").and_then(|v| v.as_str()).unwrap_or("");
-        b_ts.cmp(a_ts)
-    });
+    sessions.extend(external_sessions);
+    apply_external_wrapper_index_to_sessions(home_path, &mut sessions);
 
-    // Cap at 100
-    sessions.truncate(100);
+    sort_sessions_newest_first(&mut sessions);
+    if truncate_for_list_view {
+        truncate_sessions_preserving_sources(&mut sessions);
+    }
 
     serde_json::to_string(&sessions).unwrap_or_else(|_| "[]".to_string())
 }
@@ -1847,43 +7706,590 @@ fn list_sessions() -> String {
 ///
 /// - No path suffix: list all changed files (baseline vs current).
 /// - With path suffix: return unified diff for a single file.
+#[derive(Debug, Clone)]
+enum ChangeFileState {
+    Text { content: String, hash: String },
+    Unsupported { hash: String, reason: String },
+}
+
+#[derive(Debug, Clone)]
+struct ChangeRecord {
+    path: String,
+    kind: &'static str,
+    lines_added: u32,
+    lines_removed: u32,
+    diff_available: bool,
+    reason: Option<String>,
+    diff: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct ChangesRequestTarget {
+    snapshot_dir: PathBuf,
+    project_root: PathBuf,
+    include_project_external_logs: bool,
+}
+
 fn handle_changes_request(
     request_line: &str,
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
-) -> String {
+) -> (&'static str, String) {
+    handle_changes_request_inner(request_line, snapshot_dir, project_root, false)
+}
+
+fn handle_changes_request_for_home(
+    request_line: &str,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    home: &Path,
+) -> (&'static str, String) {
+    if let Some(target) = changes_request_target_from_home(request_line, home) {
+        if should_use_live_changes_for_target(request_line, &target, snapshot_dir, project_root) {
+            return handle_changes_request(request_line, snapshot_dir, project_root);
+        }
+        return handle_changes_request_inner(
+            request_line,
+            Some(&target.snapshot_dir),
+            Some(&target.project_root),
+            target.include_project_external_logs,
+        );
+    }
+    handle_changes_request(request_line, snapshot_dir, project_root)
+}
+
+fn handle_changes_request_inner(
+    request_line: &str,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+    include_project_external_logs: bool,
+) -> (&'static str, String) {
     let (snapshot_dir, project_root) = match (snapshot_dir, project_root) {
         (Some(s), Some(p)) => (s, p),
         _ => {
-            return serde_json::json!({"error": "file watcher not active"}).to_string();
+            return (
+                "503 Service Unavailable",
+                serde_json::json!({"error": "file watcher not active"}).to_string(),
+            );
         }
     };
 
     let baseline_dir = snapshot_dir.join("baseline");
-    if !baseline_dir.exists() {
-        return serde_json::json!([]).to_string();
-    }
+    // Extract the request target from `GET <target> HTTP/1.1`, then trim the
+    // endpoint prefix. The list endpoint has no path suffix.
+    let file_path = changes_request_file_path(request_line);
 
-    // Extract the path after /api/session/current/changes
-    let file_path = request_line
-        .split("/api/session/current/changes")
-        .nth(1)
-        .and_then(|rest| rest.split_whitespace().next())
-        .unwrap_or("")
-        .trim_start_matches('/');
+    if !baseline_dir.exists() {
+        let records =
+            load_external_change_records(snapshot_dir, project_root, !file_path.is_empty(), true);
+        if file_path.is_empty() {
+            let changes: Vec<_> = records.iter().map(change_record_summary_json).collect();
+            return (
+                "200 OK",
+                serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string()),
+            );
+        }
+
+        let decoded = url_path_decode(file_path);
+        if let Some(record) = records.into_iter().find(|record| record.path == decoded) {
+            return ("200 OK", change_record_detail_json(&record).to_string());
+        }
+        return (
+            "404 Not Found",
+            serde_json::json!({"error": "no changes for path"}).to_string(),
+        );
+    }
 
     if file_path.is_empty() {
         // List all changed files.
-        handle_changes_list(&baseline_dir, project_root)
+        (
+            "200 OK",
+            handle_changes_list(
+                snapshot_dir,
+                &baseline_dir,
+                project_root,
+                include_project_external_logs,
+            ),
+        )
     } else {
         // Single-file diff.
-        handle_changes_file_diff(file_path, &baseline_dir, project_root)
+        handle_changes_file_diff(
+            file_path,
+            snapshot_dir,
+            &baseline_dir,
+            project_root,
+            include_project_external_logs,
+        )
     }
 }
 
-/// List all files that have changed since the session baseline.
-fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
-    let mut changes = Vec::new();
+fn changes_request_file_path(request_line: &str) -> &str {
+    let target = request_line.split_whitespace().nth(1).unwrap_or("");
+    target
+        .strip_prefix("/api/session/current/changes")
+        .unwrap_or("")
+        .split('?')
+        .next()
+        .unwrap_or("")
+        .trim_start_matches('/')
+}
+
+fn should_use_live_changes_for_target(
+    request_line: &str,
+    target: &ChangesRequestTarget,
+    snapshot_dir: Option<&Path>,
+    project_root: Option<&Path>,
+) -> bool {
+    let (Some(live_snapshot_dir), Some(live_project_root)) = (snapshot_dir, project_root) else {
+        return false;
+    };
+    if target.snapshot_dir.join("baseline").exists()
+        || !live_snapshot_dir.join("baseline").exists()
+        || !path_keys_match(&target.project_root, live_project_root)
+    {
+        return false;
+    }
+
+    let file_path = changes_request_file_path(request_line);
+    let records = load_external_change_records(
+        &target.snapshot_dir,
+        &target.project_root,
+        !file_path.is_empty(),
+        target.include_project_external_logs,
+    );
+    if file_path.is_empty() {
+        return records.is_empty();
+    }
+
+    let decoded = url_path_decode(file_path);
+    !records.iter().any(|record| record.path == decoded)
+}
+
+fn changes_request_target_id(request_line: &str) -> Option<String> {
+    [
+        "session_id",
+        "target_session_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .find_map(|key| query_param(request_line, key))
+    .map(|value| value.trim().to_string())
+    .filter(|value| !value.is_empty())
+}
+
+fn session_row_matches_changes_target(session: &serde_json::Value, target_id: &str) -> bool {
+    [
+        "session_id",
+        "resume_id",
+        "backend_session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .any(|key| session.get(key).and_then(|v| v.as_str()) == Some(target_id))
+}
+
+fn changes_project_root_from_session(session: &serde_json::Value) -> Option<PathBuf> {
+    ["project_root", "cwd", "workdir", "workDir"]
+        .into_iter()
+        .find_map(|key| value_str(session, key))
+        .map(PathBuf::from)
+        .filter(|path| !path.as_os_str().is_empty())
+}
+
+fn changes_log_dir_from_session(session: &serde_json::Value) -> Option<PathBuf> {
+    ["intendant_session_path", "path"]
+        .into_iter()
+        .filter_map(|key| value_str(session, key).map(PathBuf::from))
+        .find(|path| path.is_dir())
+}
+
+fn changes_request_target_from_home(
+    request_line: &str,
+    home: &Path,
+) -> Option<ChangesRequestTarget> {
+    let target_id = changes_request_target_id(request_line)?;
+    let logs_dir = home.join(".intendant").join("logs");
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    let mut candidates = Vec::new();
+
+    for entry in entries.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+        let session_id = entry.file_name().to_string_lossy().to_string();
+        let Some(row) = intendant_session_list_row_from_dir(&dir, &session_id) else {
+            continue;
+        };
+        if !session_row_matches_changes_target(&row, &target_id) {
+            continue;
+        }
+        if let Some(project_root) = changes_project_root_from_session(&row) {
+            candidates.push(ChangesRequestTarget {
+                snapshot_dir: dir.join("file_snapshots"),
+                project_root,
+                include_project_external_logs: true,
+            });
+        }
+    }
+
+    let sessions: Vec<serde_json::Value> =
+        serde_json::from_str(&list_sessions_from_home(home)).unwrap_or_default();
+    for session in sessions {
+        if !session_row_matches_changes_target(&session, &target_id) {
+            continue;
+        }
+        if let (Some(project_root), Some(log_dir)) = (
+            changes_project_root_from_session(&session),
+            changes_log_dir_from_session(&session),
+        ) {
+            candidates.push(ChangesRequestTarget {
+                snapshot_dir: log_dir.join("file_snapshots"),
+                project_root,
+                include_project_external_logs: true,
+            });
+        }
+    }
+
+    best_changes_request_target(candidates)
+}
+
+fn best_changes_request_target(
+    candidates: Vec<ChangesRequestTarget>,
+) -> Option<ChangesRequestTarget> {
+    candidates
+        .into_iter()
+        .max_by_key(changes_request_target_score)
+}
+
+fn changes_request_target_score(target: &ChangesRequestTarget) -> usize {
+    let baseline_dir = target.snapshot_dir.join("baseline");
+    if baseline_dir.exists() {
+        let body = handle_changes_list(
+            &target.snapshot_dir,
+            &baseline_dir,
+            &target.project_root,
+            target.include_project_external_logs,
+        );
+        let count = serde_json::from_str::<Vec<serde_json::Value>>(&body)
+            .map(|items| items.len())
+            .unwrap_or(0);
+        if count > 0 {
+            return 2_000 + count;
+        }
+    }
+
+    let external_count = load_external_change_records(
+        &target.snapshot_dir,
+        &target.project_root,
+        false,
+        target.include_project_external_logs,
+    )
+    .len();
+    if external_count > 0 {
+        return 1_000 + external_count;
+    }
+    if baseline_dir.exists() {
+        10
+    } else {
+        100
+    }
+}
+
+fn load_baseline_manifest(baseline_dir: &Path) -> crate::file_watcher::BaselineManifest {
+    let Some(snapshot_dir) = baseline_dir.parent() else {
+        return HashMap::new();
+    };
+    let path = snapshot_dir.join(crate::file_watcher::BASELINE_MANIFEST_FILE);
+    match std::fs::read(&path) {
+        Ok(bytes) => serde_json::from_slice(&bytes).unwrap_or_default(),
+        Err(_) => HashMap::new(),
+    }
+}
+
+fn normalize_external_diff_path(path: &str) -> Option<String> {
+    let path = path.split('\t').next().unwrap_or(path).trim();
+    if path == "/dev/null" {
+        return None;
+    }
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path);
+    (!path.is_empty()).then(|| path.to_string())
+}
+
+fn parse_external_diff_file_paths(unified_diff: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    for line in unified_diff.lines() {
+        let path = if let Some(rest) = line.strip_prefix("+++ ") {
+            rest
+        } else if let Some(rest) = line.strip_prefix("--- ") {
+            rest
+        } else {
+            continue;
+        };
+        if let Some(path) = normalize_external_diff_path(path) {
+            if !out.iter().any(|p| p == &path) {
+                out.push(path);
+            }
+        }
+    }
+    out
+}
+
+fn external_diff_line_text(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn is_external_diff_file_boundary(lines: &[&str], idx: usize) -> bool {
+    let line = external_diff_line_text(lines[idx]);
+    line.starts_with("diff --git ")
+        || (line.starts_with("--- ")
+            && lines
+                .get(idx + 1)
+                .is_some_and(|next| external_diff_line_text(next).starts_with("+++ ")))
+}
+
+fn split_external_unified_diff_by_file(unified_diff: &str) -> Vec<(String, String)> {
+    if unified_diff.trim().is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines: Vec<&str> = unified_diff.split_inclusive('\n').collect();
+    if lines.is_empty() {
+        lines.push(unified_diff);
+    }
+
+    let mut starts: Vec<usize> = lines
+        .iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            external_diff_line_text(line)
+                .starts_with("diff --git ")
+                .then_some(idx)
+        })
+        .collect();
+    if starts.is_empty() {
+        for idx in 0..lines.len() {
+            if is_external_diff_file_boundary(&lines, idx) {
+                starts.push(idx);
+            }
+        }
+    }
+    if starts.is_empty() {
+        return parse_external_diff_file_paths(unified_diff)
+            .into_iter()
+            .next()
+            .map(|path| vec![(path, unified_diff.to_string())])
+            .unwrap_or_default();
+    }
+
+    let mut out = Vec::new();
+    for (i, start) in starts.iter().copied().enumerate() {
+        let end = starts.get(i + 1).copied().unwrap_or(lines.len());
+        let block = lines[start..end].concat();
+        if let Some(path) = parse_external_diff_file_paths(&block).into_iter().next() {
+            out.push((path, block));
+        }
+    }
+    out
+}
+
+fn external_diff_log_body(message: &str) -> Option<&str> {
+    if !message.starts_with("External agent diff") {
+        return None;
+    }
+    let first_line_end = message.find('\n')?;
+    let body = &message[first_line_end + 1..];
+    if body.contains("diff --git ") || body.contains("--- ") || body.contains("@@ ") {
+        Some(body)
+    } else {
+        None
+    }
+}
+
+fn diff_stats_from_unified_diff(diff: &str) -> (u32, u32) {
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for line in diff.lines() {
+        if line.starts_with("+++") || line.starts_with("---") {
+            continue;
+        }
+        if line.starts_with('+') {
+            added += 1;
+        } else if line.starts_with('-') {
+            removed += 1;
+        }
+    }
+    (added, removed)
+}
+
+fn external_diff_project_root(diff: &str) -> Option<String> {
+    for line in diff.lines() {
+        let line = line.trim();
+        if let Some(root) = line.strip_prefix("# intendant-project-root:") {
+            let root = root.trim();
+            if !root.is_empty() {
+                return Some(root.to_string());
+            }
+        }
+        if line.starts_with("diff --git ") || line.starts_with("--- ") {
+            break;
+        }
+    }
+    None
+}
+
+fn path_keys_match(a: &Path, b: &Path) -> bool {
+    let clean = |path: &Path| {
+        path.canonicalize()
+            .unwrap_or_else(|_| path.to_path_buf())
+            .to_string_lossy()
+            .trim_end_matches(['/', '\\'])
+            .to_string()
+    };
+    clean(a) == clean(b)
+}
+
+fn external_diff_kind(diff: &str) -> &'static str {
+    if diff
+        .lines()
+        .any(|line| line.starts_with("new file mode") || line == "--- /dev/null")
+    {
+        return "created";
+    }
+    if diff
+        .lines()
+        .any(|line| line.starts_with("deleted file mode") || line == "+++ /dev/null")
+    {
+        return "deleted";
+    }
+    "modified"
+}
+
+fn path_is_inside_project_root(project_root: &Path, path: &Path) -> bool {
+    if !path.is_absolute() {
+        return true;
+    }
+    if path.starts_with(project_root) {
+        return true;
+    }
+    let Ok(root) = project_root.canonicalize() else {
+        return false;
+    };
+    match path.canonicalize() {
+        Ok(resolved) => resolved.starts_with(root),
+        Err(_) => false,
+    }
+}
+
+fn safe_relative_change_path(path: &str) -> Option<String> {
+    let rel = Path::new(path);
+    if rel.is_absolute() {
+        return None;
+    }
+    if rel
+        .components()
+        .all(|component| matches!(component, std::path::Component::Normal(_)))
+        && !crate::file_watcher::should_ignore(rel)
+    {
+        Some(crate::file_watcher::rel_path_key(rel))
+    } else {
+        None
+    }
+}
+
+fn project_relative_external_diff_path(project_root: &Path, path: &str) -> Option<String> {
+    let path_obj = Path::new(path);
+    if !path_obj.is_absolute() {
+        return safe_relative_change_path(path);
+    }
+    if let Ok(rel) = path_obj.strip_prefix(project_root) {
+        return safe_relative_change_path(&crate::file_watcher::rel_path_key(rel));
+    }
+    if let Ok(root) = project_root.canonicalize() {
+        if let Ok(rel) = path_obj.strip_prefix(root) {
+            return safe_relative_change_path(&crate::file_watcher::rel_path_key(rel));
+        }
+    }
+    None
+}
+
+fn load_external_change_records(
+    snapshot_dir: &Path,
+    project_root: &Path,
+    include_diff: bool,
+    include_project_root_paths: bool,
+) -> Vec<ChangeRecord> {
+    let Some(log_dir) = snapshot_dir.parent() else {
+        return Vec::new();
+    };
+    let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
+        return Vec::new();
+    };
+
+    let mut by_path: HashMap<String, ChangeRecord> = HashMap::new();
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let Some(message) = value.get("message").and_then(|v| v.as_str()) else {
+            continue;
+        };
+        let Some(diff_body) = external_diff_log_body(message) else {
+            continue;
+        };
+        if let Some(log_project_root) = external_diff_project_root(diff_body) {
+            if !path_keys_match(Path::new(&log_project_root), project_root) {
+                continue;
+            }
+        }
+        for (path, block) in split_external_unified_diff_by_file(diff_body) {
+            let path_obj = Path::new(&path);
+            let project_relative = project_relative_external_diff_path(project_root, &path);
+            let (display_path, kind, reason) = if let Some(rel) = project_relative {
+                if !include_project_root_paths {
+                    continue;
+                }
+                (rel, external_diff_kind(&block), None)
+            } else {
+                if !path_obj.is_absolute() || path_is_inside_project_root(project_root, path_obj) {
+                    continue;
+                }
+                (
+                    path.clone(),
+                    "external",
+                    Some(
+                        "outside tracked project root; shown from external agent diff log"
+                            .to_string(),
+                    ),
+                )
+            };
+            let (lines_added, lines_removed) = diff_stats_from_unified_diff(&block);
+            by_path.insert(
+                display_path.clone(),
+                ChangeRecord {
+                    path: display_path,
+                    kind,
+                    lines_added,
+                    lines_removed,
+                    diff_available: true,
+                    reason,
+                    diff: include_diff.then_some(block),
+                },
+            );
+        }
+    }
+
+    let mut records: Vec<_> = by_path.into_values().collect();
+    records.sort_by(|a, b| a.path.cmp(&b.path));
+    records
+}
+
+fn collect_baseline_text_paths(baseline_dir: &Path) -> HashSet<String> {
+    let mut paths = HashSet::new();
     let mut stack = vec![baseline_dir.to_path_buf()];
     while let Some(dir) = stack.pop() {
         let entries = match std::fs::read_dir(&dir) {
@@ -1896,129 +8302,431 @@ fn handle_changes_list(baseline_dir: &Path, project_root: &Path) -> String {
                 stack.push(path);
                 continue;
             }
+            if !path.is_file() {
+                continue;
+            }
             let rel = match path.strip_prefix(baseline_dir) {
                 Ok(r) => r,
                 Err(_) => continue,
             };
-            let rel_str = rel.to_string_lossy().to_string();
-            let current_path = project_root.join(rel);
-
-            let baseline = std::fs::read_to_string(&path).unwrap_or_default();
-            if current_path.exists() {
-                let current = match std::fs::read_to_string(&current_path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                if baseline == current {
-                    continue; // no change
-                }
-                let (lines_added, lines_removed) = {
-                    let diff = similar::TextDiff::from_lines(baseline.as_str(), current.as_str());
-                    let mut added = 0u32;
-                    let mut removed = 0u32;
-                    for change in diff.iter_all_changes() {
-                        match change.tag() {
-                            similar::ChangeTag::Insert => added += 1,
-                            similar::ChangeTag::Delete => removed += 1,
-                            similar::ChangeTag::Equal => {}
-                        }
-                    }
-                    (added, removed)
-                };
-                let kind = if baseline.is_empty() {
-                    "created"
-                } else {
-                    "modified"
-                };
-                changes.push(serde_json::json!({
-                    "path": rel_str,
-                    "kind": kind,
-                    "lines_added": lines_added,
-                    "lines_removed": lines_removed,
-                }));
-            } else {
-                // File was deleted.
-                let lines_removed = baseline.lines().count() as u32;
-                changes.push(serde_json::json!({
-                    "path": rel_str,
-                    "kind": "deleted",
-                    "lines_added": 0,
-                    "lines_removed": lines_removed,
-                }));
+            if crate::file_watcher::should_ignore(rel) {
+                continue;
             }
+            paths.insert(crate::file_watcher::rel_path_key(rel));
+        }
+    }
+    paths
+}
+
+fn collect_current_change_states(project_root: &Path) -> HashMap<String, ChangeFileState> {
+    let mut states = HashMap::new();
+    let mut stack = vec![project_root.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let ft = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(_) => continue,
+            };
+            if ft.is_dir() {
+                if let Ok(rel) = path.strip_prefix(project_root) {
+                    if !crate::file_watcher::should_ignore(rel) {
+                        stack.push(path);
+                    }
+                }
+                continue;
+            }
+            if !ft.is_file() {
+                continue;
+            }
+            let rel = match path.strip_prefix(project_root) {
+                Ok(r) => r,
+                Err(_) => continue,
+            };
+            if crate::file_watcher::should_ignore(rel) {
+                continue;
+            }
+            let key = crate::file_watcher::rel_path_key(rel);
+            match crate::file_watcher::inspect_file(&path) {
+                Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => {
+                    states.insert(
+                        key,
+                        ChangeFileState::Text {
+                            content: snapshot.text,
+                            hash: snapshot.hash_hex,
+                        },
+                    );
+                }
+                Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => {
+                    states.insert(
+                        key,
+                        ChangeFileState::Unsupported {
+                            hash: snapshot.hash_hex,
+                            reason: snapshot.reason,
+                        },
+                    );
+                }
+                Err(_) => continue,
+            }
+        }
+    }
+    states
+}
+
+fn inspect_current_change_state(project_root: &Path, rel_key: &str) -> Option<ChangeFileState> {
+    let path = project_root.join(Path::new(rel_key));
+    if !path.exists() {
+        return None;
+    }
+    match crate::file_watcher::inspect_file(&path) {
+        Ok(crate::file_watcher::InspectedFile::Text(snapshot)) => Some(ChangeFileState::Text {
+            content: snapshot.text,
+            hash: snapshot.hash_hex,
+        }),
+        Ok(crate::file_watcher::InspectedFile::Unsupported(snapshot)) => {
+            Some(ChangeFileState::Unsupported {
+                hash: snapshot.hash_hex,
+                reason: snapshot.reason,
+            })
+        }
+        Err(_) => None,
+    }
+}
+
+fn read_baseline_text(baseline_dir: &Path, rel_key: &str) -> Option<String> {
+    std::fs::read_to_string(baseline_dir.join(Path::new(rel_key))).ok()
+}
+
+fn baseline_hash_for(
+    baseline_text: Option<&str>,
+    baseline_meta: Option<&crate::file_watcher::BaselineFileMeta>,
+) -> Option<String> {
+    baseline_meta.map(|m| m.hash.clone()).or_else(|| {
+        baseline_text.map(|s| {
+            crate::file_watcher::hex_encode(&crate::file_watcher::sha256_hash(s.as_bytes()))
+        })
+    })
+}
+
+fn diff_stat_pair(baseline: &str, current: &str) -> (u32, u32) {
+    let diff = similar::TextDiff::from_lines(baseline, current);
+    let mut added = 0u32;
+    let mut removed = 0u32;
+    for change in diff.iter_all_changes() {
+        match change.tag() {
+            similar::ChangeTag::Insert => added += 1,
+            similar::ChangeTag::Delete => removed += 1,
+            similar::ChangeTag::Equal => {}
+        }
+    }
+    (added, removed)
+}
+
+fn unsupported_change_record(rel_key: &str, kind: &'static str, reason: String) -> ChangeRecord {
+    ChangeRecord {
+        path: rel_key.to_string(),
+        kind,
+        lines_added: 0,
+        lines_removed: 0,
+        diff_available: false,
+        reason: Some(reason),
+        diff: None,
+    }
+}
+
+fn compute_change_record(
+    rel_key: &str,
+    baseline_dir: &Path,
+    current: Option<&ChangeFileState>,
+    baseline_manifest: &crate::file_watcher::BaselineManifest,
+    include_diff: bool,
+) -> Option<ChangeRecord> {
+    let baseline_text = read_baseline_text(baseline_dir, rel_key);
+    let baseline_meta = baseline_manifest.get(rel_key);
+    let baseline_exists = baseline_text.is_some() || baseline_meta.is_some();
+    let baseline_supported_text =
+        baseline_text.is_some() && baseline_meta.map(|m| m.supported_text).unwrap_or(true);
+
+    match (
+        baseline_exists,
+        baseline_supported_text,
+        baseline_text.as_deref(),
+        current,
+    ) {
+        (false, _, _, None) => None,
+        (false, _, _, Some(ChangeFileState::Text { content, .. })) => {
+            let (lines_added, lines_removed) = diff_stat_pair("", content);
+            let diff = include_diff
+                .then(|| crate::file_watcher::compute_unified_diff("", content, rel_key));
+            Some(ChangeRecord {
+                path: rel_key.to_string(),
+                kind: "created",
+                lines_added,
+                lines_removed,
+                diff_available: true,
+                reason: None,
+                diff,
+            })
+        }
+        (false, _, _, Some(ChangeFileState::Unsupported { reason, .. })) => Some(
+            unsupported_change_record(rel_key, "created", reason.clone()),
+        ),
+        (true, true, Some(base), None) => {
+            let diff =
+                include_diff.then(|| crate::file_watcher::compute_unified_diff(base, "", rel_key));
+            Some(ChangeRecord {
+                path: rel_key.to_string(),
+                kind: "deleted",
+                lines_added: 0,
+                lines_removed: base.lines().count() as u32,
+                diff_available: true,
+                reason: None,
+                diff,
+            })
+        }
+        (true, false, _, None) => {
+            let reason = baseline_meta
+                .and_then(|m| m.reason.clone())
+                .unwrap_or_else(|| "baseline file was not text-diffable".to_string());
+            Some(unsupported_change_record(rel_key, "deleted", reason))
+        }
+        (true, true, Some(base), Some(ChangeFileState::Text { content, hash })) => {
+            let baseline_hash = baseline_hash_for(Some(base), baseline_meta);
+            if baseline_hash.as_ref() == Some(hash) || base == content {
+                return None;
+            }
+            let (lines_added, lines_removed) = diff_stat_pair(base, content);
+            let diff = include_diff
+                .then(|| crate::file_watcher::compute_unified_diff(base, content, rel_key));
+            Some(ChangeRecord {
+                path: rel_key.to_string(),
+                kind: "modified",
+                lines_added,
+                lines_removed,
+                diff_available: true,
+                reason: None,
+                diff,
+            })
+        }
+        (true, true, Some(base), Some(ChangeFileState::Unsupported { hash, reason })) => {
+            let baseline_hash = baseline_hash_for(Some(base), baseline_meta);
+            if baseline_hash.as_ref() == Some(hash) {
+                return None;
+            }
+            Some(unsupported_change_record(
+                rel_key,
+                "modified",
+                reason.clone(),
+            ))
+        }
+        (true, false, _, Some(ChangeFileState::Text { hash, .. }))
+        | (true, false, _, Some(ChangeFileState::Unsupported { hash, .. })) => {
+            if baseline_meta.map(|m| &m.hash) == Some(hash) {
+                return None;
+            }
+            let reason = baseline_meta
+                .and_then(|m| m.reason.clone())
+                .unwrap_or_else(|| "baseline file was not text-diffable".to_string());
+            Some(unsupported_change_record(rel_key, "modified", reason))
+        }
+        _ => None,
+    }
+}
+
+fn change_record_summary_json(record: &ChangeRecord) -> serde_json::Value {
+    serde_json::json!({
+        "path": record.path.clone(),
+        "kind": record.kind,
+        "lines_added": record.lines_added,
+        "lines_removed": record.lines_removed,
+        "diff_available": record.diff_available,
+        "reason": record.reason.clone(),
+    })
+}
+
+fn change_record_detail_json(record: &ChangeRecord) -> serde_json::Value {
+    serde_json::json!({
+        "path": record.path.clone(),
+        "kind": record.kind,
+        "diff": record.diff.clone().unwrap_or_default(),
+        "lines_added": record.lines_added,
+        "lines_removed": record.lines_removed,
+        "diff_available": record.diff_available,
+        "reason": record.reason.clone(),
+    })
+}
+
+/// List all files that have changed since the session baseline.
+fn handle_changes_list(
+    snapshot_dir: &Path,
+    baseline_dir: &Path,
+    project_root: &Path,
+    include_project_external_logs: bool,
+) -> String {
+    let baseline_manifest = load_baseline_manifest(baseline_dir);
+    let baseline_paths = collect_baseline_text_paths(baseline_dir);
+    let current_states = collect_current_change_states(project_root);
+    let mut keys: HashSet<String> = baseline_manifest.keys().cloned().collect();
+    keys.extend(baseline_paths);
+    keys.extend(current_states.keys().cloned());
+
+    let mut changes = Vec::new();
+    let mut sorted_keys: Vec<String> = keys.into_iter().collect();
+    sorted_keys.sort();
+    for key in sorted_keys {
+        if crate::file_watcher::should_ignore(Path::new(&key)) {
+            continue;
+        }
+        if let Some(record) = compute_change_record(
+            &key,
+            baseline_dir,
+            current_states.get(&key),
+            &baseline_manifest,
+            false,
+        ) {
+            changes.push(change_record_summary_json(&record));
+        }
+    }
+    let existing_paths: HashSet<String> = changes
+        .iter()
+        .filter_map(|value| {
+            value
+                .get("path")
+                .and_then(|path| path.as_str())
+                .map(str::to_string)
+        })
+        .collect();
+    for record in load_external_change_records(
+        snapshot_dir,
+        project_root,
+        false,
+        include_project_external_logs,
+    ) {
+        if !existing_paths.contains(&record.path) {
+            changes.push(change_record_summary_json(&record));
         }
     }
     serde_json::to_string(&changes).unwrap_or_else(|_| "[]".to_string())
 }
 
 /// Return a unified diff for a single file.
-fn handle_changes_file_diff(file_path: &str, baseline_dir: &Path, project_root: &Path) -> String {
+fn handle_changes_file_diff(
+    file_path: &str,
+    snapshot_dir: &Path,
+    baseline_dir: &Path,
+    project_root: &Path,
+    include_project_external_logs: bool,
+) -> (&'static str, String) {
+    let decoded = url_path_decode(file_path);
     // Reject path traversal.
-    let rel = Path::new(file_path);
-    for component in rel.components() {
-        if matches!(component, std::path::Component::ParentDir) {
-            return serde_json::json!({"error": "invalid path"}).to_string();
+    let rel = Path::new(&decoded);
+    if rel.is_absolute() {
+        if let Some(record) = load_external_change_records(
+            snapshot_dir,
+            project_root,
+            true,
+            include_project_external_logs,
+        )
+        .into_iter()
+        .find(|record| record.path == decoded)
+        {
+            return ("200 OK", change_record_detail_json(&record).to_string());
         }
+        return (
+            "404 Not Found",
+            serde_json::json!({"error": "no changes for path"}).to_string(),
+        );
+    }
+    for component in rel.components() {
+        if !matches!(component, std::path::Component::Normal(_)) {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": "invalid path"}).to_string(),
+            );
+        }
+    }
+    if crate::file_watcher::should_ignore(rel) {
+        return (
+            "404 Not Found",
+            serde_json::json!({"error": "no changes for path"}).to_string(),
+        );
     }
 
     let baseline_path = baseline_dir.join(rel);
     let current_path = project_root.join(rel);
 
-    // Verify resolved paths stay within their roots.
-    if let (Ok(resolved_baseline), Ok(resolved_root)) = (
-        baseline_path
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_path.clone())),
-        baseline_dir
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(baseline_dir.to_path_buf())),
-    ) {
-        if !resolved_baseline.starts_with(&resolved_root) {
-            return serde_json::json!({"error": "invalid path"}).to_string();
-        }
-    }
-    if let (Ok(resolved_current), Ok(resolved_root)) = (
-        current_path
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(current_path.clone())),
-        project_root
-            .canonicalize()
-            .or_else(|_| Ok::<PathBuf, std::io::Error>(project_root.to_path_buf())),
-    ) {
-        if !resolved_current.starts_with(&resolved_root) {
-            return serde_json::json!({"error": "invalid path"}).to_string();
-        }
-    }
-
-    let baseline = std::fs::read_to_string(&baseline_path).unwrap_or_default();
-    let current = if current_path.exists() {
-        std::fs::read_to_string(&current_path).unwrap_or_default()
-    } else {
-        String::new()
-    };
-
-    let diff = crate::file_watcher::compute_unified_diff(&baseline, &current, file_path);
-    let (lines_added, lines_removed) = {
-        let text_diff = similar::TextDiff::from_lines(baseline.as_str(), current.as_str());
-        let mut added = 0u32;
-        let mut removed = 0u32;
-        for change in text_diff.iter_all_changes() {
-            match change.tag() {
-                similar::ChangeTag::Insert => added += 1,
-                similar::ChangeTag::Delete => removed += 1,
-                similar::ChangeTag::Equal => {}
+    // Verify existing resolved paths stay within their roots. Missing paths
+    // are safe after the component check above; canonicalizing a missing
+    // `baseline/<created-file>` path can otherwise mix `/tmp` and
+    // `/private/tmp` spellings on macOS and reject valid created files.
+    if baseline_path.exists() {
+        if let (Ok(resolved_baseline), Ok(resolved_root)) =
+            (baseline_path.canonicalize(), baseline_dir.canonicalize())
+        {
+            if !resolved_baseline.starts_with(&resolved_root) {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"error": "invalid path"}).to_string(),
+                );
             }
+        } else {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": "invalid path"}).to_string(),
+            );
         }
-        (added, removed)
-    };
+    }
+    if current_path.exists() {
+        if let (Ok(resolved_current), Ok(resolved_root)) =
+            (current_path.canonicalize(), project_root.canonicalize())
+        {
+            if !resolved_current.starts_with(&resolved_root) {
+                return (
+                    "400 Bad Request",
+                    serde_json::json!({"error": "invalid path"}).to_string(),
+                );
+            }
+        } else {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": "invalid path"}).to_string(),
+            );
+        }
+    }
 
-    serde_json::json!({
-        "path": file_path,
-        "diff": diff,
-        "lines_added": lines_added,
-        "lines_removed": lines_removed,
-    })
-    .to_string()
+    let baseline_manifest = load_baseline_manifest(baseline_dir);
+    let current = inspect_current_change_state(project_root, &decoded);
+
+    match compute_change_record(
+        &decoded,
+        baseline_dir,
+        current.as_ref(),
+        &baseline_manifest,
+        true,
+    ) {
+        Some(record) => ("200 OK", change_record_detail_json(&record).to_string()),
+        None => {
+            if let Some(record) = load_external_change_records(
+                snapshot_dir,
+                project_root,
+                true,
+                include_project_external_logs,
+            )
+            .into_iter()
+            .find(|record| record.path == decoded)
+            {
+                return ("200 OK", change_record_detail_json(&record).to_string());
+            }
+            (
+                "404 Not Found",
+                serde_json::json!({"error": "no changes for path"}).to_string(),
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2028,7 +8736,7 @@ fn handle_changes_file_diff(file_path: &str, baseline_dir: &Path, project_root: 
 /// Read the full POST body (honoring Content-Length). Returns the peeked
 /// prefix if the headers already carried the entire payload; otherwise reads
 /// the remainder from the stream.
-async fn read_post_body(header_text: &str, stream: &mut tokio::net::TcpStream) -> String {
+async fn read_post_body<S: AsyncRead + Unpin>(header_text: &str, stream: &mut S) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -2075,9 +8783,10 @@ const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
 ///
 /// This is the binary counterpart to `read_post_body` — same peek-then-
 /// stream pattern, but sinks to disk instead of a UTF-8 `String`.
-async fn stream_body_to_tempfile(
+async fn stream_body_to_tempfile<S: AsyncRead + Unpin>(
     header_text: &str,
-    stream: &mut tokio::net::TcpStream,
+    initial_request_bytes: &[u8],
+    stream: &mut S,
     max_bytes: usize,
 ) -> Result<(tempfile::NamedTempFile, usize), String> {
     use std::io::Write;
@@ -2099,11 +8808,7 @@ async fn stream_body_to_tempfile(
         ));
     }
 
-    let peeked_body = header_text
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or("")
-        .as_bytes();
+    let peeked_body = initial_body_bytes(initial_request_bytes)?;
     let mut tmp = tempfile::NamedTempFile::new().map_err(|e| format!("create tempfile: {e}"))?;
 
     // Write whatever body bytes we already have from the peek. These come
@@ -2141,6 +8846,540 @@ async fn stream_body_to_tempfile(
         .flush()
         .map_err(|e| format!("flush tempfile: {e}"))?;
     Ok((tmp, written))
+}
+
+fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
+    initial_request_bytes
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .map(|idx| &initial_request_bytes[idx + 4..])
+        .ok_or_else(|| "incomplete HTTP headers".to_string())
+}
+
+fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
+    project_root.join(".intendant").join("pending_uploads")
+}
+
+fn json_response(status: &str, body: String) -> String {
+    format!(
+        "HTTP/1.1 {}\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        status,
+        body.len(),
+        body
+    )
+}
+
+fn json_ok(value: serde_json::Value) -> String {
+    json_response("200 OK", value.to_string())
+}
+
+fn json_error(status: &str, message: impl AsRef<str>) -> String {
+    json_response(
+        status,
+        serde_json::json!({ "error": message.as_ref() }).to_string(),
+    )
+}
+
+fn request_query_param(request_line: &str, key: &str) -> Option<String> {
+    let path = request_line.split_whitespace().nth(1)?;
+    let query = path.split_once('?')?.1;
+    for pair in query.split('&') {
+        let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
+        if k == key && !v.trim().is_empty() {
+            return Some(percent_decode_query_value(v));
+        }
+    }
+    None
+}
+
+fn managed_context_query_session_id(request_line: &str) -> Option<String> {
+    request_query_param(request_line, "backend_session_id")
+        .or_else(|| request_query_param(request_line, "session_id"))
+        .or_else(|| request_query_param(request_line, "session"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn managed_context_query_wrapper_session_id(request_line: &str) -> Option<String> {
+    request_query_param(request_line, "intendant_session_id")
+        .or_else(|| request_query_param(request_line, "wrapper_session_id"))
+        .map(|id| id.trim().to_string())
+        .filter(|id| !id.is_empty())
+}
+
+fn managed_context_safe_log_dir_id(id: &str) -> Option<String> {
+    let id = id.trim();
+    // Reject anything that isn't a plain single path component. `:` matters on
+    // Windows, where `Path::join("C:")` (or `C:foo`) yields a drive-relative path
+    // that escapes the logs dir; we also reject path separators, NUL, and the
+    // `.`/`..` traversal components on every platform.
+    if id.is_empty()
+        || id == "."
+        || id == ".."
+        || id.contains('/')
+        || id.contains('\\')
+        || id.contains(':')
+        || id.contains('\0')
+    {
+        return None;
+    }
+    Some(id.to_string())
+}
+
+fn managed_context_named_log_dir(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let session_id = managed_context_safe_log_dir_id(session_id)?;
+    let path = home.join(".intendant").join("logs").join(session_id);
+    path.is_dir().then_some(path)
+}
+
+fn managed_context_line_mentions_session(line: &str, session_id: &str) -> bool {
+    if !line.contains(session_id) {
+        return false;
+    }
+    if line.contains("\"session_identity\"")
+        || line.contains("External agent thread:")
+        || line.contains("Mode: external agent")
+        || line.contains("\"backend_session_id\"")
+    {
+        return true;
+    }
+    serde_json::from_str::<serde_json::Value>(line)
+        .ok()
+        .map(|value| {
+            value.pointer("/data/session_id").and_then(|v| v.as_str()) == Some(session_id)
+                || value
+                    .pointer("/data/backend_session_id")
+                    .and_then(|v| v.as_str())
+                    == Some(session_id)
+                || value
+                    .get("message")
+                    .and_then(|v| v.as_str())
+                    .and_then(external_agent_thread_id_from_message)
+                    .as_deref()
+                    == Some(session_id)
+        })
+        .unwrap_or(false)
+}
+
+fn managed_context_trace_dirs_mention_session(log_dir: &Path, session_id: &str) -> bool {
+    let trace_root = log_dir.join("model-request-traces");
+    let Ok(entries) = std::fs::read_dir(trace_root) else {
+        return false;
+    };
+    entries.flatten().any(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .map(|name| name.contains(session_id))
+            .unwrap_or(false)
+    })
+}
+
+fn managed_context_log_dir_mentions_session(log_dir: &Path, session_id: &str) -> bool {
+    if log_dir.file_name().and_then(|name| name.to_str()) == Some(session_id) {
+        return true;
+    }
+    if managed_context_trace_dirs_mention_session(log_dir, session_id) {
+        return true;
+    }
+    let session_path = log_dir.join("session.jsonl");
+    let Ok(file) = std::fs::File::open(session_path) else {
+        return false;
+    };
+    let reader = std::io::BufReader::new(file);
+    reader
+        .lines()
+        .map_while(Result::ok)
+        .any(|line| managed_context_line_mentions_session(&line, session_id))
+}
+
+fn managed_context_candidate_log_dirs(
+    home: &Path,
+    active_log_dir: Option<&Path>,
+    session_id: Option<&str>,
+    wrapper_session_id: Option<&str>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    let mut seen_dirs = HashSet::new();
+    let mut push_dir = |path: PathBuf| {
+        let key = std::fs::canonicalize(&path)
+            .unwrap_or_else(|_| path.clone())
+            .to_string_lossy()
+            .to_string();
+        if seen_dirs.insert(key) {
+            dirs.push(path);
+        }
+    };
+
+    if let Some(log_dir) = active_log_dir {
+        push_dir(log_dir.to_path_buf());
+    }
+    if let Some(wrapper_session_id) = wrapper_session_id {
+        if let Some(path) = managed_context_named_log_dir(home, wrapper_session_id) {
+            push_dir(path);
+            if session_id.is_none() || session_id == Some(wrapper_session_id) {
+                return dirs;
+            }
+        }
+    }
+    if let Some(session_id) = session_id {
+        if let Some(path) = managed_context_named_log_dir(home, session_id) {
+            push_dir(path);
+            if wrapper_session_id.is_none() || wrapper_session_id == Some(session_id) {
+                return dirs;
+            }
+        }
+        let logs_dir = home.join(".intendant").join("logs");
+        if let Ok(entries) = std::fs::read_dir(&logs_dir) {
+            for entry in entries.flatten() {
+                let log_dir = entry.path();
+                if log_dir.is_dir()
+                    && (managed_context_log_dir_mentions_session(&log_dir, session_id)
+                        || crate::context_rewind::records_dir(&log_dir).is_dir())
+                {
+                    push_dir(log_dir);
+                }
+            }
+        }
+    }
+    dirs
+}
+
+fn managed_context_record_matches_session(
+    record: &crate::context_rewind::ContextRewindRecord,
+    session_id: &str,
+) -> bool {
+    record.thread_id == session_id || record.session_id.as_deref() == Some(session_id)
+}
+
+fn append_managed_context_records_from_dir(
+    records: &mut Vec<crate::context_rewind::ContextRewindRecord>,
+    seen_dirs: &mut std::collections::HashSet<String>,
+    log_dir: &Path,
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    let key = std::fs::canonicalize(log_dir)
+        .unwrap_or_else(|_| log_dir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if !seen_dirs.insert(key) {
+        return Ok(());
+    }
+    let mut from_dir = crate::context_rewind::list_records(log_dir)?;
+    if let Some(session_id) = session_id {
+        from_dir.retain(|record| managed_context_record_matches_session(record, session_id));
+    }
+    records.extend(from_dir);
+    Ok(())
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct ManagedContextAnchor {
+    item_id: String,
+    session_id: Option<String>,
+    intendant_session_id: Option<String>,
+    tool_name: String,
+    preview: String,
+    status: Option<String>,
+    created_at: Option<String>,
+    trace_path: String,
+}
+
+fn managed_context_anchor_timestamp(value: &serde_json::Value) -> Option<String> {
+    value
+        .get("wall_time_unix_ms")
+        .and_then(|v| v.as_i64())
+        .and_then(chrono::DateTime::<chrono::Utc>::from_timestamp_millis)
+        .map(|dt| dt.to_rfc3339())
+}
+
+fn managed_context_anchor_tool_name(payload: &serde_json::Value) -> String {
+    payload
+        .pointer("/summary/label")
+        .and_then(|v| v.as_str())
+        .or_else(|| payload.pointer("/kind/type").and_then(|v| v.as_str()))
+        .unwrap_or("tool")
+        .to_string()
+}
+
+fn managed_context_anchor_preview(payload: &serde_json::Value) -> String {
+    payload
+        .pointer("/summary/input_preview")
+        .and_then(|v| v.as_str())
+        .or_else(|| {
+            payload
+                .pointer("/summary/output_preview")
+                .and_then(|v| v.as_str())
+        })
+        .map(|s| compact_text(s, 240))
+        .unwrap_or_default()
+}
+
+fn managed_context_anchor_session_id(value: &serde_json::Value) -> Option<String> {
+    value_str(value, "thread_id")
+        .or_else(|| {
+            value
+                .pointer("/payload/thread_id")
+                .and_then(|v| v.as_str())
+                .map(str::to_string)
+        })
+        .or_else(|| value_str(value, "rollout_id"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+fn managed_context_anchor_matches_session(anchor: &ManagedContextAnchor, session_id: &str) -> bool {
+    anchor.session_id.as_deref() == Some(session_id)
+        || anchor.intendant_session_id.as_deref() == Some(session_id)
+}
+
+fn append_managed_context_anchors_from_trace_file(
+    anchors: &mut Vec<ManagedContextAnchor>,
+    trace_path: &Path,
+    intendant_session_id: Option<&str>,
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    let file = std::fs::File::open(trace_path)?;
+    let reader = std::io::BufReader::new(file);
+    let mut indexes: HashMap<String, usize> = HashMap::new();
+    for line in reader.lines() {
+        let Ok(line) = line else {
+            continue;
+        };
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let Some(payload) = value.get("payload") else {
+            continue;
+        };
+        match payload.get("type").and_then(|v| v.as_str()) {
+            Some("tool_call_started") => {
+                let Some(item_id) = value_str(payload, "tool_call_id")
+                    .or_else(|| value_str(payload, "model_visible_call_id"))
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+                else {
+                    continue;
+                };
+                let anchor = ManagedContextAnchor {
+                    item_id: item_id.clone(),
+                    session_id: managed_context_anchor_session_id(&value),
+                    intendant_session_id: intendant_session_id.map(str::to_string),
+                    tool_name: managed_context_anchor_tool_name(payload),
+                    preview: managed_context_anchor_preview(payload),
+                    status: None,
+                    created_at: managed_context_anchor_timestamp(&value),
+                    trace_path: trace_path.to_string_lossy().to_string(),
+                };
+                if let Some(session_id) = session_id {
+                    if !managed_context_anchor_matches_session(&anchor, session_id) {
+                        continue;
+                    }
+                }
+                indexes.insert(item_id, anchors.len());
+                anchors.push(anchor);
+            }
+            Some("tool_call_ended" | "tool_call_runtime_ended") => {
+                let Some(item_id) = value_str(payload, "tool_call_id") else {
+                    continue;
+                };
+                let Some(index) = indexes.get(item_id.trim()).copied() else {
+                    continue;
+                };
+                if anchors[index].status.is_none() {
+                    anchors[index].status = value_str(payload, "status");
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn append_managed_context_anchors_from_dir(
+    anchors: &mut Vec<ManagedContextAnchor>,
+    seen_dirs: &mut HashSet<String>,
+    log_dir: &Path,
+    session_id: Option<&str>,
+) -> std::io::Result<()> {
+    let key = std::fs::canonicalize(log_dir)
+        .unwrap_or_else(|_| log_dir.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if !seen_dirs.insert(key) {
+        return Ok(());
+    }
+    let intendant_session_id = log_dir.file_name().and_then(|name| name.to_str());
+    let trace_root = log_dir.join("model-request-traces");
+    for trace_path in collect_recent_files(
+        &trace_root,
+        "trace.jsonl",
+        MANAGED_CONTEXT_ANCHOR_TRACE_LIMIT,
+    ) {
+        append_managed_context_anchors_from_trace_file(
+            anchors,
+            &trace_path,
+            intendant_session_id,
+            session_id,
+        )?;
+    }
+    Ok(())
+}
+
+fn managed_context_anchors_response_from_home(
+    request_line: &str,
+    active_log_dir: Option<&Path>,
+    home: &Path,
+) -> String {
+    let session_id = managed_context_query_session_id(request_line);
+    let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
+    let filter_session_id = session_id.as_deref().or(wrapper_session_id.as_deref());
+    let mut anchors = Vec::new();
+    let mut seen_dirs = HashSet::new();
+
+    let dirs = managed_context_candidate_log_dirs(
+        home,
+        active_log_dir,
+        session_id.as_deref(),
+        wrapper_session_id.as_deref(),
+    );
+    if !dirs.is_empty() {
+        for log_dir in dirs {
+            if let Err(err) = append_managed_context_anchors_from_dir(
+                &mut anchors,
+                &mut seen_dirs,
+                &log_dir,
+                filter_session_id,
+            ) {
+                return json_error(
+                    "500 Internal Server Error",
+                    format!("failed to read managed-context anchors: {err}"),
+                );
+            }
+        }
+    } else if active_log_dir.is_some() {
+        // Active log was present but unreadable or raced with session teardown.
+        return json_ok(serde_json::json!({ "anchors": [] }));
+    } else if session_id.is_none() && wrapper_session_id.is_none() {
+        return json_error(
+            "404 Not Found",
+            "managed-context anchors need an active session log",
+        );
+    } else {
+        let Some(log_dir) = active_log_dir else {
+            anchors.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            return json_ok(serde_json::json!({ "anchors": anchors }));
+        };
+        if let Err(err) = append_managed_context_anchors_from_dir(
+            &mut anchors,
+            &mut seen_dirs,
+            log_dir,
+            filter_session_id,
+        ) {
+            return json_error(
+                "500 Internal Server Error",
+                format!("failed to read managed-context anchors: {err}"),
+            );
+        }
+    }
+
+    anchors.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    let mut seen_items = HashSet::new();
+    anchors.retain(|anchor| seen_items.insert(anchor.item_id.clone()));
+    anchors.truncate(MANAGED_CONTEXT_ANCHOR_LIMIT);
+    json_ok(serde_json::json!({ "anchors": anchors }))
+}
+
+#[cfg(test)]
+fn managed_context_anchors_response(request_line: &str, log_dir: &Path) -> String {
+    managed_context_anchors_response_from_home(
+        request_line,
+        Some(log_dir),
+        &crate::platform::home_dir(),
+    )
+}
+
+fn managed_context_records_response_from_home(
+    request_line: &str,
+    active_log_dir: Option<&Path>,
+    home: &Path,
+) -> String {
+    let session_id = managed_context_query_session_id(request_line);
+    let wrapper_session_id = managed_context_query_wrapper_session_id(request_line);
+    let filter_session_id = session_id.as_deref().or(wrapper_session_id.as_deref());
+    let mut records = Vec::new();
+    let mut seen_dirs = std::collections::HashSet::new();
+
+    let dirs = managed_context_candidate_log_dirs(
+        home,
+        active_log_dir,
+        session_id.as_deref(),
+        wrapper_session_id.as_deref(),
+    );
+    if !dirs.is_empty() {
+        for log_dir in dirs {
+            if let Err(err) = append_managed_context_records_from_dir(
+                &mut records,
+                &mut seen_dirs,
+                &log_dir,
+                filter_session_id,
+            ) {
+                return json_error(
+                    "500 Internal Server Error",
+                    format!("failed to read managed-context records: {err}"),
+                );
+            }
+        }
+    } else if active_log_dir.is_some() {
+        return json_ok(serde_json::json!({ "records": [] }));
+    } else if session_id.is_none() && wrapper_session_id.is_none() {
+        return json_error(
+            "404 Not Found",
+            "managed-context records need an active session log",
+        );
+    } else {
+        let Some(log_dir) = active_log_dir else {
+            records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+            return json_ok(serde_json::json!({ "records": records }));
+        };
+        if let Err(err) = append_managed_context_records_from_dir(
+            &mut records,
+            &mut seen_dirs,
+            log_dir,
+            filter_session_id,
+        ) {
+            return json_error(
+                "500 Internal Server Error",
+                format!("failed to read managed-context records: {err}"),
+            );
+        }
+    }
+
+    records.sort_by(|a, b| b.created_at.cmp(&a.created_at));
+    json_ok(serde_json::json!({ "records": records }))
+}
+
+#[cfg(test)]
+fn managed_context_records_response(request_line: &str, log_dir: &Path) -> String {
+    managed_context_records_response_from_home(
+        request_line,
+        Some(log_dir),
+        &crate::platform::home_dir(),
+    )
+}
+
+fn effective_upload_destination(
+    requested: crate::upload_store::UploadDestination,
+    _has_active_session: bool,
+) -> crate::upload_store::UploadDestination {
+    requested
 }
 
 /// Parse a query-string value by key out of a full `request_line`
@@ -2196,6 +9435,931 @@ fn url_decode(s: &str) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// Decode percent escapes in an HTTP path segment. Unlike query-string
+/// decoding, `+` is a literal plus in paths.
+fn url_path_decode(s: &str) -> String {
+    let bytes = s.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'%' if i + 2 < bytes.len() => {
+                let h = &bytes[i + 1..i + 3];
+                match std::str::from_utf8(h)
+                    .ok()
+                    .and_then(|hs| u8::from_str_radix(hs, 16).ok())
+                {
+                    Some(b) => {
+                        out.push(b);
+                        i += 3;
+                    }
+                    None => {
+                        out.push(bytes[i]);
+                        i += 1;
+                    }
+                }
+            }
+            b => {
+                out.push(b);
+                i += 1;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DashboardSourceRequest {
+    path: PathBuf,
+    line: Option<usize>,
+}
+
+enum DashboardLocalFileResponse {
+    Html {
+        status: &'static str,
+        body: String,
+    },
+    Bytes {
+        status: &'static str,
+        content_type: &'static str,
+        bytes: Vec<u8>,
+    },
+}
+
+fn dashboard_source_request_from_line(request_line: &str) -> Option<DashboardSourceRequest> {
+    if !request_line.starts_with("GET ") {
+        return None;
+    }
+    let path_token = request_line.split_whitespace().nth(1)?;
+    let path_part = path_token.split('?').next().unwrap_or(path_token);
+    if path_part.is_empty() || path_part == "/" {
+        return None;
+    }
+    let decoded = url_path_decode(path_part);
+    if decoded.contains('\0') {
+        return None;
+    }
+
+    let exact_path = dashboard_url_path_to_fs_path(&decoded);
+    if source_viewer_file_candidate(&exact_path) {
+        return Some(DashboardSourceRequest {
+            path: exact_path,
+            line: None,
+        });
+    }
+
+    let (without_line, line) = split_source_line_suffix(&decoded)?;
+    let source_path = dashboard_url_path_to_fs_path(without_line);
+    if source_viewer_file_candidate(&source_path) {
+        return Some(DashboardSourceRequest {
+            path: source_path,
+            line: Some(line),
+        });
+    }
+    None
+}
+
+fn dashboard_url_path_to_fs_path(decoded: &str) -> PathBuf {
+    #[cfg(windows)]
+    {
+        if let Some(rest) = decoded.strip_prefix('/') {
+            if looks_like_windows_drive_path(rest) {
+                return PathBuf::from(rest);
+            }
+        }
+    }
+    PathBuf::from(decoded)
+}
+
+#[cfg(windows)]
+fn looks_like_windows_drive_path(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() >= 3
+        && bytes[1] == b':'
+        && (bytes[2] == b'/' || bytes[2] == b'\\')
+        && bytes[0].is_ascii_alphabetic()
+}
+
+fn source_viewer_file_candidate(path: &Path) -> bool {
+    path.is_absolute()
+        && std::fs::metadata(path)
+            .map(|metadata| metadata.is_file())
+            .unwrap_or(false)
+}
+
+fn split_source_line_suffix(raw: &str) -> Option<(&str, usize)> {
+    let (path, line_raw) = raw.rsplit_once(':')?;
+    if path.is_empty() || line_raw.is_empty() || !line_raw.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let line = line_raw.parse::<usize>().ok()?;
+    if line == 0 {
+        return None;
+    }
+    Some((path, line))
+}
+
+fn dashboard_local_file_response(request_line: &str) -> Option<DashboardLocalFileResponse> {
+    let request = dashboard_source_request_from_line(request_line)?;
+    if let Some(content_type) = dashboard_image_content_type(&request.path) {
+        Some(render_dashboard_image_file_response(request, content_type))
+    } else {
+        let (status, body) = render_dashboard_source_viewer_response(request);
+        Some(DashboardLocalFileResponse::Html { status, body })
+    }
+}
+
+#[cfg(test)]
+fn dashboard_source_viewer_response(request_line: &str) -> Option<(&'static str, String)> {
+    let request = dashboard_source_request_from_line(request_line)?;
+    Some(render_dashboard_source_viewer_response(request))
+}
+
+fn dashboard_image_content_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" | "jfif" | "pjpeg" | "pjp" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "avif" => Some("image/avif"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        _ => None,
+    }
+}
+
+fn render_dashboard_image_file_response(
+    request: DashboardSourceRequest,
+    content_type: &'static str,
+) -> DashboardLocalFileResponse {
+    let display_path = std::fs::canonicalize(&request.path).unwrap_or(request.path.clone());
+    let display_path_str = display_path.to_string_lossy().to_string();
+    let metadata = match std::fs::metadata(&display_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return DashboardLocalFileResponse::Html {
+                status: "404 Not Found",
+                body: render_dashboard_source_error_html(
+                    &display_path_str,
+                    "Not a file",
+                    "The requested path is not a regular file.",
+                ),
+            }
+        }
+        Err(err) => {
+            return DashboardLocalFileResponse::Html {
+                status: "404 Not Found",
+                body: render_dashboard_source_error_html(
+                    &display_path_str,
+                    "File not found",
+                    &format!("Could not read file metadata: {err}"),
+                ),
+            }
+        }
+    };
+
+    if metadata.len() > DASHBOARD_IMAGE_MAX_BYTES {
+        return DashboardLocalFileResponse::Html {
+            status: "413 Payload Too Large",
+            body: render_dashboard_source_error_html(
+                &display_path_str,
+                "Image too large",
+                &format!(
+                    "Image preview is limited to {} bytes; this file is {} bytes.",
+                    DASHBOARD_IMAGE_MAX_BYTES,
+                    metadata.len()
+                ),
+            ),
+        };
+    }
+
+    match std::fs::read(&display_path) {
+        Ok(bytes) => DashboardLocalFileResponse::Bytes {
+            status: "200 OK",
+            content_type,
+            bytes,
+        },
+        Err(err) => DashboardLocalFileResponse::Html {
+            status: "500 Internal Server Error",
+            body: render_dashboard_source_error_html(
+                &display_path_str,
+                "Read failed",
+                &format!("Could not read the file: {err}"),
+            ),
+        },
+    }
+}
+
+fn render_dashboard_source_viewer_response(
+    request: DashboardSourceRequest,
+) -> (&'static str, String) {
+    let display_path = std::fs::canonicalize(&request.path).unwrap_or(request.path.clone());
+    let display_path_str = display_path.to_string_lossy().to_string();
+    let metadata = match std::fs::metadata(&display_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return (
+                "404 Not Found",
+                render_dashboard_source_error_html(
+                    &display_path_str,
+                    "Not a file",
+                    "The requested path is not a regular file.",
+                ),
+            )
+        }
+        Err(err) => {
+            return (
+                "404 Not Found",
+                render_dashboard_source_error_html(
+                    &display_path_str,
+                    "File not found",
+                    &format!("Could not read file metadata: {err}"),
+                ),
+            )
+        }
+    };
+
+    if metadata.len() > SOURCE_VIEWER_MAX_BYTES {
+        return (
+            "413 Payload Too Large",
+            render_dashboard_source_error_html(
+                &display_path_str,
+                "File too large",
+                &format!(
+                    "Source viewer is limited to {} bytes; this file is {} bytes.",
+                    SOURCE_VIEWER_MAX_BYTES,
+                    metadata.len()
+                ),
+            ),
+        );
+    }
+
+    let bytes = match std::fs::read(&display_path) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (
+                "500 Internal Server Error",
+                render_dashboard_source_error_html(
+                    &display_path_str,
+                    "Read failed",
+                    &format!("Could not read the file: {err}"),
+                ),
+            )
+        }
+    };
+
+    if bytes.contains(&0) {
+        return (
+            "415 Unsupported Media Type",
+            render_dashboard_source_error_html(
+                &display_path_str,
+                "Binary file",
+                "The requested file appears to be binary and cannot be rendered as source.",
+            ),
+        );
+    }
+
+    let text = String::from_utf8_lossy(&bytes);
+    let language = source_viewer_language(&display_path);
+    use base64::Engine as _;
+    let content_b64 = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
+    (
+        "200 OK",
+        render_dashboard_source_viewer_html(
+            &display_path_str,
+            request.line,
+            language,
+            &content_b64,
+            bytes.len(),
+        ),
+    )
+}
+
+fn source_viewer_language(path: &Path) -> &'static str {
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match file_name.as_str() {
+        "cargo.toml" => return "toml",
+        "makefile" | "dockerfile" => return "shell",
+        _ => {}
+    }
+
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "rs" => "rust",
+        "js" | "jsx" | "mjs" | "cjs" => "javascript",
+        "ts" | "tsx" => "typescript",
+        "py" => "python",
+        "rb" => "ruby",
+        "go" => "go",
+        "java" => "java",
+        "c" | "h" => "c",
+        "cc" | "cpp" | "cxx" | "hpp" => "cpp",
+        "cs" => "csharp",
+        "swift" => "swift",
+        "kt" | "kts" => "kotlin",
+        "php" => "php",
+        "sh" | "bash" | "zsh" | "fish" | "ps1" => "shell",
+        "json" | "jsonl" => "json",
+        "toml" => "toml",
+        "yaml" | "yml" => "yaml",
+        "md" | "markdown" => "markdown",
+        "css" | "scss" | "sass" => "css",
+        "html" | "htm" => "html",
+        "xml" => "xml",
+        "sql" => "sql",
+        _ => "",
+    }
+}
+
+fn html_escape(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for ch in value.chars() {
+        match ch {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(ch),
+        }
+    }
+    out
+}
+
+fn render_dashboard_source_error_html(path: &str, title: &str, message: &str) -> String {
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>");
+    html.push_str(&html_escape(title));
+    html.push_str("</title><style>");
+    html.push_str(SOURCE_VIEWER_BASE_CSS);
+    html.push_str(
+        "</style></head><body><header><div class=\"source-kicker\">Intendant source</div><h1>",
+    );
+    html.push_str(&html_escape(title));
+    html.push_str("</h1><div class=\"source-path\">");
+    html.push_str(&html_escape(path));
+    html.push_str("</div></header><main class=\"source-error\"><p>");
+    html.push_str(&html_escape(message));
+    html.push_str("</p><a href=\"/\">Dashboard</a></main></body></html>");
+    html
+}
+
+fn render_dashboard_source_viewer_html(
+    path: &str,
+    line: Option<usize>,
+    language: &str,
+    content_b64: &str,
+    byte_len: usize,
+) -> String {
+    let file_name = Path::new(path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(path);
+    let title = match line {
+        Some(line) => format!("{file_name}:{line}"),
+        None => file_name.to_string(),
+    };
+    let data_json = serde_json::json!({
+        "path": path,
+        "line": line,
+        "language": language,
+        "bytes": byte_len,
+        "content_b64": content_b64,
+    })
+    .to_string()
+    .replace("</", "<\\/");
+
+    let mut html = String::new();
+    html.push_str("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"><title>");
+    html.push_str(&html_escape(&title));
+    html.push_str("</title><style>");
+    html.push_str(SOURCE_VIEWER_BASE_CSS);
+    html.push_str(SOURCE_VIEWER_CODE_CSS);
+    html.push_str("</style></head><body><header><div class=\"source-topline\"><div><div class=\"source-kicker\">Intendant source</div><h1 title=\"");
+    html.push_str(&html_escape(path));
+    html.push_str("\">");
+    html.push_str(&html_escape(&title));
+    html.push_str("</h1></div><a class=\"source-dashboard\" href=\"/\">Dashboard</a></div><div class=\"source-path\">");
+    html.push_str(&html_escape(path));
+    html.push_str("</div><div class=\"source-meta\"><span>");
+    if language.is_empty() {
+        html.push_str("text");
+    } else {
+        html.push_str(&html_escape(language));
+    }
+    html.push_str("</span><span id=\"source-line-count\">loading</span><span>");
+    html.push_str(&byte_len.to_string());
+    html.push_str(" bytes</span></div></header><main><pre id=\"source-code\" class=\"source-code\" aria-label=\"source file\"></pre></main><script>const SOURCE_DATA = ");
+    html.push_str(&data_json);
+    html.push_str(";</script><script>");
+    html.push_str(SOURCE_VIEWER_JS);
+    html.push_str("</script></body></html>");
+    html
+}
+
+const SOURCE_VIEWER_BASE_CSS: &str = r#"
+:root {
+  color-scheme: dark;
+  --base: #1e1e2e;
+  --mantle: #181825;
+  --crust: #11111b;
+  --surface0: #313244;
+  --surface1: #45475a;
+  --overlay0: #6c7086;
+  --subtext0: #a6adc8;
+  --text: #cdd6f4;
+  --blue: #89b4fa;
+  --sapphire: #74c7ec;
+  --green: #a6e3a1;
+  --yellow: #f9e2af;
+  --peach: #fab387;
+  --red: #f38ba8;
+  --mauve: #cba6f7;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  min-height: 100vh;
+  color: var(--text);
+  background: var(--base);
+  font-family: var(--font-sans);
+}
+header {
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  padding: 14px 18px 12px;
+  background: color-mix(in srgb, var(--mantle) 94%, transparent);
+  border-bottom: 1px solid var(--surface0);
+  backdrop-filter: blur(10px);
+}
+.source-topline {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+}
+.source-kicker {
+  color: var(--subtext0);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+h1 {
+  margin: 2px 0 0;
+  font-size: 18px;
+  line-height: 1.25;
+  font-weight: 700;
+  word-break: break-word;
+}
+.source-dashboard {
+  flex: 0 0 auto;
+  color: var(--crust);
+  background: var(--blue);
+  border: 0;
+  border-radius: 5px;
+  padding: 6px 10px;
+  font-size: 12px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.source-path {
+  margin-top: 8px;
+  color: var(--subtext0);
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+.source-meta {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 9px;
+}
+.source-meta span {
+  color: var(--subtext0);
+  border: 1px solid var(--surface0);
+  border-radius: 4px;
+  padding: 2px 7px;
+  font-family: var(--font-mono);
+  font-size: 11px;
+}
+.source-error {
+  max-width: 860px;
+  margin: 48px auto;
+  padding: 0 18px;
+  color: var(--text);
+}
+.source-error p {
+  margin: 0 0 14px;
+  color: var(--subtext0);
+  line-height: 1.5;
+}
+.source-error a {
+  color: var(--sapphire);
+}
+"#;
+
+const SOURCE_VIEWER_CODE_CSS: &str = r#"
+main {
+  overflow-x: auto;
+}
+.source-code {
+  margin: 0;
+  min-width: max-content;
+  padding: 10px 0 28px;
+  font-family: var(--font-mono);
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 2;
+}
+.source-line {
+  display: grid;
+  grid-template-columns: 72px minmax(max-content, 1fr);
+  min-height: 1.55em;
+  scroll-margin-top: 110px;
+}
+.source-line:hover {
+  background: rgba(69, 71, 90, 0.28);
+}
+.source-line.is-target {
+  background: rgba(250, 179, 135, 0.16);
+  box-shadow: inset 3px 0 0 var(--peach);
+}
+.line-no {
+  user-select: none;
+  padding: 0 12px 0 18px;
+  color: var(--overlay0);
+  text-align: right;
+  text-decoration: none;
+}
+.source-line:hover .line-no,
+.source-line.is-target .line-no {
+  color: var(--peach);
+}
+.line-code {
+  display: block;
+  padding-right: 24px;
+  color: var(--text);
+  white-space: pre;
+}
+.syntax-comment { color: var(--overlay0); }
+.syntax-string { color: var(--green); }
+.syntax-number { color: var(--peach); }
+.syntax-keyword { color: var(--mauve); font-weight: 600; }
+.syntax-type { color: var(--yellow); }
+.syntax-fn { color: var(--blue); }
+.syntax-punct { color: var(--subtext0); }
+.syntax-op { color: var(--red); }
+.syntax-var { color: var(--sapphire); }
+.syntax-tag { color: var(--blue); }
+.syntax-attr { color: var(--yellow); }
+.syntax-md-heading { color: var(--mauve); font-weight: 700; }
+.syntax-md-code { color: var(--peach); }
+"#;
+
+const SOURCE_VIEWER_JS: &str = r##"
+(function () {
+  const data = SOURCE_DATA || {};
+  const bytes = Uint8Array.from(atob(data.content_b64 || ''), ch => ch.charCodeAt(0));
+  const text = new TextDecoder('utf-8').decode(bytes).replace(/\r\n?/g, '\n');
+  const lines = text.length ? (text.endsWith('\n') ? text.slice(0, -1).split('\n') : text.split('\n')) : [''];
+  const codeEl = document.getElementById('source-code');
+  const countEl = document.getElementById('source-line-count');
+  const language = String(data.language || '');
+  const keywords = new Set(('as async await break case catch class const continue default defer delete do dyn else enum export extends extern false finally fn for from func function if impl import in interface let loop match mod move mut new nil null package priv pub ref return self Self static struct super switch this throw trait true try type typeof undefined unsafe use var where while yield').split(/\s+/));
+
+  function escapeHtml(value) {
+    return String(value).replace(/[&<>"']/g, ch => ({
+      '&': '&amp;',
+      '<': '&lt;',
+      '>': '&gt;',
+      '"': '&quot;',
+      "'": '&#39;'
+    })[ch]);
+  }
+
+  function span(cls, value) {
+    return '<span class="' + cls + '">' + escapeHtml(value) + '</span>';
+  }
+
+  function highlightMarkdown(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/^(\s{0,3}#{1,6})(\s.*)?$/, '<span class="syntax-md-heading">$1</span>$2');
+    html = html.replace(/(`[^`]+`)/g, '<span class="syntax-md-code">$1</span>');
+    html = html.replace(/(\*\*[^*]+\*\*)/g, '<span class="syntax-keyword">$1</span>');
+    return html;
+  }
+
+  function highlightJsonLike(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/(&quot;(?:\\.|[^&])*?&quot;)(\s*:)/g, '<span class="syntax-attr">$1</span>$2');
+    html = html.replace(/(:\s*)(&quot;(?:\\.|[^&])*?&quot;)/g, '$1<span class="syntax-string">$2</span>');
+    html = html.replace(/\b(true|false|null)\b/g, '<span class="syntax-keyword">$1</span>');
+    html = html.replace(/\b(-?\d+(?:\.\d+)?)\b/g, '<span class="syntax-number">$1</span>');
+    return html;
+  }
+
+  function highlightMarkup(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/(&lt;\/?)([A-Za-z0-9:_-]+)/g, '$1<span class="syntax-tag">$2</span>');
+    html = html.replace(/\b([A-Za-z_:][-A-Za-z0-9_:.]*)(=)/g, '<span class="syntax-attr">$1</span>$2');
+    html = html.replace(/(&quot;.*?&quot;|&#39;.*?&#39;)/g, '<span class="syntax-string">$1</span>');
+    return html;
+  }
+
+  function highlightCss(src) {
+    let html = escapeHtml(src);
+    html = html.replace(/(\/\*.*?\*\/)/g, '<span class="syntax-comment">$1</span>');
+    html = html.replace(/([.#]?[A-Za-z_-][A-Za-z0-9_-]*)(\s*[:{])/g, '<span class="syntax-tag">$1</span>$2');
+    html = html.replace(/\b(-?\d+(?:\.\d+)?(?:px|rem|em|%|vh|vw)?)\b/g, '<span class="syntax-number">$1</span>');
+    return html;
+  }
+
+  function highlightCode(src) {
+    let html = '';
+    let i = 0;
+    const hashComment = ['python', 'ruby', 'shell', 'toml', 'yaml'].includes(language);
+    const sqlComment = language === 'sql';
+    while (i < src.length) {
+      const ch = src[i];
+      const next = src[i + 1] || '';
+      if (hashComment && ch === '#') {
+        html += span('syntax-comment', src.slice(i));
+        break;
+      }
+      if (sqlComment && ch === '-' && next === '-') {
+        html += span('syntax-comment', src.slice(i));
+        break;
+      }
+      if (ch === '/' && next === '/') {
+        html += span('syntax-comment', src.slice(i));
+        break;
+      }
+      if (ch === '/' && next === '*') {
+        const end = src.indexOf('*/', i + 2);
+        const stop = end === -1 ? src.length : end + 2;
+        html += span('syntax-comment', src.slice(i, stop));
+        i = stop;
+        continue;
+      }
+      if (ch === '"' || ch === "'" || ch === '`') {
+        const quote = ch;
+        let j = i + 1;
+        while (j < src.length) {
+          if (src[j] === '\\') {
+            j += 2;
+            continue;
+          }
+          if (src[j] === quote) {
+            j++;
+            break;
+          }
+          j++;
+        }
+        html += span('syntax-string', src.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (/[0-9]/.test(ch) && (i === 0 || !/[A-Za-z0-9_]/.test(src[i - 1] || ''))) {
+        let j = i + 1;
+        while (j < src.length && /[A-Za-z0-9_.]/.test(src[j])) j++;
+        html += span('syntax-number', src.slice(i, j));
+        i = j;
+        continue;
+      }
+      if (/[A-Za-z_$]/.test(ch)) {
+        let j = i + 1;
+        while (j < src.length && /[A-Za-z0-9_$]/.test(src[j])) j++;
+        const token = src.slice(i, j);
+        const rest = src.slice(j).trimStart();
+        if (keywords.has(token)) {
+          html += span('syntax-keyword', token);
+        } else if (/^[A-Z][A-Za-z0-9_$]*$/.test(token)) {
+          html += span('syntax-type', token);
+        } else if (rest.startsWith('(')) {
+          html += span('syntax-fn', token);
+        } else {
+          html += escapeHtml(token);
+        }
+        i = j;
+        continue;
+      }
+      if ('{}[]().,;:'.includes(ch)) {
+        html += span('syntax-punct', ch);
+      } else if ('+-=*/!&|<>?%'.includes(ch)) {
+        html += span('syntax-op', ch);
+      } else {
+        html += escapeHtml(ch);
+      }
+      i++;
+    }
+    return html;
+  }
+
+  function highlightLine(src) {
+    if (language === 'markdown') return highlightMarkdown(src);
+    if (language === 'json') return highlightJsonLike(src);
+    if (language === 'html' || language === 'xml') return highlightMarkup(src);
+    if (language === 'css') return highlightCss(src);
+    return highlightCode(src);
+  }
+
+  function targetFromHash() {
+    const match = location.hash.match(/^#L?(\d+)$/i);
+    return match ? Number(match[1]) : 0;
+  }
+
+  function setTarget(line, scroll) {
+    document.querySelector('.source-line.is-target')?.classList.remove('is-target');
+    if (!line || !Number.isFinite(line)) return;
+    const el = document.getElementById('L' + line);
+    if (!el) return;
+    el.classList.add('is-target');
+    if (scroll) requestAnimationFrame(() => el.scrollIntoView({ block: 'center' }));
+  }
+
+  codeEl.innerHTML = lines.map((line, index) => {
+    const number = index + 1;
+    return '<div class="source-line" id="L' + number + '" data-line="' + number + '">' +
+      '<a class="line-no" href="#L' + number + '">' + number + '</a>' +
+      '<code class="line-code">' + (highlightLine(line) || ' ') + '</code>' +
+      '</div>';
+  }).join('');
+  countEl.textContent = lines.length + (lines.length === 1 ? ' line' : ' lines');
+  setTarget(Number(data.line || 0) || targetFromHash(), true);
+  window.addEventListener('hashchange', () => setTarget(targetFromHash(), true));
+})();
+"##;
+
+fn expand_dashboard_fs_path(raw: &str) -> Result<PathBuf, String> {
+    let trimmed = raw.trim();
+    let path = if trimmed.is_empty() || trimmed == "~" {
+        dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?
+    } else if let Some(rest) = trimmed.strip_prefix("~/") {
+        dirs::home_dir()
+            .ok_or_else(|| "could not resolve home directory".to_string())?
+            .join(rest)
+    } else {
+        PathBuf::from(trimmed)
+    };
+    if !path.is_absolute() {
+        return Err(format!(
+            "path must be absolute or start with ~/ (got {})",
+            trimmed
+        ));
+    }
+    Ok(path)
+}
+
+fn nearest_existing_parent(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
+fn inspect_dashboard_fs_path(raw: &str) -> Result<FsPathStatus, String> {
+    let path = expand_dashboard_fs_path(raw)?;
+    let metadata = std::fs::metadata(&path).ok();
+    let exists = metadata.is_some();
+    let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+    let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
+    let readable = if is_dir {
+        std::fs::read_dir(&path).is_ok()
+    } else if is_file {
+        std::fs::File::open(&path).is_ok()
+    } else {
+        false
+    };
+    let display_path = if exists {
+        std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone())
+    } else {
+        path.clone()
+    };
+    let parent = path.parent().map(|p| p.to_string_lossy().to_string());
+    let parent_metadata = path.parent().and_then(|p| std::fs::metadata(p).ok());
+    let nearest = nearest_existing_parent(&path);
+    let nearest_is_dir = nearest
+        .as_ref()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| m.is_dir())
+        .unwrap_or(false);
+    Ok(FsPathStatus {
+        input: raw.trim().to_string(),
+        path: display_path.to_string_lossy().to_string(),
+        exists,
+        is_dir,
+        is_file,
+        readable,
+        parent,
+        parent_exists: parent_metadata.is_some(),
+        parent_is_dir: parent_metadata.map(|m| m.is_dir()).unwrap_or(false),
+        nearest_existing_parent: nearest.map(|p| p.to_string_lossy().to_string()),
+        can_create: !exists && nearest_is_dir,
+    })
+}
+
+fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, String> {
+    let path = expand_dashboard_fs_path(raw)?;
+    let canonical = std::fs::canonicalize(&path)
+        .map_err(|e| format!("{} is not accessible: {}", path.display(), e))?;
+    if !canonical.is_dir() {
+        return Err(format!("{} is not a directory", canonical.display()));
+    }
+    let read_dir = std::fs::read_dir(&canonical)
+        .map_err(|e| format!("could not read {}: {}", canonical.display(), e))?;
+    let mut entries = Vec::new();
+    for entry in read_dir.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        let file_type = entry.file_type().ok();
+        let metadata = entry.metadata().ok();
+        let is_dir = metadata.as_ref().map(|m| m.is_dir()).unwrap_or(false);
+        let is_file = metadata.as_ref().map(|m| m.is_file()).unwrap_or(false);
+        entries.push(FsListEntry {
+            hidden: name.starts_with('.'),
+            name,
+            path: entry.path().to_string_lossy().to_string(),
+            is_dir,
+            is_file,
+            is_symlink: file_type.map(|t| t.is_symlink()).unwrap_or(false),
+        });
+    }
+    entries.sort_by(|a, b| {
+        b.is_dir
+            .cmp(&a.is_dir)
+            .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
+    });
+    let truncated = entries.len() > FS_LIST_LIMIT;
+    entries.truncate(FS_LIST_LIMIT);
+    let parent = canonical.parent().map(|p| p.to_string_lossy().to_string());
+    Ok(serde_json::json!({
+        "path": canonical.to_string_lossy().to_string(),
+        "parent": parent,
+        "home": dirs::home_dir().map(|p| p.to_string_lossy().to_string()),
+        "entries": entries,
+        "truncated": truncated,
+    }))
+}
+
+fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, String)> {
+    let path = expand_dashboard_fs_path(raw).map_err(|e| ("400 Bad Request".to_string(), e))?;
+    if path.exists() {
+        if path.is_dir() {
+            let display = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
+            return Ok(serde_json::json!({
+                "ok": true,
+                "created": false,
+                "already_exists": true,
+                "path": display.to_string_lossy().to_string(),
+                "notice": "Directory already exists"
+            }));
+        }
+        return Err((
+            "409 Conflict".to_string(),
+            format!("{} already exists and is not a directory", path.display()),
+        ));
+    }
+    std::fs::create_dir_all(&path).map_err(|e| {
+        (
+            "500 Internal Server Error".to_string(),
+            format!("failed to create {}: {}", path.display(), e),
+        )
+    })?;
+    let display = std::fs::canonicalize(&path).unwrap_or(path);
+    Ok(serde_json::json!({
+        "ok": true,
+        "created": true,
+        "already_exists": false,
+        "path": display.to_string_lossy().to_string()
+    }))
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -2350,7 +10514,7 @@ async fn handle_history_rollback(
         match (target_idx, head_idx) {
             (Some(t), Some(h)) => {
                 // Compute turns to drop from the head turn-count sum
-                // between (t, h]. This matches Codex's `turnsToRollback`
+                // between (t, h]. This matches Codex's `numTurns`
                 // semantics: the number of turns we want to undo.
                 let turns_to_drop: u32 = if t < h {
                     hist.rounds[t + 1..=h]
@@ -2489,7 +10653,7 @@ async fn handle_history_prune(
 /// Returns a JSON result with `ok` and `bytes_freed`.
 fn delete_session_data(session_id: &str, target: &str) -> String {
     // Path traversal protection
-    if session_id.contains("..") || session_id.contains('/') || session_id.contains('\\') {
+    if !session_lookup_id_is_safe(session_id) {
         return serde_json::json!({"ok": false, "error": "invalid session id"}).to_string();
     }
 
@@ -2501,19 +10665,29 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
     let dir_byte_size = |path: &std::path::Path| -> u64 {
         let mut total = 0u64;
         if path.is_dir() {
-            fn walk(dir: &std::path::Path, total: &mut u64) {
+            // On-disk allocation (512-byte blocks) with hardlinked inodes
+            // counted once, matching `du` — so bytes_freed reflects the space
+            // actually reclaimed, not apparent size.
+            fn walk(dir: &std::path::Path, total: &mut u64, seen: &mut HashSet<(u64, u64)>) {
                 if let Ok(entries) = std::fs::read_dir(dir) {
                     for e in entries.flatten() {
                         let p = e.path();
                         if p.is_dir() {
-                            walk(&p, total);
+                            walk(&p, total, seen);
                         } else if let Ok(m) = p.metadata() {
-                            *total += m.len();
+                            if crate::platform::metadata_is_multiply_linked(&m)
+                                && !seen.insert(crate::platform::metadata_dev_ino(&m))
+                            {
+                                continue;
+                            }
+                            *total =
+                                total.saturating_add(crate::platform::metadata_on_disk_bytes(&m));
                         }
                     }
                 }
             }
-            walk(path, &mut total);
+            let mut seen: HashSet<(u64, u64)> = HashSet::new();
+            walk(path, &mut total, &mut seen);
         }
         total
     };
@@ -2521,10 +10695,28 @@ fn delete_session_data(session_id: &str, target: &str) -> String {
     match target {
         "session" => {
             let bytes = dir_byte_size(&dir);
+            let external_delete_target = external_delete_target_for_intendant_session_dir(&dir);
             match std::fs::remove_dir_all(&dir) {
                 Ok(_) => {
-                    serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes})
-                        .to_string()
+                    let mut body =
+                        serde_json::json!({"ok": true, "deleted": "session", "bytes_freed": bytes});
+                    if let Some((source, external_id)) = external_delete_target {
+                        match mark_external_session_deleted(
+                            &crate::platform::home_dir(),
+                            &source,
+                            &external_id,
+                        ) {
+                            Ok(()) => {
+                                body["external_session_hidden"] = serde_json::json!(true);
+                            }
+                            Err(e) => {
+                                body["external_session_hidden"] = serde_json::json!(false);
+                                body["external_session_hide_error"] = serde_json::json!(e);
+                            }
+                        }
+                    }
+                    invalidate_session_list_response_cache();
+                    body.to_string()
                 }
                 Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
             }
@@ -2607,6 +10799,8 @@ pub struct SettingsPayload {
     pub external_agent: Option<String>,
     // Codex runtime config (persisted to `[agent.codex]`). Mirrored here so
     // the Activity → Control sub-tab can load in one fetch.
+    #[serde(default)]
+    pub codex_command: Option<String>,
     #[serde(default = "default_settings_codex_sandbox")]
     pub codex_sandbox: String,
     #[serde(default = "default_settings_codex_approval_policy")]
@@ -2615,12 +10809,27 @@ pub struct SettingsPayload {
     pub codex_model: Option<String>,
     #[serde(default)]
     pub codex_reasoning_effort: Option<String>,
+    // Empty / omitted = inherit Codex config; "standard" sends an explicit
+    // normal/clear override for Intendant-managed Codex sessions.
+    #[serde(default)]
+    pub codex_service_tier: Option<String>,
     #[serde(default)]
     pub codex_web_search: bool,
     #[serde(default)]
     pub codex_network_access: bool,
     #[serde(default)]
     pub codex_writable_roots: Vec<String>,
+    #[serde(default, alias = "codex_context_recovery")]
+    pub codex_managed_context: Option<String>,
+    #[serde(default)]
+    pub codex_context_archive: Option<String>,
+    // Other external-agent executable commands. The Settings pane does not
+    // edit these today, but the New Session pane uses them as per-launch
+    // command/path defaults.
+    #[serde(default)]
+    pub claude_command: Option<String>,
+    #[serde(default)]
+    pub gemini_command: Option<String>,
     // Gemini runtime config (persisted to `[agent.gemini_cli]`). Mirrors
     // the Codex fields above for the Activity → Control sub-tab.
     #[serde(default)]
@@ -2637,9 +10846,38 @@ pub struct SettingsPayload {
     pub gemini_include_directories: Vec<String>,
     #[serde(default)]
     pub gemini_debug: bool,
+    // Per-category approval rules (persisted to `[approval]`). Exposed here
+    // for the dashboard's "Approval rules" controls to populate the selects.
+    // Live edits flow through the `set_approval_rule` ControlMsg, not through
+    // `apply_settings_payload`, so these are display/read-only in the payload.
+    // Values: "auto" | "ask" | "deny".
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_file_read: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_file_write: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_file_delete: String,
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_command_exec: String,
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_network: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_destructive: String,
+    #[serde(default = "default_settings_approval_ask")]
+    pub approval_display_control: String,
+    #[serde(default = "default_settings_approval_auto")]
+    pub approval_tool_call: String,
     // Env var overrides (read-only, shown in UI)
     #[serde(default)]
     pub env_overrides: std::collections::HashMap<String, String>,
+}
+
+fn default_settings_approval_auto() -> String {
+    crate::autonomy::ApprovalRule::Auto.as_str().to_string()
+}
+
+fn default_settings_approval_ask() -> String {
+    crate::autonomy::ApprovalRule::Ask.as_str().to_string()
 }
 
 fn default_settings_codex_sandbox() -> String {
@@ -2648,6 +10886,19 @@ fn default_settings_codex_sandbox() -> String {
 
 fn default_settings_codex_approval_policy() -> String {
     crate::project::normalize_approval_policy("")
+}
+
+fn normalize_settings_codex_command(input: Option<&str>) -> String {
+    normalize_settings_agent_command(input, "codex")
+}
+
+fn normalize_settings_agent_command(input: Option<&str>, fallback: &str) -> String {
+    let trimmed = input.map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        fallback.to_string()
+    } else {
+        trimmed.to_string()
+    }
 }
 
 fn default_settings_gemini_approval_mode() -> String {
@@ -2688,6 +10939,7 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         live_audio_enabled: config.live_audio.enabled,
         live_audio_timeout_secs: config.live_audio.default_timeout_secs,
         external_agent: config.agent.default_backend.clone(),
+        codex_command: Some(config.agent.codex.command.clone()),
         codex_sandbox: crate::project::normalize_sandbox_mode(&config.agent.codex.sandbox),
         codex_approval_policy: crate::project::normalize_approval_policy(
             &config.agent.codex.approval_policy,
@@ -2696,9 +10948,20 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         codex_reasoning_effort: crate::project::normalize_reasoning_effort(
             config.agent.codex.reasoning_effort.as_deref(),
         ),
+        codex_service_tier: crate::project::normalize_codex_service_tier(
+            config.agent.codex.service_tier.as_deref(),
+        ),
         codex_web_search: config.agent.codex.web_search,
         codex_network_access: config.agent.codex.network_access,
         codex_writable_roots: config.agent.codex.writable_roots.clone(),
+        codex_managed_context: Some(crate::project::normalize_codex_managed_context(
+            &config.agent.codex.managed_context,
+        )),
+        codex_context_archive: Some(crate::project::normalize_codex_context_archive(
+            &config.agent.codex.context_archive,
+        )),
+        claude_command: Some(config.agent.claude_code.command.clone()),
+        gemini_command: Some(config.agent.gemini_cli.command.clone()),
         gemini_model: config.agent.gemini_cli.model.clone(),
         gemini_approval_mode: crate::project::normalize_gemini_approval_mode(
             &config.agent.gemini_cli.approval_mode,
@@ -2708,8 +10971,34 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         gemini_allowed_mcp_servers: config.agent.gemini_cli.allowed_mcp_servers.clone(),
         gemini_include_directories: config.agent.gemini_cli.include_directories.clone(),
         gemini_debug: config.agent.gemini_cli.debug,
+        approval_file_read: config.approval.file_read.as_str().to_string(),
+        approval_file_write: config.approval.file_write.as_str().to_string(),
+        approval_file_delete: config.approval.file_delete.as_str().to_string(),
+        approval_command_exec: config.approval.command_exec.as_str().to_string(),
+        approval_network: config.approval.network.as_str().to_string(),
+        approval_destructive: config.approval.destructive.as_str().to_string(),
+        approval_display_control: config.approval.display_control.as_str().to_string(),
+        approval_tool_call: config.approval.tool_call.as_str().to_string(),
         env_overrides,
     }
+}
+
+async fn settings_payload_with_runtime_overrides(
+    config: &crate::project::ProjectConfig,
+    runtime: &RuntimeSettingsState,
+) -> SettingsPayload {
+    let mut payload = settings_payload_from_config(config);
+    if let Some(presence_enabled) = runtime.presence_enabled {
+        payload.presence_enabled = presence_enabled;
+    }
+    if let Some(shared_external_agent) = &runtime.external_agent {
+        payload.external_agent = shared_external_agent
+            .read()
+            .await
+            .as_ref()
+            .map(|backend| backend.as_short_str().to_string());
+    }
+    payload
 }
 
 fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &SettingsPayload) {
@@ -2739,6 +11028,63 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
             .external_agent
             .as_ref()
             .and_then(|s| if s.is_empty() { None } else { Some(s.clone()) });
+    if payload.codex_command.is_some() {
+        config.agent.codex.command =
+            normalize_settings_codex_command(payload.codex_command.as_deref());
+    }
+    if payload.codex_service_tier.is_some() {
+        config.agent.codex.service_tier =
+            crate::project::normalize_codex_service_tier(payload.codex_service_tier.as_deref());
+    }
+    if let Some(mode) = payload.codex_managed_context.as_deref() {
+        config.agent.codex.managed_context = crate::project::normalize_codex_managed_context(mode);
+    }
+    if let Some(mode) = payload.codex_context_archive.as_deref() {
+        config.agent.codex.context_archive = crate::project::normalize_codex_context_archive(mode);
+    }
+    if payload.claude_command.is_some() {
+        config.agent.claude_code.command =
+            normalize_settings_agent_command(payload.claude_command.as_deref(), "claude");
+    }
+    if payload.gemini_command.is_some() {
+        config.agent.gemini_cli.command =
+            normalize_settings_agent_command(payload.gemini_command.as_deref(), "gemini");
+    }
+}
+
+fn settings_post_result(body_text: &str, project_root: Option<&Path>) -> (&'static str, String) {
+    let Some(root) = project_root else {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "No project root"}).to_string(),
+        );
+    };
+    let payload = match serde_json::from_str::<SettingsPayload>(body_text) {
+        Ok(payload) => payload,
+        Err(e) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": format!("Invalid settings: {}", e)}).to_string(),
+            );
+        }
+    };
+    let mut proj = match crate::project::Project::from_root(root.to_path_buf()) {
+        Ok(proj) => proj,
+        Err(e) => {
+            return (
+                "500 Internal Server Error",
+                serde_json::json!({"error": e.to_string()}).to_string(),
+            );
+        }
+    };
+    apply_settings_payload(&mut proj.config, &payload);
+    match proj.save_config() {
+        Ok(()) => ("200 OK", serde_json::json!({"ok": true}).to_string()),
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({"error": e.to_string()}).to_string(),
+        ),
+    }
 }
 
 /// Return JSON with boolean flags indicating which API keys are configured.
@@ -2895,9 +11241,73 @@ enum McpHttpOutcome {
     Accepted,
 }
 
+fn mcp_context_from_request_line(
+    request_line: &str,
+) -> (Option<String>, Option<bool>, Option<String>) {
+    let Some(path) = request_line.split_whitespace().nth(1) else {
+        return (None, None, None);
+    };
+    let Some((_, query)) = path.split_once('?') else {
+        return (None, None, None);
+    };
+    let mut session_id = None;
+    let mut managed_context = None;
+    let mut tool_profile = None;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        match key {
+            "session_id" | "session" | "intendant_session" => {
+                if !value.trim().is_empty() {
+                    session_id = Some(percent_decode_query_value(value));
+                }
+            }
+            "managed_context" => {
+                managed_context = Some(crate::project::codex_managed_context_enabled(value));
+            }
+            "tool_profile" | "tools" | "toolset" | "toolsets" => {
+                if !value.trim().is_empty() {
+                    tool_profile = Some(percent_decode_query_value(value));
+                }
+            }
+            _ => {}
+        }
+    }
+    (session_id, managed_context, tool_profile)
+}
+
+fn percent_decode_query_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (hex_value(bytes[i + 1]), hex_value(bytes[i + 2])) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
+}
+
 async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
+    session_id: Option<&str>,
+    codex_managed_context: Option<bool>,
+    tool_profile: Option<&str>,
 ) -> McpHttpOutcome {
     let request: McpHttpRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -2934,7 +11344,9 @@ async fn handle_mcp_http_request(
             // All notification methods: acknowledge and return 202.
             return McpHttpOutcome::Accepted;
         }
-        "tools/list" => Ok(server.list_tools_json()),
+        "tools/list" => Ok(server
+            .list_tools_json_for_session(session_id, codex_managed_context, tool_profile)
+            .await),
         "tools/call" => {
             let params = request.params.unwrap_or_default();
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -2942,7 +11354,10 @@ async fn handle_mcp_http_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
-            match server.call_tool_by_name(name, args).await {
+            match server
+                .call_tool_by_name_for_session(name, args, session_id, codex_managed_context)
+                .await
+            {
                 Ok(result) => Ok(serde_json::to_value(result).unwrap_or_else(|e| {
                     serde_json::json!({
                         "content": [{
@@ -3020,6 +11435,15 @@ pub fn spawn_web_gateway(
     // don't exercise the advertise path; production call sites in
     // main.rs build the requirements from the project config.
     local_card_auth: crate::peer::AuthRequirements,
+    // Native TLS for the dashboard. `Some(acceptor)` (built in main.rs
+    // from `[server.tls]` / `--tls`) makes the per-connection demux wrap
+    // any connection whose first bytes are a TLS ClientHello, serving the
+    // dashboard over HTTPS/WSS. `None` (the default) preserves the
+    // current plain-HTTP behavior. Either way the raw ICE-TCP (STUN-
+    // framed) demux branch is unaffected — TLS is distinguished by its
+    // `0x16` handshake-record first byte, which is disjoint from both the
+    // STUN length-prefix and HTTP method bytes.
+    tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
 
@@ -3031,7 +11455,16 @@ pub fn spawn_web_gateway(
     // address. Multiple URLs let one daemon advertise itself reachable
     // via several paths (LAN IP, Tailscale, host port-forward, etc.)
     // — the connecting peer probes them in order.
-    let advertise_urls = resolve_advertise_urls(listener.local_addr().ok(), &advertise_urls);
+    //
+    // TLS state drives the advertised scheme: when a TLS acceptor is
+    // present the dashboard is HTTPS/WSS-only (strict demux below), so
+    // auto-detected URLs must be `wss://`, not `ws://`, or peers handed a
+    // `ws://` URL would be refused.
+    let advertise_urls = resolve_advertise_urls(
+        listener.local_addr().ok(),
+        &advertise_urls,
+        tls_acceptor.is_some(),
+    );
     let agent_card = build_local_agent_card(advertise_urls, local_card_auth);
     let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
 
@@ -3180,12 +11613,22 @@ pub fn spawn_web_gateway(
     let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest status event (has autonomy, session_id, task).
     let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache standalone autonomy changes so reconnecting dashboards do not
+    // fall back to the stale autonomy value in the latest status event.
+    let last_autonomy_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     // Cache the latest external_agent_changed event so a refreshed
     // browser learns the current value without having to re-fetch
     // settings. Without this the dashboard dropdown snaps back to
     // "None (internal agent)" on every page refresh even though the
     // daemon still has the value in memory.
     let last_external_agent_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    // Cache all currently externally-attached sessions so refreshed browsers
+    // can rehydrate every open Activity window with the same compact
+    // transcript shown in the Sessions tab. This must be a set, not "last
+    // attached", because multiple Codex/Claude/Gemini session windows may be
+    // open at once.
+    let attached_external_sessions: Arc<Mutex<HashMap<String, String>>> =
+        Arc::new(Mutex::new(HashMap::new()));
     // Cache the latest user_display_granted event. The authoritative
     // state lives in AutonomyState.user_display_granted on the server,
     // but the dashboard only learns about it via the broadcast; without
@@ -3197,11 +11640,18 @@ pub fn spawn_web_gateway(
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
+    // Cache the most recent worktree inventory scan. Scanning can walk
+    // large worktree directories for disk-size accounting, so the
+    // dashboard explicitly triggers refreshes instead of doing it on
+    // every GET.
+    let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
         let status_cache = last_status_json.clone();
+        let autonomy_cache = last_autonomy_json.clone();
         let external_agent_cache = last_external_agent_json.clone();
+        let session_attached_cache = attached_external_sessions.clone();
         let user_display_cache = last_user_display_json.clone();
         let display_cache = display_ready_cache.clone();
         let mut usage_rx = broadcast_tx.subscribe();
@@ -3260,9 +11710,24 @@ pub fn spawn_web_gateway(
                                 *guard = Some(line.clone());
                             }
                         }
+                        if line.contains("\"event\":\"autonomy_changed\"") {
+                            if let Ok(mut guard) = autonomy_cache.lock() {
+                                *guard = Some(line.clone());
+                            }
+                        }
                         if line.contains("\"event\":\"external_agent_changed\"") {
                             if let Ok(mut guard) = external_agent_cache.lock() {
-                                *guard = Some(line);
+                                *guard = Some(line.clone());
+                            }
+                        }
+                        if line.contains("\"event\":\"session_attached\"") {
+                            if let Ok(mut guard) = session_attached_cache.lock() {
+                                update_external_attached_sessions_from_wire(&mut guard, &line);
+                            }
+                        }
+                        if line.contains("\"event\":\"session_ended\"") {
+                            if let Ok(mut guard) = session_attached_cache.lock() {
+                                update_external_attached_sessions_from_wire(&mut guard, &line);
                             }
                         }
                     }
@@ -3360,7 +11825,12 @@ pub fn spawn_web_gateway(
             .replace(
                 "/wasm-station/station_web_bg.wasm",
                 &format!("/wasm-station/station_web_bg.wasm?v={}", v),
-            ),
+            )
+            .replace(
+                "/three.module.min.js",
+                &format!("/three.module.min.js?v={}", v),
+            )
+            .replace("/icon-128.png", &format!("/icon-128.png?v={}", v)),
     );
 
     tokio::spawn(async move {
@@ -3398,7 +11868,9 @@ pub fn spawn_web_gateway(
             let last_usage_json = last_usage_json.clone();
             let last_live_usage_json = last_live_usage_json.clone();
             let last_status_json = last_status_json.clone();
+            let last_autonomy_json = last_autonomy_json.clone();
             let last_external_agent_json = last_external_agent_json.clone();
+            let attached_external_sessions = attached_external_sessions.clone();
             let last_user_display_json = last_user_display_json.clone();
             let display_ready_cache = display_ready_cache.clone();
             let web_tui_tx = web_tui_tx.clone();
@@ -3407,10 +11879,15 @@ pub fn spawn_web_gateway(
             let mcp_server = mcp_server.clone();
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
+            let worktree_inventory_cache = worktree_inventory_cache.clone();
+            // `TlsAcceptor` wraps an `Arc<ServerConfig>`, so cloning is cheap
+            // (one Arc bump). `None` when TLS is disabled.
+            let tls_acceptor = tls_acceptor.clone();
 
             tokio::spawn(async move {
                 // Snapshot session state at connection time
                 let session_snap = shared_session.read().await;
+                let daemon_session_id = session_snap.daemon_session_id.clone();
                 let query_ctx = session_snap.query_ctx.clone();
                 let frame_registry = session_snap.frame_registry.clone();
                 let session_log = session_snap.session_log.clone();
@@ -3419,24 +11896,44 @@ pub fn spawn_web_gateway(
                 let snapshot_dir = session_snap.snapshot_dir.clone();
                 let project_root_for_changes = session_snap.project_root_for_changes.clone();
                 let file_watcher = session_snap.file_watcher.clone();
+                let runtime_settings = session_snap.runtime_settings.clone();
                 drop(session_snap);
                 // Peek at the first bytes to detect (in order):
                 //  1. ICE-TCP STUN-framed traffic (RFC 4571 length prefix
                 //     followed by a STUN message whose magic cookie
-                //     0x2112A442 sits at payload offset 4 = peek offset 6)
-                //  2. WebSocket upgrade (HTTP header containing
+                //     0x2112A442 sits at payload offset 4 = peek offset 6).
+                //     First byte (length MSB) is 0x00 for STUN-sized frames.
+                //  2. TLS ClientHello (handshake record: first byte 0x16,
+                //     then version major 0x03) — only when a TLS acceptor
+                //     is configured. Wrapped in the rustls acceptor; the
+                //     decrypted stream then flows through the WS/HTTP paths
+                //     below exactly as a plain connection would.
+                //  3. WebSocket upgrade (HTTP header containing
                 //     "Upgrade: websocket")
-                //  3. Plain HTTP (everything else)
+                //  4. Plain HTTP (everything else)
                 //
-                // `peek()` does not consume the data, so both the
-                // WebSocket handshake and the HTTP parser still get the
-                // full request. Only the ICE-TCP branch actually reads
-                // (and consumes) the first RFC 4571 frame, after which
-                // the rest of the stream is handed to the WebRTC peer's
-                // reader task.
+                // Cases 3 and 4 are cleartext. When a TLS acceptor is
+                // configured the dashboard is HTTPS/WSS-only, so such
+                // cleartext connections are refused (see the strict-TLS
+                // rejection below) — only the TLS-wrapped path serves them.
+                // Case 1 (raw ICE-TCP for the WebRTC media tunnel) stays
+                // cleartext regardless: it returns above before that check.
+                //
+                // The three first-byte classes are mutually exclusive:
+                // STUN length-prefix MSB 0x00, TLS handshake 0x16, HTTP
+                // method ASCII letters (>= 0x41). So one peeked byte
+                // disambiguates raw ICE-TCP from TLS from cleartext HTTP.
+                //
+                // `peek()` does not consume the data, so the ICE-TCP, TLS,
+                // WebSocket, and HTTP branches all still get the full
+                // first segment. The ICE-TCP branch reads (and consumes)
+                // the first RFC 4571 frame and hands the rest to the
+                // WebRTC peer reader; the TLS branch lets the handshake
+                // consume the peeked ClientHello and re-reads the
+                // decrypted request head before dispatching.
                 let mut buf = [0u8; 2048];
-                let mut stream = stream;
-                let n = match stream.peek(&mut buf).await {
+                let mut raw_stream = stream;
+                let peeked = match raw_stream.peek(&mut buf).await {
                     Ok(n) if n > 0 => n,
                     _ => return,
                 };
@@ -3449,21 +11946,22 @@ pub fn spawn_web_gateway(
                 // length prefix. A valid HTTP request never starts with
                 // these bytes (method chars are ASCII >= 0x41).
                 let looks_like_stun_tcp =
-                    n >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
+                    peeked >= 22 && buf[2] < 2 && buf[6..10] == [0x21, 0x12, 0xA4, 0x42];
                 if looks_like_stun_tcp {
                     // Consume the first RFC 4571 frame from the stream
                     // (peek leaves it in the kernel buffer; we have to
                     // read it through to hand a clean stream to the peer
                     // reader task).
                     let first_frame =
-                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut stream).await {
+                        match crate::display::webrtc::read_rfc4571_frame_pub(&mut raw_stream).await
+                        {
                             Ok(f) => f,
                             Err(e) => {
                                 eprintln!("[web_gateway] ICE-TCP first-frame read failed: {e}");
                                 return;
                             }
                         };
-                    let remote_addr = match stream.peer_addr() {
+                    let remote_addr = match raw_stream.peer_addr() {
                         Ok(a) => a,
                         Err(_) => return,
                     };
@@ -3482,7 +11980,7 @@ pub fn spawn_web_gateway(
                     match crate::display::webrtc::parse_first_frame_ufrag(&first_frame) {
                         Some(ufrag) if tcp_peer_registry.contains_ufrag(&ufrag) => {
                             if let Err(e) = tcp_peer_registry
-                                .route_accepted(stream, first_frame, remote_addr)
+                                .route_accepted(raw_stream, first_frame, remote_addr)
                                 .await
                             {
                                 eprintln!(
@@ -3491,8 +11989,9 @@ pub fn spawn_web_gateway(
                             }
                         }
                         Some(ufrag) if tcp_relay_registry.contains_ufrag(&ufrag) => {
-                            if let Err(e) =
-                                tcp_relay_registry.route_accepted(stream, first_frame).await
+                            if let Err(e) = tcp_relay_registry
+                                .route_accepted(raw_stream, first_frame)
+                                .await
                             {
                                 eprintln!(
                                     "[web_gateway] ICE-TCP relay routing for ufrag={ufrag} from {remote_addr} failed: {e}"
@@ -3514,6 +12013,106 @@ pub fn spawn_web_gateway(
                     }
                     return;
                 }
+
+                // Connection is not raw ICE-TCP. It is one of: TLS
+                // (HTTPS/WSS), plain WebSocket, or plain HTTP. Convert the
+                // raw `TcpStream` into a unified, boxed `DemuxStream` that
+                // the WS/HTTP handling below operates through. The plain
+                // path boxes the TcpStream verbatim (the peeked bytes stay
+                // in the kernel buffer, unconsumed). The TLS path runs the
+                // rustls handshake — which consumes the peeked ClientHello
+                // — then re-reads the decrypted request head so the rest of
+                // the handler sees cleartext HTTP.
+                let is_tls = tls_acceptor.is_some()
+                    && crate::web_tls::looks_like_tls_client_hello(&buf[..peeked]);
+
+                // Strict TLS: when a TLS acceptor is configured the dashboard
+                // is HTTPS/WSS-only. A connection that reaches this point is
+                // neither raw ICE-TCP (handled and returned above — that path
+                // stays cleartext for the WebRTC media tunnel and must keep
+                // working) nor a TLS ClientHello, so it's a cleartext HTTP or
+                // WebSocket client dialing the secure port in the clear.
+                // Opportunistic TLS — quietly serving such a client over plain
+                // HTTP — would undercut the project's "no unencrypted traffic"
+                // guarantee, so we refuse it: emit a one-line HTTP 426 "Upgrade
+                // Required" hint (best effort; a raw WebSocket client may not
+                // parse it, but a browser hitting `http://` shows the operator
+                // why) and close. When TLS is off this branch is skipped and
+                // cleartext is served exactly as before.
+                if tls_acceptor.is_some() && !is_tls {
+                    use tokio::io::AsyncWriteExt;
+                    let peer = raw_stream
+                        .peer_addr()
+                        .map(|a| a.to_string())
+                        .unwrap_or_else(|_| "<unknown>".to_string());
+                    eprintln!(
+                        "[web_gateway] strict TLS: rejecting cleartext HTTP/WS connection from \
+                         {peer} (dashboard is HTTPS/WSS-only when --tls is enabled)"
+                    );
+                    let body = "This endpoint requires TLS. Use https:// (or wss://) instead of \
+                                http:// / ws://.\n";
+                    let response = format!(
+                        "HTTP/1.1 426 Upgrade Required\r\n\
+                         Content-Type: text/plain\r\n\
+                         Content-Length: {}\r\n\
+                         Upgrade: TLS/1.2\r\n\
+                         Connection: close\r\n\
+                         \r\n\
+                         {body}",
+                        body.len(),
+                    );
+                    let _ = raw_stream.write_all(response.as_bytes()).await;
+                    let _ = raw_stream.shutdown().await;
+                    return;
+                }
+
+                let buf_owned: Vec<u8>;
+                let n: usize;
+                let mut stream: DemuxStream;
+                if is_tls {
+                    let acceptor = tls_acceptor
+                        .as_ref()
+                        .expect("is_tls implies acceptor present")
+                        .clone();
+                    let mut tls_stream = match acceptor.accept(raw_stream).await {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("[web_gateway] TLS handshake failed: {e}");
+                            return;
+                        }
+                    };
+                    // Read the first segment of the *decrypted* request so
+                    // we can route on the real HTTP request line/headers.
+                    // This is the TLS analogue of the plain-path peek.
+                    use tokio::io::AsyncReadExt;
+                    let mut decrypted = vec![0u8; 8192];
+                    let read_n = match tls_stream.read(&mut decrypted).await {
+                        Ok(0) => return, // client closed right after handshake
+                        Ok(r) => r,
+                        Err(e) => {
+                            eprintln!("[web_gateway] TLS first decrypted read failed: {e}");
+                            return;
+                        }
+                    };
+                    decrypted.truncate(read_n);
+                    n = read_n;
+                    buf_owned = decrypted.clone();
+                    // Replay the decrypted request head in front of the TLS
+                    // stream so the WS upgrade / HTTP body reads downstream
+                    // see the request from byte zero.
+                    stream = Box::pin(crate::web_tls::PrefixedStream::new(decrypted, tls_stream));
+                } else {
+                    // Plain HTTP/WS: the peeked bytes are still in the
+                    // kernel buffer. Box the raw stream with an empty
+                    // replay prefix — a zero-overhead pass-through that
+                    // reads the request straight from the socket.
+                    n = peeked;
+                    buf_owned = buf[..peeked].to_vec();
+                    stream = Box::pin(crate::web_tls::PrefixedStream::new(Vec::new(), raw_stream));
+                }
+                // Downstream code reads `buf[..n]`; point `buf` at the
+                // (decrypted, for TLS) request head we just captured.
+                let buf = buf_owned.as_slice();
 
                 let header_text = String::from_utf8_lossy(&buf[..n]);
                 let is_websocket = header_text
@@ -3545,8 +12144,12 @@ pub fn spawn_web_gateway(
                         verify_bearer_for_ws(&header_text, inbound_bearer_token.as_deref())
                     {
                         use tokio::io::AsyncWriteExt;
+                        let reason = match status {
+                            401 => "Unauthorized",
+                            _ => "Error",
+                        };
                         let response = format!(
-                            "HTTP/1.1 {status} Unauthorized\r\n\
+                            "HTTP/1.1 {status} {reason}\r\n\
                              Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
                              WWW-Authenticate: Bearer\r\n\
@@ -3556,6 +12159,13 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                        // Flush + cleanly shut down before the task returns and
+                        // drops the stream. On the TLS path rustls buffers the
+                        // ciphertext for this 401 inside the session; dropping
+                        // without flushing discards it and the rejected client
+                        // sees an *empty* response instead of the 401 (audit
+                        // F2). A no-op pass-through on plain TCP.
+                        finalize_http_stream(&mut stream).await;
                         return;
                     }
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
@@ -3585,27 +12195,34 @@ pub fn spawn_web_gateway(
 
                     // Send bootstrap state snapshot on connect (with connection_id).
                     // Include config (provider/model) since AgentStateSnapshot
-                    // doesn't carry those.
-                    if let Some(ref ctx) = query_ctx {
-                        let state = ctx
-                            .agent_state
-                            .lock()
-                            .unwrap_or_else(|e| e.into_inner())
-                            .clone();
+                    // doesn't carry those. The top-level `session_id` is the
+                    // stable daemon/process session, not the active worker log.
+                    let state = query_ctx
+                        .as_ref()
+                        .map(|ctx| {
+                            ctx.agent_state
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .clone()
+                        })
+                        .unwrap_or_default();
+                    let bootstrap_session_id = daemon_session_id
+                        .clone()
+                        .or_else(|| {
+                            query_ctx
+                                .as_ref()
+                                .and_then(|ctx| replay_session_id_from_dir(&ctx.log_dir))
+                        })
+                        .or_else(|| session_log.as_ref().and_then(session_log_id));
+                    if query_ctx.is_some() || bootstrap_session_id.is_some() {
                         let config: serde_json::Value =
                             serde_json::from_str(&config_json).unwrap_or_default();
-                        // Extract session_id from log_dir path name
-                        let session_id = ctx
-                            .log_dir
-                            .file_name()
-                            .and_then(|n| n.to_str())
-                            .unwrap_or("");
                         let bootstrap = serde_json::json!({
                             "t": "state_snapshot",
                             "state": state,
                             "connection_id": connection_id,
                             "config": config,
-                            "session_id": session_id,
+                            "session_id": bootstrap_session_id.unwrap_or_default(),
                         });
                         let _ = direct_tx.send(bootstrap.to_string());
                     }
@@ -3632,6 +12249,15 @@ pub fn spawn_web_gateway(
                         }
                     }
 
+                    // Send cached autonomy after cached status so it wins
+                    // when the latest status event is older than the user's
+                    // most recent autonomy switch.
+                    if let Ok(guard) = last_autonomy_json.lock() {
+                        if let Some(ref autonomy_json) = *guard {
+                            let _ = direct_tx.send(autonomy_json.clone());
+                        }
+                    }
+
                     // Send cached external_agent_changed so the dropdown
                     // and status badge reflect the current value on a
                     // fresh browser connection.
@@ -3651,6 +12277,13 @@ pub fn spawn_web_gateway(
                             let _ = direct_tx.send(ud_json.clone());
                         }
                     }
+
+                    let browser_workspaces = crate::browser_workspace::list_workspaces().await;
+                    let browser_snapshot = serde_json::json!({
+                        "t": "browser_workspace_snapshot",
+                        "workspaces": browser_workspaces,
+                    });
+                    let _ = direct_tx.send(browser_snapshot.to_string());
 
                     // Replay display_ready for every active display session so
                     // late-connecting browsers (including refreshes) recreate
@@ -3740,14 +12373,51 @@ pub fn spawn_web_gateway(
                     // Each JSONL entry is converted to an OutboundEvent via
                     // session_log_entry_to_app_event → app_event_to_outbound
                     // so replay drives the same rendering path as live.
-                    if let Some(ref ctx) = query_ctx {
-                        let session_jsonl = ctx.log_dir.join("session.jsonl");
-                        if let Ok(contents) = std::fs::read_to_string(&session_jsonl) {
-                            let replay = serde_json::json!({
-                                "t": "log_replay",
-                                "entries": replay_jsonl_to_outbound_entries(&contents, &ctx.log_dir),
+                    let replay_log_dir =
+                        query_ctx
+                            .as_ref()
+                            .map(|ctx| ctx.log_dir.clone())
+                            .or_else(|| {
+                                session_log.as_ref().and_then(|sl| {
+                                    sl.lock().ok().map(|log| log.dir().to_path_buf())
+                                })
                             });
-                            let _ = direct_tx.send(replay.to_string());
+                    let mut replayed_external_session_ids: HashSet<String> = HashSet::new();
+                    if let Some(ref log_dir) = replay_log_dir {
+                        if let Some((replay, external_session_id)) =
+                            session_log_replay_payload_from_dir(log_dir)
+                        {
+                            if let Some(external_session_id) = external_session_id {
+                                replayed_external_session_ids.insert(external_session_id);
+                            }
+                            let _ = direct_tx.send(replay);
+                        }
+                    }
+
+                    let mut active_external_sessions: Vec<(String, String)> =
+                        attached_external_sessions
+                            .lock()
+                            .ok()
+                            .map(|guard| {
+                                guard
+                                    .iter()
+                                    .map(|(session_id, source)| {
+                                        (session_id.clone(), source.clone())
+                                    })
+                                    .collect()
+                            })
+                            .unwrap_or_default();
+                    active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
+                    for (session_id, source) in active_external_sessions {
+                        if replayed_external_session_ids.contains(&session_id) {
+                            continue;
+                        }
+                        if let Some(replay) = external_session_activity_replay(
+                            &source,
+                            &session_id,
+                            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+                        ) {
+                            let _ = direct_tx.send(replay);
                         }
                     }
 
@@ -4277,6 +12947,30 @@ pub fn spawn_web_gateway(
                                                 thinking_tokens: json["thinking_tokens"]
                                                     .as_u64()
                                                     .unwrap_or(0),
+                                                input_text_tokens: json["input_text_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                input_audio_tokens: json["input_audio_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                input_image_tokens: json["input_image_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                cached_text_tokens: json["cached_text_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                cached_audio_tokens: json["cached_audio_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                cached_image_tokens: json["cached_image_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                output_text_tokens: json["output_text_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
+                                                output_audio_tokens: json["output_audio_tokens"]
+                                                    .as_u64()
+                                                    .unwrap_or(0),
                                             });
                                         }
                                         Some("presence_checkpoint") => {
@@ -4621,6 +13315,7 @@ pub fn spawn_web_gateway(
                                                                             data: data_b64.to_string(),
                                                                         }],
                                                                         source: crate::event::InjectionSource::User,
+                                                                        target_session_id: None,
                                                                         steer_id: None,
                                                                     });
                                                                     injected_to_queue = true;
@@ -4783,6 +13478,7 @@ pub fn spawn_web_gateway(
                                                                     text: label,
                                                                     images,
                                                                     source: crate::event::InjectionSource::User,
+                                                                    target_session_id: None,
                                                                     steer_id: None,
                                                                 });
                                                                 injected = true;
@@ -4830,11 +13526,7 @@ pub fn spawn_web_gateway(
                                             let args_preview = {
                                                 let s = serde_json::to_string(&args)
                                                     .unwrap_or_default();
-                                                if s.len() > 200 {
-                                                    format!("{}...", &s[..200])
-                                                } else {
-                                                    s
-                                                }
+                                                preview_text(&s, 200)
                                             };
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!(
@@ -4938,11 +13630,8 @@ pub fn spawn_web_gateway(
                                                 };
 
                                             // Log the tool response at Debug level
-                                            let result_preview = if query_result.text.len() > 200 {
-                                                format!("{}...", &query_result.text[..200])
-                                            } else {
-                                                query_result.text.clone()
-                                            };
+                                            let result_preview =
+                                                preview_text(&query_result.text, 200);
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!(
                                                     "[tool_response] {} → {}",
@@ -5021,11 +13710,8 @@ pub fn spawn_web_gateway(
                                                 )
                                             };
 
-                                            let result_preview = if query_result.text.len() > 200 {
-                                                format!("{}...", &query_result.text[..200])
-                                            } else {
-                                                query_result.text.clone()
-                                            };
+                                            let result_preview =
+                                                preview_text(&query_result.text, 200);
                                             bus_inbound.send(AppEvent::PresenceLog {
                                                 message: format!(
                                                     "[async_query_result] {} → {}",
@@ -5608,6 +14294,54 @@ pub fn spawn_web_gateway(
                                                         }
                                                     }
                                                 }
+                                                Ok(ctrl @ ControlMsg::ResumeSession { .. }) => {
+                                                    let ControlMsg::ResumeSession {
+                                                        source,
+                                                        session_id,
+                                                        resume_id,
+                                                        task,
+                                                        ..
+                                                    } = &ctrl
+                                                    else {
+                                                        unreachable!();
+                                                    };
+                                                    let source = source.clone();
+                                                    let session_id = session_id.clone();
+                                                    let resume_id = resume_id.clone();
+                                                    let task = task.clone();
+                                                    let direct_tx_resume =
+                                                        direct_tx_inbound.clone();
+                                                    let bus_resume = bus_inbound.clone();
+                                                    tokio::spawn(async move {
+                                                        let replay = tokio::task::spawn_blocking(
+                                                            move || {
+                                                                resume_session_activity_replay(
+                                                                    &source,
+                                                                    &session_id,
+                                                                    resume_id.as_deref(),
+                                                                    task.as_deref(),
+                                                                    EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+                                                                )
+                                                            },
+                                                        )
+                                                        .await
+                                                        .ok()
+                                                        .flatten();
+                                                        if let Some(replay) = replay {
+                                                            let _ = direct_tx_resume.send(replay);
+                                                        }
+                                                        bus_resume.send(AppEvent::PresenceLog {
+                                                            message: format!(
+                                                                "[ws] ControlMsg: {:?}",
+                                                                ctrl
+                                                            ),
+                                                            level: Some(LogLevel::Debug),
+                                                            turn: None,
+                                                        });
+                                                        bus_resume
+                                                            .send(AppEvent::ControlCommand(ctrl));
+                                                    });
+                                                }
                                                 Ok(ctrl) => {
                                                     bus_inbound.send(AppEvent::PresenceLog {
                                                         message: format!(
@@ -5618,7 +14352,7 @@ pub fn spawn_web_gateway(
                                                                     ..
                                                                 } => format!(
                                                                     "StartTask({})",
-                                                                    &task[..task.len().min(60)]
+                                                                    preview_text(task, 60)
                                                                 ),
                                                                 other => format!("{:?}", other),
                                                             }
@@ -5878,11 +14612,12 @@ pub fn spawn_web_gateway(
                         let response = "HTTP/1.1 204 No Content\r\n\
                             Access-Control-Allow-Origin: *\r\n\
                             Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
-                            Access-Control-Allow-Headers: Content-Type\r\n\
+                            Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
                             Access-Control-Max-Age: 86400\r\n\
                             Connection: close\r\n\
                             \r\n";
                         let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
                         return;
                     }
 
@@ -5915,6 +14650,7 @@ pub fn spawn_web_gateway(
                                 body.len(),
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
                             return;
                         }
                     }
@@ -5941,6 +14677,22 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(header.as_bytes()).await;
                         let _ = stream.write_all(wasm_data).await;
+                    } else if request_line.contains("/icon-128.png")
+                        || request_line.contains("/favicon.ico")
+                    {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: image/png\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n",
+                            ICON_128_PNG.len()
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(header.as_bytes()).await;
+                        let _ = stream.write_all(ICON_128_PNG).await;
                     } else if request_line.contains(" /frames/") {
                         // Serve HQ frame images from the frame registry.
                         // URL format: /frames/<frame_id> (not /api/session/*/frames/*)
@@ -5982,6 +14734,62 @@ pub fn spawn_web_gateway(
                             );
                             let _ = stream.write_all(response.as_bytes()).await;
                         }
+                    } else if request_line.contains("/api/project-root") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "project_root": project_root
+                                .as_ref()
+                                .map(|root| root.to_string_lossy().to_string())
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/fs/stat")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        let response = match inspect_dashboard_fs_path(&path) {
+                            Ok(status) => json_response(
+                                "200 OK",
+                                serde_json::to_string(&status).unwrap_or_else(|_| "{}".to_string()),
+                            ),
+                            Err(e) => json_error("400 Bad Request", e),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/fs/list")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        let response = match list_dashboard_fs_dir(&path) {
+                            Ok(body) => json_ok(body),
+                            Err(e) => json_error("400 Bad Request", e),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/fs/mkdir")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
+                            Ok(req) => match mkdir_dashboard_fs_path(&req.path) {
+                                Ok(body) => json_ok(body),
+                                Err((status, message)) => json_error(&status, message),
+                            },
+                            Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains("/api/settings")
                     {
@@ -6009,45 +14817,9 @@ pub fn spawn_web_gateway(
                             body_owned = full;
                             &body_owned
                         };
-                        let result = match &project_root {
-                            Some(root) => match serde_json::from_str::<SettingsPayload>(body_text) {
-                                Ok(payload) => {
-                                    match crate::project::Project::from_root(root.clone()) {
-                                        Ok(mut proj) => {
-                                            apply_settings_payload(&mut proj.config, &payload);
-                                            match proj.save_config() {
-                                                Ok(()) => {
-                                                    serde_json::json!({"ok": true}).to_string()
-                                                }
-                                                Err(e) => {
-                                                    serde_json::json!({"error": e.to_string()})
-                                                        .to_string()
-                                                }
-                                            }
-                                        }
-                                        Err(e) => {
-                                            serde_json::json!({"error": e.to_string()}).to_string()
-                                        }
-                                    }
-                                }
-                                Err(e) => {
-                                    serde_json::json!({"error": format!("Invalid settings: {}", e)})
-                                        .to_string()
-                                }
-                            },
-                            None => serde_json::json!({"error": "No project root"}).to_string(),
-                        };
-                        let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
-                             Content-Type: application/json\r\n\
-                             Content-Length: {}\r\n\
-                             Access-Control-Allow-Origin: *\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            result.len(),
-                            result
-                        );
+                        let (status, result) =
+                            settings_post_result(body_text, project_root.as_deref());
+                        let response = json_response(status, result);
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
                         && request_line.contains("/api/diagnostics/visual-freshness")
@@ -6140,7 +14912,11 @@ pub fn spawn_web_gateway(
                         let body = match &project_root {
                             Some(root) => match crate::project::Project::from_root(root.clone()) {
                                 Ok(proj) => {
-                                    let payload = settings_payload_from_config(&proj.config);
+                                    let payload = settings_payload_with_runtime_overrides(
+                                        &proj.config,
+                                        &runtime_settings,
+                                    )
+                                    .await;
                                     serde_json::to_string(&payload)
                                         .unwrap_or_else(|_| "{}".to_string())
                                 }
@@ -6555,6 +15331,18 @@ pub fn spawn_web_gateway(
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/session/current/agent-output")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let log_dir =
+                            current_session_log_dir(session_log.as_ref(), query_ctx.as_ref());
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = match log_dir {
+                            Some(dir) => current_agent_output_post_response(&body_text, &dir),
+                            None => upload_error_response("404 Not Found", "no active session log"),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
                         && request_line.contains(" /api/session/current/uploads")
                     {
                         // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
@@ -6562,9 +15350,10 @@ pub fn spawn_web_gateway(
                         //   <raw bytes>
                         //
                         // Streams the body into a tempfile, commits it into
-                        // the upload store (per-session `uploads/` or
-                        // per-project `workspace_files/`), and broadcasts
-                        // UploadReady so all connected browsers see it.
+                        // the project-local ignored upload store
+                        // (`.intendant/uploads/<session-id>/`), and
+                        // broadcasts UploadReady so all connected browsers
+                        // see it.
                         //
                         // Route sits in the `/api/session/current/*` family
                         // alongside `changes`, `history`, `rollback`, etc.
@@ -6574,12 +15363,6 @@ pub fn spawn_web_gateway(
                         // protect uploads, gate the whole family at once.
                         use tokio::io::AsyncWriteExt;
                         let response = 'upload: {
-                            let Some(ref slog) = session_log else {
-                                break 'upload upload_error_response(
-                                    "400 Bad Request",
-                                    "no active session",
-                                );
-                            };
                             let Some(ref root) = project_root_for_changes else {
                                 break 'upload upload_error_response(
                                     "400 Bad Request",
@@ -6589,14 +15372,21 @@ pub fn spawn_web_gateway(
 
                             let name = query_param(&request_line, "name")
                                 .unwrap_or_else(|| "upload.bin".to_string());
-                            let destination = query_param(&request_line, "destination")
+                            let requested_destination = query_param(&request_line, "destination")
                                 .as_deref()
                                 .and_then(crate::upload_store::UploadDestination::from_str)
                                 .unwrap_or(crate::upload_store::UploadDestination::Task);
                             let mime = content_type_header(&header_text);
+                            if header_text
+                                .lines()
+                                .any(|l| l.trim().eq_ignore_ascii_case("expect: 100-continue"))
+                            {
+                                let _ = stream.write_all(b"HTTP/1.1 100 Continue\r\n\r\n").await;
+                            }
 
                             match stream_body_to_tempfile(
                                 &header_text,
+                                &discard,
                                 &mut stream,
                                 UPLOAD_MAX_BYTES,
                             )
@@ -6612,18 +15402,32 @@ pub fn spawn_web_gateway(
                                 }
                                 Ok((tmp, size)) => {
                                     let (session_dir, session_id) = {
-                                        match slog.lock() {
-                                            Ok(l) => {
-                                                (l.dir().to_path_buf(), l.session_id().to_string())
+                                        if let Some(ref slog) = session_log {
+                                            match slog.lock() {
+                                                Ok(l) => (
+                                                    l.dir().to_path_buf(),
+                                                    l.session_id().to_string(),
+                                                ),
+                                                Err(_) => {
+                                                    break 'upload upload_error_response(
+                                                        "500 Internal Server Error",
+                                                        "session log lock poisoned",
+                                                    );
+                                                }
                                             }
-                                            Err(_) => {
-                                                break 'upload upload_error_response(
-                                                    "500 Internal Server Error",
-                                                    "session log lock poisoned",
-                                                );
-                                            }
+                                        } else {
+                                            (
+                                                pending_upload_session_dir(root),
+                                                daemon_session_id
+                                                    .clone()
+                                                    .unwrap_or_else(|| "pending".to_string()),
+                                            )
                                         }
                                     };
+                                    let destination = effective_upload_destination(
+                                        requested_destination,
+                                        session_log.is_some(),
+                                    );
                                     match crate::upload_store::commit_upload(
                                         tmp,
                                         &name,
@@ -6669,26 +15473,24 @@ pub fn spawn_web_gateway(
                         // GET /api/session/current/uploads/<id>/raw  — stream bytes of one upload
                         use tokio::io::AsyncWriteExt;
                         let response = 'get_upload: {
-                            let Some(ref slog) = session_log else {
-                                break 'get_upload upload_error_response(
-                                    "404 Not Found",
-                                    "no active session",
-                                );
-                            };
                             let Some(ref root) = project_root_for_changes else {
                                 break 'get_upload upload_error_response(
                                     "404 Not Found",
                                     "no project root",
                                 );
                             };
-                            let session_dir = match slog.lock() {
-                                Ok(l) => l.dir().to_path_buf(),
-                                Err(_) => {
-                                    break 'get_upload upload_error_response(
-                                        "500 Internal Server Error",
-                                        "session log lock poisoned",
-                                    );
+                            let session_dir = if let Some(ref slog) = session_log {
+                                match slog.lock() {
+                                    Ok(l) => l.dir().to_path_buf(),
+                                    Err(_) => {
+                                        break 'get_upload upload_error_response(
+                                            "500 Internal Server Error",
+                                            "session log lock poisoned",
+                                        );
+                                    }
                                 }
+                            } else {
+                                pending_upload_session_dir(root)
                             };
                             // Path after /api/session/current/uploads
                             let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
@@ -6759,26 +15561,24 @@ pub fn spawn_web_gateway(
                         // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
                         use tokio::io::AsyncWriteExt;
                         let response = 'del_upload: {
-                            let Some(ref slog) = session_log else {
-                                break 'del_upload upload_error_response(
-                                    "404 Not Found",
-                                    "no active session",
-                                );
-                            };
                             let Some(ref root) = project_root_for_changes else {
                                 break 'del_upload upload_error_response(
                                     "404 Not Found",
                                     "no project root",
                                 );
                             };
-                            let session_dir = match slog.lock() {
-                                Ok(l) => l.dir().to_path_buf(),
-                                Err(_) => {
-                                    break 'del_upload upload_error_response(
-                                        "500 Internal Server Error",
-                                        "session log lock poisoned",
-                                    );
+                            let session_dir = if let Some(ref slog) = session_log {
+                                match slog.lock() {
+                                    Ok(l) => l.dir().to_path_buf(),
+                                    Err(_) => {
+                                        break 'del_upload upload_error_response(
+                                            "500 Internal Server Error",
+                                            "session log lock poisoned",
+                                        );
+                                    }
                                 }
+                            } else {
+                                pending_upload_session_dir(root)
                             };
                             let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
                             let path = path_and_q.splitn(2, '?').next().unwrap_or("");
@@ -6818,19 +15618,72 @@ pub fn spawn_web_gateway(
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/managed-context/anchors")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = match session_log.as_ref() {
+                            Some(log) => match log.lock() {
+                                Ok(log) => {
+                                    let active_log_dir = log.dir().to_path_buf();
+                                    managed_context_anchors_response_from_home(
+                                        &request_line,
+                                        Some(active_log_dir.as_path()),
+                                        &crate::platform::home_dir(),
+                                    )
+                                }
+                                Err(_) => json_error(
+                                    "500 Internal Server Error",
+                                    "session log lock poisoned",
+                                ),
+                            },
+                            None => managed_context_anchors_response_from_home(
+                                &request_line,
+                                None,
+                                &crate::platform::home_dir(),
+                            ),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/managed-context/records")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = match session_log.as_ref() {
+                            Some(log) => match log.lock() {
+                                Ok(log) => {
+                                    let active_log_dir = log.dir().to_path_buf();
+                                    managed_context_records_response_from_home(
+                                        &request_line,
+                                        Some(active_log_dir.as_path()),
+                                        &crate::platform::home_dir(),
+                                    )
+                                }
+                                Err(_) => json_error(
+                                    "500 Internal Server Error",
+                                    "session log lock poisoned",
+                                ),
+                            },
+                            None => managed_context_records_response_from_home(
+                                &request_line,
+                                None,
+                                &crate::platform::home_dir(),
+                            ),
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
                         && request_line.contains("/api/session/current/changes")
                     {
                         // File change tracking endpoints:
                         //   GET /api/session/current/changes        — list all changed files
                         //   GET /api/session/current/changes/{path} — unified diff for one file
                         use tokio::io::AsyncWriteExt;
-                        let body = handle_changes_request(
+                        let (status, body) = handle_changes_request_for_home(
                             &request_line,
                             snapshot_dir.as_deref(),
                             project_root_for_changes.as_deref(),
+                            &crate::platform::home_dir(),
                         );
                         let response = format!(
-                            "HTTP/1.1 200 OK\r\n\
+                            "HTTP/1.1 {}\r\n\
                              Content-Type: application/json\r\n\
                              Content-Length: {}\r\n\
                              Cache-Control: no-cache\r\n\
@@ -6838,6 +15691,7 @@ pub fn spawn_web_gateway(
                              Connection: close\r\n\
                              \r\n\
                              {}",
+                            status,
                             body.len(),
                             body
                         );
@@ -6947,12 +15801,48 @@ pub fn spawn_web_gateway(
                             .unwrap_or("");
                         let rest_parts: Vec<&str> = rest.split('/').collect();
 
-                        if rest_parts.len() >= 2 && rest_parts[1] == "recordings" {
+                        let route_name = rest_parts
+                            .get(1)
+                            .map(|part| part.split('?').next().unwrap_or(part))
+                            .unwrap_or("");
+
+                        if rest_parts.len() >= 2 && route_name == "context-snapshot" {
+                            // GET /api/session/{id}/context-snapshot?file=...
+                            // Replays exactly one archived context snapshot
+                            // on demand so historical session replay can stay
+                            // lightweight by default.
+                            let raw_id = rest_parts[0];
+                            let session_id = raw_id.split('?').next().unwrap_or(raw_id);
+                            let source = query_param(request_line, "source")
+                                .unwrap_or_else(|| "intendant".to_string());
+                            let (status, body) = get_session_context_snapshot_from_home(
+                                &crate::platform::home_dir(),
+                                session_id,
+                                &source,
+                                request_line,
+                            );
+                            let response = format!(
+                                "HTTP/1.1 {status}\r\n\
+                                 Content-Type: application/json\r\n\
+                                 Content-Length: {}\r\n\
+                                 Cache-Control: no-cache\r\n\
+                                 Connection: close\r\n\
+                                 \r\n\
+                                 {}",
+                                body.len(),
+                                body
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        } else if rest_parts.len() >= 2 && route_name == "recordings" {
                             // Session recording sub-routes: /api/session/{id}/recordings[/...]
                             let session_id = rest_parts[0];
                             let rec_rest = &rest_parts[2..]; // parts after "recordings"
 
-                            if rec_rest.len() == 2 && rec_rest[1] == "segments" {
+                            if !session_lookup_id_is_safe(session_id) {
+                                let response =
+                                    upload_error_response("400 Bad Request", "invalid session id");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else if rec_rest.len() == 2 && rec_rest[1] == "segments" {
                                 // GET /api/session/{id}/recordings/{stream}/segments
                                 let stream_name = rec_rest[0];
                                 let body =
@@ -7088,43 +15978,66 @@ pub fn spawn_web_gateway(
                                 );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
-                        } else if rest_parts.len() >= 2 && rest_parts[1] == "report" {
+                        } else if rest_parts.len() >= 2 && route_name == "report" {
                             // GET /api/session/{id}/report — download a zip of
                             // the current session's text artifacts for sharing
                             // with the dev. Pass id="current" to target the
                             // live daemon's own session via WebQueryCtx.
                             use tokio::io::AsyncWriteExt;
                             let session_id = rest_parts[0];
-                            let resolved_dir: Option<PathBuf> = if session_id == "current" {
-                                query_ctx.as_ref().map(|ctx| ctx.log_dir.clone())
+                            if session_id != "current" && !session_lookup_id_is_safe(session_id) {
+                                let response =
+                                    upload_error_response("400 Bad Request", "invalid session id");
+                                let _ = stream.write_all(response.as_bytes()).await;
                             } else {
-                                resolve_session_dir(session_id)
-                            };
-                            match resolved_dir {
-                                Some(dir) => match build_session_report_zip(&dir) {
-                                    Ok(bytes) => {
-                                        let fname = dir
-                                            .file_name()
-                                            .map(|n| n.to_string_lossy().to_string())
-                                            .unwrap_or_else(|| "session".to_string());
-                                        let header = format!(
-                                            "HTTP/1.1 200 OK\r\n\
-                                             Content-Type: application/zip\r\n\
-                                             Content-Length: {}\r\n\
-                                             Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
-                                             Cache-Control: no-cache\r\n\
-                                             Connection: close\r\n\
-                                             \r\n",
-                                            bytes.len(),
-                                            fname
-                                        );
-                                        let _ = stream.write_all(header.as_bytes()).await;
-                                        let _ = stream.write_all(&bytes).await;
-                                    }
-                                    Err(e) => {
-                                        let body = format!("Failed to build report: {}", e);
+                                let resolved_dir: Option<PathBuf> = if session_id == "current" {
+                                    current_session_log_dir(
+                                        session_log.as_ref(),
+                                        query_ctx.as_ref(),
+                                    )
+                                } else {
+                                    resolve_session_dir(session_id)
+                                };
+                                match resolved_dir {
+                                    Some(dir) => match build_session_report_zip(&dir) {
+                                        Ok(bytes) => {
+                                            let fname = dir
+                                                .file_name()
+                                                .map(|n| n.to_string_lossy().to_string())
+                                                .unwrap_or_else(|| "session".to_string());
+                                            let header = format!(
+                                                "HTTP/1.1 200 OK\r\n\
+                                                 Content-Type: application/zip\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Content-Disposition: attachment; filename=\"intendant-session-{}.zip\"\r\n\
+                                                 Cache-Control: no-cache\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n",
+                                                bytes.len(),
+                                                fname
+                                            );
+                                            let _ = stream.write_all(header.as_bytes()).await;
+                                            let _ = stream.write_all(&bytes).await;
+                                        }
+                                        Err(e) => {
+                                            let body = format!("Failed to build report: {}", e);
+                                            let response = format!(
+                                                "HTTP/1.1 500 Internal Server Error\r\n\
+                                                 Content-Type: text/plain\r\n\
+                                                 Content-Length: {}\r\n\
+                                                 Connection: close\r\n\
+                                                 \r\n\
+                                                 {}",
+                                                body.len(),
+                                                body
+                                            );
+                                            let _ = stream.write_all(response.as_bytes()).await;
+                                        }
+                                    },
+                                    None => {
+                                        let body = "Session not found";
                                         let response = format!(
-                                            "HTTP/1.1 500 Internal Server Error\r\n\
+                                            "HTTP/1.1 404 Not Found\r\n\
                                              Content-Type: text/plain\r\n\
                                              Content-Length: {}\r\n\
                                              Connection: close\r\n\
@@ -7135,29 +16048,19 @@ pub fn spawn_web_gateway(
                                         );
                                         let _ = stream.write_all(response.as_bytes()).await;
                                     }
-                                },
-                                None => {
-                                    let body = "Session not found";
-                                    let response = format!(
-                                        "HTTP/1.1 404 Not Found\r\n\
-                                         Content-Type: text/plain\r\n\
-                                         Content-Length: {}\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        body.len(),
-                                        body
-                                    );
-                                    let _ = stream.write_all(response.as_bytes()).await;
                                 }
                             }
-                        } else if rest_parts.len() >= 2 && rest_parts[1] == "frames" {
+                        } else if rest_parts.len() >= 2 && route_name == "frames" {
                             // Session frame sub-routes: /api/session/{id}/frames[/{filename}]
                             use tokio::io::AsyncWriteExt;
                             let session_id = rest_parts[0];
                             let frame_rest = &rest_parts[2..];
 
-                            if frame_rest.len() == 1 {
+                            if !session_lookup_id_is_safe(session_id) {
+                                let response =
+                                    upload_error_response("400 Bad Request", "invalid session id");
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else if frame_rest.len() == 1 {
                                 // GET /api/session/{id}/frames/{filename}
                                 let filename = frame_rest[0];
                                 let valid = (filename.ends_with(".jpg")
@@ -7268,11 +16171,34 @@ pub fn spawn_web_gateway(
                             }
                         } else {
                             // GET /api/session/{id} — session detail
-                            let session_id =
-                                rest_parts[0].split('?').next().unwrap_or(rest_parts[0]);
-                            let body = get_session_detail(session_id);
+                            let raw_id = rest_parts[0];
+                            let session_id = raw_id.split('?').next().unwrap_or(raw_id);
+                            let source = query_param(request_line, "source")
+                                .unwrap_or_else(|| "intendant".to_string());
+                            let body = if !session_lookup_id_is_safe(session_id) {
+                                serde_json::json!({"error": "invalid session id"}).to_string()
+                            } else if source == "intendant" {
+                                get_session_detail_from_home(
+                                    &crate::platform::home_dir(),
+                                    session_id,
+                                )
+                            } else {
+                                external_session_detail_from_home(
+                                    &crate::platform::home_dir(),
+                                    &source,
+                                    session_id,
+                                )
+                                .unwrap_or_else(|| {
+                                    serde_json::json!({"error": "session not found"}).to_string()
+                                })
+                            };
+                            let status = if !session_lookup_id_is_safe(session_id) {
+                                "400 Bad Request"
+                            } else {
+                                session_detail_http_status(&body)
+                            };
                             let response = format!(
-                                "HTTP/1.1 200 OK\r\n\
+                                "HTTP/1.1 {status}\r\n\
                                  Content-Type: application/json\r\n\
                                  Content-Length: {}\r\n\
                                  Cache-Control: no-cache\r\n\
@@ -7493,12 +16419,127 @@ pub fn spawn_web_gateway(
                             body.len(),
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/worktrees/remove")
+                    {
+                        let body_text = read_request_body(&mut stream, &header_text).await;
+                        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                        let cache = worktree_inventory_cache.clone();
+                        let (status, body) = match tokio::task::spawn_blocking(move || {
+                            let result = remove_worktree_inventory_response(&home, &body_text);
+                            if result.0 == "200 OK" {
+                                if let Ok(mut guard) = cache.lock() {
+                                    *guard = None;
+                                }
+                            }
+                            result
+                        })
+                        .await
+                        {
+                            Ok(result) => result,
+                            Err(e) => (
+                                "500 Internal Server Error",
+                                serde_json::json!({
+                                    "ok": false,
+                                    "error": format!("worktree removal task failed: {e}")
+                                })
+                                .to_string(),
+                            ),
+                        };
+                        let response = json_response(status, body);
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/worktrees/scan")
+                    {
+                        let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+                        let project_root = project_root.clone();
+                        let cache = worktree_inventory_cache.clone();
+                        let body = match tokio::task::spawn_blocking(move || {
+                            let body =
+                                scan_worktree_inventory_response(&home, project_root.as_deref());
+                            if let Ok(mut guard) = cache.lock() {
+                                *guard = Some(body.clone());
+                            }
+                            body
+                        })
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err(e) => serde_json::json!({
+                                "error": format!("worktree scan task failed: {e}")
+                            })
+                            .to_string(),
+                        };
+                        let response = json_response("200 OK", body);
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/worktrees")
+                    {
+                        let body = worktree_inventory_cache
+                            .lock()
+                            .ok()
+                            .and_then(|guard| guard.clone())
+                            .unwrap_or_else(empty_worktree_inventory_response);
+                        let response = json_response("200 OK", body);
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains("/api/sessions/search") {
+                        let body = if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+                            serde_json::json!({
+                                "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
+                                "busy": true,
+                            })
+                            .to_string()
+                        } else {
+                            let request_line_for_search = request_line.to_string();
+                            let body = match tokio::task::spawn_blocking(move || {
+                                session_log_search_from_request(&request_line_for_search)
+                            })
+                            .await
+                            {
+                                Ok(body) => body,
+                                Err(e) => serde_json::json!({
+                                    "error": format!("session search task failed: {e}")
+                                })
+                                .to_string(),
+                            };
+                            SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+                            body
+                        };
+                        let response = format!(
+                            "HTTP/1.1 200 OK\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Access-Control-Allow-Origin: *\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {}",
+                            body.len(),
+                            body
+                        );
+                        use tokio::io::AsyncWriteExt;
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/sessions") {
                         // Session listing endpoint. CORS `*` so the
                         // multi-host Stats tab can fetch sibling
                         // daemons' session lists to populate its "All
                         // Sessions" and "Disk Usage" cards per host.
-                        let body = list_sessions();
+                        let ids_filter = session_ids_filter_from_request(request_line);
+                        let body = match tokio::task::spawn_blocking(move || match ids_filter {
+                            Some(ids) => cached_list_sessions_for_ids(&ids),
+                            None => cached_list_sessions(),
+                        })
+                        .await
+                        {
+                            Ok(body) => body,
+                            Err(e) => serde_json::json!({
+                                "error": format!("session list task failed: {e}")
+                            })
+                            .to_string(),
+                        };
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -7580,7 +16621,16 @@ pub fn spawn_web_gateway(
                                 body_owned = full;
                                 &body_owned
                             };
-                            let outcome = handle_mcp_http_request(body_text, mcp).await;
+                            let (mcp_session_id, codex_managed_context, tool_profile) =
+                                mcp_context_from_request_line(&request_line);
+                            let outcome = handle_mcp_http_request(
+                                body_text,
+                                mcp,
+                                mcp_session_id.as_deref(),
+                                codex_managed_context,
+                                tool_profile.as_deref(),
+                            )
+                            .await;
                             let http_response = match outcome {
                                 McpHttpOutcome::Response(resp) => {
                                     let json = serde_json::to_string(&resp).unwrap_or_default();
@@ -7628,6 +16678,42 @@ pub fn spawn_web_gateway(
                                     Content-Length: 0\r\n\
                                     \r\n";
                         let _ = stream.write_all(http.as_bytes()).await;
+                    } else if let Some(response) = dashboard_local_file_response(request_line) {
+                        use tokio::io::AsyncWriteExt;
+                        match response {
+                            DashboardLocalFileResponse::Html { status, body } => {
+                                let response = format!(
+                                    "HTTP/1.1 {status}\r\n\
+                                     Content-Type: text/html; charset=utf-8\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            DashboardLocalFileResponse::Bytes {
+                                status,
+                                content_type,
+                                bytes,
+                            } => {
+                                let header = format!(
+                                    "HTTP/1.1 {status}\r\n\
+                                     Content-Type: {content_type}\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     X-Content-Type-Options: nosniff\r\n\
+                                     Connection: close\r\n\
+                                     \r\n",
+                                    bytes.len()
+                                );
+                                let _ = stream.write_all(header.as_bytes()).await;
+                                let _ = stream.write_all(&bytes).await;
+                            }
+                        }
                     } else {
                         let (content_type, body, cache) =
                             if request_line.contains("/wasm-web/presence_web.js") {
@@ -7640,6 +16726,12 @@ pub fn spawn_web_gateway(
                                 (
                                     "application/javascript",
                                     WASM_STATION_JS.to_string(),
+                                    "no-cache, must-revalidate",
+                                )
+                            } else if request_line.contains("/three.module.min.js") {
+                                (
+                                    "application/javascript",
+                                    THREE_MODULE_JS.to_string(),
                                     "no-cache, must-revalidate",
                                 )
                             } else if request_line.contains("/audio-processor.js") {
@@ -7683,6 +16775,16 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(response.as_bytes()).await;
                     }
+
+                    // Flush + cleanly shut down the stream before this task
+                    // returns and drops it. Mandatory for the TLS path so the
+                    // final ciphertext records reach the socket (rustls buffers
+                    // them; dropping mid-buffer truncates large bodies); a
+                    // harmless pass-through on plain TCP. Covers every
+                    // fall-through dispatch arm above in one place; the early
+                    // `return`s (OPTIONS / failed federation auth) finalize
+                    // inline before returning.
+                    finalize_http_stream(&mut stream).await;
                 }
             });
         }
@@ -7701,12 +16803,14 @@ pub fn build_config(
     live_model: Option<&str>,
     transcription_enabled: bool,
     ice_config: crate::display::IceConfig,
+    federation_allow_h264: bool,
 ) -> WebGatewayConfig {
     build_config_inner(
         live_provider,
         live_model,
         transcription_enabled,
         ice_config.ice_servers,
+        federation_allow_h264,
     )
 }
 
@@ -7848,7 +16952,7 @@ async fn peers_remove(registry: &crate::peer::PeerRegistry, body_text: &str) -> 
 /// Factored out of the original inline body-reading block in the
 /// `/api/peers` handler so the per-peer outbound op handlers below
 /// can share it without duplicating the peek-then-stream pattern.
-async fn read_request_body(stream: &mut tokio::net::TcpStream, header_text: &str) -> String {
+async fn read_request_body<S: AsyncRead + Unpin>(stream: &mut S, header_text: &str) -> String {
     use tokio::io::AsyncReadExt;
     let content_length: usize = header_text
         .lines()
@@ -8027,6 +17131,7 @@ async fn peers_webrtc_signal(
         Ok(r) => r,
         Err(e) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!("rejecting webrtc signal from browser — invalid body: {e}"),
@@ -8046,6 +17151,7 @@ async fn peers_webrtc_signal(
         crate::peer::WebRtcSignal::Unknown => "unknown",
     };
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "debug".to_string(),
         source: LOG_SOURCE.to_string(),
         content: format!(
@@ -8059,6 +17165,7 @@ async fn peers_webrtc_signal(
         Some(h) => h,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!("peer {id} not in registry — dropping {signal_kind}"),
@@ -8083,6 +17190,7 @@ async fn peers_webrtc_signal(
         Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
         Err(crate::peer::PeerError::NotConnected) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8097,6 +17205,7 @@ async fn peers_webrtc_signal(
         }
         Err(crate::peer::PeerError::UnsupportedCapability(_)) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8114,6 +17223,7 @@ async fn peers_webrtc_signal(
         }
         Err(e) => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "error".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!("webrtc_signal to peer {id} failed: {e}"),
@@ -8170,6 +17280,7 @@ async fn maybe_rewrite_federated_answer(
         Some(u) => u,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8199,6 +17310,7 @@ async fn maybe_rewrite_federated_answer(
         Some(u) => u,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8214,6 +17326,7 @@ async fn maybe_rewrite_federated_answer(
         Some(addr) => addr,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8238,6 +17351,7 @@ async fn maybe_rewrite_federated_answer(
             Some(addr) => addr,
             None => {
                 bus.send(AppEvent::LogEntry {
+                    session_id: None,
                     level: "warn".to_string(),
                     source: LOG_SOURCE.to_string(),
                     content: format!(
@@ -8251,6 +17365,7 @@ async fn maybe_rewrite_federated_answer(
         },
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8266,6 +17381,7 @@ async fn maybe_rewrite_federated_answer(
     let rewritten_sdp =
         crate::display::webrtc::inject_relay_tcp_candidate(&sdp, primary_relay_addr);
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "info".to_string(),
         source: LOG_SOURCE.to_string(),
         content: format!(
@@ -8395,6 +17511,7 @@ async fn handle_federated_webrtc_signal(
         crate::peer::WebRtcSignal::Unknown => "unknown",
     };
     bus.send(AppEvent::LogEntry {
+        session_id: None,
         level: "debug".to_string(),
         source: LOG_SOURCE.to_string(),
         content: format!(
@@ -8407,6 +17524,7 @@ async fn handle_federated_webrtc_signal(
         Some(r) => r,
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8419,43 +17537,9 @@ async fn handle_federated_webrtc_signal(
     };
     let session = match registry.read().await.get(display_id) {
         Some(s) => s,
-        None if matches!(&signal, crate::peer::WebRtcSignal::Offer { .. }) => {
-            bus.send(AppEvent::LogEntry {
-                level: "info".to_string(),
-                source: LOG_SOURCE.to_string(),
-                content: format!(
-                    "display {display_id} is not active; requesting display grant for federated offer (session {session_id})"
-                ),
-                turn: None,
-            });
-            bus.send(AppEvent::UserDisplayGranted { display_id });
-            match wait_for_federated_display_session(registry, display_id).await {
-                Some(s) => {
-                    bus.send(AppEvent::LogEntry {
-                        level: "info".to_string(),
-                        source: LOG_SOURCE.to_string(),
-                        content: format!(
-                            "display {display_id} became active for federated offer (session {session_id})"
-                        ),
-                        turn: None,
-                    });
-                    s
-                }
-                None => {
-                    bus.send(AppEvent::LogEntry {
-                        level: "warn".to_string(),
-                        source: LOG_SOURCE.to_string(),
-                        content: format!(
-                            "dropping offer: display {display_id} did not become active before timeout (session {session_id})"
-                        ),
-                        turn: None,
-                    });
-                    return;
-                }
-            }
-        }
         None => {
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8490,6 +17574,7 @@ async fn handle_federated_webrtc_signal(
                 _ => None,
             };
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "debug".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8513,6 +17598,7 @@ async fn handle_federated_webrtc_signal(
             if let Some(addr) = tcp_advertised_addr {
                 if addr.ip().is_loopback() {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "warn".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -8576,6 +17662,7 @@ async fn handle_federated_webrtc_signal(
             match answer_result {
                 Ok(answer_sdp) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "info".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -8620,6 +17707,7 @@ async fn handle_federated_webrtc_signal(
                         Ok(s) => {
                             if direct_tx.send(s).is_err() {
                                 bus.send(AppEvent::LogEntry {
+                                    session_id: None,
                                     level: "warn".to_string(),
                                     source: LOG_SOURCE.to_string(),
                                     content: format!(
@@ -8631,6 +17719,7 @@ async fn handle_federated_webrtc_signal(
                         }
                         Err(e) => {
                             bus.send(AppEvent::LogEntry {
+                                session_id: None,
                                 level: "error".to_string(),
                                 source: LOG_SOURCE.to_string(),
                                 content: format!(
@@ -8660,6 +17749,7 @@ async fn handle_federated_webrtc_signal(
                             if let Ok(s) = serde_json::to_string(&evt) {
                                 if direct_tx_ice.send(s).is_err() {
                                     bus_ice.send(AppEvent::LogEntry {
+                                        session_id: None,
                                         level: "debug".to_string(),
                                         source: LOG_SOURCE.to_string(),
                                         content: format!(
@@ -8672,6 +17762,7 @@ async fn handle_federated_webrtc_signal(
                             }
                         }
                         bus_ice.send(AppEvent::LogEntry {
+                            session_id: None,
                             level: "debug".to_string(),
                             source: LOG_SOURCE.to_string(),
                             content: format!(
@@ -8683,6 +17774,7 @@ async fn handle_federated_webrtc_signal(
                 }
                 Err(e) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "warn".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -8697,6 +17789,7 @@ async fn handle_federated_webrtc_signal(
             match session.add_ice_candidate(peer_id, &candidate_json).await {
                 Ok(()) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "debug".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -8707,6 +17800,7 @@ async fn handle_federated_webrtc_signal(
                 }
                 Err(e) => {
                     bus.send(AppEvent::LogEntry {
+                        session_id: None,
                         level: "warn".to_string(),
                         source: LOG_SOURCE.to_string(),
                         content: format!(
@@ -8724,6 +17818,7 @@ async fn handle_federated_webrtc_signal(
             // An incoming Answer here means a confused sender — log
             // and drop rather than silently mishandling.
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8760,6 +17855,7 @@ async fn handle_federated_webrtc_signal(
                 &federated_authority_subscribers,
             );
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "debug".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8774,6 +17870,7 @@ async fn handle_federated_webrtc_signal(
             // debug so the operator can see unknown signal arrivals
             // when they're hunting wire-format issues.
             bus.send(AppEvent::LogEntry {
+                session_id: None,
                 level: "debug".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!(
@@ -8782,24 +17879,6 @@ async fn handle_federated_webrtc_signal(
                 turn: None,
             });
         }
-    }
-}
-
-async fn wait_for_federated_display_session(
-    registry: &Arc<RwLock<crate::display::SessionRegistry>>,
-    display_id: u32,
-) -> Option<Arc<crate::display::DisplaySession>> {
-    let started = tokio::time::Instant::now();
-    let timeout = std::time::Duration::from_secs(310);
-    let poll_interval = std::time::Duration::from_millis(250);
-    loop {
-        if let Some(session) = registry.read().await.get(display_id) {
-            return Some(session);
-        }
-        if started.elapsed() >= timeout {
-            return None;
-        }
-        tokio::time::sleep(poll_interval).await;
     }
 }
 
@@ -9072,7 +18151,8 @@ async fn coordinator_route(registry: &crate::peer::PeerRegistry, body_text: &str
 }
 
 /// True for HTTP requests that hit the federation REST surface:
-/// `/api/peers*`, `/api/coordinator/*`, and `/api/sessions`. These
+/// `/api/peers*`, `/api/coordinator/*`, `/api/sessions`, and
+/// `/api/worktrees`. These
 /// are the endpoints the bearer-token enforcement layer protects
 /// when `[server.auth] bearer_token` is set. Discovery
 /// (`/.well-known/agent-card.json`), browser bootstrap (`/config`,
@@ -9082,6 +18162,7 @@ fn is_federation_path(request_line: &str) -> bool {
     request_line.contains(" /api/peers")
         || request_line.contains(" /api/coordinator/")
         || request_line.contains(" /api/sessions")
+        || request_line.contains(" /api/worktrees")
 }
 
 /// Extract a token from the `?token=...` query parameter of an HTTP
@@ -9246,14 +18327,25 @@ pub(crate) fn verify_bearer_token(
 ///
 /// Dedup: exact-string match. If the operator's override happens to
 /// match an auto-detected URL, only the operator's copy is kept.
+///
+/// ## Scheme
+///
+/// `tls_enabled` selects the auto-detected URL scheme: `wss://` when the
+/// dashboard is served over TLS (`--tls` / `[server.tls]`), `ws://`
+/// otherwise. This keeps advertised peer URLs honest — a TLS daemon is
+/// HTTPS/WSS-only (see the strict-TLS demux in `spawn_web_gateway`), so a
+/// peer handed a `ws://` URL would be refused. Operator overrides are
+/// taken verbatim (the operator owns their scheme) and the final
+/// no-listener fallback tracks the flag too.
 pub(crate) fn resolve_advertise_urls(
     local_addr: Option<std::net::SocketAddr>,
     overrides: &[String],
+    tls_enabled: bool,
 ) -> Vec<String> {
     let port = local_addr.map(|a| a.port()).unwrap_or(0);
 
     // Auto-detect. Operator overrides come first; auto entries append.
-    let auto = auto_detect_advertise_urls(local_addr, port);
+    let auto = auto_detect_advertise_urls(local_addr, port, tls_enabled);
 
     let mut out: Vec<String> = Vec::with_capacity(overrides.len() + auto.len());
     for url in overrides {
@@ -9269,15 +18361,21 @@ pub(crate) fn resolve_advertise_urls(
 
     if out.is_empty() {
         // No bind, no overrides, no interfaces. Card stays valid;
-        // URL just won't work until the next daemon restart.
-        out.push("ws://localhost:0/ws".to_string());
+        // URL just won't work until the next daemon restart. Match the
+        // TLS scheme so even this degenerate fallback is scheme-honest.
+        out.push(format_ws_url("localhost", 0, tls_enabled));
     }
     out
 }
 
 /// Build the auto-detected URL list from the listener bind address.
 /// See [`resolve_advertise_urls`] for the full resolution rules.
-fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u16) -> Vec<String> {
+/// `tls_enabled` selects `wss://` vs `ws://` (see that fn's docstring).
+fn auto_detect_advertise_urls(
+    local_addr: Option<std::net::SocketAddr>,
+    port: u16,
+    tls_enabled: bool,
+) -> Vec<String> {
     use std::net::IpAddr;
     let Some(addr) = local_addr else {
         return Vec::new();
@@ -9286,10 +18384,10 @@ fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u1
     // Specific bind: that one IP wins, no enumeration.
     match addr.ip() {
         IpAddr::V4(v4) if !v4.is_unspecified() => {
-            return vec![format_ws_url(&v4.to_string(), port)];
+            return vec![format_ws_url(&v4.to_string(), port, tls_enabled)];
         }
         IpAddr::V6(v6) if !v6.is_unspecified() => {
-            return vec![format_ws_url(&format!("[{v6}]"), port)];
+            return vec![format_ws_url(&format!("[{v6}]"), port, tls_enabled)];
         }
         _ => {}
     }
@@ -9312,8 +18410,8 @@ fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u1
     let mut urls: Vec<String> = ips
         .into_iter()
         .map(|ip| match ip {
-            IpAddr::V6(v6) => format_ws_url(&format!("[{v6}]"), port),
-            ip => format_ws_url(&ip.to_string(), port),
+            IpAddr::V6(v6) => format_ws_url(&format!("[{v6}]"), port, tls_enabled),
+            ip => format_ws_url(&ip.to_string(), port, tls_enabled),
         })
         .collect();
 
@@ -9321,13 +18419,21 @@ fn auto_detect_advertise_urls(local_addr: Option<std::net::SocketAddr>, port: u1
     // back to the resolved host label so the card carries *something*
     // dialable on a trusted LAN with mDNS.
     if urls.is_empty() {
-        urls.push(format_ws_url(&crate::lan::resolve_host_label(), port));
+        urls.push(format_ws_url(
+            &crate::lan::resolve_host_label(),
+            port,
+            tls_enabled,
+        ));
     }
     urls
 }
 
-fn format_ws_url(host: &str, port: u16) -> String {
-    format!("ws://{host}:{port}/ws")
+/// Format one advertised WebSocket URL. `tls_enabled` picks the secure
+/// scheme (`wss://`) so a TLS daemon never advertises a `ws://` URL a peer
+/// would be refused on.
+fn format_ws_url(host: &str, port: u16, tls_enabled: bool) -> String {
+    let scheme = if tls_enabled { "wss" } else { "ws" };
+    format!("{scheme}://{host}:{port}/ws")
 }
 
 /// Assemble the [`crate::peer::AgentCard`] for this daemon from live
@@ -9394,6 +18500,7 @@ fn build_config_inner(
     live_model: Option<&str>,
     transcription_enabled: bool,
     ice_servers: Vec<crate::display::IceServer>,
+    federation_allow_h264: bool,
 ) -> WebGatewayConfig {
     // If an explicit provider is given, use it directly.
     if let Some(provider) = live_provider {
@@ -9413,6 +18520,7 @@ fn build_config_inner(
             output_sample_rate: output_rate,
             transcription_enabled,
             ice_servers,
+            federation_allow_h264,
             ..Default::default()
         };
     }
@@ -9431,6 +18539,7 @@ fn build_config_inner(
                 output_sample_rate: 24000,
                 transcription_enabled,
                 ice_servers,
+                federation_allow_h264,
                 ..Default::default()
             };
         }
@@ -9441,6 +18550,7 @@ fn build_config_inner(
             output_sample_rate: 24000,
             transcription_enabled,
             ice_servers,
+            federation_allow_h264,
             ..Default::default()
         };
     }
@@ -9454,12 +18564,14 @@ fn build_config_inner(
             output_sample_rate: 24000,
             transcription_enabled,
             ice_servers,
+            federation_allow_h264,
             ..Default::default()
         }
     } else {
         let mut cfg = WebGatewayConfig::default();
         cfg.transcription_enabled = transcription_enabled;
         cfg.ice_servers = ice_servers;
+        cfg.federation_allow_h264 = federation_allow_h264;
         cfg
     }
 }
@@ -9470,9 +18582,4081 @@ mod tests {
     use crate::types::OutboundEvent;
     use tokio::io::AsyncWriteExt;
 
+    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        previous: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn unset(key: &'static str) -> Self {
+            let previous = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, previous }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match self.previous.take() {
+                Some(value) => std::env::set_var(self.key, value),
+                None => std::env::remove_var(self.key),
+            }
+        }
+    }
+
     #[test]
     fn test_default_port() {
         assert_eq!(DEFAULT_PORT, 8765);
+    }
+
+    #[test]
+    fn current_session_log_dir_uses_live_log_without_query_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("headless-session");
+        let session_log = Arc::new(Mutex::new(
+            crate::session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+
+        assert_eq!(
+            current_session_log_dir(Some(&session_log), None).unwrap(),
+            log_dir
+        );
+    }
+
+    #[test]
+    fn initial_body_bytes_preserves_non_utf8_upload_prefix() {
+        let mut request =
+            b"POST /api/session/current/uploads HTTP/1.1\r\nContent-Length: 4\r\n\r\n".to_vec();
+        request.extend_from_slice(&[0xff, 0x00, 0x80, b'a']);
+
+        assert_eq!(
+            initial_body_bytes(&request).unwrap(),
+            &[0xff, 0x00, 0x80, b'a']
+        );
+    }
+
+    #[test]
+    fn initial_body_bytes_rejects_incomplete_headers() {
+        let request = b"POST /api/session/current/uploads HTTP/1.1\r\nContent-Length: 4\r\n";
+        assert!(initial_body_bytes(request).is_err());
+    }
+
+    #[test]
+    fn source_viewer_request_strips_line_suffix() {
+        let dir = tempfile::tempdir().unwrap();
+        let src_dir = dir.path().join("src");
+        std::fs::create_dir_all(&src_dir).unwrap();
+        let file = src_dir.join("file name.rs");
+        std::fs::write(&file, "fn main() {}\n").unwrap();
+        let encoded_path = file.to_string_lossy().replace(' ', "%20");
+        let request_line = format!("GET {encoded_path}:42 HTTP/1.1");
+
+        let parsed = dashboard_source_request_from_line(&request_line).unwrap();
+        assert_eq!(parsed.path, file);
+        assert_eq!(parsed.line, Some(42));
+    }
+
+    #[test]
+    fn source_viewer_request_ignores_dashboard_routes() {
+        assert!(dashboard_source_request_from_line("GET /sessions HTTP/1.1").is_none());
+    }
+
+    #[test]
+    fn source_viewer_response_embeds_file_and_target_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        std::fs::write(&file, "fn one() {}\nfn two() {}\n").unwrap();
+        let request_line = format!("GET {}:2 HTTP/1.1", file.to_string_lossy());
+
+        let (status, body) = dashboard_source_viewer_response(&request_line).unwrap();
+        assert_eq!(status, "200 OK");
+        assert!(body.contains("\"line\":2"), "{body}");
+        assert!(body.contains("\"language\":\"rust\""), "{body}");
+        assert!(body.contains("source-code"), "{body}");
+    }
+
+    #[test]
+    fn dashboard_local_file_response_serves_image_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("screen shot.png");
+        let image_bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3];
+        std::fs::write(&file, &image_bytes).unwrap();
+        let encoded_path = file.to_string_lossy().replace(' ', "%20");
+        let request_line = format!("GET {encoded_path} HTTP/1.1");
+
+        match dashboard_local_file_response(&request_line).unwrap() {
+            DashboardLocalFileResponse::Bytes {
+                status,
+                content_type,
+                bytes,
+            } => {
+                assert_eq!(status, "200 OK");
+                assert_eq!(content_type, "image/png");
+                assert_eq!(bytes, image_bytes);
+            }
+            DashboardLocalFileResponse::Html { body, .. } => {
+                panic!("expected image bytes, got html: {body}")
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_local_file_response_keeps_text_source_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        std::fs::write(&file, "fn one() {}\nfn two() {}\n").unwrap();
+        let request_line = format!("GET {}:2 HTTP/1.1", file.to_string_lossy());
+
+        match dashboard_local_file_response(&request_line).unwrap() {
+            DashboardLocalFileResponse::Html { status, body } => {
+                assert_eq!(status, "200 OK");
+                assert!(body.contains("\"line\":2"), "{body}");
+                assert!(body.contains("source-code"), "{body}");
+            }
+            DashboardLocalFileResponse::Bytes { .. } => {
+                panic!("expected source viewer html, got bytes")
+            }
+        }
+    }
+
+    #[test]
+    fn preview_text_truncates_on_char_boundary() {
+        let text = "Wait, the `CONCURRENT AGENTS (n)` indicator is at the top — where";
+
+        assert_eq!(
+            preview_text(text, 60),
+            "Wait, the `CONCURRENT AGENTS (n)` indicator is at the top — ..."
+        );
+    }
+
+    #[test]
+    fn preview_text_leaves_short_unicode_unchanged() {
+        assert_eq!(preview_text("top — where", 60), "top — where");
+    }
+
+    #[test]
+    fn upload_destination_is_not_rewritten_without_active_session() {
+        assert_eq!(
+            effective_upload_destination(crate::upload_store::UploadDestination::Task, false,),
+            crate::upload_store::UploadDestination::Task
+        );
+        assert_eq!(
+            effective_upload_destination(crate::upload_store::UploadDestination::Workspace, false,),
+            crate::upload_store::UploadDestination::Workspace
+        );
+        assert_eq!(
+            effective_upload_destination(crate::upload_store::UploadDestination::Task, true,),
+            crate::upload_store::UploadDestination::Task
+        );
+    }
+
+    fn response_json_body(response: &str) -> serde_json::Value {
+        let body = response
+            .split_once("\r\n\r\n")
+            .map(|(_, body)| body)
+            .expect("response body");
+        serde_json::from_str(body).expect("json response")
+    }
+
+    fn managed_context_test_record(
+        record_id: &str,
+        session_id: Option<&str>,
+        thread_id: &str,
+        created_at: &str,
+    ) -> crate::context_rewind::ContextRewindRecord {
+        crate::context_rewind::ContextRewindRecord {
+            record_id: record_id.to_string(),
+            created_at: created_at.to_string(),
+            session_id: session_id.map(str::to_string),
+            thread_id: thread_id.to_string(),
+            item_id: "call-1".to_string(),
+            position: "after".to_string(),
+            reason: Some("crystallize branch".to_string()),
+            primer: Some("dense state".to_string()),
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            source_rollout_path: None,
+            recovery_rollout_path: None,
+            fission_snapshot: None,
+            lineage_ledger: None,
+            fission_ledger: None,
+        }
+    }
+
+    #[test]
+    fn managed_context_records_response_filters_by_session_or_thread_id() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "visible-by-session",
+                Some("dashboard session"),
+                "thread-a",
+                "2026-05-26T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "visible-by-thread",
+                Some("other-session"),
+                "dashboard session",
+                "2026-05-25T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "hidden",
+                Some("other-session"),
+                "other-thread",
+                "2026-05-24T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let response = managed_context_records_response(
+            "GET /api/managed-context/records?session_id=dashboard%20session HTTP/1.1",
+            dir.path(),
+        );
+        let body = response_json_body(&response);
+        let ids: Vec<_> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["record_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["visible-by-session", "visible-by-thread"]);
+    }
+
+    #[test]
+    fn managed_context_records_response_accepts_session_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        crate::context_rewind::persist_record(
+            dir.path(),
+            &managed_context_test_record(
+                "visible",
+                Some("session-a"),
+                "thread-a",
+                "2026-05-26T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let response = managed_context_records_response(
+            "GET /api/managed-context/records?session=session-a HTTP/1.1",
+            dir.path(),
+        );
+        let body = response_json_body(&response);
+        assert_eq!(body["records"].as_array().unwrap().len(), 1);
+        assert_eq!(body["records"][0]["record_id"], "visible");
+    }
+
+    #[test]
+    fn managed_context_records_response_scans_historical_logs_for_session_id() {
+        let home = tempfile::tempdir().unwrap();
+        let active = tempfile::tempdir().unwrap();
+        let old_log = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-a");
+        crate::context_rewind::persist_record(
+            &old_log,
+            &managed_context_test_record(
+                "historical",
+                Some("wrapper-a"),
+                "codex-thread-a",
+                "2026-05-27T00:00:00Z",
+            ),
+        )
+        .unwrap();
+        crate::context_rewind::persist_record(
+            active.path(),
+            &managed_context_test_record(
+                "active-other",
+                Some("active-session"),
+                "active-thread",
+                "2026-05-28T00:00:00Z",
+            ),
+        )
+        .unwrap();
+
+        let response = managed_context_records_response_from_home(
+            "GET /api/managed-context/records?session_id=codex-thread-a HTTP/1.1",
+            Some(active.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let ids: Vec<_> = body["records"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|record| record["record_id"].as_str().unwrap())
+            .collect();
+        assert_eq!(ids, vec!["historical"]);
+    }
+
+    #[test]
+    fn managed_context_anchors_response_reads_trace_anchors_by_backend_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let trace_dir = dir.path().join("model-request-traces").join("trace-a");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        let trace_path = trace_dir.join("trace.jsonl");
+        let lines = [
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944111933i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-visible",
+                    "kind": { "type": "exec_command" },
+                    "summary": {
+                        "label": "exec_command",
+                        "input_preview": "{\"cmd\":\"pwd\"}"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944112003i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_ended",
+                    "tool_call_id": "call-visible",
+                    "status": "completed"
+                }
+            }),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944113000i64,
+                "rollout_id": "other-thread",
+                "thread_id": "other-thread",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-hidden",
+                    "kind": { "type": "exec_command" }
+                }
+            }),
+        ];
+        std::fs::write(
+            trace_path,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let response = managed_context_anchors_response(
+            "GET /api/managed-context/anchors?session_id=codex-thread-a HTTP/1.1",
+            dir.path(),
+        );
+        let body = response_json_body(&response);
+        let anchors = body["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["item_id"], "call-visible");
+        assert_eq!(anchors[0]["session_id"], "codex-thread-a");
+        assert_eq!(anchors[0]["tool_name"], "exec_command");
+        assert_eq!(anchors[0]["status"], "completed");
+        assert!(anchors[0]["preview"]
+            .as_str()
+            .unwrap()
+            .contains("\"cmd\":\"pwd\""));
+    }
+
+    #[test]
+    fn managed_context_anchors_response_accepts_wrapper_session_alias() {
+        let home = tempfile::tempdir().unwrap();
+        let active = tempfile::tempdir().unwrap();
+        let old_log = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-a");
+        let trace_dir = old_log.join("model-request-traces").join("trace-a");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        std::fs::write(
+            trace_dir.join("trace.jsonl"),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944111933i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-wrapper",
+                    "kind": { "type": "exec_command" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response = managed_context_anchors_response_from_home(
+            "GET /api/managed-context/anchors?session_id=wrapper-a HTTP/1.1",
+            Some(active.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let anchors = body["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["item_id"], "call-wrapper");
+        assert_eq!(anchors[0]["intendant_session_id"], "wrapper-a");
+    }
+
+    #[test]
+    fn managed_context_anchors_response_scans_backend_when_wrapper_alias_is_stale() {
+        let home = tempfile::tempdir().unwrap();
+        let active = tempfile::tempdir().unwrap();
+        let logs_dir = home.path().join(".intendant").join("logs");
+        let stale_log = logs_dir.join("wrapper-stale");
+        let resumed_log = logs_dir.join("wrapper-resumed");
+        std::fs::create_dir_all(stale_log.join("model-request-traces")).unwrap();
+        let trace_dir = resumed_log
+            .join("model-request-traces")
+            .join("codex-thread-a-trace");
+        std::fs::create_dir_all(&trace_dir).unwrap();
+        std::fs::write(
+            trace_dir.join("trace.jsonl"),
+            serde_json::json!({
+                "wall_time_unix_ms": 1779944111933i64,
+                "rollout_id": "codex-thread-a",
+                "thread_id": "codex-thread-a",
+                "payload": {
+                    "type": "tool_call_started",
+                    "tool_call_id": "call-resumed",
+                    "kind": { "type": "exec_command" }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response = managed_context_anchors_response_from_home(
+            "GET /api/managed-context/anchors?session_id=codex-thread-a&backend_session_id=codex-thread-a&intendant_session_id=wrapper-stale HTTP/1.1",
+            Some(active.path()),
+            home.path(),
+        );
+        let body = response_json_body(&response);
+        let anchors = body["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1);
+        assert_eq!(anchors[0]["item_id"], "call-resumed");
+        assert_eq!(anchors[0]["session_id"], "codex-thread-a");
+        assert_eq!(anchors[0]["intendant_session_id"], "wrapper-resumed");
+    }
+
+    #[test]
+    fn pending_upload_session_dir_is_project_scoped() {
+        let root = std::path::PathBuf::from("/tmp/project");
+        assert_eq!(
+            pending_upload_session_dir(&root),
+            root.join(".intendant").join("pending_uploads")
+        );
+    }
+
+    #[test]
+    fn dashboard_fs_stat_reports_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let status = inspect_dashboard_fs_path(dir.path().to_str().unwrap()).unwrap();
+
+        assert!(status.exists);
+        assert!(status.is_dir);
+        assert!(status.readable);
+        assert!(!status.can_create);
+    }
+
+    #[test]
+    fn dashboard_fs_stat_marks_missing_directory_creatable() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("new").join("project");
+        let status = inspect_dashboard_fs_path(missing.to_str().unwrap()).unwrap();
+
+        assert!(!status.exists);
+        assert!(status.can_create);
+        assert_eq!(
+            status.nearest_existing_parent.as_deref(),
+            Some(dir.path().to_str().unwrap())
+        );
+    }
+
+    #[test]
+    fn dashboard_fs_mkdir_creates_missing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("new").join("project");
+        let result = mkdir_dashboard_fs_path(missing.to_str().unwrap()).unwrap();
+
+        assert_eq!(result["created"], true);
+        assert_eq!(result["already_exists"], false);
+        assert!(missing.is_dir());
+    }
+
+    #[test]
+    fn dashboard_fs_mkdir_reports_existing_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let result = mkdir_dashboard_fs_path(dir.path().to_str().unwrap()).unwrap();
+
+        assert_eq!(result["created"], false);
+        assert_eq!(result["already_exists"], true);
+    }
+
+    #[test]
+    fn external_session_json_falls_back_to_created_at_for_updated_at() {
+        let session = external_session_json(
+            "codex",
+            "Codex",
+            "session-1".to_string(),
+            "session-1".to_string(),
+            Some("2026-05-17T10:00:00Z".to_string()),
+            None,
+            Some("name".to_string()),
+            Some("task".to_string()),
+            "Codex",
+            None,
+            1,
+            None,
+            None,
+            None,
+            0,
+        );
+
+        assert_eq!(session["created_at"], "2026-05-17T10:00:00Z");
+        assert_eq!(session["updated_at"], "2026-05-17T10:00:00Z");
+        assert_eq!(session["name"], "name");
+    }
+
+    #[test]
+    fn external_agent_thread_id_is_extracted_from_log_messages() {
+        assert_eq!(
+            external_agent_thread_id_from_message(
+                "External agent thread: 019e41de-e785-7581-85dd-8e74bb464c6c"
+            )
+            .as_deref(),
+            Some("019e41de-e785-7581-85dd-8e74bb464c6c")
+        );
+        assert_eq!(
+            external_agent_thread_id_from_message(
+                "Mode: external agent (Codex) via presence, thread: codex-session-1"
+            )
+            .as_deref(),
+            Some("codex-session-1")
+        );
+        assert_eq!(
+            external_agent_source_from_message(
+                "Mode: external agent (Claude Code) via presence, thread: claude-session-1"
+            )
+            .as_deref(),
+            Some("claude-code")
+        );
+    }
+
+    #[test]
+    fn external_session_context_indexes_session_and_resume_ids() {
+        let sessions = vec![serde_json::json!({
+            "session_id": "display-id",
+            "resume_id": "resume-id",
+            "project_root": "/repo",
+            "cwd": "/repo/.worktrees/feature",
+            "source": "codex",
+            "source_label": "Codex",
+            "name": "Dashboard task"
+        })];
+
+        let context = external_session_context_by_id(&sessions);
+        assert_eq!(
+            context
+                .get("display-id")
+                .and_then(|ctx| ctx.project_root.as_deref()),
+            Some("/repo")
+        );
+        assert_eq!(
+            context.get("resume-id").and_then(|ctx| ctx.cwd.as_deref()),
+            Some("/repo/.worktrees/feature")
+        );
+        assert_eq!(
+            context
+                .get("resume-id")
+                .and_then(|ctx| ctx.source.as_deref()),
+            Some("codex")
+        );
+        assert_eq!(
+            context
+                .get("resume-id")
+                .and_then(|ctx| ctx.source_label.as_deref()),
+            Some("Codex")
+        );
+        assert_eq!(
+            context.get("resume-id").and_then(|ctx| ctx.name.as_deref()),
+            Some("Dashboard task")
+        );
+    }
+
+    #[test]
+    fn list_sessions_joins_external_context_from_debug_thread_log() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let command_cwd = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&command_cwd).unwrap();
+
+        let intendant_id = "intendant-wrapper-session";
+        let log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(intendant_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": intendant_id,
+                "created_at": "2026-05-17T20:44:00",
+                "project_root": repo.to_string_lossy(),
+                "task": "Dashboard-started Codex task",
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let codex_id = "019e37ae-dashboard-started";
+        let intendant_lines = [
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:01",
+                "event": "debug",
+                "message": "Mode: external agent (Codex)"
+            }),
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:01.500Z",
+                "event": "session_capabilities",
+                "data": {
+                    "session_id": intendant_id,
+                    "capabilities": {
+                        "follow_up": true,
+                        "steer": true,
+                        "interrupt": true,
+                        "codex_thread_actions": ["compact", "fork", "side"],
+                        "codex_managed_context": "managed",
+                        "codex_command": "/tmp/codex-managed"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:02",
+                "event": "debug",
+                "message": format!("External agent thread: {codex_id}")
+            }),
+        ];
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            intendant_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let codex_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": codex_id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "exec_command_end",
+                    "cwd": command_cwd.to_string_lossy()
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{codex_id}.jsonl")),
+            codex_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        assert!(
+            sessions.iter().all(|s| {
+                !(s.get("source").and_then(|v| v.as_str()) == Some("intendant")
+                    && s.get("session_id").and_then(|v| v.as_str()) == Some(intendant_id))
+            }),
+            "intendant wrapper should be merged into the native external session row"
+        );
+        let wrapped = sessions
+            .iter()
+            .find(|s| {
+                s.get("source").and_then(|v| v.as_str()) == Some("codex")
+                    && s.get("session_id").and_then(|v| v.as_str()) == Some(codex_id)
+            })
+            .expect("native Codex session should be listed");
+        let expected_project_root = repo.to_string_lossy().to_string();
+        let expected_cwd = command_cwd.to_string_lossy().to_string();
+        assert_eq!(
+            wrapped.get("project_root").and_then(|v| v.as_str()),
+            Some(expected_project_root.as_str())
+        );
+        assert_eq!(
+            wrapped.get("cwd").and_then(|v| v.as_str()),
+            Some(expected_cwd.as_str())
+        );
+        assert_eq!(
+            wrapped.get("backend_source").and_then(|v| v.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            wrapped.get("backend_source_label").and_then(|v| v.as_str()),
+            Some("Codex")
+        );
+        assert_eq!(
+            wrapped.get("backend_session_id").and_then(|v| v.as_str()),
+            Some(codex_id)
+        );
+        assert_eq!(
+            wrapped.get("intendant_session_id").and_then(|v| v.as_str()),
+            Some(intendant_id)
+        );
+        let capabilities = wrapped
+            .get("capabilities")
+            .and_then(|v| v.as_object())
+            .expect("capabilities should be merged from wrapper session");
+        assert_eq!(
+            capabilities
+                .get("codex_managed_context")
+                .and_then(|v| v.as_str()),
+            Some("managed")
+        );
+        assert_eq!(
+            capabilities.get("codex_command").and_then(|v| v.as_str()),
+            Some("/tmp/codex-managed")
+        );
+        assert_eq!(
+            wrapped
+                .get("codex_managed_context")
+                .and_then(|v| v.as_str()),
+            Some("managed")
+        );
+        assert_eq!(
+            wrapped.get("agent_command").and_then(|v| v.as_str()),
+            Some("/tmp/codex-managed")
+        );
+    }
+
+    #[test]
+    fn codex_observed_worktree_hints_include_exec_workdirs() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("projects").join("codex");
+        let worktree = repo.join(".worktrees").join("vanilla-upstream");
+        let worktree_src = worktree.join("src");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&worktree_src).unwrap();
+        std::fs::write(
+            worktree.join(".git"),
+            "gitdir: ../../.git/worktrees/vanilla\n",
+        )
+        .unwrap();
+
+        let session_id = "019e37ae-worktree-hints";
+        let rollout = home.path().join("rollout.jsonl");
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-27T13:00:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": session_id,
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-27T13:01:00Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": serde_json::json!({
+                        "workdir": worktree_src.to_string_lossy().to_string()
+                    }).to_string()
+                }
+            }),
+        ];
+        std::fs::write(
+            &rollout,
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let mut status_by_session = HashMap::new();
+        status_by_session.insert(
+            ("codex".to_string(), session_id.to_string()),
+            (
+                "running".to_string(),
+                Some("2026-05-27T13:02:00Z".to_string()),
+            ),
+        );
+
+        let hints = codex_observed_worktree_session_hints_from_file(
+            home.path(),
+            &rollout,
+            &status_by_session,
+        );
+
+        assert!(hints.iter().any(|hint| {
+            hint.project_root
+                .as_ref()
+                .map(|root| worktree_hint_path_key(root) == worktree_hint_path_key(&repo))
+                .unwrap_or(false)
+        }));
+        let worktree_hint = hints
+            .iter()
+            .find(|hint| {
+                hint.project_root
+                    .as_ref()
+                    .map(|root| worktree_hint_path_key(root) == worktree_hint_path_key(&worktree))
+                    .unwrap_or(false)
+            })
+            .expect("exec workdir hint should resolve to linked worktree root");
+        assert_eq!(worktree_hint.source, "codex");
+        assert_eq!(worktree_hint.session_id, session_id);
+        assert_eq!(worktree_hint.status, "running");
+        assert_eq!(
+            worktree_hint.updated_at.as_deref(),
+            Some("2026-05-27T13:02:00Z")
+        );
+    }
+
+    #[test]
+    fn list_sessions_cache_invalidates_intendant_log_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "intendant-cache-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let write_task = |task: &str| {
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": "2026-05-17T20:45:00",
+                    "event": "info",
+                    "message": format!("Task: {task}")
+                })
+                .to_string(),
+            )
+            .unwrap();
+        };
+        write_task("First cache task");
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        let row = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .unwrap();
+        assert_eq!(
+            row.get("task").and_then(|v| v.as_str()),
+            Some("First cache task")
+        );
+
+        write_task("Second cache invalidated task");
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        let row = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .unwrap();
+        assert_eq!(
+            row.get("task").and_then(|v| v.as_str()),
+            Some("Second cache invalidated task")
+        );
+    }
+
+    #[test]
+    fn session_log_search_finds_intendant_log_content_not_summary() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "intendant-search-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "ordinary dashboard task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": "Detailed log contains alpha-search-token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha-search-token",
+            "all",
+            "",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some(session_id)
+        );
+        assert_eq!(
+            results[0].get("source").and_then(|v| v.as_str()),
+            Some("intendant")
+        );
+    }
+
+    #[test]
+    fn session_log_search_can_filter_external_agent_sessions() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-search-filter";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/repo"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:40Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "ordinary request"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:50Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "external-only beta-search-token"
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "beta-search-token",
+            "external",
+            "",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("source").and_then(|v| v.as_str()),
+            Some("codex")
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "beta-search-token",
+            "intendant",
+            "",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_filters_deleted_external_references_from_parent_logs() {
+        let home = tempfile::tempdir().unwrap();
+        let parent_id = "intendant-parent-search-session";
+        let deleted_external_id = "019e37ae-deleted-search";
+        let deleted_marker = "deleted-parent-search-token";
+        let visible_marker = "visible-parent-search-token";
+        let log_dir = home.path().join(".intendant").join("logs").join(parent_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": parent_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "parent daemon session",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let lines = [
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:01",
+                "event": "presence_log",
+                "level": "debug",
+                "message": format!("[ws] ControlMsg: \"CreateSession {{ task: \\\"{deleted_marker}\\\" }}\"")
+            }),
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:02",
+                "event": "session_started",
+                "message": format!("Session started: {deleted_external_id} {deleted_marker}"),
+                "data": {
+                    "source": "codex",
+                    "session_id": deleted_external_id,
+                    "task": deleted_marker,
+                }
+            }),
+            serde_json::json!({
+                "ts": "2026-05-17T20:44:03",
+                "event": "info",
+                "message": visible_marker
+            }),
+        ];
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        mark_external_session_deleted(home.path(), "codex", deleted_external_id).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            deleted_marker,
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert!(
+            results.is_empty(),
+            "deleted external child references should not leak through parent log search: {results:?}"
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            visible_marker,
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some(parent_id)
+        );
+    }
+
+    #[test]
+    fn session_log_search_prefilters_by_project_directory() {
+        let home = tempfile::tempdir().unwrap();
+        for (session_id, project_root) in [
+            ("project-search-target", "/repo/target"),
+            ("project-search-other", "/repo/other"),
+        ] {
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({
+                    "session_id": session_id,
+                    "created_at": "2026-05-17T20:44:00",
+                    "task": "project scoped task",
+                    "status": "completed",
+                    "project_root": project_root,
+                    "cwd": project_root
+                })
+                .to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": "2026-05-17T20:45:00",
+                    "event": "info",
+                    "message": "shared-project-filter-token"
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let project_filter = vec!["/repo/target".to_string()];
+        let response: serde_json::Value =
+            serde_json::from_str(&session_log_search_from_home_with_projects(
+                home.path(),
+                "shared-project-filter-token",
+                "all",
+                "",
+                &project_filter,
+            ))
+            .unwrap();
+        assert_eq!(response.get("searched").and_then(|v| v.as_u64()), Some(1));
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some("project-search-target")
+        );
+
+        let missing_filter = vec!["/repo/missing".to_string()];
+        let response: serde_json::Value =
+            serde_json::from_str(&session_log_search_from_home_with_projects(
+                home.path(),
+                "shared-project-filter-token",
+                "all",
+                "",
+                &missing_filter,
+            ))
+            .unwrap();
+        assert_eq!(response.get("searched").and_then(|v| v.as_u64()), Some(0));
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_scans_beyond_recent_session_window() {
+        let home = tempfile::tempdir().unwrap();
+        for idx in 0..160 {
+            let session_id = format!("exhaustive-window-{idx:03}");
+            let log_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(&session_id);
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({
+                    "session_id": session_id,
+                    "created_at": format!("2026-05-17T{:02}:{:02}:00Z", 20 + idx / 60, idx % 60),
+                    "updated_at": format!("2026-05-17T{:02}:{:02}:00Z", 20 + idx / 60, idx % 60),
+                    "task": "exhaustive deep search window",
+                    "status": "completed"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            let message = if idx == 0 {
+                "oldest-session-only exhaustive-window-token"
+            } else {
+                "ordinary session log"
+            };
+            std::fs::write(
+                log_dir.join("session.jsonl"),
+                serde_json::json!({
+                    "ts": "2026-05-17T20:45:00",
+                    "event": "info",
+                    "message": message
+                })
+                .to_string(),
+            )
+            .unwrap();
+        }
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "exhaustive-window-token",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        assert_eq!(response.get("searched").and_then(|v| v.as_u64()), Some(160));
+        assert_eq!(
+            response.get("truncated").and_then(|v| v.as_bool()),
+            Some(false)
+        );
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some("exhaustive-window-000")
+        );
+    }
+
+    #[test]
+    fn session_log_search_scans_full_log_file_and_full_fields() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "exhaustive-full-file-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00Z",
+                "task": "full file search task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let mut contents = String::new();
+        for _ in 0..50_000 {
+            contents.push_str("{\"event\":\"info\",\"message\":\"prefix filler line\"}\n");
+        }
+        let mut long_field = "x".repeat(10_000);
+        long_field.push_str(" exhaustive-full-field-token");
+        contents.push_str(
+            &serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": long_field
+            })
+            .to_string(),
+        );
+        std::fs::write(log_dir.join("session.jsonl"), contents).unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "exhaustive-full-field-token",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        let results = response.get("results").and_then(|v| v.as_array()).unwrap();
+        assert_eq!(results.len(), 1);
+        assert_eq!(
+            results[0].get("session_id").and_then(|v| v.as_str()),
+            Some(session_id)
+        );
+    }
+
+    #[test]
+    fn session_log_search_supports_exact_phrase_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "exact-phrase-search-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "exact phrase task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": "Needle words appear as alpha phrase token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha phrase",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        assert_eq!(
+            response
+                .get("results")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha token",
+            "all",
+            "exact_phrase",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn session_log_search_supports_any_keyword_session_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let session_id = "any-keyword-search-session";
+        let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": session_id,
+                "created_at": "2026-05-17T20:44:00",
+                "task": "any keyword task",
+                "status": "completed"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            log_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-05-17T20:45:00",
+                "event": "info",
+                "message": "This line contains only one-side-token"
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "one-side-token absent-token",
+            "all",
+            "all_keywords",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "one-side-token absent-token",
+            "all",
+            "any_keyword_session",
+        ))
+        .unwrap();
+        assert_eq!(
+            response
+                .get("results")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[test]
+    fn session_log_search_supports_user_message_mode() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-user-message-search";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/repo"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:40Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "user_message",
+                    "message": "user-only alpha-token beta-token"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:50Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "agent_message",
+                    "message": "assistant-only gamma-token delta-token"
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "alpha-token beta-token",
+            "codex",
+            "user_message_all_keywords",
+        ))
+        .unwrap();
+        assert_eq!(
+            response
+                .get("results")
+                .and_then(|v| v.as_array())
+                .unwrap()
+                .len(),
+            1
+        );
+
+        let response: serde_json::Value = serde_json::from_str(&session_log_search_from_home(
+            home.path(),
+            "gamma-token delta-token",
+            "codex",
+            "user_message_all_keywords",
+        ))
+        .unwrap();
+        assert!(response
+            .get("results")
+            .and_then(|v| v.as_array())
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn list_codex_sessions_uses_first_real_user_message() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-f523-73b0-8bb4-01be02f30ebd";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z",
+                "thread_name": "# AGENTS.md instructions for /Users/vm/projects/intendant <INSTRUCTIONS>"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant",
+                    "model": "gpt-5.5",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-1"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "# AGENTS.md instructions for /Users/vm/projects/intendant <INSTRUCTIONS>"}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Fix the Sessions tab"}]
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix the Sessions tab"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix the Sessions tab")
+        );
+        assert_eq!(session.get("name").and_then(|v| v.as_str()), None);
+        assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn list_codex_sessions_cache_invalidates_when_file_changes() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        let id = "019e37ae-cache-invalidates";
+        let session_path = sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl"));
+
+        let write_task = |task: &str| {
+            let lines = [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "type": "session_meta",
+                    "payload": {
+                        "id": id,
+                        "timestamp": "2026-05-17T20:44:33Z",
+                        "cwd": "/repo"
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T20:45:21Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "user_message",
+                        "message": task
+                    }
+                }),
+            ];
+            std::fs::write(
+                &session_path,
+                lines
+                    .iter()
+                    .map(serde_json::Value::to_string)
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
+        };
+
+        write_task("First cached Codex task");
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap();
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("First cached Codex task")
+        );
+
+        write_task("Second invalidated Codex task");
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .unwrap();
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Second invalidated Codex task")
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_exposes_thread_name_separately_from_task() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-thread-name";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z",
+                "thread_name": "Rehydration fix"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix activity replay"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("name").and_then(|v| v.as_str()),
+            Some("Rehydration fix")
+        );
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix activity replay")
+        );
+    }
+
+    #[test]
+    fn list_sessions_applies_external_session_name_overlay() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-overlay-name";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix naming"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+        crate::session_names::rename_session(home.path(), "codex", id, "Overlay name").unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("name").and_then(|v| v.as_str()),
+            Some("Overlay name")
+        );
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix naming")
+        );
+    }
+
+    #[test]
+    fn list_sessions_filters_deleted_external_session_tombstones() {
+        let home = tempfile::tempdir().unwrap();
+        let codex_dir = home.path().join(".codex");
+        let sessions_dir = codex_dir
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-deleted-external";
+        std::fs::write(
+            codex_dir.join("session_index.jsonl"),
+            serde_json::json!({
+                "id": id,
+                "updated_at": "2026-05-17T20:44:33Z"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": "/Users/vm/projects/intendant"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Delete me"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        assert!(
+            sessions
+                .iter()
+                .any(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id)),
+            "codex session should be listed before tombstone"
+        );
+
+        mark_external_session_deleted(home.path(), "codex", id).unwrap();
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home.path())).unwrap();
+        assert!(
+            !sessions
+                .iter()
+                .any(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id)),
+            "tombstoned codex session should be hidden"
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_separates_project_root_from_latest_command_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let command_cwd = repo.join(".worktrees").join("feature");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&command_cwd).unwrap();
+
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-project-cwd-split";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "exec_command_end",
+                    "cwd": command_cwd.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:22Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Inspect cwd"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        let expected_project_root = repo.to_string_lossy().to_string();
+        let expected_cwd = command_cwd.to_string_lossy().to_string();
+        assert_eq!(
+            session.get("project_root").and_then(|v| v.as_str()),
+            Some(expected_project_root.as_str())
+        );
+        assert_eq!(
+            session.get("cwd").and_then(|v| v.as_str()),
+            Some(expected_cwd.as_str())
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_uses_function_call_workdir_as_latest_cwd() {
+        let home = tempfile::tempdir().unwrap();
+        let repo = home.path().join("repo");
+        let command_cwd = repo.join(".worktrees").join("live-cwd");
+        std::fs::create_dir_all(repo.join(".git")).unwrap();
+        std::fs::create_dir_all(&command_cwd).unwrap();
+
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37ae-function-call-workdir";
+        let arguments = serde_json::json!({
+            "cmd": "pwd",
+            "workdir": command_cwd.to_string_lossy()
+        })
+        .to_string();
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:44:33Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T20:44:33Z",
+                    "cwd": repo.to_string_lossy()
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:21Z",
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": arguments
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:45:22Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Inspect cwd"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-44-33-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        let expected_project_root = repo.to_string_lossy().to_string();
+        let expected_cwd = command_cwd.to_string_lossy().to_string();
+        assert_eq!(
+            session.get("project_root").and_then(|v| v.as_str()),
+            Some(expected_project_root.as_str())
+        );
+        assert_eq!(
+            session.get("cwd").and_then(|v| v.as_str()),
+            Some(expected_cwd.as_str())
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_applies_thread_rollback_to_turns_and_task() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37b2-e756-7461-9946-34b639448717";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T20:48:52Z",
+                "type": "session_meta",
+                "payload": {"id": id, "timestamp": "2026-05-17T20:48:52Z"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "old-turn"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "Old prompt"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Old prompt"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "turn_aborted", "turn_id": "old-turn"}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "thread_rolled_back", "num_turns": 1}
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "new-turn"}
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "New prompt"}]
+                }
+            }),
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "New prompt"}
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T20-48-52-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("New prompt")
+        );
+        assert_eq!(session.get("turns").and_then(|v| v.as_u64()), Some(1));
+    }
+
+    #[test]
+    fn list_codex_sessions_parses_token_count_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37c5-9d93-76f0-a395-f5b28bd54a74";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "cwd": "/Users/vm/projects/intendant",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {"type": "task_started", "turn_id": "turn-1"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:02Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Fix stats usage"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 200,
+                            "cached_input_tokens": 50,
+                            "output_tokens": 25,
+                            "total_tokens": 225
+                        },
+                        "model_context_window": 258400
+                    }
+                }
+            }),
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{id}.jsonl")),
+            contents,
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(1000));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(250));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(400));
+        assert_eq!(session["total_tokens"].as_u64(), Some(1250));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.00535).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn list_codex_sessions_subtracts_parent_usage_from_forks() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_id = "019e37c5-parent-cost-thread";
+        let child_id = "019e37c5-child-cost-thread";
+        let parent_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": parent_id,
+                    "timestamp": "2026-05-17T21:09:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:30Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:11:00Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 2000,
+                            "cached_input_tokens": 600,
+                            "output_tokens": 400,
+                            "total_tokens": 2400
+                        }
+                    }
+                }
+            }),
+        ];
+        let child_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:30Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1300,
+                            "cached_input_tokens": 550,
+                            "output_tokens": 300,
+                            "total_tokens": 1600
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-09-00-{parent_id}.jsonl")),
+            parent_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{child_id}.jsonl")),
+            child_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let parent = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(parent_id))
+            .expect("parent codex session should be listed");
+        let child = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(child_id))
+            .expect("child codex session should be listed");
+
+        assert_eq!(parent["total_tokens"].as_u64(), Some(2400));
+        assert_eq!(child["prompt_tokens"].as_u64(), Some(300));
+        assert_eq!(child["completion_tokens"].as_u64(), Some(50));
+        assert_eq!(child["cached_tokens"].as_u64(), Some(150));
+        assert_eq!(child["total_tokens"].as_u64(), Some(350));
+        let cost = child["estimated_cost"].as_f64().unwrap();
+        assert!(
+            (cost - 0.0011625).abs() < 1e-12,
+            "unexpected child cost {cost}"
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_keeps_cumulative_usage_after_thread_rollback() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e37c5-rollback-cost-thread";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "model": "gpt-5.4",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:02Z",
+                "type": "event_msg",
+                "payload": {"type": "thread_rolled_back", "num_turns": 1}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:03Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 0,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": 120
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:04Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1300,
+                            "cached_input_tokens": 550,
+                            "output_tokens": 300,
+                            "total_tokens": 1600
+                        },
+                        "last_token_usage": {
+                            "input_tokens": 300,
+                            "cached_input_tokens": 150,
+                            "output_tokens": 50,
+                            "total_tokens": 350
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(1300));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(300));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(550));
+        assert_eq!(session["total_tokens"].as_u64(), Some(1600));
+    }
+
+    #[test]
+    fn list_codex_sessions_inherits_model_from_parent_thread() {
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("05")
+            .join("17");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_id = "019e37c5-parent-model-thread";
+        let child_id = "019e37c5-child-forked-thread";
+        let parent_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": parent_id,
+                    "timestamp": "2026-05-17T21:09:00Z",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:09:01Z",
+                "type": "turn_context",
+                "payload": {"model": "gpt-5.5"}
+            }),
+        ];
+        let child_lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:00Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "forked_from_id": parent_id,
+                    "timestamp": "2026-05-17T21:10:00Z",
+                    "model_provider": "openai"
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:01Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Use inherited model"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:10:02Z",
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 1000,
+                            "cached_input_tokens": 400,
+                            "output_tokens": 250,
+                            "total_tokens": 1250
+                        }
+                    }
+                }
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-09-00-{parent_id}.jsonl")),
+            parent_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T21-10-00-{child_id}.jsonl")),
+            child_lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(child_id))
+            .expect("child codex session should be listed");
+        assert_eq!(session["model"].as_str(), Some("gpt-5.5"));
+        assert_eq!(session["pricing_known"].as_bool(), Some(true));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.0107).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn list_claude_sessions_parses_and_deduplicates_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-Users-vm-projects-intendant");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "019e37cf-34ad-7b08-8a1e-7ad5086eb39f";
+        let assistant = serde_json::json!({
+            "timestamp": "2026-05-17T21:20:02Z",
+            "type": "assistant",
+            "cwd": "/Users/vm/projects/intendant",
+            "requestId": "req-usage-1",
+            "message": {
+                "id": "msg-usage-1",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 10,
+                    "cache_creation_input_tokens": 20,
+                    "cache_read_input_tokens": 30,
+                    "output_tokens": 40
+                }
+            }
+        });
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:20:00Z",
+                "type": "user",
+                "cwd": "/Users/vm/projects/intendant",
+                "message": {"content": "Fix stats usage"}
+            }),
+            assistant.clone(),
+            assistant,
+        ];
+        let contents = lines
+            .iter()
+            .map(serde_json::Value::to_string)
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(project_dir.join(format!("{session_id}.jsonl")), contents).unwrap();
+
+        let sessions = list_claude_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .expect("claude session should be listed");
+        assert_eq!(
+            session.get("task").and_then(|v| v.as_str()),
+            Some("Fix stats usage")
+        );
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(60));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(40));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(30));
+        assert_eq!(session["cache_creation_tokens"].as_u64(), Some(20));
+        assert_eq!(session["total_tokens"].as_u64(), Some(100));
+        assert_eq!(session["turns"].as_u64(), Some(1));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.000714).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn list_claude_sessions_counts_usage_in_large_file_middle() {
+        let home = tempfile::tempdir().unwrap();
+        let project_dir = home
+            .path()
+            .join(".claude")
+            .join("projects")
+            .join("-Users-vm-projects-intendant");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "019e37cf-large-middle-usage";
+        let user = serde_json::json!({
+            "timestamp": "2026-05-17T21:20:00Z",
+            "type": "user",
+            "cwd": "/Users/vm/projects/intendant",
+            "message": {"content": "Fix stats usage"}
+        });
+        let assistant = serde_json::json!({
+            "timestamp": "2026-05-17T21:20:02Z",
+            "type": "assistant",
+            "cwd": "/Users/vm/projects/intendant",
+            "requestId": "req-middle",
+            "message": {
+                "id": "msg-middle",
+                "model": "claude-sonnet-4-6",
+                "usage": {
+                    "input_tokens": 1000,
+                    "cache_creation_input_tokens": 2000,
+                    "cache_read_input_tokens": 3000,
+                    "output_tokens": 4000
+                }
+            }
+        });
+        let filler = "x".repeat(EXTERNAL_SESSION_READ_LIMIT as usize + 64);
+        let contents = format!("{}\n{}\n{}\n{}\n", user, filler, assistant, filler);
+        std::fs::write(project_dir.join(format!("{session_id}.jsonl")), contents).unwrap();
+
+        let sessions = list_claude_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .expect("claude session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(6000));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(4000));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(3000));
+        assert_eq!(session["cache_creation_tokens"].as_u64(), Some(2000));
+        assert_eq!(session["total_tokens"].as_u64(), Some(10000));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.0714).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn list_claude_sessions_deduplicates_symlinked_project_dirs() {
+        let home = tempfile::tempdir().unwrap();
+        let projects_dir = home.path().join(".claude").join("projects");
+        let project_dir = projects_dir.join("-Users-vm-projects-intendant");
+        std::fs::create_dir_all(&project_dir).unwrap();
+
+        let session_id = "019e37cf-symlink-dedupe";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:20:00Z",
+                "type": "user",
+                "cwd": "/Users/vm/projects/intendant",
+                "message": {"content": "Fix stats usage"}
+            }),
+            serde_json::json!({
+                "timestamp": "2026-05-17T21:20:02Z",
+                "type": "assistant",
+                "cwd": "/Users/vm/projects/intendant",
+                "requestId": "req-usage",
+                "message": {
+                    "id": "msg-usage",
+                    "model": "claude-sonnet-4-6",
+                    "usage": {"input_tokens": 10, "output_tokens": 20}
+                }
+            }),
+        ];
+        std::fs::write(
+            project_dir.join(format!("{session_id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        std::os::unix::fs::symlink(
+            &project_dir,
+            projects_dir.join("-Volumes-Untitled-projects-intendant"),
+        )
+        .unwrap();
+
+        let sessions = list_claude_sessions(home.path());
+        let matching = sessions
+            .iter()
+            .filter(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .count();
+        assert_eq!(matching, 1);
+    }
+
+    #[test]
+    fn list_gemini_sessions_parses_token_usage() {
+        let home = tempfile::tempdir().unwrap();
+        let chats_dir = home
+            .path()
+            .join(".gemini")
+            .join("tmp")
+            .join("sample-project")
+            .join("chats");
+        std::fs::create_dir_all(&chats_dir).unwrap();
+
+        let session_id = "session-2026-05-18T09-30-gemini";
+        let session = serde_json::json!({
+            "sessionId": session_id,
+            "startTime": "2026-05-18T09:30:00Z",
+            "messages": [
+                {
+                    "type": "user",
+                    "timestamp": "2026-05-18T09:30:01Z",
+                    "content": "Fix stats usage"
+                },
+                {
+                    "type": "assistant",
+                    "timestamp": "2026-05-18T09:30:02Z",
+                    "model": "gemini-2.5-flash",
+                    "tokens": {
+                        "input": 1000,
+                        "cached": 100,
+                        "output": 20,
+                        "thoughts": 30,
+                        "tool": 5,
+                        "total": 1055
+                    },
+                    "content": "Done"
+                }
+            ]
+        });
+        std::fs::write(
+            chats_dir.join(format!("{session_id}.json")),
+            serde_json::to_string(&session).unwrap(),
+        )
+        .unwrap();
+
+        let sessions = list_gemini_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(session_id))
+            .expect("gemini session should be listed");
+        assert_eq!(session["prompt_tokens"].as_u64(), Some(1000));
+        assert_eq!(session["completion_tokens"].as_u64(), Some(55));
+        assert_eq!(session["cached_tokens"].as_u64(), Some(100));
+        assert_eq!(session["total_tokens"].as_u64(), Some(1055));
+        assert_eq!(session["turns"].as_u64(), Some(1));
+        assert_eq!(session["model"].as_str(), Some("gemini-2.5-flash"));
+        assert_eq!(session["pricing_known"].as_bool(), Some(true));
+        let cost = session["estimated_cost"].as_f64().unwrap();
+        assert!((cost - 0.0004105).abs() < 1e-12, "unexpected cost {cost}");
+    }
+
+    #[test]
+    fn sort_sessions_newest_first_uses_updated_at() {
+        let mut sessions = vec![
+            serde_json::json!({
+                "session_id": "newer-created",
+                "created_at": "2026-05-17T11:00:00Z",
+                "updated_at": "2026-05-17T11:00:00Z",
+            }),
+            serde_json::json!({
+                "session_id": "recently-changed",
+                "created_at": "2026-05-17T08:00:00Z",
+                "updated_at": "2026-05-17T12:00:00Z",
+            }),
+            serde_json::json!({
+                "session_id": "fallback-created",
+                "created_at": "2026-05-17T10:30:00Z",
+            }),
+        ];
+
+        sort_sessions_newest_first(&mut sessions);
+        let ids: Vec<_> = sessions
+            .iter()
+            .filter_map(|s| s.get("session_id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert_eq!(
+            ids,
+            vec!["recently-changed", "newer-created", "fallback-created"]
+        );
+    }
+
+    #[test]
+    fn filter_session_list_by_ids_matches_session_and_backend_ids() {
+        let body = serde_json::json!([
+            {
+                "session_id": "wrapper-a",
+                "backend_session_id": "backend-a",
+                "intendant_session_id": "intendant-a",
+                "source": "codex"
+            },
+            {
+                "session_id": "standalone-b",
+                "resume_id": "resume-b",
+                "source": "intendant"
+            },
+            {
+                "session_id": "other-c",
+                "source": "codex"
+            }
+        ])
+        .to_string();
+
+        let filtered =
+            filter_session_list_by_ids(&body, &["backend-a".to_string(), "resume-b".to_string()]);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&filtered).unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.get("session_id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert_eq!(ids, vec!["wrapper-a", "standalone-b"]);
+    }
+
+    #[test]
+    fn session_ids_filter_from_request_distinguishes_absent_and_empty_filters() {
+        assert!(session_ids_filter_from_request("GET /api/sessions HTTP/1.1").is_none());
+        assert_eq!(
+            session_ids_filter_from_request("GET /api/sessions?ids=ok-id,%2E%2E%2Fbad HTTP/1.1"),
+            Some(vec!["ok-id".to_string()])
+        );
+        assert_eq!(
+            session_ids_filter_from_request("GET /api/sessions?ids=..%2Fbad HTTP/1.1"),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn codex_detail_uses_session_meta_id_not_substring_mentions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let target_id = "019e36b9-fffa-7b42-9070-e06db38b2abd";
+        let other_id = "019e37ea-1ace-7091-ad2a-7805190330fa";
+
+        std::fs::write(
+            sessions_dir.join("a-other-session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-05-17T21:49:12.197Z",
+                    "type": "session_meta",
+                    "payload": { "id": other_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T21:49:16.518Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": format!("mentions {target_id} but is the wrong file")
+                            }
+                        ]
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        let target_path = sessions_dir.join("z-target-session.jsonl");
+        std::fs::write(
+            &target_path,
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({
+                    "timestamp": "2026-05-17T18:16:59.898Z",
+                    "type": "session_meta",
+                    "payload": { "id": target_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T18:17:01.000Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "input_text",
+                                "text": "Implement a new subtab for the dashboard in the Activity tab"
+                            }
+                        ]
+                    }
+                })
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            find_codex_session_file(dir.path(), target_id).as_deref(),
+            Some(target_path.as_path())
+        );
+
+        let detail = external_session_detail_from_home(dir.path(), "codex", target_id)
+            .expect("target session should resolve");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let entries = detail
+            .get("entries")
+            .and_then(|v| v.as_array())
+            .expect("entries should be present");
+        let contents: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry.get("content").and_then(|v| v.as_str()))
+            .collect();
+
+        assert!(
+            contents
+                .iter()
+                .any(|content| content.contains("Implement a new subtab")),
+            "target session content missing: {contents:?}"
+        );
+        assert!(
+            contents
+                .iter()
+                .all(|content| !content.contains("wrong file")),
+            "detail included content from a substring match: {contents:?}"
+        );
+        assert!(entries.iter().any(|entry| {
+            entry.get("source").and_then(|v| v.as_str()) == Some("user")
+                && entry
+                    .get("content")
+                    .and_then(|v| v.as_str())
+                    .is_some_and(|content| content.contains("Implement a new subtab"))
+        }));
+    }
+
+    #[test]
+    fn codex_transcript_filters_and_deduplicates_human_assistant_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-transcript-filter";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:53Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{ "type": "input_text", "text": "internal developer context" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:54Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "# AGENTS.md instructions for /Users/vm/projects/intendant\n<INSTRUCTIONS>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:55Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<subagent_notification>\n{\"agent_path\":\"child\",\"status\":{\"completed\":\"done\"}}\n</subagent_notification>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:56Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<environment_context>\n  <cwd>/repo</cwd>\n</environment_context>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:57Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<user_shell_command>\n<command>\nhtop\n</command>\n</user_shell_command>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:58Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<task-notification>\n<task-id>child</task-id>\n</task-notification>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Visible prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00.013Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "Visible prompt" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04.276Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Visible answer" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04.289Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Visible answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:05Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"echo hidden\"}"
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let detail = external_session_detail_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should resolve");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let entries = detail["entries"].as_array().unwrap();
+        let contents: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents, vec!["Visible prompt", "Visible answer"]);
+        assert_eq!(entries[0]["source"], "user");
+        assert_eq!(entries[0]["user_turn_index"], 1);
+        assert_eq!(entries[1]["source"], "codex");
+    }
+
+    #[test]
+    fn external_transcript_cache_invalidates_when_source_file_changes() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-cache-invalidation";
+        let path = sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl"));
+        let session_meta = serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        });
+        let first_message = serde_json::json!({
+            "timestamp": "2026-05-17T16:49:00Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "user",
+                "content": [{ "type": "input_text", "text": "first cached message" }]
+            }
+        });
+        let second_message = serde_json::json!({
+            "timestamp": "2026-05-17T16:49:01Z",
+            "type": "response_item",
+            "payload": {
+                "type": "message",
+                "role": "assistant",
+                "content": [{ "type": "output_text", "text": "second uncached message" }]
+            }
+        });
+
+        std::fs::write(&path, format!("{session_meta}\n{first_message}\n")).unwrap();
+        let first = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("first load should resolve");
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0]["content"], "first cached message");
+
+        std::fs::write(
+            &path,
+            format!("{session_meta}\n{first_message}\n{second_message}\n"),
+        )
+        .unwrap();
+        let second = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("second load should resolve");
+        let contents: Vec<_> = second
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(
+            contents,
+            vec!["first cached message", "second uncached message"]
+        );
+    }
+
+    #[test]
+    fn codex_transcript_keeps_repeated_messages_outside_dedupe_window() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-transcript-repeat";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Still working" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:10Z",
+                    "type": "event_msg",
+                    "payload": { "type": "agent_message", "message": "Still working" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should resolve");
+        let contents: Vec<_> = entries
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents, vec!["Still working", "Still working"]);
+    }
+
+    #[test]
+    fn external_activity_replay_uses_compact_session_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-e756-7461-9946-34b639448717";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "What happens on refresh?" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "The task keeps running." }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        assert_eq!(replay["t"], "log_replay");
+        assert_eq!(replay["replay_semantics"], EXTERNAL_TRANSCRIPT_SEMANTICS);
+
+        let entries = replay["entries"].as_array().unwrap();
+        assert_eq!(entries[0]["event"], "replay_start");
+        assert_eq!(
+            entries[0]["replay_semantics"],
+            EXTERNAL_TRANSCRIPT_SEMANTICS
+        );
+        assert_eq!(entries[1]["event"], "session_attached");
+        assert_eq!(entries[1]["session_id"], session_id);
+        assert_eq!(entries[1]["source"], "codex");
+
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry"
+                && entry["session_id"] == session_id
+                && entry["level"] == "info"
+                && entry["source"] == "user"
+                && entry["content"] == "What happens on refresh?"
+                && entry["user_turn_index"] == 1
+        }));
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry"
+                && entry["session_id"] == session_id
+                && entry["level"] == "model"
+                && entry["source"] == "codex"
+                && entry["content"] == "The task keeps running."
+        }));
+    }
+
+    #[test]
+    fn external_activity_replay_marks_rolled_back_context() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-overwritten-activity";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Old prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Old answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "New prompt" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let old_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Old prompt")
+            .expect("old prompt should remain visible");
+        assert_eq!(old_prompt["user_turn_index"], 1);
+        assert_eq!(old_prompt["user_turn_revision"], 1);
+        assert_eq!(old_prompt["superseded"], true);
+
+        let old_answer = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Old answer")
+            .expect("old answer should remain visible");
+        assert_eq!(old_answer["superseded"], true);
+
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry"
+                && entry["kind"] == "rollback_marker"
+                && entry["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Rewound 1 user turn"))
+        }));
+
+        let new_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "New prompt")
+            .expect("replacement prompt should replay");
+        assert_eq!(new_prompt["user_turn_index"], 1);
+        assert_eq!(new_prompt["user_turn_revision"], 2);
+        assert_eq!(new_prompt["replacement_for_user_turn_index"], 1);
+        assert_ne!(new_prompt["superseded"], true);
+    }
+
+    #[test]
+    fn external_activity_replay_preserves_anchor_rollback_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-anchor-rewind-activity";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Kept answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 0,
+                        "anchor": { "itemId": "call-keep", "position": "after" }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let marker = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["kind"] == "rollback_marker")
+            .expect("anchor rollback marker should replay");
+        assert_eq!(marker["rollback_turns"], 0);
+        assert_eq!(marker["rollback_anchor_item_id"], "call-keep");
+        assert_eq!(marker["rollback_anchor_position"], "after");
+        assert!(marker["content"]
+            .as_str()
+            .is_some_and(|content| content.contains("Rewound to after item call-keep")));
+    }
+
+    #[test]
+    fn external_activity_replay_supersedes_entries_after_item_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-item-anchor-dimming";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-prompt",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-keep",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Kept answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg-noise",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Discarded noise" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:03Z",
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 0,
+                        "anchor": { "itemId": "msg-keep", "position": "after" }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let entry_for = |needle: &str| {
+            entries
+                .iter()
+                .find(|entry| entry["content"].as_str() == Some(needle))
+                .unwrap_or_else(|| panic!("missing entry {needle}"))
+                .clone()
+        };
+        // Everything up to and including the "after" anchor stays live; the tail is dimmed.
+        assert_ne!(entry_for("Prompt")["superseded"], true);
+        assert_ne!(entry_for("Kept answer")["superseded"], true);
+        assert_eq!(entry_for("Discarded noise")["superseded"], true);
+    }
+
+    #[test]
+    fn external_activity_replay_tracks_double_rewind_revisions() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-double-rewind-activity";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Original prompt" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Original answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:03Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Replacement one" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:04Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "Replacement answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:05Z",
+                    "type": "event_msg",
+                    "payload": { "type": "thread_rolled_back", "num_turns": 1 }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:06Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Replacement two" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        let original = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Original prompt")
+            .expect("original prompt should replay");
+        assert_eq!(original["user_turn_index"], 1);
+        assert_eq!(original["user_turn_revision"], 1);
+        assert_eq!(original["superseded"], true);
+
+        let first_replacement = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Replacement one")
+            .expect("first replacement should replay");
+        assert_eq!(first_replacement["user_turn_index"], 1);
+        assert_eq!(first_replacement["user_turn_revision"], 2);
+        assert_eq!(first_replacement["replacement_for_user_turn_index"], 1);
+        assert_eq!(first_replacement["superseded"], true);
+
+        let second_replacement = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "Replacement two")
+            .expect("second replacement should replay");
+        assert_eq!(second_replacement["user_turn_index"], 1);
+        assert_eq!(second_replacement["user_turn_revision"], 3);
+        assert_eq!(second_replacement["replacement_for_user_turn_index"], 1);
+        assert_ne!(second_replacement["superseded"], true);
+    }
+
+    #[test]
+    fn codex_transcript_keeps_distinct_identical_user_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-identical-user-turns";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "continue" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "first answer" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:02Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "continue" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should parse");
+        let user_entries: Vec<_> = entries
+            .iter()
+            .filter(|entry| {
+                entry.get("source").and_then(|v| v.as_str()) == Some("user")
+                    && entry.get("content").and_then(|v| v.as_str()) == Some("continue")
+            })
+            .collect();
+
+        assert_eq!(user_entries.len(), 2);
+        assert_eq!(user_entries[0]["user_turn_index"], 1);
+        assert_eq!(user_entries[1]["user_turn_index"], 2);
+    }
+
+    #[test]
+    fn codex_transcript_uses_user_message_events_as_editable_turns_when_present() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-event-user-canonical";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "provider request context" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "human prompt" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should parse");
+        assert!(!entries
+            .iter()
+            .any(|entry| entry.get("content").and_then(|v| v.as_str())
+                == Some("provider request context")));
+
+        let prompt = entries
+            .iter()
+            .find(|entry| entry.get("content").and_then(|v| v.as_str()) == Some("human prompt"))
+            .expect("event user message should be rendered");
+        assert_eq!(prompt["user_turn_index"], 1);
+        assert_eq!(prompt["user_turn_revision"], 1);
+    }
+
+    #[test]
+    fn resume_session_open_replays_full_external_transcript() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-full-activity-replay";
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        })];
+        for n in 1..=90 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-05-17T16:{:02}:00Z", 49 + (n / 60)),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": if n % 2 == 0 { "assistant" } else { "user" },
+                    "content": [{ "type": "text", "text": format!("turn message {n}") }]
+                }
+            }));
+        }
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            lines
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            session_id,
+            None,
+            None,
+            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+        )
+        .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let contents: Vec<_> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "log_entry")
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents.len(), 90);
+        assert_eq!(contents.first(), Some(&"turn message 1"));
+        assert_eq!(contents.last(), Some(&"turn message 90"));
+        assert!(replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "log_entry")
+            .all(|entry| entry["session_id"] == session_id));
+    }
+
+    #[test]
+    fn external_activity_replay_limits_transcript_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-e756-7461-9946-34b639448717";
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        })];
+        for n in 1..=3 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-05-17T16:49:0{n}Z"),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": format!("message {n}") }]
+                }
+            }));
+        }
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            lines
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let replay = external_session_activity_replay_from_home(dir.path(), "codex", session_id, 2)
+            .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let contents: Vec<_> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "log_entry")
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+
+        assert_eq!(contents, vec!["message 2", "message 3"]);
+    }
+
+    #[test]
+    fn resume_session_open_replays_external_transcript_without_attach_marker() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-e756-7461-9946-34b639448717";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "Open this from Sessions" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            session_id,
+            None,
+            None,
+            80,
+        )
+        .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        assert_eq!(entries[0]["event"], "replay_start");
+        assert!(
+            entries
+                .iter()
+                .all(|entry| entry["event"] != "session_attached"),
+            "Sessions-tab open replay should let the live attach event render the attach line"
+        );
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry"
+                && entry["session_id"] == session_id
+                && entry["content"] == "Open this from Sessions"
+        }));
+    }
+
+    #[test]
+    fn resume_session_open_does_not_replay_when_task_is_submitted() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resume_session_activity_replay_from_home(
+            dir.path(),
+            "codex",
+            "session-1",
+            None,
+            Some("continue the task"),
+            80,
+        )
+        .is_none());
+    }
+
+    #[test]
+    fn resume_session_open_replays_intendant_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".intendant").join("logs").join("session-1");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.model_response("internal history", 0, 0, 0, 0, None);
+        drop(log);
+
+        let replay = resume_session_activity_replay_from_home(
+            dir.path(),
+            "intendant",
+            "session-1",
+            None,
+            None,
+            80,
+        )
+        .expect("intendant session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+
+        assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["event"] == "model_response" && entry["summary"] == "internal history"
+        }));
+    }
+
+    #[test]
+    fn session_detail_exposes_persisted_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".intendant").join("logs").join("parent");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.session_relationship("parent", "child", "subagent", false);
+        drop(log);
+
+        let detail: serde_json::Value =
+            serde_json::from_str(&get_session_detail_from_home(dir.path(), "parent")).unwrap();
+        let relationships = detail["relationships"].as_array().unwrap();
+
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0]["parent_session_id"], "parent");
+        assert_eq!(relationships[0]["child_session_id"], "child");
+        assert_eq!(relationships[0]["relationship"], "subagent");
+        assert_eq!(relationships[0]["ephemeral"], false);
+    }
+
+    #[test]
+    fn session_detail_http_status_marks_missing_sessions_not_found() {
+        let missing = serde_json::json!({"error": "session not found"}).to_string();
+        assert_eq!(session_detail_http_status(&missing), "404 Not Found");
+        assert_eq!(
+            session_detail_http_status(&serde_json::json!({"entries": []}).to_string()),
+            "200 OK"
+        );
+    }
+
+    #[test]
+    fn list_sessions_exposes_persisted_relationships() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join(".intendant").join("logs").join("parent");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.session_relationship("parent", "child", "subagent", false);
+        drop(log);
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(dir.path())).unwrap();
+        let parent = sessions
+            .iter()
+            .find(|session| session["session_id"] == "parent")
+            .expect("parent session should be listed");
+        let relationships = parent["relationships"].as_array().unwrap();
+
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0]["parent_session_id"], "parent");
+        assert_eq!(relationships[0]["child_session_id"], "child");
+        assert_eq!(relationships[0]["relationship"], "subagent");
+    }
+
+    #[test]
+    fn merged_external_session_preserves_wrapper_relationships() {
+        let mut external = serde_json::json!({
+            "source": "codex",
+            "session_id": "parent",
+            "resume_id": "parent",
+        });
+        let wrapper = serde_json::json!({
+            "session_id": "wrapper",
+            "backend_source": "codex",
+            "backend_session_id": "parent",
+            "relationships": [{
+                "parent_session_id": "parent",
+                "child_session_id": "child",
+                "relationship": "subagent",
+                "ephemeral": false,
+            }],
+        });
+
+        merge_intendant_wrapper_into_external_session(&mut external, &wrapper);
+
+        let relationships = external["relationships"].as_array().unwrap();
+        assert_eq!(relationships.len(), 1);
+        assert_eq!(relationships[0]["parent_session_id"], "parent");
+        assert_eq!(relationships[0]["child_session_id"], "child");
+    }
+
+    #[test]
+    fn external_attached_session_cache_ignores_internal_sessions() {
+        assert_eq!(
+            external_attached_session_from_wire(
+                &serde_json::json!({
+                    "event": "session_attached",
+                    "session_id": "internal",
+                    "source": "intendant"
+                })
+                .to_string()
+            ),
+            None
+        );
+        assert_eq!(
+            external_attached_session_from_wire(
+                &serde_json::json!({
+                    "event": "session_attached",
+                    "session_id": "external",
+                    "source": "codex"
+                })
+                .to_string()
+            ),
+            Some(("external".to_string(), "codex".to_string()))
+        );
+    }
+
+    #[test]
+    fn external_attached_session_cache_tracks_all_live_external_sessions() {
+        let mut sessions = HashMap::new();
+        for (session_id, source) in [("codex-a", "codex"), ("claude-b", "claude_code")] {
+            update_external_attached_sessions_from_wire(
+                &mut sessions,
+                &serde_json::json!({
+                    "event": "session_attached",
+                    "session_id": session_id,
+                    "source": source,
+                })
+                .to_string(),
+            );
+        }
+
+        update_external_attached_sessions_from_wire(
+            &mut sessions,
+            &serde_json::json!({
+                "event": "session_started",
+                "session_id": "internal-wrapper",
+            })
+            .to_string(),
+        );
+
+        assert_eq!(sessions.get("codex-a").map(String::as_str), Some("codex"));
+        assert_eq!(
+            sessions.get("claude-b").map(String::as_str),
+            Some("claude-code")
+        );
+
+        update_external_attached_sessions_from_wire(
+            &mut sessions,
+            &serde_json::json!({
+                "event": "session_ended",
+                "session_id": "codex-a",
+            })
+            .to_string(),
+        );
+
+        assert!(!sessions.contains_key("codex-a"));
+        assert_eq!(
+            sessions.get("claude-b").map(String::as_str),
+            Some("claude-code")
+        );
     }
 
     #[test]
@@ -9504,16 +22688,119 @@ mod tests {
         assert_eq!(payload.external_agent.as_deref(), Some("codex"));
         assert_eq!(payload.codex_sandbox, "workspace-write");
         assert_eq!(payload.codex_approval_policy, "on-request");
+        assert_eq!(payload.codex_managed_context, None);
         assert_eq!(payload.gemini_approval_mode, "default");
 
         let mut config = crate::project::ProjectConfig::default();
+        config.agent.codex.command = "/opt/codex/bin/codex".to_string();
         config.agent.codex.sandbox = "danger-full-access".to_string();
+        config.agent.codex.managed_context = "managed".to_string();
+        config.agent.codex.service_tier = Some("priority".to_string());
         config.agent.gemini_cli.approval_mode = "yolo".to_string();
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
+        assert_eq!(config.agent.codex.command, "/opt/codex/bin/codex");
         assert_eq!(config.agent.codex.sandbox, "danger-full-access");
+        assert_eq!(config.agent.codex.managed_context, "managed");
+        assert_eq!(config.agent.codex.service_tier.as_deref(), Some("priority"));
         assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
+    }
+
+    #[test]
+    fn settings_payload_round_trips_codex_command() {
+        let mut config = crate::project::ProjectConfig::default();
+        config.agent.codex.command = "/usr/local/bin/codex".to_string();
+        config.agent.codex.managed_context = "managed".to_string();
+        config.agent.codex.service_tier = Some("priority".to_string());
+        config.agent.claude_code.command = "/usr/local/bin/claude".to_string();
+        config.agent.gemini_cli.command = "/usr/local/bin/gemini".to_string();
+
+        let payload = settings_payload_from_config(&config);
+        assert_eq!(
+            payload.codex_command.as_deref(),
+            Some("/usr/local/bin/codex")
+        );
+        assert_eq!(payload.codex_managed_context.as_deref(), Some("managed"));
+        assert_eq!(payload.codex_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            payload.claude_command.as_deref(),
+            Some("/usr/local/bin/claude")
+        );
+        assert_eq!(
+            payload.gemini_command.as_deref(),
+            Some("/usr/local/bin/gemini")
+        );
+
+        let body = serde_json::json!({
+            "cu_provider": null,
+            "cu_model": null,
+            "cu_backend": "auto",
+            "presence_enabled": true,
+            "presence_provider": null,
+            "presence_model": null,
+            "presence_live_provider": null,
+            "presence_live_model": null,
+            "transcription_enabled": false,
+            "transcription_provider": "openai",
+            "transcription_model": "whisper-1",
+            "transcription_endpoint": null,
+            "transcription_language": null,
+            "recording_enabled": false,
+            "recording_framerate": 15,
+            "recording_quality": "medium",
+            "live_audio_enabled": false,
+            "live_audio_timeout_secs": 300,
+            "external_agent": "codex",
+            "codex_command": "  /opt/homebrew/bin/codex  ",
+            "codex_service_tier": "normal",
+            "codex_managed_context": "true",
+            "claude_command": "  /opt/claude/bin/claude  ",
+            "gemini_command": "  /opt/gemini/bin/gemini  "
+        })
+        .to_string();
+
+        let payload: SettingsPayload = serde_json::from_str(&body).unwrap();
+        apply_settings_payload(&mut config, &payload);
+
+        assert_eq!(config.agent.codex.command, "/opt/homebrew/bin/codex");
+        assert_eq!(config.agent.codex.service_tier.as_deref(), Some("standard"));
+        assert_eq!(config.agent.codex.managed_context, "managed");
+        assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");
+        assert_eq!(config.agent.gemini_cli.command, "/opt/gemini/bin/gemini");
+    }
+
+    #[test]
+    fn settings_post_result_rejects_invalid_json_with_bad_request() {
+        let (status, body) = settings_post_result("{\"external_agent\":", Some(Path::new(".")));
+
+        assert_eq!(status, "400 Bad Request");
+        assert!(body.contains("Invalid settings"));
+    }
+
+    #[test]
+    fn settings_post_result_rejects_missing_project_root_with_bad_request() {
+        let (status, body) = settings_post_result("{}", None);
+
+        assert_eq!(status, "400 Bad Request");
+        assert!(body.contains("No project root"));
+    }
+
+    #[test]
+    fn mcp_context_from_request_line_reads_session_scoped_managed_context() {
+        let (session_id, managed_context, tool_profile) = mcp_context_from_request_line(
+            "POST /mcp?session_id=abc-123&managed_context=managed&tool_profile=core HTTP/1.1",
+        );
+        assert_eq!(session_id.as_deref(), Some("abc-123"));
+        assert_eq!(managed_context, Some(true));
+        assert_eq!(tool_profile.as_deref(), Some("core"));
+
+        let (session_id, managed_context, tool_profile) = mcp_context_from_request_line(
+            "POST /mcp?intendant_session=wrapped%20id&managed_context=vanilla HTTP/1.1",
+        );
+        assert_eq!(session_id.as_deref(), Some("wrapped id"));
+        assert_eq!(managed_context, Some(false));
+        assert_eq!(tool_profile, None);
     }
 
     /// A specific bind address is preserved verbatim in the
@@ -9523,14 +22810,40 @@ mod tests {
         use std::net::{Ipv4Addr, SocketAddr};
         let specific = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 8765);
         assert_eq!(
-            resolve_advertise_urls(Some(specific), &[]),
+            resolve_advertise_urls(Some(specific), &[], false),
             vec!["ws://127.0.0.1:8765/ws".to_string()]
         );
         let lan_ip = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
         assert_eq!(
-            resolve_advertise_urls(Some(lan_ip), &[]),
+            resolve_advertise_urls(Some(lan_ip), &[], false),
             vec!["ws://192.168.1.42:8765/ws".to_string()]
         );
+    }
+
+    /// With TLS enabled the auto-detected scheme is `wss://`, not `ws://`
+    /// — a TLS daemon is HTTPS/WSS-only, so advertising `ws://` would hand
+    /// peers a URL they'd be refused on. Operator overrides are still
+    /// taken verbatim (they own their scheme).
+    #[test]
+    fn advertise_url_uses_wss_when_tls_enabled() {
+        use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+        let specific = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
+        assert_eq!(
+            resolve_advertise_urls(Some(specific), &[], true),
+            vec!["wss://192.168.1.42:8765/ws".to_string()]
+        );
+        let v6 = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8765);
+        let urls = resolve_advertise_urls(Some(v6), &[], true);
+        assert_eq!(urls, vec!["wss://[::1]:8765/ws".to_string()]);
+        // Wildcard bind with TLS: every auto-detected URL is wss://.
+        let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
+        for url in resolve_advertise_urls(Some(wildcard), &[], true) {
+            assert!(url.starts_with("wss://"), "tls scheme on every URL: {url}");
+        }
+        // Operator override is verbatim — its scheme is not rewritten.
+        let overrides = vec!["ws://operator.example:9000/ws".to_string()];
+        let urls = resolve_advertise_urls(Some(specific), &overrides, true);
+        assert_eq!(urls[0], "ws://operator.example:9000/ws");
     }
 
     /// Wildcard bind (0.0.0.0) gets replaced with one URL per routable
@@ -9548,7 +22861,7 @@ mod tests {
     fn advertise_url_replaces_ipv4_wildcard_with_interface_urls() {
         use std::net::{Ipv4Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
-        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        let urls = resolve_advertise_urls(Some(wildcard), &[], false);
         assert!(
             !urls.is_empty(),
             "auto-detect should produce at least one URL"
@@ -9579,7 +22892,7 @@ mod tests {
     fn advertise_url_replaces_ipv6_wildcard_with_interface_urls() {
         use std::net::{Ipv6Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv6Addr::UNSPECIFIED.into(), 8765);
-        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        let urls = resolve_advertise_urls(Some(wildcard), &[], false);
         assert!(
             !urls.is_empty(),
             "wildcard v6 bind should still produce some auto-detected URLs"
@@ -9600,7 +22913,7 @@ mod tests {
     fn advertise_url_brackets_specific_ipv6_address() {
         use std::net::{Ipv6Addr, SocketAddr};
         let specific = SocketAddr::new(Ipv6Addr::LOCALHOST.into(), 8765);
-        let urls = resolve_advertise_urls(Some(specific), &[]);
+        let urls = resolve_advertise_urls(Some(specific), &[], false);
         assert_eq!(urls.len(), 1);
         assert!(
             urls[0].contains("[::1]"),
@@ -9707,7 +23020,7 @@ mod tests {
             "ws://192.168.1.42:8765/ws".to_string(),
             "wss://laptop.tail-abcd.ts.net:8443/ws".to_string(),
         ];
-        let urls = resolve_advertise_urls(Some(bind), &overrides);
+        let urls = resolve_advertise_urls(Some(bind), &overrides, false);
         // Overrides come first, auto-detected entry appended.
         assert_eq!(urls.len(), 3, "got: {urls:?}");
         assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
@@ -9721,7 +23034,7 @@ mod tests {
     fn empty_overrides_use_only_auto_detected_url() {
         use std::net::{Ipv4Addr, SocketAddr};
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
-        let urls = resolve_advertise_urls(Some(lan), &[]);
+        let urls = resolve_advertise_urls(Some(lan), &[], false);
         assert_eq!(urls, vec!["ws://192.168.1.42:8765/ws".to_string()]);
     }
 
@@ -9735,7 +23048,7 @@ mod tests {
         use std::net::{Ipv4Addr, SocketAddr};
         let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
         let overrides = vec!["ws://192.168.1.42:8765/ws".to_string()];
-        let urls = resolve_advertise_urls(Some(lan), &overrides);
+        let urls = resolve_advertise_urls(Some(lan), &overrides, false);
         assert_eq!(urls.len(), 1, "duplicate suppressed: {urls:?}");
         assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
     }
@@ -9749,7 +23062,7 @@ mod tests {
     fn advertise_wildcard_bind_enumerates_interfaces_excluding_loopback() {
         use std::net::{Ipv4Addr, SocketAddr};
         let wildcard = SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), 8765);
-        let urls = resolve_advertise_urls(Some(wildcard), &[]);
+        let urls = resolve_advertise_urls(Some(wildcard), &[], false);
         assert!(
             !urls.is_empty(),
             "expected at least one auto-detected URL, got: {urls:?}"
@@ -9777,7 +23090,7 @@ mod tests {
     fn specific_bind_narrows_auto_detection_to_one_interface() {
         use std::net::{Ipv4Addr, SocketAddr};
         let lan_only = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 42).into(), 8765);
-        let urls = resolve_advertise_urls(Some(lan_only), &[]);
+        let urls = resolve_advertise_urls(Some(lan_only), &[], false);
         assert_eq!(urls.len(), 1, "specific bind = exactly one auto entry");
         assert_eq!(urls[0], "ws://192.168.1.42:8765/ws");
     }
@@ -9790,6 +23103,621 @@ mod tests {
         assert!(APP_HTML.contains("tab-stats"));
         assert!(APP_HTML.contains("tab-terminal"));
         assert!(APP_HTML.contains("tab-displays"));
+        assert!(APP_HTML.contains("/three.module.min.js"));
+        assert!(THREE_MODULE_JS.contains("Three.js Authors"));
+    }
+
+    #[test]
+    fn changes_request_decodes_nested_file_path() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/main.rs");
+        let current_path = project.path().join("src/main.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "old\nsame\n").unwrap();
+        std::fs::write(&current_path, "new\nsame\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/src%2Fmain.rs HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "src/main.rs");
+        assert!(json["diff"].as_str().unwrap().contains("-old"));
+        assert!(json["diff"].as_str().unwrap().contains("+new"));
+    }
+
+    #[test]
+    fn changes_request_without_path_lists_files() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/main.rs");
+        let current_path = project.path().join("src/main.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "old\n").unwrap();
+        std::fs::write(&current_path, "new\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert!(
+            json.as_array().is_some(),
+            "list endpoint should return an array"
+        );
+        assert_eq!(json[0]["path"], "src/main.rs");
+    }
+
+    #[test]
+    fn changes_request_lists_current_only_created_file() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+        let current_path = project.path().join("src/new.rs");
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&current_path, "new\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], "src/new.rs");
+        assert_eq!(json[0]["kind"], "created");
+        assert_eq!(json[0]["lines_added"], 1);
+        assert_eq!(json[0]["diff_available"], true);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn changes_request_created_file_detail_accepts_symlinked_snapshot_root() {
+        use std::os::unix::fs::symlink;
+
+        let holder = tempfile::TempDir::new().unwrap();
+        let real_log = holder.path().join("real-log");
+        let linked_log = holder.path().join("linked-log");
+        std::fs::create_dir_all(real_log.join("file_snapshots/baseline")).unwrap();
+        symlink(&real_log, &linked_log).unwrap();
+
+        let snapshot_dir = linked_log.join("file_snapshots");
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(project.path().join("new file.txt"), "created\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/new%20file.txt HTTP/1.1",
+            Some(&snapshot_dir),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "new file.txt");
+        assert_eq!(json["kind"], "created");
+        assert!(json["diff"].as_str().unwrap().contains("+created"));
+    }
+
+    #[test]
+    fn changes_request_surfaces_external_absolute_diff_from_session_log() {
+        let log = tempfile::TempDir::new().unwrap();
+        let snapshot_dir = log.path().join("file_snapshots");
+        let project = tempfile::TempDir::new().unwrap();
+        let external = tempfile::TempDir::new().unwrap();
+        let external_path = external.path().join("outside file.txt");
+        let external_display = external_path.to_string_lossy();
+        std::fs::create_dir_all(snapshot_dir.join("baseline")).unwrap();
+        let diff = format!(
+            "External agent diff: {external_display}\n# intendant-project-root: {}\n--- a/{external_display}\n+++ b/{external_display}\n@@ -0,0 +1,2 @@\n+alpha\n+beta\n",
+            project.path().display()
+        );
+        let entry = serde_json::json!({
+            "event": "info",
+            "message": diff,
+        });
+        std::fs::write(log.path().join("session.jsonl"), format!("{entry}\n")).unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(&snapshot_dir),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], external_display.as_ref());
+        assert_eq!(json[0]["kind"], "external");
+        assert_eq!(json[0]["lines_added"], 2);
+        assert!(json[0]["reason"]
+            .as_str()
+            .unwrap()
+            .contains("outside tracked project root"));
+
+        let encoded = external_display
+            .replace('%', "%25")
+            .replace('/', "%2F")
+            .replace(' ', "%20");
+        let request = format!("GET /api/session/current/changes/{encoded} HTTP/1.1");
+        let (status, body) =
+            handle_changes_request(&request, Some(&snapshot_dir), Some(project.path()));
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], external_display.as_ref());
+        assert_eq!(json["kind"], "external");
+        assert!(json["diff"].as_str().unwrap().contains("+alpha"));
+    }
+
+    #[test]
+    fn changes_request_targets_external_wrapper_diff_without_baseline() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let wrapper_id = "wrapper-session";
+        let backend_id = "backend-session";
+        let wrapper_dir = logs_dir.join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-05-29T06:11:20",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external diff"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let diff = format!(
+            "External agent diff: 2 files (created.txt, tracked.txt)\n# intendant-project-root: {}\ndiff --git a/created.txt b/created.txt\nnew file mode 100644\n--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\ndiff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            project.path().display()
+        );
+        let session_lines = vec![
+            serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"}),
+            serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")}),
+            serde_json::json!({"event": "info", "message": diff}),
+        ];
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            session_lines
+                .into_iter()
+                .map(|line| line.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let default_snapshot = tempfile::TempDir::new().unwrap();
+        let default_project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(default_snapshot.path().join("baseline")).unwrap();
+
+        let request = format!("GET /api/session/current/changes?session_id={backend_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(default_snapshot.path()),
+            Some(default_project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let paths: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("path").and_then(|path| path.as_str()))
+            .collect();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(paths, vec!["created.txt", "tracked.txt"]);
+        assert_eq!(json[0]["kind"], "created");
+        assert_eq!(json[1]["kind"], "modified");
+
+        let request = format!(
+            "GET /api/session/current/changes/created.txt?session_id={backend_id} HTTP/1.1"
+        );
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(default_snapshot.path()),
+            Some(default_project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "created.txt");
+        assert!(json["diff"].as_str().unwrap().contains("+created"));
+    }
+
+    #[test]
+    fn resolve_session_dir_accepts_external_backend_id() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let wrapper_id = "wrapper-session";
+        let backend_id = "backend-session";
+        let wrapper_dir = logs_dir.join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-05-29T06:11:20",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external report"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"})
+                    .to_string(),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+                    .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_session_dir_from_home(home.path(), backend_id).as_deref(),
+            Some(wrapper_dir.as_path())
+        );
+    }
+
+    #[test]
+    fn resolve_session_dir_rejects_unsafe_session_ids() {
+        let home = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(home.path().join(".intendant/logs/safe-session")).unwrap();
+
+        for session_id in [
+            "",
+            ".",
+            "..",
+            "../logs",
+            "safe/session",
+            "safe\\session",
+            " safe",
+        ] {
+            assert!(
+                resolve_session_dir_from_home(home.path(), session_id).is_none(),
+                "unsafe session id resolved: {session_id:?}"
+            );
+        }
+
+        let expected = home.path().join(".intendant/logs/safe-session");
+        assert_eq!(
+            resolve_session_dir_from_home(home.path(), "safe").as_deref(),
+            Some(expected.as_path())
+        );
+    }
+
+    #[test]
+    fn changes_request_target_without_snapshot_falls_back_to_live_project() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let wrapper_id = "wrapper-session";
+        let backend_id = "backend-session";
+        let wrapper_dir = logs_dir.join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": wrapper_id,
+                "created_at": "2026-05-29T06:11:20",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external session without watcher snapshots"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"})
+                    .to_string(),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+                    .to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let live_snapshot = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(live_snapshot.path().join("baseline")).unwrap();
+        std::fs::write(project.path().join("created.txt"), "created\n").unwrap();
+
+        let request = format!("GET /api/session/current/changes?session_id={backend_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], "created.txt");
+        assert_eq!(json[0]["kind"], "created");
+
+        let request = format!(
+            "GET /api/session/current/changes/created.txt?session_id={backend_id} HTTP/1.1"
+        );
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(live_snapshot.path()),
+            Some(project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "created.txt");
+        assert!(json["diff"].as_str().unwrap().contains("+created"));
+    }
+
+    #[test]
+    fn changes_request_prefers_matching_external_log_with_changes() {
+        let home = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::write(project.path().join("created.txt"), "created\n").unwrap();
+        std::fs::write(project.path().join("tracked.txt"), "new\n").unwrap();
+        let logs_dir = home.path().join(".intendant/logs");
+        let backend_id = "backend-session";
+
+        let attach_dir = logs_dir.join("attach-wrapper");
+        std::fs::create_dir_all(attach_dir.join("file_snapshots/baseline")).unwrap();
+        std::fs::write(
+            attach_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "attach-wrapper",
+                "project_root": project.path().to_string_lossy(),
+                "task": "reattach"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            attach_dir.join("session.jsonl"),
+            format!(
+                "{}\n{}\n",
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"}),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+            ),
+        )
+        .unwrap();
+        std::fs::write(
+            attach_dir.join("file_snapshots/baseline/created.txt"),
+            "created\n",
+        )
+        .unwrap();
+        std::fs::write(
+            attach_dir.join("file_snapshots/baseline/tracked.txt"),
+            "new\n",
+        )
+        .unwrap();
+
+        let wrapper_dir = logs_dir.join("original-wrapper");
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "original-wrapper",
+                "project_root": project.path().to_string_lossy(),
+                "task": "external diff"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let diff = format!(
+            "External agent diff: 2 files (created.txt, tracked.txt)\n# intendant-project-root: {}\ndiff --git a/created.txt b/created.txt\nnew file mode 100644\n--- /dev/null\n+++ b/created.txt\n@@ -0,0 +1 @@\n+created\ndiff --git a/tracked.txt b/tracked.txt\n--- a/tracked.txt\n+++ b/tracked.txt\n@@ -1 +1 @@\n-old\n+new\n",
+            project.path().display()
+        );
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            [
+                serde_json::json!({"event": "info", "message": "Mode: external agent (Codex)"})
+                    .to_string(),
+                serde_json::json!({"event": "debug", "message": format!("External agent thread: {backend_id}")})
+                    .to_string(),
+                serde_json::json!({"event": "info", "message": diff}).to_string(),
+            ]
+            .join("\n"),
+        )
+        .unwrap();
+
+        let default_snapshot = tempfile::TempDir::new().unwrap();
+        let default_project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(default_snapshot.path().join("baseline")).unwrap();
+
+        let request = format!("GET /api/session/current/changes?session_id={backend_id} HTTP/1.1");
+        let (status, body) = handle_changes_request_for_home(
+            &request,
+            Some(default_snapshot.path()),
+            Some(default_project.path()),
+            home.path(),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let paths: Vec<_> = json
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|item| item.get("path").and_then(|path| path.as_str()))
+            .collect();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(paths, vec!["created.txt", "tracked.txt"]);
+    }
+
+    #[test]
+    fn changes_request_lists_created_empty_file() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+        std::fs::write(project.path().join("empty.txt"), "").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 1);
+        assert_eq!(json[0]["path"], "empty.txt");
+        assert_eq!(json[0]["kind"], "created");
+        assert_eq!(json[0]["lines_added"], 0);
+        assert_eq!(json[0]["lines_removed"], 0);
+    }
+
+    #[test]
+    fn changes_request_empty_baseline_file_modified_is_not_created() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/empty.txt");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "").unwrap();
+        std::fs::write(project.path().join("empty.txt"), "now has text\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json[0]["path"], "empty.txt");
+        assert_eq!(json[0]["kind"], "modified");
+        assert_eq!(json[0]["lines_added"], 1);
+    }
+
+    #[test]
+    fn changes_request_created_then_deleted_net_zero_is_absent() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn changes_request_ignores_nested_worktrees() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+        let worktree_file = project.path().join(".worktrees/feature/src/main.rs");
+        std::fs::create_dir_all(worktree_file.parent().unwrap()).unwrap();
+        std::fs::write(worktree_file, "fn main() {}\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json.as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn changes_request_reports_unsupported_current_for_text_baseline() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/main.rs");
+        let current_path = project.path().join("src/main.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "fn main() {}\n").unwrap();
+        std::fs::write(&current_path, b"fn\0main").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json[0]["path"], "src/main.rs");
+        assert_eq!(json[0]["kind"], "modified");
+        assert_eq!(json[0]["diff_available"], false);
+        assert_eq!(json[0]["reason"], "binary file");
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/src/main.rs HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["diff_available"], false);
+        assert_eq!(json["diff"], "");
+    }
+
+    #[test]
+    fn changes_request_decodes_segment_escaped_file_path() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        let baseline_path = snapshot.path().join("baseline/src/file name.rs");
+        let current_path = project.path().join("src/file name.rs");
+        std::fs::create_dir_all(baseline_path.parent().unwrap()).unwrap();
+        std::fs::create_dir_all(current_path.parent().unwrap()).unwrap();
+        std::fs::write(&baseline_path, "before\n").unwrap();
+        std::fs::write(&current_path, "after\n").unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/src/file%20name.rs HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "200 OK");
+        assert_eq!(json["path"], "src/file name.rs");
+        assert!(json["diff"].as_str().unwrap().contains("-before"));
+        assert!(json["diff"].as_str().unwrap().contains("+after"));
+    }
+
+    #[test]
+    fn changes_request_rejects_decoded_path_traversal() {
+        let snapshot = tempfile::TempDir::new().unwrap();
+        let project = tempfile::TempDir::new().unwrap();
+        std::fs::create_dir_all(snapshot.path().join("baseline")).unwrap();
+
+        let (status, body) = handle_changes_request(
+            "GET /api/session/current/changes/%2E%2E/Cargo.toml HTTP/1.1",
+            Some(snapshot.path()),
+            Some(project.path()),
+        );
+        let json: serde_json::Value = serde_json::from_str(&body).unwrap();
+
+        assert_eq!(status, "400 Bad Request");
+        assert_eq!(json["error"], "invalid path");
     }
 
     #[test]
@@ -9815,6 +23743,7 @@ mod tests {
             Some("gemini-2.5-flash-native-audio-preview-12-2025"),
             false,
             crate::display::IceConfig::default(),
+            false,
         );
         assert_eq!(config.provider, "gemini");
         assert_eq!(config.input_sample_rate, 16000);
@@ -9827,6 +23756,7 @@ mod tests {
             Some("gpt-4o-realtime-preview"),
             false,
             crate::display::IceConfig::default(),
+            false,
         );
         assert_eq!(config.provider, "openai");
         assert_eq!(config.input_sample_rate, 24000);
@@ -9839,6 +23769,7 @@ mod tests {
             None,
             false,
             crate::display::IceConfig::default(),
+            false,
         );
         assert_eq!(config.provider, "openai");
         assert_eq!(config.model, "gpt-4o-realtime-preview");
@@ -9848,7 +23779,13 @@ mod tests {
     fn test_build_config_no_model() {
         // With no model and no env vars set in a predictable way,
         // this should default to gemini
-        let config = build_config(None, None, false, crate::display::IceConfig::default());
+        let config = build_config(
+            None,
+            None,
+            false,
+            crate::display::IceConfig::default(),
+            false,
+        );
         // Either gemini or openai depending on env, but it shouldn't panic
         assert!(!config.provider.is_empty());
     }
@@ -9926,6 +23863,10 @@ mod tests {
             turn_started.get("ts").is_some(),
             "ts should be injected into each outbound entry"
         );
+        assert_eq!(
+            turn_started.get("session_id").and_then(|v| v.as_str()),
+            Some("session")
+        );
 
         // auto_approved preview preserved.
         let auto_approved = entries
@@ -9935,6 +23876,10 @@ mod tests {
         assert_eq!(
             auto_approved.get("preview").and_then(|v| v.as_str()),
             Some("exec: ls")
+        );
+        assert_eq!(
+            auto_approved.get("session_id").and_then(|v| v.as_str()),
+            Some("session")
         );
 
         // round_complete fields propagated.
@@ -9947,6 +23892,520 @@ mod tests {
             round.get("turns_in_round").and_then(|v| v.as_u64()),
             Some(3)
         );
+    }
+
+    #[test]
+    fn session_list_round_complete_is_idle_not_completed() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.round_complete(1, 3);
+        drop(log);
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["status"].as_str(), Some("idle"));
+    }
+
+    #[test]
+    fn session_list_preserves_user_interrupted_status_after_round_complete() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.info("External agent interrupted: user requested");
+        log.round_complete(1, 2);
+        drop(log);
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["status"].as_str(), Some("interrupted"));
+    }
+
+    #[test]
+    fn session_list_new_turn_after_interrupt_returns_to_in_progress() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.info("Interrupted: user requested");
+        log.round_complete(1, 1);
+        log.turn_start(2, 0.0, 100_000);
+        drop(log);
+
+        let row = intendant_session_list_row_from_dir(&log_dir, "session").unwrap();
+        assert_eq!(row["status"].as_str(), Some("in_progress"));
+    }
+
+    #[test]
+    fn test_external_wrapper_replay_uses_backend_session_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("wrapper-session");
+        let backend_id = "019e598b-256e-7b61-8816-22908ece438a";
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.session_started("wrapper-session", Some("external task"));
+        log.session_identity("wrapper-session", "codex", backend_id);
+        log.info("Mode: external agent (Codex)");
+        log.debug(&format!("External agent thread: {backend_id}"));
+        log.info("[user] continue here");
+        drop(log);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+        let started_row = entries
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_started"))
+            .expect("wrapper session_started should replay");
+        let identity_row = entries
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_identity"))
+            .expect("wrapper session_identity should replay");
+        let user_row = entries
+            .iter()
+            .find(|entry| {
+                entry.get("event").and_then(|v| v.as_str()) == Some("log_entry")
+                    && entry.get("content").and_then(|v| v.as_str()) == Some("continue here")
+            })
+            .expect("wrapper log entry should replay");
+
+        assert_eq!(
+            started_row.get("session_id").and_then(|v| v.as_str()),
+            Some(backend_id)
+        );
+        assert_eq!(
+            identity_row.get("session_id").and_then(|v| v.as_str()),
+            Some("wrapper-session")
+        );
+        assert_eq!(
+            user_row.get("session_id").and_then(|v| v.as_str()),
+            Some(backend_id)
+        );
+    }
+
+    #[test]
+    fn resume_external_wrapper_replays_full_log_with_editable_user_turns() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let log_dir = home.join(".intendant").join("logs").join("wrapper-session");
+        let backend_id = "019e598b-editable-wrapper-replay";
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.session_started("wrapper-session", Some("external task"));
+        log.session_identity("wrapper-session", "codex", backend_id);
+        log.info("Mode: external agent (Codex)");
+        log.info("[user] first prompt");
+        log.info("full wrapper-only event");
+        log.info("[user] second prompt");
+        drop(log);
+
+        let codex_dir = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&codex_dir).unwrap();
+        std::fs::write(
+            codex_dir.join(format!("rollout-2026-05-17T16-48-52-{backend_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": backend_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "first prompt" }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:50:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": "assistant reply" }]
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:51:00Z",
+                    "type": "event_msg",
+                    "payload": { "type": "user_message", "message": "second prompt" }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let replay = resume_session_activity_replay_from_home(
+            home,
+            "codex",
+            "wrapper-session",
+            Some(backend_id),
+            None,
+            EXTERNAL_ACTIVITY_REPLAY_LIMIT,
+        )
+        .expect("wrapper session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+
+        assert!(entries.iter().any(|entry| {
+            entry["event"] == "log_entry" && entry["content"] == "full wrapper-only event"
+        }));
+        let first_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "first prompt")
+            .expect("first prompt should replay from wrapper log");
+        assert_eq!(first_prompt["session_id"], backend_id);
+        assert_eq!(first_prompt["user_turn_index"], 1);
+        assert_eq!(first_prompt["user_turn_revision"], 1);
+        let second_prompt = entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "second prompt")
+            .expect("second prompt should replay from wrapper log");
+        assert_eq!(second_prompt["user_turn_index"], 2);
+        assert_eq!(second_prompt["user_turn_revision"], 1);
+
+        let detail: serde_json::Value =
+            serde_json::from_str(&get_session_detail_from_home(home, "wrapper-session")).unwrap();
+        let detail_entries = detail["entries"].as_array().unwrap();
+        let detail_prompt = detail_entries
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["content"] == "first prompt")
+            .expect("session detail should expose editable wrapper prompt");
+        assert_eq!(detail_prompt["session_id"], backend_id);
+        assert_eq!(detail_prompt["user_turn_index"], 1);
+        assert_eq!(detail_prompt["user_turn_revision"], 1);
+    }
+
+    #[test]
+    fn test_session_log_replay_from_dir_reads_active_session_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.info("Provider: openai");
+        log.model_response("still here after refresh", 0, 0, 0, 0, None);
+        drop(log);
+
+        let replay = session_log_replay_from_dir(&log_dir).expect("session log should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+
+        assert_eq!(replay["t"], "log_replay");
+        assert!(replay["entries"].as_array().unwrap().iter().any(|entry| {
+            entry["event"] == "model_response" && entry["summary"] == "still here after refresh"
+        }));
+    }
+
+    #[test]
+    fn session_log_replay_payload_compacts_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let large = "x".repeat(8_000);
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "instructions": large,
+                "input": [{"role": "user", "content": "inspect dashboard lag"}]
+            }),
+        );
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(2),
+            "openai.responses.resolved_request.v1",
+            Some(1_100),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "input": [{"role": "user", "content": "latest context survives as compact summary"}]
+            }),
+        );
+        drop(log);
+
+        let replay = session_log_replay_from_dir(&log_dir).expect("session log should replay");
+        assert!(
+            !replay.contains(&"x".repeat(1_000)),
+            "replay should not include exact historical context payloads"
+        );
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let contexts: Vec<&serde_json::Value> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "context_snapshot")
+            .collect();
+        assert_eq!(contexts.len(), 2);
+        assert_eq!(
+            contexts
+                .iter()
+                .filter(|entry| entry.pointer("/raw/_intendant_context/raw_omitted")
+                    == Some(&serde_json::json!(true)))
+                .count(),
+            1
+        );
+        let context = contexts
+            .iter()
+            .find(|entry| {
+                entry
+                    .pointer("/raw/_intendant_context/raw_omitted")
+                    .and_then(|v| v.as_bool())
+                    != Some(true)
+            })
+            .expect("latest context snapshot should keep a compact summary");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
+        assert_eq!(context["exact_replay_available"], true);
+        assert!(context
+            .pointer("/raw/summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| !parts.is_empty()));
+    }
+
+    #[test]
+    fn session_detail_compacts_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("detail-session");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "instructions": "y".repeat(8_000),
+                "input": [{"role": "user", "content": "open session detail"}]
+            }),
+        );
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "detail-session");
+        assert!(
+            !detail.contains(&"y".repeat(1_000)),
+            "session detail should not include exact historical context payloads"
+        );
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let context = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("context snapshot should be present");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
+    }
+
+    #[test]
+    fn session_detail_omits_oversized_latest_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("oversized-detail-session");
+        let oversized = "z".repeat(CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES as usize + 16_384);
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "instructions": oversized,
+                "input": [{"role": "user", "content": "open session detail"}]
+            }),
+        );
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "oversized-detail-session");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let context = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("context snapshot should be present");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(
+            context.pointer("/raw/summary/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
+    }
+
+    #[test]
+    fn session_context_snapshot_endpoint_loads_exact_raw_on_demand() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("lazy-session");
+        let exact_text = "selected tool call payload survives lazy load";
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.context_snapshot(
+            "codex",
+            "Codex resolved request payload",
+            Some(1),
+            "openai.responses.resolved_request.v1",
+            Some(1_000),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "input": [{
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": { "cmd": exact_text }
+                }]
+            }),
+        );
+        drop(log);
+
+        let detail = get_session_detail_from_home(dir.path(), "lazy-session");
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let context = detail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("context snapshot should be present");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(
+            context.pointer("/raw/input").is_none(),
+            "session detail replay should not carry exact raw input"
+        );
+        let snapshot_file = context["snapshot_file"]
+            .as_str()
+            .expect("context snapshot should carry a lazy-load file pointer");
+        let encoded_file = snapshot_file.replace('/', "%2F");
+        let request = format!(
+            "GET /api/session/lazy-session/context-snapshot?source=intendant&file={encoded_file} HTTP/1.1"
+        );
+        let (status, body) = get_session_context_snapshot_from_home(
+            dir.path(),
+            "lazy-session",
+            "intendant",
+            &request,
+        );
+        assert_eq!(status, "200 OK");
+        let loaded: serde_json::Value = serde_json::from_str(&body).unwrap();
+        let snapshot = &loaded["snapshot"];
+        assert_eq!(snapshot["snapshot_file"], snapshot_file);
+        assert_eq!(snapshot["exact_replay_available"], true);
+        assert_eq!(
+            snapshot.pointer("/raw/input/0/arguments/cmd"),
+            Some(&serde_json::json!(exact_text))
+        );
+    }
+
+    #[test]
+    fn agent_output_chunks_falls_back_to_other_logs_by_output_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let logs_dir = dir.path().join("logs");
+        let primary_dir = logs_dir.join("primary");
+        let fallback_dir = logs_dir.join("fallback");
+
+        let mut primary = crate::session_log::SessionLog::open(primary_dir.clone()).unwrap();
+        primary.agent_output_with_id("primary output", "", Some("Codex"), Some("primary-out"));
+        drop(primary);
+
+        let mut fallback = crate::session_log::SessionLog::open(fallback_dir.clone()).unwrap();
+        fallback.agent_output_with_id("fallback output", "", Some("Codex"), Some("fallback-out"));
+        drop(fallback);
+
+        let chunks = agent_output_chunks_with_fallback(
+            &primary_dir,
+            &["fallback-out".to_string(), "primary-out".to_string()],
+            Some(&logs_dir),
+        );
+
+        assert_eq!(chunks.len(), 2);
+        assert_eq!(chunks[0].output_id, "fallback-out");
+        assert_eq!(chunks[0].stdout, "fallback output");
+        assert_eq!(chunks[1].output_id, "primary-out");
+        assert_eq!(chunks[1].stdout, "primary output");
+    }
+
+    #[test]
+    fn agent_output_post_response_reads_json_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.agent_output_with_id("first output", "", Some("Codex"), Some("out-1"));
+        drop(log);
+
+        let response =
+            current_agent_output_post_response(r#"{"ids":["out-1","missing-out"]}"#, &log_dir);
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["outputs"][0]["output_id"], "out-1");
+        assert_eq!(json["outputs"][0]["stdout"], "first output");
+        assert_eq!(json["missing"][0], "missing-out");
+    }
+
+    #[test]
+    fn agent_output_post_response_rejects_empty_json_ids() {
+        let dir = tempfile::tempdir().unwrap();
+        let response = current_agent_output_post_response(r#"{"ids":[""]}"#, dir.path());
+        assert!(response.starts_with("HTTP/1.1 400 Bad Request"));
+        assert!(response.contains("missing output ids"));
+    }
+
+    #[test]
+    fn agent_output_json_body_accepts_large_id_lists() {
+        let ids: Vec<String> = (0..700).map(|n| format!("ao-19e4f985a17-{n:x}")).collect();
+        let body = serde_json::json!({ "ids": ids }).to_string();
+
+        let parsed = agent_output_ids_from_json_body(&body).unwrap();
+
+        assert_eq!(parsed.len(), 700);
+        assert_eq!(parsed[0], "ao-19e4f985a17-0");
+        assert_eq!(parsed[699], "ao-19e4f985a17-2bb");
     }
 
     #[test]
@@ -9975,6 +24434,406 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_replay_jsonl_includes_context_snapshot() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.turn_start(1, 0.0, 100_000);
+        log.context_snapshot(
+            "native",
+            "Internal agent messages",
+            Some(1),
+            "intendant.conversation.messages.v1",
+            None,
+            None,
+            Some(200_000),
+            Some(200_000),
+            Some(1),
+            &serde_json::json!([{"role": "user", "content": "hi"}]),
+        );
+        drop(log);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+
+        let context = entries
+            .iter()
+            .find(|e| e.get("event").and_then(|v| v.as_str()) == Some("context_snapshot"))
+            .expect("context_snapshot should replay");
+        assert_eq!(
+            context.get("format").and_then(|v| v.as_str()),
+            Some("intendant.conversation.messages.v1")
+        );
+        assert_eq!(
+            context.pointer("/raw/0/role").and_then(|v| v.as_str()),
+            Some("user")
+        );
+    }
+
+    #[test]
+    fn external_activity_replay_includes_persisted_context_snapshots() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-context-replay";
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "show context" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let wrapper_log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session");
+        let mut log = crate::session_log::SessionLog::open(wrapper_log_dir).unwrap();
+        log.context_snapshot_for_session(
+            Some(session_id),
+            "codex",
+            "Codex resolved request payload",
+            Some("req-context-1"),
+            Some(1),
+            Some(4),
+            "openai.responses.resolved_request.v1",
+            Some(1200),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "_intendant_context": {
+                    "thread_id": session_id,
+                    "request_id": "req-context-1",
+                    "request_index": 1
+                },
+                "input": [{"role": "user", "content": "show context"}]
+            }),
+        );
+        drop(log);
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+        let context = entries
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("persisted context snapshot should replay with external transcript");
+        assert_eq!(context["session_id"], session_id);
+        assert_eq!(context["request_id"], "req-context-1");
+        assert_eq!(context["request_index"], 1);
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(context
+            .pointer("/raw/summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| parts.iter().any(|part| part
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .is_some_and(|preview| preview.contains("show context")))));
+    }
+
+    #[test]
+    fn external_activity_replay_omits_oversized_persisted_context_snapshot_raw() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e37b2-context-replay-large";
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "show large context" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let oversized = "large-context-sentinel "
+            .repeat((CONTEXT_REPLAY_RAW_SUMMARY_MAX_BYTES as usize / 23) + 4096);
+        let wrapper_log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session");
+        let mut log = crate::session_log::SessionLog::open(wrapper_log_dir).unwrap();
+        log.context_snapshot_for_session(
+            Some(session_id),
+            "codex",
+            "Codex resolved request payload",
+            Some("req-context-large"),
+            Some(1),
+            Some(4),
+            "openai.responses.resolved_request.v1",
+            Some(1200),
+            Some("backend_reported"),
+            Some(128_000),
+            Some(272_000),
+            Some(1),
+            &serde_json::json!({
+                "_intendant_context": {
+                    "thread_id": session_id,
+                    "request_id": "req-context-large",
+                    "request_index": 1
+                },
+                "input": [{"role": "user", "content": oversized}]
+            }),
+        );
+        drop(log);
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        assert!(
+            !replay.contains("large-context-sentinel large-context-sentinel"),
+            "external attach replay should not inline oversized raw context"
+        );
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let context = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("persisted context snapshot should replay with external transcript");
+        assert_eq!(context["session_id"], session_id);
+        assert_eq!(context["request_id"], "req-context-large");
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/raw_omitted"),
+            Some(&serde_json::json!(true))
+        );
+        assert_eq!(context["exact_replay_available"], true);
+        assert!(context
+            .get("snapshot_file")
+            .and_then(|v| v.as_str())
+            .is_some_and(|file| file.contains("_context_")));
+    }
+
+    #[test]
+    fn external_activity_replay_uses_wrapper_index_for_multiple_codex_attaches() {
+        let dir = tempfile::tempdir().unwrap();
+        let home = dir.path();
+        let session_id = "019e37b2-multiple-wrapper-index";
+        let sessions_dir = home.join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "continue indexed thread" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        for (wrapper_id, request_id, request_index) in [
+            ("wrapper-before-daemon-restart", "req-before", 1_u64),
+            ("wrapper-after-daemon-restart", "req-after", 2_u64),
+        ] {
+            let wrapper_log_dir = home.join(".intendant").join("logs").join(wrapper_id);
+            let mut log = crate::session_log::SessionLog::open(wrapper_log_dir).unwrap();
+            log.session_identity(wrapper_id, "codex", session_id);
+            log.context_snapshot_for_session(
+                Some(session_id),
+                "codex",
+                "Codex resolved request payload",
+                Some(request_id),
+                Some(request_index),
+                Some(request_index as usize),
+                "openai.responses.resolved_request.v1",
+                Some(1200 + request_index),
+                Some("backend_reported"),
+                Some(128_000),
+                Some(272_000),
+                Some(1),
+                &serde_json::json!({
+                    "_intendant_context": {
+                        "thread_id": session_id,
+                        "request_id": request_id,
+                        "request_index": request_index
+                    },
+                    "input": [{"role": "user", "content": request_id}]
+                }),
+            );
+            drop(log);
+        }
+
+        let indexed = crate::external_wrapper_index::wrappers_for(home, "codex", session_id);
+        assert_eq!(indexed.len(), 2);
+
+        let replay = external_session_activity_replay_from_home(home, "codex", session_id, 80)
+            .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let request_ids: HashSet<_> = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|entry| entry["event"] == "context_snapshot")
+            .filter_map(|entry| entry["request_id"].as_str())
+            .collect();
+        assert!(request_ids.contains("req-before"));
+        assert!(request_ids.contains("req-after"));
+
+        let sessions: Vec<serde_json::Value> =
+            serde_json::from_str(&list_sessions_from_home(home)).unwrap();
+        let row = sessions
+            .iter()
+            .find(|session| session["session_id"] == session_id)
+            .expect("codex session row should be present");
+        assert_eq!(row["intendant_wrappers"].as_array().map(Vec::len), Some(2));
+    }
+
+    #[test]
+    fn external_activity_replay_synthesizes_context_snapshots_from_codex_trace_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let session_id = "019e7adb-raw-replay";
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-31T02-45-00-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-31T02:45:00Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-31T02:45:02Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{ "type": "input_text", "text": "show raw trace context" }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let trace_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("wrapper-session")
+            .join("model-request-traces")
+            .join(format!("trace-aa6e5cc0-{session_id}"));
+        std::fs::create_dir_all(trace_dir.join("payloads")).unwrap();
+        std::fs::write(
+            trace_dir.join("payloads/request-1.json"),
+            serde_json::json!({
+                "model": "gpt-test",
+                "input": [{"role": "user", "content": "from raw trace"}]
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            trace_dir.join("trace.jsonl"),
+            serde_json::json!({
+                "schema_version": 1,
+                "wall_time_unix_ms": 1780182481847_u64,
+                "payload": {
+                    "type": "inference_started",
+                    "provider_name": "OpenAI",
+                    "thread_id": session_id,
+                    "inference_call_id": "call-1",
+                    "request_payload": {
+                        "kind": {"type": "inference_request"},
+                        "path": "payloads/request-1.json"
+                    }
+                }
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let entries = replay["entries"].as_array().unwrap();
+        let context = entries
+            .iter()
+            .find(|entry| entry["event"] == "context_snapshot")
+            .expect("trace archive context snapshot should replay with external transcript");
+        assert_eq!(context["session_id"], session_id);
+        assert_eq!(context["source"], "codex");
+        assert_eq!(context["label"], "Codex resolved request payload");
+        assert_eq!(context["format"], "openai.responses.resolved_request.v1");
+        assert_eq!(context["request_index"], 1);
+        assert!(context["request_id"]
+            .as_str()
+            .is_some_and(|request_id| request_id.starts_with("codex-request-")));
+        assert_eq!(
+            context.pointer("/raw/_intendant_context/archive_mode"),
+            Some(&serde_json::json!("summary"))
+        );
+        assert!(context
+            .pointer("/raw/summary_parts")
+            .and_then(|v| v.as_array())
+            .is_some_and(|parts| parts.iter().any(|part| part
+                .get("preview")
+                .and_then(|v| v.as_str())
+                .is_some_and(|preview| preview.contains("from raw trace")))));
+    }
+
     #[tokio::test]
     async fn test_spawn_web_gateway_lifecycle() {
         let bus = EventBus::new();
@@ -9996,6 +24855,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
 
         // Give it a moment to start
@@ -10030,6 +24890,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -10051,7 +24912,7 @@ mod tests {
                 .expect("timeout")
                 .expect("channel closed");
 
-            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
+            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status { .. })) {
                 found = true;
                 break;
             }
@@ -10085,6 +24946,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -10151,14 +25013,14 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
     }
 
-    /// Fire a raw HTTP request and read the response. Small helper
-    /// because the /api/peers tests all make a handful of these.
-    async fn http_request(port: u16, request: &str) -> String {
+    /// Fire a raw HTTP request and read the response bytes.
+    async fn http_request_bytes(port: u16, request: &str) -> Vec<u8> {
         use tokio::io::AsyncWriteExt;
         let mut stream = tokio::net::TcpStream::connect(format!("127.0.0.1:{}", port))
             .await
@@ -10170,7 +25032,13 @@ mod tests {
             tokio::io::AsyncReadExt::read_to_end(&mut stream, &mut response),
         )
         .await;
-        String::from_utf8_lossy(&response).into_owned()
+        response
+    }
+
+    /// Fire a raw HTTP request and read the response. Small helper
+    /// because the /api/peers tests all make a handful of these.
+    async fn http_request(port: u16, request: &str) -> String {
+        String::from_utf8_lossy(&http_request_bytes(port, request).await).into_owned()
     }
 
     /// Same as `spawn_test_gateway_with_registry` but also wires an
@@ -10198,9 +25066,134 @@ mod tests {
             Vec::new(),
             bearer_token,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
         (port, handle)
+    }
+
+    /// Spawn a gateway with a self-signed TLS acceptor wired in (strict
+    /// HTTPS/WSS mode) plus an optional inbound bearer token. Used by the
+    /// strict-TLS demux tests and the TLS variant of the /ws bearer test
+    /// (audit F2), which only manifests over TLS — rustls buffers the
+    /// response ciphertext, so a missing flush truncates it to empty.
+    async fn spawn_test_gateway_tls(
+        bearer_token: Option<String>,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Self-signed cert with localhost / 127.0.0.1 in the SAN list, the
+        // same construction the production `--tls` self-signed path uses.
+        let acceptor = crate::web_tls::build_acceptor(&crate::web_tls::TlsCertSource::SelfSigned {
+            bind_ip: Some("127.0.0.1".parse().unwrap()),
+            hostname: None,
+        })
+        .expect("self-signed acceptor builds");
+        let handle = spawn_web_gateway(
+            listener,
+            bus,
+            broadcast_tx,
+            WebGatewayConfig::default(),
+            ActiveSessionState::empty(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            bearer_token,
+            crate::peer::AuthRequirements::none(),
+            Some(acceptor),
+        );
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+        (port, handle)
+    }
+
+    /// Test-only `ServerCertVerifier` that accepts any certificate. The
+    /// gateway serves a self-signed cert with no chain to a trust anchor,
+    /// so a real verifier would reject it; tests only care that the bytes
+    /// flow over an encrypted channel, not that the cert is trusted.
+    /// Signature verification still delegates to the ring provider so the
+    /// handshake's signed-transcript check is genuine.
+    #[derive(Debug)]
+    struct AcceptAnyCert(Arc<rustls::crypto::CryptoProvider>);
+
+    impl rustls::client::danger::ServerCertVerifier for AcceptAnyCert {
+        fn verify_server_cert(
+            &self,
+            _end_entity: &rustls::pki_types::CertificateDer<'_>,
+            _intermediates: &[rustls::pki_types::CertificateDer<'_>],
+            _server_name: &rustls::pki_types::ServerName<'_>,
+            _ocsp_response: &[u8],
+            _now: rustls::pki_types::UnixTime,
+        ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+            Ok(rustls::client::danger::ServerCertVerified::assertion())
+        }
+
+        fn verify_tls12_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls12_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn verify_tls13_signature(
+            &self,
+            message: &[u8],
+            cert: &rustls::pki_types::CertificateDer<'_>,
+            dss: &rustls::DigitallySignedStruct,
+        ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+            rustls::crypto::verify_tls13_signature(
+                message,
+                cert,
+                dss,
+                &self.0.signature_verification_algorithms,
+            )
+        }
+
+        fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+            self.0.signature_verification_algorithms.supported_schemes()
+        }
+    }
+
+    /// Fire a raw request over a TLS client connection to a `--tls` gateway
+    /// and read the full decrypted response. The TLS analogue of
+    /// `http_request`: connects with `AcceptAnyCert` (the gateway's cert is
+    /// self-signed), writes the request as cleartext into the TLS session,
+    /// and reads to EOF. Returns the decrypted bytes as a lossy string.
+    async fn https_request(port: u16, request: &str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let provider = Arc::new(rustls::crypto::ring::default_provider());
+        let config = rustls::ClientConfig::builder_with_provider(provider.clone())
+            .with_safe_default_protocol_versions()
+            .unwrap()
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(AcceptAnyCert(provider)))
+            .with_no_client_auth();
+        let connector = tokio_rustls::TlsConnector::from(Arc::new(config));
+        let server_name = rustls::pki_types::ServerName::try_from("localhost").unwrap();
+        let tcp = tokio::net::TcpStream::connect(format!("127.0.0.1:{port}"))
+            .await
+            .unwrap();
+        let mut tls = connector.connect(server_name, tcp).await.unwrap();
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut response = Vec::new();
+        let _ = tokio::time::timeout(
+            tokio::time::Duration::from_secs(2),
+            tls.read_to_end(&mut response),
+        )
+        .await;
+        String::from_utf8_lossy(&response).into_owned()
     }
 
     // -----------------------------------------------------------------
@@ -10359,6 +25352,41 @@ mod tests {
         handle.abort();
     }
 
+    #[tokio::test]
+    async fn test_favicon_routes_serve_png() {
+        let (port, handle) = spawn_test_gateway_with_auth(None, Some("test-token".into())).await;
+
+        for path in ["/icon-128.png", "/favicon.ico"] {
+            let request = format!("GET {path} HTTP/1.1\r\nHost: x\r\n\r\n");
+            let resp = http_request_bytes(port, &request).await;
+            let response_str = String::from_utf8_lossy(&resp);
+            assert!(
+                response_str.starts_with("HTTP/1.1 200 OK"),
+                "expected 200 for {path}, got: {response_str}"
+            );
+            assert!(
+                response_str.contains("Content-Type: image/png"),
+                "expected PNG content type for {path}, got: {response_str}"
+            );
+            assert!(
+                !response_str.contains("<!DOCTYPE html>"),
+                "{path} should not fall through to app HTML"
+            );
+
+            let body_offset = resp
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map(|idx| idx + 4)
+                .expect("HTTP response should contain a body separator");
+            assert!(
+                resp[body_offset..].starts_with(b"\x89PNG\r\n\x1a\n"),
+                "{path} should serve PNG bytes"
+            );
+        }
+
+        handle.abort();
+    }
+
     // -----------------------------------------------------------------
     // /ws bearer enforcement (slice 2d)
     // -----------------------------------------------------------------
@@ -10462,6 +25490,138 @@ mod tests {
         assert!(
             !resp.contains("101 Switching Protocols"),
             "must reject before WS handshake completes"
+        );
+        handle.abort();
+    }
+
+    /// The same /ws-without-token rejection, but over a real TLS connection
+    /// (audit F2). The /ws bearer-reject arm writes the 401 then returns,
+    /// dropping the stream; over TLS the 401's ciphertext can sit in the
+    /// rustls session buffer and be discarded on an abortive close, so the
+    /// client reads an *empty* response instead of the 401. The
+    /// `finalize_http_stream` flush+shutdown on that arm closes the session
+    /// cleanly (close_notify + FIN) so the response always lands. This test
+    /// exercises the TLS path end to end; it's the cross-platform companion
+    /// to the plain-TCP `test_ws_upgrade_rejects_missing_bearer` and is the
+    /// regression net for the empty-response symptom on platforms whose
+    /// socket close discards queued TX (e.g. Windows).
+    #[tokio::test]
+    async fn test_ws_upgrade_rejects_missing_bearer_over_tls() {
+        let (port, handle) = spawn_test_gateway_tls(Some("ws-token".into())).await;
+        let resp = https_request(
+            port,
+            "GET /ws HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            !resp.is_empty(),
+            "TLS 401 must not be truncated to empty (audit F2)"
+        );
+        assert!(resp.contains("401"), "expected 401 over TLS, got: {resp}");
+        assert!(
+            resp.contains("WWW-Authenticate: Bearer"),
+            "WWW-Authenticate signals scheme"
+        );
+        assert!(
+            !resp.contains("101 Switching Protocols"),
+            "must reject before WS handshake completes"
+        );
+        handle.abort();
+    }
+
+    /// Strict TLS: with a TLS acceptor configured, a *cleartext* HTTP
+    /// connection to the secure port is refused with a 426 Upgrade Required
+    /// hint and closed — never served over plain HTTP (audit F3 "no
+    /// unencrypted traffic"). Uses a plain `http_request` (no TLS) against
+    /// the TLS gateway.
+    #[tokio::test]
+    async fn test_strict_tls_rejects_cleartext_http() {
+        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let resp = http_request(port, "GET / HTTP/1.1\r\nHost: x\r\n\r\n").await;
+        assert!(
+            resp.contains("426"),
+            "cleartext HTTP to a --tls gateway must get 426, got: {resp}"
+        );
+        assert!(
+            !resp.contains("200 OK"),
+            "must not serve the dashboard over cleartext, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    /// Strict TLS: a cleartext WebSocket upgrade to the secure port is
+    /// likewise refused (426) and never upgraded — the WS-over-cleartext
+    /// path is closed off the same way as plain HTTP.
+    #[tokio::test]
+    async fn test_strict_tls_rejects_cleartext_ws() {
+        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let resp = http_request(
+            port,
+            "GET /ws HTTP/1.1\r\n\
+             Host: x\r\n\
+             Upgrade: websocket\r\n\
+             Connection: Upgrade\r\n\
+             Sec-WebSocket-Key: dGVzdA==\r\n\
+             Sec-WebSocket-Version: 13\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.contains("426"),
+            "cleartext WS to a --tls gateway must get 426, got: {resp}"
+        );
+        assert!(
+            !resp.contains("101 Switching Protocols"),
+            "must not upgrade a cleartext WS on the secure port, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    /// Strict TLS sanity + truncation guard: a *real* TLS request to the
+    /// secure port serves the full dashboard (the rejection above is
+    /// specific to cleartext, not a blanket closure). The body-length
+    /// assertion guards the audit-F2 truncation class: the ~871 KB
+    /// `app.html` far exceeds one synchronous rustls record, so a missing
+    /// `finalize_http_stream` flush+shutdown can drop the buffered tail and
+    /// truncate the body. Whether that manifests is platform-dependent
+    /// (Windows' abortive socket close discards queued TX; macOS loopback
+    /// happens to drain it), so this is a cross-platform regression net —
+    /// strongest on the Windows build. We assert the decrypted body length
+    /// matches `Content-Length` and that the closing `</html>` survived.
+    #[tokio::test]
+    async fn test_strict_tls_serves_https() {
+        let (port, handle) = spawn_test_gateway_tls(None).await;
+        let resp = https_request(port, "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n").await;
+        assert!(
+            resp.contains("200 OK"),
+            "HTTPS request to a --tls gateway should serve the dashboard, got first 200 bytes: {}",
+            &resp.chars().take(200).collect::<String>()
+        );
+        // Body must arrive intact, not truncated mid-buffer (audit F2).
+        let content_length: usize = resp
+            .split("\r\n")
+            .find_map(|line| {
+                line.strip_prefix("Content-Length: ")
+                    .and_then(|v| v.trim().parse().ok())
+            })
+            .expect("response carries a Content-Length");
+        let body = resp
+            .split_once("\r\n\r\n")
+            .map(|(_, b)| b)
+            .expect("response has a header/body separator");
+        assert_eq!(
+            body.len(),
+            content_length,
+            "TLS body truncated: got {} bytes, Content-Length promised {content_length}",
+            body.len()
+        );
+        assert!(
+            body.contains("</html>"),
+            "TLS body must include the closing </html> (not cut off mid-record)"
         );
         handle.abort();
     }
@@ -11272,6 +26432,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -11331,6 +26492,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -11385,6 +26547,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -11463,6 +26626,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -11581,6 +26745,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -11651,6 +26816,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -11727,6 +26893,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -11747,6 +26914,126 @@ mod tests {
             assert_eq!(json["t"], "state_snapshot");
             assert_eq!(json["state"]["phase"], "thinking");
             assert_eq!(json["state"]["turn"], 3);
+        } else {
+            panic!("expected text message for state_snapshot");
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_state_snapshot_uses_daemon_session_without_active_session() {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+
+        let config = WebGatewayConfig::default();
+        let handle = {
+            let ss = ActiveSessionState::empty();
+            ss.write().await.daemon_session_id = Some("daemon-session".to_string());
+            spawn_web_gateway(
+                listener,
+                bus,
+                broadcast_tx,
+                config,
+                ss,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::peer::AuthRequirements::none(),
+                None,
+            )
+        };
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (_ws, mut ws_rx) = tokio_tungstenite::connect_async(&url)
+            .await
+            .unwrap()
+            .0
+            .split();
+
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "state_snapshot");
+            assert_eq!(json["session_id"], "daemon-session");
+        } else {
+            panic!("expected text message for state_snapshot");
+        }
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_bootstrap_state_snapshot_prefers_daemon_over_active_session_log() {
+        let bus = EventBus::new();
+        let (broadcast_tx, _) = broadcast::channel::<String>(16);
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let dir = tempfile::tempdir().unwrap();
+        let active_log = Arc::new(Mutex::new(
+            crate::session_log::SessionLog::open(dir.path().join("active-worker")).unwrap(),
+        ));
+
+        let config = WebGatewayConfig::default();
+        let handle = {
+            let ss = ActiveSessionState::empty();
+            {
+                let mut state = ss.write().await;
+                state.daemon_session_id = Some("daemon-session".to_string());
+                state.session_log = Some(active_log);
+            }
+            spawn_web_gateway(
+                listener,
+                bus,
+                broadcast_tx,
+                config,
+                ss,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Vec::new(),
+                None,
+                crate::peer::AuthRequirements::none(),
+                None,
+            )
+        };
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let url = format!("ws://127.0.0.1:{}", port);
+        let (_ws, mut ws_rx) = tokio_tungstenite::connect_async(&url)
+            .await
+            .unwrap()
+            .0
+            .split();
+
+        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+            .await
+            .expect("timeout")
+            .unwrap()
+            .unwrap();
+
+        if let Message::Text(text) = msg {
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            assert_eq!(json["t"], "state_snapshot");
+            assert_eq!(json["session_id"], "daemon-session");
         } else {
             panic!("expected text message for state_snapshot");
         }
@@ -11798,6 +27085,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -11882,6 +27170,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                None,
             )
         };
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -11904,7 +27193,7 @@ mod tests {
                 .await
                 .expect("timeout")
                 .expect("channel closed");
-            if let AppEvent::ControlCommand(ControlMsg::Approve { id }) = event {
+            if let AppEvent::ControlCommand(ControlMsg::Approve { id, .. }) = event {
                 assert_eq!(id, 42);
                 found = true;
                 break;
@@ -11969,6 +27258,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12029,6 +27319,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12048,7 +27339,7 @@ mod tests {
                 .await
                 .expect("timeout")
                 .expect("channel closed");
-            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status)) {
+            if matches!(event, AppEvent::ControlCommand(ControlMsg::Status { .. })) {
                 found = true;
                 break;
             }
@@ -12068,6 +27359,8 @@ mod tests {
     /// POST /session returns 502 when no API key is configured.
     #[tokio::test]
     async fn test_post_session_no_api_key() {
+        let _env_lock = TEST_ENV_LOCK.lock().await;
+        let _gemini_key = EnvVarGuard::unset("GEMINI_API_KEY");
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
 
@@ -12090,6 +27383,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12148,6 +27442,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12212,6 +27507,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12278,6 +27574,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12368,6 +27665,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12493,6 +27791,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -12593,6 +27892,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
@@ -13292,11 +28592,6 @@ mod tests {
         );
     }
 
-    /// **F-1 invariant pin**: federated input authorizer is
-    /// deny-by-default in F-1.3b. F-2 will replace this with a real
-    /// registry-backed predicate; this test exists so any premature
-    /// flip fires loudly.
-    #[test]
     /// F-2: positive — an authority entry of `FederatedWebRtc` matching
     /// this closure's `(federation_connection_id, session_id)`
     /// authorizes input. Mirrors the local 5c

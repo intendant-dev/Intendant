@@ -23,13 +23,17 @@ use crate::external_agent;
 /// `thread/start`.
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
+    pub command: String,
     pub sandbox: String,
     pub approval_policy: String,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
     pub web_search: bool,
     pub network_access: bool,
     pub writable_roots: Vec<String>,
+    pub managed_context: String,
+    pub context_archive: String,
 }
 
 pub type SharedCodexConfig = Arc<RwLock<CodexRuntimeConfig>>;
@@ -89,6 +93,41 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             let new_level = AutonomyLevel::from_str_loose(level);
             let mut guard = state.autonomy.write().await;
             guard.level = new_level;
+            drop(guard);
+            state.bus.send(AppEvent::AutonomyChanged {
+                autonomy: new_level.to_string(),
+            });
+        }
+        ControlMsg::SetApprovalRule { category, rule } => {
+            use crate::autonomy::ApprovalRule;
+            let Some(parsed) = ApprovalRule::from_str_loose(rule) else {
+                eprintln!(
+                    "[control_plane] ignoring SetApprovalRule with invalid rule {rule:?} (expected auto/ask/deny)"
+                );
+                return;
+            };
+            // Update the LIVE shared autonomy state so the change takes
+            // effect immediately for the running agent loop.
+            let updated = {
+                let mut guard = state.autonomy.write().await;
+                guard.rules.set_rule_by_name(category, parsed)
+            };
+            if !updated {
+                eprintln!(
+                    "[control_plane] ignoring SetApprovalRule with unknown category {category:?}"
+                );
+                return;
+            }
+            // Persist to intendant.toml [approval] so the rule survives
+            // daemon restarts. Mirrors the Codex persistence helpers:
+            // re-read, mutate, save (avoids racing concurrent writers).
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_approval_rule(root, category, parsed) {
+                    eprintln!(
+                        "[control_plane] failed to persist approval.{category} to intendant.toml: {e}"
+                    );
+                }
+            }
         }
         ControlMsg::SetExternalAgent { agent } => {
             let parsed = agent
@@ -120,6 +159,26 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 agent: parsed.map(|b| b.to_string()),
             });
         }
+        ControlMsg::SetCodexCommand { command } => {
+            let normalized = normalize_codex_command(command.as_deref());
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.command = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.command = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.command to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                command: Some(normalized),
+                ..Default::default()
+            }));
+        }
         ControlMsg::SetCodexSandbox { mode } => {
             let normalized = crate::project::normalize_sandbox_mode(mode);
             {
@@ -135,9 +194,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(codex_config_changed_event(
-                CodexConfigDelta { sandbox: Some(normalized), ..Default::default() },
-            ));
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                sandbox: Some(normalized),
+                ..Default::default()
+            }));
         }
         ControlMsg::SetCodexApprovalPolicy { policy } => {
             let normalized = crate::project::normalize_approval_policy(policy);
@@ -154,9 +214,10 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(codex_config_changed_event(
-                CodexConfigDelta { approval_policy: Some(normalized), ..Default::default() },
-            ));
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                approval_policy: Some(normalized),
+                ..Default::default()
+            }));
         }
         ControlMsg::SetCodexModel { model } => {
             // Treat empty/whitespace string as "clear the override" — matches
@@ -208,6 +269,28 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
+        ControlMsg::SetCodexServiceTier { service_tier } => {
+            let normalized = crate::project::normalize_codex_service_tier(service_tier.as_deref());
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.service_tier = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.service_tier = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.service_tier to intendant.toml: {e}"
+                    );
+                }
+            }
+            let cleared = normalized.is_none();
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                service_tier: normalized,
+                service_tier_cleared: cleared,
+                ..Default::default()
+            }));
+        }
         ControlMsg::SetCodexWebSearch { enabled } => {
             {
                 let mut guard = state.codex_config.write().await;
@@ -246,11 +329,31 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
-        ControlMsg::CodexThreadAction { op, params } => {
+        ControlMsg::CodexThreadAction {
+            session_id,
+            op,
+            params,
+        } => {
+            if session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .is_none()
+            {
+                state.bus.send(AppEvent::CodexThreadActionResult {
+                    session_id: None,
+                    action: op.clone(),
+                    success: false,
+                    message: "Codex thread action requires a target session".to_string(),
+                });
+                return;
+            }
             // Republish as an AppEvent so the daemon-side watcher (which
             // owns the persistent Codex agent) can pick it up and run the
             // RPC. We don't own the agent here, so we only translate.
             state.bus.send(AppEvent::CodexThreadActionRequested {
+                request_id: uuid::Uuid::new_v4().simple().to_string(),
+                session_id: session_id.clone(),
                 action: op.clone(),
                 params: params.clone(),
             });
@@ -275,6 +378,46 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 ..Default::default()
             }));
         }
+        ControlMsg::SetCodexManagedContext { mode } => {
+            let normalized = crate::project::normalize_codex_managed_context(mode);
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.managed_context = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.managed_context = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.managed_context to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                managed_context: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexContextArchive { mode } => {
+            let normalized = crate::project::normalize_codex_context_archive(mode);
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.context_archive = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.context_archive = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.context_archive to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                context_archive: Some(normalized),
+                ..Default::default()
+            }));
+        }
         ControlMsg::SetGeminiModel { model } => {
             // Treat empty/whitespace as "clear the override", matching the
             // dashboard input semantics for the Codex-model field.
@@ -295,11 +438,13 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                model: normalized.clone(),
-                model_cleared: normalized.is_none(),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    model: normalized.clone(),
+                    model_cleared: normalized.is_none(),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiApprovalMode { mode } => {
             let normalized = crate::project::normalize_gemini_approval_mode(mode);
@@ -316,10 +461,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                approval_mode: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    approval_mode: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiSandbox { enabled } => {
             {
@@ -335,10 +482,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                sandbox: Some(*enabled),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    sandbox: Some(*enabled),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiExtensions { extensions } => {
             let normalized = normalize_name_list(extensions);
@@ -355,10 +504,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                extensions: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    extensions: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiAllowedMcpServers { servers } => {
             let normalized = normalize_name_list(servers);
@@ -375,10 +526,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                allowed_mcp_servers: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    allowed_mcp_servers: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiIncludeDirectories { directories } => {
             // Reuse writable-roots normalizer — same "drop empty / dedupe,
@@ -397,10 +550,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                include_directories: Some(normalized),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    include_directories: Some(normalized),
+                    ..Default::default()
+                }));
         }
         ControlMsg::SetGeminiDebug { enabled } => {
             {
@@ -416,10 +571,12 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     );
                 }
             }
-            state.bus.send(gemini_config_changed_event(GeminiConfigDelta {
-                debug: Some(*enabled),
-                ..Default::default()
-            }));
+            state
+                .bus
+                .send(gemini_config_changed_event(GeminiConfigDelta {
+                    debug: Some(*enabled),
+                    ..Default::default()
+                }));
         }
         ControlMsg::GeminiThreadAction { op, params } => {
             // Rebroadcast for the daemon-side watcher, same pattern as
@@ -429,6 +586,118 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                 action: op.clone(),
                 params: params.clone(),
             });
+        }
+        ControlMsg::ResumeSession { .. }
+        | ControlMsg::RestartSession { .. }
+        | ControlMsg::StopSession { .. } => {
+            // Routed by the daemon loop; there is no persistent config state
+            // to update here.
+        }
+        ControlMsg::ConfigureSessionAgent { .. } => {
+            // Routed by the daemon loop because it persists per-session files
+            // and external-session overlays.
+        }
+        ControlMsg::CreateBrowserWorkspace {
+            url,
+            label,
+            provider,
+            peer_id,
+            owner_session_id,
+            profile_dir,
+        } => {
+            let request = crate::browser_workspace::CreateBrowserWorkspaceRequest {
+                url: url.clone(),
+                label: label.clone(),
+                provider: provider.clone(),
+                peer_id: peer_id.clone(),
+                owner_session_id: owner_session_id.clone(),
+                profile_dir: profile_dir.clone(),
+            };
+            match crate::browser_workspace::create_workspace(request).await {
+                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "created".to_string(),
+                    workspace: Some(workspace),
+                    workspace_id: None,
+                    message: None,
+                }),
+                Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: None,
+                    message: Some(err.to_string()),
+                }),
+            }
+        }
+        ControlMsg::CloseBrowserWorkspace {
+            workspace_id,
+            reason,
+        } => match crate::browser_workspace::close_workspace(workspace_id, reason.clone()).await {
+            Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                kind: "closed".to_string(),
+                workspace_id: Some(workspace.id.clone()),
+                workspace: Some(workspace),
+                message: None,
+            }),
+            Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                kind: "error".to_string(),
+                workspace: None,
+                workspace_id: Some(workspace_id.clone()),
+                message: Some(err.to_string()),
+            }),
+        },
+        ControlMsg::AcquireBrowserWorkspace {
+            workspace_id,
+            holder_id,
+            holder_kind,
+            note,
+            force,
+        } => {
+            let request = crate::browser_workspace::AcquireBrowserWorkspaceRequest {
+                workspace_id: workspace_id.clone(),
+                holder_id: holder_id.clone(),
+                holder_kind: holder_kind.clone(),
+                note: note.clone(),
+                force: *force,
+            };
+            match crate::browser_workspace::acquire_workspace(request).await {
+                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_acquired".to_string(),
+                    workspace: Some(workspace),
+                    workspace_id: Some(workspace_id.clone()),
+                    message: None,
+                }),
+                Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: Some(workspace_id.clone()),
+                    message: Some(err.to_string()),
+                }),
+            }
+        }
+        ControlMsg::ReleaseBrowserWorkspace {
+            workspace_id,
+            holder_id,
+            note,
+        } => {
+            let request = crate::browser_workspace::ReleaseBrowserWorkspaceRequest {
+                workspace_id: workspace_id.clone(),
+                holder_id: holder_id.clone(),
+                note: note.clone(),
+            };
+            match crate::browser_workspace::release_workspace(request).await {
+                Ok(workspace) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "lease_released".to_string(),
+                    workspace: Some(workspace),
+                    workspace_id: Some(workspace_id.clone()),
+                    message: None,
+                }),
+                Err(err) => state.bus.send(AppEvent::BrowserWorkspaceChanged {
+                    kind: "error".to_string(),
+                    workspace: None,
+                    workspace_id: Some(workspace_id.clone()),
+                    message: Some(err.to_string()),
+                }),
+            }
         }
         ControlMsg::GrantUserDisplay { display_id } => {
             // Moved out of `tui/app.rs::handle_control_command` — the TUI is
@@ -452,7 +721,9 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             // (agent runners, etc.) observe the same state the autonomy
             // guard reports. Matches the tui/mcp paths that set it.
             std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-            state.bus.send(AppEvent::UserDisplayGranted { display_id: did });
+            state
+                .bus
+                .send(AppEvent::UserDisplayGranted { display_id: did });
         }
         ControlMsg::RevokeUserDisplay { display_id, note } => {
             let did = display_id.unwrap_or(0);
@@ -508,28 +779,47 @@ fn normalize_writable_roots(raw: &[String]) -> Vec<String> {
 /// to "unchanged" so callers can populate only the field they touched.
 #[derive(Debug, Default)]
 struct CodexConfigDelta {
+    command: Option<String>,
     sandbox: Option<String>,
     approval_policy: Option<String>,
     model: Option<String>,
     model_cleared: bool,
     reasoning_effort: Option<String>,
     reasoning_effort_cleared: bool,
+    service_tier: Option<String>,
+    service_tier_cleared: bool,
     web_search: Option<bool>,
     network_access: Option<bool>,
     writable_roots: Option<Vec<String>>,
+    managed_context: Option<String>,
+    context_archive: Option<String>,
 }
 
 fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
     AppEvent::CodexConfigChanged {
+        command: delta.command,
         sandbox: delta.sandbox,
         approval_policy: delta.approval_policy,
         model: delta.model,
         model_cleared: delta.model_cleared,
         reasoning_effort: delta.reasoning_effort,
         reasoning_effort_cleared: delta.reasoning_effort_cleared,
+        service_tier: delta.service_tier,
+        service_tier_cleared: delta.service_tier_cleared,
         web_search: delta.web_search,
         network_access: delta.network_access,
         writable_roots: delta.writable_roots,
+        managed_context: delta.managed_context,
+        context_archive: delta.context_archive,
+    }
+}
+
+fn normalize_codex_command(input: Option<&str>) -> String {
+    let trimmed = input.map(str::trim).unwrap_or("");
+    if trimmed.is_empty() {
+        "codex".to_string()
+    } else {
+        trimmed.to_string()
     }
 }
 
@@ -601,6 +891,19 @@ fn persist_external_agent(
     proj.save_config()
 }
 
+/// Re-read intendant.toml, set one `[approval]` category rule, and save it
+/// back. Re-reading (rather than mutating a cached config) avoids racing
+/// concurrent writers to the TOML. Mirrors `persist_external_agent`.
+fn persist_approval_rule(
+    project_root: &std::path::Path,
+    category: &str,
+    rule: crate::autonomy::ApprovalRule,
+) -> Result<(), crate::error::CallerError> {
+    let mut proj = crate::project::Project::from_root(project_root.to_path_buf())?;
+    proj.config.approval.set_rule_by_name(category, rule);
+    proj.save_config()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,13 +912,17 @@ mod tests {
 
     fn test_codex_config() -> SharedCodexConfig {
         Arc::new(RwLock::new(CodexRuntimeConfig {
+            command: "codex".to_string(),
             sandbox: "workspace-write".to_string(),
             approval_policy: "on-request".to_string(),
             model: None,
             reasoning_effort: None,
+            service_tier: None,
             web_search: false,
             network_access: false,
             writable_roots: Vec::new(),
+            managed_context: "vanilla".to_string(),
+            context_archive: "summary".to_string(),
         }))
     }
 
@@ -636,6 +943,7 @@ mod tests {
         let bus = EventBus::new();
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
         let external_agent = Arc::new(RwLock::new(None));
+        let mut events = bus.subscribe();
 
         let handle = spawn(
             bus.subscribe(),
@@ -661,6 +969,51 @@ mod tests {
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
 
         assert_eq!(autonomy.read().await.level, AutonomyLevel::High);
+        let mut saw_autonomy_changed = false;
+        for _ in 0..4 {
+            if let Ok(Ok(AppEvent::AutonomyChanged { autonomy })) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), events.recv()).await
+            {
+                assert_eq!(autonomy, "High");
+                saw_autonomy_changed = true;
+                break;
+            }
+        }
+        assert!(saw_autonomy_changed);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_approval_rule_updates_shared_state() {
+        use crate::autonomy::ApprovalRule;
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy: autonomy.clone(),
+                external_agent: external_agent.clone(),
+                codex_config: test_codex_config(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        // tool_call defaults to Auto.
+        assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Auto);
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetApprovalRule {
+            category: "tool_call".to_string(),
+            rule: "deny".to_string(),
+        }));
+
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        assert_eq!(autonomy.read().await.rules.tool_call, ApprovalRule::Deny);
 
         handle.abort();
     }
@@ -772,6 +1125,40 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn set_codex_command_updates_shared_state() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
+            command: Some("  /opt/bin/codex  ".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.command, "/opt/bin/codex");
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
+            command: Some(" ".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.command, "codex");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
     async fn set_codex_sandbox_updates_shared_state() {
         let bus = EventBus::new();
         let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
@@ -827,9 +1214,11 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexApprovalPolicy {
-            policy: "never".to_string(),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexApprovalPolicy {
+                policy: "never".to_string(),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.approval_policy, "never");
 
@@ -890,18 +1279,71 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexReasoningEffort {
-            effort: Some("high".to_string()),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexReasoningEffort {
+                effort: Some("high".to_string()),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-        assert_eq!(codex_config.read().await.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            codex_config.read().await.reasoning_effort.as_deref(),
+            Some("high")
+        );
 
         // Unknown value → cleared (normalized to None, don't silently pass garbage to Codex).
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexReasoningEffort {
-            effort: Some("ultra-galaxy".to_string()),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexReasoningEffort {
+                effort: Some("ultra-galaxy".to_string()),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(codex_config.read().await.reasoning_effort, None);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_service_tier_normalizes_and_clears() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
+            service_tier: Some("fast".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            codex_config.read().await.service_tier.as_deref(),
+            Some("priority")
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
+            service_tier: Some("normal".to_string()),
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(
+            codex_config.read().await.service_tier.as_deref(),
+            Some("standard")
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexServiceTier {
+            service_tier: None,
+        }));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.service_tier, None);
 
         handle.abort();
     }
@@ -925,15 +1367,21 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch { enabled: true }));
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexNetworkAccess { enabled: true }));
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
+            enabled: true,
+        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexNetworkAccess { enabled: true },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let g = codex_config.read().await;
         assert!(g.web_search);
         assert!(g.network_access);
         drop(g);
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch { enabled: false }));
+        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWebSearch {
+            enabled: false,
+        }));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert!(!codex_config.read().await.web_search);
 
@@ -963,6 +1411,7 @@ mod tests {
         );
 
         bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+            session_id: Some("sess-action".to_string()),
             op: "compact".to_string(),
             params: serde_json::json!({"extra": "data"}),
         }));
@@ -971,7 +1420,14 @@ mod tests {
         let mut found = false;
         for _ in 0..20 {
             match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
-                Ok(Ok(AppEvent::CodexThreadActionRequested { action, params })) => {
+                Ok(Ok(AppEvent::CodexThreadActionRequested {
+                    request_id,
+                    session_id,
+                    action,
+                    params,
+                })) => {
+                    assert!(!request_id.is_empty());
+                    assert_eq!(session_id.as_deref(), Some("sess-action"));
                     assert_eq!(action, "compact");
                     assert_eq!(params["extra"], "data");
                     found = true;
@@ -982,6 +1438,63 @@ mod tests {
             }
         }
         assert!(found, "expected CodexThreadActionRequested on bus");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn codex_thread_action_without_session_is_rejected() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let mut rx = bus.subscribe();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config,
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+            session_id: None,
+            op: "goal-clear".to_string(),
+            params: serde_json::json!({}),
+        }));
+
+        let mut found_result = false;
+        let mut found_request = false;
+        for _ in 0..20 {
+            match tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv()).await {
+                Ok(Ok(AppEvent::CodexThreadActionResult {
+                    session_id,
+                    action,
+                    success,
+                    message,
+                })) => {
+                    assert!(session_id.is_none());
+                    assert_eq!(action, "goal-clear");
+                    assert!(!success);
+                    assert!(message.contains("requires a target session"));
+                    found_result = true;
+                }
+                Ok(Ok(AppEvent::CodexThreadActionRequested { .. })) => {
+                    found_request = true;
+                    break;
+                }
+                Ok(Ok(_)) => continue,
+                _ => break,
+            }
+        }
+        assert!(found_result, "expected missing-session rejection");
+        assert!(!found_request, "sessionless action must not fan out");
 
         handle.abort();
     }
@@ -1005,18 +1518,96 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexWritableRoots {
-            roots: vec![
-                "/tmp/a".into(),
-                "  ".into(),
-                "/tmp/a".into(),
-                "/tmp/b".into(),
-                "".into(),
-            ],
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexWritableRoots {
+                roots: vec![
+                    "/tmp/a".into(),
+                    "  ".into(),
+                    "/tmp/a".into(),
+                    "/tmp/b".into(),
+                    "".into(),
+                ],
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         let got = codex_config.read().await.writable_roots.clone();
         assert_eq!(got, vec!["/tmp/a".to_string(), "/tmp/b".to_string()]);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_managed_context_normalizes_and_updates_shared_state() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexManagedContext {
+                mode: "on".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.managed_context, "managed");
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexManagedContext {
+                mode: "vanilla".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.managed_context, "vanilla");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn set_codex_context_archive_normalizes_and_updates_shared_state() {
+        let bus = EventBus::new();
+        let autonomy = crate::autonomy::shared_autonomy(AutonomyState::default());
+        let external_agent = Arc::new(RwLock::new(None));
+        let codex_config = test_codex_config();
+
+        let handle = spawn(
+            bus.subscribe(),
+            ControlPlaneState {
+                autonomy,
+                external_agent,
+                codex_config: codex_config.clone(),
+                gemini_config: test_gemini_config(),
+                bus: bus.clone(),
+                project_root: None,
+            },
+        );
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexContextArchive {
+                mode: "raw".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.context_archive, "exact");
+
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexContextArchive {
+                mode: "disabled".to_string(),
+            },
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert_eq!(codex_config.read().await.context_archive, "off");
 
         handle.abort();
     }
@@ -1078,16 +1669,20 @@ mod tests {
             },
         );
 
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiApprovalMode {
-            mode: "yolo".to_string(),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetGeminiApprovalMode {
+                mode: "yolo".to_string(),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(gemini_config.read().await.approval_mode, "yolo");
 
         // Unknown → default (safe fallback — don't silently leave yolo).
-        bus.send(AppEvent::ControlCommand(ControlMsg::SetGeminiApprovalMode {
-            mode: "banana".to_string(),
-        }));
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetGeminiApprovalMode {
+                mode: "banana".to_string(),
+            },
+        ));
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         assert_eq!(gemini_config.read().await.approval_mode, "default");
 

@@ -2,12 +2,48 @@ use crate::conversation::ImageData;
 use crate::error::CallerError;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::{Mutex as StdMutex, MutexGuard as StdMutexGuard, OnceLock};
 use tokio::sync::mpsc;
 
 pub mod claude_code;
 pub mod codex;
 pub mod gemini;
+
+static SPAWNED_CHILD_PROCESSES: OnceLock<StdMutex<HashSet<u32>>> = OnceLock::new();
+
+fn spawned_child_processes() -> &'static StdMutex<HashSet<u32>> {
+    SPAWNED_CHILD_PROCESSES.get_or_init(|| StdMutex::new(HashSet::new()))
+}
+
+fn lock_spawned_child_processes() -> StdMutexGuard<'static, HashSet<u32>> {
+    match spawned_child_processes().lock() {
+        Ok(guard) => guard,
+        Err(poisoned) => poisoned.into_inner(),
+    }
+}
+
+pub(crate) fn register_child_process(pid: u32) {
+    if pid != 0 {
+        lock_spawned_child_processes().insert(pid);
+    }
+}
+
+pub(crate) fn unregister_child_process(pid: u32) {
+    lock_spawned_child_processes().remove(&pid);
+}
+
+pub(crate) fn cleanup_spawned_child_processes_now() -> Vec<u32> {
+    let pids: Vec<u32> = lock_spawned_child_processes().drain().collect();
+    let mut cleaned = Vec::new();
+    for pid in pids {
+        cleaned.extend(crate::platform::terminate_process_tree_now(pid));
+    }
+    cleaned.sort_unstable();
+    cleaned.dedup();
+    cleaned
+}
 
 /// One image attachment passed alongside a user message.
 ///
@@ -167,6 +203,34 @@ impl AgentBackend {
             AgentBackend::GeminiCli => "gemini",
         }
     }
+
+    pub fn thread_id_is_canonical(&self, thread_id: &str) -> bool {
+        let thread_id = thread_id.trim();
+        if thread_id.is_empty() {
+            return false;
+        }
+        match self {
+            AgentBackend::Codex | AgentBackend::GeminiCli => true,
+            // Claude Code does not expose a real session id during start_thread
+            // today. Keep the Intendant log id as canonical until that backend
+            // reports a usable native id.
+            AgentBackend::ClaudeCode => thread_id != "claude-code-session",
+        }
+    }
+
+    pub fn supports_user_message_rewind(&self) -> bool {
+        matches!(self, AgentBackend::Codex)
+    }
+
+    pub fn supports_item_anchor_rewind(&self) -> bool {
+        matches!(self, AgentBackend::Codex)
+    }
+}
+
+pub fn source_session_id_is_canonical(source: &str, session_id: &str) -> bool {
+    AgentBackend::from_str_loose(source)
+        .map(|backend| backend.thread_id_is_canonical(session_id))
+        .unwrap_or(false)
 }
 
 impl std::fmt::Display for AgentBackend {
@@ -182,10 +246,25 @@ impl std::fmt::Display for AgentBackend {
 /// Events emitted by an external agent, normalized to Intendant concepts.
 #[derive(Debug, Clone)]
 pub enum AgentEvent {
+    /// Backend event scoped to a native conversation thread / turn.
+    ///
+    /// Codex's app-server can run and report multiple threads through one
+    /// process connection. Keep scope at the common boundary so the controller
+    /// can demultiplex those streams without pretending each thread is a
+    /// separate backend process.
+    Scoped {
+        thread_id: Option<String>,
+        turn_id: Option<String>,
+        event: Box<AgentEvent>,
+    },
     /// Incremental text from the agent's message.
     MessageDelta { text: String },
     /// Complete agent message.
     Message { text: String },
+    /// Echo of a user message observed by the external runtime. This is used
+    /// internally to confirm that an accepted steer reached the conversation;
+    /// it is not rendered as agent output.
+    UserMessage { text: String },
     /// The agent's chain-of-thought / reasoning trace.
     ///
     /// Codex emits this via `item/completed` with `type: "reasoning"`. The
@@ -199,10 +278,34 @@ pub enum AgentEvent {
     PlanUpdate {
         entries: Vec<(String, String, String)>,
     },
+    /// Token usage update reported by the external agent runtime.
+    Usage { usage: AgentUsageSnapshot },
     /// Informational backend event that should be written to the activity log.
-    Log {
-        level: String,
+    Log { level: String, message: String },
+    /// Latest Codex `/goal` state for a thread.
+    GoalUpdated { goal: crate::types::SessionGoal },
+    /// The Codex `/goal` state was cleared for a thread.
+    GoalCleared,
+    /// A backend/runtime error for the active turn.
+    BackendError {
         message: String,
+        code: Option<String>,
+        details: Option<String>,
+        will_retry: bool,
+        likely_generation_starvation: bool,
+        recovery_hint: Option<String>,
+    },
+    /// An external runtime spawned or interacted with native sub-agents.
+    SubAgentToolCall {
+        item_id: String,
+        tool: String,
+        status: String,
+        sender_thread_id: String,
+        receiver_thread_ids: Vec<String>,
+        prompt: Option<String>,
+        model: Option<String>,
+        reasoning_effort: Option<String>,
+        agents: Vec<SubAgentState>,
     },
     /// A tool/command execution has started.
     ToolStarted {
@@ -243,6 +346,53 @@ pub enum AgentEvent {
     },
 }
 
+impl AgentEvent {
+    pub fn scoped(thread_id: Option<String>, turn_id: Option<String>, event: AgentEvent) -> Self {
+        if thread_id.is_none() && turn_id.is_none() {
+            event
+        } else {
+            Self::Scoped {
+                thread_id,
+                turn_id,
+                event: Box::new(event),
+            }
+        }
+    }
+
+    pub fn into_scope(self) -> (Option<String>, Option<String>, AgentEvent) {
+        match self {
+            Self::Scoped {
+                thread_id,
+                turn_id,
+                event,
+            } => (thread_id, turn_id, *event),
+            event => (None, None, event),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SubAgentState {
+    pub thread_id: String,
+    pub status: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct AgentUsageSnapshot {
+    pub provider: String,
+    pub model: String,
+    pub tokens_used: u64,
+    /// Effective context window reported by the backend.
+    pub context_window: u64,
+    /// Raw model/backend context window, when the backend distinguishes it.
+    pub hard_context_window: Option<u64>,
+    pub usage_pct: f64,
+    pub prompt_tokens: u64,
+    pub completion_tokens: u64,
+    pub cached_tokens: u64,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ToolCompletionStatus {
     Success,
@@ -254,6 +404,10 @@ pub enum ToolCompletionStatus {
 pub enum ApprovalCategory {
     CommandExecution,
     FileChange,
+    /// A tool / MCP call the external agent wants to make (e.g. Codex
+    /// invoking Intendant's own MCP server tools like computer-use
+    /// `take_screenshot` / `execute_cu_actions`, or an MCP elicitation).
+    McpTool,
 }
 
 /// Re-export of the shared approval decision type. The canonical
@@ -265,6 +419,14 @@ pub use crate::approval::ApprovalDecision;
 pub struct AgentConfig {
     pub model: Option<String>,
     pub working_dir: PathBuf,
+    /// Directory where a backend can write exact model request payload traces.
+    /// Backends that cannot capture provider-bound request bodies ignore it.
+    pub request_trace_dir: Option<PathBuf>,
+    /// True when `request_trace_dir` is a temporary summary-mode trace root
+    /// that should be deleted when the backend shuts down.
+    pub request_trace_temporary: bool,
+    /// Context snapshot archive mode: `summary`, `exact`, or `off`.
+    pub context_archive: String,
     pub approval_policy: String,
     /// Sandbox mode for Codex: `"read-only"`, `"workspace-write"`, or
     /// `"danger-full-access"`. Ignored by backends that don't model a
@@ -273,6 +435,10 @@ pub struct AgentConfig {
     /// Codex reasoning-effort override (`low|medium|high|...`). Codex-only;
     /// other backends ignore.
     pub reasoning_effort: Option<String>,
+    /// Codex service-tier override (`priority` for Fast, `flex`, or
+    /// Intendant's `standard` sentinel to send `serviceTier: null`).
+    /// Codex-only; other backends ignore.
+    pub service_tier: Option<String>,
     /// Enable Codex's `web_search` Responses tool. Codex-only.
     pub web_search: bool,
     /// Allow outbound network in Codex's `workspace-write` sandbox.
@@ -281,13 +447,96 @@ pub struct AgentConfig {
     /// Extra writable roots for Codex's sandbox. Codex-only; other backends
     /// ignore.
     pub writable_roots: Vec<String>,
+    /// Whether Codex has Intendant's managed-context protocol. Codex-only;
+    /// vanilla/fork-safe mode leaves this false.
+    pub codex_managed_context: bool,
     /// Web gateway port for MCP-over-HTTP config generation.
     pub web_port: Option<u16>,
+    /// Intendant session id to include in the injected MCP URL so tool
+    /// exposure can be scoped to the Codex process that is calling.
+    pub mcp_session_id: Option<String>,
+    /// Persisted backend-native session/thread id to resume instead of
+    /// starting a fresh external conversation.
+    pub resume_session: Option<String>,
 }
 
 /// Handle to a conversation thread within an external agent.
 pub struct AgentThread {
     pub thread_id: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct AgentThreadSnapshot {
+    pub thread_id: String,
+    pub rollout_path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RollbackAnchorPosition {
+    Before,
+    After,
+}
+
+impl RollbackAnchorPosition {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Before => "before",
+            Self::After => "after",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "before" => Some(Self::Before),
+            "after" => Some(Self::After),
+            _ => None,
+        }
+    }
+}
+
+/// Exact model request payload exposed by an external agent backend.
+#[derive(Debug, Clone)]
+pub struct AgentContextSnapshot {
+    pub source: String,
+    pub label: String,
+    pub request_id: Option<String>,
+    pub request_index: Option<u64>,
+    pub rollout_path: Option<PathBuf>,
+    pub format: String,
+    pub token_count: Option<u64>,
+    pub token_count_kind: Option<AgentContextTokenCountKind>,
+    pub context_window: Option<u64>,
+    pub hard_context_window: Option<u64>,
+    pub item_count: Option<usize>,
+    pub raw: serde_json::Value,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, std::hash::Hash)]
+pub enum AgentContextTokenCountKind {
+    BackendReported,
+    LocalEstimate,
+    Unknown,
+}
+
+impl AgentContextTokenCountKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::BackendReported => "backend_reported",
+            Self::LocalEstimate => "local_estimate",
+            Self::Unknown => "unknown",
+        }
+    }
+}
+
+/// Result of making a backend-owned autonomous goal passive.
+#[derive(Debug, Clone, Default)]
+pub struct AutonomousGoalPauseResult {
+    /// The latest visible goal state, if the backend has one.
+    pub goal: Option<crate::types::SessionGoal>,
+    /// True when the backend successfully reported that no visible goal exists.
+    pub goal_absent: bool,
+    /// True when this call changed an active goal into a passive state.
+    pub paused: bool,
 }
 
 /// Trait for opaque external agent backends.
@@ -308,6 +557,13 @@ pub trait ExternalAgent: Send + Sync {
     /// Create a new conversation thread.
     async fn start_thread(&mut self) -> Result<AgentThread, CallerError>;
 
+    /// Return the current service-tier override for this external session.
+    /// Codex uses this for its app-server `serviceTier` field; other backends
+    /// currently do not expose tiered routing.
+    fn service_tier(&self) -> Option<&str> {
+        None
+    }
+
     /// Send a user message into an existing thread (starts a turn).
     async fn send_message(
         &mut self,
@@ -326,6 +582,21 @@ pub trait ExternalAgent: Send + Sync {
     ) -> Result<(), CallerError> {
         let _ = images;
         self.send_message(thread, message).await
+    }
+
+    /// Return the latest exact model request payload captured at the provider
+    /// boundary. Backends without such a payload return `None`; callers should
+    /// not synthesize transcript-shaped replacements.
+    async fn context_snapshot(&mut self) -> Result<Option<AgentContextSnapshot>, CallerError> {
+        Ok(None)
+    }
+
+    /// Return all exact model request payloads currently visible at the
+    /// provider boundary. Backends with durable request traces should override
+    /// this so Intendant can import every request even when several happen
+    /// between dashboard polls.
+    async fn context_snapshots(&mut self) -> Result<Vec<AgentContextSnapshot>, CallerError> {
+        Ok(self.context_snapshot().await?.into_iter().collect())
     }
 
     /// Send a user message with a heterogeneous list of attachments
@@ -362,7 +633,8 @@ pub trait ExternalAgent: Send + Sync {
         } else {
             format!("{}{}", prelude, message)
         };
-        self.send_message_with_images(thread, &augmented, &images).await
+        self.send_message_with_images(thread, &augmented, &images)
+            .await
     }
 
     /// Respond to an approval request from the agent.
@@ -406,8 +678,8 @@ pub trait ExternalAgent: Send + Sync {
         ))
     }
 
-    /// Dispatch a backend-specific thread action (Codex: compact, fork,
-    /// rollback, review, memory-reset; other backends currently reject).
+    /// Dispatch a backend-specific thread action (Codex: compact, fork, side,
+    /// side-close, rollback, review, memory-reset; other backends currently reject).
     /// Returns a short human-readable status message on success.
     async fn thread_action(
         &mut self,
@@ -419,6 +691,67 @@ pub trait ExternalAgent: Send + Sync {
             "thread action /{} not supported by this backend",
             op
         )))
+    }
+
+    /// Pause backend-owned autonomous work for a thread without starting a
+    /// user turn. Codex active goals can auto-continue immediately after a
+    /// resume; attach-only control paths use this to keep rehydration passive.
+    async fn pause_autonomous_goal(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<AutonomousGoalPauseResult, CallerError> {
+        let _ = thread_id;
+        Ok(AutonomousGoalPauseResult::default())
+    }
+
+    /// Read backend-owned thread metadata. The rollout path is important for
+    /// Intendant-owned rewind records: copying it before a rollback preserves a
+    /// backout/fork handle without teaching Codex about Intendant's policy.
+    async fn read_thread_snapshot(
+        &mut self,
+        thread_id: &str,
+    ) -> Result<AgentThreadSnapshot, CallerError> {
+        let _ = thread_id;
+        Err(CallerError::ExternalAgent(
+            "thread metadata read not supported by this backend".into(),
+        ))
+    }
+
+    /// Fork a backend thread from a persisted rollout path. Patched managed
+    /// Codex creates a new thread id while inheriting the rollout's lineage
+    /// prompt-cache key.
+    async fn fork_thread_from_rollout_path(
+        &mut self,
+        rollout_path: &Path,
+        name: Option<&str>,
+    ) -> Result<AgentThread, CallerError> {
+        let _ = (rollout_path, name);
+        Err(CallerError::ExternalAgent(
+            "rollout-path thread fork not supported by this backend".into(),
+        ))
+    }
+
+    /// Restore a loaded backend thread from a persisted rollout path while
+    /// preserving the same backend thread id. Codex implements this through
+    /// app-server `thread/restore`; other backends use the default error.
+    async fn restore_thread_from_rollout_path(
+        &mut self,
+        thread_id: &str,
+        rollout_path: &Path,
+        record_id: Option<&str>,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, rollout_path, record_id);
+        Err(CallerError::ExternalAgent(
+            "same-thread rollout restore not supported by this backend".into(),
+        ))
+    }
+
+    fn supports_user_message_rewind(&self) -> bool {
+        false
+    }
+
+    fn supports_item_anchor_rewind(&self) -> bool {
+        false
     }
 
     /// Ask the backend to drop the last `turns_to_drop` conversational
@@ -436,6 +769,59 @@ pub trait ExternalAgent: Send + Sync {
         Err(CallerError::ExternalAgent(
             "conversation rollback not supported by this backend".into(),
         ))
+    }
+
+    /// Ask the backend to drop the last `turns_to_drop` conversational
+    /// turns from a specific thread. This is used for Codex side
+    /// conversations, where the side child must be rewound without
+    /// touching the parent thread.
+    async fn rollback_thread_turns(
+        &mut self,
+        thread_id: &str,
+        turns_to_drop: u32,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, turns_to_drop);
+        Err(CallerError::ExternalAgent(
+            "targeted conversation rollback not supported by this backend".into(),
+        ))
+    }
+
+    /// Ask the backend to truncate a specific thread at a provider-visible
+    /// item anchor. This is intentionally narrower than Intendant's lineage
+    /// policy: Codex owns exact rollout mutation, while Intendant decides
+    /// which anchor is valid for a rewind.
+    async fn rollback_thread_to_item_anchor(
+        &mut self,
+        thread_id: &str,
+        item_id: &str,
+        position: RollbackAnchorPosition,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, item_id, position);
+        Err(CallerError::ExternalAgent(
+            "item-anchor conversation rollback not supported by this backend".into(),
+        ))
+    }
+
+    /// Append a developer-role item to a loaded backend thread without
+    /// starting a user turn. Used by Intendant-owned context rewind so the
+    /// carry-forward primer is instruction context, not user intent.
+    async fn inject_thread_developer_message(
+        &mut self,
+        thread_id: &str,
+        message: &str,
+    ) -> Result<(), CallerError> {
+        let _ = (thread_id, message);
+        Err(CallerError::ExternalAgent(
+            "developer-message injection not supported by this backend".into(),
+        ))
+    }
+
+    /// Restore the backend adapter's notion of the active thread after a
+    /// targeted child-thread turn. This is local adapter state: it does not
+    /// send a provider request.
+    async fn activate_thread(&mut self, thread_id: &str) -> Result<(), CallerError> {
+        let _ = thread_id;
+        Ok(())
     }
 
     /// Shut down the agent process.
@@ -517,9 +903,37 @@ mod tests {
         assert_eq!(AgentBackend::ClaudeCode.as_short_str(), "claude-code");
         assert_eq!(AgentBackend::GeminiCli.as_short_str(), "gemini");
         // And from_str_loose must round-trip every as_short_str output.
-        for v in [AgentBackend::Codex, AgentBackend::ClaudeCode, AgentBackend::GeminiCli] {
+        for v in [
+            AgentBackend::Codex,
+            AgentBackend::ClaudeCode,
+            AgentBackend::GeminiCli,
+        ] {
             assert_eq!(AgentBackend::from_str_loose(v.as_short_str()), Some(v));
         }
+    }
+
+    #[test]
+    fn canonical_thread_ids_match_backend_capabilities() {
+        assert!(AgentBackend::Codex.thread_id_is_canonical("019e37cf-34ad-7b08-8a1e-7ad5086eb39f"));
+        assert!(AgentBackend::GeminiCli.thread_id_is_canonical("session-2026-05-21T12-00"));
+        assert!(!AgentBackend::ClaudeCode.thread_id_is_canonical("claude-code-session"));
+        assert!(AgentBackend::ClaudeCode.thread_id_is_canonical("real-claude-session"));
+        assert!(!source_session_id_is_canonical("unknown", "abc"));
+        assert!(source_session_id_is_canonical("codex", "019abc"));
+    }
+
+    #[test]
+    fn user_message_rewind_capability_is_explicit() {
+        assert!(AgentBackend::Codex.supports_user_message_rewind());
+        assert!(!AgentBackend::ClaudeCode.supports_user_message_rewind());
+        assert!(!AgentBackend::GeminiCli.supports_user_message_rewind());
+    }
+
+    #[test]
+    fn item_anchor_rewind_capability_is_explicit() {
+        assert!(AgentBackend::Codex.supports_item_anchor_rewind());
+        assert!(!AgentBackend::ClaudeCode.supports_item_anchor_rewind());
+        assert!(!AgentBackend::GeminiCli.supports_item_anchor_rewind());
     }
 
     #[test]

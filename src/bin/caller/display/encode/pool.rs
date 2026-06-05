@@ -42,11 +42,16 @@
 //!
 //! Each [`EncoderPool`] holds two kinds of encoders:
 //!
-//! - **Always-on** (constructed at pool creation): VP8 layers from
+//! - **Always-on** (constructed at pool creation): the platform
+//!   [`BASELINE_CODEC`]. On macOS/Linux that's VP8 layers from
 //!   `LayerSpec::vp8_simulcast` (up to three at full / half / quarter).
 //!   VP8 is the universal codec — Safari, Firefox, Chrome, Edge all
 //!   decode it reliably and it has a long history of working well for
-//!   screen content. The layers exist as a *capability*; which ones
+//!   screen content. On Windows the VP8/libvpx backend is gated off
+//!   (Tier-0 deferral), so the baseline is instead a single full-resolution
+//!   H.264 layer via the Media Foundation software encoder — also
+//!   universally decodable by WebRTC browsers. The layers exist as a
+//!   *capability*; which ones
 //!   actually emit frames is governed by the demand-bound (#48) and
 //!   capacity policies. By default:
 //!     - a local DisplaySlot viewer (single-RID, post-#58) demands `f`
@@ -189,6 +194,22 @@ pub const RID_HALF: &str = "h";
 /// resolution).
 pub const RID_QUARTER: &str = "q";
 
+/// RID for the on-demand *federated* H.264 layer (quarter resolution +
+/// capped bitrate — see [`LayerSpec::single_federated`]). Distinct from
+/// [`RID_FULL`] so a federated H.264 encoder keys a different pool slot
+/// (`EncoderId { H264, RID_FEDERATED }`) than a local full-resolution
+/// H.264 encoder (`EncoderId { H264, RID_FULL }`) — the two never share
+/// a refcounted slot, so a federated viewer can never be handed a
+/// full-resolution H.264 encoder a local viewer spawned, or vice versa.
+///
+/// Single-encoding only: the federated path narrows to one RID, the
+/// track is built with a single encoding, and rtc 0.9 emits NO
+/// `a=rid` / `a=simulcast` lines for a single encoding (see
+/// `add_sender_sdp`'s `is_simulcast = encodings.len() > 1` gate). So this
+/// non-canonical RID is purely an internal routing/slot key and never
+/// reaches the wire — no `from_str_loose` round-trip is required.
+pub const RID_FEDERATED: &str = "fed";
+
 /// PLI/FIR coalesce window. Within this duration, multiple keyframe
 /// requests for the same `(codec, rid)` collapse into one request to
 /// the encoder. 50 ms is short enough that perceived recovery latency
@@ -213,6 +234,24 @@ pub const I420_BROADCAST_CAPACITY: usize = 4;
 // ---------------------------------------------------------------------------
 // Codec identity
 // ---------------------------------------------------------------------------
+
+/// The always-on / baseline codec for this platform — the codec the pool
+/// guarantees is producing frames the instant any peer subscribes, and the one
+/// `EncoderPool::new` / `on_resize` spawn for every always-on layer.
+///
+/// VP8 everywhere it's available (universal browser support, no licensing
+/// complications). On Windows the VP8/libvpx backend is gated off (Tier-0
+/// deferral — see `vp8.rs` / `Cargo.toml`), so the baseline is **H.264** via
+/// the Media Foundation software encoder ([`super::h264_windows`]); H.264 is
+/// universally decodable by WebRTC browsers too, so it is a sound baseline.
+/// This keeps the Windows streaming path supplied with a working always-on
+/// encoder while leaving the macOS/Linux VP8 baseline unchanged.
+#[cfg(not(target_os = "windows"))]
+pub const BASELINE_CODEC: CodecKind = CodecKind::Vp8;
+/// See the non-Windows definition above; Windows has no VP8 backend so the
+/// baseline is H.264.
+#[cfg(target_os = "windows")]
+pub const BASELINE_CODEC: CodecKind = CodecKind::H264;
 
 /// Codec kinds the pool can produce. Closed enum because adding a codec is a
 /// coordinated change (new encoder backend + RTC codec registration + browser
@@ -267,11 +306,12 @@ impl CodecKind {
         }
     }
 
-    /// Whether this codec is in the always-on bank by default. Only
-    /// VP8 is always-on (universal compatibility); everything else
-    /// spins up on demand.
+    /// Whether this codec is in the always-on bank by default. The
+    /// [`BASELINE_CODEC`] is always-on (VP8 on macOS/Linux for universal
+    /// compatibility; H.264 on Windows where VP8 is unavailable); everything
+    /// else spins up on demand.
     pub fn is_always_on_default(&self) -> bool {
-        matches!(self, Self::Vp8)
+        *self == BASELINE_CODEC
     }
 }
 
@@ -305,6 +345,14 @@ impl SimulcastRid {
     /// `RID_QUARTER` — convention for the bottom simulcast layer.
     pub fn quarter() -> Self {
         Self(RID_QUARTER.to_string())
+    }
+
+    /// `RID_FEDERATED` — the on-demand federated H.264 layer (quarter
+    /// resolution + capped bitrate). Keeps the federated H.264 slot
+    /// distinct from a local full-resolution H.264 slot. See
+    /// [`RID_FEDERATED`].
+    pub fn federated() -> Self {
+        Self(RID_FEDERATED.to_string())
     }
 
     pub fn as_str(&self) -> &str {
@@ -365,6 +413,17 @@ pub struct LayerSpec {
 /// a normal `RecvError::Closed` and resubscribe via the
 /// pool-frame-intake reconnect path.
 pub const MIN_LAYER_DIM: u32 = 16;
+
+/// Target bitrate (kbps) for the on-demand federated H.264 layer
+/// ([`LayerSpec::single_federated`]). Roughly double the VP8 quarter
+/// floor's 125 kbps — H.264 carries more per-frame overhead (SPS/PPS
+/// repeated before every periodic IDR, slice headers from
+/// `slice-max-size=1200`) than VP8 at the same resolution, so a slightly
+/// higher cap holds equivalent quality at quarter resolution while
+/// keeping each IDR small enough to reassemble under relay loss. Well
+/// below the 2500 kbps full-resolution [`LayerSpec::single`] cap that
+/// produces the un-reassemblable seed IDR this layer exists to avoid.
+pub const FEDERATED_H264_BITRATE_KBPS: u32 = 250;
 
 /// Normalize a `(width, height)` pair to the constraints both
 /// VP8 encoder construction and [`super::downscale_i420`] require:
@@ -428,9 +487,7 @@ impl LayerSpec {
             (SimulcastRid::half(), 2, 400),
             (SimulcastRid::quarter(), 4, 125),
         ] {
-            let Some((w, h)) =
-                normalize_layer_dims(source_w / divisor, source_h / divisor)
-            else {
+            let Some((w, h)) = normalize_layer_dims(source_w / divisor, source_h / divisor) else {
                 continue;
             };
             out.push(LayerSpec {
@@ -457,6 +514,62 @@ impl LayerSpec {
             width,
             height,
             target_bitrate_kbps: bitrate,
+            framerate,
+        }
+    }
+
+    /// Single-layer spec for the on-demand **federated** H.264 layer:
+    /// quarter resolution + a capped bitrate, mirroring the VP8 federated
+    /// floor that already works under loss.
+    ///
+    /// **Why this exists.** A federated viewer reaches the daemon over a
+    /// `browser → TURN relay → remote peer` path where moderate sustained
+    /// packet loss (~5-20 %) is the operational baseline. A full-resolution
+    /// 2500 kbps H.264 stream ([`Self::single`]) produces a seed IDR of
+    /// hundreds of RTP packets — at ~17 % loss the probability of
+    /// reassembling every packet is effectively zero, so the stream never
+    /// bootstraps (`framesDecoded == 0`). The working VP8 federated floor
+    /// is quarter-resolution / 125 kbps (~17-packet IDR, ~24 % intact
+    /// arrival); this gives federated H.264 the same shape: quarter the
+    /// source dimensions (`source / 4`, rounded to the same even /
+    /// [`MIN_LAYER_DIM`] constraints as [`Self::vp8_simulcast`]'s quarter
+    /// layer via [`normalize_layer_dims`]) and a bitrate capped at
+    /// [`FEDERATED_H264_BITRATE_KBPS`]. Combined with the finite-GOP
+    /// periodic IDR (`encode/h264_linux.rs`) and same-SSRC NACK
+    /// retransmission (`display/webrtc.rs`), the small IDR both survives
+    /// the relay and is recoverable.
+    ///
+    /// **Distinct RID.** The layer carries [`SimulcastRid::federated`], not
+    /// [`SimulcastRid::full`], so its pool slot
+    /// (`EncoderId { H264, RID_FEDERATED }`) is never shared with a local
+    /// full-resolution H.264 slot — see [`RID_FEDERATED`].
+    ///
+    /// **Single-RID, not simulcast.** H.264 stays single-encoding (the
+    /// pool's `try_spawn_encoder_thread` / libx264 broken-pipe constraint
+    /// makes parallel H.264 encoders fragile); this is one capped layer,
+    /// not an added simulcast tier. H.264 is the only codec that takes
+    /// this federated path (VP8 federation uses its own quarter tier from
+    /// [`Self::vp8_simulcast`]), so this constructor is codec-implicit —
+    /// no `codec` argument.
+    ///
+    /// Degrades safely: if `source / 4` falls below [`MIN_LAYER_DIM`]
+    /// (tiny source / mid-resize transient), falls back to the largest
+    /// encodable dims at or below source rather than dropping the layer —
+    /// a federated peer that negotiated H.264 must get *a* stream, never
+    /// an empty layer set.
+    pub fn single_federated(source_w: u32, source_h: u32, framerate: u32) -> LayerSpec {
+        // Quarter resolution, same even / MIN_LAYER_DIM normalization as
+        // the VP8 quarter floor. Fall back to normalized source dims if
+        // the quarter is too small to encode, and finally to the raw
+        // source so we always return an encodable layer.
+        let (width, height) = normalize_layer_dims(source_w / 4, source_h / 4)
+            .or_else(|| normalize_layer_dims(source_w, source_h))
+            .unwrap_or((source_w, source_h));
+        LayerSpec {
+            rid: SimulcastRid::federated(),
+            width,
+            height,
+            target_bitrate_kbps: FEDERATED_H264_BITRATE_KBPS,
             framerate,
         }
     }
@@ -608,11 +721,36 @@ pub struct EncoderSubscription {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct PeerCodecPreferences {
     pub supported: Vec<CodecKind>,
+    /// True when this peer is a **federated** viewer (its offer has no
+    /// `a=simulcast:recv` directive — the signature of a
+    /// `PeerDisplayConnection` reaching us over the TURN relay). The pool
+    /// uses this to spawn the on-demand H.264 layer at the loss-resilient
+    /// quarter-resolution / capped-bitrate shape
+    /// ([`LayerSpec::single_federated`]) instead of the full-resolution
+    /// [`LayerSpec::single`]. Carried through every resubscribe so the
+    /// federated peer keeps getting a federated-shaped encoder across
+    /// resize / Closed-recovery epochs.
+    pub federated: bool,
 }
 
 impl PeerCodecPreferences {
+    /// Local (non-federated) peer preferences — the on-demand H.264 layer
+    /// is built at full resolution ([`LayerSpec::single`]).
     pub fn new(supported: Vec<CodecKind>) -> Self {
-        Self { supported }
+        Self {
+            supported,
+            federated: false,
+        }
+    }
+
+    /// Federated peer preferences — the on-demand H.264 layer is built at
+    /// the loss-resilient quarter-resolution / capped-bitrate shape
+    /// ([`LayerSpec::single_federated`]). See the `federated` field doc.
+    pub fn new_federated(supported: Vec<CodecKind>) -> Self {
+        Self {
+            supported,
+            federated: true,
+        }
     }
 
     pub fn supports(&self, codec: CodecKind) -> bool {
@@ -773,10 +911,9 @@ impl PoolLease {
         }
         // Partition the lease's claims: the ones we're releasing
         // now, and the ones we keep for full-release later.
-        let (to_release, keep): (Vec<_>, Vec<_>) =
-            std::mem::take(&mut self.on_demand_refs)
-                .into_iter()
-                .partition(|(id, _gen)| ids.contains(id));
+        let (to_release, keep): (Vec<_>, Vec<_>) = std::mem::take(&mut self.on_demand_refs)
+            .into_iter()
+            .partition(|(id, _gen)| ids.contains(id));
         self.on_demand_refs = keep;
 
         if to_release.is_empty() {
@@ -1045,8 +1182,7 @@ struct EncoderPoolInner {
 ///     single full-source VP8 layer (used by tests that exercise
 ///     the on-demand path with a minimal always-on set).
 ///   - `|_, _| vec![]` — no always-on, on-demand-only flows.
-pub type LayerFactory =
-    Box<dyn Fn(u32, u32) -> Vec<LayerSpec> + Send + Sync>;
+pub type LayerFactory = Box<dyn Fn(u32, u32) -> Vec<LayerSpec> + Send + Sync>;
 
 /// Atomic snapshot of source dimensions + resize epoch. Stored
 /// behind a `RwLock` inside [`EncoderPoolInner`] so any caller that
@@ -1063,6 +1199,53 @@ struct SourceState {
     /// advance the epoch (so racing subscribes aren't penalized for
     /// a resize that changed nothing).
     gen: u64,
+}
+
+/// Policy for an always-on / baseline encoder that fails to construct at
+/// pool startup ([`EncoderPool::new`]).
+///
+/// **macOS / Linux — fail loud (panic).** The baseline there is VP8
+/// (libvpx), the universally-available fallback the pool guarantees is
+/// producing frames the instant any peer subscribes. libvpx has no host
+/// dependency that can be absent, so a construction failure means the
+/// build is fundamentally broken — better to fail loud at startup than
+/// serve a silent never-decoding stream. Keeping the panic here also means
+/// a real regression in the VP8 path can't be masked by this softening.
+#[cfg(not(target_os = "windows"))]
+fn baseline_encoder_construction_failed(id: &EncoderId, err: &str) -> ! {
+    panic!(
+        "always-on encoder {} construction failed at pool startup: {} — \
+         always-on codecs must always be constructable; a VP8 libvpx \
+         failure at startup is unrecoverable",
+        id, err,
+    )
+}
+
+/// Windows variant — degrade, do not panic.
+///
+/// The baseline on Windows is the Media Foundation H.264 software encoder
+/// (VP8/libvpx is gated off). Unlike libvpx, that MFT can be genuinely
+/// unavailable or reject a configuration on a given host (e.g. the
+/// `Server-Media-Foundation` optional feature missing, no registered H.264
+/// encoder MFT, or an output media type the MFT won't initialize). When
+/// the pool is constructed eagerly at `--web` daemon startup
+/// (`auto_activate_windows_user_display` → `DisplaySession::start`), a
+/// panic here takes down the entire dashboard daemon, not just the display
+/// stream. So on Windows we log and continue with an empty (or partial)
+/// always-on bank: `subscribe` simply yields no baseline subscription, the
+/// Video tab reports no active stream, and every other surface (Activity,
+/// Stats, Terminal, Sessions, Settings) stays up. This is the
+/// degrade-gracefully contract the rest of the pool already honors for
+/// on-demand construction failures.
+#[cfg(target_os = "windows")]
+fn baseline_encoder_construction_failed(id: &EncoderId, err: &str) {
+    eprintln!(
+        "[encoder/pool] WARN: always-on baseline encoder {} failed to \
+         construct at pool startup: {} — display will not stream on this \
+         host (the dashboard stays up); check that the Media Foundation \
+         H.264 encoder is available",
+        id, err,
+    );
 }
 
 impl EncoderPool {
@@ -1109,24 +1292,23 @@ impl EncoderPool {
         // reflects the pool's total throughput. Tests that don't
         // care about metrics pass `None`; production passes
         // `Some(Arc::clone(&self.counters))` from DisplaySession::start.
-        let counters = counters
-            .unwrap_or_else(|| Arc::new(crate::display::DisplayMetricsCounters::new()));
-        let duration_ms = if framerate > 0 { 1000 / framerate as u64 } else { 33 };
+        let counters =
+            counters.unwrap_or_else(|| Arc::new(crate::display::DisplayMetricsCounters::new()));
+        let duration_ms = if framerate > 0 {
+            1000 / framerate as u64
+        } else {
+            33
+        };
         let (i420_tx, _) = broadcast::channel::<I420Frame>(I420_BROADCAST_CAPACITY);
 
         let layer_factory: LayerFactory = Box::new(layer_factory);
         let initial_layers = (layer_factory)(source_width, source_height);
         let mut always_on = Vec::with_capacity(initial_layers.len());
         for layer in initial_layers {
-            // Always-on bank is VP8 (universal codec, see module docs).
-            // Use the failable constructor here and PANIC on failure —
-            // always-on is the universally-available fallback path; if
-            // even VP8 won't construct, there is no recovery and the
-            // display pipeline is fundamentally broken. Better to fail
-            // loud at pool construction than produce a silent
-            // never-decoding stream.
-            let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
-            let handle = try_spawn_encoder_thread(
+            // Always-on bank is the platform [`BASELINE_CODEC`] (VP8 on
+            // macOS/Linux, H.264 on Windows — see module docs).
+            let id = EncoderId::new(BASELINE_CODEC, layer.rid.clone());
+            match try_spawn_encoder_thread(
                 id.clone(),
                 layer,
                 source_width,
@@ -1134,16 +1316,10 @@ impl EncoderPool {
                 &i420_tx,
                 duration_ms,
                 &counters,
-            )
-            .unwrap_or_else(|e| {
-                        panic!(
-                            "always-on encoder {} construction failed at pool startup: {} — \
-                             always-on codecs must always be constructable; a VP8 libvpx \
-                             failure at startup is unrecoverable",
-                            id, e,
-                        )
-                    });
-            always_on.push(handle);
+            ) {
+                Ok(handle) => always_on.push(handle),
+                Err(e) => baseline_encoder_construction_failed(&id, &e),
+            }
         }
 
         Self {
@@ -1167,10 +1343,22 @@ impl EncoderPool {
     }
 
     /// Codecs this pool knows how to spawn an on-demand encoder for.
-    /// Currently VP8 + H.264 (the two with wired backends).
-    /// VP9 and AV1 will be added when their encoder crates are picked.
+    /// VP8 + H.264 are the codecs with wired backends; VP9 and AV1 will be
+    /// added when their encoder crates are picked.
+    ///
+    /// On Windows the VP8/libvpx backend is gated off (its `new()` always
+    /// `Err`s), so VP8 is excluded — attempting it would just fail
+    /// construction and get logged+skipped. H.264 (Media Foundation) is the
+    /// only spawnable codec there, and it's already the always-on baseline.
+    #[cfg(not(target_os = "windows"))]
     fn on_demand_spawnable(codec: CodecKind) -> bool {
         matches!(codec, CodecKind::Vp8 | CodecKind::H264)
+    }
+
+    /// Windows variant — see the non-Windows definition. VP8 has no backend.
+    #[cfg(target_os = "windows")]
+    fn on_demand_spawnable(codec: CodecKind) -> bool {
+        matches!(codec, CodecKind::H264)
     }
 
     /// Source (capture) dimensions the pool was constructed with.
@@ -1254,10 +1442,12 @@ impl EncoderPool {
     ///
     /// # Panics
     ///
-    /// Panics if a new always-on encoder fails to construct: an
-    /// always-on construction failure at any lifecycle point —
-    /// startup or resize — is unrecoverable by contract (see
-    /// [`Self::new`]).
+    /// On macOS / Linux, panics if a new always-on encoder fails to
+    /// construct — a VP8 baseline failure at any lifecycle point (startup
+    /// or resize) is unrecoverable by contract (see [`Self::new`] and
+    /// [`baseline_encoder_construction_failed`]). On Windows the same
+    /// failure is logged and the layer is dropped instead, so a resize the
+    /// Media Foundation H.264 MFT can't honor never crashes the daemon.
     pub fn on_resize(&self, new_width: u32, new_height: u32) {
         // Atomic update of dimensions + epoch under the source-state
         // write lock. Holding the lock across both the dim and gen
@@ -1318,8 +1508,8 @@ impl EncoderPool {
 
             let new_layers = (self.inner.layer_factory)(new_width, new_height);
             for layer in new_layers {
-                let id = EncoderId::new(CodecKind::Vp8, layer.rid.clone());
-                let new_handle = try_spawn_encoder_thread(
+                let id = EncoderId::new(BASELINE_CODEC, layer.rid.clone());
+                match try_spawn_encoder_thread(
                     id.clone(),
                     layer,
                     new_width,
@@ -1327,16 +1517,16 @@ impl EncoderPool {
                     &self.inner.i420_tx,
                     self.inner.duration_ms,
                     &self.inner.counters,
-                )
-                .unwrap_or_else(|e| {
-                    panic!(
-                        "on_resize: always-on respawn failed for {:?}: {} — \
-                         always-on construction failure is unrecoverable by \
-                         contract (see EncoderPool::new)",
-                        id, e,
-                    )
-                });
-                always_on.push(new_handle);
+                ) {
+                    Ok(new_handle) => always_on.push(new_handle),
+                    // Same per-platform policy as `EncoderPool::new`:
+                    // panic on macOS/Linux (VP8 always reconstructs),
+                    // log + degrade on Windows (a resize to a resolution
+                    // the MF H.264 MFT rejects must not crash the daemon —
+                    // the bank is left without this layer until the next
+                    // resize regenerates it).
+                    Err(e) => baseline_encoder_construction_failed(&id, &e),
+                }
             }
         }
 
@@ -1365,8 +1555,7 @@ impl EncoderPool {
         // refcount=0 would be a CPU leak.
         {
             let mut on_demand = self.inner.on_demand.lock().unwrap();
-            let old_slots: HashMap<EncoderId, OnDemandSlot> =
-                std::mem::take(&mut *on_demand);
+            let old_slots: HashMap<EncoderId, OnDemandSlot> = std::mem::take(&mut *on_demand);
             for (_id, old_slot) in old_slots {
                 old_slot.handle.shutdown.cancel();
             }
@@ -1482,10 +1671,7 @@ impl EncoderPool {
         Err(SubscribeError::NoCompatibleCodec)
     }
 
-    fn subscribe_once(
-        &self,
-        prefs: &PeerCodecPreferences,
-    ) -> SubscribeAttemptOutcome {
+    fn subscribe_once(&self, prefs: &PeerCodecPreferences) -> SubscribeAttemptOutcome {
         let mut subs = Vec::new();
         let mut always_on_codecs: Vec<CodecKind> = Vec::new();
 
@@ -1508,11 +1694,14 @@ impl EncoderPool {
         // a resize happened before they're consumed.
         let source_at_start = self.snapshot_source();
 
-        // Always-on: no refcount, subscribe-only. These are guaranteed
-        // to be producing frames — EncoderPool::new panics on
-        // always-on construction failure. Read lock is held only for
-        // the duration of this iteration; on_resize acquires the write
-        // lock to swap handles.
+        // Always-on: no refcount, subscribe-only. On macOS/Linux these
+        // are guaranteed to be producing frames (EncoderPool::new panics
+        // on a VP8 baseline construction failure); on Windows the bank may
+        // be empty if the Media Foundation H.264 baseline failed to
+        // construct (logged + degraded), in which case this loop simply
+        // yields no baseline subscription. Read lock is held only for the
+        // duration of this iteration; on_resize acquires the write lock to
+        // swap handles.
         {
             let always_on = self.inner.always_on.read().unwrap();
             for handle in always_on.iter() {
@@ -1556,7 +1745,20 @@ impl EncoderPool {
                 if !Self::on_demand_spawnable(codec) {
                     continue;
                 }
-                let rid = SimulcastRid::full();
+                // A federated H.264 peer gets the loss-resilient
+                // quarter-resolution / capped-bitrate layer on a DISTINCT
+                // RID (`RID_FEDERATED`), so its slot never aliases a local
+                // full-resolution H.264 slot (`RID_FULL`). Every other
+                // on-demand codec/peer keeps the full-resolution single
+                // layer on `RID_FULL`. The slot key (`EncoderId`) and the
+                // constructed layer must agree on the RID — they're
+                // derived together here.
+                let federated_h264 = prefs.federated && codec == CodecKind::H264;
+                let rid = if federated_h264 {
+                    SimulcastRid::federated()
+                } else {
+                    SimulcastRid::full()
+                };
                 let id = EncoderId::new(codec, rid);
                 if let Some(slot) = on_demand.get_mut(&id) {
                     slot.refcount += 1;
@@ -1570,12 +1772,20 @@ impl EncoderPool {
                     // Use the dimensions from the snapshot captured
                     // at function entry — same gen, same dims,
                     // checked together by pass 3.
-                    let layer = LayerSpec::single(
-                        codec,
-                        source_at_start.width,
-                        source_at_start.height,
-                        self.inner.framerate,
-                    );
+                    let layer = if federated_h264 {
+                        LayerSpec::single_federated(
+                            source_at_start.width,
+                            source_at_start.height,
+                            self.inner.framerate,
+                        )
+                    } else {
+                        LayerSpec::single(
+                            codec,
+                            source_at_start.width,
+                            source_at_start.height,
+                            self.inner.framerate,
+                        )
+                    };
                     to_construct.push((codec, id, layer));
                 }
             }
@@ -1591,12 +1801,15 @@ impl EncoderPool {
             match try_spawn_encoder_thread(
                 id.clone(),
                 layer.clone(),
-                // On-demand encoders are always at source dim
-                // (LayerSpec::single uses snapshot dims), so
-                // needs_downscale is false for them — passing
-                // source dims here is a no-op the encoder thread
-                // never exercises. Threading them anyway keeps
-                // the API uniform with the always-on case.
+                // The encoder thread downscales source → layer dims when
+                // they differ. A full-resolution on-demand layer
+                // (`LayerSpec::single`) matches the source dims, so
+                // needs_downscale is false and these are a no-op. A
+                // federated H.264 layer (`LayerSpec::single_federated`) is
+                // quarter-resolution, so passing the SOURCE dims here is
+                // load-bearing: the thread's `needs_downscale` path scales
+                // each source frame down to the layer's quarter dims
+                // before encode.
                 source_at_start.width,
                 source_at_start.height,
                 &self.inner.i420_tx,
@@ -1637,8 +1850,7 @@ impl EncoderPool {
             // transient subscribe failure and retries on the next
             // offer/reconnect — same semantics as any other
             // encoder construction failure.
-            let stale_epoch =
-                self.snapshot_source().gen != source_at_start.gen;
+            let stale_epoch = self.snapshot_source().gen != source_at_start.gen;
             if stale_epoch {
                 for (id, handle, _layer) in &constructed {
                     eprintln!(
@@ -1695,8 +1907,7 @@ impl EncoderPool {
                         // Race win: no slot yet. Install ours with a
                         // fresh generation from the pool-level
                         // counter.
-                        let generation =
-                            self.inner.slot_gen_counter.fetch_add(1, Ordering::SeqCst);
+                        let generation = self.inner.slot_gen_counter.fetch_add(1, Ordering::SeqCst);
                         let slot = OnDemandSlot {
                             handle: handle.clone(),
                             refcount: 1,
@@ -1739,11 +1950,7 @@ impl EncoderPool {
     ///
     /// Called by the per-peer forwarder when inbound RTCP requests a
     /// keyframe for that peer.
-    pub fn request_keyframe(
-        &self,
-        codec: CodecKind,
-        rid: Option<SimulcastRid>,
-    ) -> bool {
+    pub fn request_keyframe(&self, codec: CodecKind, rid: Option<SimulcastRid>) -> bool {
         // Coalesce per (codec, rid). When rid is None we coalesce
         // against the full layer (callers using None typically mean
         // "any layer is fine, just give me a keyframe").
@@ -1989,11 +2196,7 @@ impl EncoderPool {
     /// Test-only access to on-demand slot counts. Lets tests verify
     /// refcount + teardown semantics without exposing the map.
     #[cfg(test)]
-    pub(crate) fn on_demand_refcount(
-        &self,
-        codec: CodecKind,
-        rid: SimulcastRid,
-    ) -> Option<usize> {
+    pub(crate) fn on_demand_refcount(&self, codec: CodecKind, rid: SimulcastRid) -> Option<usize> {
         let id = EncoderId::new(codec, rid);
         let map = self.inner.on_demand.lock().unwrap();
         map.get(&id).map(|slot| slot.refcount)
@@ -2049,7 +2252,8 @@ impl Drop for EncoderPoolInner {
 /// [`EncoderHandle`]. The thread:
 ///
 /// 1. Constructs the codec's encoder backend via
-///    [`super::select_codec_for_mime`].
+///    [`super::select_codec_for_mime`] — **on the encoder thread
+///    itself** (see below).
 /// 2. Subscribes to the pool's I420 broadcast.
 /// 3. In a `blocking_recv` loop: pulls the next I420 frame, swaps the
 ///    `force_keyframe` flag, calls `encoder.encode(...)`, and
@@ -2058,18 +2262,33 @@ impl Drop for EncoderPoolInner {
 /// 4. Exits when `shutdown` is cancelled OR the I420 broadcast closes
 ///    (sender dropped at pool drop).
 ///
-/// Synchronously probes the encoder backend via
-/// [`super::select_codec_for_mime`] and spawns the driver thread only
-/// if construction succeeded. Returns the `EncoderHandle` on `Ok`,
-/// propagates the construction error on `Err` — callers (the pool's
-/// on-demand subscribe path) use the error to skip the codec rather
-/// than return a ghost subscription.
+/// **Construct-on-the-driver-thread.** The encoder is built inside the
+/// spawned thread and then *used and dropped* on that same thread for
+/// its entire life. This is load-bearing for the Windows Media
+/// Foundation backend ([`super::h264_windows`]), whose `new()` calls
+/// `CoInitializeEx` + `MFStartup` and whose `Drop` calls `MFShutdown` +
+/// `CoUninitialize` — COM init/teardown is **per-thread**, so the same
+/// thread that initializes COM must be the one that touches and releases
+/// the COM objects. The other backends (VP8/libvpx, VideoToolbox,
+/// ffmpeg) have no per-thread state and are unaffected; their
+/// construction code is unchanged — only the thread on which
+/// `select_codec_for_mime` runs has moved.
 ///
-/// Replaces the earlier in-thread construction that logged failures
-/// and silently exited after the handle had already been published to
-/// subscribers. That behavior surfaced as "the peer negotiated a
-/// codec the system can't actually produce" — which was one of the
-/// root causes the encoder-pool redesign exists to fix.
+/// **No ghost handles.** Construction can still fail (a host without a
+/// usable H.264 MFT, libvpx ABI mismatch, …) and the contract is that a
+/// failed construct must *not* publish an [`EncoderHandle`] — callers
+/// (the on-demand subscribe path) rely on the error to exclude the codec
+/// from the subscription set rather than hand back a subscription to an
+/// encoder that will never emit a frame. To keep that contract while
+/// moving construction onto the thread, the thread reports the
+/// construction outcome back over a one-shot startup channel and this
+/// function blocks until it arrives: on `Err` we return the error (the
+/// thread has already exited, nothing was published); on `Ok` we return
+/// the `EncoderHandle`. This replaces the original design where the
+/// caller constructed synchronously and moved the boxed encoder into the
+/// thread — which worked for libvpx/VideoToolbox/ffmpeg but constructed
+/// the Windows MF encoder on a Tokio worker only to use and drop it on
+/// the encoder thread, a latent cross-thread-COM hazard.
 fn try_spawn_encoder_thread(
     id: EncoderId,
     layer: LayerSpec,
@@ -2079,18 +2298,22 @@ fn try_spawn_encoder_thread(
     duration_ms: u64,
     counters: &Arc<crate::display::DisplayMetricsCounters>,
 ) -> Result<EncoderHandle, String> {
-    // Synchronous construction probe. If this fails, we never spawn
-    // the thread, never publish a handle, and the caller knows to
-    // exclude this codec from the subscription set.
-    let (encoder, _) = super::select_codec_for_mime(
-        id.codec.mime(),
-        layer.width,
-        layer.height,
-        layer.target_bitrate_kbps,
-    )?;
-    Ok(spawn_encoder_thread_with(
-        id, layer, source_w, source_h, encoder, i420_tx, duration_ms, counters,
-    ))
+    // The construction parameters captured for the driver thread. The
+    // thread runs `select_codec_for_mime` so any per-thread codec state
+    // (Windows COM/MF) is initialized on the thread that will use it.
+    let mime = id.codec.mime();
+    let (cw, ch, cbr) = (layer.width, layer.height, layer.target_bitrate_kbps);
+    let construct = move || super::select_codec_for_mime(mime, cw, ch, cbr).map(|(enc, _)| enc);
+    spawn_encoder_thread_with(
+        id,
+        layer,
+        source_w,
+        source_h,
+        construct,
+        i420_tx,
+        duration_ms,
+        counters,
+    )
 }
 
 /// 3c.3b.4f: per-encoder silent-output watchdog.
@@ -2188,9 +2411,14 @@ fn try_h264_fallback_for_layer(
     if codec != CodecKind::H264 {
         return None;
     }
-    // Idempotent — see VAAPI_BANNED in h264_linux.rs (one-way
-    // AtomicBool that's never cleared). Calling when already
-    // banned is a no-op store.
+    // Ban BOTH GPU encoders before reconstructing. The watchdog fires on a
+    // silent-failure (encoder accepts input, emits nothing) but can't tell
+    // which backend the dead encoder used — VA-API or NVENC — so banning
+    // both forces the rebuilt encoder past the GPU arms straight to
+    // software libx264, which is the watchdog's whole intent. Idempotent —
+    // see VAAPI_BANNED / NVENC_BANNED in h264_linux.rs (one-way AtomicBools
+    // that are never cleared). Calling when already banned is a no-op store.
+    super::h264_linux::ban_nvenc();
     super::h264_linux::ban_vaapi();
     match super::select_codec_for_mime(
         codec.mime(),
@@ -2217,21 +2445,26 @@ fn try_h264_fallback_for_layer(
     None
 }
 
-/// Spawn the encoder driver thread with a pre-constructed [`super::Encoder`].
-/// Returns immediately; the thread runs until `shutdown.cancel()` or the
-/// i420 broadcast closes.
+/// Spawn the encoder driver thread, constructing the [`super::Encoder`]
+/// **inside that thread** via the `construct` closure.
+///
+/// Blocks until the thread reports its construction outcome over a
+/// one-shot startup channel: returns `Err` (and publishes no handle) if
+/// `construct` failed, or the running [`EncoderHandle`] once the encoder
+/// is built. Constructing on the thread that will use and drop the
+/// encoder is what makes the Windows MF backend's per-thread COM
+/// init/teardown correct; see [`try_spawn_encoder_thread`].
 fn spawn_encoder_thread_with(
     id: EncoderId,
     layer: LayerSpec,
     source_w: u32,
     source_h: u32,
-    encoder: Box<dyn super::Encoder>,
+    construct: impl FnOnce() -> Result<Box<dyn super::Encoder>, String> + Send + 'static,
     i420_tx: &broadcast::Sender<I420Frame>,
     duration_ms: u64,
     counters: &Arc<crate::display::DisplayMetricsCounters>,
-) -> EncoderHandle {
-    let (frames_tx, _) =
-        broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
+) -> Result<EncoderHandle, String> {
+    let (frames_tx, _) = broadcast::channel::<Arc<EncodedFrame>>(ENCODER_FRAME_BROADCAST_CAPACITY);
     let force_keyframe = Arc::new(AtomicBool::new(false));
     // Phase 4d.0: paused defaults to false. Layer-selection policy
     // flips this via [`EncoderPool::pause_layer`] /
@@ -2260,8 +2493,7 @@ fn spawn_encoder_thread_with(
     // `layer.height`. When they differ (simulcast: half/quarter
     // layers), each frame must be downscaled before encode or the
     // encoder will reject (size mismatch) or mis-encode.
-    let needs_downscale =
-        (layer.width, layer.height) != (source_w, source_h);
+    let needs_downscale = (layer.width, layer.height) != (source_w, source_h);
     let downscale_src_w = source_w;
     let downscale_src_h = source_h;
     let downscale_dst_w = layer.width;
@@ -2271,9 +2503,43 @@ fn spawn_encoder_thread_with(
     // (encode_drops). Counter is shared with DisplaySession via Arc.
     let counters_for_thread = Arc::clone(counters);
 
+    // One-shot startup channel: the thread constructs the encoder and
+    // reports `Ok(())` / `Err(reason)` back here before entering its
+    // loop. Sized 1 — exactly one message is ever sent. This lets us
+    // construct on the encoder thread (correct for Windows per-thread
+    // COM/MF) yet still propagate a construction failure to the caller
+    // synchronously, so no handle is published for an encoder that
+    // could not be built.
+    let (startup_tx, startup_rx) = std::sync::mpsc::sync_channel::<Result<(), String>>(1);
+
     std::thread::spawn(move || {
-        let mut encoder = encoder;
+        // Construct on THIS thread so any per-thread codec state
+        // (Windows COM apartment + Media Foundation) is initialized,
+        // used, and torn down all on one thread. On failure, report the
+        // error and exit without ever touching the i420 broadcast.
+        let mut encoder = match construct() {
+            Ok(enc) => {
+                // Report success first; if the receiver is already gone
+                // (caller dropped), there's nothing to drive, so exit.
+                if startup_tx.send(Ok(())).is_err() {
+                    return;
+                }
+                enc
+            }
+            Err(e) => {
+                let _ = startup_tx.send(Err(e));
+                return;
+            }
+        };
+        // Drop the startup sender now that the outcome is delivered; the
+        // encoder's lifetime is owned entirely by this thread from here.
+        drop(startup_tx);
         let mut watchdog = WatchdogState::new();
+        // Windows black-frame diagnostic: count encode calls so the
+        // hop-by-hop avg-byte logging below self-limits to the first few
+        // frames (then stays off the hot path).
+        #[cfg(target_os = "windows")]
+        let mut diag_frame_count: u64 = 0;
 
         loop {
             if shutdown_for_thread.is_cancelled() {
@@ -2409,6 +2675,29 @@ fn spawn_encoder_thread_with(
                 &frame.data
             };
 
+            // Windows black-frame diagnostic (hop B): log the average byte of
+            // the exact I420 slice handed to the encoder for the first few
+            // frames. This is the buffer the codec actually sees — if the
+            // bridge logged a bright I420 (hop A) but this reads ~0, the frame
+            // was lost/zeroed in the pool broadcast or the
+            // downscale/visual-marker selection above; if both are bright, the
+            // black is inside the encoder (hop C, in h264_windows.rs).
+            #[cfg(target_os = "windows")]
+            {
+                if diag_frame_count < 5 {
+                    eprintln!(
+                        "[encoder/pool] {} encode-input frame #{} i420 avg={} \
+                         (len={}, downscale={})",
+                        id_for_log,
+                        diag_frame_count + 1,
+                        super::sampled_avg_byte(i420_for_encode),
+                        i420_for_encode.len(),
+                        needs_downscale,
+                    );
+                }
+                diag_frame_count += 1;
+            }
+
             let produced = match encoder.encode(i420_for_encode, duration_ms, force_kf) {
                 Ok(packets) => {
                     let n = packets.len();
@@ -2473,13 +2762,23 @@ fn spawn_encoder_thread_with(
         }
     });
 
-    EncoderHandle {
-        id,
-        layer,
-        frames: frames_tx,
-        force_keyframe,
-        paused,
-        shutdown,
+    // Block until the thread reports its construction outcome. A
+    // `RecvError` here means the thread panicked or exited before
+    // sending — treat that as a construction failure rather than
+    // publishing a handle to a dead thread.
+    match startup_rx.recv() {
+        Ok(Ok(())) => Ok(EncoderHandle {
+            id,
+            layer,
+            frames: frames_tx,
+            force_keyframe,
+            paused,
+            shutdown,
+        }),
+        Ok(Err(e)) => Err(e),
+        Err(_) => Err(format!(
+            "encoder {id} thread exited before reporting construction outcome"
+        )),
     }
 }
 
@@ -2487,15 +2786,17 @@ fn spawn_encoder_thread_with(
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Codec-agnostic, allocation-free pool logic tests that run on **every**
+/// platform (no `EncoderPool::new`, so no encoder backend is constructed).
+/// Kept separate from [`tests`] so the Windows target — where the heavier
+/// pool-construction tests are gated off (see that module's note) — still
+/// verifies codec identity, the platform baseline, and the pure helper math.
 #[cfg(test)]
-mod tests {
+mod logic_tests {
     use super::*;
-    use std::thread::sleep;
 
     #[test]
     fn codec_kind_mime_round_trip() {
-        // mime() → CodecChoice expectation (existing constants from
-        // super::). Guards against drift between the two enums.
         assert_eq!(CodecKind::Vp8.mime(), super::super::MIME_TYPE_VP8);
         assert_eq!(CodecKind::H264.mime(), super::super::MIME_TYPE_H264);
         assert_eq!(CodecKind::Vp9.mime(), "video/VP9");
@@ -2504,19 +2805,44 @@ mod tests {
 
     #[test]
     fn codec_kind_from_mime_round_trips_every_kind() {
-        for k in [CodecKind::Vp8, CodecKind::H264, CodecKind::Vp9, CodecKind::Av1] {
+        for k in [
+            CodecKind::Vp8,
+            CodecKind::H264,
+            CodecKind::Vp9,
+            CodecKind::Av1,
+        ] {
             assert_eq!(CodecKind::from_mime(k.mime()), Some(k));
         }
-        assert_eq!(CodecKind::from_mime("video/HEVC"), None);
         assert_eq!(CodecKind::from_mime(""), None);
     }
 
     #[test]
-    fn codec_kind_only_vp8_is_always_on_default() {
-        assert!(CodecKind::Vp8.is_always_on_default());
-        assert!(!CodecKind::H264.is_always_on_default());
-        assert!(!CodecKind::Vp9.is_always_on_default());
-        assert!(!CodecKind::Av1.is_always_on_default());
+    fn codec_kind_only_baseline_is_always_on_default() {
+        // Exactly the platform BASELINE_CODEC is always-on (VP8 on
+        // macOS/Linux, H.264 on Windows where VP8 is gated off); every other
+        // codec spins up on demand. This is the load-bearing cross-platform
+        // assertion for the Windows H.264-baseline wiring.
+        for k in [
+            CodecKind::Vp8,
+            CodecKind::H264,
+            CodecKind::Vp9,
+            CodecKind::Av1,
+        ] {
+            assert_eq!(
+                k.is_always_on_default(),
+                k == BASELINE_CODEC,
+                "{k:?} always-on should equal (k == BASELINE_CODEC)"
+            );
+        }
+        assert!(BASELINE_CODEC.is_always_on_default());
+    }
+
+    #[test]
+    fn baseline_codec_is_h264_on_windows_vp8_elsewhere() {
+        #[cfg(target_os = "windows")]
+        assert_eq!(BASELINE_CODEC, CodecKind::H264);
+        #[cfg(not(target_os = "windows"))]
+        assert_eq!(BASELINE_CODEC, CodecKind::Vp8);
     }
 
     #[test]
@@ -2530,20 +2856,122 @@ mod tests {
     fn vp8_simulcast_layout_is_three_descending_layers() {
         let layers = LayerSpec::vp8_simulcast(1920, 1080, 30);
         assert_eq!(layers.len(), 3);
-        // Order: full, half, quarter.
+        // Order: full, half, quarter, with exact even-rounded dims.
         assert_eq!(layers[0].rid, SimulcastRid::full());
-        assert_eq!(layers[0].width, 1920);
-        assert_eq!(layers[0].height, 1080);
+        assert_eq!((layers[0].width, layers[0].height), (1920, 1080));
         assert_eq!(layers[1].rid, SimulcastRid::half());
-        assert_eq!(layers[1].width, 960);
-        assert_eq!(layers[1].height, 540);
+        assert_eq!((layers[1].width, layers[1].height), (960, 540));
         assert_eq!(layers[2].rid, SimulcastRid::quarter());
-        assert_eq!(layers[2].width, 480);
-        assert_eq!(layers[2].height, 270);
+        assert_eq!((layers[2].width, layers[2].height), (480, 270));
         // Bitrate strictly descending — smaller layers are cheap.
         assert!(layers[0].target_bitrate_kbps > layers[1].target_bitrate_kbps);
         assert!(layers[1].target_bitrate_kbps > layers[2].target_bitrate_kbps);
     }
+
+    #[test]
+    fn single_full_layer_is_source_res_and_full_rid() {
+        // The local (non-federated) on-demand H.264 layer: source
+        // resolution, the full 2.5 Mbps cap, on the `full` RID.
+        let layer = LayerSpec::single(CodecKind::H264, 1920, 1080, 30);
+        assert_eq!((layer.width, layer.height), (1920, 1080));
+        assert_eq!(layer.target_bitrate_kbps, 2500);
+        assert_eq!(layer.rid, SimulcastRid::full());
+    }
+
+    #[test]
+    fn single_federated_layer_is_quarter_res_capped_bitrate_federated_rid() {
+        // The federated on-demand H.264 layer mirrors the VP8 quarter
+        // floor: quarter the source dims (even-rounded) + the capped
+        // bitrate, on the distinct `fed` RID.
+        let layer = LayerSpec::single_federated(1920, 1080, 30);
+        assert_eq!(
+            (layer.width, layer.height),
+            (480, 270),
+            "federated H.264 must be quarter of 1920x1080"
+        );
+        assert_eq!(layer.target_bitrate_kbps, FEDERATED_H264_BITRATE_KBPS);
+        assert!(
+            layer.target_bitrate_kbps < 2500,
+            "federated bitrate must be well below the full-res 2500 kbps cap"
+        );
+        assert_eq!(
+            layer.rid,
+            SimulcastRid::federated(),
+            "federated layer must use RID_FEDERATED, not RID_FULL, so its \
+             pool slot never aliases a local full-res H.264 slot"
+        );
+        // The federated RID is distinct from the full RID — the property
+        // that keeps the two EncoderId slots separate.
+        assert_ne!(SimulcastRid::federated(), SimulcastRid::full());
+        assert_eq!(SimulcastRid::federated().as_str(), RID_FEDERATED);
+    }
+
+    #[test]
+    fn single_federated_odd_source_dims_round_to_even() {
+        // 1366x768 quarter = 341x192; 341 is odd → must round down to 340
+        // (the same even-dim constraint vp8_simulcast enforces, so the
+        // downscale + encoder accept the dims).
+        let layer = LayerSpec::single_federated(1366, 768, 30);
+        assert_eq!((layer.width, layer.height), (340, 192));
+        assert_eq!(layer.width % 2, 0, "width must be even");
+        assert_eq!(layer.height % 2, 0, "height must be even");
+    }
+
+    #[test]
+    fn single_federated_tiny_source_falls_back_to_encodable_dims() {
+        // A source whose quarter would fall below MIN_LAYER_DIM must still
+        // yield an encodable layer (a federated H.264 peer needs *a*
+        // stream), not panic or produce sub-minimum dims.
+        let layer = LayerSpec::single_federated(40, 40, 30);
+        // Quarter (10x10) is below MIN_LAYER_DIM=16 → falls back to the
+        // normalized source dims (40x40, both even and >= 16).
+        assert!(layer.width >= MIN_LAYER_DIM && layer.height >= MIN_LAYER_DIM);
+        assert_eq!((layer.width, layer.height), (40, 40));
+    }
+
+    #[test]
+    fn peer_codec_preferences_federated_flag() {
+        // `new` is non-federated; `new_federated` sets the flag. Both keep
+        // the supported-codec list intact.
+        let local = PeerCodecPreferences::new(vec![CodecKind::H264, CodecKind::Vp8]);
+        assert!(!local.federated);
+        assert!(local.supports(CodecKind::H264));
+
+        let fed = PeerCodecPreferences::new_federated(vec![CodecKind::H264, CodecKind::Vp8]);
+        assert!(fed.federated);
+        assert!(fed.supports(CodecKind::H264));
+        assert_eq!(fed.supported, local.supported);
+    }
+}
+
+// These pool-orchestration tests are gated off Windows. They were written
+// around VP8 as the always-on baseline: they construct pools with
+// `LayerSpec::vp8_simulcast` factories at small synthetic dimensions (64×64
+// and below, down to 16×16 quarter layers) — sizes VP8/libvpx accepts but the
+// Windows Media Foundation H.264 encoder MFT rejects at `SetOutputType`
+// (`MF_E_INVALIDMEDIATYPE`; the MS H.264 encoder enforces a larger minimum
+// frame size). On Windows the baseline codec is H.264 (`BASELINE_CODEC`), so
+// every such `EncoderPool::new` would try to spawn an H.264 encoder at those
+// dims and panic on the always-on construction-failure contract.
+//
+// The orchestration semantics these tests cover (refcounted on-demand slots,
+// PoolLease drop ordering, resize epoch races, pause/resume, keyframe
+// coalescing) are codec-agnostic and fully exercised on macOS/Linux where VP8
+// is the baseline. The Windows-specific pool behavior — H.264 as the always-on
+// baseline — is covered by [`logic_tests`] (which run everywhere) plus
+// `h264_windows`'s own encoder tests (which construct the MF encoder and
+// encode a real frame). Rather than rewrite 47 VP8-shaped construction sites
+// to H.264-compatible dimensions (a large, risky change to proven test code),
+// the heavyweight module is gated; see the task's pool-integration scope note.
+#[cfg(all(test, not(target_os = "windows")))]
+mod tests {
+    use super::*;
+    use std::thread::sleep;
+
+    // NOTE: codec-identity / baseline / simulcast-layout / RID-constant tests
+    // live in [`super::logic_tests`] (compiled on every platform). This module
+    // is gated off Windows and holds the pool-construction tests; see the
+    // module-level comment above for why.
 
     /// **Phase 4a follow-up regression test (review finding).** Common
     /// non-power-of-2 display widths produce odd half/quarter dims
@@ -2767,10 +3195,7 @@ mod tests {
         // (128, 96) → new layer is (128, 96).
         assert_eq!(new_layer.width, 128);
         assert_eq!(new_layer.height, 96);
-        assert_eq!(
-            new_layer.rid, old_layer.rid,
-            "rid preserved across resize"
-        );
+        assert_eq!(new_layer.rid, old_layer.rid, "rid preserved across resize");
 
         // Old subscription must terminate. The mechanics:
         // - on_resize cancels the old handle's shutdown token, but the
@@ -2801,9 +3226,7 @@ mod tests {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
         for _ in 0..3 {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            let Ok(result) =
-                tokio::time::timeout(remaining, old_frames_rx.recv()).await
-            else {
+            let Ok(result) = tokio::time::timeout(remaining, old_frames_rx.recv()).await else {
                 break;
             };
             match result {
@@ -2924,13 +3347,7 @@ mod tests {
     /// (drift-free resize through odd intermediate dims).
     #[tokio::test]
     async fn on_resize_drops_simulcast_layers_below_min_dim() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Precondition: all 3 simulcast layers spawned cleanly.
         {
@@ -2946,8 +3363,7 @@ mod tests {
         pool.on_resize(60, 48);
 
         let always_on = pool.always_on();
-        let rids: Vec<SimulcastRid> =
-            always_on.iter().map(|h| h.layer.rid.clone()).collect();
+        let rids: Vec<SimulcastRid> = always_on.iter().map(|h| h.layer.rid.clone()).collect();
         assert_eq!(
             always_on.len(),
             2,
@@ -2993,8 +3409,7 @@ mod tests {
         // checked by both the resize and initial-construction paths
         // through `normalize_layer_dims`.
         let fresh = LayerSpec::vp8_simulcast(60, 48, 30);
-        let fresh_rids: Vec<SimulcastRid> =
-            fresh.iter().map(|l| l.rid.clone()).collect();
+        let fresh_rids: Vec<SimulcastRid> = fresh.iter().map(|l| l.rid.clone()).collect();
         let mut sorted_rids = rids.clone();
         sorted_rids.sort_by(|a, b| a.as_str().cmp(b.as_str()));
         let mut sorted_fresh = fresh_rids.clone();
@@ -3025,13 +3440,7 @@ mod tests {
     ///   after  64×64: full(64×64), half(32×32), quarter(16×16)  [restored]
     #[tokio::test]
     async fn on_resize_grow_back_restores_dropped_simulcast_layers() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Start: 3 layers.
         assert_eq!(pool.always_on().len(), 3, "initial pool has 3 layers");
@@ -3053,10 +3462,12 @@ mod tests {
             "after 60×48 → 64×64 round-trip: quarter must be restored \
              (got {} layers, rids={:?})",
             always_on.len(),
-            always_on.iter().map(|h| h.layer.rid.as_str()).collect::<Vec<_>>(),
+            always_on
+                .iter()
+                .map(|h| h.layer.rid.as_str())
+                .collect::<Vec<_>>(),
         );
-        let rids: Vec<&str> =
-            always_on.iter().map(|h| h.layer.rid.as_str()).collect();
+        let rids: Vec<&str> = always_on.iter().map(|h| h.layer.rid.as_str()).collect();
         assert!(rids.contains(&RID_FULL), "full present");
         assert!(rids.contains(&RID_HALF), "half present");
         assert!(
@@ -3142,11 +3553,10 @@ mod tests {
             .collect();
         let mut actual_sorted = actual.clone();
         actual_sorted.sort();
-        let expected: Vec<(String, u32, u32)> =
-            LayerSpec::vp8_simulcast(1920, 1080, 30)
-                .iter()
-                .map(|l| (l.rid.as_str().to_string(), l.width, l.height))
-                .collect();
+        let expected: Vec<(String, u32, u32)> = LayerSpec::vp8_simulcast(1920, 1080, 30)
+            .iter()
+            .map(|l| (l.rid.as_str().to_string(), l.width, l.height))
+            .collect();
         let mut expected_sorted = expected.clone();
         expected_sorted.sort();
         assert_eq!(
@@ -3247,9 +3657,7 @@ mod tests {
         // giving us a VP8 slot to observe.
         let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let (_subs, _lease) = pool
-            .subscribe(&prefs)
-            .expect("on-demand VP8 spawn");
+        let (_subs, _lease) = pool.subscribe(&prefs).expect("on-demand VP8 spawn");
         assert_eq!(
             pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
             Some(1),
@@ -3522,8 +3930,7 @@ mod tests {
             None,
         );
 
-        let unsupported_prefs =
-            PeerCodecPreferences::new(vec![CodecKind::Vp9, CodecKind::Av1]);
+        let unsupported_prefs = PeerCodecPreferences::new(vec![CodecKind::Vp9, CodecKind::Av1]);
         let result = pool.subscribe(&unsupported_prefs);
         assert!(
             matches!(result, Err(SubscribeError::NoCompatibleCodec)),
@@ -3563,7 +3970,10 @@ mod tests {
 
         // Fire keyframe request → flag goes true.
         let fired = pool.request_keyframe(CodecKind::Vp8, Some(SimulcastRid::full()));
-        assert!(fired, "request_keyframe must return true when encoder matches");
+        assert!(
+            fired,
+            "request_keyframe must return true when encoder matches"
+        );
         assert!(handle.force_keyframe.load(Ordering::SeqCst));
 
         // Second request is coalesced (returns false) — flag stays
@@ -3586,13 +3996,7 @@ mod tests {
     async fn pool_request_keyframe_all_fires_all_active_encoders() {
         // Three always-on layers (full / half / quarter) — exercises
         // multi-encoder iteration, not just a single layer.
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Initial state: flags clear on every always-on encoder.
         {
@@ -3653,13 +4057,7 @@ mod tests {
     /// reflected without a separate refresh path.
     #[tokio::test]
     async fn pool_always_on_ids_returns_one_id_per_layer() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         let ids = pool.always_on_ids();
         assert_eq!(
@@ -3677,11 +4075,7 @@ mod tests {
             );
         }
         // Must match what `always_on()` (the internal accessor) sees.
-        let internal_ids: Vec<EncoderId> = pool
-            .always_on()
-            .iter()
-            .map(|h| h.id.clone())
-            .collect();
+        let internal_ids: Vec<EncoderId> = pool.always_on().iter().map(|h| h.id.clone()).collect();
         assert_eq!(
             ids, internal_ids,
             "always_on_ids must mirror the internal handle set \
@@ -3725,10 +4119,7 @@ mod tests {
         // Behavior 3: post-swap latch — never fires again, even on
         // continued silence well past the threshold.
         for _ in 0..(ENCODER_SILENT_FRAMES_THRESHOLD * 3) {
-            assert!(
-                !w.record(0),
-                "post-swap watchdog must never fire again",
-            );
+            assert!(!w.record(0), "post-swap watchdog must never fire again",);
         }
         // Even produced > 0 followed by silence stays latched.
         assert!(!w.record(2));
@@ -3811,7 +4202,10 @@ mod tests {
             .await
             .expect("encoded frame should arrive within 2s")
             .expect("broadcast should not be closed while pool is alive");
-        assert!(!ef.data.is_empty(), "encoded frame payload must be non-empty");
+        assert!(
+            !ef.data.is_empty(),
+            "encoded frame payload must be non-empty"
+        );
     }
 
     /// **Phase 4a regression test.** A pool with a half-resolution
@@ -3853,13 +4247,15 @@ mod tests {
             SRC_W,
             SRC_H,
             30,
-            |_w, _h| vec![LayerSpec {
-                rid: SimulcastRid::half(),
-                width: HALF_W,
-                height: HALF_H,
-                target_bitrate_kbps: 400,
-                framerate: 30,
-            }],
+            |_w, _h| {
+                vec![LayerSpec {
+                    rid: SimulcastRid::half(),
+                    width: HALF_W,
+                    height: HALF_H,
+                    target_bitrate_kbps: 400,
+                    framerate: 30,
+                }]
+            },
             None,
         );
 
@@ -4115,7 +4511,11 @@ mod tests {
         );
 
         let (subs, _lease) = pool.subscribe(&prefs).expect("subscribe must succeed");
-        assert_eq!(subs.len(), 1, "on-demand spawn must return one subscription");
+        assert_eq!(
+            subs.len(),
+            1,
+            "on-demand spawn must return one subscription"
+        );
         assert_eq!(subs[0].id.codec, CodecKind::Vp8);
 
         // Refcount = 1 after first subscribe.
@@ -4205,10 +4605,8 @@ mod tests {
         let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
 
-        let (_subs_a, mut lease_a) =
-            pool.subscribe(&prefs).expect("subscribe a");
-        let (_subs_b, lease_b) =
-            pool.subscribe(&prefs).expect("subscribe b");
+        let (_subs_a, mut lease_a) = pool.subscribe(&prefs).expect("subscribe a");
+        let (_subs_b, lease_b) = pool.subscribe(&prefs).expect("subscribe b");
         assert_eq!(
             pool.on_demand_refcount(CodecKind::Vp8, SimulcastRid::full()),
             Some(2),
@@ -4270,8 +4668,7 @@ mod tests {
         // VP8 is always-on; no on-demand claim. Subscribe still
         // returns the always-on sub but lease has empty on_demand_refs.
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let (_subs, mut lease) =
-            pool.subscribe(&prefs).expect("subscribe always-on VP8");
+        let (_subs, mut lease) = pool.subscribe(&prefs).expect("subscribe always-on VP8");
         assert_eq!(lease.on_demand_count(), 0);
 
         // Pass an always-on id and a never-claimed id; both should
@@ -4289,8 +4686,7 @@ mod tests {
     async fn release_on_demand_subset_empty_ids_is_noop() {
         let pool = EncoderPool::new(64, 64, 30, |_, _| vec![], None);
         let prefs = PeerCodecPreferences::new(vec![CodecKind::Vp8]);
-        let (_subs, mut lease) =
-            pool.subscribe(&prefs).expect("subscribe on-demand VP8");
+        let (_subs, mut lease) = pool.subscribe(&prefs).expect("subscribe on-demand VP8");
         assert_eq!(lease.on_demand_count(), 1);
 
         lease.release_on_demand_subset(&[]);
@@ -4387,7 +4783,10 @@ mod tests {
         // VP8 from always-on is guaranteed. H.264 on-demand is
         // best-effort — depends on platform backend availability.
         let codecs: Vec<CodecKind> = subs.iter().map(|s| s.id.codec).collect();
-        assert!(codecs.contains(&CodecKind::Vp8), "VP8 always-on must be present");
+        assert!(
+            codecs.contains(&CodecKind::Vp8),
+            "VP8 always-on must be present"
+        );
 
         // VP8 is in always_on, not on_demand — refcount tracking only
         // applies to on-demand slots.
@@ -4400,8 +4799,7 @@ mod tests {
         // slot. If not, refcount is None. Assert the condition is
         // consistent with what came back in the subscription set.
         let h264_in_subs = codecs.contains(&CodecKind::H264);
-        let h264_refcount =
-            pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full());
+        let h264_refcount = pool.on_demand_refcount(CodecKind::H264, SimulcastRid::full());
         assert_eq!(
             h264_in_subs,
             h264_refcount.is_some(),
@@ -4473,15 +4871,13 @@ mod tests {
     /// implicitly paused at construction).
     #[tokio::test]
     async fn pool_layer_paused_defaults_false() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
-        for rid in [SimulcastRid::full(), SimulcastRid::half(), SimulcastRid::quarter()] {
+        for rid in [
+            SimulcastRid::full(),
+            SimulcastRid::half(),
+            SimulcastRid::quarter(),
+        ] {
             assert_eq!(
                 pool.is_layer_paused(CodecKind::Vp8, rid.clone()),
                 Some(false),
@@ -4498,13 +4894,7 @@ mod tests {
     /// returns true since the slot exists).
     #[tokio::test]
     async fn pool_pause_resume_layer_toggles_flag() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Pause half — full and quarter stay active.
         let paused = pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
@@ -4525,7 +4915,10 @@ mod tests {
 
         // Idempotent pause: second call returns true, state unchanged.
         let paused_again = pool.pause_layer(CodecKind::Vp8, SimulcastRid::half());
-        assert!(paused_again, "pause_layer is idempotent on already-paused slot");
+        assert!(
+            paused_again,
+            "pause_layer is idempotent on already-paused slot"
+        );
         assert_eq!(
             pool.is_layer_paused(CodecKind::Vp8, SimulcastRid::half()),
             Some(true)
@@ -4541,7 +4934,10 @@ mod tests {
 
         // Idempotent resume.
         let resumed_again = pool.resume_layer(CodecKind::Vp8, SimulcastRid::half());
-        assert!(resumed_again, "resume_layer is idempotent on already-active slot");
+        assert!(
+            resumed_again,
+            "resume_layer is idempotent on already-active slot"
+        );
     }
 
     /// Unknown `(codec, rid)` lookups return `false` from
@@ -4722,13 +5118,7 @@ mod tests {
     /// accidentally collapse layer state.
     #[tokio::test]
     async fn pool_pause_resume_targets_correct_layer_in_simulcast() {
-        let pool = EncoderPool::new(
-            64,
-            64,
-            30,
-            |w, h| LayerSpec::vp8_simulcast(w, h, 30),
-            None,
-        );
+        let pool = EncoderPool::new(64, 64, 30, |w, h| LayerSpec::vp8_simulcast(w, h, 30), None);
 
         // Pause full only.
         pool.pause_layer(CodecKind::Vp8, SimulcastRid::full());

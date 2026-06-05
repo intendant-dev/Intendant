@@ -1,5 +1,10 @@
 use crate::error::AgentError;
 use crate::models::{AgentInput, Command as AgentCommand, ProcessInfo, ProcessStatus};
+// `MetadataExt` exposes the POSIX `mode`/`uid`/`gid` accessors used by
+// `inspectPath`. They don't exist on Windows metadata, so the import (and
+// the fields it powers) are gated to Unix; the Windows arm of the
+// `inspectPath` result omits those fields.
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt;
 
 use std::{
@@ -24,11 +29,38 @@ static NONCE_RE: LazyLock<regex::Regex> =
     LazyLock::new(|| regex::Regex::new(r"\$NONCE\[(\d+)\]").unwrap());
 
 struct PtySession {
-    writer: Box<dyn std::io::Write + Send>,
-    reader: Box<dyn std::io::Read + Send>,
+    // Shared with the reader thread so it can answer terminal queries (see
+    // below) on the same PTY input stream that `exec_pty` writes commands to.
+    writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>>,
+    // All bytes the shell has emitted so far, accumulated by a dedicated
+    // background reader thread (see `exec_pty`). A background thread — rather
+    // than an inline blocking `read()` in the command loop — is what makes the
+    // per-command read timeout robust: `portable_pty`'s reader is blocking and
+    // has no portable non-blocking / deadline mode, so an inline read against
+    // a shell that has gone quiet (e.g. PowerShell sitting at its prompt on
+    // Windows ConPTY) blocks indefinitely and the loop's elapsed-time check
+    // never runs. Draining on a thread lets `exec_pty` poll this buffer under
+    // an async deadline that always fires.
+    output: Arc<std::sync::Mutex<Vec<u8>>>,
+    // How many bytes of `output` previous `exec_pty` calls have already
+    // consumed, so each call only scans newly-produced bytes for its markers.
+    read_offset: usize,
     // Keep master alive to prevent EOF
     _master: Box<dyn portable_pty::MasterPty + Send>,
 }
+
+/// Reply to a terminal Device Status Report (cursor-position) query.
+///
+/// Windows ConPTY emits `ESC[6n` (DSR-CPR) when a console app starts and
+/// *blocks waiting for the reply* before it will process stdin. A raw PTY
+/// consumer like this one is the "terminal" and must answer, or the shell
+/// (both cmd.exe and PowerShell) hangs at startup and never runs the commands
+/// we inject. We answer with a fixed cursor-at-origin report `ESC[1;1R`; the
+/// exact coordinates are irrelevant for our non-interactive marker-scrape use.
+/// On Unix this query effectively never fires at shell startup, so the scan is
+/// a cheap no-op and a stray reply would be harmless.
+const DSR_CPR_QUERY: &[u8] = b"\x1b[6n";
+const DSR_CPR_REPLY: &[u8] = b"\x1b[1;1R";
 
 const HUMAN_POLL_MS: u64 = 500;
 const LOG_TAIL_BYTES: u64 = 10 * 1024; // 10KB
@@ -251,8 +283,7 @@ impl Agent {
             }
         }
         // Prefer virtual displays (>0), allow :0 only when granted
-        let user_display_granted =
-            std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+        let user_display_granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
         self.available_displays
             .iter()
             .copied()
@@ -324,19 +355,22 @@ impl Agent {
                 .unwrap_or_else(|| self.default_display())
         });
         // Gate user session display access
-        if display_id <= 0
-            && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err()
-        {
+        if display_id <= 0 && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err() {
             return Err(AgentError::Process(
                 "Access to the user's session display (display :0) requires explicit grant. \
                  Use a virtual display or request display access first."
                     .to_string(),
             ));
         }
-        let mut cmd_builder = Command::new("bash");
+        // Platform shell: `bash -c <command>` on Unix (unchanged), `cmd.exe
+        // /C <command>` on Windows where bash is not on PATH. The whole
+        // command string is passed as one argument so the shell does the
+        // word-splitting; exec semantics (cwd, env, stdio, exit code) are
+        // identical across both arms.
+        let (shell, shell_args) = crate::utils::agent_shell_command(&command);
+        let mut cmd_builder = Command::new(shell);
         cmd_builder
-            .arg("-c")
-            .arg(&command)
+            .args(&shell_args)
             .env("DISPLAY", format!(":{}", display_id))
             .env_remove("OPENAI_API_KEY")
             .env_remove("ANTHROPIC_API_KEY")
@@ -418,9 +452,7 @@ impl Agent {
                     .unwrap_or_else(|| self.default_display())
             });
             // Gate user session display access
-            if display <= 0
-                && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err()
-            {
+            if display <= 0 && std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_err() {
                 return Err(AgentError::Process(
                     "Access to the user's session display (display :0) requires explicit grant. \
                      Use a virtual display or request display access first."
@@ -465,8 +497,7 @@ impl Agent {
                      terminal app running intendant. A restart may be required after granting."
                         .to_string()
                 } else {
-                    "Screenshot capture failed. Check DISPLAY and XAUTHORITY settings."
-                        .to_string()
+                    "Screenshot capture failed. Check DISPLAY and XAUTHORITY settings.".to_string()
                 }
             } else {
                 stderr.trim().to_string()
@@ -556,7 +587,8 @@ impl Agent {
             .map(|d| d.as_secs())
             .unwrap_or(0);
 
-        Ok(serde_json::json!({
+        #[cfg(unix)]
+        let result = serde_json::json!({
             "exists": true,
             "path": path_str,
             "type": file_type,
@@ -565,8 +597,18 @@ impl Agent {
             "modified": modified,
             "uid": meta.uid(),
             "gid": meta.gid()
-        })
-        .to_string())
+        });
+        // Windows file metadata has no POSIX mode/uid/gid; omit those fields
+        // (Tier-1 could surface ACL/owner info via the Win32 security APIs).
+        #[cfg(not(unix))]
+        let result = serde_json::json!({
+            "exists": true,
+            "path": path_str,
+            "type": file_type,
+            "size": meta.len(),
+            "modified": modified,
+        });
+        Ok(result.to_string())
     }
 
     async fn exec_pty(&self, cmd: &AgentCommand) -> Result<String, AgentError> {
@@ -590,26 +632,93 @@ impl Agent {
                 })
                 .map_err(|e| AgentError::Process(format!("Failed to open PTY: {}", e)))?;
 
-            let mut pty_cmd = PtyCommandBuilder::new("bash");
-            pty_cmd.args(["--norc", "--noprofile"]);
-            pair.slave
-                .spawn_command(pty_cmd)
-                .map_err(|e| AgentError::Process(format!("Failed to spawn shell: {}", e)))?;
+            // Platform PTY shell: `bash --norc --noprofile` on Unix
+            // (unchanged), `powershell.exe -NoLogo -NoProfile` on Windows with
+            // a `cmd.exe` fallback if PowerShell can't be spawned.
+            let build_pty_cmd = |program: &str, args: &[String]| {
+                let mut c = PtyCommandBuilder::new(program);
+                c.args(args);
+                c
+            };
+            let (shell, shell_args) = crate::utils::pty_shell_command();
+            let spawn_result = pair.slave.spawn_command(build_pty_cmd(shell, &shell_args));
+            let spawn_result = match spawn_result {
+                Ok(child) => Ok(child),
+                Err(primary_err) => match crate::utils::pty_shell_fallback() {
+                    Some((fb_shell, fb_args)) => pair
+                        .slave
+                        .spawn_command(build_pty_cmd(fb_shell, &fb_args))
+                        .map_err(|fb_err| {
+                            AgentError::Process(format!(
+                                "Failed to spawn PTY shell '{}' ({}) and fallback '{}' ({})",
+                                shell, primary_err, fb_shell, fb_err
+                            ))
+                        }),
+                    None => Err(AgentError::Process(format!(
+                        "Failed to spawn shell: {}",
+                        primary_err
+                    ))),
+                },
+            };
+            spawn_result?;
 
-            let reader = pair
+            let mut reader = pair
                 .master
                 .try_clone_reader()
                 .map_err(|e| AgentError::Process(format!("Failed to clone reader: {}", e)))?;
-            let writer = pair
-                .master
-                .take_writer()
-                .map_err(|e| AgentError::Process(format!("Failed to take writer: {}", e)))?;
+            let writer: Arc<std::sync::Mutex<Box<dyn std::io::Write + Send>>> =
+                Arc::new(std::sync::Mutex::new(pair.master.take_writer().map_err(
+                    |e| AgentError::Process(format!("Failed to take writer: {}", e)),
+                )?));
+
+            // Dedicated blocking reader thread: drains the PTY into the shared
+            // buffer for the session's lifetime. `exec_pty` polls the buffer
+            // under an async deadline rather than blocking on `read()` itself,
+            // so a quiet shell can never wedge the command loop. The thread
+            // exits on EOF/error (when the shell dies and the master closes).
+            //
+            // It also answers ConPTY's startup `ESC[6n` cursor-position query
+            // (see DSR_CPR_*): both cmd.exe and PowerShell block waiting for
+            // that reply before processing injected stdin, so without this the
+            // shell never runs our commands. We scan each chunk (the sequence
+            // is tiny and arrives in one read in practice) and write the reply
+            // back through the shared writer.
+            let output = Arc::new(std::sync::Mutex::new(Vec::<u8>::new()));
+            let output_for_thread = Arc::clone(&output);
+            let writer_for_thread = Arc::clone(&writer);
+            std::thread::spawn(move || {
+                let mut buf = [0u8; 4096];
+                loop {
+                    match reader.read(&mut buf) {
+                        Ok(0) => break,
+                        Ok(n) => {
+                            let chunk = &buf[..n];
+                            if chunk
+                                .windows(DSR_CPR_QUERY.len())
+                                .any(|w| w == DSR_CPR_QUERY)
+                            {
+                                if let Ok(mut w) = writer_for_thread.lock() {
+                                    let _ = w.write_all(DSR_CPR_REPLY);
+                                    let _ = w.flush();
+                                }
+                            }
+                            if let Ok(mut o) = output_for_thread.lock() {
+                                o.extend_from_slice(chunk);
+                            } else {
+                                break;
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+            });
 
             sessions.insert(
                 shell_id.clone(),
                 PtySession {
                     writer,
-                    reader,
+                    output,
+                    read_offset: 0,
                     _master: pair.master,
                 },
             );
@@ -623,39 +732,67 @@ impl Agent {
         let start_marker = format!("__PTY_START_{}__", cmd.nonce);
         let marker = format!("__PTY_END_{}__", cmd.nonce);
 
-        // Write: echo start-marker, then command, then echo end-marker
-        let pty_input = format!("echo '{}'\n{}\necho '{}'\n", start_marker, command, marker);
-        session
-            .writer
-            .write_all(pty_input.as_bytes())
-            .map_err(|e| AgentError::Process(format!("Failed to write to PTY: {}", e)))?;
-        session
-            .writer
-            .flush()
-            .map_err(|e| AgentError::Process(format!("Failed to flush PTY: {}", e)))?;
+        // Write: echo start-marker, then command, then echo end-marker. The
+        // writer is shared with the reader thread (which answers DSR queries),
+        // so take the lock just for the duration of this write. Each line is
+        // terminated with the platform PTY submit byte (`\r` on Windows so
+        // ConPTY treats it as Enter; `\n` on Unix, unchanged).
+        let nl = crate::utils::pty_line_ending();
+        let pty_input = format!(
+            "echo '{start}'{nl}{cmd}{nl}echo '{end}'{nl}",
+            start = start_marker,
+            cmd = command,
+            end = marker,
+            nl = nl,
+        );
+        {
+            let mut writer = session
+                .writer
+                .lock()
+                .map_err(|_| AgentError::Process("PTY writer poisoned".to_string()))?;
+            writer
+                .write_all(pty_input.as_bytes())
+                .map_err(|e| AgentError::Process(format!("Failed to write to PTY: {}", e)))?;
+            writer
+                .flush()
+                .map_err(|e| AgentError::Process(format!("Failed to flush PTY: {}", e)))?;
+        }
 
-        // Read from PTY until end marker appears, with timeout
-        let mut output = String::new();
+        // Poll the background-filled buffer until the end marker appears or the
+        // deadline elapses. Only bytes produced since this session's last
+        // command (`read_offset`) are this call's output. Because the blocking
+        // `read()` runs on the reader thread, this deadline is always honored —
+        // a shell that goes quiet (no output, no EOF) can't wedge us.
         let timeout_duration = Duration::from_secs(30);
         let start = std::time::Instant::now();
-        let mut buf = [0u8; 4096];
+        let mut output = String::new();
+        // Where this call's output ends within the shared buffer; advanced past
+        // the consumed bytes once we're done so the next call starts fresh.
+        let mut consumed_to = session.read_offset;
 
         loop {
+            // Snapshot the bytes produced for this call so far.
+            {
+                let guard = session
+                    .output
+                    .lock()
+                    .map_err(|_| AgentError::Process("PTY reader buffer poisoned".to_string()))?;
+                if guard.len() > session.read_offset {
+                    output = String::from_utf8_lossy(&guard[session.read_offset..]).into_owned();
+                    consumed_to = guard.len();
+                }
+            }
+
+            if output.contains(&marker) {
+                break;
+            }
             if start.elapsed() >= timeout_duration {
                 break;
             }
-
-            match session.reader.read(&mut buf) {
-                Ok(0) => break,
-                Ok(n) => {
-                    output.push_str(&String::from_utf8_lossy(&buf[..n]));
-                    if output.contains(&marker) {
-                        break;
-                    }
-                }
-                Err(_) => break,
-            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
         }
+        // Mark this call's bytes consumed regardless of outcome.
+        session.read_offset = consumed_to;
 
         // Clean output: strip ANSI escapes and carriage returns
         let cleaned = ANSI_RE.replace_all(&output, "").to_string();
@@ -827,6 +964,7 @@ impl Agent {
 
         let content = if content_type.contains("text/html") {
             html2text::from_read(body.as_bytes(), 120)
+                .map_err(|e| AgentError::Process(format!("Failed to parse HTML response: {}", e)))?
         } else {
             body
         };
@@ -2084,10 +2222,7 @@ mod tests {
             question: Some("proceed?".to_string()),
             ..Default::default()
         };
-        let result = agent
-            .ask_human_with_paths(&cmd, &q, &r, 100)
-            .await
-            .unwrap();
+        let result = agent.ask_human_with_paths(&cmd, &q, &r, 100).await.unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&result).unwrap();
         assert_eq!(parsed["success"], true);
         assert_eq!(parsed["response"], "yes");
@@ -2423,7 +2558,11 @@ mod tests {
         if cfg!(target_os = "macos") {
             // macOS defaults to virtual display 99; returns 0 only when
             // INTENDANT_USER_DISPLAY_GRANTED is set.
-            assert!(d == 0 || d == 99, "default_display on macOS should be 0 or 99, got {}", d);
+            assert!(
+                d == 0 || d == 99,
+                "default_display on macOS should be 0 or 99, got {}",
+                d
+            );
         } else {
             // Linux: DISPLAY env var or fallback to 1
             assert!(d >= 1, "default_display should be >= 1, got {}", d);

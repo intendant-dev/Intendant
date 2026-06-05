@@ -6,27 +6,27 @@
 //!   iOS requires ≤825 days since 2020).
 //! - A client cert (10-year validity).
 //! - A password-protected PKCS#12 bundle containing the client key, cert,
-//!   and CA chain, packaged with **legacy** algorithms so older iOS
-//!   versions can import it (see `build_legacy_p12`).
+//!   and CA chain, packaged with **modern** algorithms (PBES2 /
+//!   PBKDF2-HMAC-SHA256 / AES-256-CBC + SHA-256 MAC) that iOS 18 /
+//!   macOS 15 import (see `build_modern_p12`).
 //!
 //! Everything is idempotent — if certs already exist, the CA and client
 //! cert are preserved and only the server cert is regenerated when the
 //! LAN IP has changed.
+//!
+//! Pure-Rust: cert generation uses `rcgen` (ECDSA P-256 keys via the
+//! `ring` backend — no OpenSSL/aws-lc-sys C toolchain) and the PKCS#12
+//! bundle is built with `p12-keystore` (RustCrypto PBES2/AES).
 
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 
-use openssl::asn1::Asn1Time;
-use openssl::bn::{BigNum, MsbOption};
-use openssl::hash::MessageDigest;
-use openssl::nid::Nid;
-use openssl::pkcs12::Pkcs12;
-use openssl::pkey::{PKey, Private};
-use openssl::rsa::Rsa;
-use openssl::stack::Stack;
-use openssl::x509::extension::{
-    BasicConstraints, ExtendedKeyUsage, KeyUsage, SubjectAlternativeName,
+use p12_keystore::{Certificate as P12Certificate, KeyStore, KeyStoreEntry, PrivateKeyChain};
+use rcgen::{
+    BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
+    Issuer, KeyPair, KeyUsagePurpose, SanType,
 };
-use openssl::x509::{X509Builder, X509NameBuilder, X509};
+use time::{Duration, OffsetDateTime};
 
 use super::{state, LanError, LanResult};
 
@@ -57,14 +57,14 @@ pub fn ensure_certs(
     label: &str,
     force: bool,
 ) -> LanResult<CertState> {
-    load_legacy_provider_if_needed();
-
     let ca_exists = cert_dir.join(CA_KEY).exists() && cert_dir.join(CA_CRT).exists();
-    let client_exists =
-        cert_dir.join(CLIENT_KEY).exists() && cert_dir.join(CLIENT_P12).exists();
+    let client_exists = cert_dir.join(CLIENT_KEY).exists() && cert_dir.join(CLIENT_P12).exists();
 
     if ca_exists && client_exists && !force {
-        println!(":: certs already exist in {} (use --force to regenerate)", cert_dir.display());
+        println!(
+            ":: certs already exist in {} (use --force to regenerate)",
+            cert_dir.display()
+        );
 
         if cert_needs_regen_for_ip(cert_dir, lan_ip)? {
             println!("!! IP changed — regenerating server cert");
@@ -85,17 +85,22 @@ pub fn ensure_certs(
     write_pem_cert(&cert_dir.join(CA_CRT), &ca_cert)?;
     write_pem_private_key(&cert_dir.join(CA_KEY), &ca_key)?;
 
-    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key, lan_ip)?;
+    // The CA acts as issuer for both the server and client leaf certs.
+    // Derive the issuer from the freshly generated CA cert PEM so it
+    // carries the real subject DN + key-usage extensions (same path
+    // `recert` uses when reading the CA back from disk).
+    let ca_issuer = issuer_from_pem(&ca_cert.pem(), ca_key)?;
+
+    let (server_cert, server_key) = generate_server_cert(&ca_issuer, lan_ip)?;
     write_pem_cert(&cert_dir.join(SERVER_CRT), &server_cert)?;
     write_pem_private_key(&cert_dir.join(SERVER_KEY), &server_key)?;
 
-    let (client_cert, client_key) = generate_client_cert(&ca_cert, &ca_key, label)?;
+    let (client_cert, client_key) = generate_client_cert(&ca_issuer, label)?;
     write_pem_cert(&cert_dir.join(CLIENT_CRT), &client_cert)?;
     write_pem_private_key(&cert_dir.join(CLIENT_KEY), &client_key)?;
 
     let password = random_password(12);
-    let p12_bytes =
-        build_legacy_p12(&client_key, &client_cert, &[ca_cert.clone()], label, &password)?;
+    let p12_bytes = build_modern_p12(&client_key, &client_cert, &[ca_cert], label, &password)?;
     std::fs::write(cert_dir.join(CLIENT_P12), &p12_bytes)?;
     state::write_p12_password(cert_dir, &password)?;
 
@@ -113,10 +118,10 @@ pub fn ensure_certs(
 /// client cert, and .p12 are preserved — clients that already imported
 /// the CA don't need to do anything.
 pub fn recert(cert_dir: &Path, lan_ip: &str, force: bool) -> LanResult<()> {
-    load_legacy_provider_if_needed();
-
     if !force && !cert_needs_regen_for_ip(cert_dir, lan_ip)? {
-        println!(":: server cert already matches {lan_ip} — nothing to do (use --force to regenerate)");
+        println!(
+            ":: server cert already matches {lan_ip} — nothing to do (use --force to regenerate)"
+        );
         return Ok(());
     }
 
@@ -127,9 +132,12 @@ pub fn recert(cert_dir: &Path, lan_ip: &str, force: bool) -> LanResult<()> {
 }
 
 fn regenerate_server_cert(cert_dir: &Path, lan_ip: &str) -> LanResult<()> {
-    let ca_cert = read_pem_cert(&cert_dir.join(CA_CRT))?;
-    let ca_key = read_pem_private_key(&cert_dir.join(CA_KEY))?;
-    let (server_cert, server_key) = generate_server_cert(&ca_cert, &ca_key, lan_ip)?;
+    let ca_pem = std::fs::read_to_string(cert_dir.join(CA_CRT))?;
+    let ca_key_pem = std::fs::read_to_string(cert_dir.join(CA_KEY))?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem)?;
+    let ca_issuer = issuer_from_pem(&ca_pem, ca_key)?;
+
+    let (server_cert, server_key) = generate_server_cert(&ca_issuer, lan_ip)?;
     write_pem_cert(&cert_dir.join(SERVER_CRT), &server_cert)?;
     write_pem_private_key(&cert_dir.join(SERVER_KEY), &server_key)?;
     println!(":: server cert issued for {lan_ip} (valid 825 days)");
@@ -156,8 +164,7 @@ fn regenerate_server_cert(cert_dir: &Path, lan_ip: &str) -> LanResult<()> {
 pub fn read_server_cert_fingerprint(cert_dir: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
 
-    let cert = read_pem_cert(&cert_dir.join(SERVER_CRT)).ok()?;
-    let der = cert.to_der().ok()?;
+    let der = read_cert_der(&cert_dir.join(SERVER_CRT)).ok()?;
     let mut hasher = Sha256::new();
     hasher.update(&der);
     let fp: [u8; 32] = hasher.finalize().into();
@@ -168,16 +175,17 @@ pub fn read_server_cert_fingerprint(cert_dir: &Path) -> Option<String> {
     Some(s)
 }
 
-/// Extract the current server cert's SAN IP (for drift detection).
+/// Extract the current server cert's subject CN (for drift detection).
+/// `generate_server_cert` sets both `CN` and `subjectAltName = IP:<ip>`
+/// to the LAN IP, so reading the CN recovers it.
 pub fn current_cert_ip(cert_dir: &Path) -> LanResult<String> {
-    let cert = read_pem_cert(&cert_dir.join(SERVER_CRT))?;
-    // openssl doesn't expose a typed SAN reader easily — parse the
-    // subject CN instead, which we set to the IP. If someone ever
-    // changes generate_server_cert to use a hostname, this needs to
-    // parse the SAN extension directly.
-    let subject = cert.subject_name();
-    for entry in subject.entries_by_nid(Nid::COMMONNAME) {
-        if let Ok(cn) = entry.data().as_utf8() {
+    use x509_parser::prelude::*;
+
+    let der = read_cert_der(&cert_dir.join(SERVER_CRT))?;
+    let (_, cert) =
+        X509Certificate::from_der(&der).map_err(|e| LanError(format!("parse server cert: {e}")))?;
+    for attr in cert.subject().iter_common_name() {
+        if let Ok(cn) = attr.as_str() {
             return Ok(cn.to_string());
         }
     }
@@ -194,224 +202,157 @@ fn cert_needs_regen_for_ip(cert_dir: &Path, lan_ip: &str) -> LanResult<bool> {
 
 // ── Cert primitives ─────────────────────────────────────────────────────────
 
-fn generate_ca(label: &str) -> LanResult<(X509, PKey<Private>)> {
-    let rsa = Rsa::generate(2048)?;
-    let pkey = PKey::from_rsa(rsa)?;
+/// Build the `CertificateParams` for the CA. Factored out so the same
+/// shape is used whether we're self-signing or rederiving an issuer.
+fn ca_params_for(label: &str) -> LanResult<CertificateParams> {
+    let mut params =
+        CertificateParams::new(vec![]).map_err(|e| LanError(format!("ca params: {e}")))?;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("Intendant CA ({label})"));
+    params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+    params.key_usages = vec![KeyUsagePurpose::KeyCertSign, KeyUsagePurpose::CrlSign];
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - Duration::hours(1);
+    params.not_after = now + Duration::days(3650);
+    Ok(params)
+}
 
-    let mut name = X509NameBuilder::new()?;
-    name.append_entry_by_nid(Nid::COMMONNAME, &format!("Intendant CA ({label})"))?;
-    let name = name.build();
+fn generate_ca(label: &str) -> LanResult<(Certificate, KeyPair)> {
+    let params = ca_params_for(label)?;
+    let key = KeyPair::generate()?;
+    let cert = params.self_signed(&key)?;
+    Ok((cert, key))
+}
 
-    let serial = random_serial()?;
-    let not_before = Asn1Time::days_from_now(0)?;
-    let not_after = Asn1Time::days_from_now(3650)?;
-
-    let mut builder = X509Builder::new()?;
-    builder.set_version(2)?; // v3
-    builder.set_serial_number(&serial)?;
-    builder.set_subject_name(&name)?;
-    builder.set_issuer_name(&name)?;
-    builder.set_pubkey(&pkey)?;
-    builder.set_not_before(&not_before)?;
-    builder.set_not_after(&not_after)?;
-
-    let bc = BasicConstraints::new().critical().ca().build()?;
-    builder.append_extension(bc)?;
-    let ku = KeyUsage::new()
-        .critical()
-        .key_cert_sign()
-        .crl_sign()
-        .build()?;
-    builder.append_extension(ku)?;
-
-    builder.sign(&pkey, MessageDigest::sha256())?;
-    Ok((builder.build(), pkey))
+/// Reconstruct a signing [`Issuer`] from a CA cert in PEM form plus its
+/// key pair. Used both right after generation and on the `recert` path
+/// where the CA is read back from disk. The issuer captures the CA's
+/// subject DN and key-usage extensions from the parsed cert.
+fn issuer_from_pem(ca_pem: &str, ca_key: KeyPair) -> LanResult<Issuer<'static, KeyPair>> {
+    Issuer::from_ca_cert_pem(ca_pem, ca_key).map_err(|e| LanError(format!("load CA issuer: {e}")))
 }
 
 fn generate_server_cert(
-    ca_cert: &X509,
-    ca_key: &PKey<Private>,
+    ca_issuer: &Issuer<'_, KeyPair>,
     lan_ip: &str,
-) -> LanResult<(X509, PKey<Private>)> {
-    let rsa = Rsa::generate(2048)?;
-    let pkey = PKey::from_rsa(rsa)?;
+) -> LanResult<(Certificate, KeyPair)> {
+    let ip: IpAddr = lan_ip
+        .parse()
+        .map_err(|_| LanError(format!("invalid LAN IP: {lan_ip}")))?;
 
-    let mut name = X509NameBuilder::new()?;
-    name.append_entry_by_nid(Nid::COMMONNAME, lan_ip)?;
-    let name = name.build();
-
-    let serial = random_serial()?;
-    let not_before = Asn1Time::days_from_now(0)?;
+    let mut params =
+        CertificateParams::new(vec![]).map_err(|e| LanError(format!("server params: {e}")))?;
+    params.distinguished_name.push(DnType::CommonName, lan_ip);
+    params.subject_alt_names = vec![SanType::IpAddress(ip)];
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ServerAuth];
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - Duration::hours(1);
     // iOS requires server cert validity ≤825 days.
-    let not_after = Asn1Time::days_from_now(825)?;
+    params.not_after = now + Duration::days(825);
 
-    let mut builder = X509Builder::new()?;
-    builder.set_version(2)?;
-    builder.set_serial_number(&serial)?;
-    builder.set_subject_name(&name)?;
-    builder.set_issuer_name(ca_cert.subject_name())?;
-    builder.set_pubkey(&pkey)?;
-    builder.set_not_before(&not_before)?;
-    builder.set_not_after(&not_after)?;
-
-    builder.append_extension(BasicConstraints::new().critical().build()?)?;
-    builder.append_extension(
-        KeyUsage::new()
-            .critical()
-            .digital_signature()
-            .key_encipherment()
-            .build()?,
-    )?;
-    builder.append_extension(ExtendedKeyUsage::new().server_auth().build()?)?;
-
-    let san = SubjectAlternativeName::new()
-        .ip(lan_ip)
-        .build(&builder.x509v3_context(Some(ca_cert), None))?;
-    builder.append_extension(san)?;
-
-    builder.sign(ca_key, MessageDigest::sha256())?;
-    Ok((builder.build(), pkey))
+    let key = KeyPair::generate()?;
+    let cert = params.signed_by(&key, ca_issuer)?;
+    Ok((cert, key))
 }
 
 fn generate_client_cert(
-    ca_cert: &X509,
-    ca_key: &PKey<Private>,
+    ca_issuer: &Issuer<'_, KeyPair>,
     label: &str,
-) -> LanResult<(X509, PKey<Private>)> {
-    let rsa = Rsa::generate(2048)?;
-    let pkey = PKey::from_rsa(rsa)?;
+) -> LanResult<(Certificate, KeyPair)> {
+    let mut params =
+        CertificateParams::new(vec![]).map_err(|e| LanError(format!("client params: {e}")))?;
+    params
+        .distinguished_name
+        .push(DnType::CommonName, format!("Intendant Client ({label})"));
+    params.is_ca = IsCa::NoCa;
+    params.key_usages = vec![
+        KeyUsagePurpose::DigitalSignature,
+        KeyUsagePurpose::KeyEncipherment,
+    ];
+    params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
+    let now = OffsetDateTime::now_utc();
+    params.not_before = now - Duration::hours(1);
+    params.not_after = now + Duration::days(3650);
 
-    let mut name = X509NameBuilder::new()?;
-    name.append_entry_by_nid(Nid::COMMONNAME, &format!("Intendant Client ({label})"))?;
-    let name = name.build();
-
-    let serial = random_serial()?;
-    let not_before = Asn1Time::days_from_now(0)?;
-    let not_after = Asn1Time::days_from_now(3650)?;
-
-    let mut builder = X509Builder::new()?;
-    builder.set_version(2)?;
-    builder.set_serial_number(&serial)?;
-    builder.set_subject_name(&name)?;
-    builder.set_issuer_name(ca_cert.subject_name())?;
-    builder.set_pubkey(&pkey)?;
-    builder.set_not_before(&not_before)?;
-    builder.set_not_after(&not_after)?;
-
-    builder.append_extension(BasicConstraints::new().critical().build()?)?;
-    builder.append_extension(
-        KeyUsage::new()
-            .critical()
-            .digital_signature()
-            .key_encipherment()
-            .build()?,
-    )?;
-    builder.append_extension(ExtendedKeyUsage::new().client_auth().build()?)?;
-
-    builder.sign(ca_key, MessageDigest::sha256())?;
-    Ok((builder.build(), pkey))
+    let key = KeyPair::generate()?;
+    let cert = params.signed_by(&key, ca_issuer)?;
+    Ok((cert, key))
 }
 
-/// Build a PKCS#12 bundle using **legacy** encryption algorithms for
-/// broad iOS/macOS compatibility. The OpenSSL 3 defaults (AES-256-CBC +
-/// SHA-256) are rejected by older Apple import paths; Apple only broadened
-/// PKCS#12 algorithm support in iOS 18 / macOS 15. We need to keep old
-/// devices working, so we force:
+/// Build a PKCS#12 bundle using **modern** encryption: PBES2 with
+/// PBKDF2-HMAC-SHA256 and AES-256-CBC, plus a SHA-256 MAC. This is the
+/// algorithm set Apple's modern import path (`SecPKCS12Import`, used by
+/// Keychain Access on macOS 15+ and the iOS 18 profile installer)
+/// accepts. `p12-keystore`'s writer defaults to exactly this
+/// (encryption = `PbeWithHmacSha256AndAes256`, MAC = `HmacSha256`,
+/// 10 000 iterations), so we build with the defaults.
 ///
-/// - key bag = `PBE_WITHSHA1AND3_KEY_TRIPLEDES_CBC`
-/// - cert bag = `PBE_WITHSHA1AND40BITRC2_CBC`
-/// - MAC digest = SHA-1, mac_iter = 1
-///
-/// RC2-40 is only available in OpenSSL 3's legacy provider, which we
-/// load once at module init (see `load_legacy_provider_if_needed`).
-fn build_legacy_p12(
-    key: &PKey<Private>,
-    cert: &X509,
-    chain: &[X509],
+/// (Older Apple releases that predate iOS 18 / macOS 15 only accept the
+/// legacy RC2-40/3DES + SHA-1 packaging; supporting those is a
+/// deliberately dropped requirement — it was the sole reason OpenSSL was
+/// ever in the tree.)
+fn build_modern_p12(
+    key: &KeyPair,
+    cert: &Certificate,
+    chain: &[Certificate],
     friendly_name: &str,
     password: &str,
 ) -> LanResult<Vec<u8>> {
-    let mut builder = Pkcs12::builder();
-    builder.name(friendly_name);
-    builder.pkey(key);
-    builder.cert(cert);
-    if !chain.is_empty() {
-        let mut stack = Stack::<X509>::new()?;
-        for c in chain {
-            stack.push(c.clone())?;
-        }
-        builder.ca(stack);
+    // Leaf (client) cert first, CA(s) after — the order p12-keystore and
+    // Apple both expect (entity first, root last).
+    let mut certs = Vec::with_capacity(1 + chain.len());
+    certs.push(
+        P12Certificate::from_der(cert.der())
+            .map_err(|e| LanError(format!("p12 leaf cert: {e}")))?,
+    );
+    for c in chain {
+        certs.push(
+            P12Certificate::from_der(c.der()).map_err(|e| LanError(format!("p12 ca cert: {e}")))?,
+        );
     }
 
-    // Legacy algorithms per iOS compatibility research.
-    builder.key_algorithm(Nid::PBE_WITHSHA1AND3_KEY_TRIPLEDES_CBC);
-    builder.cert_algorithm(Nid::PBE_WITHSHA1AND40BITRC2_CBC);
-    builder.key_iter(2048);
-    builder.mac_iter(1);
-    builder.mac_md(MessageDigest::sha1());
+    // Private key as PKCS#8 DER bytes.
+    let key_der = key.serialize_der();
+    let entry = KeyStoreEntry::PrivateKeyChain(PrivateKeyChain::new(
+        &key_der,
+        friendly_name.as_bytes(),
+        certs,
+    ));
 
-    let p12 = builder.build2(password)?;
-    let der = p12.to_der()?;
-    Ok(der)
+    let mut store = KeyStore::new();
+    store.add_entry(friendly_name, entry);
+
+    // Writer defaults: PbeWithHmacSha256AndAes256 + HmacSha256 MAC.
+    store
+        .writer(password)
+        .write()
+        .map_err(|e| LanError(format!("p12 write: {e}")))
 }
-
-/// OpenSSL 3 ships AES-based defaults and moves legacy ciphers (including
-/// RC2-40 which we need for cert-bag encryption) to the `legacy` provider,
-/// which must be explicitly loaded. Safe to call more than once. The
-/// `ossl3` cfg is set by `build.rs` based on `DEP_OPENSSL_VERSION_NUMBER`
-/// exported by openssl-sys. On OpenSSL 1.x the provider API doesn't exist
-/// and all algorithms are available unconditionally.
-#[cfg(ossl3)]
-static LEGACY_PROVIDER: std::sync::OnceLock<
-    Result<(openssl::provider::Provider, openssl::provider::Provider), String>,
-> = std::sync::OnceLock::new();
-
-#[cfg(ossl3)]
-fn load_legacy_provider_if_needed() {
-    // Providers loaded via `try_load(.., retain_fallbacks=true)` must be
-    // kept alive — dropping them unloads the provider from the default
-    // library context. We stash them in a `OnceLock` so they persist for
-    // the lifetime of the process.
-    LEGACY_PROVIDER.get_or_init(|| {
-        let legacy = openssl::provider::Provider::try_load(None, "legacy", true)
-            .map_err(|e| format!("legacy provider: {e}"))?;
-        // Loading a non-default provider disables the implicit default
-        // provider; reload it explicitly so modern algorithms still work.
-        let default = openssl::provider::Provider::try_load(None, "default", true)
-            .map_err(|e| format!("default provider: {e}"))?;
-        Ok((legacy, default))
-    });
-}
-
-#[cfg(not(ossl3))]
-fn load_legacy_provider_if_needed() {}
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
-fn random_serial() -> LanResult<openssl::asn1::Asn1Integer> {
-    let mut bn = BigNum::new()?;
-    bn.rand(159, MsbOption::MAYBE_ZERO, false)?;
-    Ok(bn.to_asn1_integer()?)
-}
-
 fn random_password(len: usize) -> String {
-    use openssl::rand::rand_bytes;
+    use rand::Rng;
     const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
-    let mut raw = vec![0u8; len];
-    rand_bytes(&mut raw).expect("openssl rand");
-    raw.iter()
-        .map(|b| ALPHABET[(*b as usize) % ALPHABET.len()] as char)
+    let mut rng = rand::thread_rng();
+    (0..len)
+        .map(|_| ALPHABET[rng.gen_range(0..ALPHABET.len())] as char)
         .collect()
 }
 
-fn write_pem_cert(path: &Path, cert: &X509) -> LanResult<()> {
-    std::fs::write(path, cert.to_pem()?)?;
+fn write_pem_cert(path: &Path, cert: &Certificate) -> LanResult<()> {
+    std::fs::write(path, cert.pem())?;
     Ok(())
 }
 
-fn write_pem_private_key(path: &Path, key: &PKey<Private>) -> LanResult<()> {
-    let pem = key.private_key_to_pem_pkcs8()?;
-    std::fs::write(path, pem)?;
+fn write_pem_private_key(path: &Path, key: &KeyPair) -> LanResult<()> {
+    std::fs::write(path, key.serialize_pem())?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
@@ -422,28 +363,32 @@ fn write_pem_private_key(path: &Path, key: &PKey<Private>) -> LanResult<()> {
     Ok(())
 }
 
-fn read_pem_cert(path: &Path) -> LanResult<X509> {
+/// Read a PEM-encoded certificate file and return its DER bytes.
+fn read_cert_der(path: &Path) -> LanResult<Vec<u8>> {
     let bytes = std::fs::read(path)?;
-    Ok(X509::from_pem(&bytes)?)
-}
-
-fn read_pem_private_key(path: &Path) -> LanResult<PKey<Private>> {
-    let bytes = std::fs::read(path)?;
-    Ok(PKey::private_key_from_pem(&bytes)?)
+    let pem = pem::parse(&bytes).map_err(|e| LanError(format!("parse cert PEM: {e}")))?;
+    Ok(pem.into_contents())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use openssl::pkcs12::Pkcs12;
+    use p12_keystore::KeyStore;
     use tempfile::TempDir;
 
     #[test]
     fn ensure_certs_produces_full_chain() {
         let tmp = TempDir::new().unwrap();
         let state = ensure_certs(tmp.path(), "192.168.1.100", "test-host", false).unwrap();
-        for name in ["ca.crt", "ca.key", "server.crt", "server.key",
-                     "client.crt", "client.key", "client.p12"] {
+        for name in [
+            "ca.crt",
+            "ca.key",
+            "server.crt",
+            "server.key",
+            "client.crt",
+            "client.key",
+            "client.p12",
+        ] {
             let p = tmp.path().join(name);
             assert!(p.exists(), "missing: {}", p.display());
         }
@@ -481,15 +426,14 @@ mod tests {
         let fp = read_server_cert_fingerprint(tmp.path()).expect("cert exists");
         assert_eq!(fp.len(), 64, "lowercase hex, no separators");
         assert!(
-            fp.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+            fp.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
             "all chars must be lowercase hex, got: {fp}"
         );
         // Round-trips through the pinning parser — same byte sequence
         // a connecting peer's verifier consumes.
-        let parsed =
-            crate::peer::transport::pinning::parse_fingerprint(&fp).unwrap();
-        let reformatted =
-            crate::peer::transport::pinning::format_fingerprint(&parsed);
+        let parsed = crate::peer::transport::pinning::parse_fingerprint(&fp).unwrap();
+        let reformatted = crate::peer::transport::pinning::format_fingerprint(&parsed);
         assert_eq!(fp, reformatted);
     }
 
@@ -528,18 +472,88 @@ mod tests {
         assert_eq!(ca1, ca2);
     }
 
+    /// **Real Apple importer acceptance.** Round-tripping through the
+    /// `p12-keystore` crate (see `p12_is_parseable_with_password`) only
+    /// proves *we* can read what *we* wrote — it doesn't prove Apple's
+    /// importer accepts our modern PBES2/AES + SHA-256 packaging. This test
+    /// drives the actual OS importer, `SecPKCS12Import` (Security.framework,
+    /// the same call Keychain Access on macOS 15+ and the iOS 18 profile
+    /// installer make), against the generated `client.p12`.
+    ///
+    /// It imports into a throwaway keychain created in a `TempDir` (never the
+    /// user's login keychain) so it leaves no trace and triggers no
+    /// interactive password prompt. A successful import that yields the
+    /// client identity plus its cert chain is the proof that a genuine Apple
+    /// importer — not just the `p12-keystore` reader — accepts the bundle.
+    ///
+    /// macOS-only: `SecPKCS12Import` and `SecKeychain` are Security.framework
+    /// APIs, so the test is gated to `target_os = "macos"`.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn p12_imports_via_real_macos_keychain() {
+        use security_framework::import_export::Pkcs12ImportOptions;
+        use security_framework::os::macos::keychain::CreateOptions;
+
+        let tmp = TempDir::new().unwrap();
+        let state = ensure_certs(tmp.path(), "10.0.0.1", "keychain-import", false).unwrap();
+        let p12_bytes = std::fs::read(tmp.path().join(CLIENT_P12)).unwrap();
+
+        // A disposable, file-backed keychain in the temp dir. Its own
+        // password is unrelated to the .p12 password; creating it leaves the
+        // login keychain untouched and avoids any UI prompt. `.keychain(...)`
+        // is an inherent macOS-only method on `Pkcs12ImportOptions`.
+        let keychain = CreateOptions::new()
+            .password("intendant-test-keychain")
+            .create(tmp.path().join("import-test.keychain"))
+            .expect("create temporary keychain");
+
+        // Drive Apple's SecPKCS12Import. If our modern PBES2/AES + SHA-256
+        // packaging were not accepted by the real importer, this errors.
+        let identities = Pkcs12ImportOptions::new()
+            .passphrase(&state.p12_password)
+            .keychain(keychain)
+            .import(&p12_bytes)
+            .expect("SecPKCS12Import must accept the generated client.p12");
+
+        assert_eq!(
+            identities.len(),
+            1,
+            "expected exactly one imported identity from client.p12"
+        );
+        let imported = &identities[0];
+        assert!(
+            imported.identity.is_some(),
+            "imported item must carry a SecIdentity (private key + leaf cert)"
+        );
+        // Leaf (client) cert + CA in the validated chain.
+        let chain_len = imported
+            .cert_chain
+            .as_ref()
+            .map(|c| c.len())
+            .unwrap_or_default();
+        assert!(
+            chain_len >= 1,
+            "imported identity must carry at least the leaf cert in its chain, got {chain_len}"
+        );
+    }
+
+    /// The generated PKCS#12 parses back with its password, yields the
+    /// client identity, and carries the CA in the chain. Uses
+    /// `p12-keystore`'s own reader (which understands the modern
+    /// PBES2/AES + SHA-256 MAC packaging we write).
     #[test]
     fn p12_is_parseable_with_password() {
         let tmp = TempDir::new().unwrap();
         let state = ensure_certs(tmp.path(), "10.0.0.1", "test", false).unwrap();
         let bytes = std::fs::read(tmp.path().join("client.p12")).unwrap();
 
-        let p12 = Pkcs12::from_der(&bytes).expect("p12 parse");
-        let parsed = p12.parse2(&state.p12_password).expect("p12 parse2");
-        assert!(parsed.cert.is_some(), "client cert missing from p12");
-        assert!(parsed.pkey.is_some(), "client key missing from p12");
-        let chain = parsed.ca.expect("ca chain missing from p12");
-        assert_eq!(chain.len(), 1, "expected exactly 1 CA in chain");
+        let store = KeyStore::from_pkcs12(&bytes, &state.p12_password).expect("p12 parse");
+        let (_alias, chain) = store
+            .private_key_chain()
+            .expect("private key chain missing from p12");
+        assert!(!chain.key().is_empty(), "client key missing from p12");
+        // Leaf (client) + CA.
+        assert_eq!(chain.chain().len(), 2, "expected client + CA in the chain");
     }
 
     #[test]
@@ -558,8 +572,9 @@ mod tests {
     }
 
     /// Drops a freshly-generated p12 into /tmp so it can be inspected
-    /// with `openssl pkcs12 -info`. Gated behind an env var so it only
-    /// runs when we explicitly want a sample.
+    /// with `openssl pkcs12 -info` or imported via `SecPKCS12Import`.
+    /// Gated behind an env var so it only runs when we explicitly want
+    /// a sample.
     #[test]
     fn dump_sample_p12() {
         if std::env::var("LAN_DUMP_SAMPLE_P12").is_err() {
@@ -583,4 +598,3 @@ mod tests {
         assert_ne!(ca_before, ca_after, "force did not regenerate CA");
     }
 }
-
