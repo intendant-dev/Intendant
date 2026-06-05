@@ -1599,7 +1599,11 @@ impl CodexThreadActionDedupe {
 }
 
 impl ExternalContextRewindRequest {
-    fn rendered_primer(&self, record_id: Option<&str>) -> Option<String> {
+    fn rendered_primer(
+        &self,
+        record_id: Option<&str>,
+        carried_forward_prior_facts: Option<&str>,
+    ) -> Option<String> {
         let primer = self.primer.as_deref()?.trim();
         if primer.is_empty() {
             return None;
@@ -1620,6 +1624,16 @@ impl ExternalContextRewindRequest {
         push_context_rewind_list_section(&mut out, "Discard", &self.discard);
         push_context_rewind_list_section(&mut out, "Artifacts", &self.artifacts);
         push_context_rewind_list_section(&mut out, "Next steps", &self.next_steps);
+        if let Some(facts) = carried_forward_prior_facts
+            .map(str::trim)
+            .filter(|facts| !facts.is_empty())
+        {
+            push_context_rewind_text_section(
+                &mut out,
+                "Previous managed-context primer facts not repeated above",
+                facts,
+            );
+        }
         out.push_str("</model_context_rewind_primer>");
         Some(out)
     }
@@ -2256,6 +2270,7 @@ const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
 const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
 const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
 const CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS: u64 = 4_096;
+const CONTEXT_REWIND_PRIOR_PRIMER_FACT_LIMIT: usize = 12_000;
 
 #[derive(Debug, Clone, Copy)]
 struct ContextRewindBackendUsageAtLine {
@@ -2693,6 +2708,132 @@ fn response_item_content_text(item: &serde_json::Value) -> impl Iterator<Item = 
         })
 }
 
+fn response_item_managed_context_rewind_primer_text(item: &serde_json::Value) -> Option<String> {
+    if item.get("type").and_then(|value| value.as_str()) != Some("message") {
+        return None;
+    }
+    let text = response_item_content_text(item)
+        .collect::<Vec<_>>()
+        .join("\n");
+    text.contains("<model_context_rewind_primer>")
+        .then_some(text)
+}
+
+fn context_rewind_pruned_prior_primer_facts(
+    source_rollout_path: &Path,
+    anchor_item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+    request: &ExternalContextRewindRequest,
+) -> io::Result<Option<String>> {
+    let Some(current_primer) = request.rendered_primer(None, None) else {
+        return Ok(None);
+    };
+    let Some(anchor) = find_context_rewind_anchor_entry(source_rollout_path, anchor_item_id)?
+    else {
+        return Ok(None);
+    };
+
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut prior_primers = Vec::new();
+    for (line_index, line) in reader.lines().enumerate() {
+        let line_number = line_index.saturating_add(1);
+        let pruned_by_rewind = match position {
+            external_agent::RollbackAnchorPosition::After => line_number > anchor.last_line,
+            external_agent::RollbackAnchorPosition::Before => line_number >= anchor.first_line,
+        };
+        if !pruned_by_rewind {
+            continue;
+        }
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
+            continue;
+        }
+        let Some(payload) = entry.get("payload") else {
+            continue;
+        };
+        if let Some(primer) = response_item_managed_context_rewind_primer_text(payload) {
+            prior_primers.push(primer);
+        }
+    }
+
+    Ok(context_rewind_unrepeated_prior_primer_facts(
+        &prior_primers,
+        &current_primer,
+    ))
+}
+
+fn context_rewind_unrepeated_prior_primer_facts(
+    prior_primers: &[String],
+    current_primer: &str,
+) -> Option<String> {
+    if prior_primers.is_empty() {
+        return None;
+    }
+    let current_normalized =
+        normalize_context_rewind_fact_for_compare(current_primer).to_ascii_lowercase();
+    let mut seen = HashSet::new();
+    let mut out = String::new();
+
+    for primer in prior_primers.iter().rev() {
+        for line in context_rewind_prior_primer_fact_lines(primer) {
+            let normalized = normalize_context_rewind_fact_for_compare(&line);
+            if normalized.is_empty() {
+                continue;
+            }
+            let normalized_lower = normalized.to_ascii_lowercase();
+            if current_normalized.contains(&normalized_lower) || !seen.insert(normalized_lower) {
+                continue;
+            }
+            let additional = line.len().saturating_add(1);
+            if out.len().saturating_add(additional) > CONTEXT_REWIND_PRIOR_PRIMER_FACT_LIMIT {
+                if !out.is_empty() {
+                    out.push_str("...\n");
+                }
+                return (!out.trim().is_empty()).then(|| out.trim().to_string());
+            }
+            out.push_str(&line);
+            out.push('\n');
+        }
+    }
+
+    (!out.trim().is_empty()).then(|| out.trim().to_string())
+}
+
+fn context_rewind_prior_primer_fact_lines(primer: &str) -> Vec<String> {
+    primer
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !context_rewind_prior_primer_admin_line(line))
+        .map(str::to_string)
+        .collect()
+}
+
+fn context_rewind_prior_primer_admin_line(line: &str) -> bool {
+    matches!(
+        line,
+        "<model_context_rewind_primer>"
+            | "</model_context_rewind_primer>"
+            | "Reason:"
+            | "Record id:"
+            | "Primer:"
+            | "Preserve:"
+            | "Discard:"
+            | "Artifacts:"
+            | "Next steps:"
+            | "Previous managed-context primer facts not repeated above:"
+    ) || line.starts_with("History after the rewind target was pruned")
+        || (line.starts_with("rewind-") && line.split_whitespace().count() == 1)
+}
+
+fn normalize_context_rewind_fact_for_compare(value: &str) -> String {
+    value.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 fn response_item_anchor_ids(item: &serde_json::Value) -> Vec<String> {
     let mut ids = Vec::new();
     match item.get("type").and_then(|value| value.as_str()) {
@@ -2755,6 +2896,22 @@ async fn apply_external_context_rewind(
         .clone()
         .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
     let resolved_anchor = resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
+    let carried_forward_prior_facts = match context_rewind_pruned_prior_primer_facts(
+        &source_rollout_path,
+        &resolved_anchor.item_id,
+        request.position,
+        request,
+    ) {
+        Ok(facts) => facts,
+        Err(err) => {
+            slog(config.session_log, |log| {
+                log.warn(&format!(
+                    "Could not inspect pruned prior managed-context primers before rewind {record_id}: {err}"
+                ))
+            });
+            None
+        }
+    };
     let recovery_rollout_path =
         context_rewind::copy_recovery_rollout(config.log_dir, &record_id, &source_rollout_path)
             .map_err(|e| format!("failed to copy pre-rewind rollout: {}", e))?;
@@ -2837,7 +2994,10 @@ async fn apply_external_context_rewind(
     context_rewind::persist_record(config.log_dir, &record)
         .map_err(|e| format!("failed to persist context rewind record: {}", e))?;
 
-    if let Some(primer) = request.rendered_primer(Some(record_id.as_str())) {
+    if let Some(primer) = request.rendered_primer(
+        Some(record_id.as_str()),
+        carried_forward_prior_facts.as_deref(),
+    ) {
         agent
             .inject_thread_developer_message(thread_id, &primer)
             .await
@@ -8852,7 +9012,7 @@ mod tests {
         assert!(!context_rewind_should_interrupt_active_turn(&request));
 
         let primer = request
-            .rendered_primer(Some("rewind-test-record"))
+            .rendered_primer(Some("rewind-test-record"), None)
             .expect("primer");
         assert!(primer.contains("<model_context_rewind_primer>"));
         assert!(primer.contains("Earlier history before the target is still present"));
@@ -8862,6 +9022,91 @@ mod tests {
         assert!(primer.contains("- bad assumption"));
         assert!(!primer.contains("- \n"));
         assert!(request.resume_followup().is_some());
+    }
+
+    #[test]
+    fn context_rewind_request_renders_carried_forward_prior_facts() {
+        let request = ExternalContextRewindRequest {
+            session_id: Some("s".to_string()),
+            item_id: "call-123".to_string(),
+            position: external_agent::RollbackAnchorPosition::After,
+            reason: Some("repeat rewind".to_string()),
+            primer: Some("Current durable fact.".to_string()),
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            auto_resume: true,
+        };
+
+        let primer = request
+            .rendered_primer(
+                Some("rewind-test-record"),
+                Some("- Prior selector: .display-picker.visible .display-picker-item"),
+            )
+            .expect("primer");
+
+        assert!(primer.contains("Current durable fact."));
+        assert!(primer.contains("Previous managed-context primer facts not repeated above"));
+        assert!(primer.contains(".display-picker.visible .display-picker-item"));
+    }
+
+    #[test]
+    fn context_rewind_carries_unrepeated_prior_primer_facts_from_pruned_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let prior_primer = "<model_context_rewind_primer>\nHistory after the rewind target was pruned by rewind_context. Earlier history before the target is still present. Treat this primer as the carry-forward summary of only the pruned span.\n\nPrimer:\nHost peer connected.\n- Prior selector: .display-picker.visible .display-picker-item\n\n</model_context_rewind_primer>";
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_anchor",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "developer",
+                        "content": [{ "type": "input_text", "text": prior_primer }]
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+        let request = ExternalContextRewindRequest {
+            session_id: Some("s".to_string()),
+            item_id: "call_anchor".to_string(),
+            position: external_agent::RollbackAnchorPosition::After,
+            reason: Some("repeat rewind".to_string()),
+            primer: Some("Host peer connected.".to_string()),
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            auto_resume: true,
+        };
+
+        let carried = context_rewind_pruned_prior_primer_facts(
+            &path,
+            "call_anchor",
+            external_agent::RollbackAnchorPosition::After,
+            &request,
+        )
+        .expect("carry-forward scan")
+        .expect("missing prior fact");
+
+        assert!(!carried.contains("Host peer connected."));
+        assert!(carried.contains(".display-picker.visible .display-picker-item"));
     }
 
     #[test]

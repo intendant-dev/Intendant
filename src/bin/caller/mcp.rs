@@ -127,6 +127,8 @@ pub struct McpAppState {
     pub codex_managed_context: bool,
     /// Managed-context capability latched per Intendant/backend session id.
     pub session_codex_managed_context: std::collections::HashMap<String, bool>,
+    /// Bidirectional aliases between Intendant wrapper ids and backend thread ids.
+    session_aliases: std::collections::HashMap<String, std::collections::HashSet<String>>,
     /// Latest backend usage sample by Intendant/backend session id.
     session_usage: std::collections::HashMap<String, frontend::ModelUsageSnapshot>,
     /// Source for the currently active session, when it is known.
@@ -206,6 +208,7 @@ impl McpAppState {
             configured_codex_managed_context: false,
             codex_managed_context: false,
             session_codex_managed_context: std::collections::HashMap::new(),
+            session_aliases: std::collections::HashMap::new(),
             session_usage: std::collections::HashMap::new(),
             active_session_source: None,
             session_sources: std::collections::HashMap::new(),
@@ -284,7 +287,7 @@ impl McpAppState {
     fn usage_snapshot_for(&self, session_id: Option<&str>) -> crate::frontend::UsageSnapshot {
         let mut usage = self.usage_snapshot();
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
-            if let Some(main) = self.session_usage.get(id) {
+            if let Some(main) = self.session_usage_for_id(id) {
                 usage.main = main.clone();
             } else if id != self.session_id {
                 usage.main.provider.clear();
@@ -299,6 +302,59 @@ impl McpAppState {
             }
         }
         usage
+    }
+
+    fn link_session_aliases(&mut self, session_id: &str, backend_session_id: &str) {
+        let session_id = session_id.trim();
+        let backend_session_id = backend_session_id.trim();
+        if session_id.is_empty()
+            || backend_session_id.is_empty()
+            || session_id == backend_session_id
+        {
+            return;
+        }
+        self.session_aliases
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(backend_session_id.to_string());
+        self.session_aliases
+            .entry(backend_session_id.to_string())
+            .or_default()
+            .insert(session_id.to_string());
+    }
+
+    fn session_related_ids(&self, session_id: &str) -> Vec<String> {
+        let session_id = session_id.trim();
+        if session_id.is_empty() {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back(session_id.to_string());
+        while let Some(id) = queue.pop_front() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            out.push(id.clone());
+            if let Some(aliases) = self.session_aliases.get(&id) {
+                for alias in aliases {
+                    if !seen.contains(alias) {
+                        queue.push_back(alias.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn session_usage_for_id(&self, session_id: &str) -> Option<&frontend::ModelUsageSnapshot> {
+        for related in self.session_related_ids(session_id) {
+            if let Some(usage) = self.session_usage.get(&related) {
+                return Some(usage);
+            }
+        }
+        None
     }
 
     fn apply_main_usage_snapshot(&mut self, usage: frontend::ModelUsageSnapshot) {
@@ -333,6 +389,42 @@ impl McpAppState {
             })
     }
 
+    fn rewind_related_keys(&self, key: &str) -> Vec<String> {
+        let related = self.session_related_ids(key);
+        if related.is_empty() {
+            vec![key.to_string()]
+        } else {
+            related
+        }
+    }
+
+    fn remove_pending_rewind_pressure_check_for_key(&mut self, key: &str) -> Option<String> {
+        let mut record_id = None;
+        for related in self.rewind_related_keys(key) {
+            if let Some(found) = self.pending_rewind_pressure_checks.remove(&related) {
+                record_id.get_or_insert(found);
+            }
+        }
+        record_id
+    }
+
+    fn remove_insufficient_rewind_notice_for_key(&mut self, key: &str) {
+        for related in self.rewind_related_keys(key) {
+            self.insufficient_rewind_notices.remove(&related);
+        }
+    }
+
+    fn insert_insufficient_rewind_notice_for_key(
+        &mut self,
+        key: &str,
+        notice: InsufficientRewindNotice,
+    ) {
+        for related in self.rewind_related_keys(key) {
+            self.insufficient_rewind_notices
+                .insert(related, notice.clone());
+        }
+    }
+
     fn note_context_rewind_result_for(
         &mut self,
         session_id: Option<&str>,
@@ -344,15 +436,17 @@ impl McpAppState {
         };
         if success {
             if let Some(record_id) = context_rewind_record_id_from_message(message) {
-                self.pending_rewind_pressure_checks
-                    .insert(key.clone(), record_id);
-                self.insufficient_rewind_notices.remove(&key);
+                for related in self.rewind_related_keys(&key) {
+                    self.pending_rewind_pressure_checks
+                        .insert(related, record_id.clone());
+                }
+                self.remove_insufficient_rewind_notice_for_key(&key);
             }
         } else {
             // A failed rewind must not leave a pending pressure check behind: a
             // later (possibly stale) usage sample could otherwise resolve it into a
             // false "insufficient" notice against a record that never committed.
-            self.pending_rewind_pressure_checks.remove(&key);
+            self.remove_pending_rewind_pressure_check_for_key(&key);
         }
     }
 
@@ -364,7 +458,7 @@ impl McpAppState {
         let Some(key) = self.rewind_session_key(session_id) else {
             return;
         };
-        let Some(record_id) = self.pending_rewind_pressure_checks.remove(&key) else {
+        let Some(record_id) = self.remove_pending_rewind_pressure_check_for_key(&key) else {
             return;
         };
         if !self.active_codex_managed_context_enabled_for(Some(&key), None) {
@@ -374,8 +468,8 @@ impl McpAppState {
             self.context_pressure_rewind_only_for(Some(&key))
         {
             let context_window = self.session_usage_values(Some(&key)).1;
-            self.insufficient_rewind_notices.insert(
-                key,
+            self.insert_insufficient_rewind_notice_for_key(
+                &key,
                 InsufficientRewindNotice {
                     record_id,
                     used_tokens,
@@ -384,7 +478,7 @@ impl McpAppState {
                 },
             );
         } else {
-            self.insufficient_rewind_notices.remove(&key);
+            self.remove_insufficient_rewind_notice_for_key(&key);
         }
     }
 
@@ -393,7 +487,9 @@ impl McpAppState {
         session_id: Option<&str>,
     ) -> Option<&InsufficientRewindNotice> {
         let key = self.rewind_session_key(session_id)?;
-        self.insufficient_rewind_notices.get(&key)
+        self.rewind_related_keys(&key)
+            .into_iter()
+            .find_map(|related| self.insufficient_rewind_notices.get(&related))
     }
 
     fn managed_context_mode(enabled: bool) -> &'static str {
@@ -410,7 +506,7 @@ impl McpAppState {
             // not borrow the globally-active session's totals. Borrowing would let a
             // starting session A inherit a saturated session B's pressure and be
             // wrongly forced into rewind-only mode during the startup race.
-            if let Some(usage) = self.session_usage.get(id) {
+            if let Some(usage) = self.session_usage_for_id(id) {
                 return (
                     usage.tokens_used,
                     usage.context_window,
@@ -418,7 +514,12 @@ impl McpAppState {
                 );
             }
 
-            if id == self.session_id && self.context_window > 0 {
+            if self
+                .session_related_ids(id)
+                .iter()
+                .any(|candidate| candidate == &self.session_id)
+                && self.context_window > 0
+            {
                 return (
                     self.session_tokens,
                     self.context_window,
@@ -537,8 +638,10 @@ impl McpAppState {
             return enabled;
         }
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
-            if let Some(enabled) = self.session_codex_managed_context.get(id) {
-                return *enabled;
+            for related in self.session_related_ids(id) {
+                if let Some(enabled) = self.session_codex_managed_context.get(&related) {
+                    return *enabled;
+                }
             }
         }
         self.exposed_codex_managed_context_enabled()
@@ -553,8 +656,10 @@ impl McpAppState {
             return enabled;
         }
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
-            if let Some(enabled) = self.session_codex_managed_context.get(id) {
-                return *enabled;
+            for related in self.session_related_ids(id) {
+                if let Some(enabled) = self.session_codex_managed_context.get(&related) {
+                    return *enabled;
+                }
             }
         }
         self.active_codex_managed_context_enabled()
@@ -2886,6 +2991,7 @@ pub fn spawn_event_listener(
                         ref source,
                         ref backend_session_id,
                     } => {
+                        s.link_session_aliases(session_id, backend_session_id);
                         if !session_id.is_empty() {
                             s.session_sources.insert(session_id.clone(), source.clone());
                         }
@@ -3632,6 +3738,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             source,
             backend_session_id,
         } => {
+            s.link_session_aliases(session_id, backend_session_id);
             if !session_id.is_empty() {
                 s.session_sources.insert(session_id.clone(), source.clone());
             }
@@ -8049,6 +8156,73 @@ mod tests {
     }
 
     #[test]
+    fn insufficient_rewind_notice_resolves_through_session_identity_alias() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionCapabilities {
+                session_id: "wrapper-session".to_string(),
+                capabilities: crate::types::SessionCapabilities {
+                    follow_up: true,
+                    steer: true,
+                    interrupt: true,
+                    codex_thread_actions: vec!["rewind_context".to_string()],
+                    codex_managed_context: Some("managed".to_string()),
+                    codex_context_archive: None,
+                    codex_command: Some("/tmp/codex".to_string()),
+                    codex_fast_mode: None,
+                    codex_service_tier: None,
+                },
+            },
+        );
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::SessionIdentity {
+                session_id: "wrapper-session".to_string(),
+                source: "codex".to_string(),
+                backend_session_id: "codex-thread".to_string(),
+            },
+        );
+        s.session_usage.insert(
+            "codex-thread".to_string(),
+            frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 101_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 101.0,
+                prompt_tokens: 97_000,
+                completion_tokens: 4_000,
+                cached_tokens: 0,
+            },
+        );
+
+        s.note_context_rewind_result_for(
+            Some("wrapper-session"),
+            true,
+            "Rewound Codex thread and saved record rewind-alias.",
+        );
+        s.complete_pending_rewind_pressure_check_for(Some("codex-thread"));
+
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("wrapper-session"), None)
+                .pointer("/last_rewind_insufficient/record_id"),
+            Some(&serde_json::Value::String("rewind-alias".to_string()))
+        );
+        assert_eq!(
+            s.context_pressure_snapshot_for(Some("codex-thread"), None)
+                .pointer("/last_rewind_insufficient/record_id"),
+            Some(&serde_json::Value::String("rewind-alias".to_string()))
+        );
+    }
+
+    #[test]
     fn spawn_event_listener_tracks_rewind_result_for_stdio_mcp_state() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -8353,6 +8527,82 @@ mod tests {
             assert_eq!(
                 value.pointer("/context_pressure/used_tokens"),
                 Some(&950.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"pressure".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_resolves_backend_usage_through_session_identity_alias() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionCapabilities {
+                        session_id: "wrapper-session".to_string(),
+                        capabilities: crate::types::SessionCapabilities {
+                            follow_up: true,
+                            steer: true,
+                            interrupt: true,
+                            codex_thread_actions: vec!["rewind_context".to_string()],
+                            codex_managed_context: Some("managed".to_string()),
+                            codex_context_archive: None,
+                            codex_command: Some("/tmp/codex".to_string()),
+                            codex_fast_mode: None,
+                            codex_service_tier: None,
+                        },
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: "wrapper-session".to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: "codex-thread".to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::UsageSnapshot {
+                        session_id: Some("codex-thread".to_string()),
+                        main: frontend::ModelUsageSnapshot {
+                            provider: "openai".to_string(),
+                            model: "gpt-5.2-codex".to_string(),
+                            tokens_used: 990,
+                            context_window: 1_000,
+                            hard_context_window: Some(1_200),
+                            usage_pct: 99.0,
+                            prompt_tokens: 950,
+                            completion_tokens: 40,
+                            cached_tokens: 500,
+                        },
+                        presence: None,
+                    },
+                );
+            }
+
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("wrapper-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&990.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&990.into())
             );
             assert_eq!(
                 value.pointer("/context_pressure/status"),
