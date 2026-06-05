@@ -5435,15 +5435,7 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<ListRewindAnchorsParams>,
     ) -> String {
-        let recovery_candidates_only = params.recovery_candidates_only.unwrap_or_else(|| {
-            self.state
-                .try_read()
-                .ok()
-                .and_then(|state| {
-                    state.context_pressure_rewind_only_for(params.session_id.as_deref())
-                })
-                .is_some()
-        });
+        let recovery_candidates_only = params.recovery_candidates_only.unwrap_or(true);
         let mut payload = serde_json::json!({
             "offset": params.offset.unwrap_or(0),
             "limit": params.limit.unwrap_or(100),

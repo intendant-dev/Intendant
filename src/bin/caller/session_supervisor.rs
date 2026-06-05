@@ -1779,7 +1779,8 @@ impl SessionSupervisor {
             ));
             return;
         };
-        self.deliver_edit_user_message(request, target, relation).await;
+        self.deliver_edit_user_message(request, target, relation)
+            .await;
     }
 
     fn queue_edit_user_message_after_attach(
@@ -2537,10 +2538,7 @@ impl SessionSupervisor {
                 message,
             });
         } else {
-            let message = format!(
-                "Session config partially failed: {}",
-                errors.join("; ")
-            );
+            let message = format!("Session config partially failed: {}", errors.join("; "));
             self.config.bus.send(AppEvent::SessionAgentConfigResult {
                 session_id,
                 source: backend.as_short_str().to_string(),

@@ -608,13 +608,8 @@ mod tests {
         write_external_overlay(home.path(), "codex", "wrapper-id", &stale_wrapper).unwrap();
         write_external_overlay(home.path(), "codex", "backend-thread", &backend).unwrap();
 
-        let loaded = load_for_resume(
-            home.path(),
-            "codex",
-            "wrapper-id",
-            Some("backend-thread"),
-        )
-        .unwrap();
+        let loaded =
+            load_for_resume(home.path(), "codex", "wrapper-id", Some("backend-thread")).unwrap();
         assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/backend-codex"));
     }
 

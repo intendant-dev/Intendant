@@ -421,6 +421,7 @@ impl CodexAgent {
             .send_request("thread/rollback", Some(params))
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("thread/rollback: {e}")))?;
+        self.reset_context_pressure_after_thread_rewrite().await;
         Ok(format!("rolled back {} turn(s)", turns))
     }
 
@@ -464,6 +465,7 @@ impl CodexAgent {
             .send_request("thread/rollback", Some(params))
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("thread/rollback: {e}")))?;
+        self.reset_context_pressure_after_thread_rewrite().await;
         Ok(())
     }
 
@@ -1092,6 +1094,17 @@ pub struct CodexAgent {
     /// Latest token-usage notification from Codex app-server. Joined with
     /// request payload snapshots so the dashboard can show current context usage.
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
+    /// A backend-reported saturated context sample that remains effective until
+    /// Codex confirms a thread rewrite. Short failed turns can report a much
+    /// smaller last-call usage without changing the still-saturated rollout.
+    context_pressure_floor: Arc<Mutex<Option<CodexContextPressureFloor>>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct CodexContextPressureFloor {
+    token_count: u64,
+    context_window: u64,
+    hard_context_window: Option<u64>,
 }
 
 /// Knobs that vary per-session and feed into Codex `thread/start` or the
@@ -1218,6 +1231,63 @@ impl CodexAgent {
         self.insert_working_dir_param(&mut params);
         self.insert_service_tier_override_consuming_clear(&mut params);
         params
+    }
+
+    fn sandbox_permission_profile(&self) -> Option<&'static str> {
+        match self.sandbox.trim() {
+            "read-only" => Some(":read-only"),
+            "workspace-write" => Some(":workspace"),
+            "danger-full-access" => Some(":danger-full-access"),
+            _ => None,
+        }
+    }
+
+    fn resumed_thread_settings_update_params(
+        &self,
+        thread_id: &str,
+    ) -> serde_json::Map<String, serde_json::Value> {
+        let mut params = serde_json::Map::new();
+        params.insert(
+            "threadId".into(),
+            serde_json::Value::String(thread_id.to_string()),
+        );
+        if let Some(cwd) = self.working_dir.as_ref() {
+            params.insert(
+                "cwd".into(),
+                serde_json::Value::String(cwd.to_string_lossy().to_string()),
+            );
+        }
+        if !self.approval_policy.trim().is_empty() {
+            params.insert(
+                "approvalPolicy".into(),
+                serde_json::Value::String(self.approval_policy.clone()),
+            );
+        }
+        if let Some(profile) = self.sandbox_permission_profile() {
+            params.insert(
+                "permissions".into(),
+                serde_json::Value::String(profile.to_string()),
+            );
+        }
+        if let Some(ref model) = self.model {
+            params.insert("model".into(), serde_json::Value::String(model.clone()));
+        }
+        self.insert_service_tier_override(&mut params);
+        params
+    }
+
+    async fn apply_resumed_thread_settings(&mut self, thread_id: &str) -> Result<(), CallerError> {
+        let params = self.resumed_thread_settings_update_params(thread_id);
+        if params.len() <= 1 {
+            return Ok(());
+        }
+        self.send_request(
+            "thread/settings/update",
+            Some(serde_json::Value::Object(params)),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|e| CallerError::ExternalAgent(format!("thread/settings/update: {e}")))
     }
 
     fn cleanup_temporary_request_trace_root(&mut self) {
@@ -1363,6 +1433,7 @@ impl CodexAgent {
             turn_descendant_baseline: None,
             side_threads: Arc::new(Mutex::new(HashMap::new())),
             latest_token_usage: Arc::new(Mutex::new(None)),
+            context_pressure_floor: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -1472,10 +1543,9 @@ impl CodexAgent {
             None => None,
         };
         let usage = self.latest_token_usage.lock().await.clone();
-        let token_count = usage.as_ref().and_then(codex_usage_total_tokens);
-        let token_count_kind = usage.as_ref().and_then(codex_usage_token_count_kind);
-        let context_window = usage.as_ref().and_then(codex_usage_context_window);
-        let hard_context_window = usage.as_ref().and_then(codex_usage_hard_context_window);
+        let pressure_floor = *self.context_pressure_floor.lock().await;
+        let (token_count, token_count_kind, context_window, hard_context_window) =
+            codex_pressure_aware_usage_fields(usage.as_ref(), pressure_floor);
         let item_count = codex_request_item_count(&trace.payload);
         let raw = codex_context_archive_payload(
             trace.payload,
@@ -1498,6 +1568,11 @@ impl CodexAgent {
             item_count,
             raw,
         })
+    }
+
+    async fn reset_context_pressure_after_thread_rewrite(&self) {
+        self.latest_token_usage.lock().await.take();
+        self.context_pressure_floor.lock().await.take();
     }
 
     async fn active_thread_and_turn(&self, action: &str) -> Result<(String, String), CallerError> {
@@ -2836,6 +2911,107 @@ fn codex_usage_preserving_hard_context_window(
     usage
 }
 
+fn codex_context_pressure_floor_from_usage(
+    usage: &serde_json::Value,
+) -> Option<CodexContextPressureFloor> {
+    if codex_usage_token_count_kind(usage) != Some(AgentContextTokenCountKind::BackendReported) {
+        return None;
+    }
+    let token_count = codex_usage_total_tokens(usage)?;
+    let context_window = codex_usage_context_window(usage)?;
+    if context_window == 0 || token_count < context_window {
+        return None;
+    }
+    Some(CodexContextPressureFloor {
+        token_count,
+        context_window,
+        hard_context_window: codex_usage_hard_context_window(usage),
+    })
+}
+
+fn codex_pressure_floor_applies(
+    usage: Option<&serde_json::Value>,
+    floor: CodexContextPressureFloor,
+) -> bool {
+    usage
+        .and_then(codex_usage_context_window)
+        .map_or(true, |context_window| {
+            context_window == floor.context_window
+        })
+}
+
+fn codex_pressure_aware_usage_fields(
+    usage: Option<&serde_json::Value>,
+    pressure_floor: Option<CodexContextPressureFloor>,
+) -> (
+    Option<u64>,
+    Option<AgentContextTokenCountKind>,
+    Option<u64>,
+    Option<u64>,
+) {
+    let mut token_count = usage.and_then(codex_usage_total_tokens);
+    let mut token_count_kind = usage.and_then(codex_usage_token_count_kind);
+    let mut context_window = usage.and_then(codex_usage_context_window);
+    let mut hard_context_window = usage.and_then(codex_usage_hard_context_window);
+
+    let Some(floor) = pressure_floor else {
+        return (
+            token_count,
+            token_count_kind,
+            context_window,
+            hard_context_window,
+        );
+    };
+    if !codex_pressure_floor_applies(usage, floor) {
+        return (
+            token_count,
+            token_count_kind,
+            context_window,
+            hard_context_window,
+        );
+    }
+
+    if context_window.is_none() {
+        context_window = Some(floor.context_window);
+    }
+    if hard_context_window.is_none() {
+        hard_context_window = floor.hard_context_window;
+    }
+    let should_use_floor = match (token_count, token_count_kind) {
+        (Some(tokens), Some(AgentContextTokenCountKind::BackendReported)) => {
+            tokens < floor.token_count
+        }
+        _ => true,
+    };
+    if should_use_floor {
+        token_count = Some(floor.token_count);
+        token_count_kind = Some(AgentContextTokenCountKind::BackendReported);
+    }
+
+    (
+        token_count,
+        token_count_kind,
+        context_window,
+        hard_context_window,
+    )
+}
+
+async fn update_codex_context_pressure_floor(
+    context_pressure_floor: &Arc<Mutex<Option<CodexContextPressureFloor>>>,
+    usage: &serde_json::Value,
+) {
+    let Some(new_floor) = codex_context_pressure_floor_from_usage(usage) else {
+        return;
+    };
+    let mut floor = context_pressure_floor.lock().await;
+    match *floor {
+        Some(existing)
+            if existing.context_window == new_floor.context_window
+                && existing.token_count >= new_floor.token_count => {}
+        _ => *floor = Some(new_floor),
+    }
+}
+
 fn codex_usage_input_tokens(value: &serde_json::Value) -> Option<u64> {
     first_u64_at(value, &["/inputTokens", "/input_tokens"])
 }
@@ -2916,6 +3092,7 @@ async fn reader_task(
     active_turn_id: Arc<Mutex<Option<String>>>,
     active_turns: ActiveTurns,
     latest_token_usage: Arc<Mutex<Option<serde_json::Value>>>,
+    context_pressure_floor: Arc<Mutex<Option<CodexContextPressureFloor>>>,
     model: Option<String>,
 ) {
     let reader = BufReader::new(stdout);
@@ -3131,6 +3308,8 @@ async fn reader_task(
                 let mut latest = latest_token_usage.lock().await;
                 let usage = codex_usage_preserving_hard_context_window(usage, latest.as_ref());
                 *latest = Some(usage.clone());
+                drop(latest);
+                update_codex_context_pressure_floor(&context_pressure_floor, &usage).await;
                 usage
             } else {
                 usage
@@ -4462,6 +4641,7 @@ impl ExternalAgent for CodexAgent {
         let active_turns = Arc::clone(&self.active_turns);
         let active_thread_id = Arc::clone(&self.active_thread_id);
         let latest_token_usage = Arc::clone(&self.latest_token_usage);
+        let context_pressure_floor = Arc::clone(&self.context_pressure_floor);
         let model = self.model.clone();
 
         let handle = tokio::spawn(reader_task(
@@ -4474,6 +4654,7 @@ impl ExternalAgent for CodexAgent {
             active_turn_id,
             active_turns,
             latest_token_usage,
+            context_pressure_floor,
             model,
         ));
         self.reader_handle = Some(handle);
@@ -4550,6 +4731,7 @@ impl ExternalAgent for CodexAgent {
         *self.active_thread_id.lock().await = Some(thread_id.clone());
 
         if self.resume_session.is_some() {
+            self.apply_resumed_thread_settings(&thread_id).await?;
             if let Err(e) = self
                 .mark_existing_context_requests_seen(Some(&thread_id))
                 .await
@@ -4577,7 +4759,10 @@ impl ExternalAgent for CodexAgent {
                         let mut latest = self.latest_token_usage.lock().await;
                         let usage =
                             codex_usage_preserving_hard_context_window(usage, latest.as_ref());
-                        *latest = Some(usage);
+                        *latest = Some(usage.clone());
+                        drop(latest);
+                        update_codex_context_pressure_floor(&self.context_pressure_floor, &usage)
+                            .await;
                     }
                     Ok(None) => {}
                     Err(e) => {
@@ -4700,12 +4885,19 @@ impl ExternalAgent for CodexAgent {
             None => None,
         };
         let usage = self.latest_token_usage.lock().await.clone();
+        let pressure_floor = *self.context_pressure_floor.lock().await;
         let latest_request_id = traces.last().map(|trace| trace.request_id.clone());
         let exact_archive = self.context_archive_exact();
         Ok(traces
             .into_iter()
             .map(|trace| {
                 let is_latest = latest_request_id.as_deref() == Some(trace.request_id.as_str());
+                let (token_count, token_count_kind, context_window, hard_context_window) =
+                    if is_latest {
+                        codex_pressure_aware_usage_fields(usage.as_ref(), pressure_floor)
+                    } else {
+                        (None, None, None, None)
+                    };
                 let item_count = codex_request_item_count(&trace.payload);
                 let raw = codex_context_archive_payload(
                     trace.payload,
@@ -4721,18 +4913,10 @@ impl ExternalAgent for CodexAgent {
                     request_index: Some(trace.request_index),
                     rollout_path: rollout_path.clone(),
                     format: trace.format,
-                    token_count: is_latest
-                        .then(|| usage.as_ref().and_then(codex_usage_total_tokens))
-                        .flatten(),
-                    token_count_kind: is_latest
-                        .then(|| usage.as_ref().and_then(codex_usage_token_count_kind))
-                        .flatten(),
-                    context_window: is_latest
-                        .then(|| usage.as_ref().and_then(codex_usage_context_window))
-                        .flatten(),
-                    hard_context_window: is_latest
-                        .then(|| usage.as_ref().and_then(codex_usage_hard_context_window))
-                        .flatten(),
+                    token_count,
+                    token_count_kind,
+                    context_window,
+                    hard_context_window,
                     item_count,
                     raw,
                 }
@@ -4936,6 +5120,7 @@ impl ExternalAgent for CodexAgent {
         let thread_id = extract_thread_id(&response).ok_or_else(|| {
             CallerError::ExternalAgent("thread/fork response missing thread id".into())
         })?;
+        self.reset_context_pressure_after_thread_rewrite().await;
         if let Some(name) = name.map(str::trim).filter(|name| !name.is_empty()) {
             let request = serde_json::json!({ "threadId": thread_id.clone(), "name": name });
             self.send_request("thread/name/set", Some(request))
@@ -4982,6 +5167,7 @@ impl ExternalAgent for CodexAgent {
             .await
             .map_err(|e| CallerError::ExternalAgent(format!("thread/restore: {e}")))?;
         *self.active_thread_id.lock().await = Some(thread_id.to_string());
+        self.reset_context_pressure_after_thread_rewrite().await;
         Ok(())
     }
 
@@ -5724,6 +5910,49 @@ mod tests {
         assert_eq!(codex_usage_hard_context_window(&usage), Some(272000));
         let snapshot = codex_usage_snapshot(&usage, "codex").unwrap();
         assert_eq!(snapshot.hard_context_window, Some(272000));
+    }
+
+    #[test]
+    fn codex_pressure_floor_keeps_saturated_rollout_rewind_only_until_reset() {
+        let saturated = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": 258000,
+                "output_tokens": 400,
+                "total_tokens": 258400
+            },
+            "model_context_window": 258400,
+            "model_hard_context_window": 272000
+        });
+        let floor = codex_context_pressure_floor_from_usage(&saturated).unwrap();
+        assert_eq!(
+            floor,
+            CodexContextPressureFloor {
+                token_count: 258400,
+                context_window: 258400,
+                hard_context_window: Some(272000),
+            }
+        );
+
+        let short_failed_call = serde_json::json!({
+            "last_token_usage": {
+                "input_tokens": 149700,
+                "output_tokens": 8,
+                "total_tokens": 149708
+            },
+            "model_context_window": 258400,
+            "model_hard_context_window": 272000
+        });
+        let (tokens, kind, context_window, hard_context_window) =
+            codex_pressure_aware_usage_fields(Some(&short_failed_call), Some(floor));
+        assert_eq!(tokens, Some(258400));
+        assert_eq!(kind, Some(AgentContextTokenCountKind::BackendReported));
+        assert_eq!(context_window, Some(258400));
+        assert_eq!(hard_context_window, Some(272000));
+
+        let (tokens, kind, _, _) =
+            codex_pressure_aware_usage_fields(Some(&short_failed_call), None);
+        assert_eq!(tokens, Some(149708));
+        assert_eq!(kind, Some(AgentContextTokenCountKind::BackendReported));
     }
 
     #[test]
@@ -7371,6 +7600,25 @@ mod tests {
         assert_eq!(params["approvalPolicy"], "on-request");
         assert_eq!(params["sandbox"], "workspace-write");
         assert_eq!(params["cwd"], "/tmp/intendant-workspace");
+    }
+
+    #[test]
+    fn resumed_thread_settings_update_uses_permission_profile() {
+        let mut agent = test_agent();
+        agent.model = Some("gpt-5.5".to_string());
+        agent.approval_policy = "never".to_string();
+        agent.sandbox = "danger-full-access".to_string();
+        agent.working_dir = Some(PathBuf::from("/tmp/intendant-workspace"));
+
+        let params = agent.resumed_thread_settings_update_params("thread-123");
+
+        assert_eq!(params["threadId"], "thread-123");
+        assert_eq!(params["model"], "gpt-5.5");
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["permissions"], ":danger-full-access");
+        assert_eq!(params["cwd"], "/tmp/intendant-workspace");
+        assert!(params.get("sandbox").is_none());
+        assert!(params.get("sandboxPolicy").is_none());
     }
 
     #[test]

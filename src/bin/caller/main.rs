@@ -1653,11 +1653,12 @@ impl ExternalContextRewindRequest {
     }
 }
 
-fn context_rewind_should_interrupt_active_turn(_request: &ExternalContextRewindRequest) -> bool {
-    // Rewind application only requires the current Codex turn to become idle.
-    // Interrupting the active turn can also cancel long-running tool sessions
-    // that have already returned a session id, such as a dev server launch.
-    false
+fn context_rewind_should_interrupt_active_turn(request: &ExternalContextRewindRequest) -> bool {
+    // Model-origin managed rewinds must make the active Codex turn idle before
+    // Intendant can apply the rewrite. Relying on the model to stop after the
+    // tool result is brittle under context pressure: a single response can keep
+    // issuing recovery tools and grow context before the scheduler runs.
+    request.auto_resume
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1885,6 +1886,80 @@ fn resolve_context_rewind_anchor(
     Ok(ResolvedContextRewindAnchor::requested(requested_item_id))
 }
 
+fn context_rewind_anchor_prefix_estimate(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    position: external_agent::RollbackAnchorPosition,
+) -> Option<u64> {
+    match position {
+        external_agent::RollbackAnchorPosition::Before => {
+            anchor.prefix_estimated_tokens_before_anchor
+        }
+        external_agent::RollbackAnchorPosition::After => {
+            anchor.prefix_estimated_tokens_after_anchor
+        }
+    }
+}
+
+fn validate_context_rewind_anchor_restore_headroom(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> Result<(), String> {
+    let requested_item_id = requested_item_id.trim();
+    let Some(anchor) = find_context_rewind_anchor_entry(source_rollout_path, requested_item_id)
+        .map_err(|err| {
+            format!(
+                "failed to inspect rollout anchors in {}: {err}",
+                source_rollout_path.display()
+            )
+        })?
+    else {
+        return Ok(());
+    };
+
+    let Some(rewind_only_limit) = anchor.rewind_only_limit_at_or_after_anchor else {
+        return Ok(());
+    };
+    let Some(prefix_tokens) = context_rewind_anchor_prefix_estimate(&anchor, position) else {
+        return Ok(());
+    };
+    if context_rewind_anchor_has_recovery_headroom(prefix_tokens, rewind_only_limit) {
+        if let Some(outcome) = latest_context_rewind_outcome_for_anchor(
+            source_rollout_path,
+            requested_item_id,
+            position,
+        )
+        .map_err(|err| {
+            format!(
+                "failed to inspect prior rewind outcomes in {}: {err}",
+                source_rollout_path.display()
+            )
+        })? {
+            if context_rewind_anchor_has_recovery_headroom(
+                outcome.used_tokens,
+                outcome.rewind_only_limit,
+            ) {
+                return Ok(());
+            }
+            return Err(format!(
+                "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: a prior rewind to {} item was followed by {} tokens against the {} token rewind-only limit. Call list_rewind_anchors again and choose an anchor whose recovery_eligible field is true.",
+                position.as_str(),
+                outcome.used_tokens,
+                outcome.rewind_only_limit
+            ));
+        }
+        return Ok(());
+    }
+
+    Err(format!(
+        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: restoring {} item would keep an estimated {} prefix tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Call list_rewind_anchors again and choose an anchor whose recovery_eligible field is true.",
+        position.as_str(),
+        prefix_tokens,
+        CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS,
+        rewind_only_limit
+    ))
+}
+
 fn context_rewind_thread_id_candidates(
     session_id: Option<&str>,
     alias_session_id: Option<&str>,
@@ -1934,8 +2009,13 @@ async fn validate_context_rewind_request_before_schedule(
                 let source_rollout_path = snapshot.rollout_path.ok_or_else(|| {
                     format!("thread metadata for {thread_id} did not include a rollout path")
                 })?;
-                return resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)
-                    .map(|_| ());
+                resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
+                validate_context_rewind_anchor_restore_headroom(
+                    &source_rollout_path,
+                    &request.item_id,
+                    request.position,
+                )?;
+                return Ok(());
             }
             Err(e) => metadata_errors.push(format!("{thread_id}: {e}")),
         }
@@ -2021,11 +2101,7 @@ fn rollout_user_turns(rollout_path: &Path) -> io::Result<Vec<RolloutUserTurn>> {
                     continue;
                 };
                 if let Some(text) = codex_payload_user_text(payload) {
-                    push_rollout_user_turn(
-                        &mut fallback_turns,
-                        line_index.saturating_add(1),
-                        text,
-                    );
+                    push_rollout_user_turn(&mut fallback_turns, line_index.saturating_add(1), text);
                 }
             }
             _ => {}
@@ -2122,9 +2198,8 @@ fn managed_context_edit_records(
         })?;
         from_dir.retain(|record| {
             record.thread_id == thread_id
-                || session_id.is_some_and(|session_id| {
-                    record.session_id.as_deref() == Some(session_id)
-                })
+                || session_id
+                    .is_some_and(|session_id| record.session_id.as_deref() == Some(session_id))
         });
         for record in from_dir {
             let key = format!(
@@ -2224,6 +2299,16 @@ struct ContextRewindAnchorCatalogEntry {
     backend_usage_at_or_after_anchor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rewind_only_limit_at_or_after_anchor: Option<u64>,
+    #[serde(skip_serializing)]
+    prefix_estimated_tokens_before_anchor: Option<u64>,
+    #[serde(skip_serializing)]
+    prefix_estimated_tokens_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prefix_tokens_after: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_rewind_usage_after_anchor: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    latest_rewind_limit_after_anchor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_eligible: Option<bool>,
 }
@@ -2269,7 +2354,7 @@ const CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS: usize = 2;
 const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
 const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
 const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
-const CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS: u64 = 4_096;
+const CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS: u64 = 8_000;
 const CONTEXT_REWIND_PRIOR_PRIMER_FACT_LIMIT: usize = 12_000;
 
 #[derive(Debug, Clone, Copy)]
@@ -2277,6 +2362,19 @@ struct ContextRewindBackendUsageAtLine {
     line: usize,
     used_tokens: u64,
     rewind_only_limit: u64,
+}
+
+#[derive(Debug, Clone)]
+struct PendingContextRewindOutcome {
+    key: String,
+    prior_usage: Option<ContextRewindBackendUsageAtLine>,
+}
+
+fn context_rewind_anchor_outcome_key(
+    item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> String {
+    format!("{}\0{}", position.as_str(), item_id)
 }
 
 fn list_context_rewind_anchors_from_rollout(
@@ -2310,7 +2408,7 @@ fn list_context_rewind_anchors_from_rollout(
         .get("recovery_candidates_only")
         .or_else(|| params.get("recoveryCandidatesOnly"))
         .and_then(|value| value.as_bool())
-        .unwrap_or(false);
+        .unwrap_or(true);
     let include_non_recovery = params
         .get("include_non_recovery")
         .or_else(|| params.get("includeNonRecovery"))
@@ -2468,6 +2566,10 @@ fn scan_context_rewind_anchor_catalog(
     let mut anchors = Vec::<ContextRewindAnchorCatalogEntry>::new();
     let mut by_item_id = HashMap::<String, usize>::new();
     let mut backend_usage = Vec::<ContextRewindBackendUsageAtLine>::new();
+    let mut pending_rewind_outcome: Option<PendingContextRewindOutcome> = None;
+    let mut latest_rewind_outcomes = HashMap::<String, ContextRewindBackendUsageAtLine>::new();
+    let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
+    let mut prefix_estimated_tokens = 0_u64;
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -2476,7 +2578,26 @@ fn scan_context_rewind_anchor_catalog(
         };
         let line_number = line_index.saturating_add(1);
         if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry) {
+            if let Some(pending) = pending_rewind_outcome.take() {
+                latest_rewind_outcomes.insert(
+                    pending.key,
+                    context_rewind_worse_usage(pending.prior_usage, usage),
+                );
+            }
+            latest_backend_usage = Some(usage);
             backend_usage.push(usage);
+        }
+        if let Some(key) = context_rewind_rollback_anchor_outcome_key_from_rollout_entry(&entry) {
+            if let Some(pending) = pending_rewind_outcome.take() {
+                if let Some(prior_usage) = pending.prior_usage {
+                    latest_rewind_outcomes.insert(pending.key, prior_usage);
+                }
+            }
+            pending_rewind_outcome = Some(PendingContextRewindOutcome {
+                key,
+                prior_usage: latest_backend_usage
+                    .filter(|usage| line_number.saturating_sub(usage.line) <= 3),
+            });
         }
         if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
             continue;
@@ -2484,6 +2605,10 @@ fn scan_context_rewind_anchor_catalog(
         let Some(payload) = entry.get("payload") else {
             continue;
         };
+        let prefix_before_item = prefix_estimated_tokens;
+        prefix_estimated_tokens =
+            prefix_estimated_tokens.saturating_add(context_rewind_estimated_tokens(payload));
+        let prefix_after_item = prefix_estimated_tokens;
         let item_type = payload
             .get("type")
             .and_then(|value| value.as_str())
@@ -2497,6 +2622,7 @@ fn scan_context_rewind_anchor_catalog(
                 let anchor = &mut anchors[index];
                 anchor.last_line = line_number;
                 anchor.last_item_type = item_type.clone();
+                anchor.prefix_estimated_tokens_after_anchor = Some(prefix_after_item);
                 merge_string_set(&mut anchor.names, names.iter().cloned());
                 merge_string_set(&mut anchor.roles, roles.iter().cloned());
                 if !summary.is_empty() && !anchor.summary.contains(&summary) {
@@ -2527,8 +2653,18 @@ fn scan_context_rewind_anchor_catalog(
                 summary: summary.clone(),
                 backend_usage_at_or_after_anchor: None,
                 rewind_only_limit_at_or_after_anchor: None,
+                prefix_estimated_tokens_before_anchor: Some(prefix_before_item),
+                prefix_estimated_tokens_after_anchor: Some(prefix_after_item),
+                prefix_tokens_after: None,
+                latest_rewind_usage_after_anchor: None,
+                latest_rewind_limit_after_anchor: None,
                 recovery_eligible: None,
             });
+        }
+    }
+    if let Some(pending) = pending_rewind_outcome {
+        if let Some(prior_usage) = pending.prior_usage {
+            latest_rewind_outcomes.insert(pending.key, prior_usage);
         }
     }
 
@@ -2542,19 +2678,140 @@ fn scan_context_rewind_anchor_catalog(
         };
         anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
         anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
-        anchor.recovery_eligible = Some(context_rewind_anchor_has_recovery_headroom(
-            usage.used_tokens,
-            usage.rewind_only_limit,
-        ));
+        let backend_has_headroom =
+            context_rewind_anchor_has_recovery_headroom(usage.used_tokens, usage.rewind_only_limit);
+        let restore_prefix_has_headroom =
+            anchor
+                .prefix_estimated_tokens_after_anchor
+                .is_some_and(|prefix_tokens| {
+                    context_rewind_anchor_has_recovery_headroom(
+                        prefix_tokens,
+                        usage.rewind_only_limit,
+                    )
+                });
+        if !restore_prefix_has_headroom {
+            anchor.prefix_tokens_after = anchor.prefix_estimated_tokens_after_anchor;
+        }
+        let latest_rewind_outcome = latest_rewind_outcomes
+            .get(&context_rewind_anchor_outcome_key(
+                &anchor.item_id,
+                external_agent::RollbackAnchorPosition::After,
+            ))
+            .copied();
+        let latest_rewind_has_headroom = latest_rewind_outcome.is_none_or(|outcome| {
+            context_rewind_anchor_has_recovery_headroom(
+                outcome.used_tokens,
+                outcome.rewind_only_limit,
+            )
+        });
+        if let Some(outcome) = latest_rewind_outcome.filter(|_| !latest_rewind_has_headroom) {
+            anchor.latest_rewind_usage_after_anchor = Some(outcome.used_tokens);
+            anchor.latest_rewind_limit_after_anchor = Some(outcome.rewind_only_limit);
+        }
+        anchor.recovery_eligible =
+            Some(backend_has_headroom && restore_prefix_has_headroom && latest_rewind_has_headroom);
     }
 
     Ok(anchors)
+}
+
+fn latest_context_rewind_outcome_for_anchor(
+    source_rollout_path: &Path,
+    requested_item_id: &str,
+    position: external_agent::RollbackAnchorPosition,
+) -> io::Result<Option<ContextRewindBackendUsageAtLine>> {
+    let key = context_rewind_anchor_outcome_key(requested_item_id, position);
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut pending = None::<PendingContextRewindOutcome>;
+    let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
+    let mut latest = None;
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        let line_number = line_index.saturating_add(1);
+        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry) {
+            if let Some(pending_key) = pending.take() {
+                if pending_key.key == key {
+                    latest = Some(context_rewind_worse_usage(pending_key.prior_usage, usage));
+                }
+            }
+            latest_backend_usage = Some(usage);
+        }
+        if let Some(outcome_key) =
+            context_rewind_rollback_anchor_outcome_key_from_rollout_entry(&entry)
+        {
+            if let Some(pending_key) = pending.take() {
+                if pending_key.key == key {
+                    if let Some(prior_usage) = pending_key.prior_usage {
+                        latest = Some(prior_usage);
+                    }
+                }
+            }
+            pending = Some(PendingContextRewindOutcome {
+                key: outcome_key,
+                prior_usage: latest_backend_usage
+                    .filter(|usage| line_number.saturating_sub(usage.line) <= 3),
+            });
+        }
+    }
+    if let Some(pending_key) = pending {
+        if pending_key.key == key {
+            if let Some(prior_usage) = pending_key.prior_usage {
+                latest = Some(prior_usage);
+            }
+        }
+    }
+    Ok(latest)
+}
+
+fn context_rewind_estimated_tokens(value: &serde_json::Value) -> u64 {
+    let chars = serde_json::to_vec(value)
+        .map(|bytes| bytes.len())
+        .unwrap_or_else(|_| value.to_string().len());
+    std::cmp::max(1, chars.div_ceil(4) as u64)
 }
 
 fn context_rewind_anchor_has_recovery_headroom(used_tokens: u64, rewind_only_limit: u64) -> bool {
     used_tokens < rewind_only_limit
         && rewind_only_limit.saturating_sub(used_tokens)
             >= CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS
+}
+
+fn context_rewind_worse_usage(
+    prior_usage: Option<ContextRewindBackendUsageAtLine>,
+    next_usage: ContextRewindBackendUsageAtLine,
+) -> ContextRewindBackendUsageAtLine {
+    let Some(prior_usage) = prior_usage else {
+        return next_usage;
+    };
+    let prior_has_headroom = context_rewind_anchor_has_recovery_headroom(
+        prior_usage.used_tokens,
+        prior_usage.rewind_only_limit,
+    );
+    let next_has_headroom = context_rewind_anchor_has_recovery_headroom(
+        next_usage.used_tokens,
+        next_usage.rewind_only_limit,
+    );
+    match (prior_has_headroom, next_has_headroom) {
+        (false, true) => prior_usage,
+        (true, false) => next_usage,
+        _ => {
+            let prior_remaining = prior_usage
+                .rewind_only_limit
+                .saturating_sub(prior_usage.used_tokens);
+            let next_remaining = next_usage
+                .rewind_only_limit
+                .saturating_sub(next_usage.used_tokens);
+            if prior_remaining <= next_remaining {
+                prior_usage
+            } else {
+                next_usage
+            }
+        }
+    }
 }
 
 fn context_rewind_backend_usage_from_rollout_entry(
@@ -2588,6 +2845,33 @@ fn context_rewind_backend_usage_from_rollout_entry(
         used_tokens,
         rewind_only_limit,
     })
+}
+
+fn context_rewind_rollback_anchor_outcome_key_from_rollout_entry(
+    entry: &serde_json::Value,
+) -> Option<String> {
+    if entry.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type").and_then(|value| value.as_str()) != Some("thread_rolled_back") {
+        return None;
+    }
+    let anchor = payload.get("anchor")?;
+    let item_id = anchor
+        .get("itemId")
+        .or_else(|| anchor.get("item_id"))?
+        .as_str()?
+        .trim();
+    if item_id.is_empty() {
+        return None;
+    }
+    let position = anchor
+        .get("position")
+        .and_then(|value| value.as_str())
+        .and_then(external_agent::RollbackAnchorPosition::from_str)
+        .unwrap_or(external_agent::RollbackAnchorPosition::After);
+    Some(context_rewind_anchor_outcome_key(item_id, position))
 }
 
 fn context_rewind_anchor_matches_query(
@@ -2896,6 +3180,11 @@ async fn apply_external_context_rewind(
         .clone()
         .ok_or_else(|| "thread metadata did not include a rollout path".to_string())?;
     let resolved_anchor = resolve_context_rewind_anchor(&source_rollout_path, &request.item_id)?;
+    validate_context_rewind_anchor_restore_headroom(
+        &source_rollout_path,
+        &resolved_anchor.item_id,
+        request.position,
+    )?;
     let carried_forward_prior_facts = match context_rewind_pruned_prior_primer_facts(
         &source_rollout_path,
         &resolved_anchor.item_id,
@@ -3331,7 +3620,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}). Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -3350,7 +3639,7 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -9009,7 +9298,7 @@ mod tests {
             external_agent::RollbackAnchorPosition::Before
         );
         assert!(request.auto_resume);
-        assert!(!context_rewind_should_interrupt_active_turn(&request));
+        assert!(context_rewind_should_interrupt_active_turn(&request));
 
         let primer = request
             .rendered_primer(Some("rewind-test-record"), None)
@@ -9363,10 +9652,10 @@ mod tests {
                         "type": "token_count",
                         "info": {
                             "last_token_usage": {
-                                "input_tokens": 5000,
-                                "cached_input_tokens": 4000,
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 800,
                                 "output_tokens": 0,
-                                "total_tokens": 5000
+                                "total_tokens": 1000
                             },
                             "model_context_window": 10000
                         }
@@ -9433,6 +9722,7 @@ mod tests {
             &serde_json::json!({
                 "offset": 0,
                 "limit": 10,
+                "include_non_recovery": true,
             }),
         )
         .expect("full catalog");
@@ -9445,7 +9735,7 @@ mod tests {
             .expect("below-soft anchor");
         assert_eq!(
             below["backend_usage_at_or_after_anchor"].as_u64(),
-            Some(5000)
+            Some(1000)
         );
         assert_eq!(
             below["rewind_only_limit_at_or_after_anchor"].as_u64(),
@@ -9504,6 +9794,362 @@ mod tests {
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(catalog["anchors"].as_array().unwrap().len(), 3);
         assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(false));
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_filters_oversized_restored_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let huge_prior_context = "x".repeat(90_000);
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_fit",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{ "type": "output_text", "text": huge_prior_context }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_after_huge_prefix",
+                        "arguments": "{\"cmd\":\"echo after\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_fit"]);
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let oversized = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_after_huge_prefix")
+            .expect("oversized-prefix anchor");
+        assert_eq!(
+            oversized["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(1000)
+        );
+        assert_eq!(oversized["recovery_eligible"].as_bool(), Some(false));
+        assert!(
+            oversized["prefix_tokens_after"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 22_000),
+            "got {oversized}"
+        );
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_after_huge_prefix",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("oversized restored prefix must be rejected");
+        assert!(err.contains("not a valid recovery target"), "got: {err}");
+        assert!(err.contains("recovery_eligible"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_filters_prior_failed_rewind_outcome() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_failed_recovery_anchor",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 0,
+                        "anchor": {
+                            "itemId": "call_failed_recovery_anchor",
+                            "position": "after"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 0,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 45000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog["anchors"].as_array().unwrap().is_empty());
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchor = &catalog["anchors"].as_array().unwrap()[0];
+        assert_eq!(anchor["recovery_eligible"].as_bool(), Some(false));
+        assert_eq!(
+            anchor["latest_rewind_usage_after_anchor"].as_u64(),
+            Some(45000)
+        );
+        assert_eq!(
+            anchor["latest_rewind_limit_after_anchor"].as_u64(),
+            Some(30000)
+        );
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_failed_recovery_anchor",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("prior failed rewind must be rejected");
+        assert!(err.contains("prior rewind"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_uses_pre_rollback_restore_usage() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_failed_pre_marker",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 0,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 45000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "thread_rolled_back",
+                        "num_turns": 1,
+                        "anchor": {
+                            "itemId": "call_failed_pre_marker",
+                            "position": "after"
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1200,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1200
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog["anchors"].as_array().unwrap().is_empty());
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchor = &catalog["anchors"].as_array().unwrap()[0];
+        assert_eq!(anchor["recovery_eligible"].as_bool(), Some(false));
+        assert_eq!(
+            anchor["latest_rewind_usage_after_anchor"].as_u64(),
+            Some(45000)
+        );
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_failed_pre_marker",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("prior pre-marker failed rewind must be rejected");
+        assert!(err.contains("prior rewind"), "got: {err}");
     }
 
     #[test]
@@ -15836,8 +16482,6 @@ async fn run_external_agent_mode(
     } else {
         None
     };
-    let codex_managed_context_enabled = backend == external_agent::AgentBackend::Codex
-        && project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
     if backend == external_agent::AgentBackend::Codex {
         emit_codex_session_capabilities_for_project(
             &bus,
@@ -15874,6 +16518,8 @@ async fn run_external_agent_mode(
             return Err(e);
         }
     };
+    let codex_managed_context_enabled =
+        backend == external_agent::AgentBackend::Codex && agent.supports_item_anchor_rewind();
     let backend_session_id = thread.thread_id.clone();
     let mut session_agent_config = session_config::from_project(&backend, &project);
     if backend == external_agent::AgentBackend::Codex {
