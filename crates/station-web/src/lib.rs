@@ -2780,7 +2780,63 @@ impl StationInner {
             "new task",
             &nonempty(&controls.new_session_agent, "--"),
         );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "target",
+            &nonempty(&controls.session_selection, "--"),
+        );
         yy += 30.0;
+        if controls.session_can_config && !controls.session_id.is_empty() {
+            self.section_title_color(x, yy, "Active session actions", C_PEACH_CSS);
+            yy += 22.0;
+            self.pill_at(
+                x + 14.0,
+                yy - 14.0,
+                112.0,
+                21.0,
+                "launch config",
+                C_MAUVE_CSS,
+            );
+            self.hit_zones.push(HitZone::new(
+                x + 14.0,
+                yy - 14.0,
+                112.0,
+                21.0,
+                HitAction::SessionAction {
+                    action: "config".to_string(),
+                    session_id: controls.session_id.clone(),
+                },
+            ));
+            self.pill_at(
+                x + 134.0,
+                yy - 14.0,
+                112.0,
+                21.0,
+                "restart saved",
+                C_PEACH_CSS,
+            );
+            self.hit_zones.push(HitZone::new(
+                x + 134.0,
+                yy - 14.0,
+                112.0,
+                21.0,
+                HitAction::SessionAction {
+                    action: "restart".to_string(),
+                    session_id: controls.session_id.clone(),
+                },
+            ));
+            self.text(
+                "per-session binary and managed mode",
+                x + 14.0,
+                yy + 17.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            yy += 47.0;
+        }
         self.section_title_color(x, yy, "Thread actions", C_MAUVE_CSS);
         yy += 22.0;
         let codex_target = if controls.session_source == "codex" {
@@ -2848,37 +2904,6 @@ impl StationInner {
             "archive",
             &nonempty(&controls.session_context_archive, "--"),
         );
-        yy += 30.0;
-        if controls.session_can_config && !controls.session_id.is_empty() {
-            self.section_title_color(x, yy, "Session actions", C_MAUVE_CSS);
-            yy += 22.0;
-            self.pill_at(
-                x + 14.0,
-                yy - 14.0,
-                112.0,
-                21.0,
-                "launch config",
-                C_MAUVE_CSS,
-            );
-            self.hit_zones.push(HitZone::new(
-                x + 14.0,
-                yy - 14.0,
-                112.0,
-                21.0,
-                HitAction::SessionAction {
-                    action: "config".to_string(),
-                    session_id: controls.session_id.clone(),
-                },
-            ));
-            self.text(
-                "per-session binary and managed mode",
-                x + 136.0,
-                yy + 2.0,
-                9.0,
-                C_SUBTEXT0_CSS,
-                "normal",
-            );
-        }
     }
 
     fn draw_thread_action_pills(
@@ -4501,6 +4526,7 @@ struct StationControlsSummary {
     writable_roots: u32,
     new_session_agent: String,
     session_id: String,
+    session_selection: String,
     session_source: String,
     session_command: String,
     session_managed_context: String,
@@ -4524,6 +4550,7 @@ impl Default for StationControlsSummary {
             writable_roots: 0,
             new_session_agent: String::new(),
             session_id: String::new(),
+            session_selection: String::new(),
             session_source: String::new(),
             session_command: String::new(),
             session_managed_context: String::new(),

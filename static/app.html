@@ -10251,6 +10251,10 @@ function stationHandleSessionAction(action) {
     openSessionConfigModal(session);
     return;
   }
+  if (op === 'restart') {
+    restartSessionWindowAction(sessionId);
+    return;
+  }
   stationForceRouteTo('sessions', 'recent', () => openSessionDetail(session));
 }
 
@@ -10768,6 +10772,18 @@ function stationSessionSource(session) {
   ).trim();
 }
 
+function stationSessionId(session) {
+  return String(
+    session?.session_id ||
+    session?.sessionId ||
+    session?.resume_id ||
+    session?.resumeId ||
+    session?.backend_session_id ||
+    session?.backendSessionId ||
+    ''
+  ).trim();
+}
+
 function stationSessionBytes(session) {
   return stationNum(
     session?.disk_bytes ??
@@ -10925,13 +10941,23 @@ function stationBuildSessionsSummary() {
 function stationBuildControlsSummary() {
   const backend = controlCurrentBackend || currentExternalAgent || newSessionConfiguredAgent || '';
   const isGemini = backend === 'gemini';
+  const promptTargetId = String(resolvePromptTargetSessionId() || '').trim();
+  const windowTargetId = String(currentSessionFullId || foregroundSessionFullId || '').trim();
+  const fallbackTargetId = (!promptTargetId && !windowTargetId)
+    ? stationLatestConfigurableExternalSessionId()
+    : '';
   const sessionId = String(
-    resolvePromptTargetSessionId() ||
-    currentSessionFullId ||
-    foregroundSessionFullId ||
+    promptTargetId ||
+    windowTargetId ||
+    fallbackTargetId ||
     daemonSessionFullId ||
     ''
   ).trim();
+  const sessionSelection = promptTargetId
+    ? 'prompt target'
+    : (windowTargetId
+      ? 'session window'
+      : (fallbackTargetId ? 'latest external' : 'daemon'));
   const sessionMeta = sessionId ? sessionConfigMetadata(sessionId) : {};
   const rawSessionSource = sessionId ? sessionConfigSource(sessionMeta) : '';
   const sessionSource = rawSessionSource || (sessionId ? 'intendant' : '');
@@ -10964,12 +10990,38 @@ function stationBuildControlsSummary() {
       : 0,
     newSessionAgent: newSessionConfiguredAgent || backend || '',
     sessionId,
+    sessionSelection,
     sessionSource,
     sessionCommand,
     sessionManagedContext,
     sessionContextArchive,
     sessionCanConfig,
   };
+}
+
+function stationLatestConfigurableExternalSessionId() {
+  const seen = new Set();
+  const candidates = [];
+  const pools = [
+    _cachedSessions || [],
+    sessionsListCache.get(selfPeerId) || [],
+    stationSessionWindowSummaries(),
+  ];
+  for (const pool of pools) {
+    if (!Array.isArray(pool)) continue;
+    for (const session of pool) {
+      if (!session) continue;
+      const id = stationSessionId(session);
+      if (!id || id === daemonSessionFullId || seen.has(id)) continue;
+      seen.add(id);
+      const meta = sessionConfigMetadata(session);
+      const source = sessionConfigSource(meta) || normalizeAgentId(stationSessionSource(session));
+      if (!source || source === 'intendant') continue;
+      candidates.push({ id, updated: stationSessionUpdatedMs(session) });
+    }
+  }
+  candidates.sort((a, b) => b.updated - a.updated);
+  return candidates[0]?.id || '';
 }
 
 function buildStationSnapshot() {
@@ -16500,6 +16552,14 @@ function resolvePromptTargetSessionId() {
 }
 
 function compactSessionText(value) {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Element) return compactSessionText(value.textContent || '');
+  if (typeof value === 'object') {
+    for (const key of ['text', 'content', 'message', 'task', 'title', 'name']) {
+      if (typeof value[key] === 'string' && value[key].trim()) return compactSessionText(value[key]);
+    }
+    return '';
+  }
   return String(value || '').replace(/\s+/g, ' ').trim();
 }
 
@@ -33030,7 +33090,7 @@ function focusActivityForSessionEvent(options = {}) {
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   const sid = String(sessionId || '').trim();
-  stationCurrentTask = task || '';
+  stationCurrentTask = compactSessionText(task);
   stationCurrentApproval = null;
   stationScheduleUpdate();
   const shouldFocusActivity = newSessionSpawnPending;

@@ -131,7 +131,11 @@ canonical local display-share flow. The Control panel exposes the full Codex
 thread, goal, setup, and memory action groups through the same dispatcher,
 prompts, and confirmations used by
 **Activity → Control**, plus the active external session's per-session binary
-and managed-context launch configuration when that backend supports it.
+and managed-context launch configuration when that backend supports it, with a
+direct restart-with-saved-config action for applying those settings immediately.
+After a page refresh, if no prompt target or session window is active, Station
+falls back to the most recently updated configurable external session so these
+controls remain reachable without hunting through the full session list.
 
 ### Sessions
 
