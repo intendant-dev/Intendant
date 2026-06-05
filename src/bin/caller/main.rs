@@ -15836,6 +15836,8 @@ async fn run_external_agent_mode(
     } else {
         None
     };
+    let codex_managed_context_enabled = backend == external_agent::AgentBackend::Codex
+        && project::codex_managed_context_enabled(&project.config.agent.codex.managed_context);
     if backend == external_agent::AgentBackend::Codex {
         emit_codex_session_capabilities_for_project(
             &bus,
@@ -16612,10 +16614,7 @@ async fn run_external_agent_mode(
             continue;
         }
 
-        if backend == external_agent::AgentBackend::Codex
-            && project::codex_managed_context_enabled(&project.config.agent.codex.managed_context)
-            && !managed_context_recovery_kickstart
-        {
+        if codex_managed_context_enabled && !managed_context_recovery_kickstart {
             match agent.context_snapshot().await {
                 Ok(Some(snapshot)) => {
                     if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
@@ -16746,12 +16745,7 @@ async fn run_external_agent_mode(
                     .validate_expected_revision(user_turn_index, edit_user_turn_revision)
                     .is_ok();
             let mut archived_edit_branch_not_found = false;
-            if !active_edit_revision_ok
-                && backend == external_agent::AgentBackend::Codex
-                && project::codex_managed_context_enabled(
-                    &project.config.agent.codex.managed_context,
-                )
-            {
+            if !active_edit_revision_ok && codex_managed_context_enabled {
                 match fork_managed_context_edit_branch(
                     &mut agent,
                     &thread.thread_id,
@@ -17166,11 +17160,7 @@ async fn run_external_agent_mode(
                 turns_in_round,
             } => {
                 stats.rounds = round;
-                if backend == external_agent::AgentBackend::Codex
-                    && project::codex_managed_context_enabled(
-                        &project.config.agent.codex.managed_context,
-                    )
-                {
+                if codex_managed_context_enabled {
                     match agent.context_snapshot().await {
                         Ok(Some(snapshot)) => {
                             if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
@@ -17416,11 +17406,7 @@ async fn run_external_agent_mode(
                 turns_in_round,
             } => {
                 stats.rounds = round;
-                if backend == external_agent::AgentBackend::Codex
-                    && project::codex_managed_context_enabled(
-                        &project.config.agent.codex.managed_context,
-                    )
-                {
+                if codex_managed_context_enabled {
                     managed_context_recovery_kickstarts_without_rewind =
                         managed_context_recovery_kickstarts_without_rewind.saturating_add(1);
                     if managed_context_recovery_kickstarts_without_rewind
@@ -17556,19 +17542,13 @@ async fn run_external_agent_mode(
             }
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
-                if backend == external_agent::AgentBackend::Codex
-                    && project::codex_managed_context_enabled(
-                        &project.config.agent.codex.managed_context,
-                    )
-                    && (managed_context_recovery_kickstart
-                        || !pending_managed_context_replays.is_empty())
-                {
+                if codex_managed_context_enabled {
                     match agent.context_snapshot().await {
                         Ok(Some(snapshot)) => {
                             if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
                             {
                                 let message = format!(
-                                    "Managed Codex terminated as {reason} during context recovery while backend-reported pressure remains {}/{} tokens; refusing to mark the session complete.",
+                                    "Managed Codex terminated as {reason} while backend-reported pressure remains {}/{} tokens; refusing to mark the session complete.",
                                     pressure.used_tokens,
                                     pressure.rewind_only_limit
                                 );
