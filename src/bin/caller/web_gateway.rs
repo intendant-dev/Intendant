@@ -1235,6 +1235,7 @@ const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
 const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
 const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
+const DASHBOARD_IMAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
 // 0 means replay every renderable entry from the external audit transcript.
 // External activity replay intentionally includes only user/assistant messages
 // and explicit context-rewind markers, not tool events or tool output.
@@ -9471,6 +9472,18 @@ struct DashboardSourceRequest {
     line: Option<usize>,
 }
 
+enum DashboardLocalFileResponse {
+    Html {
+        status: &'static str,
+        body: String,
+    },
+    Bytes {
+        status: &'static str,
+        content_type: &'static str,
+        bytes: Vec<u8>,
+    },
+}
+
 fn dashboard_source_request_from_line(request_line: &str) -> Option<DashboardSourceRequest> {
     if !request_line.starts_with("GET ") {
         return None;
@@ -9545,9 +9558,101 @@ fn split_source_line_suffix(raw: &str) -> Option<(&str, usize)> {
     Some((path, line))
 }
 
+fn dashboard_local_file_response(request_line: &str) -> Option<DashboardLocalFileResponse> {
+    let request = dashboard_source_request_from_line(request_line)?;
+    if let Some(content_type) = dashboard_image_content_type(&request.path) {
+        Some(render_dashboard_image_file_response(request, content_type))
+    } else {
+        let (status, body) = render_dashboard_source_viewer_response(request);
+        Some(DashboardLocalFileResponse::Html { status, body })
+    }
+}
+
+#[cfg(test)]
 fn dashboard_source_viewer_response(request_line: &str) -> Option<(&'static str, String)> {
     let request = dashboard_source_request_from_line(request_line)?;
     Some(render_dashboard_source_viewer_response(request))
+}
+
+fn dashboard_image_content_type(path: &Path) -> Option<&'static str> {
+    match path
+        .extension()
+        .and_then(|ext| ext.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "png" => Some("image/png"),
+        "jpg" | "jpeg" | "jfif" | "pjpeg" | "pjp" => Some("image/jpeg"),
+        "gif" => Some("image/gif"),
+        "webp" => Some("image/webp"),
+        "avif" => Some("image/avif"),
+        "bmp" => Some("image/bmp"),
+        "ico" => Some("image/x-icon"),
+        _ => None,
+    }
+}
+
+fn render_dashboard_image_file_response(
+    request: DashboardSourceRequest,
+    content_type: &'static str,
+) -> DashboardLocalFileResponse {
+    let display_path = std::fs::canonicalize(&request.path).unwrap_or(request.path.clone());
+    let display_path_str = display_path.to_string_lossy().to_string();
+    let metadata = match std::fs::metadata(&display_path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => {
+            return DashboardLocalFileResponse::Html {
+                status: "404 Not Found",
+                body: render_dashboard_source_error_html(
+                    &display_path_str,
+                    "Not a file",
+                    "The requested path is not a regular file.",
+                ),
+            }
+        }
+        Err(err) => {
+            return DashboardLocalFileResponse::Html {
+                status: "404 Not Found",
+                body: render_dashboard_source_error_html(
+                    &display_path_str,
+                    "File not found",
+                    &format!("Could not read file metadata: {err}"),
+                ),
+            }
+        }
+    };
+
+    if metadata.len() > DASHBOARD_IMAGE_MAX_BYTES {
+        return DashboardLocalFileResponse::Html {
+            status: "413 Payload Too Large",
+            body: render_dashboard_source_error_html(
+                &display_path_str,
+                "Image too large",
+                &format!(
+                    "Image preview is limited to {} bytes; this file is {} bytes.",
+                    DASHBOARD_IMAGE_MAX_BYTES,
+                    metadata.len()
+                ),
+            ),
+        };
+    }
+
+    match std::fs::read(&display_path) {
+        Ok(bytes) => DashboardLocalFileResponse::Bytes {
+            status: "200 OK",
+            content_type,
+            bytes,
+        },
+        Err(err) => DashboardLocalFileResponse::Html {
+            status: "500 Internal Server Error",
+            body: render_dashboard_source_error_html(
+                &display_path_str,
+                "Read failed",
+                &format!("Could not read the file: {err}"),
+            ),
+        },
+    }
 }
 
 fn render_dashboard_source_viewer_response(
@@ -16559,22 +16664,42 @@ pub fn spawn_web_gateway(
                                     Content-Length: 0\r\n\
                                     \r\n";
                         let _ = stream.write_all(http.as_bytes()).await;
-                    } else if let Some((status, body)) =
-                        dashboard_source_viewer_response(request_line)
-                    {
-                        let response = format!(
-                            "HTTP/1.1 {status}\r\n\
-                             Content-Type: text/html; charset=utf-8\r\n\
-                             Content-Length: {}\r\n\
-                             Cache-Control: no-cache\r\n\
-                             Connection: close\r\n\
-                             \r\n\
-                             {}",
-                            body.len(),
-                            body
-                        );
+                    } else if let Some(response) = dashboard_local_file_response(request_line) {
                         use tokio::io::AsyncWriteExt;
-                        let _ = stream.write_all(response.as_bytes()).await;
+                        match response {
+                            DashboardLocalFileResponse::Html { status, body } => {
+                                let response = format!(
+                                    "HTTP/1.1 {status}\r\n\
+                                     Content-Type: text/html; charset=utf-8\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {}",
+                                    body.len(),
+                                    body
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                            DashboardLocalFileResponse::Bytes {
+                                status,
+                                content_type,
+                                bytes,
+                            } => {
+                                let header = format!(
+                                    "HTTP/1.1 {status}\r\n\
+                                     Content-Type: {content_type}\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     X-Content-Type-Options: nosniff\r\n\
+                                     Connection: close\r\n\
+                                     \r\n",
+                                    bytes.len()
+                                );
+                                let _ = stream.write_all(header.as_bytes()).await;
+                                let _ = stream.write_all(&bytes).await;
+                            }
+                        }
                     } else {
                         let (content_type, body, cache) =
                             if request_line.contains("/wasm-web/presence_web.js") {
@@ -18530,6 +18655,50 @@ mod tests {
         assert!(body.contains("\"line\":2"), "{body}");
         assert!(body.contains("\"language\":\"rust\""), "{body}");
         assert!(body.contains("source-code"), "{body}");
+    }
+
+    #[test]
+    fn dashboard_local_file_response_serves_image_bytes() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("screen shot.png");
+        let image_bytes = vec![0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a, 0, 1, 2, 3];
+        std::fs::write(&file, &image_bytes).unwrap();
+        let encoded_path = file.to_string_lossy().replace(' ', "%20");
+        let request_line = format!("GET {encoded_path} HTTP/1.1");
+
+        match dashboard_local_file_response(&request_line).unwrap() {
+            DashboardLocalFileResponse::Bytes {
+                status,
+                content_type,
+                bytes,
+            } => {
+                assert_eq!(status, "200 OK");
+                assert_eq!(content_type, "image/png");
+                assert_eq!(bytes, image_bytes);
+            }
+            DashboardLocalFileResponse::Html { body, .. } => {
+                panic!("expected image bytes, got html: {body}")
+            }
+        }
+    }
+
+    #[test]
+    fn dashboard_local_file_response_keeps_text_source_viewer() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("lib.rs");
+        std::fs::write(&file, "fn one() {}\nfn two() {}\n").unwrap();
+        let request_line = format!("GET {}:2 HTTP/1.1", file.to_string_lossy());
+
+        match dashboard_local_file_response(&request_line).unwrap() {
+            DashboardLocalFileResponse::Html { status, body } => {
+                assert_eq!(status, "200 OK");
+                assert!(body.contains("\"line\":2"), "{body}");
+                assert!(body.contains("source-code"), "{body}");
+            }
+            DashboardLocalFileResponse::Bytes { .. } => {
+                panic!("expected source viewer html, got bytes")
+            }
+        }
     }
 
     #[test]
