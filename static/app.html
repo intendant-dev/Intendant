@@ -10045,6 +10045,8 @@ function handleStationAction(action) {
     }
   } else if (action.type === 'open_display') {
     stationOpenDisplay(action.host_id);
+  } else if (action.type === 'session_action') {
+    stationHandleSessionAction(action);
   } else if (action.type === 'navigate') {
     const tab = String(action.tab || '').trim();
     const subtab = action.subtab ? String(action.subtab).trim() : undefined;
@@ -10055,6 +10057,55 @@ function handleStationAction(action) {
     if (tab === 'sessions' && subtab && !VALID_SESSIONS_SUBTABS.includes(subtab)) return;
     routeTo(tab, subtab);
   }
+}
+
+function stationFindSessionById(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  if (typeof findCachedSessionByAnyId === 'function') {
+    const cached = findCachedSessionByAnyId(sid);
+    if (cached) return cached;
+  }
+  const matches = session => {
+    if (!session) return false;
+    return [
+      session.session_id,
+      session.sessionId,
+      session.resume_id,
+      session.resumeId,
+      session.backend_session_id,
+      session.backendSessionId,
+      session.intendant_session_id,
+      session.intendantSessionId,
+    ].some(id => String(id || '').trim() === sid);
+  };
+  for (const pool of [
+    _cachedSessions || [],
+    sessionsListCache.get(selfPeerId) || [],
+    stationSessionWindowSummaries(),
+    [stationCurrentDaemonSessionSummary()].filter(Boolean),
+  ]) {
+    const found = Array.isArray(pool) ? pool.find(matches) : null;
+    if (found) return found;
+  }
+  return null;
+}
+
+function stationHandleSessionAction(action) {
+  const sessionId = String(action.session_id || '').trim();
+  const op = String(action.action || 'detail').trim();
+  if (!sessionId) return;
+  const session = stationFindSessionById(sessionId) || { session_id: sessionId };
+  if (op === 'resume') {
+    resumeSession(session);
+    return;
+  }
+  if (op === 'config') {
+    openSessionConfigModal(session);
+    return;
+  }
+  routeTo('sessions', 'recent');
+  setTimeout(() => openSessionDetail(session), 0);
 }
 
 function stationOpenDisplay(hostId) {
@@ -10363,9 +10414,11 @@ function stationBuildSessionsSummary() {
     ? _cachedSessions
     : (sessionsListCache.get(selfPeerId) || []);
   const byId = new Map();
+  const indexedIds = new Set();
   for (const session of indexedSessions) {
     const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
     byId.set(String(id), session);
+    indexedIds.add(String(id));
   }
   for (const session of stationSessionWindowSummaries()) {
     const id = session?.session_id || session?.resume_id || session?.backend_session_id || JSON.stringify(session);
@@ -10402,12 +10455,18 @@ function stationBuildSessionsSummary() {
     .map(session => {
       const id = session?.session_id || session?.resume_id || session?.backend_session_id || '';
       const status = session?.status || 'session';
-      const source = stationSessionSource(session) || session?.source || '';
+      const configMeta = sessionConfigMetadata(session);
+      const configSource = sessionConfigSource(configMeta);
+      const source = configSource || stationSessionSource(session) || session?.source || '';
       return {
+        id: String(id || '').trim(),
+        action: indexedIds.has(String(id)) ? 'detail' : '',
         label: stationSessionTask(session) || 'Untitled session',
         value: [status, source].filter(Boolean).join(' · '),
         detail: [String(id).slice(0, 8), formatContextTimestamp(session?.updated_at || session?.updatedAt || session?.changed_at || session?.changedAt || session?.created_at || session?.createdAt)].filter(Boolean).join(' · '),
         tone: 'session',
+        canResume: !!id && session?.can_resume !== false,
+        canConfig: !!id && !!configSource && configSource !== 'intendant',
       };
     });
   return {

@@ -2286,7 +2286,7 @@ impl StationInner {
         yy += 78.0;
         self.section_title_color(x, yy, "Recent sessions", C_MAUVE_CSS);
         yy += 18.0;
-        self.detail_rows(
+        self.session_detail_rows(
             x,
             yy,
             panel_w,
@@ -2549,6 +2549,104 @@ impl StationInner {
                 "normal",
             );
             yy += 39.0;
+        }
+        yy
+    }
+
+    fn session_detail_rows(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        rows: &[StationDetailRow],
+        empty: &str,
+        max_rows: usize,
+    ) -> f32 {
+        let mut yy = y;
+        if rows.is_empty() {
+            self.panel_row(x, yy, "items", empty);
+            return yy + 20.0;
+        }
+        for row in rows.iter().take(max_rows) {
+            self.round_rect(
+                x + 12.0,
+                yy - 11.0,
+                panel_w - 24.0,
+                43.0,
+                4.0,
+                "rgba(17,17,27,0.76)",
+                "rgba(49,50,68,0.72)",
+            );
+            if !row.id.is_empty() {
+                let action = if row.action.is_empty() {
+                    HitAction::Noop
+                } else {
+                    HitAction::SessionAction {
+                        action: row.action.clone(),
+                        session_id: row.id.clone(),
+                    }
+                };
+                self.hit_zones.push(HitZone::new(
+                    x + 12.0,
+                    yy - 11.0,
+                    panel_w - 24.0,
+                    43.0,
+                    action,
+                ));
+            }
+            self.text(
+                &truncate(&row.label, 28),
+                x + 20.0,
+                yy + 1.0,
+                9.5,
+                tone_color_css(&row.tone),
+                "bold",
+            );
+            self.text(
+                &truncate(&row.value, 20),
+                x + panel_w - 126.0,
+                yy + 1.0,
+                9.5,
+                C_TEXT_CSS,
+                "normal",
+            );
+            self.text(
+                &truncate(&row.detail, 36),
+                x + 20.0,
+                yy + 18.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            let mut bx = x + panel_w - 144.0;
+            if row.can_resume && !row.id.is_empty() {
+                self.pill_at(bx, yy + 15.0, 58.0, 19.0, "resume", C_TEAL_CSS);
+                self.hit_zones.push(HitZone::new(
+                    bx,
+                    yy + 15.0,
+                    58.0,
+                    19.0,
+                    HitAction::SessionAction {
+                        action: "resume".to_string(),
+                        session_id: row.id.clone(),
+                    },
+                ));
+                bx += 64.0;
+            }
+            if row.can_config && !row.id.is_empty() {
+                self.pill_at(bx, yy + 15.0, 58.0, 19.0, "config", C_MAUVE_CSS);
+                self.hit_zones.push(HitZone::new(
+                    bx,
+                    yy + 15.0,
+                    58.0,
+                    19.0,
+                    HitAction::SessionAction {
+                        action: "config".to_string(),
+                        session_id: row.id.clone(),
+                    },
+                ));
+            }
+            yy += 47.0;
         }
         yy
     }
@@ -2868,6 +2966,7 @@ impl StationInner {
                 self.apply_slider_at(kind, x);
                 None
             }
+            HitAction::Noop => None,
             HitAction::Approval {
                 host_id,
                 approval_id,
@@ -2886,6 +2985,11 @@ impl StationInner {
                     "type": "navigate",
                     "tab": tab,
                     "subtab": subtab,
+            })),
+            HitAction::SessionAction { action, session_id } => Some(serde_json::json!({
+                    "type": "session_action",
+                    "action": action,
+                    "session_id": session_id,
             })),
         }
     }
@@ -3742,19 +3846,27 @@ impl Default for StationBreakdown {
 #[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct StationDetailRow {
+    id: String,
+    action: String,
     label: String,
     value: String,
     detail: String,
     tone: String,
+    can_resume: bool,
+    can_config: bool,
 }
 
 impl Default for StationDetailRow {
     fn default() -> Self {
         Self {
+            id: String::new(),
+            action: String::new(),
             label: String::new(),
             value: String::new(),
             detail: String::new(),
             tone: String::new(),
+            can_resume: false,
+            can_config: false,
         }
     }
 }
@@ -3801,6 +3913,7 @@ enum HitAction {
     Layout(LayoutName),
     Mood(Mood),
     Slider(SliderKind),
+    Noop,
     Select(String),
     ClosePanel,
     Approval {
@@ -3812,6 +3925,10 @@ enum HitAction {
     Navigate {
         tab: String,
         subtab: Option<String>,
+    },
+    SessionAction {
+        action: String,
+        session_id: String,
     },
 }
 
