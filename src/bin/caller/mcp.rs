@@ -286,6 +286,16 @@ impl McpAppState {
         if let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) {
             if let Some(main) = self.session_usage.get(id) {
                 usage.main = main.clone();
+            } else if id != self.session_id {
+                usage.main.provider.clear();
+                usage.main.model.clear();
+                usage.main.tokens_used = 0;
+                usage.main.context_window = 0;
+                usage.main.hard_context_window = None;
+                usage.main.usage_pct = 0.0;
+                usage.main.prompt_tokens = 0;
+                usage.main.completion_tokens = 0;
+                usage.main.cached_tokens = 0;
             }
         }
         usage
@@ -400,17 +410,23 @@ impl McpAppState {
             // not borrow the globally-active session's totals. Borrowing would let a
             // starting session A inherit a saturated session B's pressure and be
             // wrongly forced into rewind-only mode during the startup race.
-            return self
-                .session_usage
-                .get(id)
-                .map(|usage| {
-                    (
-                        usage.tokens_used,
-                        usage.context_window,
-                        usage.hard_context_window,
-                    )
-                })
-                .unwrap_or((0, 0, None));
+            if let Some(usage) = self.session_usage.get(id) {
+                return (
+                    usage.tokens_used,
+                    usage.context_window,
+                    usage.hard_context_window,
+                );
+            }
+
+            if id == self.session_id && self.context_window > 0 {
+                return (
+                    self.session_tokens,
+                    self.context_window,
+                    self.hard_context_window,
+                );
+            }
+
+            return (0, 0, None);
         }
         (
             self.session_tokens,
@@ -8297,6 +8313,96 @@ mod tests {
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),
                 Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_for_active_session_uses_global_usage_for_context_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "active-managed-session".to_string();
+                s.active_session_source = Some("codex".to_string());
+                s.codex_managed_context = true;
+                s.session_codex_managed_context
+                    .insert("active-managed-session".to_string(), true);
+                s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 950,
+                    context_window: 1_000,
+                    hard_context_window: Some(1_200),
+                    usage_pct: 95.0,
+                    prompt_tokens: 900,
+                    completion_tokens: 50,
+                    cached_tokens: 400,
+                });
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("active-managed-session"), Some(true))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&950.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&950.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"pressure".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_for_unknown_session_does_not_inherit_active_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "active-managed-session".to_string();
+                s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 1_000,
+                    context_window: 1_000,
+                    hard_context_window: Some(1_200),
+                    usage_pct: 100.0,
+                    prompt_tokens: 900,
+                    completion_tokens: 100,
+                    cached_tokens: 400,
+                });
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("new-session-without-usage"), Some(true))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/usage/main/provider"), Some(&"".into()));
+            assert_eq!(value.pointer("/usage/main/model"), Some(&"".into()));
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&0.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"unknown".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&0.into())
             );
         });
     }
