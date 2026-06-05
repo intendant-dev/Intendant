@@ -115,8 +115,10 @@ canonical dashboard surface, such as a changed file row opening
 
 The Station detail panels are also direct launch points for common operations:
 Activity rows focus the matching log entry, context rows open the selected
-context item, managed rows select rewind anchors or saved rewind records, and
-the Managed panel can jump straight into the rewind, backout/restore, or refresh
+context item, and the Context panel can jump into live/replay mode, focus view,
+raw rendering, or reset view through the canonical **Activity → Context**
+toolbar. Managed rows select rewind anchors or saved rewind records, and the
+Managed panel can jump straight into the rewind, backout/restore, or refresh
 workflows. Session rows can resume or open Launch config, and the Sessions panel
 links straight to New Session and Deep Search. The Peers panel links to both the
 Network settings and the Video display surface, while the Control panel exposes

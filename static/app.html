@@ -10309,10 +10309,22 @@ function stationHandleManagedAction(action) {
 function stationHandleContextAction(action) {
   const op = String(action.action || '').trim();
   const id = String(action.id || '').trim();
-  if (op !== 'part' || !id) return;
+  const actionButtonByOp = {
+    live: 'context-live-btn',
+    replay: 'context-replay-btn',
+    reset: 'context-reset-view-btn',
+    focus: 'context-open-focus-btn',
+    raw: 'context-raw-toggle-btn',
+  };
+  if (op === 'part' && !id) return;
+  if (op !== 'part' && !actionButtonByOp[op]) return;
   stationForceRouteTo('activity', 'context', () => {
     if (typeof renderContextPane === 'function') renderContextPane();
-    if (typeof focusContextPart === 'function') focusContextPart(id);
+    if (op === 'part') {
+      if (typeof focusContextPart === 'function') focusContextPart(id);
+      return;
+    }
+    document.getElementById(actionButtonByOp[op])?.click();
   });
 }
 
@@ -27234,37 +27246,51 @@ function setContextRawOpen(open) {
 function wireContextPaneListeners() {
   if (contextListenersWired) return;
   contextListenersWired = true;
-  document.getElementById('context-live-btn')?.addEventListener('click', () => {
-    contextReplayMode = 'live';
-    contextSelectedPartId = null;
-    renderContextPane();
+  document.addEventListener('click', ev => {
+    const target = ev.target instanceof Element
+      ? ev.target.closest('#context-live-btn,#context-replay-btn,#context-reset-view-btn,#context-open-focus-btn,#context-close-focus-btn,#context-raw-toggle-btn')
+      : null;
+    if (!target) return;
+    if (target.id === 'context-live-btn') {
+      contextReplayMode = 'live';
+      contextSelectedPartId = null;
+      renderContextPane();
+      return;
+    }
+    if (target.id === 'context-replay-btn') {
+      if (target.disabled) return;
+      const { key, timeline } = contextTimelineForForegroundSession();
+      if (!timeline.length) return;
+      contextReplayMode = 'replay';
+      if (!contextReplayIndexBySession.has(key)) contextReplayIndexBySession.set(key, timeline.length - 1);
+      renderContextPane();
+      return;
+    }
+    if (target.id === 'context-reset-view-btn') {
+      contextResetView();
+      return;
+    }
+    if (target.id === 'context-open-focus-btn') {
+      setContextFocusMode(true, { requestFullscreen: true });
+      return;
+    }
+    if (target.id === 'context-close-focus-btn') {
+      setContextFocusMode(false);
+      return;
+    }
+    if (target.id === 'context-raw-toggle-btn') {
+      setContextRawOpen(!contextRawOpen);
+    }
   });
-  document.getElementById('context-replay-btn')?.addEventListener('click', () => {
+  document.addEventListener('input', ev => {
+    const target = ev.target;
+    if (!(target instanceof HTMLInputElement) || target.id !== 'context-replay-range') return;
     const { key, timeline } = contextTimelineForForegroundSession();
     if (!timeline.length) return;
     contextReplayMode = 'replay';
-    if (!contextReplayIndexBySession.has(key)) contextReplayIndexBySession.set(key, timeline.length - 1);
-    renderContextPane();
-  });
-  document.getElementById('context-replay-range')?.addEventListener('input', ev => {
-    const { key, timeline } = contextTimelineForForegroundSession();
-    if (!timeline.length) return;
-    contextReplayMode = 'replay';
-    contextReplayIndexBySession.set(key, Math.max(0, Math.min(timeline.length - 1, Number(ev.currentTarget.value) || 0)));
+    contextReplayIndexBySession.set(key, Math.max(0, Math.min(timeline.length - 1, Number(target.value) || 0)));
     contextSelectedPartId = null;
     renderContextPane();
-  });
-  document.getElementById('context-reset-view-btn')?.addEventListener('click', () => {
-    contextResetView();
-  });
-  document.getElementById('context-open-focus-btn')?.addEventListener('click', () => {
-    setContextFocusMode(true, { requestFullscreen: true });
-  });
-  document.getElementById('context-close-focus-btn')?.addEventListener('click', () => {
-    setContextFocusMode(false);
-  });
-  document.getElementById('context-raw-toggle-btn')?.addEventListener('click', () => {
-    setContextRawOpen(!contextRawOpen);
   });
   document.addEventListener('keydown', ev => {
     if (contextShouldHandleKeyboardEvent(ev)) {

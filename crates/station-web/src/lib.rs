@@ -2076,7 +2076,32 @@ impl StationInner {
         self.panel_row(x, yy, "turn", &nonempty(&ctx.turn, "--"));
         yy += 22.0;
         self.panel_row(x, yy, "format", &nonempty(&ctx.format, "--"));
-        yy += 28.0;
+        yy += 30.0;
+        self.section_title_color(x, yy, "View controls", C_BLUE_CSS);
+        yy += 22.0;
+        let context_actions = [
+            ("live", "live", 50.0),
+            ("replay", "replay", 64.0),
+            ("focus", "focus", 58.0),
+            ("raw", "raw", 46.0),
+            ("reset", "reset", 54.0),
+        ];
+        let mut ax = x + 14.0;
+        for (action, label, width) in context_actions {
+            self.pill_at(ax, yy - 14.0, width, 21.0, label, C_BLUE_CSS);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                yy - 14.0,
+                width,
+                21.0,
+                HitAction::ContextAction {
+                    action: action.to_string(),
+                    id: String::new(),
+                },
+            ));
+            ax += width + 8.0;
+        }
+        yy += 30.0;
         self.section_title(x, yy, "Token pressure");
         yy += 18.0;
         self.meter(
