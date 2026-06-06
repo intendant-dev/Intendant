@@ -10721,6 +10721,11 @@ function stationForceRouteTo(tab, subtab, after) {
 let stationSessionDockFilter = '';
 let stationSessionDockSourceFilter = '';
 let stationSessionDockStatusFilter = '';
+let stationSessionDeepDraft = {
+  query: '',
+  mode: 'all_keywords',
+  resultFilter: '',
+};
 let stationWorktreeDockFilter = '';
 let stationActivityDockFilter = '';
 let stationActivityDockHost = activeHostFilter || '';
@@ -12317,6 +12322,240 @@ function stationSessionDockRowMatchesFilters(row, query, sourceFilter, statusFil
   return text.includes(sourceFilter);
 }
 
+function stationSessionDeepModeOptions() {
+  return [
+    ['all_keywords', 'all keywords in one entry'],
+    ['exact_phrase', 'exact phrase'],
+    ['any_keyword_session', 'any keyword anywhere'],
+    ['user_message_all_keywords', 'all keywords in user message'],
+  ];
+}
+
+function stationSessionDeepSearchUrl(query, mode) {
+  const params = new URLSearchParams({ q: query, source: 'all', mode });
+  const projectFilter = typeof sessionDeepProjectFilterValue === 'function'
+    ? sessionDeepProjectFilterValue()
+    : [];
+  if (Array.isArray(projectFilter) && projectFilter.length > 0) {
+    params.set('projects', JSON.stringify(projectFilter));
+  }
+  return `/api/sessions/search?${params.toString()}`;
+}
+
+function stationSyncDeepSearchLegacyInputs() {
+  const queryInput = document.getElementById('sessions-deep-search-query');
+  if (queryInput) queryInput.value = stationSessionDeepDraft.query || '';
+  const modeInput = document.getElementById('sessions-deep-search-mode');
+  if (modeInput) modeInput.value = stationSessionDeepDraft.mode || 'all_keywords';
+  const resultInput = document.getElementById('sessions-deep-result-search');
+  if (resultInput) resultInput.value = stationSessionDeepDraft.resultFilter || '';
+}
+
+async function stationRunSessionDeepSearch() {
+  const query = String(stationSessionDeepDraft.query || '').trim();
+  const mode = stationSessionDeepDraft.mode || 'all_keywords';
+  stationSyncDeepSearchLegacyInputs();
+  if (query.length < 2) {
+    _sessionDeepSearch = {
+      query,
+      mode,
+      sourceFilter: 'all',
+      active: false,
+      loading: false,
+      waiting: false,
+      loaded: false,
+      error: 'Enter at least 2 characters for deep search.',
+      projectFilter: [],
+      searched: 0,
+      truncated: false,
+      limit: 0,
+      truncatedFiles: 0,
+      results: new Map(),
+    };
+    stationRenderSessionsDock();
+    return;
+  }
+  if (_sessionDeepSearchAbort) {
+    _sessionDeepSearchAbort.abort();
+    _sessionDeepSearchAbort = null;
+  }
+  const token = ++_sessionDeepSearchToken;
+  _sessionDeepSearch = {
+    query,
+    mode,
+    sourceFilter: 'all',
+    active: false,
+    loading: true,
+    waiting: false,
+    loaded: false,
+    error: null,
+    projectFilter: typeof sessionDeepProjectFilterValue === 'function' ? sessionDeepProjectFilterValue() : [],
+    searched: 0,
+    truncated: false,
+    limit: 0,
+    truncatedFiles: 0,
+    results: new Map(),
+  };
+  stationRenderSessionsDock();
+  const url = stationSessionDeepSearchUrl(query, mode);
+  try {
+    let data = null;
+    for (let attempt = 0; attempt < 6; attempt += 1) {
+      const resp = await authedFetch(url);
+      data = await resp.json().catch(() => ({}));
+      if (!resp.ok) throw new Error(data.error || `/api/sessions/search returned ${resp.status}`);
+      if (!data.busy) break;
+      _sessionDeepSearch = { ..._sessionDeepSearch, waiting: true };
+      stationRenderSessionsDock();
+      await new Promise(resolve => setTimeout(resolve, Math.min(500 + attempt * 250, 2000)));
+    }
+    if (token !== _sessionDeepSearchToken) return;
+    if (data?.busy) throw new Error('Deep search is still busy; retry from Station.');
+    if (data?.error) throw new Error(data.error);
+    const results = new Map();
+    for (const hit of data?.results || []) {
+      const key = hit.key || sessionLogSearchKey(hit.source, hit.session_id);
+      results.set(key, hit);
+    }
+    _sessionDeepSearch = {
+      query,
+      mode,
+      sourceFilter: 'all',
+      active: true,
+      loading: false,
+      waiting: false,
+      loaded: true,
+      error: null,
+      projectFilter: _sessionDeepSearch.projectFilter || [],
+      searched: data?.searched || 0,
+      truncated: !!data?.truncated,
+      limit: data?.limit || 0,
+      truncatedFiles: data?.truncated_files || data?.skipped_large || 0,
+      results,
+    };
+    mergeDeepSearchResultSessions(results);
+    _refilterSessions();
+  } catch (err) {
+    if (token !== _sessionDeepSearchToken) return;
+    _sessionDeepSearch = {
+      query,
+      mode,
+      sourceFilter: 'all',
+      active: false,
+      loading: false,
+      waiting: false,
+      loaded: true,
+      error: err?.message || String(err),
+      projectFilter: _sessionDeepSearch.projectFilter || [],
+      searched: 0,
+      truncated: false,
+      limit: 0,
+      truncatedFiles: 0,
+      results: new Map(),
+    };
+  } finally {
+    if (token === _sessionDeepSearchToken) {
+      stationRenderSessionsDock();
+    }
+  }
+}
+
+function stationClearSessionDeepSearch() {
+  if (_sessionDeepSearchAbort) {
+    _sessionDeepSearchAbort.abort();
+    _sessionDeepSearchAbort = null;
+  }
+  _sessionDeepSearchToken += 1;
+  stationSessionDeepDraft.query = '';
+  stationSessionDeepDraft.resultFilter = '';
+  stationSyncDeepSearchLegacyInputs();
+  clearSessionDeepSearch?.();
+  stationRenderSessionsDock();
+}
+
+function stationSessionForDeepHit(hit) {
+  const sid = String(hit?.session_id || hit?.sessionId || hit?.session?.session_id || '').trim();
+  return stationFindSessionById(sid) || hit?.session || { session_id: sid, source: hit?.source || 'intendant' };
+}
+
+function stationSessionDeepRows() {
+  if (!_sessionDeepSearch?.results || typeof _sessionDeepSearch.results.values !== 'function') return [];
+  const query = String(stationSessionDeepDraft.resultFilter || '').trim().toLowerCase();
+  return Array.from(_sessionDeepSearch.results.values())
+    .map(hit => {
+      const session = stationSessionForDeepHit(hit);
+      const snippet = (hit?.snippets || [])[0] || {};
+      const sid = stationSessionId(session) || hit?.session_id || '';
+      const source = hit?.source || stationSessionSource(session) || 'intendant';
+      const row = {
+        hit,
+        session,
+        id: sid,
+        source,
+        title: stationSessionTask(session) || hit?.label || 'Matched session',
+        meta: `${hit?.matches || 0} matches / ${source}`,
+        detail: compactSessionText(snippet.content || session?.task || session?.path || sid),
+      };
+      return row;
+    })
+    .filter(row => {
+      if (!query) return true;
+      return [row.id, row.source, row.title, row.meta, row.detail].join(' ').toLowerCase().includes(query);
+    })
+    .slice(0, 10);
+}
+
+function stationRenderSessionDeepSearchSection(parent) {
+  const section = stationDockSection(parent, 'Deep log search');
+  const query = stationDockInput(section, 'Query', stationSessionDeepDraft.query, { id: 'station-session-deep-query', placeholder: 'Search log content' });
+  query.addEventListener('input', ev => {
+    stationSessionDeepDraft.query = ev.target.value || '';
+  });
+  stationDockCommitOnEnter(query, () => stationRunSessionDeepSearch());
+  const mode = stationDockSelect(section, 'Mode', stationSessionDeepDraft.mode || 'all_keywords', stationSessionDeepModeOptions(), { id: 'station-session-deep-mode' });
+  mode.addEventListener('change', ev => {
+    stationSessionDeepDraft.mode = ev.target.value || 'all_keywords';
+    stationSyncDeepSearchLegacyInputs();
+  });
+  const resultFilter = stationDockInput(section, 'Result filter', stationSessionDeepDraft.resultFilter, { id: 'station-session-deep-result-filter', placeholder: 'Filter matched sessions' });
+  resultFilter.addEventListener('input', ev => {
+    stationSessionDeepDraft.resultFilter = ev.target.value.toLowerCase();
+    stationSyncDeepSearchLegacyInputs();
+    stationRenderSessionsDock();
+    document.getElementById('station-session-deep-result-filter')?.focus();
+  });
+  const status = _sessionDeepSearch.loading
+    ? (_sessionDeepSearch.waiting ? 'waiting for previous search' : 'searching logs')
+    : (_sessionDeepSearch.error
+      ? _sessionDeepSearch.error
+      : (_sessionDeepSearch.loaded
+        ? `${_sessionDeepSearch.results?.size || 0} matching sessions / ${stationCompactNumber(_sessionDeepSearch.searched || 0)} scanned`
+        : 'ready'));
+  stationDockEmpty(section, status).classList.toggle('error', !!_sessionDeepSearch.error);
+  stationDockActions(section, [
+    { label: 'Run', primary: true, disabled: !!_sessionDeepSearch.loading, onClick: stationRunSessionDeepSearch },
+    { label: 'Clear', onClick: stationClearSessionDeepSearch },
+    stationDockRouteAction('Route deep search', 'sessions', 'deep', () => document.getElementById('sessions-deep-search-query')?.focus()),
+  ]);
+  const rows = stationSessionDeepRows();
+  if (!_sessionDeepSearch.active && !_sessionDeepSearch.loading) return;
+  if (!rows.length) {
+    stationDockEmpty(section, _sessionDeepSearch.loading ? 'Waiting for results.' : 'No matched sessions pass the Station result filter.');
+    return;
+  }
+  for (const row of rows) {
+    stationDockCard(section, {
+      title: row.title,
+      meta: row.meta,
+      detail: row.detail,
+      actions: [
+        { label: 'Details', primary: true, onClick: () => stationRenderSessionsDock(row.id) },
+        ...stationSessionActionsForDock(row.session, { omitDetail: true }).slice(0, 4),
+      ],
+    });
+  }
+}
+
 function stationRenderSessionsDock(focusId = '') {
   const sessions = stationBuildSessionsSummary();
   const body = stationDockBegin('sessions', 'Sessions', `${sessions.total} known / ${sessions.active} active`);
@@ -12352,6 +12591,7 @@ function stationRenderSessionsDock(focusId = '') {
   ]);
   stationRenderSessionLaunchSection(body);
   if (focusId) stationRenderSessionDetailSection(body, focusId);
+  stationRenderSessionDeepSearchSection(body);
 
   const list = stationDockSection(body, 'Recent sessions');
   const query = stationSessionDockFilter.trim();
