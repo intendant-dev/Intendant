@@ -516,6 +516,87 @@ html, body {
   grid-template-columns: repeat(2, minmax(0, 1fr));
   gap: 7px;
 }
+.station-peer-grid {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.station-peer-grid .station-dock-card {
+  padding: 7px;
+}
+.station-peer-grid .station-dock-card-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.station-peer-grid .station-dock-actions {
+  margin-top: 7px;
+}
+.station-peer-grid .station-dock-btn {
+  min-height: 24px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+.station-peer-card .station-dock-card-detail {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.station-peer-card .station-dock-actions {
+  margin-top: 6px;
+}
+.station-peer-card .station-dock-btn {
+  min-height: 24px;
+  padding: 4px 8px;
+  font-size: 11px;
+}
+.station-dock-peers .station-dock-section:nth-of-type(1),
+.station-dock-peers .station-dock-section:nth-of-type(2),
+.station-dock-peers .station-dock-section:nth-of-type(3),
+.station-dock-peers .station-dock-section:nth-of-type(4),
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(1),
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(2),
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(3),
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(4) {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 7px;
+}
+.station-dock-peers .station-dock-section:nth-of-type(1) .station-dock-section-title,
+.station-dock-peers .station-dock-section:nth-of-type(2) .station-dock-section-title,
+.station-dock-peers .station-dock-section:nth-of-type(3) .station-dock-section-title,
+.station-dock-peers .station-dock-section:nth-of-type(4) .station-dock-section-title,
+.station-dock-peers .station-dock-section:nth-of-type(1) .station-dock-empty,
+.station-dock-peers .station-dock-section:nth-of-type(2) .station-dock-empty,
+.station-dock-peers .station-dock-section:nth-of-type(3) .station-dock-empty,
+.station-dock-peers .station-dock-section:nth-of-type(4) .station-dock-empty,
+.station-dock-peers .station-dock-section:nth-of-type(1) .station-peer-grid,
+.station-dock-peers .station-dock-section:nth-of-type(2) .station-peer-grid,
+.station-dock-peers .station-dock-section:nth-of-type(3) .station-peer-grid,
+.station-dock-peers .station-dock-section:nth-of-type(4) .station-peer-grid,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(1) .station-dock-section-title,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(2) .station-dock-section-title,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(3) .station-dock-section-title,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(4) .station-dock-section-title,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(1) .station-dock-empty,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(2) .station-dock-empty,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(3) .station-dock-empty,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(4) .station-dock-empty,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(1) .station-peer-grid,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(2) .station-peer-grid,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(3) .station-peer-grid,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(4) .station-peer-grid {
+  grid-column: 1 / -1;
+}
+.station-dock-peers .station-dock-section:nth-of-type(1) > .station-dock-card,
+.station-dock-peers .station-dock-section:nth-of-type(2) > .station-dock-card,
+.station-dock-peers .station-dock-section:nth-of-type(3) > .station-dock-card,
+.station-dock-peers .station-dock-section:nth-of-type(4) > .station-dock-card,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(1) > .station-dock-card,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(2) > .station-dock-card,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(3) > .station-dock-card,
+.station-dock[data-kind="peers"] .station-dock-section:nth-of-type(4) > .station-dock-card {
+  min-width: 0;
+  padding: 7px;
+}
 .station-dock-row,
 .station-dock-card {
   border: 1px solid rgba(69, 71, 90, 0.86);
@@ -657,6 +738,19 @@ html, body {
   }
   .station-dock-nav {
     grid-template-columns: repeat(3, minmax(0, 1fr));
+  }
+  .station-peer-grid {
+    grid-template-columns: minmax(0, 1fr);
+  }
+  .station-dock-peers .station-dock-section:nth-of-type(1),
+  .station-dock-peers .station-dock-section:nth-of-type(2),
+  .station-dock-peers .station-dock-section:nth-of-type(3),
+  .station-dock-peers .station-dock-section:nth-of-type(4),
+  .station-dock[data-kind="peers"] .station-dock-section:nth-of-type(1),
+  .station-dock[data-kind="peers"] .station-dock-section:nth-of-type(2),
+  .station-dock[data-kind="peers"] .station-dock-section:nth-of-type(3),
+  .station-dock[data-kind="peers"] .station-dock-section:nth-of-type(4) {
+    grid-template-columns: minmax(0, 1fr);
   }
 }
 
@@ -10674,6 +10768,7 @@ function stationDockBegin(kind, title, subtitle = '') {
   const body = document.getElementById('station-dock-body');
   if (!dock || !body) return null;
   dock.dataset.kind = kind || '';
+  dock.classList.toggle('station-dock-peers', kind === 'peers');
   dock.classList.remove('hidden');
   if (titleEl) titleEl.textContent = title || 'Station';
   if (subtitleEl) subtitleEl.textContent = subtitle || '';
@@ -10826,6 +10921,49 @@ function stationHotspotAt(clientX, clientY) {
 function stationRenderPeersDock() {
   const body = stationDockBegin('peers', 'Peers and Displays', `${daemons.length} peers / ${displaySlots.size + peerDisplayConnections.size} displays`);
   if (!body) return;
+  const peers = stationDockSection(body, 'Peers');
+  if (!daemons.length) {
+    stationDockEmpty(peers, 'No configured peer daemons.');
+  } else {
+    const peerGrid = document.createElement('div');
+    peerGrid.className = 'station-dock-grid station-peer-grid';
+    peers.appendChild(peerGrid);
+    for (const d of daemons) {
+      stationDockCard(peerGrid, {
+        className: 'station-peer-card',
+        title: d.label || d.host_id,
+        meta: d.connected ? 'connected' : 'offline',
+        detail: d.url || daemonPlatformLabel(d) || '',
+        actions: [
+          { label: 'Open display', onClick: () => stationOpenDisplay(d.host_id) },
+        ],
+      });
+    }
+  }
+  const remote = stationDockSection(body, 'Remote streams');
+  if (!peerDisplayConnections.size) {
+    stationDockEmpty(remote, 'No peer display streams are active.');
+  } else {
+    const remoteGrid = document.createElement('div');
+    remoteGrid.className = 'station-dock-grid station-peer-grid';
+    remote.appendChild(remoteGrid);
+    for (const conn of peerDisplayConnections.values()) {
+      const authority = conn.peerAuthorityState || 'unknown';
+      stationDockCard(remoteGrid, {
+        className: 'station-peer-card',
+        title: stationHostLabel(conn.hostId),
+        meta: `display ${conn.displayId} / input ${authority}`,
+        detail: conn.sessionId || '',
+        actions: [
+          { label: 'Focus', onClick: () => stationOpenDisplay(conn.hostId) },
+          authority === 'you'
+            ? { label: 'Release input', onClick: () => conn.releaseControl?.() }
+            : { label: 'Take input', primary: true, onClick: () => conn.takeControl?.() },
+          { label: 'Close', danger: true, onClick: () => closePeerDisplaysForHost(conn.hostId) },
+        ],
+      });
+    }
+  }
   const overview = stationDockSection(body, 'Local display');
   stationDockRow(overview, 'host', selfHostLabel || selfPeerId || 'local');
   stationDockRow(overview, 'access', document.getElementById('sb-display-access')?.textContent || 'off');
@@ -10860,41 +10998,6 @@ function stationRenderPeersDock() {
         meta: `${slot.connected ? 'connected' : 'connecting'} / input ${authority}`,
         detail: `${slot.width || 0}x${slot.height || 0} / ${slot.interactive ? 'interactive' : 'view only'}`,
         actions,
-      });
-    }
-  }
-  const peers = stationDockSection(body, 'Peers');
-  if (!daemons.length) {
-    stationDockEmpty(peers, 'No configured peer daemons.');
-  } else {
-    for (const d of daemons) {
-      stationDockCard(peers, {
-        title: d.label || d.host_id,
-        meta: d.connected ? 'connected' : 'offline',
-        detail: d.url || daemonPlatformLabel(d) || '',
-        actions: [
-          { label: 'Open display', onClick: () => stationOpenDisplay(d.host_id) },
-        ],
-      });
-    }
-  }
-  const remote = stationDockSection(body, 'Remote streams');
-  if (!peerDisplayConnections.size) {
-    stationDockEmpty(remote, 'No peer display streams are active.');
-  } else {
-    for (const conn of peerDisplayConnections.values()) {
-      const authority = conn.peerAuthorityState || 'unknown';
-      stationDockCard(remote, {
-        title: stationHostLabel(conn.hostId),
-        meta: `display ${conn.displayId} / input ${authority}`,
-        detail: conn.sessionId || '',
-        actions: [
-          { label: 'Focus', onClick: () => stationOpenDisplay(conn.hostId) },
-          authority === 'you'
-            ? { label: 'Release input', onClick: () => conn.releaseControl?.() }
-            : { label: 'Take input', primary: true, onClick: () => conn.takeControl?.() },
-          { label: 'Close', danger: true, onClick: () => closePeerDisplaysForHost(conn.hostId) },
-        ],
       });
     }
   }
@@ -10955,6 +11058,7 @@ function stationHotspotLayerEvent(ev) {
 }
 
 document.getElementById('station-hotspots')?.addEventListener('click', stationHotspotLayerEvent);
+document.getElementById('station-hud-canvas')?.addEventListener('click', stationHotspotLayerEvent);
 window.addEventListener('resize', stationSyncHotspots);
 if ('ResizeObserver' in window) {
   const stationHotspotResizeObserver = new ResizeObserver(() => stationSyncHotspots());
@@ -11040,6 +11144,7 @@ function stationDockRow(parent, key, value) {
 function stationDockCard(parent, item) {
   const card = document.createElement('div');
   card.className = 'station-dock-card' + (item.active ? ' active' : '');
+  if (item.className) card.className += ' ' + item.className;
   if (item.onClick) {
     card.style.cursor = 'pointer';
     card.addEventListener('click', item.onClick);
