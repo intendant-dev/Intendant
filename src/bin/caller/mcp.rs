@@ -1490,7 +1490,8 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
                 active_codex.push(serde_json::json!({
                     "run_id": run_id,
                     "pid": pid,
-                    "source": "controller_loop"
+                    "source": "controller_loop",
+                    "app_server_active": true,
                 }));
             }
         }
@@ -1502,12 +1503,10 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
         .filter_map(|pid| u32::try_from(pid).ok())
         .collect();
     active_codex.extend(process_tree_codex);
-    if active_wrappers.is_empty() {
-        active_wrappers.extend(active_external_wrappers_from_index(
-            loop_dir,
-            &process_tree_codex_pids,
-        ));
-    }
+    active_wrappers.extend(active_external_wrappers_from_index(
+        loop_dir,
+        &process_tree_codex_pids,
+    ));
 
     let latest_run_id = read_trimmed(&loop_dir.join("latest.run_id"));
     let latest_status_file = read_json_file(&loop_dir.join("latest.status.json"));
@@ -1620,6 +1619,8 @@ where
                 "run_id": serde_json::Value::Null,
                 "pid": serde_json::Value::Null,
                 "codex_pid": codex_pid,
+                "app_server_pid": codex_pid,
+                "app_server_active": process_tree_active,
                 "source": "external_wrapper_index",
                 "backend_source": record.source,
                 "backend_session_id": record.backend_session_id,
@@ -1676,6 +1677,8 @@ fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<
         "log_path": wrapper.get("log_path").cloned().unwrap_or(serde_json::Value::Null),
         "session_meta_status": wrapper.get("session_meta_status").cloned().unwrap_or(serde_json::Value::Null),
         "process_tree_active": wrapper.get("process_tree_active").cloned().unwrap_or(serde_json::Value::Null),
+        "app_server_pid": wrapper.get("app_server_pid").cloned().unwrap_or_else(|| wrapper.get("codex_pid").cloned().unwrap_or(serde_json::Value::Null)),
+        "app_server_active": wrapper.get("app_server_active").cloned().unwrap_or_else(|| wrapper.get("process_tree_active").cloned().unwrap_or(serde_json::Value::Null)),
     }))
 }
 
@@ -1743,10 +1746,32 @@ fn controller_loop_state_is_idle(status: &str) -> bool {
 }
 
 fn codex_app_server_process_tree_active(pid: u32) -> bool {
-    codex_app_server_process_tree_active_from_descendants(
+    codex_app_server_process_tree_active_with_root(
+        pid,
         super::platform::process_descendants(pid),
         super::platform::process_alive,
         super::platform::process_cmdline,
+    )
+}
+
+fn codex_app_server_process_tree_active_with_root<I, A, C>(
+    root_pid: u32,
+    descendants: I,
+    mut process_alive: A,
+    process_cmdline: C,
+) -> bool
+where
+    I: IntoIterator<Item = u32>,
+    A: FnMut(u32) -> bool,
+    C: FnMut(u32) -> Option<String>,
+{
+    if process_alive(root_pid) {
+        return true;
+    }
+    codex_app_server_process_tree_active_from_descendants(
+        descendants,
+        process_alive,
+        process_cmdline,
     )
 }
 
@@ -1779,6 +1804,7 @@ fn live_codex_app_server_processes(
                 "run_id": serde_json::Value::Null,
                 "pid": pid,
                 "source": "process_tree",
+                "app_server_active": true,
             })
         })
         .collect()
@@ -6177,6 +6203,13 @@ impl IntendantServer {
             .filter(|id| !id.is_empty())
             .map(str::to_string);
         if let Some(session_id) = session_id {
+            if let Some(phase) = self.terminal_target_session_phase(&session_id).await {
+                return format!(
+                    "Cannot start task: session {} is not active (phase {}); use restart/resume before sending a follow-up",
+                    session_id,
+                    phase_to_str(&phase)
+                );
+            }
             self.bus
                 .send(AppEvent::ControlCommand(ControlMsg::StartTask {
                     session_id: Some(session_id),
@@ -6214,6 +6247,15 @@ impl IntendantServer {
             Ok(()) => "ok".to_string(),
             Err(e) => format!("Cannot start task: {}", e),
         }
+    }
+
+    async fn terminal_target_session_phase(&self, session_id: &str) -> Option<Phase> {
+        let s = self.state.read().await;
+        let phase = s
+            .session_status_for_id(session_id)
+            .map(|status| status.phase.clone())
+            .or_else(|| (s.session_id == session_id).then(|| s.phase.clone()))?;
+        matches!(phase, Phase::Done | Phase::Interrupted).then_some(phase)
     }
 
     #[tool(
@@ -8888,6 +8930,54 @@ mod tests {
     }
 
     #[test]
+    fn start_task_rejects_known_terminal_target_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 3,
+                        phase: "done".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: "724fafac-36d7-41e5-b822-e0a08c1f4701".to_string(),
+                        task: "stopped managed Codex session".to_string(),
+                    },
+                );
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue existing managed session"
+                    }),
+                    Some("724fafac-36d7-41e5-b822-e0a08c1f4701"),
+                    None,
+                )
+                .await
+                .expect("tool should return a rejection");
+            let text = format!("{result:?}");
+            assert!(text.contains("Cannot start task"), "got: {text}");
+            assert!(text.contains("phase done"), "got: {text}");
+            assert!(
+                timeout(Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err(),
+                "terminal targeted start should not broadcast a StartTask event"
+            );
+        });
+    }
+
+    #[test]
     fn start_task_without_session_still_requires_launcher_for_new_task() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -10926,13 +11016,99 @@ mod tests {
     }
 
     #[test]
-    fn codex_app_server_process_tree_active_requires_live_descendant_cmdline() {
+    fn controller_loop_status_uses_indexed_app_server_when_wrapper_pid_is_alive() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let loop_dir = home.join(".intendant/controller-loop");
+        let log_dir = home.join(".intendant/logs/wrapper-session");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "wrapper-session",
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home,
+            "codex",
+            "724fafac-36d7-41e5-b822-e0a08c1f4701",
+            "wrapper-session",
+            &log_dir,
+            None,
+        )
+        .unwrap();
+
+        let mut wrappers = vec![serde_json::json!({
+            "run_id": "20260101T000000Z-1297050",
+            "pid": 1297050
+        })];
+        wrappers.extend(active_external_wrappers_from_index_homes_with_probe(
+            [home.to_path_buf()].iter(),
+            &[1298123],
+            |pid| pid == 1298123,
+        ));
+
+        let latest = controller_loop_latest_status(
+            serde_json::json!({
+                "run_id": "20260101T000000Z-1297050",
+                "state": "idle",
+                "process_tree_active": false
+            }),
+            &wrappers,
+        );
+        assert_eq!(
+            latest.get("state").and_then(|value| value.as_str()),
+            Some("unknown_running")
+        );
+        assert_eq!(
+            latest
+                .get("app_server_pid")
+                .and_then(|value| value.as_u64()),
+            Some(1298123)
+        );
+        assert_eq!(
+            latest
+                .get("app_server_active")
+                .and_then(|value| value.as_bool()),
+            Some(true)
+        );
+        assert_eq!(
+            latest
+                .get("session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn codex_app_server_process_tree_active_includes_root_pid_liveness() {
+        assert!(codex_app_server_process_tree_active_with_root(
+            1298123,
+            std::iter::empty(),
+            |pid| pid == 1298123,
+            |_| None,
+        ));
+    }
+
+    #[test]
+    fn codex_app_server_process_tree_active_requires_live_descendant_cmdline_when_root_dead() {
         let cmdlines = std::collections::HashMap::from([
             (101, "cargo build --release".to_string()),
             (102, String::new()),
             (103, "sleep 60".to_string()),
         ]);
 
+        assert!(codex_app_server_process_tree_active_with_root(
+            100,
+            [101],
+            |pid| pid == 101,
+            |pid| cmdlines.get(&pid).cloned(),
+        ));
         assert!(codex_app_server_process_tree_active_from_descendants(
             [101],
             |_| true,
