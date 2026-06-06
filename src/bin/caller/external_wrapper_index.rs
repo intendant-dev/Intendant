@@ -156,6 +156,28 @@ pub fn wrappers_for(
     records
 }
 
+pub fn wrappers_for_source(home: &Path, source: &str) -> Vec<ExternalWrapperRecord> {
+    let source = crate::session_names::normalize_source(source);
+    if source.is_empty() {
+        return Vec::new();
+    }
+    let _guard = INDEX_LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut records: Vec<_> = read_index_unlocked(home)
+        .wrappers
+        .into_iter()
+        .filter(|record| record.source == source && Path::new(&record.log_path).is_dir())
+        .collect();
+    records.sort_by(|a, b| {
+        b.updated_at_secs
+            .cmp(&a.updated_at_secs)
+            .then_with(|| b.intendant_session_id.cmp(&a.intendant_session_id))
+    });
+    records
+}
+
 pub fn record_to_json(record: &ExternalWrapperRecord) -> serde_json::Value {
     serde_json::json!({
         "source": record.source,
