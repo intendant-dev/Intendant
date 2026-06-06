@@ -9736,6 +9736,10 @@ body.display-fullscreen-open {
                 <input id="set-claude-command" type="text" placeholder="claude or /usr/local/bin/claude" autocomplete="off">
               </div>
               <div class="settings-row">
+                <label>Gemini binary</label>
+                <input id="set-gemini-command" type="text" placeholder="gemini or /usr/local/bin/gemini" autocomplete="off">
+              </div>
+              <div class="settings-row">
                 <label>Codex tier</label>
                 <select id="set-codex-service-tier">
                   <option value="">Inherit Codex config</option>
@@ -15872,10 +15876,60 @@ function stationRunGeminiThreadAction(op = 'new') {
   stationRenderControlsDock('launch');
 }
 
+function stationGeminiCommandValue() {
+  return document.getElementById('set-gemini-command')?.value
+    || commandDefaultForNewSessionAgent('gemini')
+    || 'gemini';
+}
+
+function stationSetGeminiCommandFromDock(value) {
+  const command = String(value || '').trim() || 'gemini';
+  const input = document.getElementById('set-gemini-command');
+  if (input) input.value = command;
+  newSessionAgentCommands.gemini = command;
+  stationGeminiCommandStatus = 'Unsaved Gemini binary.';
+  renderNewSessionAgentControls();
+  stationRenderControlsDock('launch');
+}
+
+async function stationSaveGeminiDefaultsFromDock() {
+  const current = document.getElementById('station-gemini-command')?.value;
+  if (current !== undefined) {
+    const command = String(current || '').trim() || 'gemini';
+    const input = document.getElementById('set-gemini-command');
+    if (input) input.value = command;
+    newSessionAgentCommands.gemini = command;
+  }
+  stationGeminiCommandSaving = true;
+  stationGeminiCommandStatus = 'Saving Gemini defaults...';
+  stationRenderControlsDock('launch');
+  try {
+    await saveSettings();
+    stationGeminiCommandStatus = 'Saved Gemini defaults.';
+    showControlToast?.('success', 'Gemini defaults saved');
+  } catch (err) {
+    stationGeminiCommandStatus = err?.message || 'Gemini defaults save failed.';
+    showControlToast?.('error', stationGeminiCommandStatus);
+  } finally {
+    stationGeminiCommandSaving = false;
+    stationRenderControlsDock('launch');
+  }
+}
+
+async function stationReloadGeminiDefaultsFromDock() {
+  stationGeminiCommandStatus = 'Reloading Gemini defaults...';
+  stationRenderControlsDock('launch');
+  settingsLoaded = false;
+  await loadSettings();
+  stationGeminiCommandStatus = 'Reloaded Gemini defaults.';
+  stationRenderControlsDock('launch');
+}
+
 function stationRenderGeminiSessionSection(parent, controls) {
   const active = controls.backend === 'gemini' || controls.newSessionAgent === 'gemini';
   const section = stationDockSection(parent, 'Gemini session');
   stationDockRow(section, 'backend', active ? 'selected' : 'not selected');
+  stationDockRow(section, 'binary', stationGeminiCommandValue() || 'gemini');
   stationDockRow(section, 'approval', controlGeminiConfig.approval_mode || 'default');
   stationDockRow(section, 'sandbox', controlGeminiConfig.sandbox ? 'on' : 'off');
   stationDockActions(section, [
@@ -16047,6 +16101,9 @@ function stationRenderCodexDefaultsEditor(parent) {
 function stationRenderGeminiDefaultsEditor(parent) {
   if (controlCurrentBackend !== 'gemini') return;
   const section = stationDockSection(parent, 'Gemini defaults');
+  const command = stationDockInput(section, 'Binary', stationGeminiCommandValue(), { id: 'station-gemini-command', placeholder: 'gemini or /absolute/path/gemini' });
+  stationDockCommitOnEnter(command, ev => stationSetGeminiCommandFromDock(ev.target.value));
+
   const approval = stationDockSelect(section, 'Approval mode', controlGeminiConfig.approval_mode || 'default', [
     ['default', 'default'],
     ['auto_edit', 'auto_edit'],
@@ -16075,6 +16132,12 @@ function stationRenderGeminiDefaultsEditor(parent) {
 
   const debug = stationDockCheckbox(section, 'DevTools', !!controlGeminiConfig.debug, { id: 'station-gemini-debug' });
   debug.addEventListener('change', ev => stationApplyDockCheckbox('control-gemini-debug', ev.target.checked, onControlGeminiDebugChange, 'launch'));
+  if (stationGeminiCommandStatus) stationDockEmpty(section, stationGeminiCommandStatus);
+  stationDockActions(section, [
+    { label: stationGeminiCommandSaving ? 'Saving...' : 'Save Gemini', primary: true, disabled: stationGeminiCommandSaving, onClick: stationSaveGeminiDefaultsFromDock },
+    { label: 'Reload', disabled: stationGeminiCommandSaving, onClick: stationReloadGeminiDefaultsFromDock },
+    stationDockRouteAction('Route Agent settings', 'settings', 'agent', () => document.getElementById('set-gemini-command')?.focus()),
+  ]);
 }
 
 function stationComputerUseOptions(kind) {
@@ -19803,6 +19866,8 @@ let sessionConfigSavePending = null;
 let sessionDeletePending = null;
 let stationClaudeCommandStatus = '';
 let stationClaudeCommandSaving = false;
+let stationGeminiCommandStatus = '';
+let stationGeminiCommandSaving = false;
 const NEW_SESSION_SPAWN_TIMEOUT_MS = 90000;
 const NEW_SESSION_LAUNCH_FAILURE_GRACE_MS = 15000;
 
@@ -39004,6 +39069,7 @@ async function loadSettings() {
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
     document.getElementById('set-claude-command').value = d.claude_command || 'claude';
+    document.getElementById('set-gemini-command').value = d.gemini_command || 'gemini';
     document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
     controlCodexConfig.command = d.codex_command || 'codex';
     controlCodexConfig.service_tier = normalizeCodexServiceTier(d.codex_service_tier || '');
@@ -39052,9 +39118,11 @@ async function saveSettings() {
   const g = id => document.getElementById(id);
   const selectedCodexServiceTier = normalizeCodexServiceTier(g('set-codex-service-tier')?.value ?? controlCodexConfig.service_tier ?? '');
   const selectedClaudeCommand = (g('set-claude-command')?.value || '').trim() || 'claude';
+  const selectedGeminiCommand = (g('set-gemini-command')?.value || '').trim() || 'gemini';
   controlCodexConfig.service_tier = selectedCodexServiceTier;
   newSessionCodexDefaultServiceTier = selectedCodexServiceTier;
   newSessionAgentCommands['claude-code'] = selectedClaudeCommand;
+  newSessionAgentCommands.gemini = selectedGeminiCommand;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(selectedCodexServiceTier);
   }
@@ -39081,6 +39149,7 @@ async function saveSettings() {
     external_agent: g('set-external-agent').value || null,
     codex_command: (g('set-codex-command').value || '').trim() || 'codex',
     claude_command: selectedClaudeCommand,
+    gemini_command: selectedGeminiCommand,
     codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
     codex_approval_policy: controlCodexConfig.approval_policy || 'on-request',
     codex_model: controlCodexConfig.model || null,
