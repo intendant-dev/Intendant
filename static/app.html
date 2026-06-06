@@ -10671,7 +10671,7 @@ function handleStationAction(action) {
       resolvePeerApproval(hostId, action.approval_id, map[decision] || decision);
     }
   } else if (action.type === 'open_display') {
-    stationOpenDisplay(action.host_id);
+    stationOpenDisplay(action.host_id, action.display_id ?? action.displayId ?? stationPeerDisplayId());
   } else if (action.type === 'thread_action') {
     stationHandleThreadAction(action);
   } else if (action.type === 'session_action') {
@@ -10747,6 +10747,7 @@ let stationPeerDraft = {
   via: '',
   browserTcpVia: '',
   selectedHostId: '',
+  displayId: '0',
   message: '',
   capabilityFilter: 'display',
   routeCapabilities: 'display',
@@ -11062,6 +11063,7 @@ function stationRememberPeerDraft() {
     ['via', 'station-peer-via'],
     ['browserTcpVia', 'station-peer-browser-tcp-via'],
     ['selectedHostId', 'station-peer-selected'],
+    ['displayId', 'station-peer-display-id'],
     ['message', 'station-peer-message'],
     ['capabilityFilter', 'station-peer-capabilities'],
     ['routeCapabilities', 'station-peer-route-capabilities'],
@@ -11071,6 +11073,21 @@ function stationRememberPeerDraft() {
     const el = document.getElementById(id);
     if (el) stationPeerDraft[key] = el.value || '';
   }
+}
+
+function stationPeerDisplayId() {
+  const raw = String(stationPeerDraft.displayId ?? '0').trim();
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function stationSetPeerTarget(hostId, displayId = stationPeerDisplayId()) {
+  const id = String(hostId || '').trim();
+  if (id) {
+    stationSelectedPeerHost = id;
+    stationPeerDraft.selectedHostId = id;
+  }
+  stationPeerDraft.displayId = String(displayId ?? 0);
 }
 
 function stationPeerDisplayName(peer) {
@@ -11315,13 +11332,19 @@ function stationRenderPeerCommandSection(parent) {
   }
   const select = stationDockSelect(section, 'Peer', stationPeerDraft.selectedHostId || selected, peerOptions, { id: 'station-peer-selected' });
   select.addEventListener('change', ev => {
-    stationPeerDraft.selectedHostId = ev.target.value;
-    stationSelectedPeerHost = ev.target.value;
+    stationSetPeerTarget(ev.target.value);
     stationRenderPeersDock();
   });
+  const displayId = stationDockInput(section, 'Display ID', stationPeerDraftValue('displayId', '0'), { id: 'station-peer-display-id', type: 'number', placeholder: '0' });
+  displayId.min = '0';
+  displayId.step = '1';
+  displayId.addEventListener('input', stationRememberPeerDraft);
   const message = stationDockInput(section, 'Message/task', stationPeerDraftValue('message'), { id: 'station-peer-message', placeholder: 'Follow-up message or task instructions', multiline: true, rows: 3 });
   message.addEventListener('input', stationRememberPeerDraft);
+  const selectedPeer = stationSelectedPeer();
+  const canOpenDisplay = !!selectedPeer && peerCanShareDisplay(selectedPeer);
   stationDockActions(section, [
+    { label: 'Open display', disabled: !canOpenDisplay, title: canOpenDisplay ? '' : 'Peer does not advertise display capability', onClick: () => stationOpenDisplay(stationPeerDraft.selectedHostId || selected, stationPeerDisplayId()) },
     { label: 'Send message', primary: true, onClick: () => stationSubmitPeerInputFromDock('message') },
     { label: 'Start task', onClick: () => stationSubmitPeerInputFromDock('task') },
   ]);
@@ -11346,10 +11369,10 @@ function stationRenderPeersDock() {
         detail: d.url || daemonPlatformLabel(d) || '',
         active: stationSelectedPeerHost === d.host_id || stationPeerDraft.selectedHostId === d.host_id,
         actions: [
-          peerCanShareDisplay(d) ? { label: 'Open display', primary: true, onClick: () => stationOpenDisplay(d.host_id) } : null,
-          { label: 'Select', onClick: () => { stationSelectedPeerHost = d.host_id; stationPeerDraft.selectedHostId = d.host_id; stationRenderPeersDock(); } },
-          { label: 'Message', onClick: () => { stationSelectedPeerHost = d.host_id; stationPeerDraft.selectedHostId = d.host_id; stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
-          { label: 'Task', onClick: () => { stationSelectedPeerHost = d.host_id; stationPeerDraft.selectedHostId = d.host_id; stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
+          peerCanShareDisplay(d) ? { label: `Open :${stationPeerDisplayId()}`, primary: true, onClick: () => { stationSetPeerTarget(d.host_id); stationOpenDisplay(d.host_id, stationPeerDisplayId()); } } : null,
+          { label: 'Select', onClick: () => { stationSetPeerTarget(d.host_id); stationRenderPeersDock(); } },
+          { label: 'Message', onClick: () => { stationSetPeerTarget(d.host_id); stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
+          { label: 'Task', onClick: () => { stationSetPeerTarget(d.host_id); stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
           { label: 'Remove', danger: true, onClick: async () => { await removeDaemon(d.host_id); stationSetPeerStatus(`Removed ${d.host_id}`, ''); stationRenderPeersDock(); } },
         ],
       });
@@ -11370,7 +11393,7 @@ function stationRenderPeersDock() {
         meta: `display ${conn.displayId} / input ${authority}`,
         detail: conn.sessionId || '',
         actions: [
-          { label: 'Focus', onClick: () => stationOpenDisplay(conn.hostId) },
+          { label: 'Focus', onClick: () => { stationSetPeerTarget(conn.hostId, conn.displayId); stationOpenDisplay(conn.hostId, conn.displayId); } },
           authority === 'you'
             ? { label: 'Release input', onClick: () => conn.releaseControl?.() }
             : { label: 'Take input', primary: true, onClick: () => conn.takeControl?.() },
@@ -13805,11 +13828,15 @@ function focusActivityLogEvent(id) {
   setTimeout(() => entry.classList.remove('station-focus'), 1800);
 }
 
-function stationOpenDisplay(hostId) {
+function stationOpenDisplay(hostId, displayId = 0) {
   const d = daemons.find(x => x.host_id === hostId);
   if (d) {
+    const did = Number.isFinite(Number(displayId)) && Number(displayId) >= 0
+      ? Math.trunc(Number(displayId))
+      : 0;
+    stationSetPeerTarget(hostId, did);
     const tcpViaUrl = resolveBrowserTcpViaUrl(d);
-    openPeerDisplay(hostId, 0, tcpViaUrl).catch(err => {
+    openPeerDisplay(hostId, did, tcpViaUrl).catch(err => {
       console.error('Station openPeerDisplay failed:', err);
       stationStatus('Display open failed: ' + (err && err.message ? err.message : err));
     });
