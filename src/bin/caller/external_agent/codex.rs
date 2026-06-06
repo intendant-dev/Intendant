@@ -1654,6 +1654,52 @@ impl CodexAgent {
         Ok((thread_id, turn_id))
     }
 
+    async fn active_turn_interrupt_targets(
+        &self,
+        action: &str,
+    ) -> Result<Vec<(String, String)>, CallerError> {
+        let active_thread_id = self.active_thread_id.lock().await.clone();
+        let fallback_turn_id = self.active_turn_id.lock().await.clone();
+        let active_turns = self.active_turns.lock().await.clone();
+        if active_thread_id.is_none() && active_turns.is_empty() {
+            if fallback_turn_id.is_some() {
+                return Err(CallerError::ExternalAgent(format!(
+                    "no active thread to {action}"
+                )));
+            }
+            return Err(CallerError::ExternalAgent(format!(
+                "no active turn to {action}"
+            )));
+        }
+
+        let mut targets = Vec::new();
+        if let Some(thread_id) = active_thread_id.as_deref() {
+            if let Some(turn_id) = active_turns
+                .get(thread_id)
+                .cloned()
+                .or_else(|| fallback_turn_id.clone())
+            {
+                targets.push((thread_id.to_string(), turn_id));
+            }
+        }
+        for (thread_id, turn_id) in active_turns {
+            if targets
+                .iter()
+                .any(|(seen_thread_id, _)| seen_thread_id == &thread_id)
+            {
+                continue;
+            }
+            targets.push((thread_id, turn_id));
+        }
+
+        if targets.is_empty() {
+            return Err(CallerError::ExternalAgent(format!(
+                "no active turn to {action}"
+            )));
+        }
+        Ok(targets)
+    }
+
     async fn remember_active_turn_for_thread(&self, thread_id: &str, turn_id: &str) {
         self.active_turns
             .lock()
@@ -5168,30 +5214,40 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
-        let (thread_id, turn_id) = self.active_thread_and_turn("interrupt").await?;
-        let params = serde_json::json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-        });
-        // turn/interrupt is a JSON-RPC request; Codex responds with `{}` and
-        // emits a `turn/completed` notification with status="interrupted"
-        // shortly after. The reader task handles that notification like any
-        // other turn completion.
-        let interrupt_result = self.send_request("turn/interrupt", Some(params)).await;
-        match interrupt_result {
-            Ok(_) => {}
-            Err(err) => {
-                let Some(actual_turn_id) = self
-                    .refresh_active_turn_after_expected_mismatch(&thread_id, &turn_id, &err)
-                    .await
-                else {
-                    return Err(err);
-                };
-                let params = serde_json::json!({
-                    "threadId": thread_id,
-                    "turnId": actual_turn_id,
-                });
-                let _ = self.send_request("turn/interrupt", Some(params)).await?;
+        let targets = self.active_turn_interrupt_targets("interrupt").await?;
+        let mut first_error: Option<CallerError> = None;
+        for (thread_id, turn_id) in targets {
+            let params = serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+            });
+            // turn/interrupt is a JSON-RPC request; Codex responds with `{}`
+            // and emits a `turn/completed` notification with
+            // status="interrupted" shortly after. The reader task handles that
+            // notification like any other turn completion.
+            let interrupt_result = self.send_request("turn/interrupt", Some(params)).await;
+            match interrupt_result {
+                Ok(_) => {}
+                Err(err) => {
+                    let Some(actual_turn_id) = self
+                        .refresh_active_turn_after_expected_mismatch(&thread_id, &turn_id, &err)
+                        .await
+                    else {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                        continue;
+                    };
+                    let params = serde_json::json!({
+                        "threadId": thread_id,
+                        "turnId": actual_turn_id,
+                    });
+                    if let Err(err) = self.send_request("turn/interrupt", Some(params)).await {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
+                }
             }
         }
         if let Some(pid) = self.child.as_ref().and_then(|child| child.id()) {
@@ -5203,6 +5259,9 @@ impl ExternalAgent for CodexAgent {
         // them, but clearing here makes the agent's state consistent if the
         // caller forgets.
         self.pending_approvals.lock().await.clear();
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -7707,6 +7766,63 @@ mod tests {
         let (thread_id, turn_id) = agent.active_thread_and_turn("steer").await.unwrap();
         assert_eq!(thread_id, "side-thread");
         assert_eq!(turn_id, "side-turn");
+    }
+
+    #[tokio::test]
+    async fn active_turn_interrupt_targets_include_side_turns() {
+        let agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        *agent.active_thread_id.lock().await = Some("parent-thread".into());
+        *agent.active_turn_id.lock().await = Some("fallback-parent-turn".into());
+        {
+            let mut active_turns = agent.active_turns.lock().await;
+            active_turns.insert("parent-thread".into(), "parent-turn".into());
+            active_turns.insert("side-thread".into(), "side-turn".into());
+        }
+
+        let targets = agent
+            .active_turn_interrupt_targets("interrupt")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            targets
+                .first()
+                .map(|(thread_id, turn_id)| { (thread_id.as_str(), turn_id.as_str()) }),
+            Some(("parent-thread", "parent-turn"))
+        );
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .any(|(thread_id, turn_id)| thread_id == "side-thread" && turn_id == "side-turn"));
+    }
+
+    #[tokio::test]
+    async fn active_turn_interrupt_targets_use_thread_map_without_active_thread_cache() {
+        let agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        agent
+            .active_turns
+            .lock()
+            .await
+            .insert("side-thread".into(), "side-turn".into());
+
+        let targets = agent
+            .active_turn_interrupt_targets("interrupt")
+            .await
+            .unwrap();
+
+        assert_eq!(targets, vec![("side-thread".into(), "side-turn".into())]);
     }
 
     #[tokio::test]
