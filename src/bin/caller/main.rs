@@ -1377,6 +1377,53 @@ fn has_queued_steers_for_session(
         .unwrap_or(false)
 }
 
+fn queued_steer_matches_cancel(
+    injection: &event::ContextInjection,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+    steer_id: Option<&str>,
+) -> bool {
+    if !queued_steer_targets_session(injection, session_id, alias_session_id) {
+        return false;
+    }
+    match steer_id.map(str::trim).filter(|id| !id.is_empty()) {
+        Some(steer_id) => injection.steer_id.as_deref() == Some(steer_id),
+        None => true,
+    }
+}
+
+fn cancel_queued_steers_for_session(
+    context_injection: &event::ContextInjectionQueue,
+    bus: &EventBus,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+    steer_id: Option<&str>,
+    reason: &str,
+) -> usize {
+    let mut cancelled = 0usize;
+    if let Ok(mut q) = context_injection.lock() {
+        let mut kept = Vec::with_capacity(q.len());
+        for inj in q.drain(..) {
+            if queued_steer_matches_cancel(&inj, session_id, alias_session_id, steer_id) {
+                cancelled += 1;
+                bus.send(AppEvent::SteerCancelled {
+                    session_id: inj
+                        .target_session_id
+                        .as_deref()
+                        .map(str::to_string)
+                        .or_else(|| session_id.map(str::to_string)),
+                    id: inj.steer_id.clone().unwrap_or_default(),
+                    reason: reason.to_string(),
+                });
+            } else {
+                kept.push(inj);
+            }
+        }
+        *q = kept;
+    }
+    cancelled
+}
+
 fn flush_pending_runtime_steers_for_session(
     bus: &EventBus,
     pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
@@ -1398,6 +1445,43 @@ fn flush_pending_runtime_steers_for_session(
     }
     *pending_runtime_steers = retained;
     delivered
+}
+
+fn cancel_pending_runtime_steers_for_session(
+    bus: &EventBus,
+    pending_runtime_steers: &mut std::collections::VecDeque<PendingRuntimeSteer>,
+    session_id: Option<&str>,
+    alias_session_id: Option<&str>,
+    steer_id: Option<&str>,
+    reason: &str,
+) -> usize {
+    let mut cancelled = 0usize;
+    let mut retained = std::collections::VecDeque::with_capacity(pending_runtime_steers.len());
+    while let Some(pending) = pending_runtime_steers.pop_front() {
+        let target_matches = match session_id {
+            Some(session_id) => {
+                pending.session_id.as_deref() == Some(session_id)
+                    || pending.session_id.as_deref() == alias_session_id
+            }
+            None => true,
+        };
+        let id_matches = match steer_id.map(str::trim).filter(|id| !id.is_empty()) {
+            Some(steer_id) => pending.id == steer_id,
+            None => true,
+        };
+        if target_matches && id_matches {
+            cancelled += 1;
+            bus.send(AppEvent::SteerCancelled {
+                session_id: pending.session_id,
+                id: pending.id,
+                reason: reason.to_string(),
+            });
+        } else {
+            retained.push_back(pending);
+        }
+    }
+    *pending_runtime_steers = retained;
+    cancelled
 }
 
 fn flush_pending_runtime_steers_for_model_checkpoint(
@@ -6606,6 +6690,58 @@ async fn drain_external_agent_events(
                                     l.warn(&format!(
                                         "Interrupt failed for {}: {}", agent.name(), e
                                     ))
+                                });
+                            }
+                        }
+                        continue;
+                    }
+                    Ok(AppEvent::SteerCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) => {
+                        let Some((target_session_id, _target_kind)) =
+                            resolve_external_steer_target_session(
+                                &session_id,
+                                &local_session_id,
+                                &alias_session_id,
+                                side_sessions
+                                    .as_ref()
+                                    .map(|state| &*state.open_side_threads),
+                            )
+                        else {
+                            continue;
+                        };
+                        let cancelled_queue = cancel_queued_steers_for_session(
+                            config.context_injection,
+                            config.bus,
+                            target_session_id.as_deref(),
+                            if target_session_id == local_session_id {
+                                alias_session_id.as_deref()
+                            } else {
+                                None
+                            },
+                            id.as_deref(),
+                            &reason,
+                        );
+                        let cancelled_pending = cancel_pending_runtime_steers_for_session(
+                            config.bus,
+                            pending_runtime_steers,
+                            target_session_id.as_deref(),
+                            if target_session_id == local_session_id {
+                                alias_session_id.as_deref()
+                            } else {
+                                None
+                            },
+                            id.as_deref(),
+                            &reason,
+                        );
+                        if cancelled_queue + cancelled_pending == 0 {
+                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+                                config.bus.send(AppEvent::SteerCancelled {
+                                    session_id: target_session_id.or_else(|| local_session_id.clone()),
+                                    id,
+                                    reason,
                                 });
                             }
                         }
@@ -13560,6 +13696,60 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn cancel_queued_steers_removes_only_matching_session_and_id() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let queue = event::ContextInjectionQueue::default();
+        {
+            let mut q = queue.lock().unwrap();
+            q.push(event::ContextInjection::text_with_steer_id_for_target(
+                "cancel this".into(),
+                "steer-a".into(),
+                Some("session-a".into()),
+            ));
+            q.push(event::ContextInjection::text_with_steer_id_for_target(
+                "keep this".into(),
+                "steer-b".into(),
+                Some("session-b".into()),
+            ));
+            q.push(event::ContextInjection::text("display grant".into()));
+        }
+
+        let cancelled = cancel_queued_steers_for_session(
+            &queue,
+            &bus,
+            Some("session-a"),
+            None,
+            Some("steer-a"),
+            "cleared by user",
+        );
+
+        assert_eq!(cancelled, 1);
+        let remaining = queue.lock().unwrap();
+        assert_eq!(remaining.len(), 2);
+        assert!(remaining
+            .iter()
+            .any(|inj| inj.steer_id.as_deref() == Some("steer-b")));
+        assert!(remaining.iter().any(|inj| inj.steer_id.is_none()));
+        drop(remaining);
+
+        let ev = rx.try_recv().expect("SteerCancelled event");
+        match ev {
+            AppEvent::SteerCancelled {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-a"));
+                assert_eq!(id, "steer-a");
+                assert_eq!(reason, "cleared by user");
+            }
+            other => panic!("expected SteerCancelled, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err(), "only one steer should cancel");
+    }
+
+    #[test]
     fn shared_external_control_receiver_consumes_turn_controls_once() {
         let bus = EventBus::new();
         let mut control_rx = bus.subscribe();
@@ -13631,6 +13821,59 @@ Also: {"source": "bare"}"#;
                 assert!(mid_turn);
             }
             other => panic!("expected SteerDelivered, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn cancel_pending_runtime_steers_removes_only_matching_id() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let mut pending = std::collections::VecDeque::from([
+            PendingRuntimeSteer {
+                session_id: Some("parent".to_string()),
+                id: "keep".to_string(),
+                text: "parent steer".to_string(),
+            },
+            PendingRuntimeSteer {
+                session_id: Some("parent".to_string()),
+                id: "cancel".to_string(),
+                text: "cancel this".to_string(),
+            },
+            PendingRuntimeSteer {
+                session_id: Some("side".to_string()),
+                id: "cancel".to_string(),
+                text: "same id, other session".to_string(),
+            },
+        ]);
+
+        let cancelled = cancel_pending_runtime_steers_for_session(
+            &bus,
+            &mut pending,
+            Some("parent"),
+            None,
+            Some("cancel"),
+            "cleared by user",
+        );
+
+        assert_eq!(cancelled, 1);
+        assert_eq!(pending.len(), 2);
+        assert!(pending.iter().any(|item| item.id == "keep"));
+        assert!(pending
+            .iter()
+            .any(|item| item.session_id.as_deref() == Some("side")));
+
+        let ev = rx.try_recv().expect("SteerCancelled event");
+        match ev {
+            AppEvent::SteerCancelled {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("parent"));
+                assert_eq!(id, "cancel");
+                assert_eq!(reason, "cleared by user");
+            }
+            other => panic!("expected SteerCancelled, got {:?}", other),
         }
     }
 
@@ -13781,6 +14024,29 @@ async fn run_agent_loop(
                             id,
                             reason: "Queued for the next model checkpoint".to_string(),
                         });
+                    }
+                    Ok(AppEvent::SteerCancelRequested {
+                        session_id,
+                        id,
+                        reason,
+                    }) if event_targets_session(&session_id, &watcher_session_id) => {
+                        let removed = cancel_queued_steers_for_session(
+                            &watcher_injection,
+                            &watcher_bus,
+                            watcher_session_id.as_deref(),
+                            None,
+                            id.as_deref(),
+                            &reason,
+                        );
+                        if removed == 0 {
+                            if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+                                watcher_bus.send(AppEvent::SteerCancelled {
+                                    session_id: watcher_session_id.clone(),
+                                    id,
+                                    reason,
+                                });
+                            }
+                        }
                     }
                     Ok(_) => continue,
                     Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
@@ -18178,6 +18444,56 @@ async fn run_external_agent_mode(
                                     l.info(&format!("Stop requested while idle: {}", reason))
                                 });
                                 break 'outer;
+                            }
+                            Ok(AppEvent::SteerCancelRequested {
+                                session_id,
+                                id,
+                                reason,
+                            }) => {
+                                let Some((target_session_id, _target_kind)) =
+                                    resolve_external_steer_target_session(
+                                        &session_id,
+                                        &live_session_id,
+                                        &drain_config.alias_session_id,
+                                        Some(&open_side_threads),
+                                    )
+                                else {
+                                    continue;
+                                };
+                                let cancelled_queue = cancel_queued_steers_for_session(
+                                    &context_injection,
+                                    &bus,
+                                    target_session_id.as_deref(),
+                                    if target_session_id == live_session_id {
+                                        drain_config.alias_session_id.as_deref()
+                                    } else {
+                                        None
+                                    },
+                                    id.as_deref(),
+                                    &reason,
+                                );
+                                let cancelled_pending = cancel_pending_runtime_steers_for_session(
+                                    &bus,
+                                    &mut pending_runtime_steers,
+                                    target_session_id.as_deref(),
+                                    if target_session_id == live_session_id {
+                                        drain_config.alias_session_id.as_deref()
+                                    } else {
+                                        None
+                                    },
+                                    id.as_deref(),
+                                    &reason,
+                                );
+                                if cancelled_queue + cancelled_pending == 0 {
+                                    if let Some(id) = id.filter(|id| !id.trim().is_empty()) {
+                                        bus.send(AppEvent::SteerCancelled {
+                                            session_id: target_session_id.or_else(|| live_session_id.clone()),
+                                            id,
+                                            reason,
+                                        });
+                                    }
+                                }
+                                continue;
                             }
                             Ok(AppEvent::SteerRequested {
                                 session_id,

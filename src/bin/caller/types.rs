@@ -725,6 +725,14 @@ pub enum OutboundEvent {
         id: String,
         mid_turn: bool,
     },
+    /// Steer was explicitly cleared/cancelled before Intendant could prove
+    /// delivery. This is terminal UI state, not an agent-observed message.
+    SteerCancelled {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        id: String,
+        reason: String,
+    },
     /// Status for an ordinary follow-up that was queued because the target
     /// session was active but does not support native mid-turn steering.
     FollowUpStatus {

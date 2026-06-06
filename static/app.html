@@ -2098,7 +2098,7 @@ body.context-focus-active {
 .steer-strip.empty { display: none; }
 .steer-row {
   display: grid;
-  grid-template-columns: auto minmax(0, 1fr);
+  grid-template-columns: auto minmax(0, 1fr) auto;
   align-items: start;
   gap: 2px 6px;
   font-style: italic;
@@ -2113,6 +2113,7 @@ body.context-focus-active {
 .steer-row.accepted { color: var(--blue); border-left-color: var(--blue); }
 .steer-row.queued { color: var(--yellow); border-left-color: var(--yellow); }
 .steer-row.delivered { color: var(--green); border-left-color: var(--green); }
+.steer-row.cancelled { color: var(--overlay1); border-left-color: var(--overlay1); }
 .steer-row.failed { color: var(--red); border-left-color: var(--red); }
 .steer-row.fading { opacity: 0; }
 .steer-icon {
@@ -2134,6 +2135,28 @@ body.context-focus-active {
   font-style: normal;
   overflow-wrap: anywhere;
   white-space: normal;
+}
+.steer-cancel {
+  grid-column: 3;
+  grid-row: 1 / span 2;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--overlay1);
+  cursor: pointer;
+  line-height: 18px;
+}
+.steer-cancel:hover {
+  border-color: var(--red);
+  color: var(--red);
+}
+.steer-row.delivered .steer-cancel,
+.steer-row.cancelled .steer-cancel,
+.steer-row.failed .steer-cancel {
+  display: none;
 }
 
 /* ── Phase Banner ── */
@@ -19418,7 +19441,7 @@ function processCommands(cmds) {
       // (backend/runtime accepted it), queued (Intendant fallback),
       // delivered (agent got it).
       case 'steer_status_update':
-        onSteerStatusUpdate(c.id, c.text, c.status, c.reason);
+        onSteerStatusUpdate(c.id, c.text, c.status, c.reason, { sessionId: c.session_id || c.sessionId });
         break;
       case 'follow_up_status':
         handleFollowUpStatusUpdate(c);
@@ -40808,7 +40831,7 @@ function clearPendingFollowUpsForSession(sessionId, reason = 'session closed') {
   for (const [id, pending] of Array.from(pendingFollowUpsById.entries())) {
     if (String(pending.sessionId || '').trim() !== sid) continue;
     pendingFollowUpsById.delete(id);
-    onSteerStatusUpdate(id, pending.text || '', 'failed', reason);
+    onSteerStatusUpdate(id, pending.text || '', 'failed', reason, { sessionId: sid });
     removeSteerRowSoon(id);
   }
 }
@@ -40829,7 +40852,7 @@ function autoAttachUnmanagedFollowUp(evt = {}) {
   pendingFollowUpsById.set(id, pending);
   dispatchControlMsg(resume);
   markSessionWindowPendingActive(sessionId);
-  onSteerStatusUpdate(id, pending.text, 'delivered', 'reattaching session');
+  onSteerStatusUpdate(id, pending.text, 'delivered', 'reattaching session', { sessionId });
   showControlToast('info', `Reattaching session ${shortSessionId(sessionId)} and retrying follow-up`);
   return true;
 }
@@ -40872,7 +40895,8 @@ window.submitActivityTask = function(options = {}) {
       id,
       attachments.length > 0 ? `${text} (${attachments.length} attachment${attachments.length === 1 ? '' : 's'})` : text,
       options.queuedFollowUp ? 'queued' : 'pending',
-      options.queuedFollowUp ? 'queued for next turn' : null
+      options.queuedFollowUp ? 'queued for next turn' : null,
+      { sessionId: targetSessionId }
     );
   }
   if (direct) msg.direct = true;
@@ -40940,7 +40964,8 @@ window.submitActivityOrSteer = function() {
       id,
       attachments.length > 0 ? `${text} (${attachments.length} attachment${attachments.length === 1 ? '' : 's'})` : text,
       'pending',
-      null
+      null,
+      { sessionId: targetSessionId }
     );
     if (attachments.length > 0) {
       renderAttachmentReceipt(text, attachmentReceipt, 'Steered', targetSessionId);
@@ -41006,7 +41031,7 @@ function handleFollowUpStatusUpdate(evt = {}) {
   const status = String(evt.status || '').trim().toLowerCase();
   const reason = String(evt.reason || '').trim();
   const sessionId = String(evt.session_id || evt.sessionId || '').trim();
-  onSteerStatusUpdate(evt.id, evt.text || '', status, reason);
+  onSteerStatusUpdate(evt.id, evt.text || '', status, reason, { sessionId });
   if (status === 'delivered') {
     forgetPendingFollowUp(evt.id);
     return;
@@ -41029,46 +41054,76 @@ function handleFollowUpStatusUpdate(evt = {}) {
   showControlToast('error', reason || 'Follow-up failed');
 }
 
-function onSteerStatusUpdate(id, text, status, reason) {
+function cancelSteerRow(id) {
+  const key = String(id || '').trim();
+  if (!key) return;
+  const entry = steerRows.get(key);
+  const sessionId = String(entry?.sessionId || resolvePromptTargetSessionId() || '').trim();
+  const text = entry?.text || '';
+  const isSteer = key.startsWith('steer-');
+  if (isSteer && app) {
+    const msg = { action: 'cancel_steer', id: key, reason: 'cleared by user' };
+    if (sessionId) msg.session_id = sessionId;
+    app.send_server_action(msg);
+  } else {
+    forgetPendingFollowUp(key);
+  }
+  onSteerStatusUpdate(key, text, 'cancelled', 'cleared by user', { sessionId });
+  removeSteerRowSoon(key, 700);
+}
+
+function onSteerStatusUpdate(id, text, status, reason, options = {}) {
+  const key = String(id || '').trim();
+  if (!key) return;
   const strip = document.getElementById('steer-strip');
   if (!strip) return;
-  let entry = steerRows.get(id);
+  const sessionId = String(options.sessionId || options.session_id || '').trim();
+  let entry = steerRows.get(key);
   if (!entry) {
     const el = document.createElement('div');
     el.className = 'steer-row ' + status;
-    el.dataset.steerId = id;
+    el.dataset.steerId = key;
     el.innerHTML =
       '<span class="steer-icon"></span>'
       + '<span class="steer-text"></span>'
-      + '<span class="steer-reason"></span>';
+      + '<span class="steer-reason"></span>'
+      + '<button type="button" class="steer-cancel" title="Clear queued steer" aria-label="Clear queued steer">&#10005;</button>';
     strip.appendChild(el);
-    entry = { el, timeout: null };
-    steerRows.set(id, entry);
+    entry = { el, timeout: null, text: '', sessionId: '' };
+    steerRows.set(key, entry);
+    el.querySelector('.steer-cancel')?.addEventListener('click', () => cancelSteerRow(key));
   }
+  if (sessionId) entry.sessionId = sessionId;
   const el = entry.el;
   el.className = 'steer-row ' + status;
   // Icons chosen to match the WASM-side log lines so the strip and the log tell the same story.
-  const iconByStatus = { pending: '\u23F3', accepted: '\u21AA', queued: '\u23F0', delivered: '\u2713', failed: '\u2715' };
+  const iconByStatus = { pending: '\u23F3', accepted: '\u21AA', queued: '\u23F0', delivered: '\u2713', cancelled: '\u2715', failed: '\u2715' };
   el.querySelector('.steer-icon').textContent = iconByStatus[status] || '';
   const textNode = el.querySelector('.steer-text');
   const reasonNode = el.querySelector('.steer-reason');
-  textNode.textContent = text || '';
-  textNode.title = text || '';
+  const cancelBtn = el.querySelector('.steer-cancel');
+  if (cancelBtn) {
+    const terminal = ['delivered', 'cancelled', 'failed'].includes(status);
+    cancelBtn.style.display = key.startsWith('steer-') && !terminal ? '' : 'none';
+  }
+  if (text) entry.text = text;
+  textNode.textContent = entry.text || text || '';
+  textNode.title = entry.text || text || '';
   reasonNode.textContent = reason ? ('— ' + reason) : '';
   reasonNode.title = reason || '';
-  el.title = [text, reason].filter(Boolean).join('\n\n');
+  el.title = [entry.text || text, reason].filter(Boolean).join('\n\n');
   strip.classList.remove('empty');
 
   // Clear any in-flight fade timer — a fresh status update preempts it.
   if (entry.timeout) { clearTimeout(entry.timeout); entry.timeout = null; }
 
-  if (status === 'delivered') {
+  if (status === 'delivered' || status === 'cancelled') {
     // Brief visual confirmation, then remove the row.
     entry.timeout = setTimeout(() => {
       el.classList.add('fading');
       entry.timeout = setTimeout(() => {
         el.remove();
-        steerRows.delete(id);
+        steerRows.delete(key);
         if (strip.childElementCount === 0) strip.classList.add('empty');
       }, 220);
     }, 1200);

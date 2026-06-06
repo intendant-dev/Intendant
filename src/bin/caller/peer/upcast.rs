@@ -1250,6 +1250,19 @@ impl AppEventUpcaster {
                     format!("steer delivered{id_part} ({mode})"),
                 )]
             }
+            AppEvent::SteerCancelRequested { .. } => Vec::new(),
+            AppEvent::SteerCancelled { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer cancelled{id_part}: {reason}"),
+                )]
+            }
         }
     }
 }
@@ -2295,6 +2308,18 @@ impl WireEventUpcaster {
                     LogLevel::Info,
                     "agent",
                     format!("steer delivered{id_part} ({mode})"),
+                )]
+            }
+            OutboundEvent::SteerCancelled { id, reason, .. } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{id}]")
+                };
+                vec![log_event(
+                    LogLevel::Info,
+                    "agent",
+                    format!("steer cancelled{id_part}: {reason}"),
                 )]
             }
         }
@@ -3419,6 +3444,15 @@ mod tests {
             session_id: None,
             id: "steer-3".into(),
             mid_turn: false,
+        });
+    }
+
+    #[test]
+    fn parity_steer_cancelled() {
+        assert_parity(AppEvent::SteerCancelled {
+            session_id: None,
+            id: "steer-9".into(),
+            reason: "cleared by user".into(),
         });
     }
 
