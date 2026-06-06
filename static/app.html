@@ -12964,6 +12964,112 @@ function stationLaunchCommandForAgent(agent) {
   return commandDefaultForNewSessionAgent(backend) || backend;
 }
 
+function stationLaunchDraftTask() {
+  return String(stationLaunchDraftValue('task', document.getElementById('activity-task-input')?.value || '')).trim();
+}
+
+function stationLaunchDraftProject() {
+  return String(stationLaunchDraftValue('project', newSessionProjectInputValue?.() || dashboardProjectRoot || '')).trim();
+}
+
+function stationLaunchDraftCommand(agent = stationEffectiveLaunchAgent()) {
+  if (!agent || agent === 'internal') return '';
+  return String(stationLaunchDraftValue('command', stationLaunchCommandForAgent(agent))).trim();
+}
+
+function stationLaunchNoticeText() {
+  const notice = document.getElementById('new-session-spawn-notice');
+  const visibleNotice = notice && !notice.classList.contains('hidden')
+    ? document.getElementById('new-session-spawn-text')?.textContent?.trim()
+    : '';
+  if (visibleNotice) return visibleNotice;
+  if (newSessionSpawnPending) {
+    return `Spawning ${compactSessionText(newSessionSpawnName || newSessionSpawnTask || 'new session')}`;
+  }
+  if (newSessionSpawnRecent?.sessionId) {
+    return `Last launch: ${shortSessionId(newSessionSpawnRecent.sessionId)}`;
+  }
+  return '';
+}
+
+function stationBuildLaunchReadiness() {
+  const agent = stationEffectiveLaunchAgent() || 'internal';
+  const command = stationLaunchDraftCommand(agent);
+  const task = stationLaunchDraftTask();
+  const project = stationLaunchDraftProject();
+  const attachments = Array.isArray(pendingAttachments) ? pendingAttachments.length : 0;
+  const missing = [];
+  if (!task) missing.push('task');
+  if (!app) missing.push('dashboard connection');
+  if (newSessionSpawnPending) missing.push('pending spawn');
+  if (agent && agent !== 'internal' && !command) missing.push('agent binary');
+  const codex = agent === 'codex';
+  return {
+    ready: missing.length === 0,
+    missing,
+    agent,
+    agentLabel: agent === 'internal' ? 'Internal agent' : prettyAgentName(agent),
+    command,
+    task,
+    taskChars: task.length,
+    project,
+    attachments,
+    direct: !!stationLaunchDraft.direct || !!document.getElementById('direct-mode-toggle')?.checked,
+    notice: stationLaunchNoticeText(),
+    codex,
+    managed: codex ? (stationLaunchDraftValue('managed', newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla')) : '',
+    archive: codex ? normalizeContextArchiveMode(stationLaunchDraftValue('archive', newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary')) : '',
+    serviceTier: codex
+      ? (stationLaunchDraft.fast ? 'priority' : normalizeCodexServiceTier(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '') || 'default')
+      : '',
+  };
+}
+
+function stationClearLaunchDraft() {
+  stationLaunchDraft = {
+    task: '',
+    name: '',
+    project: '',
+    agent: '',
+    command: '',
+    managed: '',
+    archive: '',
+    fast: false,
+    direct: false,
+  };
+}
+
+function stationRenderLaunchReadinessSection(parent, opts = {}) {
+  const readiness = stationBuildLaunchReadiness();
+  const section = stationDockSection(parent, opts.title || 'Launch readiness');
+  stationDockRow(section, 'state', readiness.ready ? 'ready' : `blocked: ${readiness.missing.join(', ')}`);
+  stationDockRow(section, 'backend', readiness.agentLabel || '--');
+  stationDockRow(section, 'binary', readiness.agent === 'internal' ? 'internal' : (readiness.command || '--'));
+  stationDockRow(section, 'task', readiness.taskChars ? `${readiness.taskChars} chars` : '--');
+  stationDockRow(section, 'project', readiness.project ? compactPathLabel(readiness.project, true) : 'default project');
+  stationDockRow(section, 'mode', readiness.direct ? 'direct' : 'orchestrated');
+  if (readiness.attachments) stationDockRow(section, 'attachments', String(readiness.attachments));
+  if (readiness.codex) {
+    stationDockRow(section, 'managed', readiness.managed || '--');
+    stationDockRow(section, 'archive', readiness.archive || '--');
+    stationDockRow(section, 'tier', readiness.serviceTier || 'default');
+  }
+  if (readiness.notice) stationDockEmpty(section, readiness.notice);
+  const rerender = opts.rerender || (() => stationRenderSessionsDock());
+  stationDockActions(section, [
+    {
+      label: 'Use activity draft',
+      onClick: () => {
+        stationLaunchDraft.task = document.getElementById('activity-task-input')?.value || stationLaunchDraft.task || '';
+        rerender();
+      },
+    },
+    { label: 'Refresh config', onClick: async () => { await refreshControlPane(); rerender(); } },
+    { label: 'Clear draft', danger: true, onClick: () => { stationClearLaunchDraft(); rerender(); } },
+  ]);
+  return readiness;
+}
+
 function stationApplyCodexLaunchDefaultsToDraft() {
   stationLaunchDraft.managed = newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla';
   stationLaunchDraft.archive = newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary';
@@ -13092,6 +13198,9 @@ async function stationStartSessionFromDock() {
 
 function stationRenderSessionLaunchSection(parent) {
   stationRenderLaunchProfileSection(parent);
+  stationRenderLaunchReadinessSection(parent, {
+    rerender: () => stationRenderSessionsDock(),
+  });
   const section = stationDockSection(parent, 'Launch session');
   const task = stationDockInput(section, 'Task', stationLaunchDraftValue('task', document.getElementById('activity-task-input')?.value || ''), { id: 'station-launch-task', placeholder: 'What should the agent do?', multiline: true, rows: 3 });
   const name = stationDockInput(section, 'Name', stationLaunchDraftValue('name'), { id: 'station-launch-name', placeholder: 'optional' });
@@ -13128,7 +13237,7 @@ function stationRenderSessionLaunchSection(parent) {
   const direct = stationDockCheckbox(section, 'Direct mode', !!stationLaunchDraft.direct || !!document.getElementById('direct-mode-toggle')?.checked, { id: 'station-launch-direct' });
   direct.addEventListener('change', onDraftInput);
   stationDockActions(section, [
-    { label: 'Start', primary: true, onClick: stationStartSessionFromDock },
+    { label: newSessionSpawnPending ? 'Spawning...' : 'Start', primary: true, disabled: newSessionSpawnPending || !app, onClick: stationStartSessionFromDock },
     stationDockRouteAction('Route new-session tab', 'sessions', 'new'),
   ]);
 }
@@ -14061,6 +14170,10 @@ function stationRenderControlsDock(sectionName = 'overview') {
 
   stationRenderLiveStatusSection(body, controls);
   stationRenderExternalBackendEditor(body, controls);
+  stationRenderLaunchReadinessSection(body, {
+    title: 'Next launch',
+    rerender: () => stationRenderControlsDock('launch'),
+  });
 
   const launch = stationDockSection(body, 'Launch defaults');
   stationDockRow(launch, 'backend', controls.backend || 'internal');
@@ -38653,6 +38766,17 @@ function setNewSessionStartButtonPending(pending) {
   btn.textContent = pending ? 'Spawning...' : 'Start session';
 }
 
+function refreshStationLaunchStatusIfOpen() {
+  const dock = document.getElementById('station-dock');
+  if (!dock || dock.classList.contains('hidden')) return;
+  const kind = dock.dataset.kind || '';
+  if (kind === 'sessions') {
+    stationRenderSessionsDock();
+  } else if (kind === 'controls') {
+    stationRenderControlsDock('launch');
+  }
+}
+
 function setNewSessionSpawnNotice(kind, text) {
   const notice = document.getElementById('new-session-spawn-notice');
   const textEl = document.getElementById('new-session-spawn-text');
@@ -38662,6 +38786,7 @@ function setNewSessionSpawnNotice(kind, text) {
   notice.className = `sessions-spawn-notice ${noticeKind}` + (hasText ? '' : ' hidden');
   textEl.textContent = text || '';
   notice.title = text || '';
+  refreshStationLaunchStatusIfOpen();
 }
 
 function clearNewSessionSpawnTimers() {
