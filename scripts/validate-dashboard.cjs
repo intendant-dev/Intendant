@@ -15,6 +15,7 @@ const { spawn } = require('child_process');
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_CDP_TIMEOUT_MS = 10000;
+const DEFAULT_DASHBOARD_TIMEOUT_MS = 15000;
 const DEFAULT_LOG_LINES = 8;
 const LOG_BUFFER_LIMIT = 80;
 const LOG_TEXT_LIMIT = 260;
@@ -26,6 +27,7 @@ const DIAGNOSTIC_SELECTOR_LIMIT = 220;
 const DIAGNOSTIC_LIST_LIMIT = 8;
 const DIAGNOSTIC_SELECTOR_MATCH_LIMIT = 8;
 const FORMATTED_DIAGNOSTIC_LINE_LIMIT = 520;
+const PROTECTED_DASHBOARD_PORT = 8765;
 
 const BROWSER_EXECUTABLE_ENVS = [
   'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE',
@@ -54,6 +56,10 @@ Options:
   --sandbox                  Omit default --no-sandbox
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
   --diagnostics              On failure, include compact generic DOM/page state
+  --launch-dashboard         Launch a temporary Intendant dashboard and stop it afterward
+  --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or target/{release,debug}/intendant)
+  --dashboard-arg ARG        Extra arg appended to the launched dashboard command; repeatable
+  --dashboard-timeout MS     Temporary dashboard readiness timeout (default: ${DEFAULT_DASHBOARD_TIMEOUT_MS})
   --json                     Print one compact JSON result
   --self-test                Run parser/formatter self-tests; does not launch a browser
 
@@ -71,6 +77,9 @@ function parseArgs(argv, env = process.env) {
     cdpTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
     logLines: DEFAULT_LOG_LINES,
     diagnostics: false,
+    launchDashboard: false,
+    dashboardArgs: [],
+    dashboardTimeoutMs: DEFAULT_DASHBOARD_TIMEOUT_MS,
     headless: true,
     noSandbox: true,
     json: false,
@@ -146,6 +155,20 @@ function parseArgs(argv, env = process.env) {
       opts.logLines = parsePositiveInt(arg.slice('--log-lines='.length), '--log-lines');
     } else if (arg === '--diagnostics') {
       opts.diagnostics = true;
+    } else if (arg === '--launch-dashboard') {
+      opts.launchDashboard = true;
+    } else if (arg === '--dashboard-binary') {
+      opts.dashboardBinary = readValue();
+    } else if (arg.startsWith('--dashboard-binary=')) {
+      opts.dashboardBinary = arg.slice('--dashboard-binary='.length);
+    } else if (arg === '--dashboard-arg') {
+      opts.dashboardArgs.push(readValue());
+    } else if (arg.startsWith('--dashboard-arg=')) {
+      opts.dashboardArgs.push(arg.slice('--dashboard-arg='.length));
+    } else if (arg === '--dashboard-timeout') {
+      opts.dashboardTimeoutMs = readNumber('--dashboard-timeout');
+    } else if (arg.startsWith('--dashboard-timeout=')) {
+      opts.dashboardTimeoutMs = parsePositiveInt(arg.slice('--dashboard-timeout='.length), '--dashboard-timeout');
     } else if (arg === '--json') {
       opts.json = true;
     } else {
@@ -154,6 +177,9 @@ function parseArgs(argv, env = process.env) {
   }
 
   opts.url = resolveDashboardUrl(opts, env);
+  if (opts.launchDashboard) {
+    validateDashboardLaunchOptions(opts);
+  }
   return opts;
 }
 
@@ -177,6 +203,44 @@ function resolveDashboardUrl(opts, env) {
     return fromMcp;
   }
   return undefined;
+}
+
+function validateDashboardLaunchOptions(opts) {
+  const port = dashboardLaunchPort(opts);
+  if (port === PROTECTED_DASHBOARD_PORT) {
+    throw new Error(
+      `--launch-dashboard refuses protected port ${PROTECTED_DASHBOARD_PORT}; choose a throwaway port`,
+    );
+  }
+  if (!opts.url) {
+    throw new Error('--launch-dashboard requires --port or --url');
+  }
+  const url = new URL(opts.url);
+  if (!isLoopbackHost(url.hostname)) {
+    throw new Error('--launch-dashboard only supports loopback dashboard URLs');
+  }
+  return port;
+}
+
+function dashboardLaunchPort(opts) {
+  if (opts.port) {
+    return opts.port;
+  }
+  if (opts.url) {
+    const url = new URL(opts.url);
+    if (url.port) {
+      return parsePositiveInt(url.port, 'dashboard URL port');
+    }
+  }
+  throw new Error('--launch-dashboard requires --port or a --url with an explicit port');
+}
+
+function isLoopbackHost(hostname) {
+  const host = String(hostname || '').replace(/^\[|\]$/g, '').toLowerCase();
+  if (host === 'localhost' || host === '::1' || host === '0:0:0:0:0:0:0:1') {
+    return true;
+  }
+  return /^127(?:\.\d{1,3}){3}$/.test(host);
 }
 
 function dashboardUrlFromMcpUrl(raw) {
@@ -230,7 +294,7 @@ async function main() {
   }
 
   if (opts.selfTest) {
-    runSelfTest();
+    await runSelfTest();
     return;
   }
 
@@ -242,8 +306,25 @@ async function main() {
   }
 
   const started = Date.now();
+  let dashboard;
   let harness;
+  const closeOwnedProcesses = async () => {
+    const closeTasks = [];
+    if (harness) {
+      closeTasks.push(harness.close());
+    }
+    if (dashboard) {
+      closeTasks.push(dashboard.close());
+    }
+    await Promise.allSettled(closeTasks);
+  };
+  const removeSignalCleanup = installSignalCleanup(async () => {
+    await closeOwnedProcesses();
+  });
   try {
+    if (opts.launchDashboard) {
+      dashboard = await TemporaryDashboard.launch(opts);
+    }
     harness = await BrowserHarness.launch(opts);
     await harness.validate(opts);
     const result = {
@@ -269,14 +350,92 @@ async function main() {
       reason: error.message || String(error),
       browser: harness && harness.browserExecutable,
       websocket: harness && harness.websocketKind,
-      logs: harness ? harness.failureExcerpt(opts.logLines) : [],
+      logs: collectFailureLogs(opts.logLines, dashboard, harness),
       diagnostics,
     };
     printResult(opts, result);
     process.exitCode = 1;
   } finally {
-    if (harness) {
-      await harness.close();
+    await closeOwnedProcesses();
+    removeSignalCleanup();
+  }
+}
+
+class TemporaryDashboard {
+  static async launch(opts) {
+    const port = validateDashboardLaunchOptions(opts);
+    await assertDashboardPortAvailable(port, opts.url);
+    const executable = resolveDashboardBinary(opts.dashboardBinary);
+    const args = dashboardLaunchArgs(port, opts.dashboardArgs);
+    const logs = new BoundedLog(LOG_BUFFER_LIMIT);
+    const child = spawn(executable, args, {
+      cwd: process.cwd(),
+      detached: process.platform !== 'win32',
+      env: process.env,
+      stdio: ['ignore', 'pipe', 'pipe'],
+    });
+    recordChildOutput(child.stdout, logs, 'dashboard.stdout');
+    recordChildOutput(child.stderr, logs, 'dashboard.stderr');
+
+    const dashboard = new TemporaryDashboard(
+      executable,
+      args,
+      child,
+      logs,
+      port,
+      dashboardReadyUrl(opts),
+    );
+    try {
+      await dashboard.waitForReady(opts.dashboardTimeoutMs);
+      return dashboard;
+    } catch (error) {
+      await dashboard.close();
+      throw new Error(`${error.message || String(error)}${formatLogSuffix(logs, 4)}`);
+    }
+  }
+
+  constructor(executable, args, child, logs, port, readyUrl) {
+    this.executable = executable;
+    this.args = args;
+    this.child = child;
+    this.logs = logs;
+    this.port = port;
+    this.readyUrl = readyUrl;
+    this.closed = false;
+  }
+
+  async waitForReady(timeoutMs) {
+    await waitUntil(
+      async () => {
+        const status = childExitStatus(this.child);
+        if (status) {
+          throw new Error(`temporary dashboard exited before readiness (${status})`);
+        }
+        return httpReady(this.readyUrl);
+      },
+      timeoutMs,
+      `temporary dashboard was not ready at ${this.readyUrl} within ${timeoutMs}ms`,
+    );
+  }
+
+  failureExcerpt(lineCount) {
+    return this.logs.excerpt(lineCount);
+  }
+
+  async close() {
+    if (this.closed) {
+      return;
+    }
+    this.closed = true;
+    if (!this.child || this.child.exitCode !== null || this.child.signalCode !== null) {
+      return;
+    }
+    terminateChildProcess(this.child, 'SIGTERM');
+    try {
+      await waitForExit(this.child, 1500);
+    } catch (_) {
+      terminateChildProcess(this.child, 'SIGKILL');
+      await waitForExit(this.child, 800).catch(() => {});
     }
   }
 }
@@ -305,6 +464,185 @@ function printResult(opts, result) {
   if (displayResult.next) {
     console.error(`  next=${quote(displayResult.next)}`);
   }
+}
+
+function collectFailureLogs(lineCount, dashboard, harness) {
+  if (!lineCount || lineCount <= 0) {
+    return [];
+  }
+  const dashboardBudget = dashboard && harness ? Math.max(1, Math.floor(lineCount / 2)) : lineCount;
+  const dashboardLogs = dashboard ? dashboard.failureExcerpt(dashboardBudget) : [];
+  const browserBudget = Math.max(0, lineCount - dashboardLogs.length);
+  const browserLogs = harness ? harness.failureExcerpt(browserBudget) : [];
+  return [...dashboardLogs, ...browserLogs].slice(-lineCount);
+}
+
+function dashboardLaunchArgs(port, extraArgs = []) {
+  return ['--web', String(port), '--no-tui', ...extraArgs];
+}
+
+function dashboardReadyUrl(opts) {
+  const url = new URL(opts.url);
+  url.pathname = '/';
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+function resolveDashboardBinary(explicit) {
+  const exeName = process.platform === 'win32' ? 'intendant.exe' : 'intendant';
+  const candidates = [];
+  if (explicit) {
+    candidates.push(explicit);
+  }
+  if (process.env.INTENDANT) {
+    candidates.push(process.env.INTENDANT);
+  }
+  candidates.push(path.join(process.cwd(), 'target', 'release', exeName));
+  candidates.push(path.join(process.cwd(), 'target', 'debug', exeName));
+  candidates.push(...whichCandidates([exeName, 'intendant']));
+  for (const candidate of candidates) {
+    if (candidate && isExecutableFile(candidate)) {
+      return candidate;
+    }
+  }
+  throw new Error(
+    'no intendant binary found for --launch-dashboard; run `cargo build --release` or pass --dashboard-binary',
+  );
+}
+
+async function assertDashboardPortAvailable(port, targetUrl) {
+  const hosts = new Set(process.platform === 'win32' ? ['127.0.0.1'] : ['127.0.0.1', '::1']);
+  if (targetUrl) {
+    hosts.add(new URL(targetUrl).hostname.replace(/^\[|\]$/g, ''));
+  }
+  const occupied = [];
+  for (const host of hosts) {
+    if (await canConnect(host, port, 250)) {
+      occupied.push(host);
+    }
+  }
+  if (occupied.length) {
+    throw new Error(
+      `temporary dashboard port ${port} is already accepting connections on ${occupied.join(', ')}; choose another port`,
+    );
+  }
+}
+
+function canConnect(host, port, timeoutMs) {
+  return new Promise((resolve) => {
+    const socket = net.connect({ host, port });
+    let settled = false;
+    const finish = (connected) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      socket.destroy();
+      resolve(connected);
+    };
+    socket.once('connect', () => finish(true));
+    socket.once('error', () => finish(false));
+    socket.setTimeout(timeoutMs, () => finish(false));
+  });
+}
+
+function httpReady(url) {
+  return new Promise((resolve) => {
+    const parsed = new URL(url);
+    const client = parsed.protocol === 'https:' ? https : http;
+    const req = client.get(
+      {
+        hostname: parsed.hostname.replace(/^\[|\]$/g, ''),
+        port: parsed.port,
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        protocol: parsed.protocol,
+        rejectUnauthorized: false,
+      },
+      (res) => {
+        res.resume();
+        resolve(Number(res.statusCode) >= 200 && Number(res.statusCode) < 500);
+      },
+    );
+    req.on('error', () => resolve(false));
+    req.setTimeout(1000, () => {
+      req.destroy();
+      resolve(false);
+    });
+  });
+}
+
+function recordChildOutput(stream, logs, kind) {
+  if (!stream) {
+    return;
+  }
+  stream.on('data', (chunk) => {
+    for (const line of String(chunk).split(/\r?\n/)) {
+      if (line.trim()) {
+        logs.push(kind, line);
+      }
+    }
+  });
+}
+
+function terminateChildProcess(child, signal) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return;
+  }
+  try {
+    if (process.platform !== 'win32' && child.pid) {
+      process.kill(-child.pid, signal);
+    } else {
+      child.kill(signal);
+    }
+  } catch (error) {
+    if (!error || error.code !== 'ESRCH') {
+      throw error;
+    }
+  }
+}
+
+function childExitStatus(child) {
+  if (!child) {
+    return 'missing child process';
+  }
+  if (child.exitCode !== null) {
+    return `exit ${child.exitCode}`;
+  }
+  if (child.signalCode !== null) {
+    return `signal ${child.signalCode}`;
+  }
+  return '';
+}
+
+function formatLogSuffix(logs, lineCount) {
+  const lines = logs.excerpt(lineCount);
+  return lines.length ? `; ${lines.join('; ')}` : '';
+}
+
+function installSignalCleanup(cleanup) {
+  let cleaning = false;
+  const handlers = new Map();
+  for (const signal of ['SIGINT', 'SIGTERM', 'SIGHUP']) {
+    const handler = () => {
+      if (cleaning) {
+        return;
+      }
+      cleaning = true;
+      cleanup()
+        .catch(() => {})
+        .finally(() => {
+          process.exit(signal === 'SIGINT' ? 130 : 143);
+        });
+    };
+    handlers.set(signal, handler);
+    process.once(signal, handler);
+  }
+  return () => {
+    for (const [signal, handler] of handlers) {
+      process.removeListener(signal, handler);
+    }
+  };
 }
 
 class BrowserHarness {
@@ -1320,7 +1658,7 @@ function waitForExit(child, timeoutMs) {
   });
 }
 
-function runSelfTest() {
+async function runSelfTest() {
   const parsed = parseArgs(
     [
       '--port',
@@ -1344,6 +1682,40 @@ function runSelfTest() {
   assert.strictEqual(parsed.timeoutMs, 2500);
   assert.strictEqual(parsed.logLines, 3);
   assert.strictEqual(parsed.diagnostics, true);
+  const launchParsed = parseArgs(
+    [
+      '--launch-dashboard',
+      '--url',
+      'http://localhost:8893/app',
+      '--dashboard-arg',
+      '--no-presence',
+      '--dashboard-timeout=5000',
+    ],
+    {},
+  );
+  assert.strictEqual(launchParsed.launchDashboard, true);
+  assert.strictEqual(dashboardLaunchPort(launchParsed), 8893);
+  assert.deepStrictEqual(dashboardLaunchArgs(8893, launchParsed.dashboardArgs), [
+    '--web',
+    '8893',
+    '--no-tui',
+    '--no-presence',
+  ]);
+  assert.strictEqual(dashboardReadyUrl(launchParsed), 'http://localhost:8893/');
+  assert.throws(
+    () => parseArgs(['--launch-dashboard', '--port', String(PROTECTED_DASHBOARD_PORT)], {}),
+    /refuses protected port/,
+  );
+  assert.throws(
+    () => parseArgs(['--launch-dashboard', '--url', 'http://example.com:8893/'], {}),
+    /loopback/,
+  );
+  await withLoopbackServer(async (port) => {
+    await assert.rejects(
+      () => assertDashboardPortAvailable(port, `http://127.0.0.1:${port}/`),
+      /already accepting connections/,
+    );
+  });
   assert.strictEqual(
     dashboardUrlFromMcpUrl('http://localhost:7777/mcp?managed_context=managed'),
     'http://localhost:7777/',
@@ -1396,6 +1768,23 @@ function runSelfTest() {
   log.push('c', 'third');
   assert.deepStrictEqual(log.excerpt(3), ['[b] second', '[c] third']);
   console.log('PASS dashboard-validation-self-test');
+}
+
+async function withLoopbackServer(callback) {
+  const server = net.createServer((socket) => {
+    socket.on('error', () => {});
+    socket.end('ok');
+  });
+  await new Promise((resolve, reject) => {
+    server.once('error', reject);
+    server.listen(0, '127.0.0.1', resolve);
+  });
+  try {
+    const address = server.address();
+    await callback(address.port);
+  } finally {
+    await new Promise((resolve) => server.close(resolve));
+  }
 }
 
 if (require.main === module) {
