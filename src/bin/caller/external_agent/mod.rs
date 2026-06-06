@@ -458,6 +458,9 @@ pub struct AgentConfig {
     /// Persisted backend-native session/thread id to resume instead of
     /// starting a fresh external conversation.
     pub resume_session: Option<String>,
+    /// Codex state directory to use for this session's app-server process.
+    /// Codex-only; other backends ignore.
+    pub codex_home: Option<PathBuf>,
 }
 
 /// Handle to a conversation thread within an external agent.

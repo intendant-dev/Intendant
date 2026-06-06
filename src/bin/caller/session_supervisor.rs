@@ -903,12 +903,16 @@ impl SessionSupervisor {
                 }
             }
         }
+        let mut codex_home = None;
         if let Some(backend) = backend.as_ref() {
             let mut config = crate::session_config::from_project(backend, &project);
             if matches!(backend, external_agent::AgentBackend::Codex)
                 && codex_service_tier.is_some()
             {
                 config.codex_service_tier = codex_service_tier.clone();
+            }
+            if matches!(backend, external_agent::AgentBackend::Codex) {
+                codex_home = config.codex_home.clone();
             }
             if let Err(e) = crate::session_config::write_log_dir_config(&log_dir, &config) {
                 self.warn(&format!(
@@ -965,6 +969,7 @@ impl SessionSupervisor {
             emit_session_started_after_identity,
             None,
             codex_service_tier,
+            codex_home,
         )
         .await;
     }
@@ -1110,6 +1115,9 @@ impl SessionSupervisor {
                 let codex_service_tier = session_agent_config
                     .as_ref()
                     .and_then(|config| config.codex_service_tier.clone());
+                let codex_home = session_agent_config
+                    .as_ref()
+                    .and_then(|config| config.codex_home.clone());
                 let intendant_session_id = session_log
                     .lock()
                     .map(|log| log.session_id().to_string())
@@ -1130,6 +1138,7 @@ impl SessionSupervisor {
                     false,
                     Some(ready_tx),
                     codex_service_tier,
+                    codex_home,
                 )
                 .await;
                 self.clear_external_attach_request(&external_attach_keys)
@@ -1212,6 +1221,9 @@ impl SessionSupervisor {
         let codex_service_tier = session_agent_config
             .as_ref()
             .and_then(|config| config.codex_service_tier.clone());
+        let codex_home = session_agent_config
+            .as_ref()
+            .and_then(|config| config.codex_home.clone());
         self.activate_shared_session(session_log.clone()).await;
         self.config.bus.send(AppEvent::SessionStarted {
             session_id: live_session_id.clone(),
@@ -1264,6 +1276,7 @@ impl SessionSupervisor {
             false,
             None,
             codex_service_tier,
+            codex_home,
         )
         .await;
     }
@@ -1306,6 +1319,7 @@ impl SessionSupervisor {
         emit_session_started_after_identity: bool,
         ready_for_thread_actions: Option<oneshot::Sender<()>>,
         codex_service_tier: Option<String>,
+        codex_home: Option<String>,
     ) {
         let (follow_up_tx, follow_up_rx) = mpsc::channel::<FollowUpMessage>(16);
         let (finished_tx, finished_rx) = oneshot::channel();
@@ -1352,6 +1366,7 @@ impl SessionSupervisor {
                     attachments,
                     resume_token,
                     codex_service_tier,
+                    codex_home,
                     Some(session_id.clone()),
                     emit_session_started_after_identity,
                     ready_for_thread_actions,
@@ -2424,13 +2439,38 @@ impl SessionSupervisor {
             self.loop_error(message);
             return;
         };
-        let config = crate::session_config::from_wire(
+        let mut config = crate::session_config::from_wire(
             Some(backend.as_short_str()),
             agent_command.as_deref(),
             codex_managed_context.as_deref(),
             codex_context_archive.as_deref(),
             None,
         );
+        let home = crate::platform::home_dir();
+        if let Some(existing) = crate::session_config::load_for_resume(
+            &home,
+            backend.as_short_str(),
+            &session_id,
+            backend_session_id.as_deref(),
+        ) {
+            config.merge_missing_from(existing);
+        }
+        if let Some((_, _, session_dir)) = managed.as_ref() {
+            if let Some(existing) = crate::session_config::read_log_dir_config(session_dir) {
+                config.merge_missing_from(existing);
+            }
+        }
+        if let Some(intendant_id) = intendant_session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            if let Some(dir) = session_log::SessionLog::find_session_by_id(intendant_id) {
+                if let Some(existing) = crate::session_config::read_log_dir_config(&dir) {
+                    config.merge_missing_from(existing);
+                }
+            }
+        }
         if config.is_empty() {
             let message = "Session config failed: no launch settings supplied".to_string();
             self.config.bus.send(AppEvent::SessionAgentConfigResult {
@@ -2482,7 +2522,6 @@ impl SessionSupervisor {
                 .as_ref()
                 .map(|(managed_id, _, _)| managed_id.as_str()),
         ];
-        let home = crate::platform::home_dir();
         let mut wrote_external = false;
         for external_id in external_ids
             .into_iter()

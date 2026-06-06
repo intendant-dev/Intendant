@@ -1132,6 +1132,7 @@ async fn create_external_agent(
     resume_session: Option<String>,
     mcp_session_id: Option<String>,
     codex_service_tier: Option<String>,
+    codex_home: Option<String>,
 ) -> Result<
     (
         Box<dyn external_agent::ExternalAgent>,
@@ -1155,6 +1156,11 @@ async fn create_external_agent(
             let context_archive = project::normalize_codex_context_archive(&cfg.context_archive);
             let (request_trace_dir, request_trace_temporary) =
                 codex_context_trace_dir(session_log, &context_archive);
+            let codex_home = codex_home
+                .as_deref()
+                .and_then(|home| crate::session_config::normalize_codex_home(Some(home)))
+                .or_else(crate::session_config::effective_codex_home)
+                .map(PathBuf::from);
             let opts = external_agent::codex::CodexAgentOptions {
                 reasoning_effort: reasoning_effort.clone(),
                 web_search: cfg.web_search,
@@ -1188,6 +1194,7 @@ async fn create_external_agent(
                 web_port,
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
+                codex_home,
             };
             (agent, config)
         }
@@ -1230,6 +1237,7 @@ async fn create_external_agent(
                 web_port,
                 mcp_session_id: None,
                 resume_session: resume_session.clone(),
+                codex_home: None,
             };
             (agent, config)
         }
@@ -1259,6 +1267,7 @@ async fn create_external_agent(
                 web_port,
                 mcp_session_id: None,
                 resume_session: resume_session.clone(),
+                codex_home: None,
             };
             (agent, config)
         }
@@ -7863,6 +7872,36 @@ impl FollowUpMessage {
     }
 }
 
+fn managed_context_followup_replay_after_rewind(
+    active_followup: &FollowUpMessage,
+) -> Option<FollowUpMessage> {
+    if active_followup.managed_context_recovery_kickstart || active_followup.text.trim().is_empty()
+    {
+        return None;
+    }
+
+    let text = format!(
+        "<managed_context_rewind_followup_replay>\nA managed-context rewind requested during this queued follow-up has already succeeded. Continue the user's follow-up below from the rewound context. Do not call rewind_context again merely to satisfy any instruction to rewind first; only rewind again if new context pressure or an invalid anchor genuinely requires it.\n\nUser follow-up:\n{}\n</managed_context_rewind_followup_replay>",
+        active_followup.text.trim()
+    );
+
+    Some(FollowUpMessage::with_attachments(
+        text,
+        active_followup.attachments.clone(),
+    ))
+}
+
+fn managed_context_rewind_continuation(
+    pending_replays: &mut std::collections::VecDeque<FollowUpMessage>,
+    active_followup: &FollowUpMessage,
+    automatic_resume: Option<FollowUpMessage>,
+) -> Option<FollowUpMessage> {
+    pending_replays
+        .pop_front()
+        .or_else(|| managed_context_followup_replay_after_rewind(active_followup))
+        .or(automatic_resume)
+}
+
 type FollowUpReceiver = tokio::sync::mpsc::Receiver<FollowUpMessage>;
 
 /// CLI flags parsed from command-line arguments.
@@ -9446,6 +9485,60 @@ mod tests {
         assert!(text.contains("rewind_context with one exact returned item_id"));
         assert!(text.contains("Do not synthesize anchor ids"));
         assert!(!text.contains("call_"));
+    }
+
+    #[test]
+    fn managed_context_rewind_continuation_replays_active_followup_before_auto_resume() {
+        let active = FollowUpMessage::text(
+            "First rewind context, then implement the next Station slice.".into(),
+        )
+        .with_follow_up_id(Some("follow-1".into()));
+        let automatic = FollowUpMessage::text("<context_rewind_resumed/>".into());
+        let mut pending = std::collections::VecDeque::new();
+
+        let continuation =
+            managed_context_rewind_continuation(&mut pending, &active, Some(automatic))
+                .expect("continuation");
+
+        assert!(continuation
+            .text
+            .contains("implement the next Station slice"));
+        assert!(continuation.text.contains("has already succeeded"));
+        assert!(continuation
+            .text
+            .contains("Do not call rewind_context again"));
+        assert_eq!(continuation.follow_up_id, None);
+        assert!(!continuation.managed_context_recovery_kickstart);
+    }
+
+    #[test]
+    fn managed_context_rewind_continuation_prefers_held_followup() {
+        let active =
+            FollowUpMessage::text("recovery kickstart".into()).managed_context_recovery_kickstart();
+        let held = FollowUpMessage::text("original queued user request".into());
+        let automatic = FollowUpMessage::text("<context_rewind_resumed/>".into());
+        let mut pending = std::collections::VecDeque::from([held]);
+
+        let continuation =
+            managed_context_rewind_continuation(&mut pending, &active, Some(automatic))
+                .expect("continuation");
+
+        assert_eq!(continuation.text, "original queued user request");
+        assert!(pending.is_empty());
+    }
+
+    #[test]
+    fn managed_context_rewind_continuation_uses_auto_resume_for_recovery_kickstart() {
+        let active =
+            FollowUpMessage::text("recovery kickstart".into()).managed_context_recovery_kickstart();
+        let automatic = FollowUpMessage::text("<context_rewind_resumed/>".into());
+        let mut pending = std::collections::VecDeque::new();
+
+        let continuation =
+            managed_context_rewind_continuation(&mut pending, &active, Some(automatic))
+                .expect("continuation");
+
+        assert_eq!(continuation.text, "<context_rewind_resumed/>");
     }
 
     #[test]
@@ -16176,6 +16269,7 @@ async fn run_with_presence(
                     None,
                     session_log_id(&session_log),
                     None,
+                    None,
                 )
                 .await
                 {
@@ -17256,6 +17350,7 @@ async fn run_external_agent_mode(
     attachments: UserAttachments,
     resume_session: Option<String>,
     codex_service_tier: Option<String>,
+    codex_home: Option<String>,
     control_session_id: Option<String>,
     emit_session_started_after_identity: bool,
     ready_for_thread_actions: Option<tokio::sync::oneshot::Sender<()>>,
@@ -17277,6 +17372,14 @@ async fn run_external_agent_mode(
     let resumed_external_session = resume_session.clone();
     let persist_model_responses_inline = control_session_id.is_some();
     let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
+    let effective_codex_home = if backend == external_agent::AgentBackend::Codex {
+        codex_home
+            .as_deref()
+            .and_then(|home| crate::session_config::normalize_codex_home(Some(home)))
+            .or_else(crate::session_config::effective_codex_home)
+    } else {
+        None
+    };
     let effective_codex_service_tier = if backend == external_agent::AgentBackend::Codex {
         codex_service_tier.clone().or_else(|| {
             project::normalize_codex_service_tier(
@@ -17302,6 +17405,7 @@ async fn run_external_agent_mode(
         resume_session,
         intendant_session_id.clone(),
         effective_codex_service_tier,
+        effective_codex_home.clone(),
     )
     .await
     {
@@ -17328,6 +17432,7 @@ async fn run_external_agent_mode(
     let mut session_agent_config = session_config::from_project(&backend, &project);
     if backend == external_agent::AgentBackend::Codex {
         session_agent_config.codex_service_tier = agent.service_tier().map(str::to_string);
+        session_agent_config.codex_home = effective_codex_home;
     }
     if let Err(e) = session_config::write_log_dir_config(&log_dir, &session_agent_config) {
         slog(&session_log, |l| {
@@ -17790,6 +17895,7 @@ async fn run_external_agent_mode(
                 }
             },
         };
+        let active_followup_for_rewind_replay = followup.clone();
         let turn_text = followup.text;
         let attachments = followup.attachments;
         let steer_id = followup.steer_id;
@@ -18798,24 +18904,6 @@ async fn run_external_agent_mode(
             } => {
                 managed_context_recovery_kickstarts_without_rewind = 0;
                 stats.rounds = round;
-                record_external_done_and_round_inline(
-                    &session_log,
-                    persist_model_responses_inline,
-                    live_session_id.as_deref(),
-                    message.as_deref(),
-                    round,
-                    turns_in_round,
-                );
-                bus.send(AppEvent::DoneSignal {
-                    session_id: live_session_id.clone(),
-                    message: message.clone(),
-                });
-                bus.send(AppEvent::RoundComplete {
-                    session_id: live_session_id.clone(),
-                    round,
-                    turns_in_round,
-                    native_message_count: None,
-                });
                 match apply_external_context_rewind(
                     &mut agent,
                     &thread.thread_id,
@@ -18824,30 +18912,59 @@ async fn run_external_agent_mode(
                 )
                 .await
                 {
-                    Ok(Some(followup)) => {
-                        if let Some(replay) = pending_managed_context_replays.pop_front() {
+                    Ok(automatic_resume) => {
+                        if let Some(continuation) = managed_context_rewind_continuation(
+                            &mut pending_managed_context_replays,
+                            &active_followup_for_rewind_replay,
+                            automatic_resume,
+                        ) {
                             slog(&session_log, |l| {
                                 l.info(
-                                    "Managed-context rewind succeeded; replaying held user follow-up instead of automatic resume",
+                                    "Managed-context rewind succeeded; continuing queued follow-up",
                                 )
                             });
-                            next_turn = Some(replay);
-                        } else {
-                            next_turn = Some(followup);
+                            next_turn = Some(continuation);
+                            continue 'outer;
                         }
-                    }
-                    Ok(None) => {
-                        if let Some(replay) = pending_managed_context_replays.pop_front() {
-                            slog(&session_log, |l| {
-                                l.info(
-                                    "Managed-context rewind succeeded; replaying held user follow-up",
-                                )
-                            });
-                            next_turn = Some(replay);
-                        }
+                        record_external_done_and_round_inline(
+                            &session_log,
+                            persist_model_responses_inline,
+                            live_session_id.as_deref(),
+                            message.as_deref(),
+                            round,
+                            turns_in_round,
+                        );
+                        bus.send(AppEvent::DoneSignal {
+                            session_id: live_session_id.clone(),
+                            message: message.clone(),
+                        });
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: live_session_id.clone(),
+                            round,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
                     }
                     Err(message) => {
                         emit_context_rewind_failure(&request, message, &drain_config);
+                        record_external_done_and_round_inline(
+                            &session_log,
+                            persist_model_responses_inline,
+                            live_session_id.as_deref(),
+                            None,
+                            round,
+                            turns_in_round,
+                        );
+                        bus.send(AppEvent::DoneSignal {
+                            session_id: live_session_id.clone(),
+                            message: None,
+                        });
+                        bus.send(AppEvent::RoundComplete {
+                            session_id: live_session_id.clone(),
+                            round,
+                            turns_in_round,
+                            native_message_count: None,
+                        });
                     }
                 }
             }
@@ -21340,6 +21457,7 @@ async fn main() -> Result<(), CallerError> {
                             None,
                             None,
                             None,
+                            None,
                             false,
                             None,
                         )
@@ -22033,6 +22151,7 @@ async fn main() -> Result<(), CallerError> {
                         None,
                         None,
                         None,
+                        None,
                         false,
                         None,
                     )
@@ -22499,6 +22618,7 @@ async fn main() -> Result<(), CallerError> {
                 true, // headless mode
                 web_port_for_agent,
                 UserAttachments::default(),
+                None,
                 None,
                 None,
                 None,

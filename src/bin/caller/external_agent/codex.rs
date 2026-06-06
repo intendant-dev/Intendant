@@ -55,7 +55,7 @@ Intendant, not Codex automatic compaction, owns long-task context density. This 
 Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
 - For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
-- For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. The helper launches isolated headless Chromium, waits for CDP and selectors/functions, handles WebSocket fallbacks, and prints compact PASS/FAIL output with bounded failure excerpts.
+- For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. For a temporary local dashboard smoke, prefer one owned-lifecycle command such as `node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> --selector <css>`; the helper launches the built intendant binary as `--web <port> --no-tui`, waits for HTTP readiness, and stops it afterward. Do not start a separate foreground/nohup dashboard just so the helper can connect. The helper launches isolated headless Chromium, waits for CDP and selectors/functions, handles WebSocket fallbacks, and prints compact PASS/FAIL output with bounded failure excerpts.
 - Browser validation retry discipline: run one primary helper smoke. If it fails or times out, run at most one compact diagnostic retry with `--diagnostics --json` and a targeted selector/function. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the helper reason/logs/diagnostics. Do not cycle through raw CDP, Node, Python, Browser, Chrome, and plugin automation stacks unless the user explicitly asks for deeper manual investigation or the helper itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
 - While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors. Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
@@ -1094,6 +1094,7 @@ pub struct CodexAgent {
     web_port: Option<u16>,
     mcp_session_id: Option<String>,
     resume_session: Option<String>,
+    codex_home: Option<PathBuf>,
     /// Working directory used to resolve Codex project config for config/read.
     working_dir: Option<PathBuf>,
     /// Working directory where .codex/config.toml was written (for cleanup).
@@ -1425,6 +1426,12 @@ impl CodexAgent {
         }
     }
 
+    fn apply_codex_home_env(command: &mut tokio::process::Command, codex_home: Option<&Path>) {
+        if let Some(home) = codex_home {
+            command.env("CODEX_HOME", home);
+        }
+    }
+
     pub fn new(
         command: String,
         model: Option<String>,
@@ -1465,6 +1472,7 @@ impl CodexAgent {
             web_port,
             mcp_session_id: None,
             resume_session: None,
+            codex_home: None,
             working_dir: None,
             config_working_dir: None,
             request_trace_root: None,
@@ -4969,6 +4977,7 @@ impl ExternalAgent for CodexAgent {
         self.context_seen_request_ids.clear();
         self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
+        self.codex_home = config.codex_home;
         self.working_dir = Some(config.working_dir.clone());
 
         // Write .codex/config.toml for MCP-over-HTTP access to Intendant.
@@ -5071,6 +5080,7 @@ impl ExternalAgent for CodexAgent {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
         self.add_intendant_ctl_env(&mut command, effective_web_port);
+        Self::apply_codex_home_env(&mut command, self.codex_home.as_deref());
         if let Some(root) = &self.request_trace_root {
             std::fs::create_dir_all(root)?;
             command.env("CODEX_ROLLOUT_TRACE_ROOT", root);
@@ -8459,6 +8469,10 @@ error: could not compile `demo`
         assert!(developer_instructions.contains("take_screenshot"));
         assert!(developer_instructions.contains("execute_cu_actions"));
         assert!(developer_instructions.contains("scripts/validate-dashboard.cjs"));
+        assert!(developer_instructions.contains("--launch-dashboard"));
+        assert!(
+            developer_instructions.contains("Do not start a separate foreground/nohup dashboard")
+        );
         assert!(developer_instructions.contains("compact PASS/FAIL"));
         assert!(developer_instructions.contains("--diagnostics --json"));
         assert!(developer_instructions.contains("one primary helper smoke"));
@@ -8491,6 +8505,21 @@ error: could not compile `demo`
         assert_eq!(params["cwd"], "/tmp/intendant-workspace");
         assert!(params.get("sandbox").is_none());
         assert!(params.get("sandboxPolicy").is_none());
+    }
+
+    #[test]
+    fn codex_home_env_is_applied_to_spawned_command() {
+        let codex_home = PathBuf::from("/home/user/.codex-managed");
+        let mut command = crate::platform::spawn_command("codex");
+
+        CodexAgent::apply_codex_home_env(&mut command, Some(&codex_home));
+
+        let actual = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CODEX_HOME"))
+            .and_then(|(_, value)| value.map(PathBuf::from));
+        assert_eq!(actual.as_deref(), Some(codex_home.as_path()));
     }
 
     #[test]
@@ -8955,6 +8984,7 @@ error: could not compile `demo`
             web_port: Some(mcp_port),
             mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
+            codex_home: None,
         };
 
         let _events = agent.initialize(config).await.unwrap();
