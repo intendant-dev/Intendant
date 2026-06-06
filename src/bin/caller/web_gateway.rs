@@ -2274,6 +2274,7 @@ fn limited_session_detail_entries(
                 let session_id = entry
                     .get("session_id")
                     .and_then(|v| v.as_str())
+                    .or_else(|| entry.pointer("/data/session_id").and_then(|v| v.as_str()))
                     .unwrap_or("__global__");
                 latest_goal_by_session.insert(session_id.to_string(), idx);
             }
@@ -25116,6 +25117,56 @@ mod tests {
             .filter_map(|entry| entry["summary"].as_str())
             .collect();
         assert_eq!(summaries, vec!["response 4", "response 5"]);
+    }
+
+    #[test]
+    fn session_detail_limit_keeps_latest_goal_per_nested_session_id() {
+        let entries = vec![
+            serde_json::json!({
+                "event": "session_goal",
+                "data": {
+                    "session_id": "target-session",
+                    "goal": {
+                        "objective": "old target goal",
+                        "status": "active"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "event": "session_goal",
+                "data": {
+                    "session_id": "target-session",
+                    "goal": {
+                        "objective": "latest target goal",
+                        "status": "active"
+                    }
+                }
+            }),
+            serde_json::json!({
+                "event": "session_goal",
+                "data": {
+                    "session_id": "other-session",
+                    "goal": {
+                        "objective": "other goal",
+                        "status": "active"
+                    }
+                }
+            }),
+            serde_json::json!({"event": "model_response", "summary": "tail 1"}),
+            serde_json::json!({"event": "model_response", "summary": "tail 2"}),
+        ];
+
+        let limited = limited_session_detail_entries(entries, Some(2));
+        let goals: Vec<_> = limited
+            .iter()
+            .filter(|entry| entry["event"] == "session_goal")
+            .filter_map(|entry| {
+                entry
+                    .pointer("/data/goal/objective")
+                    .and_then(|v| v.as_str())
+            })
+            .collect();
+        assert_eq!(goals, vec!["latest target goal", "other goal"]);
     }
 
     #[test]
