@@ -155,7 +155,7 @@ active holder.
 | `cancel_controller_restart`     | Cancel a scheduled restart. | `restart_id?` |
 | `request_controller_loop_halt`  | Request loop halt. | `persistent?` |
 | `clear_controller_loop_halt`    | Clear loop-halt flags so restarts can resume. | — |
-| `intervene_controller_loop`     | Intervene in the active loop process. | `mode`: `stop`/`abort` |
+| `intervene_controller_loop`     | Intervene in the active loop process and visible Codex app-server descendants. | `mode`: `stop`/`abort` |
 | `get_controller_loop_status`    | Unified loop-health snapshot. | — |
 
 `schedule_controller_restart`, `controller_turn_complete`, and
@@ -241,7 +241,9 @@ For `restart_command` wrapper scripts, loop artifacts live under
   (graceful), `request_abort` (immediate). History:
   `.intendant/controller-loop/latest/intervention.log`.
 - Per-run PIDs: `.intendant/controller-loop/<run_id>/wrapper.pid` and
-  `codex.pid`.
+  `codex.pid`. The Codex wrapper applies stop/abort to the recorded Codex
+  process and its visible descendants so nested app-server children are not
+  orphaned.
 
 ## Typical Agent Workflow
 
