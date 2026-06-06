@@ -10372,6 +10372,7 @@ async function ensureStation() {
     stationSyncHotspots();
     stationUpdateSnapshot();
     if (activeTab === 'station') stationRefreshSharedCaches();
+    if (activeTab === 'station') stationMaybeRestoreDock();
     return null;
   }
   stationDomFallback = false;
@@ -10421,6 +10422,7 @@ function stationSetActive(active) {
       stationRefreshSharedCaches();
       stationUpdateSnapshot();
       stationRegisterExistingSources();
+      stationMaybeRestoreDock();
     }
   } else if (stationDomFallback && !stationShouldUseWebgpu()) {
     stationSetFallbackClass(active);
@@ -10428,6 +10430,7 @@ function stationSetActive(active) {
       stationSyncHotspots();
       stationRefreshSharedCaches();
       stationUpdateSnapshot();
+      stationMaybeRestoreDock();
     }
   } else if (active) {
     ensureStation().catch(err => {
@@ -10754,6 +10757,18 @@ let stationPeerDraft = {
   routeInstructions: '',
 };
 const STATION_VIEW_KEY = 'intendant_station_view';
+const STATION_DOCK_STATE_KEY = 'intendant_station_dock';
+const STATION_DOCK_KINDS = Object.freeze([
+  'activity',
+  'context',
+  'managed',
+  'changes',
+  'sessions',
+  'worktrees',
+  'peers',
+  'controls',
+  'view',
+]);
 const STATION_VIEW_DEFAULTS = Object.freeze({
   layout: 'orbital',
   mood: 'cockpit',
@@ -10794,7 +10809,33 @@ function stationSaveViewDraft() {
   } catch (_) {}
 }
 
+function stationNormalizeDockState(raw = {}) {
+  const kind = STATION_DOCK_KINDS.includes(String(raw.kind || '').trim())
+    ? String(raw.kind || '').trim()
+    : 'controls';
+  return {
+    kind,
+    hidden: raw.hidden !== false,
+  };
+}
+
+function stationLoadDockState() {
+  try {
+    return stationNormalizeDockState(JSON.parse(localStorage.getItem(STATION_DOCK_STATE_KEY) || '{}'));
+  } catch (_) {
+    return stationNormalizeDockState();
+  }
+}
+
+function stationSaveDockState() {
+  try {
+    localStorage.setItem(STATION_DOCK_STATE_KEY, JSON.stringify(stationDockState));
+  } catch (_) {}
+}
+
 let stationViewDraft = stationLoadViewDraft();
+let stationDockRestorePending = false;
+let stationDockState = stationLoadDockState();
 let stationLaunchDraft = {
   task: '',
   name: '',
@@ -10851,6 +10892,10 @@ function stationDockBegin(kind, title, subtitle = '') {
   dock.dataset.kind = kind || '';
   dock.classList.toggle('station-dock-peers', kind === 'peers');
   dock.classList.remove('hidden');
+  if (STATION_DOCK_KINDS.includes(kind)) {
+    stationDockState = stationNormalizeDockState({ kind, hidden: false });
+    stationSaveDockState();
+  }
   if (titleEl) titleEl.textContent = title || 'Station';
   if (subtitleEl) subtitleEl.textContent = subtitle || '';
   body.innerHTML = '';
@@ -10859,7 +10904,13 @@ function stationDockBegin(kind, title, subtitle = '') {
 }
 
 function stationCloseDock() {
-  document.getElementById('station-dock')?.classList.add('hidden');
+  const dock = document.getElementById('station-dock');
+  dock?.classList.add('hidden');
+  stationDockState = stationNormalizeDockState({
+    kind: dock?.dataset.kind || stationDockState.kind,
+    hidden: true,
+  });
+  stationSaveDockState();
   stationSyncDockNav('');
 }
 
@@ -10876,6 +10927,22 @@ function stationSyncDockNav(kind = document.getElementById('station-dock')?.data
   const activeTarget = stationDockSystemTarget(kind);
   document.querySelectorAll('#station-dock-nav [data-station-dock-nav]').forEach(button => {
     button.classList.toggle('active', !!activeTarget && button.dataset.stationDockNav === activeTarget);
+  });
+}
+
+function stationMaybeRestoreDock() {
+  if (activeTab !== 'station' || stationDockRestorePending) return;
+  const dock = document.getElementById('station-dock');
+  if (!dock || !dock.classList.contains('hidden')) return;
+  const state = stationLoadDockState();
+  stationDockState = state;
+  if (state.hidden) return;
+  const target = stationDockSystemTarget(state.kind);
+  if (!target) return;
+  stationDockRestorePending = true;
+  requestAnimationFrame(() => {
+    stationDockRestorePending = false;
+    if (activeTab === 'station') stationHandleHotspot(target);
   });
 }
 
