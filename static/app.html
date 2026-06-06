@@ -10227,6 +10227,7 @@ let stationInitPromise = null;
 let stationDomFallback = false;
 let stationCurrentTask = '';
 let stationCurrentApproval = null;
+let stationCurrentHumanQuestion = '';
 const stationLogEvents = [];
 const stationRegisteredSources = new Set();
 let stationLastSnapshotJson = '';
@@ -10626,6 +10627,7 @@ let stationSessionDockStatusFilter = '';
 let stationWorktreeDockFilter = '';
 let stationActivityDockFilter = '';
 let stationActivityDockHost = activeHostFilter || '';
+let stationHumanDraft = '';
 let stationSelectedContextPart = '';
 let stationSelectedChangePath = '';
 let stationSelectedPeerHost = '';
@@ -12387,6 +12389,83 @@ function stationRenderApprovalsSection(parent) {
   }
 }
 
+function stationHumanQuestionText() {
+  const panel = document.getElementById('human-panel');
+  const visible = panel?.classList.contains('visible');
+  return stationCurrentHumanQuestion || (visible ? (document.getElementById('human-question')?.textContent || '') : '');
+}
+
+function stationCopyHumanDraftToLegacy() {
+  const source = document.getElementById('station-human-input');
+  if (source) stationHumanDraft = source.value || '';
+  const target = document.getElementById('human-input');
+  if (target) target.value = stationHumanDraft;
+}
+
+function stationSubmitHumanResponseFromDock() {
+  stationCopyHumanDraftToLegacy();
+  if (!stationHumanDraft.trim()) {
+    showControlToast?.('error', 'Enter a response before sending');
+    document.getElementById('station-human-input')?.focus();
+    return;
+  }
+  window.sendHumanResponse?.();
+  stationHumanDraft = '';
+  stationRenderControlsDock('input');
+}
+
+function stationRenderHumanInputSection(parent) {
+  const question = stationHumanQuestionText();
+  const section = stationDockSection(parent, 'Input requests');
+  stationDockRow(section, 'human input', question ? 'waiting' : 'clear');
+  if (!question) {
+    stationDockEmpty(section, 'No pending human input request.');
+    return;
+  }
+  stationDockCard(section, {
+    title: 'Question',
+    meta: 'agent is waiting',
+    detail: compactSessionText(question),
+    actions: [
+      stationDockRouteAction('Route Activity', 'activity', 'log', () => document.getElementById('human-input')?.focus()),
+    ],
+  });
+  const input = stationDockInput(
+    section,
+    'Response',
+    stationHumanDraft || document.getElementById('human-input')?.value || '',
+    { id: 'station-human-input', placeholder: 'Type a response for the waiting agent', multiline: true, rows: 3 }
+  );
+  input.addEventListener('input', ev => {
+    stationHumanDraft = ev.target.value || '';
+  });
+  input.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter' || ev.shiftKey) return;
+    ev.preventDefault();
+    stationSubmitHumanResponseFromDock();
+  });
+  stationDockActions(section, [
+    { label: 'Send response', primary: true, onClick: stationSubmitHumanResponseFromDock },
+  ]);
+}
+
+function stationRenderLiveStatusSection(parent, controls) {
+  const section = stationDockSection(parent, 'Live status');
+  stationDockRow(section, 'host', `${selfHostLabel || 'local'} / ${selfPeerId || 'local'}`);
+  stationDockRow(section, 'connection', document.getElementById('sb-conn')?.classList.contains('ok') ? 'connected' : 'disconnected');
+  stationDockRow(section, 'phase', currentPhase || '--');
+  stationDockRow(section, 'turn', document.getElementById('sb-turn')?.textContent || '--');
+  stationDockRow(section, 'budget', document.getElementById('sb-budget-pct')?.textContent || '--');
+  stationDockRow(section, 'provider', document.getElementById('sb-provider')?.textContent || '--');
+  stationDockRow(section, 'model', document.getElementById('sb-model')?.textContent || '--');
+  stationDockRow(section, 'autonomy', document.getElementById('sb-autonomy')?.textContent || '--');
+  stationDockRow(section, 'browser', controls.activeBrowser ? 'active' : 'passive');
+  stationDockActions(section, [
+    { label: 'Refresh', onClick: () => { stationRefreshSharedCaches(); stationRenderControlsDock('overview'); } },
+    { label: 'Cycle autonomy', onClick: () => { window.cycleAutonomy?.(); stationRenderControlsDock('overview'); } },
+  ]);
+}
+
 function stationApplyDockSelect(controlId, value, handler, rerenderSection = 'overview') {
   const target = stationDockSetSelectValue(controlId, value);
   handler({ target });
@@ -12538,6 +12617,8 @@ function stationRenderControlsDock(sectionName = 'overview') {
     controls.sessionCanInterrupt ? { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) } : null,
   ]);
 
+  stationRenderLiveStatusSection(body, controls);
+
   const launch = stationDockSection(body, 'Launch defaults');
   stationDockRow(launch, 'binary', controls.command || '--');
   stationDockRow(launch, 'model', controls.model || '--');
@@ -12553,6 +12634,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   stationRenderApprovalRulesEditor(body);
 
   stationRenderApprovalsSection(body);
+  stationRenderHumanInputSection(body);
 
   const live = stationDockSection(body, 'Live surfaces');
   stationDockRow(live, 'display', controls.displayAccess || '--');
@@ -24303,19 +24385,29 @@ function showApproval(id, command, category, sessionId) {
 
 function showHumanInput(question) {
   hideAllPanels();
+  stationCurrentHumanQuestion = question || '';
   document.getElementById('human-question').textContent = question;
   revealActivityLogPanel();
   document.getElementById('human-panel').classList.add('visible');
+  stationScheduleUpdate();
 }
 
 function showPanel(id) { hideAllPanels(); document.getElementById(id).classList.add('visible'); }
 function hidePanel(id) {
   if (id === 'approval-panel') clearPendingApproval();
+  if (id === 'human-panel') {
+    stationCurrentHumanQuestion = '';
+    stationHumanDraft = '';
+    stationScheduleUpdate();
+  }
   document.getElementById(id).classList.remove('visible');
 }
 function hideAllPanels() {
   clearPendingApproval();
+  stationCurrentHumanQuestion = '';
+  stationHumanDraft = '';
   document.querySelectorAll('.bottom-panel').forEach(p => p.classList.remove('visible'));
+  stationScheduleUpdate();
 }
 
 function showBadge(tab, text) {
