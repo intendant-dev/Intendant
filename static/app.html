@@ -10986,7 +10986,7 @@ function stationFallbackHotspotDetail(name) {
   return '';
 }
 
-function stationApplyViewSettings(showToast = false) {
+function stationApplyViewSettings(showToast = false, persist = true) {
   const layout = stationViewDraft.layout === 'constellation' ? 'constellation' : 'orbital';
   stationViewDraft.layout = layout;
   if (station?.set_layout) station.set_layout(layout);
@@ -10999,7 +10999,7 @@ function stationApplyViewSettings(showToast = false) {
       Number(stationViewDraft.density) || 1,
     );
   }
-  stationSaveViewDraft();
+  if (persist) stationSaveViewDraft();
   stationScheduleUpdate();
   if (showToast) showControlToast?.('success', 'Station view updated');
 }
@@ -11085,7 +11085,7 @@ function stationRenderViewDock() {
   stationViewRange(tuning, 'density', 'Density', 0.5, 1.8, 0.05, value => `${(Number(value) || 1).toFixed(2)}x`);
   stationDockActions(tuning, [
     { label: 'Reset', onClick: () => { stationViewDraft = stationNormalizeViewDraft(STATION_VIEW_DEFAULTS); stationApplyViewSettings(true); stationRenderViewDock(); } },
-    { label: 'Store reset', danger: true, onClick: () => { stationViewDraft = stationNormalizeViewDraft(STATION_VIEW_DEFAULTS); stationApplyViewSettings(true); stationRenderViewDock(); } },
+    { label: 'Clear stored', danger: true, onClick: () => { localStorage.removeItem(STATION_VIEW_KEY); stationViewDraft = stationNormalizeViewDraft(STATION_VIEW_DEFAULTS); stationApplyViewSettings(false, false); stationRenderViewDock(); } },
   ]);
 
   const hint = stationDockSection(body, 'Prototype affordance');
