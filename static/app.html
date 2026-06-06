@@ -11079,6 +11079,14 @@ let stationSessionDockFilter = '';
 let stationSessionDockSourceFilter = '';
 let stationSessionDockStatusFilter = '';
 let stationSessionDockProjectFilter = '';
+let stationSessionLogState = {
+  sessionId: '',
+  source: '',
+  loading: false,
+  error: '',
+  entries: null,
+  verbosity: 'normal',
+};
 let stationSessionDeepDraft = {
   query: '',
   mode: 'all_keywords',
@@ -14424,6 +14432,153 @@ function stationRenderSessionCleanupSection(parent, session) {
   })));
 }
 
+function stationSessionLogSource(session) {
+  const meta = sessionConfigMetadata(session || {});
+  return sessionConfigSource(meta) || stationSessionSource(session) || 'intendant';
+}
+
+function stationSessionLogStateFor(session) {
+  const sid = stationSessionId(session);
+  const source = stationSessionLogSource(session);
+  if (stationSessionLogState.sessionId === sid && stationSessionLogState.source === source) {
+    return stationSessionLogState;
+  }
+  return {
+    sessionId: sid,
+    source,
+    loading: false,
+    error: '',
+    entries: null,
+    verbosity: stationSessionLogState.verbosity || 'normal',
+  };
+}
+
+function stationSessionLogVisibleLevels(verbosity = 'normal') {
+  const normalLevels = ['info', 'model', 'agent', 'error', 'warn', 'subagent', 'presence'];
+  const verboseLevels = [...normalLevels, 'detail'];
+  return verbosity === 'debug' ? [...verboseLevels, 'debug'] :
+    verbosity === 'verbose' ? verboseLevels : normalLevels;
+}
+
+function stationSessionLogRows(entries, verbosity = 'normal') {
+  const visible = new Set(stationSessionLogVisibleLevels(verbosity));
+  return (entries || [])
+    .map(entry => {
+      const level = entry?.level || 'info';
+      const content = entry?.content || entry?.summary || entry?.message || '';
+      if (!visible.has(level) || !String(content).trim()) return null;
+      const source = entry?.source || '';
+      return {
+        ts: formatSessionDetailTimestamp(entry?.ts),
+        level,
+        source: sessionDetailSourceLabels[source] || source || level,
+        content: String(content),
+      };
+    })
+    .filter(Boolean);
+}
+
+async function stationLoadSessionLogForDock(sessionOrId) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  if (!sid) return;
+  const source = stationSessionLogSource(session || { session_id: sid });
+  stationSessionLogState = {
+    sessionId: sid,
+    source,
+    loading: true,
+    error: '',
+    entries: stationSessionLogState.sessionId === sid && stationSessionLogState.source === source
+      ? stationSessionLogState.entries
+      : null,
+    verbosity: stationSessionLogState.verbosity || 'normal',
+  };
+  stationRenderSessionsDock(sid);
+  try {
+    const resp = await fetch('/api/session/' + encodeURIComponent(sid) + '?source=' + encodeURIComponent(source));
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || resp.statusText || 'session log fetch failed');
+    stationSessionLogState = {
+      ...stationSessionLogState,
+      loading: false,
+      error: '',
+      entries: Array.isArray(data.entries) ? data.entries : [],
+    };
+  } catch (err) {
+    stationSessionLogState = {
+      ...stationSessionLogState,
+      loading: false,
+      error: err?.message || String(err),
+      entries: stationSessionLogState.entries || [],
+    };
+  }
+  stationRenderSessionsDock(sid);
+}
+
+async function stationCopySessionLogFromDock(session) {
+  const state = stationSessionLogStateFor(session);
+  const rows = stationSessionLogRows(state.entries || [], state.verbosity || 'normal');
+  if (!rows.length) {
+    showControlToast?.('info', 'No loaded Station log rows to copy');
+    return;
+  }
+  const text = rows.map(row => `[${row.ts}] ${row.source}: ${row.content}`).join('\n');
+  await copyTextToClipboard(text);
+  showControlToast?.('success', `Copied ${rows.length} Station log row${rows.length === 1 ? '' : 's'}`);
+}
+
+function stationRouteLegacySessionDetail(session) {
+  stationForceRouteTo('sessions', 'recent', () => openSessionDetail(session));
+}
+
+function stationRenderSessionLogSection(parent, session) {
+  const sid = stationSessionId(session);
+  if (!sid) return;
+  const state = stationSessionLogStateFor(session);
+  const section = stationDockSection(parent, 'Session log');
+  stationDockRow(section, 'source', state.source || 'intendant');
+  const loaded = Array.isArray(state.entries);
+  stationDockRow(section, 'loaded', state.loading ? 'loading' : (loaded ? `${state.entries.length} entries` : 'not loaded'));
+  const level = stationDockSelect(section, 'Level', state.verbosity || 'normal', [
+    ['normal', 'normal'],
+    ['verbose', 'verbose'],
+    ['debug', 'debug'],
+  ], { id: 'station-session-log-level' });
+  level.addEventListener('change', ev => {
+    stationSessionLogState = {
+      ...state,
+      verbosity: ev.target.value || 'normal',
+    };
+    stationRenderSessionsDock(sid);
+  });
+  if (state.error) stationDockEmpty(section, state.error).classList.add('error');
+  stationDockActions(section, [
+    { label: state.loading ? 'Loading...' : (loaded ? 'Reload logs' : 'Load logs'), primary: !loaded, disabled: state.loading, onClick: () => stationLoadSessionLogForDock(session) },
+    { label: 'Copy rows', disabled: !loaded || state.loading, onClick: () => stationCopySessionLogFromDock(session) },
+    { label: 'Legacy detail', route: true, onClick: () => stationRouteLegacySessionDetail(session) },
+  ]);
+  if (!loaded) {
+    stationDockEmpty(section, 'Load this session log to inspect recent entries from Station.');
+    return;
+  }
+  const rows = stationSessionLogRows(state.entries, state.verbosity || 'normal');
+  if (!rows.length) {
+    stationDockEmpty(section, 'No entries match this Station log level.');
+    return;
+  }
+  const visibleRows = rows.slice(-8).reverse();
+  if (rows.length > visibleRows.length) {
+    stationDockEmpty(section, `Showing latest ${visibleRows.length} of ${rows.length} matching entries.`);
+  }
+  visibleRows.forEach(row => {
+    stationDockCard(section, {
+      title: row.source,
+      meta: `${row.ts} / ${row.level}`,
+      detail: row.content.length > 260 ? `${row.content.slice(0, 257)}...` : row.content,
+    });
+  });
+}
+
 function stationRenderCodexThreadActionsSection(parent, sessionId, sessionOrMeta = null) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -14880,6 +15035,7 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
   stationRenderSessionRenameSection(parent, session);
   stationRenderSessionCleanupSection(parent, session);
+  stationRenderSessionLogSection(parent, session);
   const live = stationRenderExternalLiveThreadSection(parent, session);
   stationRenderSessionConfigSection(parent, session);
   stationRenderCodexThreadActionsSection(parent, stationCodexThreadActionSessionId(session, live) || sid, session);
