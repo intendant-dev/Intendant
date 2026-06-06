@@ -128,6 +128,26 @@ impl StationWeb {
         StationInner::schedule_next_loop(&self.inner);
     }
 
+    pub fn set_visuals(
+        &self,
+        mood: String,
+        fov_deg: f32,
+        motion: f32,
+        ar_strength: f32,
+        density: f32,
+    ) {
+        {
+            let mut inner = self.inner.borrow_mut();
+            inner.mood = Mood::from_str(&mood);
+            inner.fov_deg = fov_deg.clamp(35.0, 85.0);
+            inner.motion = motion.clamp(0.0, 2.0);
+            inner.ar_strength = ar_strength.clamp(0.0, 1.0);
+            inner.density = density.clamp(0.5, 1.8);
+            inner.last_render_ms = 0.0;
+        }
+        StationInner::schedule_next_loop(&self.inner);
+    }
+
     pub fn select_by_id(&self, id: Option<String>) {
         {
             let mut inner = self.inner.borrow_mut();
@@ -5548,6 +5568,15 @@ impl LayoutName {
 enum Mood {
     Cockpit,
     Calm,
+}
+
+impl Mood {
+    fn from_str(s: &str) -> Self {
+        match s {
+            "calm" => Self::Calm,
+            _ => Self::Cockpit,
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

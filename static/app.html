@@ -8187,6 +8187,7 @@ body.display-fullscreen-open {
               <button type="button" data-station-dock-nav="system:sessions">Sessions</button>
               <button type="button" data-station-dock-nav="system:peers">Peers</button>
               <button type="button" data-station-dock-nav="system:controls">Controls</button>
+              <button type="button" data-station-dock-nav="system:view">View</button>
             </nav>
           </div>
           <div id="station-dock-body" class="station-dock-body"></div>
@@ -10386,6 +10387,7 @@ async function ensureStation() {
     station = new StationWeb(scene, hud);
     stationLastSnapshotJson = '';
     station.set_action_callback((action) => handleStationAction(action));
+    stationApplyViewSettings(false);
     const active = activeTab === 'station';
     station.set_active(active);
     stationStatus('Station online');
@@ -10740,6 +10742,14 @@ let stationPeerDraft = {
   routeCapabilities: 'display',
   routeInstructions: '',
 };
+let stationViewDraft = {
+  layout: 'orbital',
+  mood: 'cockpit',
+  fov: 55,
+  motion: 1,
+  ar: 0.45,
+  density: 1,
+};
 let stationLaunchDraft = {
   task: '',
   name: '',
@@ -10760,6 +10770,7 @@ const STATION_SYSTEM_TARGETS = Object.freeze([
   ['system:sessions', 'Sessions'],
   ['system:peers', 'Peers'],
   ['system:controls', 'Controls'],
+  ['system:view', 'View'],
 ]);
 
 // Mirrors crates/station-web/src/lib.rs StationInner::draw_toolbar and
@@ -10926,6 +10937,84 @@ function stationFallbackHotspotDetail(name) {
   if (name === 'system:peers') return `${Math.max(0, snapshot.hosts.length - 1)} peers · ${displaySlots.size + peerDisplayConnections.size} displays`;
   if (name === 'system:controls') return `${snapshot.controls.backend || 'agent'} · ${snapshot.controls.sandbox || 'sandbox'}`;
   return '';
+}
+
+function stationApplyViewSettings(showToast = false) {
+  const layout = stationViewDraft.layout === 'constellation' ? 'constellation' : 'orbital';
+  stationViewDraft.layout = layout;
+  if (station?.set_layout) station.set_layout(layout);
+  if (station?.set_visuals) {
+    station.set_visuals(
+      stationViewDraft.mood === 'calm' ? 'calm' : 'cockpit',
+      Number(stationViewDraft.fov) || 55,
+      Number(stationViewDraft.motion) || 0,
+      Number(stationViewDraft.ar) || 0,
+      Number(stationViewDraft.density) || 1,
+    );
+  }
+  stationScheduleUpdate();
+  if (showToast) showControlToast?.('success', 'Station view updated');
+}
+
+function stationViewSet(key, value) {
+  if (key === 'layout') stationViewDraft.layout = value === 'constellation' ? 'constellation' : 'orbital';
+  else if (key === 'mood') stationViewDraft.mood = value === 'calm' ? 'calm' : 'cockpit';
+  else if (key === 'fov') stationViewDraft.fov = Math.max(35, Math.min(85, Number(value) || 55));
+  else if (key === 'motion') stationViewDraft.motion = Math.max(0, Math.min(2, Number(value) || 0));
+  else if (key === 'ar') stationViewDraft.ar = Math.max(0, Math.min(1, Number(value) || 0));
+  else if (key === 'density') stationViewDraft.density = Math.max(0.5, Math.min(1.8, Number(value) || 1));
+  stationApplyViewSettings(false);
+}
+
+function stationViewRange(parent, key, label, min, max, step, formatter) {
+  const input = stationDockInput(parent, label, stationViewDraft[key], {
+    id: `station-view-${key}`,
+    type: 'range',
+    min,
+    max,
+    step,
+  });
+  const row = stationDockRow(parent, label, formatter(stationViewDraft[key]));
+  input.addEventListener('input', ev => {
+    stationViewSet(key, ev.target.value);
+    row.querySelector('.station-dock-value').textContent = formatter(stationViewDraft[key]);
+  });
+  return input;
+}
+
+function stationRenderViewDock() {
+  const body = stationDockBegin(
+    'view',
+    'Station View',
+    stationDomFallback ? 'DOM fallback controls' : (stationShouldUseWebgpu() ? 'WebGPU visual controls' : 'Canvas visual controls')
+  );
+  if (!body) return;
+  const layout = stationDockSection(body, 'Scene');
+  stationDockRow(layout, 'renderer', stationDomFallback ? 'DOM fallback' : (station?.debug_state?.() || 'canvas'));
+  stationDockRow(layout, 'webgpu', stationShouldUseWebgpu() ? (stationWebgpuUnavailable ? 'unavailable' : 'requested') : 'off');
+  stationDockActions(layout, [
+    { label: 'Orbital', primary: stationViewDraft.layout === 'orbital', onClick: () => { stationViewSet('layout', 'orbital'); stationRenderViewDock(); } },
+    { label: 'Constellation', primary: stationViewDraft.layout === 'constellation', onClick: () => { stationViewSet('layout', 'constellation'); stationRenderViewDock(); } },
+    { label: 'Refresh scene', onClick: () => { stationApplyViewSettings(true); stationRenderViewDock(); } },
+  ]);
+
+  const mood = stationDockSection(body, 'Mood');
+  stationDockActions(mood, [
+    { label: 'Cockpit', primary: stationViewDraft.mood !== 'calm', onClick: () => { stationViewSet('mood', 'cockpit'); stationRenderViewDock(); } },
+    { label: 'Calm', primary: stationViewDraft.mood === 'calm', onClick: () => { stationViewSet('mood', 'calm'); stationRenderViewDock(); } },
+  ]);
+
+  const tuning = stationDockSection(body, 'Tuning');
+  stationViewRange(tuning, 'fov', 'FOV', 35, 85, 1, value => `${Math.round(Number(value) || 55)} deg`);
+  stationViewRange(tuning, 'motion', 'Motion', 0, 2, 0.05, value => `${(Number(value) || 0).toFixed(2)}x`);
+  stationViewRange(tuning, 'ar', 'AR', 0, 1, 0.05, value => `${Math.round((Number(value) || 0) * 100)}%`);
+  stationViewRange(tuning, 'density', 'Density', 0.5, 1.8, 0.05, value => `${(Number(value) || 1).toFixed(2)}x`);
+  stationDockActions(tuning, [
+    { label: 'Reset', onClick: () => { stationViewDraft = { layout: 'orbital', mood: 'cockpit', fov: 55, motion: 1, ar: 0.45, density: 1 }; stationApplyViewSettings(true); stationRenderViewDock(); } },
+  ]);
+
+  const hint = stationDockSection(body, 'Prototype affordance');
+  stationDockEmpty(hint, 'Mirrors the prototype Tweaks panel while keeping Station connected to live dashboard state.');
 }
 
 function stationHotspotAt(clientX, clientY) {
@@ -11334,8 +11423,11 @@ function stationHandleHotspot(name) {
   if (!target) return;
   if (target.startsWith('layout:')) {
     const layout = target.slice('layout:'.length);
-    station?.set_layout?.(layout);
+    stationViewSet('layout', layout);
     stationStatus(station?.debug_state?.() || 'Station online');
+    if (!document.getElementById('station-dock')?.classList.contains('hidden')) {
+      stationRenderViewDock();
+    }
     return;
   }
   const renderers = {
@@ -11346,6 +11438,7 @@ function stationHandleHotspot(name) {
     'system:sessions': stationRenderSessionsDock,
     'system:peers': stationRenderPeersDock,
     'system:controls': stationRenderControlsDock,
+    'system:view': stationRenderViewDock,
   };
   const render = renderers[target];
   if (render) {
@@ -11515,6 +11608,9 @@ function stationDockInput(parent, label, value = '', attrs = {}) {
   if (attrs.id) input.id = attrs.id;
   if (attrs.placeholder) input.placeholder = attrs.placeholder;
   if (attrs.type) input.type = attrs.type;
+  if (attrs.min !== undefined) input.min = String(attrs.min);
+  if (attrs.max !== undefined) input.max = String(attrs.max);
+  if (attrs.step !== undefined) input.step = String(attrs.step);
   if (attrs.rows) input.rows = attrs.rows;
   return stationDockField(parent, label, input);
 }
