@@ -14284,6 +14284,7 @@ function stationSessionActionsForDock(sessionOrId, opts = {}) {
   if (!sid) return [];
   const meta = sessionConfigMetadata(session || sid);
   const source = sessionConfigSource(meta) || stationSessionSource(session) || '';
+  const relationshipKind = stationSessionRelationshipKind(session || sid);
   const actions = [];
   if (!opts.omitDetail) actions.push({ label: 'Details', primary: true, onClick: () => stationRenderSessionsDock(sid) });
   if (sessionWindows.has(sid)) actions.push({ label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: sid }) });
@@ -14295,9 +14296,18 @@ function stationSessionActionsForDock(sessionOrId, opts = {}) {
   }
   actions.push({ label: 'Rename', onClick: () => stationHandleSessionAction({ action: 'rename', session_id: sid }) });
   if (sessionWindows.has(sid)) actions.push({ label: 'Hide', onClick: () => stationHandleSessionAction({ action: 'hide', session_id: sid }) });
+  if (relationshipKind === 'side' && sideCloseParamsForSession(sid)) {
+    actions.push({ label: 'Close side', danger: true, onClick: () => stationHandleSessionAction({ action: 'close-side', session_id: sid }) });
+  }
   if (sessionWindowStopAvailability(sid).ok) actions.push({ label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: sid }) });
   actions.push({ label: 'Copy id', onClick: () => copyTextToClipboard(sid) });
   return actions;
+}
+
+function stationSessionRelationshipKind(sessionOrId) {
+  const meta = sessionConfigMetadata(sessionOrId);
+  const raw = String(meta.relationshipKind || meta.relationship_kind || meta.relationship || '').trim();
+  return raw ? normalizeSessionRelationshipKind(raw) : '';
 }
 
 function stationSessionCleanupTargets(session) {
@@ -16355,6 +16365,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
     if (controls.sessionCanConfig) targetActions.push({ label: 'Launch config', onClick: () => stationHandleSessionAction({ action: 'config', session_id: controls.sessionId }) });
     if (controls.sessionCanConfig) targetActions.push({ label: 'Restart', onClick: () => stationHandleSessionAction({ action: 'restart', session_id: controls.sessionId }) });
     if (controls.sessionCanRename) targetActions.push({ label: 'Rename', onClick: () => stationHandleSessionAction({ action: 'rename', session_id: controls.sessionId }) });
+    if (sideCloseParamsForSession(controls.sessionId)) targetActions.push({ label: 'Close side', danger: true, onClick: () => stationHandleSessionAction({ action: 'close-side', session_id: controls.sessionId }) });
     if (controls.sessionCanStop) targetActions.push({ label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: controls.sessionId }) });
     targetActions.push({ label: 'Copy id', onClick: () => copyTextToClipboard(controls.sessionId) });
     stationDockActions(codex, targetActions);
@@ -16479,6 +16490,10 @@ function stationHandleSessionAction(action) {
   }
   if (op === 'hide') {
     hideSessionWindowAction(sessionId);
+    return;
+  }
+  if (op === 'close-side') {
+    closeSideSessionWindowAction(sessionId);
     return;
   }
   stationRenderSessionsDock(stationSessionId(session) || sessionId);
