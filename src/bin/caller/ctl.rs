@@ -793,43 +793,59 @@ async fn run_task(client: &reqwest::Client, config: &Config, raw: &[String]) -> 
     }
     match raw[0].as_str() {
         "start" => {
-            let args = parse_command_args(
-                &raw[1..],
-                &["--task", "--display-target", "--frame"],
-                &["--orchestrate", "--direct"],
-            )?;
-            let task = args
-                .one("--task")
-                .map(str::to_string)
-                .or_else(|| {
-                    if args.positional.is_empty() {
-                        None
-                    } else {
-                        Some(args.positional.join(" "))
-                    }
-                })
-                .ok_or_else(|| "task start requires a task".to_string())?;
-            let mut map = Map::new();
-            map.insert("task".to_string(), Value::String(task));
-            if args.has("--orchestrate") {
-                map.insert("orchestrate".to_string(), Value::Bool(true));
-            } else if args.has("--direct") {
-                map.insert("orchestrate".to_string(), Value::Bool(false));
-            }
-            let frames: Vec<Value> = args
-                .all("--frame")
-                .map(|v| Value::String(v.to_string()))
-                .collect();
-            if !frames.is_empty() {
-                map.insert("reference_frame_ids".to_string(), Value::Array(frames));
-            }
-            insert_string(&mut map, "display_target", args.one("--display-target"));
-            let response = call_tool(client, config, "start_task", Value::Object(map)).await?;
+            let response =
+                call_tool(client, config, "start_task", task_start_args(&raw[1..])?).await?;
             print_tool_response(response, config, None)?;
         }
         other => return Err(format!("unknown task command '{other}'")),
     }
     Ok(())
+}
+
+fn task_start_args(raw: &[String]) -> Result<Value, String> {
+    let args = parse_command_args(
+        raw,
+        &[
+            "--task",
+            "--session",
+            "--session-id",
+            "--display-target",
+            "--frame",
+        ],
+        &["--orchestrate", "--direct"],
+    )?;
+    let task = args
+        .one("--task")
+        .map(str::to_string)
+        .or_else(|| {
+            if args.positional.is_empty() {
+                None
+            } else {
+                Some(args.positional.join(" "))
+            }
+        })
+        .ok_or_else(|| "task start requires a task".to_string())?;
+    let mut map = Map::new();
+    map.insert("task".to_string(), Value::String(task));
+    insert_string(
+        &mut map,
+        "session_id",
+        args.one("--session").or_else(|| args.one("--session-id")),
+    );
+    if args.has("--orchestrate") {
+        map.insert("orchestrate".to_string(), Value::Bool(true));
+    } else if args.has("--direct") {
+        map.insert("orchestrate".to_string(), Value::Bool(false));
+    }
+    let frames: Vec<Value> = args
+        .all("--frame")
+        .map(|v| Value::String(v.to_string()))
+        .collect();
+    if !frames.is_empty() {
+        map.insert("reference_frame_ids".to_string(), Value::Array(frames));
+    }
+    insert_string(&mut map, "display_target", args.one("--display-target"));
+    Ok(Value::Object(map))
 }
 
 async fn run_controller(
@@ -1628,7 +1644,7 @@ fn help_settings() {
 
 fn help_task() {
     println!(
-        "Usage: intendant ctl task start [--task TEXT] [--orchestrate|--direct] [--display-target TARGET] [--frame ID]\n\
+        "Usage: intendant ctl task start [--task TEXT] [--session ID] [--orchestrate|--direct] [--display-target TARGET] [--frame ID]\n\
 If --task is omitted, remaining positional text becomes the task."
     );
 }
@@ -1662,4 +1678,39 @@ fn help_audio() {
         "Usage: intendant ctl audio spawn --args JSON|@file|-\n\
 The JSON object is the spawn_live_audio parameter object."
     );
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn args(values: &[&str]) -> Vec<String> {
+        values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn task_start_args_accepts_session_flag_after_subcommand() {
+        let value = task_start_args(&args(&[
+            "--session",
+            "managed-session-1",
+            "--direct",
+            "continue",
+            "the",
+            "task",
+        ]))
+        .expect("task args should parse");
+
+        assert_eq!(
+            value.pointer("/session_id").and_then(Value::as_str),
+            Some("managed-session-1")
+        );
+        assert_eq!(
+            value.pointer("/task").and_then(Value::as_str),
+            Some("continue the task")
+        );
+        assert_eq!(
+            value.pointer("/orchestrate").and_then(Value::as_bool),
+            Some(false)
+        );
+    }
 }

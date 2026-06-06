@@ -4045,6 +4045,10 @@ pub struct SetVerbosityParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct StartTaskParams {
+    /// Optional target session. When present, route the text as a follow-up
+    /// turn for that managed session instead of starting a brand-new task.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
     /// The task description for the AI agent to execute.
     pub task: String,
     /// When true, use orchestration mode (spawns orchestrator + sub-agents)
@@ -4734,7 +4738,8 @@ impl IntendantServer {
             }
             "quit" => Ok(text_tool_result(self.quit().await)),
             "start_task" => {
-                let params = parse_params::<StartTaskParams>(args)?;
+                let params =
+                    parse_params::<StartTaskParams>(with_default_mcp_session_id(args, session_id))?;
                 Ok(text_tool_result(self.start_task(params).await))
             }
             "rewind_context" => {
@@ -5415,6 +5420,27 @@ impl IntendantServer {
         description = "Start a new task for the Intendant agent to execute. The agent will begin working on the task immediately. Only one task can run at a time — check get_status to see if a task is already running."
     )]
     async fn start_task(&self, Parameters(params): Parameters<StartTaskParams>) -> String {
+        let session_id = params
+            .session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .map(str::to_string);
+        if let Some(session_id) = session_id {
+            self.bus
+                .send(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id: Some(session_id),
+                    task: params.task,
+                    orchestrate: params.orchestrate,
+                    direct: None,
+                    reference_frame_ids: params.reference_frame_ids,
+                    display_target: params.display_target,
+                    attachments: vec![],
+                    follow_up_id: None,
+                }));
+            return "ok (task dispatched)".to_string();
+        }
+
         // If reference_frame_ids are present, dispatch as a CU task via ControlMsg
         // so the main loop can route it to the ephemeral CU runner.
         if !params.reference_frame_ids.is_empty() || params.display_target.is_some() {
@@ -7949,6 +7975,84 @@ mod tests {
             assert!(text.contains("rewind_context failed"), "got: {text}");
             assert!(text.contains("call list_rewind_anchors"), "got: {text}");
             result_task.await.unwrap();
+        });
+    }
+
+    #[test]
+    fn start_task_defaults_to_http_session_id_and_dispatches_targeted_start() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus.clone());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue existing managed session"
+                    }),
+                    Some("managed-session-1"),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch");
+            assert!(!result.is_error.unwrap_or(false));
+            assert!(format!("{result:?}").contains("ok (task dispatched)"));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id,
+                    task,
+                    orchestrate,
+                    direct,
+                    reference_frame_ids,
+                    display_target,
+                    attachments,
+                    follow_up_id,
+                }))) => {
+                    assert_eq!(session_id.as_deref(), Some("managed-session-1"));
+                    assert_eq!(task, "continue existing managed session");
+                    assert_eq!(orchestrate, None);
+                    assert_eq!(direct, None);
+                    assert!(reference_frame_ids.is_empty());
+                    assert!(display_target.is_none());
+                    assert!(attachments.is_empty());
+                    assert!(follow_up_id.is_none());
+                }
+                other => panic!("expected targeted StartTask control event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn start_task_without_session_still_requires_launcher_for_new_task() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "start a new task"
+                    }),
+                    None,
+                    None,
+                )
+                .await
+                .expect("tool should return a text result");
+            assert!(
+                format!("{result:?}").contains("Cannot start task: no task launcher configured")
+            );
         });
     }
 
