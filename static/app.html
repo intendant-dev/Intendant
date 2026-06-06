@@ -8170,6 +8170,7 @@ body.display-fullscreen-open {
           <button class="station-hotspot" type="button" data-station-hotspot="system:sessions" title="Sessions"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:peers" title="Peers and displays"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:controls" title="Control surfaces"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:view" title="Station view"></button>
         </div>
         <aside id="station-dock" class="station-dock hidden" aria-live="polite">
           <div class="station-dock-header">
@@ -12685,8 +12686,66 @@ function stationApplyDockText(controlId, value, handler, rerenderSection = 'over
   stationRenderControlsDock(rerenderSection);
 }
 
+function stationExternalBackendOptions() {
+  return [
+    ['', 'Internal agent'],
+    ['codex', 'Codex'],
+    ['claude-code', 'Claude Code'],
+    ['gemini', 'Gemini CLI'],
+  ];
+}
+
+function stationApplyExternalBackendFromDock(value) {
+  const backend = normalizeAgentId(value);
+  const select = document.getElementById('set-external-agent');
+  if (select) select.value = backend || '';
+  currentExternalAgent = backend;
+  controlCurrentBackend = backend;
+  newSessionConfiguredAgent = backend;
+  renderNewSessionAgentControls();
+  applyMainBackendStatus();
+  dispatchControlMsg({ action: 'set_external_agent', agent: backend || null });
+  showControlToast?.('success', `External agent: ${backend ? prettyAgentName(backend) : 'Internal agent'}`);
+  stationRenderControlsDock('launch');
+}
+
+function stationRenderExternalBackendEditor(parent, controls) {
+  const section = stationDockSection(parent, 'External backend');
+  stationDockRow(section, 'active', controls.backend || 'internal');
+  stationDockRow(section, 'new session', controls.newSessionAgent || 'internal');
+  const backend = stationDockSelect(
+    section,
+    'Backend',
+    normalizeAgentId(controlCurrentBackend || currentExternalAgent || newSessionConfiguredAgent || ''),
+    stationExternalBackendOptions(),
+    { id: 'station-external-backend' },
+  );
+  backend.addEventListener('change', ev => stationApplyExternalBackendFromDock(ev.target.value));
+  stationDockActions(section, [
+    { label: 'Use internal', primary: !controls.backend || controls.backend === 'none', onClick: () => stationApplyExternalBackendFromDock('') },
+    { label: 'Use Codex', primary: controls.backend === 'codex', onClick: () => stationApplyExternalBackendFromDock('codex') },
+    { label: 'Use Claude', primary: controls.backend === 'claude-code', onClick: () => stationApplyExternalBackendFromDock('claude-code') },
+    { label: 'Use Gemini', primary: controls.backend === 'gemini', onClick: () => stationApplyExternalBackendFromDock('gemini') },
+  ]);
+}
+
+function stationApplyCodexCommandFromDock(value) {
+  const command = String(value || '').trim() || 'codex';
+  const settingsInput = document.getElementById('set-codex-command');
+  if (settingsInput) settingsInput.value = command;
+  controlCodexConfig.command = command;
+  newSessionAgentCommands.codex = command;
+  renderNewSessionAgentControls();
+  dispatchControlMsg({ action: 'set_codex_command', command });
+  showControlToast?.('success', `Codex binary: ${command}`);
+  stationRenderControlsDock('launch');
+}
+
 function stationRenderCodexDefaultsEditor(parent) {
   const section = stationDockSection(parent, 'Codex defaults');
+  const command = stationDockInput(section, 'Binary', controlCodexConfig.command || commandDefaultForNewSessionAgent('codex') || 'codex', { id: 'station-codex-command', placeholder: 'codex or /absolute/path/codex' });
+  stationDockCommitOnEnter(command, ev => stationApplyCodexCommandFromDock(ev.target.value));
+
   const sandbox = stationDockSelect(section, 'Sandbox', controlCodexConfig.sandbox || 'workspace-write', [
     ['read-only', 'read-only'],
     ['workspace-write', 'workspace-write'],
@@ -12819,8 +12878,10 @@ function stationRenderControlsDock(sectionName = 'overview') {
   ]);
 
   stationRenderLiveStatusSection(body, controls);
+  stationRenderExternalBackendEditor(body, controls);
 
   const launch = stationDockSection(body, 'Launch defaults');
+  stationDockRow(launch, 'backend', controls.backend || 'internal');
   stationDockRow(launch, 'binary', controls.command || '--');
   stationDockRow(launch, 'model', controls.model || '--');
   stationDockRow(launch, 'approval', controls.approvalPolicy || '--');
