@@ -107,6 +107,47 @@ capture_signal_diagnostics() {
   fi
 }
 
+child_pids_of() {
+  local parent="$1"
+  if command -v pgrep >/dev/null 2>&1; then
+    pgrep -P "$parent" 2>/dev/null || true
+  else
+    ps -eo pid=,ppid= 2>/dev/null | awk -v p="$parent" '$2 == p { print $1 }' || true
+  fi
+}
+
+descendant_pids_of() {
+  local root="$1"
+  local queue=("$root")
+  local idx=0
+  while [[ "$idx" -lt "${#queue[@]}" ]]; do
+    local parent="${queue[$idx]}"
+    idx=$((idx + 1))
+    local child
+    while IFS= read -r child; do
+      [[ -n "$child" ]] || continue
+      printf '%s\n' "$child"
+      queue+=("$child")
+    done < <(child_pids_of "$parent")
+  done
+}
+
+signal_process_tree() {
+  local signal="$1"
+  local root="$2"
+  local descendants=()
+  local pid idx
+  while IFS= read -r pid; do
+    [[ -n "$pid" ]] || continue
+    descendants+=("$pid")
+  done < <(descendant_pids_of "$root")
+
+  for ((idx=${#descendants[@]} - 1; idx >= 0; idx--)); do
+    kill "-$signal" "${descendants[$idx]}" >/dev/null 2>&1 || true
+  done
+  kill "-$signal" "$root" >/dev/null 2>&1 || true
+}
+
 write_status() {
   local state="$1"
   local exit_code="$2"
@@ -146,7 +187,7 @@ cleanup() {
   fi
   if [[ -n "$CODEX_PID" ]]; then
     if kill -0 "$CODEX_PID" >/dev/null 2>&1; then
-      kill -TERM "$CODEX_PID" >/dev/null 2>&1 || true
+      signal_process_tree TERM "$CODEX_PID"
       for _ in 1 2 3 4 5; do
         if ! kill -0 "$CODEX_PID" >/dev/null 2>&1; then
           break
@@ -154,7 +195,7 @@ cleanup() {
         sleep 1
       done
       if kill -0 "$CODEX_PID" >/dev/null 2>&1; then
-        kill -KILL "$CODEX_PID" >/dev/null 2>&1 || true
+        signal_process_tree KILL "$CODEX_PID"
       fi
     fi
     wait "$CODEX_PID" 2>/dev/null || true
@@ -248,12 +289,12 @@ HB_PID=$!
       if [[ -f "$STOP_FILE" ]]; then
         log_intervention "operator_request=stop codex_pid=$current_pid"
         rm -f "$STOP_FILE"
-        kill -TERM "$current_pid" >/dev/null 2>&1 || true
+        signal_process_tree TERM "$current_pid"
       fi
       if [[ -f "$ABORT_FILE" ]]; then
         log_intervention "operator_request=abort codex_pid=$current_pid"
         rm -f "$ABORT_FILE"
-        kill -KILL "$current_pid" >/dev/null 2>&1 || true
+        signal_process_tree KILL "$current_pid"
       fi
     fi
     sleep 2

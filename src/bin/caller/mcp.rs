@@ -1415,24 +1415,50 @@ fn live_codex_app_server_processes(
     root_pid: u32,
     known_codex_pids: &HashSet<u32>,
 ) -> Vec<serde_json::Value> {
-    let mut processes = Vec::new();
-    for pid in super::platform::process_descendants(root_pid) {
+    live_codex_app_server_pids(root_pid, known_codex_pids)
+        .into_iter()
+        .map(|pid| {
+            serde_json::json!({
+                "run_id": serde_json::Value::Null,
+                "pid": pid,
+                "source": "process_tree",
+            })
+        })
+        .collect()
+}
+
+fn live_codex_app_server_pids(root_pid: u32, known_codex_pids: &HashSet<u32>) -> Vec<u32> {
+    live_codex_app_server_pids_from_descendants(
+        super::platform::process_descendants(root_pid),
+        known_codex_pids,
+        super::platform::process_cmdline,
+    )
+}
+
+fn live_codex_app_server_pids_from_descendants<I, F>(
+    descendant_pids: I,
+    known_codex_pids: &HashSet<u32>,
+    mut cmdline_for_pid: F,
+) -> Vec<u32>
+where
+    I: IntoIterator<Item = u32>,
+    F: FnMut(u32) -> Option<String>,
+{
+    let mut pids = Vec::new();
+    for pid in descendant_pids {
         if known_codex_pids.contains(&pid) {
             continue;
         }
-        let Some(cmdline) = super::platform::process_cmdline(pid) else {
+        let Some(cmdline) = cmdline_for_pid(pid) else {
             continue;
         };
-        if !is_codex_app_server_cmdline(&cmdline) {
-            continue;
+        if is_codex_app_server_cmdline(&cmdline) {
+            pids.push(pid);
         }
-        processes.push(serde_json::json!({
-            "run_id": serde_json::Value::Null,
-            "pid": pid,
-            "source": "process_tree",
-        }));
     }
-    processes
+    pids.sort_unstable();
+    pids.dedup();
+    pids
 }
 
 fn is_codex_app_server_cmdline(cmdline: &str) -> bool {
@@ -1462,26 +1488,108 @@ fn normalize_intervention_mode(mode: &str) -> String {
     mode.trim().to_lowercase()
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControllerLoopInterventionMode {
+    Stop,
+    Abort,
+}
+
+impl ControllerLoopInterventionMode {
+    fn parse(mode: &str) -> Result<Self, String> {
+        match normalize_intervention_mode(mode).as_str() {
+            "stop" => Ok(Self::Stop),
+            "abort" => Ok(Self::Abort),
+            other => Err(format!(
+                "Invalid mode '{}': expected 'stop' or 'abort'",
+                other
+            )),
+        }
+    }
+
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Stop => "stop",
+            Self::Abort => "abort",
+        }
+    }
+
+    fn marker_name(self) -> &'static str {
+        match self {
+            Self::Stop => "request_stop",
+            Self::Abort => "request_abort",
+        }
+    }
+
+    fn process_signal(self) -> super::platform::ProcessSignal {
+        match self {
+            Self::Stop => super::platform::ProcessSignal::Terminate,
+            Self::Abort => super::platform::ProcessSignal::Kill,
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControllerLoopIntervention {
+    mode: ControllerLoopInterventionMode,
+    signaled_codex_app_server_pids: Vec<u32>,
+}
+
 fn request_loop_intervention_marker(
     loop_dir: &std::path::Path,
     mode: &str,
-) -> Result<&'static str, String> {
+) -> Result<ControllerLoopIntervention, String> {
+    request_loop_intervention_marker_for_root(loop_dir, mode, std::process::id())
+}
+
+fn request_loop_intervention_marker_for_root(
+    loop_dir: &std::path::Path,
+    mode: &str,
+    root_pid: u32,
+) -> Result<ControllerLoopIntervention, String> {
     std::fs::create_dir_all(loop_dir).map_err(|e| format!("Failed to create loop dir: {}", e))?;
-    match normalize_intervention_mode(mode).as_str() {
-        "stop" => {
-            std::fs::write(loop_dir.join("request_stop"), b"")
-                .map_err(|e| format!("Failed to write request_stop: {}", e))?;
-            Ok("stop")
-        }
-        "abort" => {
-            std::fs::write(loop_dir.join("request_abort"), b"")
-                .map_err(|e| format!("Failed to write request_abort: {}", e))?;
-            Ok("abort")
-        }
-        other => Err(format!(
-            "Invalid mode '{}': expected 'stop' or 'abort'",
-            other
-        )),
+    let mode = ControllerLoopInterventionMode::parse(mode)?;
+    let marker_name = mode.marker_name();
+    std::fs::write(loop_dir.join(marker_name), b"")
+        .map_err(|e| format!("Failed to write {}: {}", marker_name, e))?;
+
+    let signaled_codex_app_server_pids = signal_live_codex_app_server_processes(root_pid, mode);
+    Ok(ControllerLoopIntervention {
+        mode,
+        signaled_codex_app_server_pids,
+    })
+}
+
+fn signal_live_codex_app_server_processes(
+    root_pid: u32,
+    mode: ControllerLoopInterventionMode,
+) -> Vec<u32> {
+    let known_codex_pids = HashSet::new();
+    let pids = live_codex_app_server_pids(root_pid, &known_codex_pids);
+    for pid in &pids {
+        let _ = super::platform::signal_process_tree_now(*pid, mode.process_signal());
+    }
+    pids
+}
+
+fn controller_loop_intervention_report(
+    intervention: &ControllerLoopIntervention,
+) -> serde_json::Value {
+    serde_json::json!({
+        "mode": intervention.mode.as_str(),
+        "signaled_codex_app_server_count": intervention.signaled_codex_app_server_pids.len(),
+        "signaled_codex_app_server_pids": &intervention.signaled_codex_app_server_pids,
+    })
+}
+
+fn add_controller_loop_intervention_report(
+    status: &mut serde_json::Value,
+    intervention: &ControllerLoopIntervention,
+) {
+    if let Some(obj) = status.as_object_mut() {
+        obj.insert(
+            "intervention".to_string(),
+            controller_loop_intervention_report(intervention),
+        );
     }
 }
 
@@ -2523,13 +2631,14 @@ async fn handle_control_command_mcp(
         ControlMsg::InterveneControllerLoop { mode } => {
             let loop_dir = controller_loop_dir();
             match request_loop_intervention_marker(&loop_dir, &mode) {
-                Ok(applied) => {
-                    let data = collect_controller_loop_status(&loop_dir);
+                Ok(intervention) => {
+                    let mut data = collect_controller_loop_status(&loop_dir);
+                    add_controller_loop_intervention_report(&mut data, &intervention);
                     emit_control_result(
                         control_tx,
                         "intervene_controller_loop",
                         true,
-                        format!("{} requested", applied),
+                        format!("{} requested", intervention.mode.as_str()),
                         Some(data),
                     );
                 }
@@ -5953,12 +6062,17 @@ impl IntendantServer {
     ) -> String {
         let loop_dir = controller_loop_dir();
         match request_loop_intervention_marker(&loop_dir, &params.mode) {
-            Ok(mode) => serde_json::json!({
-                "ok": true,
-                "mode": mode,
-                "status": collect_controller_loop_status(&loop_dir),
-            })
-            .to_string(),
+            Ok(intervention) => {
+                let mut status = collect_controller_loop_status(&loop_dir);
+                add_controller_loop_intervention_report(&mut status, &intervention);
+                serde_json::json!({
+                    "ok": true,
+                    "mode": intervention.mode.as_str(),
+                    "intervention": controller_loop_intervention_report(&intervention),
+                    "status": status,
+                })
+                .to_string()
+            }
             Err(e) => serde_json::json!({
                 "ok": false,
                 "error": e,
@@ -9565,14 +9679,39 @@ mod tests {
     }
 
     #[test]
+    fn controller_loop_status_selects_process_tree_codex_app_servers() {
+        let known = HashSet::from([22]);
+        let cmdlines = std::collections::HashMap::from([
+            (
+                11,
+                "/opt/homebrew/bin/codex app-server -c foo=bar".to_string(),
+            ),
+            (22, "/home/user/bin/codex app-server".to_string()),
+            (33, "/home/user/bin/codex exec --json".to_string()),
+            (44, "/bin/sh -c sleep 60".to_string()),
+            (55, "/tmp/codex app-server".to_string()),
+        ]);
+
+        let pids =
+            live_codex_app_server_pids_from_descendants([55, 44, 33, 22, 11, 11], &known, |pid| {
+                cmdlines.get(&pid).cloned()
+            });
+
+        assert_eq!(pids, vec![11, 55]);
+    }
+
+    #[test]
     fn controller_loop_intervention_mode_validation() {
         let dir = tempdir().unwrap();
         let loop_dir = dir.path().join(".intendant/controller-loop");
-        let mode = request_loop_intervention_marker(&loop_dir, "stop").unwrap();
-        assert_eq!(mode, "stop");
+        let intervention =
+            request_loop_intervention_marker_for_root(&loop_dir, "stop", u32::MAX).unwrap();
+        assert_eq!(intervention.mode.as_str(), "stop");
+        assert!(intervention.signaled_codex_app_server_pids.is_empty());
         assert!(loop_dir.join("request_stop").exists());
 
-        let err = request_loop_intervention_marker(&loop_dir, "bad").unwrap_err();
+        let err =
+            request_loop_intervention_marker_for_root(&loop_dir, "bad", u32::MAX).unwrap_err();
         assert!(err.contains("expected 'stop' or 'abort'"));
     }
 

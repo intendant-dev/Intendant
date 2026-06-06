@@ -209,6 +209,12 @@ fn terminate_pid(pid: u32) {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProcessSignal {
+    Terminate,
+    Kill,
+}
+
 #[cfg(unix)]
 fn signal_pid(pid: u32, signal: libc::c_int) {
     let pid = match libc::pid_t::try_from(pid) {
@@ -227,6 +233,44 @@ fn signal_pid(pid: u32, signal: libc::c_int) {
 /// terminating processes.
 pub fn process_descendants(root_pid: u32) -> Vec<u32> {
     collect_descendants(root_pid, &process_parent_pairs())
+}
+
+/// Best-effort synchronous signal for an owned process and every visible
+/// descendant. `Terminate` maps to SIGTERM on Unix; `Kill` maps to SIGKILL.
+/// Windows has no equivalent graceful signal, so both modes terminate.
+pub fn signal_process_tree_now(root_pid: u32, signal: ProcessSignal) -> Vec<u32> {
+    if root_pid == 0 {
+        return Vec::new();
+    }
+
+    let mut targets = process_descendants(root_pid);
+    targets.push(root_pid);
+    targets.sort_unstable();
+    targets.dedup();
+    if targets.is_empty() {
+        return targets;
+    }
+
+    #[cfg(unix)]
+    {
+        let raw_signal = match signal {
+            ProcessSignal::Terminate => libc::SIGTERM,
+            ProcessSignal::Kill => libc::SIGKILL,
+        };
+        for pid in targets.iter().rev() {
+            signal_pid(*pid, raw_signal);
+        }
+    }
+
+    #[cfg(windows)]
+    {
+        let _ = signal;
+        for pid in targets.iter().rev() {
+            terminate_pid(*pid);
+        }
+    }
+
+    targets
 }
 
 /// Best-effort cleanup for child processes spawned by a long-running external
