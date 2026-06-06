@@ -10839,6 +10839,8 @@ let stationSelectedChangePath = '';
 let stationSelectedManagedAnchor = '';
 let stationSelectedManagedRecord = '';
 let stationManagedActionResult = '';
+let stationSessionConfigResult = { sessionId: '', text: '', kind: '' };
+const stationSessionConfigDrafts = new Map();
 let stationManagedDraft = {
   anchor: '',
   position: '',
@@ -13581,6 +13583,178 @@ function stationRenderCodexThreadActionsSection(parent, sessionId) {
   }));
 }
 
+function stationSessionConfigEditingFor(sessionOrId) {
+  const meta = sessionConfigMetadata(sessionOrId);
+  const sid = String(meta.session_id || meta.sessionId || sessionOrId || '').trim();
+  const source = sessionConfigSource(meta);
+  if (!sid || !source || source === 'intendant') return null;
+  return {
+    sessionId: sid,
+    source,
+    backendSessionId: String(meta.backendSessionId || meta.backend_session_id || '').trim(),
+    intendantSessionId: String(meta.intendantSessionId || meta.intendant_session_id || '').trim(),
+    meta,
+  };
+}
+
+function stationSessionConfigDraftFor(editing) {
+  if (!editing?.sessionId) return { command: '', managed: 'vanilla', archive: 'summary' };
+  const existing = stationSessionConfigDrafts.get(editing.sessionId);
+  if (existing) return existing;
+  const draft = {
+    command: sessionConfigCommand(editing.meta),
+    managed: editing.source === 'codex' ? sessionConfigManagedMode(editing.meta) : 'vanilla',
+    archive: editing.source === 'codex' ? sessionConfigArchiveMode(editing.meta) : 'summary',
+  };
+  stationSessionConfigDrafts.set(editing.sessionId, draft);
+  return draft;
+}
+
+function stationRememberSessionConfigDraft(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const prior = stationSessionConfigDrafts.get(sid) || {};
+  stationSessionConfigDrafts.set(sid, {
+    ...prior,
+    command: document.getElementById('station-session-config-command')?.value || '',
+    managed: document.getElementById('station-session-config-managed')?.value || prior.managed || 'vanilla',
+    archive: document.getElementById('station-session-config-archive')?.value || prior.archive || 'summary',
+  });
+}
+
+function stationSetSessionConfigResult(sessionId, text, kind = '') {
+  stationSessionConfigResult = {
+    sessionId: String(sessionId || '').trim(),
+    text: String(text || ''),
+    kind: String(kind || ''),
+  };
+}
+
+function stationSessionConfigPayload(editing, draft) {
+  const command = String(draft.command || '').trim();
+  const mode = draft.managed === 'managed' ? 'managed' : 'vanilla';
+  const archiveMode = normalizeContextArchiveMode(draft.archive || controlCodexConfig.context_archive);
+  return {
+    payload: {
+      action: 'configure_session_agent',
+      session_id: editing.sessionId,
+      source: editing.source,
+      ...(editing.backendSessionId ? { backend_session_id: editing.backendSessionId } : {}),
+      ...(editing.intendantSessionId ? { intendant_session_id: editing.intendantSessionId } : {}),
+      agent_command: command,
+      ...(editing.source === 'codex' ? {
+        codex_managed_context: mode,
+        codex_context_archive: archiveMode,
+      } : {}),
+    },
+    command,
+    mode,
+    archiveMode,
+  };
+}
+
+function stationSaveSessionConfigFromDock(sessionOrId, options = {}) {
+  const editing = stationSessionConfigEditingFor(sessionOrId);
+  if (!editing) {
+    showControlToast?.('error', 'Station launch config is only available for external-agent sessions');
+    return;
+  }
+  if (!app) {
+    stationSetSessionConfigResult(editing.sessionId, 'Dashboard is not connected to the server.', 'error');
+    stationRenderSessionsDock(editing.sessionId);
+    return;
+  }
+  stationRememberSessionConfigDraft(editing.sessionId);
+  const draft = stationSessionConfigDraftFor(editing);
+  const { payload, command, mode, archiveMode } = stationSessionConfigPayload(editing, draft);
+  try {
+    if (sessionConfigSavePending?.timeoutHandle) {
+      clearTimeout(sessionConfigSavePending.timeoutHandle);
+    }
+    const ids = Array.from(new Set([
+      editing.sessionId,
+      editing.backendSessionId,
+      editing.intendantSessionId,
+    ].map(id => String(id || '').trim()).filter(Boolean)));
+    sessionConfigSavePending = {
+      ids,
+      sessionId: editing.sessionId,
+      backendSessionId: editing.backendSessionId,
+      intendantSessionId: editing.intendantSessionId,
+      meta: {
+        sessionId: editing.sessionId,
+        source: editing.source,
+        backendSessionId: editing.backendSessionId,
+        intendantSessionId: editing.intendantSessionId,
+      },
+      command,
+      mode,
+      archiveMode,
+      restart: options.restart === true,
+      station: true,
+      timeoutHandle: setTimeout(() => {
+        const pending = sessionConfigSavePending;
+        if (!pending || pending.sessionId !== editing.sessionId) return;
+        sessionConfigSavePending = null;
+        setSessionConfigSaving(false);
+        stationSetSessionConfigResult(editing.sessionId, 'Save timed out before the daemon confirmed the launch config.', 'error');
+        stationRenderSessionsDock(editing.sessionId);
+        showControlToast?.('error', 'Launch config save timed out');
+      }, 15000),
+    };
+    setSessionConfigSaving(true);
+    stationSetSessionConfigResult(editing.sessionId, options.restart === true ? 'Saving launch config before restart...' : 'Saving launch config...', '');
+    dispatchControlMsg(payload);
+    stationRenderSessionsDock(editing.sessionId);
+  } catch (e) {
+    if (sessionConfigSavePending?.timeoutHandle) {
+      clearTimeout(sessionConfigSavePending.timeoutHandle);
+    }
+    sessionConfigSavePending = null;
+    setSessionConfigSaving(false);
+    stationSetSessionConfigResult(editing.sessionId, e?.message || 'Save failed', 'error');
+    stationRenderSessionsDock(editing.sessionId);
+  }
+}
+
+function stationRenderSessionConfigSection(parent, sessionOrId) {
+  const editing = stationSessionConfigEditingFor(sessionOrId);
+  if (!editing) return;
+  const draft = stationSessionConfigDraftFor(editing);
+  const pending = sessionConfigSavePending?.station && sessionConfigSavePending.sessionId === editing.sessionId;
+  const section = stationDockSection(parent, `${prettyAgentName(editing.source) || editing.source} launch config`);
+  stationDockRow(section, 'session', shortSessionId(editing.sessionId));
+  if (editing.backendSessionId) stationDockRow(section, 'backend', shortSessionId(editing.backendSessionId));
+  if (editing.intendantSessionId) stationDockRow(section, 'wrapper', shortSessionId(editing.intendantSessionId));
+  const command = stationDockInput(section, 'Binary', draft.command, {
+    id: 'station-session-config-command',
+    placeholder: commandDefaultForNewSessionAgent(editing.source) || 'Use global setting',
+  });
+  command.addEventListener('input', () => stationRememberSessionConfigDraft(editing.sessionId));
+  if (editing.source === 'codex') {
+    const managed = stationDockSelect(section, 'Managed context', draft.managed || 'vanilla', [
+      ['vanilla', 'vanilla'],
+      ['managed', 'managed'],
+    ], { id: 'station-session-config-managed' });
+    managed.addEventListener('change', () => stationRememberSessionConfigDraft(editing.sessionId));
+    const archive = stationDockSelect(section, 'Context replay', draft.archive || 'summary', [
+      ['summary', 'summary'],
+      ['exact', 'exact'],
+      ['off', 'off'],
+    ], { id: 'station-session-config-archive' });
+    archive.addEventListener('change', () => stationRememberSessionConfigDraft(editing.sessionId));
+  }
+  if (stationSessionConfigResult.sessionId === editing.sessionId && stationSessionConfigResult.text) {
+    const result = stationDockEmpty(section, stationSessionConfigResult.text);
+    if (stationSessionConfigResult.kind) result.classList.add(stationSessionConfigResult.kind);
+  }
+  stationDockActions(section, [
+    { label: pending ? 'Saving...' : 'Save', primary: true, disabled: pending, onClick: () => stationSaveSessionConfigFromDock(editing.sessionId) },
+    { label: pending ? 'Saving...' : 'Save + restart', disabled: pending, onClick: () => stationSaveSessionConfigFromDock(editing.sessionId, { restart: true }) },
+    { label: 'Legacy modal', route: true, onClick: () => openSessionConfigModal(editing.sessionId) },
+  ]);
+}
+
 function stationRenderSessionDetailSection(parent, sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -13596,6 +13770,7 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockRow(section, 'status', session?.status || meta.phase || '--');
   stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
+  stationRenderSessionConfigSection(parent, session);
   stationRenderCodexThreadActionsSection(parent, sid);
 }
 
@@ -14612,7 +14787,8 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'config') {
-    openSessionConfigModal(session);
+    stationRenderSessionsDock(stationSessionId(session) || sessionId);
+    setTimeout(() => document.getElementById('station-session-config-command')?.focus(), 0);
     return;
   }
   if (op === 'restart') {
@@ -22766,6 +22942,10 @@ function handleSessionConfigResult(result) {
       status.className = 'session-config-status error';
       status.textContent = message;
     }
+    if (pending.station) {
+      stationSetSessionConfigResult(pending.sessionId, message, 'error');
+      stationRenderSessionsDock(pending.sessionId);
+    }
     showControlToast('error', message);
     return;
   }
@@ -22778,6 +22958,14 @@ function handleSessionConfigResult(result) {
     status.textContent = `Saved, but the backend thread id ${shortSessionId(expectedBackend)} was not confirmed.`;
   }
   if (missingBackend) {
+    if (pending.station) {
+      stationSetSessionConfigResult(
+        pending.sessionId,
+        `Saved, but the backend thread id ${shortSessionId(expectedBackend)} was not confirmed.`,
+        'error'
+      );
+      stationRenderSessionsDock(pending.sessionId);
+    }
     showControlToast('error', `Launch config saved without backend id ${shortSessionId(expectedBackend)}`);
     return;
   }
@@ -22786,7 +22974,15 @@ function handleSessionConfigResult(result) {
   scheduleSessionsMetadataRefresh(200);
   showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
   const restartSessionId = pending.meta.sessionId;
+  if (pending.station) {
+    stationSetSessionConfigResult(
+      pending.sessionId,
+      pending.restart ? 'Launch config saved; restarting session.' : 'Launch config saved.',
+      'ok'
+    );
+  }
   closeSessionConfigModal();
+  if (pending.station) stationRenderSessionsDock(restartSessionId);
   if (pending.restart) restartSessionWindowAction(restartSessionId);
 }
 
