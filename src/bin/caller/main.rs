@@ -1116,6 +1116,7 @@ async fn create_external_agent(
     resume_session: Option<String>,
     mcp_session_id: Option<String>,
     codex_service_tier: Option<String>,
+    codex_home: Option<String>,
 ) -> Result<
     (
         Box<dyn external_agent::ExternalAgent>,
@@ -1139,6 +1140,11 @@ async fn create_external_agent(
             let context_archive = project::normalize_codex_context_archive(&cfg.context_archive);
             let (request_trace_dir, request_trace_temporary) =
                 codex_context_trace_dir(session_log, &context_archive);
+            let codex_home = codex_home
+                .as_deref()
+                .and_then(|home| crate::session_config::normalize_codex_home(Some(home)))
+                .or_else(crate::session_config::effective_codex_home)
+                .map(PathBuf::from);
             let opts = external_agent::codex::CodexAgentOptions {
                 reasoning_effort: reasoning_effort.clone(),
                 web_search: cfg.web_search,
@@ -1172,6 +1178,7 @@ async fn create_external_agent(
                 web_port,
                 mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
+                codex_home,
             };
             (agent, config)
         }
@@ -1214,6 +1221,7 @@ async fn create_external_agent(
                 web_port,
                 mcp_session_id: None,
                 resume_session: resume_session.clone(),
+                codex_home: None,
             };
             (agent, config)
         }
@@ -1243,6 +1251,7 @@ async fn create_external_agent(
                 web_port,
                 mcp_session_id: None,
                 resume_session: resume_session.clone(),
+                codex_home: None,
             };
             (agent, config)
         }
@@ -16160,6 +16169,7 @@ async fn run_with_presence(
                     None,
                     session_log_id(&session_log),
                     None,
+                    None,
                 )
                 .await
                 {
@@ -17234,6 +17244,7 @@ async fn run_external_agent_mode(
     attachments: UserAttachments,
     resume_session: Option<String>,
     codex_service_tier: Option<String>,
+    codex_home: Option<String>,
     control_session_id: Option<String>,
     emit_session_started_after_identity: bool,
     ready_for_thread_actions: Option<tokio::sync::oneshot::Sender<()>>,
@@ -17255,6 +17266,14 @@ async fn run_external_agent_mode(
     let resumed_external_session = resume_session.clone();
     let persist_model_responses_inline = control_session_id.is_some();
     let intendant_session_id = control_session_id.or_else(|| session_log_id(&session_log));
+    let effective_codex_home = if backend == external_agent::AgentBackend::Codex {
+        codex_home
+            .as_deref()
+            .and_then(|home| crate::session_config::normalize_codex_home(Some(home)))
+            .or_else(crate::session_config::effective_codex_home)
+    } else {
+        None
+    };
     let effective_codex_service_tier = if backend == external_agent::AgentBackend::Codex {
         codex_service_tier.clone().or_else(|| {
             project::normalize_codex_service_tier(
@@ -17280,6 +17299,7 @@ async fn run_external_agent_mode(
         resume_session,
         intendant_session_id.clone(),
         effective_codex_service_tier,
+        effective_codex_home.clone(),
     )
     .await
     {
@@ -17306,6 +17326,7 @@ async fn run_external_agent_mode(
     let mut session_agent_config = session_config::from_project(&backend, &project);
     if backend == external_agent::AgentBackend::Codex {
         session_agent_config.codex_service_tier = agent.service_tier().map(str::to_string);
+        session_agent_config.codex_home = effective_codex_home;
     }
     if let Err(e) = session_config::write_log_dir_config(&log_dir, &session_agent_config) {
         slog(&session_log, |l| {
@@ -21317,6 +21338,7 @@ async fn main() -> Result<(), CallerError> {
                             None,
                             None,
                             None,
+                            None,
                             false,
                             None,
                         )
@@ -22010,6 +22032,7 @@ async fn main() -> Result<(), CallerError> {
                         None,
                         None,
                         None,
+                        None,
                         false,
                         None,
                     )
@@ -22476,6 +22499,7 @@ async fn main() -> Result<(), CallerError> {
                 true, // headless mode
                 web_port_for_agent,
                 UserAttachments::default(),
+                None,
                 None,
                 None,
                 None,

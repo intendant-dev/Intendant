@@ -1094,6 +1094,7 @@ pub struct CodexAgent {
     web_port: Option<u16>,
     mcp_session_id: Option<String>,
     resume_session: Option<String>,
+    codex_home: Option<PathBuf>,
     /// Working directory used to resolve Codex project config for config/read.
     working_dir: Option<PathBuf>,
     /// Working directory where .codex/config.toml was written (for cleanup).
@@ -1425,6 +1426,12 @@ impl CodexAgent {
         }
     }
 
+    fn apply_codex_home_env(command: &mut tokio::process::Command, codex_home: Option<&Path>) {
+        if let Some(home) = codex_home {
+            command.env("CODEX_HOME", home);
+        }
+    }
+
     pub fn new(
         command: String,
         model: Option<String>,
@@ -1465,6 +1472,7 @@ impl CodexAgent {
             web_port,
             mcp_session_id: None,
             resume_session: None,
+            codex_home: None,
             working_dir: None,
             config_working_dir: None,
             request_trace_root: None,
@@ -4969,6 +4977,7 @@ impl ExternalAgent for CodexAgent {
         self.context_seen_request_ids.clear();
         self.mcp_session_id = config.mcp_session_id;
         self.resume_session = config.resume_session;
+        self.codex_home = config.codex_home;
         self.working_dir = Some(config.working_dir.clone());
 
         // Write .codex/config.toml for MCP-over-HTTP access to Intendant.
@@ -5071,6 +5080,7 @@ impl ExternalAgent for CodexAgent {
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::inherit());
         self.add_intendant_ctl_env(&mut command, effective_web_port);
+        Self::apply_codex_home_env(&mut command, self.codex_home.as_deref());
         if let Some(root) = &self.request_trace_root {
             std::fs::create_dir_all(root)?;
             command.env("CODEX_ROLLOUT_TRACE_ROOT", root);
@@ -8494,6 +8504,21 @@ error: could not compile `demo`
     }
 
     #[test]
+    fn codex_home_env_is_applied_to_spawned_command() {
+        let codex_home = PathBuf::from("/home/user/.codex-managed");
+        let mut command = crate::platform::spawn_command("codex");
+
+        CodexAgent::apply_codex_home_env(&mut command, Some(&codex_home));
+
+        let actual = command
+            .as_std()
+            .get_envs()
+            .find(|(key, _)| *key == std::ffi::OsStr::new("CODEX_HOME"))
+            .and_then(|(_, value)| value.map(PathBuf::from));
+        assert_eq!(actual.as_deref(), Some(codex_home.as_path()));
+    }
+
+    #[test]
     fn configured_standard_service_tier_serializes_null_once() {
         let mut agent = test_agent();
         agent.apply_configured_service_tier(Some("normal".to_string()));
@@ -8955,6 +8980,7 @@ error: could not compile `demo`
             web_port: Some(mcp_port),
             mcp_session_id: Some("test-session".to_string()),
             resume_session: None,
+            codex_home: None,
         };
 
         let _events = agent.initialize(config).await.unwrap();
