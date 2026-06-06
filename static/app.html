@@ -13762,6 +13762,83 @@ function stationRenderCodexThreadActionsSection(parent, sessionId) {
   }));
 }
 
+function stationExternalLiveThreadDescriptor(sessionOrId) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const meta = sessionConfigMetadata(session || sessionOrId);
+  const sid = String(meta.session_id || meta.sessionId || stationSessionId(session) || sessionOrId || '').trim();
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || '';
+  if (!sid || !source || source === 'intendant') return null;
+  const backendId = String(meta.backendSessionId || meta.backend_session_id || '').trim();
+  const wrapperId = String(meta.intendantSessionId || meta.intendant_session_id || '').trim();
+  const ids = Array.from(new Set([
+    sid,
+    backendId,
+    wrapperId,
+    ...relatedSessionIdsForSession(sid),
+    ...relatedSessionIdsForSession(backendId),
+    ...relatedSessionIdsForSession(wrapperId),
+  ].map(id => String(id || '').trim()).filter(Boolean)));
+  const liveId = ids.find(id => sessionWindows.has(id)) || '';
+  const targetId = resolvePromptTargetSessionId();
+  const target = !!targetId && ids.includes(targetId);
+  const canonicalId = backendId || sid;
+  const attachId = ids.find(id => canAttachSessionWindow(id)) || '';
+  const stopId = ids.find(id => sessionWindowStopAvailability(id).ok) || '';
+  const capabilities = stationSessionCapabilities(canonicalId)
+    || stationSessionCapabilities(sid)
+    || meta.capabilities
+    || {};
+  const liveWin = liveId ? sessionWindows.get(liveId) : null;
+  const liveMeta = liveId ? (sessionMetadataById.get(liveId) || {}) : {};
+  return {
+    sid,
+    source,
+    canonicalId,
+    backendId,
+    wrapperId,
+    liveId,
+    target,
+    attachId,
+    stopId,
+    detached: ids.some(id => sessionWindowIsDetached(id)),
+    phase: normalizeSessionPhase(liveWin?.phase || liveMeta.phase || meta.phase || session?.status || ''),
+    steer: capabilities ? capabilities.steer !== false : true,
+    interrupt: capabilities ? capabilities.interrupt !== false : true,
+    threadActions: Array.isArray(capabilities?.codexThreadActions)
+      ? capabilities.codexThreadActions.length
+      : null,
+  };
+}
+
+function stationRenderExternalLiveThreadSection(parent, sessionOrId) {
+  const live = stationExternalLiveThreadDescriptor(sessionOrId);
+  if (!live) return;
+  const section = stationDockSection(parent, 'External live thread');
+  stationDockRow(section, 'backend', prettyAgentName(live.source) || live.source);
+  stationDockRow(section, 'thread', shortSessionId(live.canonicalId));
+  if (live.wrapperId) stationDockRow(section, 'wrapper', shortSessionId(live.wrapperId));
+  stationDockRow(section, 'window', live.liveId ? shortSessionId(live.liveId) : 'not attached');
+  stationDockRow(section, 'phase', live.phase || 'idle');
+  stationDockRow(section, 'target', live.target ? 'prompt target' : '--');
+  stationDockRow(section, 'detached', live.detached ? 'yes' : 'no');
+  stationDockRow(section, 'steer', live.steer ? 'yes' : 'no');
+  stationDockRow(section, 'interrupt', live.interrupt ? 'yes' : 'no');
+  if (live.threadActions !== null) stationDockRow(section, 'thread actions', String(live.threadActions));
+  stationDockActions(section, [
+    live.liveId ? {
+      label: live.target ? 'Focus target' : 'Make target',
+      primary: !live.target,
+      onClick: () => {
+        focusSessionWindow(live.liveId);
+        stationRenderSessionsDock(live.canonicalId);
+      },
+    } : null,
+    live.attachId ? { label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: live.attachId }) } : null,
+    live.stopId ? { label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: live.stopId }) } : null,
+    { label: 'Copy thread', onClick: () => copyTextToClipboard(live.canonicalId) },
+  ]);
+}
+
 function stationSessionConfigEditingFor(sessionOrId) {
   const meta = sessionConfigMetadata(sessionOrId);
   const sid = String(meta.session_id || meta.sessionId || sessionOrId || '').trim();
@@ -13949,6 +14026,7 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockRow(section, 'status', session?.status || meta.phase || '--');
   stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
+  stationRenderExternalLiveThreadSection(parent, session);
   stationRenderSessionConfigSection(parent, session);
   stationRenderCodexThreadActionsSection(parent, sid);
 }
