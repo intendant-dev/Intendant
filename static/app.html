@@ -11085,6 +11085,8 @@ let stationCommandQuery = '';
 let stationHumanDraft = '';
 let stationSelectedContextPart = '';
 let stationSelectedChangePath = '';
+let stationChangesHistoryStatus = '';
+let stationChangesHistoryLoading = false;
 let stationSelectedManagedAnchor = '';
 let stationSelectedManagedRecord = '';
 let stationManagedActionResult = '';
@@ -13717,6 +13719,98 @@ async function stationCopyChangeDiffFromDock(pathArg = '') {
   showControlToast?.('info', `Copied diff for ${path}`);
 }
 
+function stationChangesHistoryRows() {
+  const rounds = Array.isArray(historyCache?.rounds) ? historyCache.rounds : [];
+  const current = historyCache?.current_head_id;
+  const currentIdx = rounds.findIndex(round => round.id === current);
+  return rounds.map((round, index) => {
+    const files = Array.isArray(round.files_changed) ? round.files_changed : [];
+    const summary = String(round.summary || '').trim();
+    return {
+      id: round.id,
+      label: `#${round.id}`,
+      files,
+      fileCount: files.length,
+      summary,
+      current: index === currentIdx,
+      future: currentIdx >= 0 && index > currentIdx,
+    };
+  });
+}
+
+async function stationRefreshChangesHistoryForDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
+  if (stationChangesHistoryLoading) return;
+  stationChangesHistoryLoading = true;
+  stationChangesHistoryStatus = 'Loading history...';
+  stationRenderChangesDock(selectedPath);
+  try {
+    if (typeof refreshHistory === 'function') await refreshHistory();
+    stationChangesHistoryStatus = historyCache ? '' : 'No rollback history is available for this session.';
+  } catch (err) {
+    stationChangesHistoryStatus = err?.message || 'History refresh failed.';
+  } finally {
+    stationChangesHistoryLoading = false;
+    stationRenderChangesDock(selectedPath);
+  }
+}
+
+async function stationCopyChangesRound(row) {
+  if (!row) return;
+  const text = [
+    `Round ${row.label}`,
+    row.current ? 'current head' : (row.future ? 'future after rollback' : 'history'),
+    row.summary,
+    row.files.length ? row.files.join('\n') : '',
+  ].filter(Boolean).join('\n\n');
+  await copyTextToClipboard(text);
+  showControlToast?.('info', `Copied ${row.label}`);
+}
+
+async function stationRunChangesRedoFromDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
+  if (typeof doRedo === 'function') await doRedo();
+  await stationRefreshChangesHistoryForDock(selectedPath);
+}
+
+async function stationRunChangesPruneFromDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
+  if (typeof doPrune === 'function') await doPrune();
+  await stationRefreshChangesHistoryForDock(selectedPath);
+}
+
+function stationRenderChangesHistorySection(body, selectedPath) {
+  const section = stationDockSection(body, 'History');
+  const rows = stationChangesHistoryRows();
+  const abandoned = Array.isArray(historyCache?.abandoned_branches) ? historyCache.abandoned_branches : [];
+  const current = historyCache?.current_head_id;
+  const currentIdx = rows.findIndex(row => row.id === current);
+  stationDockRow(section, 'rounds', rows.length ? String(rows.length) : '--');
+  stationDockRow(section, 'current', current == null ? '--' : `#${current}`);
+  stationDockRow(section, 'abandoned', String(abandoned.length));
+  if (stationChangesHistoryStatus) stationDockEmpty(section, stationChangesHistoryStatus);
+  stationDockActions(section, [
+    { label: stationChangesHistoryLoading ? 'Refreshing...' : 'Refresh history', primary: !rows.length, disabled: stationChangesHistoryLoading, onClick: () => stationRefreshChangesHistoryForDock(selectedPath) },
+    { label: 'Redo', disabled: currentIdx < 0 || currentIdx >= rows.length - 1, onClick: () => stationRunChangesRedoFromDock(selectedPath) },
+    { label: 'Prune', danger: true, disabled: !abandoned.length, onClick: () => stationRunChangesPruneFromDock(selectedPath) },
+  ]);
+  if (!rows.length) {
+    if (!stationChangesHistoryStatus) stationDockEmpty(section, 'Refresh history to load rollback rounds for this session.');
+    return;
+  }
+  for (const row of rows.slice(-8).reverse()) {
+    stationDockCard(section, {
+      title: row.label,
+      meta: [
+        row.current ? 'current' : (row.future ? 'future' : 'history'),
+        `${row.fileCount} file${row.fileCount === 1 ? '' : 's'}`,
+      ].join(' / '),
+      detail: row.summary || (row.files[0] || 'No summary for this round.'),
+      actions: [
+        { label: 'Roll back...', danger: true, disabled: row.current, onClick: () => doRollback?.(row.id) },
+        { label: 'Copy round', onClick: () => stationCopyChangesRound(row) },
+      ],
+    });
+  }
+}
+
 function stationRenderChangesDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
   stationSelectedChangePath = selectedPath || '';
   const changes = stationBuildChangesSummary();
@@ -13727,12 +13821,14 @@ function stationRenderChangesDock(selectedPath = stationSelectedChangePath || ac
   stationDockRow(overview, 'files', String(changes.count));
   stationDockRow(overview, 'lines', `+${stationCompactNumber(changes.totalAdded)} / -${stationCompactNumber(changes.totalRemoved)}`);
   stationDockActions(overview, [
-    { label: 'Refresh', primary: true, onClick: async () => { await refreshChangesList({ refreshActive: !!activeChangesFile, quiet: true }); stationRenderChangesDock(activeChangesFile || selectedPath); } },
+    { label: 'Refresh', primary: true, onClick: async () => { await refreshChangesList({ refreshActive: !!activeChangesFile, quiet: true }); if (typeof refreshHistory === 'function') await refreshHistory(); stationRenderChangesDock(activeChangesFile || selectedPath); } },
     { label: 'Copy paths', disabled: changes.count <= 0, onClick: stationCopyChangedPathsFromDock },
-    { label: 'Redo', onClick: () => { document.getElementById('redo-btn')?.click(); stationRenderChangesDock(selectedPath); } },
-    { label: 'Prune', danger: true, onClick: () => { document.getElementById('prune-btn')?.click(); stationRenderChangesDock(selectedPath); } },
+    { label: 'Redo', onClick: () => stationRunChangesRedoFromDock(selectedPath) },
+    { label: 'Prune', danger: true, onClick: () => stationRunChangesPruneFromDock(selectedPath) },
     stationDockRouteAction('Route changes tab', 'activity', 'changes'),
   ]);
+
+  stationRenderChangesHistorySection(body, selectedPath);
 
   const files = stationDockSection(body, 'Changed files');
   if (!changes.recent.length) {
@@ -16017,13 +16113,11 @@ function stationHandleChangesAction(action) {
     return;
   }
   if (op === 'redo') {
-    document.getElementById('redo-btn')?.click();
-    stationRenderChangesDock(activeChangesFile || path);
+    stationRunChangesRedoFromDock(activeChangesFile || path);
     return;
   }
   if (op === 'prune') {
-    document.getElementById('prune-btn')?.click();
-    stationRenderChangesDock(activeChangesFile || path);
+    stationRunChangesPruneFromDock(activeChangesFile || path);
     return;
   }
   if (op !== 'file' || !path) {
