@@ -2097,9 +2097,10 @@ body.context-focus-active {
 }
 .steer-strip.empty { display: none; }
 .steer-row {
-  display: flex;
-  align-items: center;
-  gap: 6px;
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  align-items: start;
+  gap: 2px 6px;
   font-style: italic;
   font-size: 12px;
   padding: 2px 6px;
@@ -2114,18 +2115,25 @@ body.context-focus-active {
 .steer-row.delivered { color: var(--green); border-left-color: var(--green); }
 .steer-row.failed { color: var(--red); border-left-color: var(--red); }
 .steer-row.fading { opacity: 0; }
-.steer-icon { margin-right: 4px; flex-shrink: 0; }
+.steer-icon {
+  grid-column: 1;
+  grid-row: 1 / span 2;
+}
 .steer-text {
-  flex: 1;
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
+  grid-column: 2;
+  min-width: 0;
+  max-height: 7.5em;
+  overflow: auto;
+  overflow-wrap: anywhere;
+  white-space: pre-wrap;
 }
 .steer-reason {
+  grid-column: 2;
   color: var(--overlay1);
   font-size: 11px;
   font-style: normal;
-  margin-left: 4px;
+  overflow-wrap: anywhere;
+  white-space: normal;
 }
 
 /* ── Phase Banner ── */
@@ -40926,8 +40934,13 @@ function onSteerStatusUpdate(id, text, status, reason) {
   // Icons chosen to match the WASM-side log lines so the strip and the log tell the same story.
   const iconByStatus = { pending: '\u23F3', accepted: '\u21AA', queued: '\u23F0', delivered: '\u2713', failed: '\u2715' };
   el.querySelector('.steer-icon').textContent = iconByStatus[status] || '';
-  el.querySelector('.steer-text').textContent = text || '';
-  el.querySelector('.steer-reason').textContent = reason ? ('— ' + reason) : '';
+  const textNode = el.querySelector('.steer-text');
+  const reasonNode = el.querySelector('.steer-reason');
+  textNode.textContent = text || '';
+  textNode.title = text || '';
+  reasonNode.textContent = reason ? ('— ' + reason) : '';
+  reasonNode.title = reason || '';
+  el.title = [text, reason].filter(Boolean).join('\n\n');
   strip.classList.remove('empty');
 
   // Clear any in-flight fade timer — a fresh status update preempts it.

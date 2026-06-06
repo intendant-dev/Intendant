@@ -2425,6 +2425,34 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         } => {
             log.task_complete_for_session(session_id.as_deref(), reason, summary.as_deref());
         }
+        AppEvent::SteerRequested {
+            session_id,
+            text,
+            id,
+        } => {
+            log.steer_requested(session_id.as_deref(), id, text);
+        }
+        AppEvent::SteerQueued {
+            session_id,
+            id,
+            reason,
+        } => {
+            log.steer_queued(session_id.as_deref(), id, reason);
+        }
+        AppEvent::SteerAccepted {
+            session_id,
+            id,
+            reason,
+        } => {
+            log.steer_accepted(session_id.as_deref(), id, reason);
+        }
+        AppEvent::SteerDelivered {
+            session_id,
+            id,
+            mid_turn,
+        } => {
+            log.steer_delivered(session_id.as_deref(), id, *mid_turn);
+        }
         AppEvent::InterruptRequested { .. } => {
             log.info("Interrupt requested");
         }
@@ -4078,6 +4106,47 @@ mod tests {
         let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         assert!(!contents.contains("\"event\":\"agent_output\""));
         assert!(!contents.contains("already logged inline"));
+    }
+
+    #[test]
+    fn session_log_writer_persists_steer_lifecycle() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        let shared = std::sync::Arc::new(std::sync::Mutex::new(log));
+        let full_text = "Quick interjectory note:\nPause before merge/push.\nKeep the full body.";
+
+        write_event_to_session_log(
+            &shared,
+            &AppEvent::SteerRequested {
+                session_id: Some("thread-1".to_string()),
+                text: full_text.to_string(),
+                id: "steer-1".to_string(),
+            },
+        );
+        write_event_to_session_log(
+            &shared,
+            &AppEvent::SteerQueued {
+                session_id: Some("thread-1".to_string()),
+                id: "steer-1".to_string(),
+                reason: "native steer failed".to_string(),
+            },
+        );
+        write_event_to_session_log(
+            &shared,
+            &AppEvent::SteerDelivered {
+                session_id: Some("thread-1".to_string()),
+                id: "steer-1".to_string(),
+                mid_turn: false,
+            },
+        );
+        drop(shared);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        assert!(contents.contains("\"event\":\"steer_requested\""));
+        assert!(contents.contains("\"event\":\"steer_queued\""));
+        assert!(contents.contains("\"event\":\"steer_delivered\""));
+        assert!(contents.contains("Keep the full body."));
     }
 
     #[test]

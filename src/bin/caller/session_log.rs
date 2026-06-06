@@ -133,6 +133,16 @@ fn update_session_meta_after_round_complete(
     }
 }
 
+fn log_preview(text: &str, max_chars: usize) -> String {
+    let mut chars = text.chars();
+    let preview: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        format!("{preview}...")
+    } else {
+        preview
+    }
+}
+
 pub fn mark_registered_session_logs_interrupted_now() -> Vec<PathBuf> {
     let dirs: Vec<PathBuf> = lock_open_session_log_dirs().iter().cloned().collect();
     let mut updated = Vec::new();
@@ -1221,6 +1231,137 @@ impl SessionLog {
             file: None,
             file2: None,
         });
+    }
+
+    fn steer_event(
+        &mut self,
+        event: &str,
+        level: &str,
+        session_id: Option<&str>,
+        id: &str,
+        text: Option<&str>,
+        reason: Option<&str>,
+        status: &str,
+        mid_turn: Option<bool>,
+    ) {
+        let mut data = serde_json::Map::new();
+        if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+            data.insert(
+                "session_id".to_string(),
+                serde_json::Value::String(session_id.to_string()),
+            );
+        }
+        data.insert("id".to_string(), serde_json::Value::String(id.to_string()));
+        data.insert(
+            "status".to_string(),
+            serde_json::Value::String(status.to_string()),
+        );
+        if let Some(text) = text {
+            data.insert(
+                "text".to_string(),
+                serde_json::Value::String(text.to_string()),
+            );
+        }
+        if let Some(reason) = reason {
+            data.insert(
+                "reason".to_string(),
+                serde_json::Value::String(reason.to_string()),
+            );
+        }
+        if let Some(mid_turn) = mid_turn {
+            data.insert("mid_turn".to_string(), serde_json::Value::Bool(mid_turn));
+        }
+
+        let message = match event {
+            "steer_requested" => {
+                format!(
+                    "Steer requested: {}",
+                    log_preview(text.unwrap_or_default(), 160)
+                )
+            }
+            "steer_queued" => reason
+                .map(|reason| format!("Steer queued: {reason}"))
+                .unwrap_or_else(|| "Steer queued".to_string()),
+            "steer_accepted" => reason
+                .map(|reason| format!("Steer accepted: {reason}"))
+                .unwrap_or_else(|| "Steer accepted".to_string()),
+            "steer_delivered" => {
+                let where_ = if mid_turn.unwrap_or(false) {
+                    "mid-turn"
+                } else {
+                    "at turn boundary"
+                };
+                format!("Steer delivered ({where_})")
+            }
+            _ => format!("Steer {status}"),
+        };
+
+        self.emit(LogEvent {
+            ts: Self::ts(),
+            turn: if self.current_turn > 0 {
+                Some(self.current_turn)
+            } else {
+                None
+            },
+            event: event.to_string(),
+            level: Some(level.to_string()),
+            message: Some(message),
+            data: Some(serde_json::Value::Object(data)),
+            file: None,
+            file2: None,
+        });
+    }
+
+    pub fn steer_requested(&mut self, session_id: Option<&str>, id: &str, text: &str) {
+        self.steer_event(
+            "steer_requested",
+            "info",
+            session_id,
+            id,
+            Some(text),
+            None,
+            "pending",
+            None,
+        );
+    }
+
+    pub fn steer_queued(&mut self, session_id: Option<&str>, id: &str, reason: &str) {
+        self.steer_event(
+            "steer_queued",
+            "warn",
+            session_id,
+            id,
+            None,
+            Some(reason),
+            "queued",
+            None,
+        );
+    }
+
+    pub fn steer_accepted(&mut self, session_id: Option<&str>, id: &str, reason: &str) {
+        self.steer_event(
+            "steer_accepted",
+            "info",
+            session_id,
+            id,
+            None,
+            Some(reason),
+            "accepted",
+            None,
+        );
+    }
+
+    pub fn steer_delivered(&mut self, session_id: Option<&str>, id: &str, mid_turn: bool) {
+        self.steer_event(
+            "steer_delivered",
+            "info",
+            session_id,
+            id,
+            None,
+            None,
+            "delivered",
+            Some(mid_turn),
+        );
     }
 
     /// Log a new session starting (MCP multi-task).
@@ -3002,6 +3143,89 @@ pub fn session_log_entry_to_app_event(
                 summary,
             })
         }
+        "steer_requested" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let text = data
+                .and_then(|d| d.get("text"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            Some(AppEvent::SteerRequested {
+                session_id,
+                text,
+                id,
+            })
+        }
+        "steer_queued" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reason = data
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message.strip_prefix("Steer queued: ").unwrap_or(message))
+                .to_string();
+            Some(AppEvent::SteerQueued {
+                session_id,
+                id,
+                reason,
+            })
+        }
+        "steer_accepted" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reason = data
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message.strip_prefix("Steer accepted: ").unwrap_or(message))
+                .to_string();
+            Some(AppEvent::SteerAccepted {
+                session_id,
+                id,
+                reason,
+            })
+        }
+        "steer_delivered" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let mid_turn = data
+                .and_then(|d| d.get("mid_turn"))
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false);
+            Some(AppEvent::SteerDelivered {
+                session_id,
+                id,
+                mid_turn,
+            })
+        }
         "session_started" => {
             let session_id = data
                 .and_then(|d| d.get("session_id"))
@@ -3631,6 +3855,7 @@ pub fn recent_entries(log_dir: &std::path::Path, count: usize) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event::AppEvent;
 
     #[test]
     fn append_turn_file_accumulates_with_separator() {
@@ -4327,6 +4552,62 @@ mod tests {
     }
 
     #[test]
+    fn steer_lifecycle_logs_full_text_and_status() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let text = "Quick interjectory note:\nPause before any Station merge/push. Preserve the exact full prompt for recovery.";
+        log.steer_requested(Some("thread-1"), "steer-1", text);
+        log.steer_queued(
+            Some("thread-1"),
+            "steer-1",
+            "codex native mid-turn steering failed",
+        );
+        log.steer_delivered(Some("thread-1"), "steer-1", false);
+        drop(log);
+
+        let requested = read_last_event(&log_dir, "steer_requested");
+        assert_eq!(requested["data"]["session_id"], "thread-1");
+        assert_eq!(requested["data"]["id"], "steer-1");
+        assert_eq!(requested["data"]["text"], text);
+        assert_eq!(requested["data"]["status"], "pending");
+
+        let queued = read_last_event(&log_dir, "steer_queued");
+        assert_eq!(queued["level"], "warn");
+        assert_eq!(
+            queued["data"]["reason"],
+            "codex native mid-turn steering failed"
+        );
+
+        let delivered = read_last_event(&log_dir, "steer_delivered");
+        assert_eq!(delivered["data"]["mid_turn"], false);
+    }
+
+    #[test]
+    fn rt_steer_requested_preserves_full_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let mut log = SessionLog::open(log_dir.clone()).unwrap();
+        let text = "Quick interjectory note:\nPause before any Station merge/push.\nDo not lose this line.";
+        log.steer_requested(Some("thread-1"), "steer-1", text);
+        drop(log);
+
+        let entry = read_last_event(&log_dir, "steer_requested");
+        match session_log_entry_to_app_event(&entry, &log_dir).unwrap() {
+            AppEvent::SteerRequested {
+                session_id,
+                id,
+                text: replayed,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("thread-1"));
+                assert_eq!(id, "steer-1");
+                assert_eq!(replayed, text);
+            }
+            other => panic!("expected SteerRequested, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn voice_log_without_tool_context() {
         let dir = tempfile::tempdir().unwrap();
         let log_dir = dir.path().join("session");
@@ -4526,8 +4807,6 @@ mod tests {
     // parses the resulting line, runs it through the inverse function,
     // and asserts the reconstructed AppEvent matches expectations.
     // ------------------------------------------------------------------
-
-    use crate::event::AppEvent;
 
     /// Helper: drop `log`, read session.jsonl, and return the last entry
     /// whose `event` field matches `event_type`.
