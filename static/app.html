@@ -11089,6 +11089,8 @@ let stationSelectedManagedAnchor = '';
 let stationSelectedManagedRecord = '';
 let stationManagedActionResult = '';
 let stationSessionConfigResult = { sessionId: '', text: '', kind: '' };
+let stationSessionRenameResult = { sessionId: '', text: '', kind: '' };
+const stationSessionRenameDrafts = new Map();
 const stationSessionConfigDrafts = new Map();
 let stationManagedDraft = {
   anchor: '',
@@ -14288,6 +14290,116 @@ function stationRenderCodexThreadActionsSection(parent, sessionId, sessionOrMeta
   }));
 }
 
+function stationSessionRenameEditingFor(sessionOrId) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  if (!sid) return null;
+  const meta = sessionConfigMetadata(session || sid);
+  const source = String(
+    session?.backend_source ||
+    session?.backendSource ||
+    meta.backendSource ||
+    meta.backend_source ||
+    session?.source ||
+    meta.source ||
+    'intendant'
+  ).trim() || 'intendant';
+  const backendSessionId = String(
+    session?.backend_session_id ||
+    session?.backendSessionId ||
+    meta.backendSessionId ||
+    meta.backend_session_id ||
+    ''
+  ).trim();
+  return {
+    sessionId: sid,
+    source,
+    backendSessionId,
+    currentName: compactSessionText(session?.name || meta.name || ''),
+  };
+}
+
+function stationSessionRenameDraftFor(editing) {
+  if (!editing?.sessionId) return '';
+  if (stationSessionRenameDrafts.has(editing.sessionId)) {
+    return stationSessionRenameDrafts.get(editing.sessionId);
+  }
+  const draft = editing.currentName || '';
+  stationSessionRenameDrafts.set(editing.sessionId, draft);
+  return draft;
+}
+
+function stationRememberSessionRenameDraft(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  stationSessionRenameDrafts.set(sid, document.getElementById('station-session-rename-name')?.value || '');
+}
+
+function stationSetSessionRenameResult(sessionId, text, kind = '') {
+  stationSessionRenameResult = {
+    sessionId: String(sessionId || '').trim(),
+    text: String(text || ''),
+    kind: String(kind || ''),
+  };
+}
+
+function stationSaveSessionRenameFromDock(sessionOrId) {
+  const editing = stationSessionRenameEditingFor(sessionOrId);
+  if (!editing) {
+    showControlToast?.('error', 'Station rename needs a selected session');
+    return;
+  }
+  if (!app) {
+    stationSetSessionRenameResult(editing.sessionId, 'Dashboard is not connected to the server.', 'error');
+    stationRenderSessionsDock(editing.sessionId);
+    return;
+  }
+  stationRememberSessionRenameDraft(editing.sessionId);
+  const name = String(stationSessionRenameDrafts.get(editing.sessionId) || '').trim();
+  if (!name) {
+    stationSetSessionRenameResult(editing.sessionId, 'Session name is required.', 'error');
+    stationRenderSessionsDock(editing.sessionId);
+    setTimeout(() => document.getElementById('station-session-rename-name')?.focus(), 0);
+    return;
+  }
+  stationSetSessionRenameResult(editing.sessionId, 'Saving session name...', '');
+  dispatchControlMsg({
+    action: 'rename_session',
+    session_id: editing.sessionId,
+    source: editing.source,
+    ...(editing.backendSessionId ? { backend_session_id: editing.backendSessionId } : {}),
+    name,
+  });
+  stationRenderSessionsDock(editing.sessionId);
+}
+
+function stationRenderSessionRenameSection(parent, sessionOrId) {
+  const editing = stationSessionRenameEditingFor(sessionOrId);
+  if (!editing) return;
+  const draft = stationSessionRenameDraftFor(editing);
+  const section = stationDockSection(parent, 'Session name');
+  stationDockRow(section, 'source', editing.source || 'intendant');
+  stationDockRow(section, 'session', shortSessionId(editing.sessionId));
+  const input = stationDockInput(section, 'Name', draft, {
+    id: 'station-session-rename-name',
+    placeholder: 'Operator label for this session',
+  });
+  input.addEventListener('input', () => stationRememberSessionRenameDraft(editing.sessionId));
+  input.addEventListener('keydown', ev => {
+    if (ev.key !== 'Enter') return;
+    ev.preventDefault();
+    stationSaveSessionRenameFromDock(editing.sessionId);
+  });
+  if (stationSessionRenameResult.sessionId === editing.sessionId && stationSessionRenameResult.text) {
+    const result = stationDockEmpty(section, stationSessionRenameResult.text);
+    if (stationSessionRenameResult.kind) result.classList.add(stationSessionRenameResult.kind);
+  }
+  stationDockActions(section, [
+    { label: 'Save name', primary: true, onClick: () => stationSaveSessionRenameFromDock(editing.sessionId) },
+    { label: 'Legacy modal', route: true, onClick: () => requestSessionRename(sessionOrId) },
+  ]);
+}
+
 function stationExternalLiveThreadDescriptor(sessionOrId) {
   const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
   const meta = sessionConfigMetadata(session || sessionOrId);
@@ -14584,6 +14696,7 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockRow(section, 'status', session?.status || meta.phase || '--');
   stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
+  stationRenderSessionRenameSection(parent, session);
   stationRenderSessionCleanupSection(parent, session);
   const live = stationRenderExternalLiveThreadSection(parent, session);
   stationRenderSessionConfigSection(parent, session);
@@ -15693,7 +15806,8 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'rename') {
-    requestSessionRename(session);
+    stationRenderSessionsDock(stationSessionId(session) || sessionId);
+    setTimeout(() => document.getElementById('station-session-rename-name')?.focus(), 0);
     return;
   }
   if (op === 'hide') {
@@ -19958,12 +20072,16 @@ function handleSessionRenameResult(evt) {
   if (evt.success) {
     const name = compactSessionText(evt.name);
     if (sid && name) applySessionRenameToUi(sid, evt.source || '', name);
+    if (sid && name) stationSessionRenameDrafts.set(sid, name);
+    stationSetSessionRenameResult(sid, evt.message || `Renamed session to ${name}`, 'success');
     refreshSessionWindowMetadata(600);
     scheduleSessionsMetadataRefresh(200);
     closeSessionRenameModalIfMatches(sid);
   } else {
+    stationSetSessionRenameResult(sid, `Rename session failed: ${evt.message}`, 'error');
     showSessionRenameStatus(`Rename session failed: ${evt.message}`, 'error', sid);
   }
+  if (stationDockState.kind === 'sessions' && sid) stationRenderSessionsDock(sid);
   showControlToast(
     evt.success ? 'success' : 'error',
     evt.success ? evt.message : `Rename session failed: ${evt.message}`
