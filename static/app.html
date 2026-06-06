@@ -506,6 +506,30 @@ html, body {
   outline: none;
   border-color: var(--blue);
 }
+.station-command-shortcuts {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 6px;
+}
+.station-command-chip {
+  min-width: 0;
+  height: 24px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: rgba(49, 50, 68, 0.74);
+  color: var(--subtext0);
+  font-size: 11px;
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 7px;
+}
+.station-command-chip:hover,
+.station-command-chip:focus {
+  border-color: var(--sapphire);
+  color: var(--text);
+}
 .station-command-results {
   display: grid;
   grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -8253,7 +8277,13 @@ body.display-fullscreen-open {
               <button type="button" data-station-dock-nav="system:view">View</button>
             </nav>
             <div class="station-command">
-              <input id="station-command-input" type="search" autocomplete="off" spellcheck="false" placeholder="Find Station command...">
+              <input id="station-command-input" type="search" autocomplete="off" spellcheck="false" placeholder="Find Station command... / or Ctrl+K">
+              <div class="station-command-shortcuts" aria-label="Station quick commands">
+                <button class="station-command-chip" type="button" data-station-command-chip="send">Send</button>
+                <button class="station-command-chip" type="button" data-station-command-chip="session">Session</button>
+                <button class="station-command-chip" type="button" data-station-command-chip="display">Display</button>
+                <button class="station-command-chip" type="button" data-station-command-chip="managed">Managed</button>
+              </div>
               <div id="station-command-results" class="station-command-results" hidden></div>
             </div>
           </div>
@@ -11049,6 +11079,53 @@ function stationRunCommand(entry) {
   entry?.run?.();
 }
 
+function stationFocusCommandSearch(target = '') {
+  if (target) {
+    stationHandleHotspot(target);
+  } else {
+    const dock = document.getElementById('station-dock');
+    if (!dock || dock.classList.contains('hidden')) {
+      stationHandleHotspot(stationDockSystemTarget(stationCurrentDockKind()) || 'system:controls');
+    }
+  }
+  requestAnimationFrame(() => {
+    const input = document.getElementById('station-command-input');
+    if (!input) return;
+    input.focus();
+    input.select();
+    stationRenderCommandResults();
+  });
+}
+
+function stationRunQuickCommand(kind) {
+  switch (String(kind || '')) {
+    case 'send': {
+      const input = document.getElementById('activity-task-input');
+      if (input?.value?.trim()) {
+        stationHandleActivityAction({ action: 'send' });
+      } else {
+        stationHandleHotspot('system:controls');
+        setTimeout(() => input?.focus(), 0);
+      }
+      break;
+    }
+    case 'session':
+      stationHandleHotspot('system:sessions');
+      setTimeout(() => document.getElementById('station-launch-task')?.focus(), 0);
+      break;
+    case 'display':
+      stationHandleHotspot('system:peers');
+      setTimeout(() => document.getElementById('station-peer-display-id')?.focus(), 0);
+      break;
+    case 'managed':
+      stationRenderManagedDock('rewind');
+      setTimeout(() => document.getElementById('station-managed-anchor')?.focus(), 0);
+      break;
+    default:
+      stationFocusCommandSearch();
+  }
+}
+
 function stationRenderCommandResults() {
   const input = document.getElementById('station-command-input');
   const results = document.getElementById('station-command-results');
@@ -11183,6 +11260,30 @@ document.getElementById('station-command-input')?.addEventListener('keydown', ev
   if (!first) return;
   ev.preventDefault();
   stationRunCommand(first);
+});
+
+document.querySelectorAll('[data-station-command-chip]').forEach(button => {
+  button.addEventListener('click', ev => {
+    ev.preventDefault();
+    ev.stopPropagation();
+    stationRunQuickCommand(button.dataset.stationCommandChip);
+  });
+});
+
+function stationKeyboardTargetIsEditable(target) {
+  const el = target instanceof Element ? target : null;
+  if (!el) return false;
+  if (el.closest('input, textarea, select, [contenteditable="true"]')) return true;
+  return false;
+}
+
+document.addEventListener('keydown', ev => {
+  if (activeTab !== 'station') return;
+  if (stationKeyboardTargetIsEditable(ev.target)) return;
+  const wantsCommand = ev.key === '/' || ((ev.ctrlKey || ev.metaKey) && ev.key.toLowerCase() === 'k');
+  if (!wantsCommand) return;
+  ev.preventDefault();
+  stationFocusCommandSearch();
 });
 
 function stationHudRect() {
