@@ -11772,6 +11772,85 @@ function stationApplyContextAction(op, id = '') {
   if (buttonId) document.getElementById(buttonId)?.click();
 }
 
+function stationContextTimelineState() {
+  const fallback = { key: '', timeline: [] };
+  const state = typeof contextTimelineForForegroundSession === 'function'
+    ? contextTimelineForForegroundSession()
+    : fallback;
+  const key = state?.key || '';
+  const timeline = Array.isArray(state?.timeline) ? state.timeline : [];
+  const snapshot = stationSnapshotForContext();
+  const max = Math.max(0, timeline.length - 1);
+  let index = timeline.indexOf(snapshot);
+  if (index < 0 && timeline.length) index = contextReplayIndexBySession.get(key) ?? max;
+  index = Math.max(0, Math.min(max, Number(index) || 0));
+  return { key, timeline, snapshot, index, max };
+}
+
+function stationSetContextReplayIndex(index) {
+  const { key, timeline, max } = stationContextTimelineState();
+  if (!timeline.length) return;
+  const next = Math.max(0, Math.min(max, Number(index) || 0));
+  contextReplayMode = 'replay';
+  contextReplayIndexBySession.set(key, next);
+  contextSelectedPartId = null;
+  stationSelectedContextPart = '';
+  if (typeof renderContextPane === 'function') renderContextPane();
+}
+
+function stationContextExactStatus(snapshot) {
+  if (!snapshot) return 'none';
+  if (typeof contextSnapshotNeedsExact === 'function' && contextSnapshotNeedsExact(snapshot)) {
+    if (typeof contextSnapshotExactFetchFailed === 'function' && contextSnapshotExactFetchFailed(snapshot)) {
+      return 'exact failed';
+    }
+    return 'compact; exact available';
+  }
+  if (snapshot.__exact_loaded || (typeof contextSnapshotHasExactRaw === 'function' && contextSnapshotHasExactRaw(snapshot))) {
+    return 'exact loaded';
+  }
+  return 'compact';
+}
+
+function stationSelectedContextPartDetail(partId = stationSelectedContextPart) {
+  const id = String(partId || '').trim();
+  const snapshot = stationSnapshotForContext();
+  if (!id || !snapshot) return null;
+  const analysis = analyzeContextSnapshot(snapshot);
+  return analysis.parts.find(part => part.id === id) || null;
+}
+
+function stationRenderContextReplaySection(parent) {
+  const { timeline, snapshot, index, max } = stationContextTimelineState();
+  const section = stationDockSection(parent, 'Replay timeline');
+  stationDockRow(section, 'mode', contextReplayMode || 'live');
+  stationDockRow(section, 'snapshots', String(timeline.length));
+  stationDockRow(section, 'selected', timeline.length ? `${index + 1} / ${timeline.length}` : '--');
+  stationDockRow(section, 'time', formatContextTimestamp(snapshot?.ts));
+  stationDockRow(section, 'raw', stationContextExactStatus(snapshot));
+  const range = stationDockInput(section, 'Snapshot', String(index), {
+    id: 'station-context-replay-range',
+    type: 'range',
+    min: 0,
+    max,
+    step: 1,
+  });
+  range.disabled = timeline.length <= 1;
+  range.addEventListener('input', ev => {
+    stationSetContextReplayIndex(ev.target.value);
+    stationRenderContextDock('');
+  });
+  stationDockActions(section, [
+    { label: 'Prev', disabled: !timeline.length || index <= 0, onClick: () => { stationSetContextReplayIndex(index - 1); stationRenderContextDock(''); } },
+    { label: 'Next', disabled: !timeline.length || index >= max, onClick: () => { stationSetContextReplayIndex(index + 1); stationRenderContextDock(''); } },
+    { label: 'Latest', primary: true, disabled: !timeline.length, onClick: () => { stationSetContextReplayIndex(max); stationRenderContextDock(''); } },
+    { label: 'Live', onClick: () => { stationApplyContextAction('live'); stationRenderContextDock(''); } },
+    snapshot && typeof ensureExactContextSnapshot === 'function' && typeof contextSnapshotNeedsExact === 'function' && contextSnapshotNeedsExact(snapshot)
+      ? { label: 'Load exact', onClick: async () => { await ensureExactContextSnapshot(snapshot); stationRenderContextDock(stationSelectedContextPart); } }
+      : null,
+  ]);
+}
+
 function stationRenderContextDock(focusId = stationSelectedContextPart) {
   const ctx = stationBuildContextSummary();
   const body = stationDockBegin(
@@ -11794,6 +11873,27 @@ function stationRenderContextDock(focusId = stationSelectedContextPart) {
     { label: 'Reset', onClick: () => { stationApplyContextAction('reset'); stationRenderContextDock(''); } },
     stationDockRouteAction('Route context tab', 'activity', 'context'),
   ]);
+
+  stationRenderContextReplaySection(body);
+
+  const selectedPart = stationSelectedContextPartDetail(focusId);
+  if (selectedPart) {
+    const selected = stationDockSection(body, 'Selected item');
+    const def = CONTEXT_CATEGORY_DEFS[selectedPart.category] || CONTEXT_CATEGORY_DEFS.other;
+    stationDockRow(selected, 'id', selectedPart.id || '--');
+    stationDockRow(selected, 'category', def.label || selectedPart.category || '--');
+    stationDockRow(selected, 'tokens', stationCompactNumber(selectedPart.tokens || selectedPart.estimatedTokens || 0));
+    stationDockRow(selected, 'share', selectedPart.share != null ? `${Math.round(selectedPart.share * 100)}%` : '--');
+    stationDockCard(selected, {
+      title: selectedPart.title || selectedPart.path || selectedPart.id || 'context item',
+      meta: selectedPart.subtitle || selectedPart.path || '',
+      detail: compactSessionText(selectedPart.preview || selectedPart.text || ''),
+      actions: [
+        { label: 'Refocus', primary: true, onClick: () => { stationApplyContextAction('part', selectedPart.id); stationRenderContextDock(selectedPart.id); } },
+        { label: 'Copy id', onClick: () => copyTextToClipboard(selectedPart.id || '') },
+      ],
+    });
+  }
 
   const lanes = stationDockSection(body, 'Top lanes');
   if (!ctx.topCategories.length) {
@@ -11855,6 +11955,36 @@ function stationCopyManagedFormToLegacy() {
 
 function stationManagedResultText() {
   return managedContextEl?.('managed-context-action-result')?.textContent || '';
+}
+
+function stationSetValueIfEmpty(id, value) {
+  const el = document.getElementById(id);
+  if (!el || el.value.trim()) return;
+  el.value = value || '';
+}
+
+function stationSeedManagedDraftFromContext() {
+  const context = stationBuildContextSummary();
+  const managed = stationBuildManagedSummary(context);
+  const lines = [
+    `Session: ${managed.sessionId || context.sessionId || 'unknown'}`,
+    `Context: ${stationCompactNumber(context.tokens)} used of ${stationCompactNumber(context.effectiveWindow)} effective tokens (${managed.status || 'unknown'}).`,
+    context.topCategories?.length
+      ? `Top lanes: ${context.topCategories.map(item => `${item.label} ${stationCompactNumber(item.value)}`).join(', ')}.`
+      : '',
+    context.topItems?.length
+      ? `Largest items: ${context.topItems.map(item => [item.label, item.value, item.detail].filter(Boolean).join(' ')).join('; ')}.`
+      : '',
+  ].filter(Boolean);
+  stationSetValueIfEmpty('station-managed-reason', managed.rewindOnly ? 'Context is in rewind-only pressure.' : 'Crystallize current Station context before continuing.');
+  stationSetValueIfEmpty('station-managed-primer', lines.join('\n'));
+  stationSetValueIfEmpty('station-managed-preserve', [
+    `Current Station context source: ${context.source || 'unknown'}`,
+    `Managed mode/status: ${managed.mode || 'unknown'} / ${managed.status || 'unknown'}`,
+  ].join('\n'));
+  stationSetValueIfEmpty('station-managed-next-steps', 'Continue from the preserved Station context summary.');
+  stationCopyManagedFormToLegacy();
+  showControlToast?.('success', 'Station managed-context draft seeded from current context');
 }
 
 async function stationApplyManagedAction(op, id = '', sessionId = '') {
@@ -11944,6 +12074,7 @@ function stationRenderManagedDock(mode = '') {
     stationDockInput(form, 'Artifacts', managedContextEl?.('managed-context-artifacts')?.value || '', { id: 'station-managed-artifacts', placeholder: 'files, commits, outputs to keep', multiline: true, rows: 2 });
     stationDockInput(form, 'Next steps', managedContextEl?.('managed-context-next-steps')?.value || '', { id: 'station-managed-next-steps', placeholder: 'immediate continuation steps', multiline: true, rows: 2 });
     stationDockActions(form, [
+      { label: 'Seed from context', onClick: () => { stationSeedManagedDraftFromContext(); stationRenderManagedDock('rewind'); } },
       { label: 'Inspect anchor', onClick: async () => { stationCopyManagedFormToLegacy(); await inspectManagedContextAnchor(); stationRenderManagedDock('rewind'); } },
       { label: 'Dispatch rewind', primary: true, onClick: async () => { stationCopyManagedFormToLegacy(); await submitManagedContextRewind(); stationRenderManagedDock('rewind'); } },
     ]);
