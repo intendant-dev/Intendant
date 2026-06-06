@@ -10451,6 +10451,7 @@ const SESSION_WINDOW_PREPEND_CHUNK = 300;
 const SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX = 64;
 const SESSION_WINDOW_STATE_KEY = 'intendant_session_windows_v1';
 const SESSION_WINDOW_RESTORE_LIMIT = 6;
+const SESSION_WINDOW_RESTORE_LOG_LIMIT = 250;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
 const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';
@@ -24203,6 +24204,117 @@ async function restorePersistedSessionWindows() {
   }
 }
 
+function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') {
+  const event = String(entry.event || '').trim();
+  const sessionId = String(entry.session_id || entry.sessionId || fallbackSessionId || '').trim();
+  const base = {
+    ...entry,
+    session_id: sessionId,
+    ts: entry.ts || entry.timestamp || '',
+    user_turn_index: entry.user_turn_index ?? entry.userTurnIndex,
+    user_turn_revision: entry.user_turn_revision ?? entry.userTurnRevision,
+    replacement_for_user_turn_index: entry.replacement_for_user_turn_index ?? entry.replacementForUserTurnIndex,
+    superseded: !!entry.superseded,
+    superseded_reason: entry.superseded_reason || entry.supersededReason || '',
+  };
+  let content = String(entry.content || entry.summary || entry.message || '').trim();
+  let level = String(entry.level || '').trim();
+  let source = String(entry.source || '').trim();
+  let kind = entry.kind || '';
+
+  if (event === 'replay_start' || event === 'context_snapshot') return null;
+  if (event === 'log_entry' || !event) {
+    if (!content) return null;
+    return { ...base, level: level || 'info', source: source || 'system', content, kind };
+  }
+  if (event === 'model_response') {
+    if (!content) {
+      const reasoning = String(entry.reasoning_summary || entry.reasoningSummary || '').trim();
+      if (!reasoning) return null;
+      content = `Reasoning: ${reasoning}`;
+      level = 'detail';
+    } else {
+      level = 'model';
+    }
+    return { ...base, level, source: source || 'model', content, kind };
+  }
+  if (event === 'agent_started') {
+    content = String(entry.commands_preview || entry.commandsPreview || '').trim();
+    if (!content) return null;
+    return { ...base, level: 'agent', source: source || 'agent', content, item_id: entry.item_id || entry.itemId || '', kind };
+  }
+  if (event === 'agent_output') {
+    const stdout = String(entry.stdout || '').trim();
+    const stderr = String(entry.stderr || '').trim();
+    content = stdout || stderr;
+    if (!content) return null;
+    return { ...base, level: stdout ? 'agent' : 'warn', source: source || 'agent', content, kind: kind || 'agent_output', output_id: entry.output_id || entry.outputId || '' };
+  }
+  if (event === 'presence_log') {
+    if (!content) return null;
+    return { ...base, level: level || 'info', source: 'presence', content, kind };
+  }
+  if (event === 'turn_started') {
+    return { ...base, level: 'info', source: 'system', content: `Turn ${entry.turn || 0} started`, kind };
+  }
+  if (event === 'round_complete') {
+    return { ...base, level: 'info', source: 'system', content: `Round ${entry.round || 0} complete (${entry.turns_in_round || entry.turnsInRound || 0} turns)`, kind };
+  }
+  if (event === 'done_signal') {
+    content = content ? `Done signal: ${content}` : 'Done signal';
+    return { ...base, level: 'detail', source: source || 'worker', content, kind };
+  }
+  if (event === 'session_started') {
+    return { ...base, level: 'info', source: 'system', content: `Session started: ${sessionId}`, kind };
+  }
+  if (event === 'session_attached') {
+    return { ...base, level: 'info', source: 'system', content: `Session attached: ${sessionId} (${source || entry.backend_source || ''})`, kind };
+  }
+  if (event === 'session_ended') {
+    const reason = String(entry.reason || '').trim();
+    return { ...base, level: 'info', source: 'system', content: `Session ended: ${sessionId}${reason ? ` - ${reason}` : ''}`, kind };
+  }
+  return null;
+}
+
+function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
+  if (!win || !Array.isArray(entries)) return 0;
+  const records = entries
+    .map(entry => sessionWindowRecordFromReplayEntry(entry, fallbackSessionId))
+    .filter(Boolean);
+  if (!records.length) return 0;
+  resetSessionWindowLog(win);
+  appendSessionWindowHistoryBatch(win, records, true);
+  return records.length;
+}
+
+async function hydrateRestoredSessionWindow(win, record) {
+  const sid = String(record?.sessionId || win?.sessionId || '').trim();
+  const source = normalizeAgentId(record?.source || win?.source || '');
+  if (!sid || !source || !win || ensureSessionWindowHistory(win).length > 0) return;
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  const url = `/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}&limit=${SESSION_WINDOW_RESTORE_LOG_LIMIT}`;
+  try {
+    const resp = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+    const data = await resp.json();
+    if (!resp.ok || data.error) throw new Error(data.error || resp.statusText || 'session detail fetch failed');
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    applySessionIdentitiesFromReplayEntries(entries);
+    applyExternalIdentitiesFromLogEntries(entries);
+    applySessionGoalsFromReplayEntries(entries);
+    const rendered = renderRestoredSessionWindowEntries(win, entries, sid);
+    if (rendered > 0) {
+      updateSessionWindow(sid, { phase: 'idle', ended: false });
+      stationScheduleUpdate();
+    }
+  } catch (err) {
+    console.warn('Failed to hydrate restored session window', sid, err);
+  } finally {
+    clearTimeout(timeout);
+  }
+}
+
 async function restorePersistedSessionWindow(record) {
   const sid = String(record?.sessionId || '').trim();
   const source = normalizeAgentId(record?.source || '');
@@ -24227,6 +24339,7 @@ async function restorePersistedSessionWindow(record) {
       ended: false,
     });
     stationScheduleUpdate();
+    await hydrateRestoredSessionWindow(win, record);
   } catch (err) {
     console.warn('Failed to restore session window', sid, err);
   } finally {

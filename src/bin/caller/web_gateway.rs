@@ -4,7 +4,7 @@ use crate::types::LogLevel;
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeSet, HashMap, HashSet};
 use std::io::{BufRead, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -98,6 +98,7 @@ const EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS: i64 = 2_000;
 const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
 const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 2;
+const SESSION_DETAIL_ENTRY_LIMIT_MAX: usize = 1_000;
 const SESSION_SOURCE_FLOOR: usize = 100;
 const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
 const SESSION_LOG_SEARCH_SNIPPET_CHARS: usize = 220;
@@ -2245,6 +2246,58 @@ fn session_log_replay_payload_from_dir(
     ))
 }
 
+fn limited_session_detail_entries(
+    entries: Vec<serde_json::Value>,
+    limit: Option<usize>,
+) -> Vec<serde_json::Value> {
+    let Some(limit) = limit else {
+        return entries;
+    };
+    let limit = limit.clamp(1, SESSION_DETAIL_ENTRY_LIMIT_MAX);
+    if entries.len() <= limit {
+        return entries;
+    }
+
+    let tail_start = entries.len().saturating_sub(limit);
+    let mut keep = BTreeSet::new();
+    let mut latest_goal_by_session: HashMap<String, usize> = HashMap::new();
+    for (idx, entry) in entries.iter().enumerate() {
+        let event = entry.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        match event {
+            "replay_start"
+            | "session_identity"
+            | "session_relationship"
+            | "session_capabilities" => {
+                keep.insert(idx);
+            }
+            "session_goal" => {
+                let session_id = entry
+                    .get("session_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("__global__");
+                latest_goal_by_session.insert(session_id.to_string(), idx);
+            }
+            _ => {}
+        }
+    }
+    keep.extend(latest_goal_by_session.into_values());
+    keep.extend(tail_start..entries.len());
+
+    entries
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, entry)| keep.contains(&idx).then_some(entry))
+        .collect()
+}
+
+fn session_detail_entry_limit_from_request(request_line: &str) -> Option<usize> {
+    query_param(request_line, "limit")
+        .or_else(|| query_param(request_line, "entry_limit"))
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(SESSION_DETAIL_ENTRY_LIMIT_MAX))
+}
+
 fn replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(log_dir.join("session_meta.json"))
         .ok()
@@ -3263,6 +3316,14 @@ fn session_detail_http_status(body: &str) -> &'static str {
 }
 
 fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
+    get_session_detail_from_home_with_limit(home, session_id, None)
+}
+
+fn get_session_detail_from_home_with_limit(
+    home: &Path,
+    session_id: &str,
+    limit: Option<usize>,
+) -> String {
     let session_dir = match resolve_session_dir_from_home(home, session_id) {
         Some(d) => d,
         None => return serde_json::json!({"error": "session not found"}).to_string(),
@@ -3272,6 +3333,7 @@ fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
         .map(|(entries, _)| entries)
         .unwrap_or_default();
     compact_context_snapshot_entries_for_replay(&mut entries);
+    entries = limited_session_detail_entries(entries, limit);
 
     // Check for screenshot frames
     let frames_dir = session_dir.join("frames");
@@ -6080,7 +6142,22 @@ fn external_session_detail_from_home(
     source: &str,
     session_id: &str,
 ) -> Option<String> {
-    let entries = external_session_entries_from_home(home, source, session_id)?;
+    external_session_detail_from_home_with_limit(home, source, session_id, None)
+}
+
+fn external_session_detail_from_home_with_limit(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    limit: Option<usize>,
+) -> Option<String> {
+    let mut entries = external_session_entries_from_home(home, source, session_id)?;
+    if let Some(limit) = limit {
+        let limit = limit.clamp(1, SESSION_DETAIL_ENTRY_LIMIT_MAX);
+        if entries.len() > limit {
+            entries = entries.split_off(entries.len() - limit);
+        }
+    }
 
     Some(
         serde_json::json!({
@@ -6926,6 +7003,18 @@ fn list_sessions() -> String {
 
 fn cached_list_sessions() -> String {
     let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
+    {
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = guard.as_ref() {
+            if entry.generated_at.elapsed()
+                <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
+            {
+                return entry.body.clone();
+            }
+        }
+    }
+
+    let body = list_sessions();
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(entry) = guard.as_ref() {
         if entry.generated_at.elapsed()
@@ -6934,8 +7023,6 @@ fn cached_list_sessions() -> String {
             return entry.body.clone();
         }
     }
-
-    let body = list_sessions();
     *guard = Some(SessionListResponseCacheEntry {
         generated_at: std::time::Instant::now(),
         body: body.clone(),
@@ -16637,23 +16724,45 @@ pub fn spawn_web_gateway(
                             let session_id = raw_id.split('?').next().unwrap_or(raw_id);
                             let source = query_param(request_line, "source")
                                 .unwrap_or_else(|| "intendant".to_string());
-                            let body = if !session_lookup_id_is_safe(session_id) {
-                                serde_json::json!({"error": "invalid session id"}).to_string()
-                            } else if source == "intendant" {
-                                get_session_detail_from_home(
-                                    &crate::platform::home_dir(),
-                                    session_id,
-                                )
-                            } else {
-                                external_session_detail_from_home(
-                                    &crate::platform::home_dir(),
-                                    &source,
-                                    session_id,
-                                )
-                                .unwrap_or_else(|| {
-                                    serde_json::json!({"error": "session not found"}).to_string()
-                                })
-                            };
+                            let entry_limit = session_detail_entry_limit_from_request(request_line);
+                            let session_id_owned = session_id.to_string();
+                            let source_owned = source.clone();
+                            let body =
+                                if !session_lookup_id_is_safe(session_id) {
+                                    serde_json::json!({"error": "invalid session id"}).to_string()
+                                } else {
+                                    match tokio::task::spawn_blocking(move || {
+                                        let home = crate::platform::home_dir();
+                                        if source_owned == "intendant" {
+                                            get_session_detail_from_home_with_limit(
+                                                &home,
+                                                &session_id_owned,
+                                                entry_limit,
+                                            )
+                                        } else {
+                                            external_session_detail_from_home_with_limit(
+                                                &home,
+                                                &source_owned,
+                                                &session_id_owned,
+                                                entry_limit,
+                                            )
+                                            .unwrap_or_else(|| {
+                                                serde_json::json!({
+                                                    "error": "session not found"
+                                                })
+                                                .to_string()
+                                            })
+                                        }
+                                    })
+                                    .await
+                                    {
+                                        Ok(body) => body,
+                                        Err(e) => serde_json::json!({
+                                            "error": format!("session detail task failed: {e}")
+                                        })
+                                        .to_string(),
+                                    }
+                                };
                             let status = if !session_lookup_id_is_safe(session_id) {
                                 "400 Bad Request"
                             } else {
@@ -24969,6 +25078,44 @@ mod tests {
             .get("snapshot_file")
             .and_then(|v| v.as_str())
             .is_some_and(|file| file.contains("_context_")));
+    }
+
+    #[test]
+    fn session_detail_limit_keeps_metadata_and_recent_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("detail-limit-session");
+        let mut log = crate::session_log::SessionLog::open(log_dir).unwrap();
+        log.session_identity("detail-limit-session", "codex", "backend-session");
+        for idx in 1..=5 {
+            log.model_response_for_session(
+                Some("backend-session"),
+                &format!("response {idx}"),
+                0,
+                0,
+                0,
+                0,
+                Some("Codex"),
+            );
+        }
+        drop(log);
+
+        let detail =
+            get_session_detail_from_home_with_limit(dir.path(), "detail-limit-session", Some(2));
+        let detail: serde_json::Value = serde_json::from_str(&detail).unwrap();
+        let entries = detail["entries"].as_array().unwrap();
+        assert!(entries
+            .iter()
+            .any(|entry| entry["event"] == "session_identity"));
+        let summaries: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry["event"] == "model_response")
+            .filter_map(|entry| entry["summary"].as_str())
+            .collect();
+        assert_eq!(summaries, vec!["response 4", "response 5"]);
     }
 
     #[test]
