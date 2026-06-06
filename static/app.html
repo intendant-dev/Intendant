@@ -16595,12 +16595,25 @@ async function stationReloadClaudeDefaultsFromDock() {
 
 function stationRenderClaudeSessionSection(parent, controls) {
   const active = controls.backend === 'claude-code' || controls.newSessionAgent === 'claude-code';
+  const targetId = controls.sessionSource === 'claude-code'
+    ? controls.sessionId
+    : stationLatestConfigurableExternalSessionId('claude-code');
+  const targetSession = targetId ? (stationFindSessionById(targetId) || { session_id: targetId, source: 'claude-code' }) : null;
+  const targetMeta = targetSession ? sessionConfigMetadata(targetSession) : {};
+  const targetCommand = targetSession
+    ? (sessionConfigCommand(targetMeta) || stationClaudeCommandValue() || 'claude')
+    : '';
   const section = stationDockSection(parent, 'Claude Code session');
   stationDockRow(section, 'backend', active ? 'selected' : 'not selected');
   stationDockRow(section, 'binary', stationClaudeCommandValue() || 'claude');
+  stationDockRow(section, 'target', targetId ? stationSessionShortLabel(targetId) : '--');
+  stationDockRow(section, 'command', targetCommand || '--');
   stationDockActions(section, [
     { label: 'Use Claude', primary: active, onClick: () => stationApplyExternalBackendFromDock('claude-code') },
     { label: 'Draft Claude launch', primary: stationEffectiveLaunchAgent() === 'claude-code', onClick: () => stationSetLaunchDraftAgent('claude-code') },
+    targetId ? { label: 'Details', onClick: () => stationRenderSessionsDock(targetId) } : null,
+    targetId ? { label: 'Launch config', onClick: () => stationHandleSessionAction({ action: 'config', session_id: targetId }) } : null,
+    targetId ? { label: 'Restart saved', title: 'Restart this Claude Code session with saved launch config', onClick: () => stationHandleSessionAction({ action: 'restart', session_id: targetId }) } : null,
     stationDockRouteAction('Route Claude settings', 'settings', 'agent', () => document.getElementById('set-claude-command')?.focus()),
   ]);
 }
@@ -16937,15 +16950,19 @@ function stationRenderControlsDock(sectionName = 'overview') {
     stationDockRouteAction('Route CU settings', 'settings', 'agent', () => document.getElementById('set-cu-provider')?.focus()),
   ]);
 
-  const codex = stationDockSection(body, 'External Codex state');
-  stationDockRow(codex, 'source', controls.sessionSource || '--');
-  stationDockRow(codex, 'command', controls.sessionCommand || '--');
-  stationDockRow(codex, 'managed', controls.sessionManagedContext || '--');
-  stationDockRow(codex, 'archive', controls.sessionContextArchive || '--');
-  stationDockRow(codex, 'tier', controls.sessionServiceTier || 'default');
-  stationDockRow(codex, 'goal status', controls.sessionGoalStatus || '--');
-  stationDockRow(codex, 'goal', controls.sessionGoalObjective || '--');
-  if (controls.sessionGoalTokens) stationDockRow(codex, 'goal tokens', controls.sessionGoalTokens);
+  const external = stationDockSection(body, 'Selected external session');
+  stationDockRow(external, 'source', prettyAgentName(controls.sessionSource) || controls.sessionSource || '--');
+  stationDockRow(external, 'selection', controls.sessionSelection || '--');
+  stationDockRow(external, 'command', controls.sessionCommand || '--');
+  stationDockRow(external, 'state', controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle'));
+  if (controls.sessionSource === 'codex') {
+    stationDockRow(external, 'managed', controls.sessionManagedContext || '--');
+    stationDockRow(external, 'archive', controls.sessionContextArchive || '--');
+    stationDockRow(external, 'tier', controls.sessionServiceTier || 'default');
+    stationDockRow(external, 'goal status', controls.sessionGoalStatus || '--');
+    stationDockRow(external, 'goal', controls.sessionGoalObjective || '--');
+    if (controls.sessionGoalTokens) stationDockRow(external, 'goal tokens', controls.sessionGoalTokens);
+  }
   if (controls.sessionId) {
     const targetActions = [];
     if (controls.sessionCanFocus) targetActions.push({ label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: controls.sessionId }) });
@@ -16956,7 +16973,9 @@ function stationRenderControlsDock(sectionName = 'overview') {
     if (sideCloseParamsForSession(controls.sessionId)) targetActions.push({ label: 'Close side', danger: true, onClick: () => stationHandleSessionAction({ action: 'close-side', session_id: controls.sessionId }) });
     if (controls.sessionCanStop) targetActions.push({ label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: controls.sessionId }) });
     targetActions.push({ label: 'Copy id', onClick: () => copyTextToClipboard(controls.sessionId) });
-    stationDockActions(codex, targetActions);
+    stationDockActions(external, targetActions);
+  } else {
+    stationDockEmpty(external, 'Select or launch an external session to operate on it from Station.');
   }
   if (controls.sessionIsCodex && controls.sessionId) stationRenderCodexThreadActionsSection(body, controls.sessionId);
 }
@@ -18076,7 +18095,8 @@ function stationBuildControlsSummary() {
   };
 }
 
-function stationLatestConfigurableExternalSessionId() {
+function stationLatestConfigurableExternalSessionId(sourceFilter = '') {
+  const wantedSource = normalizeAgentId(sourceFilter || '');
   const seen = new Set();
   const candidates = [];
   const pushCandidate = (id, session, meta = {}) => {
@@ -18087,6 +18107,7 @@ function stationLatestConfigurableExternalSessionId() {
     seen.add(sid);
     const source = sessionConfigSource(meta) || normalizeAgentId(stationSessionSource(session));
     if (!source || source === 'intendant') return;
+    if (wantedSource && source !== wantedSource) return;
     const intendantId = String(
       meta?.intendantSessionId ||
       meta?.intendant_session_id ||
