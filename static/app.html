@@ -12935,6 +12935,25 @@ function stationCopyContextPart(part) {
   copyTextToClipboard(text);
 }
 
+function stationContextLaneParts(category) {
+  const snapshot = stationSnapshotForContext();
+  if (!snapshot) return [];
+  const normalized = typeof contextNormalizeCategory === 'function'
+    ? contextNormalizeCategory(category)
+    : String(category || 'other').trim();
+  const analysis = analyzeContextSnapshot(snapshot);
+  return analysis.parts.filter(part => part.category === normalized);
+}
+
+function stationCopyContextLane(category) {
+  const text = stationContextLaneParts(category)
+    .map(part => stationContextPartText(part))
+    .filter(Boolean)
+    .join('\n\n');
+  if (!text) return;
+  copyTextToClipboard(text);
+}
+
 async function stationLoadExactContextSnapshot(partId = stationSelectedContextPart) {
   const snapshot = stationSnapshotForContext();
   if (!snapshot || typeof ensureExactContextSnapshot !== 'function') return;
@@ -13034,8 +13053,19 @@ function stationRenderContextDock(focusId = stationSelectedContextPart) {
   if (!ctx.topCategories.length) {
     stationDockEmpty(lanes, 'No context lanes in this snapshot.');
   } else {
+    const snapshot = stationSnapshotForContext();
+    const needsExact = snapshot && typeof contextSnapshotNeedsExact === 'function' && contextSnapshotNeedsExact(snapshot);
     for (const item of ctx.topCategories) {
-      stationDockRow(lanes, item.label, `${stationCompactNumber(item.value)} tokens`);
+      stationDockCard(lanes, {
+        title: item.label,
+        meta: `${stationCompactNumber(item.value)} tokens / ${stationCompactNumber(item.count)} items`,
+        detail: item.detail || 'No lane detail available.',
+        actions: [
+          item.partId ? { label: 'Focus largest', primary: true, onClick: () => { stationApplyContextAction('part', item.partId); stationRenderContextDock(item.partId); } } : null,
+          item.category ? { label: 'Copy lane', onClick: () => stationCopyContextLane(item.category) } : null,
+          item.partId && needsExact ? { label: 'Load exact', onClick: async () => stationLoadExactContextSnapshot(item.partId) } : null,
+        ],
+      });
     }
   }
 
@@ -15954,10 +15984,22 @@ function stationBuildContextSummary() {
   const effectiveWindow = Number(snapshot.effective_context_window || snapshot.context_window || analysis.effectiveWindow || 0);
   const hardWindow = Number(snapshot.hard_context_window || snapshot.hardContextWindow || analysis.hardWindow || effectiveWindow || 0);
   const categories = Array.from(analysis.byCategory.entries())
-    .map(([category, stats]) => ({
-      label: (CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other).label,
-      value: stationNum(stats.tokens),
-    }))
+    .map(([category, stats]) => {
+      const def = CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other;
+      const largest = analysis.parts
+        .filter(part => part.category === category)
+        .sort((a, b) => (b.tokens || 0) - (a.tokens || 0))[0] || null;
+      return {
+        category,
+        label: def.label,
+        value: stationNum(stats.tokens),
+        count: stationNum(stats.count),
+        partId: largest?.id || '',
+        detail: largest
+          ? `Largest: ${compactSessionText(largest.title || largest.subtitle || largest.path || largest.id || '')} (${stationCompactNumber(largest.tokens || largest.estimatedTokens || 0)} tok)`
+          : `${stationCompactNumber(stats.count)} items`,
+      };
+    })
     .sort((a, b) => b.value - a.value)
     .slice(0, 6);
   const topItems = [...analysis.parts]
