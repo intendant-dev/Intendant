@@ -54,6 +54,9 @@ Intendant, not Codex automatic compaction, owns long-task context density. This 
 
 Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
+- For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
+- After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
+- A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After noisy or unexpectedly large tool output, failed exploration, broad research, or finishing a coherent subtask, crystallize durable facts and use Intendant managed-context tools before continuing broad ordinary-tool work.
 - Use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
 - The primer must preserve user constraints, current objective, completed work, changed files, important command results, remaining decisions, and the substance of any prior managed primer that would otherwise be overwritten.
@@ -1649,6 +1652,33 @@ impl CodexAgent {
         Ok((thread_id, turn_id))
     }
 
+    async fn remember_active_turn_for_thread(&self, thread_id: &str, turn_id: &str) {
+        self.active_turns
+            .lock()
+            .await
+            .insert(thread_id.to_string(), turn_id.to_string());
+        let active_thread_matches =
+            self.active_thread_id.lock().await.as_deref() == Some(thread_id);
+        if active_thread_matches {
+            *self.active_turn_id.lock().await = Some(turn_id.to_string());
+        }
+    }
+
+    async fn refresh_active_turn_after_expected_mismatch(
+        &self,
+        thread_id: &str,
+        stale_turn_id: &str,
+        err: &CallerError,
+    ) -> Option<String> {
+        let actual_turn_id = codex_expected_active_turn_mismatch_actual_turn_id(err)?;
+        if actual_turn_id == stale_turn_id {
+            return None;
+        }
+        self.remember_active_turn_for_thread(thread_id, &actual_turn_id)
+            .await;
+        Some(actual_turn_id)
+    }
+
     async fn resume_thread_for_followup(&mut self, thread_id: &str) -> Result<(), CallerError> {
         let mut params = self.thread_lifecycle_params();
         params.insert(
@@ -1696,6 +1726,32 @@ fn codex_turn_start_thread_not_found(err: &CallerError) -> bool {
     };
     let message = message.to_ascii_lowercase();
     message.contains("thread not found")
+}
+
+fn codex_expected_active_turn_mismatch_actual_turn_id(err: &CallerError) -> Option<String> {
+    let CallerError::ExternalAgent(message) = err else {
+        return None;
+    };
+    let prefix = "expected active turn id";
+    let separator = " but found ";
+    let lower = message.to_ascii_lowercase();
+    let mismatch_start = lower.find(prefix)?;
+    let found_start = mismatch_start + lower[mismatch_start..].find(separator)? + separator.len();
+    let found = message[found_start..].trim_start();
+    let mut chars = found.chars();
+    let first = chars.next()?;
+    let actual = if matches!(first, '`' | '"' | '\'') {
+        let delimiter = first;
+        found[delimiter.len_utf8()..]
+            .split_once(delimiter)
+            .map(|(actual, _)| actual)?
+    } else {
+        found
+            .split(|c: char| c.is_whitespace() || matches!(c, ')' | ',' | ';'))
+            .next()?
+    };
+    let actual = actual.trim();
+    (!actual.is_empty()).then(|| actual.to_string())
 }
 
 struct CodexRequestPayloadSnapshot {
@@ -5026,7 +5082,23 @@ impl ExternalAgent for CodexAgent {
         // emits a `turn/completed` notification with status="interrupted"
         // shortly after. The reader task handles that notification like any
         // other turn completion.
-        let _ = self.send_request("turn/interrupt", Some(params)).await?;
+        let interrupt_result = self.send_request("turn/interrupt", Some(params)).await;
+        match interrupt_result {
+            Ok(_) => {}
+            Err(err) => {
+                let Some(actual_turn_id) = self
+                    .refresh_active_turn_after_expected_mismatch(&thread_id, &turn_id, &err)
+                    .await
+                else {
+                    return Err(err);
+                };
+                let params = serde_json::json!({
+                    "threadId": thread_id,
+                    "turnId": actual_turn_id,
+                });
+                let _ = self.send_request("turn/interrupt", Some(params)).await?;
+            }
+        }
         if let Some(pid) = self.child.as_ref().and_then(|child| child.id()) {
             let protected = self.turn_descendant_baseline.clone().unwrap_or_default();
             let _ = crate::platform::terminate_unprotected_descendants(pid, &protected).await;
@@ -5054,7 +5126,24 @@ impl ExternalAgent for CodexAgent {
         // `{"turnId": "..."}` on success. We don't care about the returned
         // id — the active turn id hasn't changed, and the active_turn_id
         // cache is still valid for the next interrupt/steer call.
-        let _ = self.send_request("turn/steer", Some(params)).await?;
+        let steer_result = self.send_request("turn/steer", Some(params)).await;
+        match steer_result {
+            Ok(_) => {}
+            Err(err) => {
+                let Some(actual_turn_id) = self
+                    .refresh_active_turn_after_expected_mismatch(&thread_id, &turn_id, &err)
+                    .await
+                else {
+                    return Err(err);
+                };
+                let params = serde_json::json!({
+                    "threadId": thread_id,
+                    "input": [{"type": "text", "text": text}],
+                    "expectedTurnId": actual_turn_id,
+                });
+                let _ = self.send_request("turn/steer", Some(params)).await?;
+            }
+        }
         Ok(())
     }
 
@@ -7320,6 +7409,44 @@ mod tests {
         assert_eq!(extract_turn_id(&v), None);
     }
 
+    #[test]
+    fn expected_turn_mismatch_parser_handles_steer_error() {
+        let err = CallerError::ExternalAgent(
+            "JSON-RPC error -32600: expected active turn id `turn-expected` but found `turn-actual`"
+                .to_string(),
+        );
+
+        assert_eq!(
+            codex_expected_active_turn_mismatch_actual_turn_id(&err).as_deref(),
+            Some("turn-actual")
+        );
+    }
+
+    #[test]
+    fn expected_turn_mismatch_parser_handles_interrupt_error() {
+        let err = CallerError::ExternalAgent(
+            "JSON-RPC error -32600: expected active turn id turn-expected but found turn-actual"
+                .to_string(),
+        );
+
+        assert_eq!(
+            codex_expected_active_turn_mismatch_actual_turn_id(&err).as_deref(),
+            Some("turn-actual")
+        );
+    }
+
+    #[test]
+    fn expected_turn_mismatch_parser_ignores_unrelated_error() {
+        let err = CallerError::ExternalAgent(
+            "JSON-RPC error -32600: no active turn to steer".to_string(),
+        );
+
+        assert_eq!(
+            codex_expected_active_turn_mismatch_actual_turn_id(&err),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn interrupt_turn_without_active_turn_errors() {
         let mut agent = CodexAgent::new(
@@ -7423,6 +7550,47 @@ mod tests {
         let (thread_id, turn_id) = agent.active_thread_and_turn("steer").await.unwrap();
         assert_eq!(thread_id, "side-thread");
         assert_eq!(turn_id, "side-turn");
+    }
+
+    #[tokio::test]
+    async fn expected_turn_mismatch_refreshes_active_turn_cache() {
+        let agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        *agent.active_thread_id.lock().await = Some("thread-abc".into());
+        *agent.active_turn_id.lock().await = Some("turn-stale".into());
+        agent
+            .active_turns
+            .lock()
+            .await
+            .insert("thread-abc".into(), "turn-stale".into());
+        let err = CallerError::ExternalAgent(
+            "JSON-RPC error -32600: expected active turn id `turn-stale` but found `turn-actual`"
+                .to_string(),
+        );
+
+        let refreshed = agent
+            .refresh_active_turn_after_expected_mismatch("thread-abc", "turn-stale", &err)
+            .await;
+
+        assert_eq!(refreshed.as_deref(), Some("turn-actual"));
+        assert_eq!(
+            agent.active_turn_id.lock().await.as_deref(),
+            Some("turn-actual")
+        );
+        assert_eq!(
+            agent
+                .active_turns
+                .lock()
+                .await
+                .get("thread-abc")
+                .map(String::as_str),
+            Some("turn-actual")
+        );
     }
 
     #[tokio::test]
@@ -7673,6 +7841,14 @@ mod tests {
         assert!(developer_instructions.contains("Existing developer policy."));
         assert!(developer_instructions.contains("managed_context=managed"));
         assert!(developer_instructions.contains("Keep the live transcript informationally dense"));
+        assert!(developer_instructions.contains("take_screenshot"));
+        assert!(developer_instructions.contains("execute_cu_actions"));
+        assert!(developer_instructions.contains("cliclick"));
+        assert!(developer_instructions.contains("osascript"));
+        assert!(developer_instructions.contains("already-built binaries"));
+        assert!(
+            developer_instructions.contains("A rewind can cancel the active long-running command")
+        );
         assert!(developer_instructions.contains("list_rewind_anchors"));
         assert!(developer_instructions.contains("inspect_rewind_anchor"));
         assert!(developer_instructions.contains("rewind_context"));

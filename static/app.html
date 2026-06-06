@@ -363,6 +363,9 @@ html, body {
   cursor: pointer;
   pointer-events: auto;
 }
+.station-pane.station-dom-fallback .station-hotspots {
+  pointer-events: auto;
+}
 .station-pane.station-dom-fallback .station-hotspot {
   display: grid;
   align-content: center;
@@ -10218,6 +10221,7 @@ let stationLastSnapshotJson = '';
 let stationLastFallbackSnapshot = null;
 let stationSessionsIndexLoading = false;
 let stationSessionsIndexError = '';
+let stationWebgpuUnavailable = false;
 
 function stationStatus(text) {
   const el = document.getElementById('station-status');
@@ -10225,12 +10229,28 @@ function stationStatus(text) {
 }
 
 function stationShouldUseWebgpu() {
-  return window.location.href.includes('station_gpu=webgpu');
+  return window.location.href.includes('station_gpu=webgpu') && !stationWebgpuUnavailable;
 }
 
 function stationSetFallbackClass(enabled) {
   const pane = document.querySelector('.station-pane');
   pane?.classList.toggle('station-dom-fallback', !!enabled);
+}
+
+function stationFallbackFromUnavailableWebgpu(instance) {
+  if (!instance || instance !== station || !window.location.href.includes('station_gpu=webgpu')) return;
+  const state = instance.debug_state?.() || '';
+  if (!state.includes('gpu=false')) return;
+  stationWebgpuUnavailable = true;
+  try { instance.set_active(false); } catch (_) {}
+  station = null;
+  stationInitPromise = null;
+  stationDomFallback = true;
+  stationSetFallbackClass(true);
+  stationStatus('Station WebGPU unavailable; using DOM fallback');
+  stationSyncHotspots();
+  stationUpdateSnapshot();
+  if (activeTab === 'station') stationRefreshSharedCaches();
 }
 
 async function ensureStation() {
@@ -10263,7 +10283,10 @@ async function ensureStation() {
     station.set_active(active);
     stationStatus('Station online');
     window.setTimeout(() => stationStatus(station?.debug_state?.() || 'Station online'), 1500);
-    window.setTimeout(() => stationStatus(station?.debug_state?.() || 'Station online'), 4000);
+    window.setTimeout(() => {
+      stationFallbackFromUnavailableWebgpu(station);
+      stationStatus(station?.debug_state?.() || (stationDomFallback ? 'Station DOM fallback' : 'Station online'));
+    }, 3200);
     stationSyncHotspots();
     stationUpdateSnapshot();
     stationRegisterExistingSources();
