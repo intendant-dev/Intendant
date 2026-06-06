@@ -332,10 +332,10 @@ pub enum UiCommand {
     HistoryChanged,
     /// Status update for an in-flight mid-turn steer. Emitted when the
     /// browser sends a steer (pending), when the backend reports it
-    /// accepted, queued, or when the backend reports it delivered. The JS layer
+    /// accepted, queued, delivered, or cancelled. The JS layer
     /// maintains an "in-flight steers" strip above the activity log and
     /// updates the row keyed by `id`. `status` is one of
-    /// `"pending"` | `"accepted"` | `"queued"` | `"delivered"`.
+    /// `"pending"` | `"accepted"` | `"queued"` | `"delivered"` | `"cancelled"`.
     SteerStatusUpdate {
         id: String,
         text: String,
@@ -370,6 +370,8 @@ pub enum SteerStatus {
     Queued,
     /// Agent actually received the message (mid-turn or on boundary).
     Delivered,
+    /// User/admin explicitly cleared Intendant's pending steer state.
+    Cancelled,
 }
 
 /// A mid-turn steer message awaiting or undergoing delivery.
@@ -1023,7 +1025,8 @@ pub struct AppState {
 
     /// In-flight mid-turn steer messages keyed by client-generated id.
     /// Populated when the browser sees `steer_requested`, updated on
-    /// `steer_accepted` / `steer_queued`, and removed on `steer_delivered`. The UI renders
+    /// `steer_accepted` / `steer_queued`, and removed on terminal delivery
+    /// or cancellation. The UI renders
     /// the remaining entries as a strip above the activity log so the
     /// user can see which interjections are still pending.
     pub queued_steers: std::collections::HashMap<String, QueuedSteer>,
@@ -1674,6 +1677,7 @@ impl AppState {
             //   steer_accepted   → backend/runtime accepted it; waiting for checkpoint
             //   steer_queued     → backend can't deliver mid-turn, queued for turn boundary
             //   steer_delivered  → agent actually received it (mid_turn or at turn boundary)
+            //   steer_cancelled  → user/admin cleared pending queue state
             //
             // For each event we update `queued_steers[id]` and emit a
             // `SteerStatusUpdate` UiCommand so the JS layer can refresh
@@ -1782,6 +1786,36 @@ impl AppState {
                     text,
                     status: "delivered".into(),
                     reason: None,
+                });
+            }
+
+            "steer_cancelled" => {
+                let id = msg["id"].as_str().unwrap_or("").to_string();
+                let reason = msg["reason"].as_str().unwrap_or("").to_string();
+                let entry = self.queued_steers.remove(&id);
+                let text = entry.as_ref().map(|q| q.text.clone()).unwrap_or_default();
+                cmds.extend(self.add_log(
+                    "warn",
+                    &format!(
+                        "\u{2715} Steer cancelled: {}",
+                        if reason.is_empty() {
+                            truncate(&text, 80)
+                        } else {
+                            reason.clone()
+                        }
+                    ),
+                    None,
+                    "user",
+                ));
+                cmds.push(UiCommand::SteerStatusUpdate {
+                    id,
+                    text,
+                    status: "cancelled".into(),
+                    reason: if reason.is_empty() {
+                        None
+                    } else {
+                        Some(reason)
+                    },
                 });
             }
 
@@ -5182,6 +5216,41 @@ mod tests {
                     && content.contains("mid-turn")
                     && content.contains("stop and summarize")
         )));
+    }
+
+    #[test]
+    fn handle_event_steer_cancelled_removes_entry() {
+        let mut s = AppState::new();
+        s.queued_steers.insert(
+            "cancel-me".into(),
+            QueuedSteer {
+                text: "pause before merge".into(),
+                status: SteerStatus::Queued,
+                reason: Some("native steer failed".into()),
+            },
+        );
+        let msg = json!({
+            "event": "steer_cancelled",
+            "id": "cancel-me",
+            "reason": "cleared by user"
+        });
+        let cmds = s.handle_message(&msg);
+        assert!(s.queued_steers.get("cancel-me").is_none());
+        let saw_update = cmds.iter().any(|c| {
+            matches!(
+                c,
+                UiCommand::SteerStatusUpdate { id, status, reason, text }
+                    if id == "cancel-me"
+                        && status == "cancelled"
+                        && reason.as_deref() == Some("cleared by user")
+                        && text == "pause before merge"
+            )
+        });
+        assert!(
+            saw_update,
+            "expected cancelled SteerStatusUpdate, got {:?}",
+            cmds
+        );
     }
 
     #[test]

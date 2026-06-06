@@ -1293,6 +1293,9 @@ impl SessionLog {
                 };
                 format!("Steer delivered ({where_})")
             }
+            "steer_cancelled" => reason
+                .map(|reason| format!("Steer cancelled: {reason}"))
+                .unwrap_or_else(|| "Steer cancelled".to_string()),
             _ => format!("Steer {status}"),
         };
 
@@ -1361,6 +1364,19 @@ impl SessionLog {
             None,
             "delivered",
             Some(mid_turn),
+        );
+    }
+
+    pub fn steer_cancelled(&mut self, session_id: Option<&str>, id: &str, reason: &str) {
+        self.steer_event(
+            "steer_cancelled",
+            "warn",
+            session_id,
+            id,
+            None,
+            Some(reason),
+            "cancelled",
+            None,
         );
     }
 
@@ -3226,6 +3242,27 @@ pub fn session_log_entry_to_app_event(
                 mid_turn,
             })
         }
+        "steer_cancelled" => {
+            let session_id = data
+                .and_then(|d| d.get("session_id"))
+                .and_then(|v| v.as_str())
+                .map(String::from);
+            let id = data
+                .and_then(|d| d.get("id"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string();
+            let reason = data
+                .and_then(|d| d.get("reason"))
+                .and_then(|v| v.as_str())
+                .unwrap_or(message.strip_prefix("Steer cancelled: ").unwrap_or(message))
+                .to_string();
+            Some(AppEvent::SteerCancelled {
+                session_id,
+                id,
+                reason,
+            })
+        }
         "session_started" => {
             let session_id = data
                 .and_then(|d| d.get("session_id"))
@@ -4564,6 +4601,7 @@ mod tests {
             "codex native mid-turn steering failed",
         );
         log.steer_delivered(Some("thread-1"), "steer-1", false);
+        log.steer_cancelled(Some("thread-1"), "steer-2", "cleared by user");
         drop(log);
 
         let requested = read_last_event(&log_dir, "steer_requested");
@@ -4581,6 +4619,13 @@ mod tests {
 
         let delivered = read_last_event(&log_dir, "steer_delivered");
         assert_eq!(delivered["data"]["mid_turn"], false);
+
+        let cancelled = read_last_event(&log_dir, "steer_cancelled");
+        assert_eq!(cancelled["level"], "warn");
+        assert_eq!(cancelled["data"]["session_id"], "thread-1");
+        assert_eq!(cancelled["data"]["id"], "steer-2");
+        assert_eq!(cancelled["data"]["status"], "cancelled");
+        assert_eq!(cancelled["data"]["reason"], "cleared by user");
     }
 
     #[test]

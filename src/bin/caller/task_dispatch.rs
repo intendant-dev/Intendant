@@ -258,6 +258,18 @@ impl Dispatcher {
                 });
             }
 
+            ControlMsg::CancelSteer {
+                session_id,
+                id,
+                reason,
+            } => {
+                bus.send(AppEvent::SteerCancelRequested {
+                    session_id,
+                    id,
+                    reason: reason.unwrap_or_else(|| "cleared by user".to_string()),
+                });
+            }
+
             _ => {
                 // Not a task-dispatch command — ignore.
             }
@@ -292,6 +304,7 @@ fn control_target_session_id(msg: &ControlMsg) -> Option<&str> {
         | ControlMsg::ApproveAll { session_id, .. }
         | ControlMsg::Interrupt { session_id, .. }
         | ControlMsg::Steer { session_id, .. }
+        | ControlMsg::CancelSteer { session_id, .. }
         | ControlMsg::StartTask { session_id, .. }
         | ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
         ControlMsg::ConfigureSessionAgent { session_id, .. } => Some(session_id.as_str()),

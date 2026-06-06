@@ -665,6 +665,13 @@ impl SessionSupervisor {
             } => {
                 self.route_steer(session_id, text, id, attachments).await;
             }
+            event::ControlMsg::CancelSteer {
+                session_id,
+                id,
+                reason,
+            } => {
+                self.route_cancel_steer(session_id, id, reason).await;
+            }
             event::ControlMsg::Approve { session_id, id } => {
                 self.resolve_approval(session_id, id, event::ApprovalResponse::Approve, "approve")
                     .await;
@@ -2274,6 +2281,28 @@ impl SessionSupervisor {
         });
     }
 
+    async fn route_cancel_steer(
+        &self,
+        session_id: Option<String>,
+        id: Option<String>,
+        reason: Option<String>,
+    ) {
+        let requested_id = session_id.clone();
+        let event_session_id =
+            if let Some(target_id) = self.resolve_target_session_id(session_id).await {
+                let state = self.state.lock().await;
+                let managed_id = state.resolve_session_id(&target_id).unwrap_or(target_id);
+                requested_id.or(Some(managed_id))
+            } else {
+                requested_id
+            };
+        self.config.bus.send(AppEvent::SteerCancelRequested {
+            session_id: event_session_id,
+            id,
+            reason: reason.unwrap_or_else(|| "cleared by user".to_string()),
+        });
+    }
+
     async fn resolve_approval(
         &self,
         session_id: Option<String>,
@@ -3362,6 +3391,7 @@ fn control_target_session_id(msg: &event::ControlMsg) -> Option<&str> {
         | event::ControlMsg::ApproveAll { session_id, .. }
         | event::ControlMsg::Interrupt { session_id, .. }
         | event::ControlMsg::Steer { session_id, .. }
+        | event::ControlMsg::CancelSteer { session_id, .. }
         | event::ControlMsg::StartTask { session_id, .. }
         | event::ControlMsg::EditUserMessage { session_id, .. }
         | event::ControlMsg::FollowUp { session_id, .. } => session_id.as_deref(),
@@ -3452,7 +3482,20 @@ fn spawn_text_steer_fallback(
                         Ok(AppEvent::SteerAccepted { session_id, id, .. })
                         | Ok(AppEvent::SteerQueued { session_id, id, .. })
                         | Ok(AppEvent::SteerDelivered { session_id, id, .. })
+                        | Ok(AppEvent::SteerCancelled { session_id, id, .. })
                             if id == steer_id
+                                && steer_ack_targets_session(
+                                    &session_id,
+                                    &target_session_id,
+                                ) =>
+                        {
+                            return;
+                        }
+                        Ok(AppEvent::SteerCancelRequested { session_id, id, .. })
+                            if id
+                                .as_deref()
+                                .map(|id| id == steer_id.as_str())
+                                .unwrap_or(true)
                                 && steer_ack_targets_session(
                                     &session_id,
                                     &target_session_id,

@@ -3393,6 +3393,25 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::CancelSteer {
+            session_id,
+            id,
+            reason,
+        } => {
+            bus.send(AppEvent::SteerCancelRequested {
+                session_id,
+                id,
+                reason: reason.unwrap_or_else(|| "cleared by user".to_string()),
+            });
+            emit_control_result(
+                control_tx,
+                "cancel_steer",
+                true,
+                "Steer cancellation requested".to_string(),
+                None,
+            );
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::WebRtcSignal { .. } => {
             // Federation-driven WebRTC signaling — handled by the
             // web gateway's per-peer WS dispatcher, not the MCP
@@ -4304,6 +4323,21 @@ pub fn spawn_event_listener(
                         s.push_log(
                             LogLevel::Info,
                             format!("Steer delivered{} ({})", id_part, mode),
+                        );
+                        resource_changed = Some("intendant://logs");
+                    }
+                    AppEvent::SteerCancelRequested { .. } => {}
+                    AppEvent::SteerCancelled {
+                        ref id, ref reason, ..
+                    } => {
+                        let id_part = if id.is_empty() {
+                            String::new()
+                        } else {
+                            format!(" [{}]", id)
+                        };
+                        s.push_log(
+                            LogLevel::Info,
+                            format!("Steer cancelled{}: {}", id_part, reason),
                         );
                         resource_changed = Some("intendant://logs");
                     }

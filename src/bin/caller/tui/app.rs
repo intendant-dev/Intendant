@@ -1775,6 +1775,10 @@ impl App {
                 // Dispatcher re-emits as AppEvent::SteerRequested; TUI
                 // reacts to that (via the log path in `handle_event`).
             }
+            ControlMsg::CancelSteer { .. } => {
+                // Dispatcher re-emits as AppEvent::SteerCancelRequested; TUI
+                // reacts to the resulting cancellation event.
+            }
             ControlMsg::WebRtcSignal { .. } => {
                 // Federation-driven WebRTC signaling — handled by the
                 // web gateway's WS handler, not the TUI control command
@@ -2779,6 +2783,20 @@ impl App {
                 self.log(
                     LogLevel::Info,
                     format!("Steer delivered{} ({})", id_part, mode),
+                );
+            }
+            AppEvent::SteerCancelRequested { .. } => {}
+            AppEvent::SteerCancelled {
+                ref id, ref reason, ..
+            } => {
+                let id_part = if id.is_empty() {
+                    String::new()
+                } else {
+                    format!(" [{}]", id)
+                };
+                self.log(
+                    LogLevel::Info,
+                    format!("Steer cancelled{}: {}", id_part, reason),
                 );
             }
         }

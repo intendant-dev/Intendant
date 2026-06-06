@@ -255,6 +255,22 @@ pub enum AppEvent {
         id: String,
         mid_turn: bool,
     },
+    /// User/admin requested that queued steer state be cleared. Agent loops
+    /// consume this to remove matching in-memory queue entries and retire the
+    /// pending dashboard row with `SteerCancelled`.
+    SteerCancelRequested {
+        session_id: Option<String>,
+        id: Option<String>,
+        reason: String,
+    },
+    /// A queued or pending steer was explicitly cancelled/cleared. This is a
+    /// terminal UI state distinct from delivery: the prompt should no longer be
+    /// shown as waiting, but Intendant is not claiming the agent saw it.
+    SteerCancelled {
+        session_id: Option<String>,
+        id: String,
+        reason: String,
+    },
     /// Ordinary follow-up lifecycle for targets that cannot be steered
     /// mid-turn. Frontends use this to show "queued for next turn" rather
     /// than making a subagent appear unresponsive while the parent loop is
@@ -1580,6 +1596,17 @@ pub enum ControlMsg {
         #[serde(default)]
         id: Option<String>,
     },
+    /// Clear one queued steer, or all queued steers for the target session
+    /// when `id` is omitted. This only controls Intendant's pending queue/UI
+    /// state; it cannot unsend text already accepted by a backend runtime.
+    CancelSteer {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
+    },
     /// Federation-driven WebRTC signaling toward this daemon. Carries the
     /// browser's offer / trickled ICE candidates / close-request, routed
     /// through the connecting peer's primary daemon over the federation
@@ -1757,6 +1784,16 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             session_id: session_id.clone(),
             id: id.clone(),
             mid_turn: *mid_turn,
+        }),
+        AppEvent::SteerCancelRequested { .. } => None,
+        AppEvent::SteerCancelled {
+            session_id,
+            id,
+            reason,
+        } => Some(OutboundEvent::SteerCancelled {
+            session_id: session_id.clone(),
+            id: id.clone(),
+            reason: reason.clone(),
         }),
         AppEvent::FollowUpStatus {
             session_id,
@@ -2452,6 +2489,13 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
             mid_turn,
         } => {
             log.steer_delivered(session_id.as_deref(), id, *mid_turn);
+        }
+        AppEvent::SteerCancelled {
+            session_id,
+            id,
+            reason,
+        } => {
+            log.steer_cancelled(session_id.as_deref(), id, reason);
         }
         AppEvent::InterruptRequested { .. } => {
             log.info("Interrupt requested");
@@ -3228,6 +3272,16 @@ mod tests {
                 attachments: vec![],
                 id: None,
             },
+            ControlMsg::CancelSteer {
+                session_id: Some("session-1".to_string()),
+                id: Some("s-1".to_string()),
+                reason: Some("cleared by user".to_string()),
+            },
+            ControlMsg::CancelSteer {
+                session_id: None,
+                id: None,
+                reason: None,
+            },
         ];
         for msg in msgs {
             let json = serde_json::to_string(&msg).unwrap();
@@ -3296,6 +3350,24 @@ mod tests {
                 assert_eq!(id, None);
             }
             _ => panic!("expected Steer"),
+        }
+    }
+
+    #[test]
+    fn control_msg_cancel_steer_deserialize() {
+        let json = r#"{"action":"cancel_steer","session_id":"session-1","id":"s-42","reason":"cleared by user"}"#;
+        let msg: ControlMsg = serde_json::from_str(json).unwrap();
+        match msg {
+            ControlMsg::CancelSteer {
+                session_id,
+                id,
+                reason,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("session-1"));
+                assert_eq!(id.as_deref(), Some("s-42"));
+                assert_eq!(reason.as_deref(), Some("cleared by user"));
+            }
+            _ => panic!("expected CancelSteer"),
         }
     }
 
@@ -4140,12 +4212,21 @@ mod tests {
                 mid_turn: false,
             },
         );
+        write_event_to_session_log(
+            &shared,
+            &AppEvent::SteerCancelled {
+                session_id: Some("thread-1".to_string()),
+                id: "steer-2".to_string(),
+                reason: "cleared by user".to_string(),
+            },
+        );
         drop(shared);
 
         let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
         assert!(contents.contains("\"event\":\"steer_requested\""));
         assert!(contents.contains("\"event\":\"steer_queued\""));
         assert!(contents.contains("\"event\":\"steer_delivered\""));
+        assert!(contents.contains("\"event\":\"steer_cancelled\""));
         assert!(contents.contains("Keep the full body."));
     }
 
