@@ -14115,6 +14115,62 @@ function stationSessionActionsForDock(sessionOrId, opts = {}) {
   return actions;
 }
 
+function stationSessionCleanupTargets(session) {
+  const sid = stationSessionId(session);
+  if (!sid) return [];
+  const rawSource = normalizeAgentId(session?.source || '') || 'intendant';
+  const isExternal = rawSource !== 'intendant';
+  const canDeleteLocalSessionData = rawSource === 'intendant'
+    ? session?.can_delete !== false
+    : !!(session?.can_delete_intendant_log && session?.intendant_session_id);
+  if (!canDeleteLocalSessionData) return [];
+  const currentId = String(currentSessionFullId || foregroundSessionFullId || '').trim();
+  const isCurrent = !!currentId && sid.startsWith(currentId);
+  const targets = [];
+  if ((session?.recordings || 0) > 0) {
+    targets.push({ label: 'Delete recordings', target: 'recordings', bytes: session?.recording_bytes || 0 });
+  }
+  if ((session?.frames_bytes || 0) > 0 || (session?.annotations || 0) > 0 || (session?.clips || 0) > 0) {
+    targets.push({ label: 'Delete frames', target: 'frames', bytes: session?.frames_bytes || 0 });
+  }
+  const hasMedia = (session?.recordings || 0) > 0 || (session?.frames_bytes || 0) > 0;
+  if (hasMedia) {
+    targets.push({ label: 'Delete all media', target: 'media', bytes: (session?.recording_bytes || 0) + (session?.frames_bytes || 0) });
+  }
+  if ((session?.turns_bytes || 0) > 0) {
+    targets.push({ label: 'Delete turn data', target: 'turns', bytes: session?.turns_bytes || 0 });
+  }
+  if (!isCurrent) {
+    targets.push({
+      label: rawSource === 'intendant' ? 'Delete session' : 'Delete Intendant log',
+      target: 'session',
+      bytes: rawSource === 'intendant' ? (session?.total_bytes || 0) : (session?.intendant_total_bytes || 0),
+      danger: true,
+    });
+  }
+  return targets;
+}
+
+function stationRenderSessionCleanupSection(parent, session) {
+  const sid = stationSessionId(session);
+  if (!sid) return;
+  const targets = stationSessionCleanupTargets(session);
+  const section = stationDockSection(parent, 'Session data');
+  stationDockRow(section, 'size', _fmtBytes(session?.total_bytes || session?.totalBytes || 0));
+  stationDockRow(section, 'recordings', String(session?.recordings || 0));
+  stationDockRow(section, 'frames', _fmtBytes(session?.frames_bytes || session?.framesBytes || 0));
+  stationDockRow(section, 'turns', _fmtBytes(session?.turns_bytes || session?.turnsBytes || 0));
+  if (!targets.length) {
+    stationDockEmpty(section, 'No Station cleanup actions are available for this session.');
+    return;
+  }
+  stationDockActions(section, targets.map(item => ({
+    label: item.bytes > 0 ? `${item.label} (${_fmtBytes(item.bytes)})` : item.label,
+    danger: !!item.danger,
+    onClick: () => deleteSessionData(sid, item.target, item.label),
+  })));
+}
+
 function stationRenderCodexThreadActionsSection(parent, sessionId, sessionOrMeta = null) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -14457,6 +14513,7 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockRow(section, 'status', session?.status || meta.phase || '--');
   stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
+  stationRenderSessionCleanupSection(parent, session);
   const live = stationRenderExternalLiveThreadSection(parent, session);
   stationRenderSessionConfigSection(parent, session);
   stationRenderCodexThreadActionsSection(parent, stationCodexThreadActionSessionId(session, live) || sid, session);
