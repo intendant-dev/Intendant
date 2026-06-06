@@ -40,13 +40,13 @@ terminal — then the TUI takes the foreground. See [TUI & Autonomy](./tui.md).
 
 ## Tabs
 
-The top tab bar has seven tabs: **Activity**, **Stats**, **Terminal**,
-**Video**, **Sessions**, **Debug**, **Settings**. New events arriving while you
-are on another tab raise a notification badge.
+The top tab bar has eight tabs: **Activity**, **Stats**, **Terminal**,
+**Video**, **Station**, **Sessions**, **Debug**, **Settings**. New events
+arriving while you are on another tab raise a notification badge.
 
 ### Activity
 
-The default tab. Four subtabs:
+The default tab. Five subtabs:
 
 - **Log** — a scrollable, color-coded event stream of everything in the system,
   grouped by turn with visual separators, with a verbosity selector
@@ -61,6 +61,8 @@ The default tab. Four subtabs:
   / Deny) and a follow-up text input for sending a message after a round
   completes.
 - **Context** — the agent's current working context (what it is operating on).
+- **Managed** — managed-context anchors, rewind records, and recovery actions for
+  managed Codex sessions.
 - **Changes** — file changes / diffs produced during the session (with its own
   badge when new changes land).
 - **Control** — direct controls for steering the run.
@@ -101,6 +103,39 @@ Displays appear automatically when the agent's first command triggers Xvfb
 auto-launch, or when access to the user's real session display is granted.
 WebRTC negotiation (SDP offer/answer + ICE candidates) is multiplexed over the
 existing dashboard WebSocket.
+
+### Station
+
+An immersive WASM/WGPU-style control center for the same operational surfaces as
+the rest of the dashboard. The left control-center cards summarize Activity,
+Context, Managed context, Changes, Sessions, Peers/displays, and Control. Each
+card opens a power-user detail panel; actionable rows jump back into the
+canonical dashboard surface, such as a changed file row opening
+**Activity → Changes** with that file's diff selected.
+
+The Station detail panels are also direct launch points for common operations:
+Activity rows focus the matching log entry, and the Activity panel can set log
+verbosity, clear the host filter, or jump to the live log bottom through the
+same state used by **Activity → Log**. Context rows open the selected context
+item, and the Context panel can jump into live/replay mode, focus view, raw
+rendering, or reset view through the canonical **Activity → Context** toolbar.
+Managed rows select rewind anchors or saved rewind records, and the Managed
+panel can jump straight into the rewind, backout/restore, or refresh workflows.
+Changed-file rows open the canonical diff viewer, and the Changes panel exposes
+refresh, redo, and prune through **Activity → Changes**, including the existing
+prune confirmation. Session rows can resume or open Launch config, and the
+Sessions panel links straight to New Session, Deep Search, and Worktrees, with
+a refresh shortcut for the canonical session index. The Peers panel links to
+both the Network settings and the Video display surface, and can start the
+canonical local display-share flow. The Control panel exposes the full Codex
+thread, goal, setup, and memory action groups through the same dispatcher,
+prompts, and confirmations used by
+**Activity → Control**, plus the active external session's per-session binary
+and managed-context launch configuration when that backend supports it, with a
+direct restart-with-saved-config action for applying those settings immediately.
+After a page refresh, if no prompt target or session window is active, Station
+falls back to the most recently updated configurable external session so these
+controls remain reachable without hunting through the full session list.
 
 ### Sessions
 

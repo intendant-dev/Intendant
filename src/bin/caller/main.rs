@@ -105,6 +105,22 @@ fn session_log_id(session_log: &SharedSessionLog) -> Option<String> {
         .filter(|id| !id.is_empty())
 }
 
+fn emit_external_session_identity(
+    bus: &EventBus,
+    session_id: Option<String>,
+    source: &str,
+    backend_session_id: &str,
+) {
+    let Some(session_id) = session_id.filter(|id| !id.trim().is_empty()) else {
+        return;
+    };
+    bus.send(AppEvent::SessionIdentity {
+        session_id,
+        source: source.to_string(),
+        backend_session_id: backend_session_id.to_string(),
+    });
+}
+
 fn record_external_done_and_round_inline(
     session_log: &SharedSessionLog,
     enabled: bool,
@@ -16596,6 +16612,12 @@ async fn run_with_presence(
                         backend, thread.thread_id
                     ))
                 });
+                emit_external_session_identity(
+                    &bus,
+                    session_log_id(&session_log),
+                    backend.as_short_str(),
+                    &thread.thread_id,
+                );
                 persistent_agent = Some(agent);
                 persistent_thread = Some(thread);
                 persistent_event_rx = Some(event_rx);
@@ -17757,13 +17779,14 @@ async fn run_external_agent_mode(
     } else {
         intendant_session_id.clone()
     };
-    if let Some(session_id) = intendant_session_id.clone() {
-        bus.send(AppEvent::SessionIdentity {
-            session_id,
-            source: backend.as_short_str().to_string(),
-            backend_session_id: backend_session_id.clone(),
-        });
-    }
+    emit_external_session_identity(
+        &bus,
+        intendant_session_id
+            .clone()
+            .or_else(|| session_log_id(&session_log)),
+        backend.as_short_str(),
+        &backend_session_id,
+    );
     if backend == external_agent::AgentBackend::Codex {
         let service_tier = agent.service_tier().map(str::to_string);
         emit_codex_session_capabilities_for_project(

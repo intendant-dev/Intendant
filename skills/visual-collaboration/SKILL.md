@@ -1,6 +1,6 @@
 ---
 name: visual-collaboration
-description: Use when the agent should cooperate with the user through Intendant's shared display surface: showing work, asking the user to watch a screen, focusing attention on a region, capturing a display frame, or requesting human input authority.
+description: "Use when the agent should cooperate with the user through Intendant's shared display surface: showing work, asking the user to watch a screen, focusing attention on a region, capturing a display frame, or requesting human input authority."
 ---
 
 # Visual Collaboration

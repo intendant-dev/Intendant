@@ -1246,6 +1246,8 @@ const AUDIO_PROCESSOR_JS: &str = include_str!("../../../static/audio-processor.j
 const ICON_128_PNG: &[u8] = include_bytes!("../../../static/icon-128.png");
 const WASM_WEB_JS: &str = include_str!("../../../static/wasm-web/presence_web.js");
 const WASM_WEB_BIN: &[u8] = include_bytes!("../../../static/wasm-web/presence_web_bg.wasm");
+const WASM_STATION_JS: &str = include_str!("../../../static/wasm-station/station_web.js");
+const WASM_STATION_BIN: &[u8] = include_bytes!("../../../static/wasm-station/station_web_bg.wasm");
 const THREE_MODULE_JS: &str = include_str!("../../../static/three.module.min.js");
 const SOURCE_VIEWER_MAX_BYTES: u64 = 5 * 1024 * 1024;
 const DASHBOARD_IMAGE_MAX_BYTES: u64 = 100 * 1024 * 1024;
@@ -1503,7 +1505,10 @@ fn replay_jsonl_to_outbound_entries_inner(
     compact_historical_context: bool,
 ) -> Vec<serde_json::Value> {
     let (provider, model, autonomy) = scan_replay_status(contents);
-    let external_replay_session_id = external_backend_session_id_from_replay(contents);
+    let external_replay_session = external_backend_session_from_replay(contents);
+    let external_replay_session_id = external_replay_session
+        .as_ref()
+        .map(|(_, session_id)| session_id.clone());
     let wrapper_replay_session_id = replay_session_id_from_dir(log_dir);
     let replay_session_id = external_replay_session_id
         .clone()
@@ -1521,6 +1526,23 @@ fn replay_jsonl_to_outbound_entries_inner(
         "model": model,
         "autonomy": autonomy,
     }));
+    if let (Some((source, backend_session_id)), Some(wrapper_session_id)) = (
+        external_replay_session.as_ref(),
+        wrapper_replay_session_id.as_ref(),
+    ) {
+        if !source.is_empty()
+            && source != "intendant"
+            && !backend_session_id.is_empty()
+            && backend_session_id != wrapper_session_id
+        {
+            entries.push(serde_json::json!({
+                "event": "session_identity",
+                "session_id": wrapper_session_id,
+                "source": source,
+                "backend_session_id": backend_session_id,
+            }));
+        }
+    }
 
     let legacy_model_spans = validated_legacy_model_response_spans(contents, log_dir);
     let mut legacy_model_indices: HashMap<String, usize> = HashMap::new();
@@ -2773,6 +2795,8 @@ fn asset_version_hash() -> String {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     WASM_WEB_BIN.hash(&mut hasher);
     WASM_WEB_JS.hash(&mut hasher);
+    WASM_STATION_BIN.hash(&mut hasher);
+    WASM_STATION_JS.hash(&mut hasher);
     ICON_128_PNG.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
 }
@@ -12257,6 +12281,14 @@ pub fn spawn_web_gateway(
                 &format!("/wasm-web/presence_web_bg.wasm?v={}", v),
             )
             .replace(
+                "/wasm-station/station_web.js",
+                &format!("/wasm-station/station_web.js?v={}", v),
+            )
+            .replace(
+                "/wasm-station/station_web_bg.wasm",
+                &format!("/wasm-station/station_web_bg.wasm?v={}", v),
+            )
+            .replace(
                 "/three.module.min.js",
                 &format!("/three.module.min.js?v={}", v),
             )
@@ -15088,6 +15120,8 @@ pub fn spawn_web_gateway(
                     // Route WASM binaries (need async write_all for large payloads)
                     let wasm_binary = if request_line.contains("/wasm-web/presence_web_bg.wasm") {
                         Some(WASM_WEB_BIN)
+                    } else if request_line.contains("/wasm-station/station_web_bg.wasm") {
+                        Some(WASM_STATION_BIN)
                     } else {
                         None
                     };
@@ -17150,6 +17184,12 @@ pub fn spawn_web_gateway(
                                     WASM_WEB_JS.to_string(),
                                     "no-cache, must-revalidate",
                                 )
+                            } else if request_line.contains("/wasm-station/station_web.js") {
+                                (
+                                    "application/javascript",
+                                    WASM_STATION_JS.to_string(),
+                                    "no-cache, must-revalidate",
+                                )
                             } else if request_line.contains("/three.module.min.js") {
                                 (
                                     "application/javascript",
@@ -19026,6 +19066,39 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    async fn next_ws_json_matching<S, F>(ws_rx: &mut S, mut matches: F) -> serde_json::Value
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+        F: FnMut(&serde_json::Value) -> bool,
+    {
+        let mut seen = Vec::new();
+        for _ in 0..20 {
+            let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
+                .await
+                .expect("timeout")
+                .expect("websocket closed")
+                .expect("websocket error");
+            let Message::Text(text) = msg else {
+                continue;
+            };
+            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if matches(&json) {
+                return json;
+            }
+            seen.push(json);
+        }
+        panic!("expected websocket message not found; seen: {seen:?}");
+    }
+
+    async fn next_ws_json_type<S>(ws_rx: &mut S, ty: &str) -> serde_json::Value
+    where
+        S: futures_util::Stream<Item = Result<Message, tokio_tungstenite::tungstenite::Error>>
+            + Unpin,
+    {
+        next_ws_json_matching(ws_rx, |json| json["t"] == ty).await
     }
 
     #[test]
@@ -24557,6 +24630,54 @@ mod tests {
     }
 
     #[test]
+    fn test_external_wrapper_replay_synthesizes_missing_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("wrapper-session");
+        let backend_id = "019e99d5-b9b0-7ff1-a8b4-bdf0a7aade61";
+        let mut log = crate::session_log::SessionLog::open(log_dir.clone()).unwrap();
+        log.session_started("wrapper-session", Some("external task"));
+        log.debug(&format!("External agent thread: {backend_id}"));
+        log.debug(&format!(
+            "Mode: external agent (Codex) via presence, thread: {backend_id}"
+        ));
+        log.info("[user] continue here");
+        drop(log);
+
+        let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap();
+        let entries = replay_jsonl_to_outbound_entries(&contents, &log_dir);
+        let identity_row = entries
+            .iter()
+            .find(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("session_identity"))
+            .expect("missing wrapper session_identity should be synthesized");
+        let user_row = entries
+            .iter()
+            .find(|entry| {
+                entry.get("event").and_then(|v| v.as_str()) == Some("log_entry")
+                    && entry.get("content").and_then(|v| v.as_str()) == Some("continue here")
+            })
+            .expect("wrapper log entry should replay");
+
+        assert_eq!(
+            identity_row.get("session_id").and_then(|v| v.as_str()),
+            Some("wrapper-session")
+        );
+        assert_eq!(
+            identity_row.get("source").and_then(|v| v.as_str()),
+            Some("codex")
+        );
+        assert_eq!(
+            identity_row
+                .get("backend_session_id")
+                .and_then(|v| v.as_str()),
+            Some(backend_id)
+        );
+        assert_eq!(
+            user_row.get("session_id").and_then(|v| v.as_str()),
+            Some(backend_id)
+        );
+    }
+
+    #[test]
     fn resume_external_wrapper_replays_full_log_with_editable_user_turns() {
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
@@ -25597,19 +25718,10 @@ mod tests {
         };
         crate::control::broadcast_event(&broadcast_tx, &event);
 
-        // Verify the WebSocket client receives it
-        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
-            .await
-            .expect("timeout")
-            .unwrap()
-            .unwrap();
-
-        if let Message::Text(text) = msg {
-            assert!(text.contains("\"event\":\"status\""));
-            assert!(text.contains("\"turn\":1"));
-        } else {
-            panic!("expected text message");
-        }
+        // Verify the WebSocket client receives it. Other bootstrap snapshots may
+        // be sent first.
+        let json = next_ws_json_matching(&mut ws_rx, |json| json["event"] == "status").await;
+        assert_eq!(json["turn"], 1);
 
         handle.abort();
     }
@@ -27527,7 +27639,7 @@ mod tests {
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let url = format!("ws://127.0.0.1:{}", port);
-        let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
+        let (ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
         let (_ws_tx_split, mut ws_rx) = ws.split();
 
         // First message should be the bootstrap state_snapshot
@@ -27721,13 +27833,6 @@ mod tests {
         let url = format!("ws://127.0.0.1:{}", port);
         let (mut ws, _) = tokio_tungstenite::connect_async(&url).await.unwrap();
 
-        // Drain the bootstrap message
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_secs(1),
-            futures_util::StreamExt::next(&mut ws),
-        )
-        .await;
-
         // Send a check_status tool request
         ws.send(Message::Text(
             r#"{"t":"tool_request","id":"req_1","tool":"check_status","args":{}}"#.into(),
@@ -27735,26 +27840,11 @@ mod tests {
         .await
         .unwrap();
 
-        // Read the tool_response
-        let msg = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            futures_util::StreamExt::next(&mut ws),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
-
-        if let Message::Text(text) = msg {
-            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(json["t"], "tool_response");
-            assert_eq!(json["id"], "req_1");
-            let result = json["result"].as_str().unwrap();
-            assert!(result.contains("running_agent"), "result: {}", result);
-            assert!(result.contains("Turn: 5"), "result: {}", result);
-        } else {
-            panic!("expected text message for tool_response");
-        }
+        let json = next_ws_json_type(&mut ws, "tool_response").await;
+        assert_eq!(json["id"], "req_1");
+        let result = json["result"].as_str().unwrap();
+        assert!(result.contains("running_agent"), "result: {}", result);
+        assert!(result.contains("Turn: 5"), "result: {}", result);
 
         handle.abort();
     }
@@ -27829,31 +27919,11 @@ mod tests {
         }
         assert!(found, "expected ControlCommand(Approve)");
 
-        // Should also get a tool_response back
-        // Drain bootstrap first
-        let _ = tokio::time::timeout(
-            tokio::time::Duration::from_millis(500),
-            futures_util::StreamExt::next(&mut ws),
-        )
-        .await;
-
-        let msg = tokio::time::timeout(
-            tokio::time::Duration::from_secs(2),
-            futures_util::StreamExt::next(&mut ws),
-        )
-        .await
-        .expect("timeout")
-        .unwrap()
-        .unwrap();
-
-        if let Message::Text(text) = msg {
-            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(json["t"], "tool_response");
-            assert_eq!(json["id"], "req_2");
-            assert!(json["result"].as_str().unwrap().contains("Approved"));
-        } else {
-            panic!("expected text message");
-        }
+        // Should also get a tool_response back. Other bootstrap snapshots may
+        // be sent first.
+        let json = next_ws_json_type(&mut ws, "tool_response").await;
+        assert_eq!(json["id"], "req_2");
+        assert!(json["result"].as_str().unwrap().contains("Approved"));
 
         handle.abort();
     }
@@ -28156,22 +28226,11 @@ mod tests {
             .expect("channel closed");
         assert!(matches!(event, AppEvent::PresenceConnected { .. }));
 
-        // Should receive a presence_welcome with is_active: true via direct channel
-        // (We need to read WS messages to find it)
+        // Should receive a presence_welcome with is_active: true via direct
+        // channel. Other bootstrap snapshots may be sent first.
         let (_ws_tx_split, mut ws_rx) = ws.split();
-        let msg = tokio::time::timeout(tokio::time::Duration::from_secs(2), ws_rx.next())
-            .await
-            .expect("timeout")
-            .unwrap()
-            .unwrap();
-
-        if let Message::Text(text) = msg {
-            let json: serde_json::Value = serde_json::from_str(&text).unwrap();
-            assert_eq!(json["t"], "presence_welcome");
-            assert_eq!(json["is_active"], true);
-        } else {
-            panic!("expected text message");
-        }
+        let json = next_ws_json_type(&mut ws_rx, "presence_welcome").await;
+        assert_eq!(json["is_active"], true);
 
         handle.abort();
     }
