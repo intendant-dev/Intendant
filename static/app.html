@@ -11096,6 +11096,8 @@ const stationSessionRenameDrafts = new Map();
 const stationSessionConfigDrafts = new Map();
 let stationComputerUseStatus = '';
 let stationComputerUseSaving = false;
+let stationRecordingSettingsStatus = '';
+let stationRecordingSettingsSaving = false;
 let stationManagedDraft = {
   anchor: '',
   position: '',
@@ -15315,6 +15317,84 @@ function stationRenderRecordingSection(parent) {
   }
 }
 
+function stationRecordingSettingValue(id, fallback = '') {
+  const el = document.getElementById(id);
+  if (!el) return fallback;
+  if (el.type === 'checkbox') return el.checked;
+  return el.value || fallback;
+}
+
+function stationSetRecordingSetting(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!value;
+  else el.value = value || '';
+  if (id === 'set-recording-framerate') updateFramerateWarning?.();
+  stationRecordingSettingsStatus = 'Unsaved recording settings.';
+  stationRenderControlsDock('recordings');
+}
+
+async function stationSaveRecordingSettingsFromDock() {
+  stationRecordingSettingsSaving = true;
+  stationRecordingSettingsStatus = 'Saving recording settings...';
+  stationRenderControlsDock('recordings');
+  try {
+    await saveSettings();
+    stationRecordingSettingsStatus = 'Saved recording settings.';
+    showControlToast?.('success', 'Recording settings saved');
+  } catch (err) {
+    stationRecordingSettingsStatus = err?.message || 'Recording settings save failed.';
+    showControlToast?.('error', stationRecordingSettingsStatus);
+  } finally {
+    stationRecordingSettingsSaving = false;
+    stationRenderControlsDock('recordings');
+  }
+}
+
+async function stationReloadRecordingSettingsForDock() {
+  stationRecordingSettingsStatus = 'Reloading recording settings...';
+  stationRenderControlsDock('recordings');
+  settingsLoaded = false;
+  await loadSettings();
+  stationRecordingSettingsStatus = 'Reloaded recording settings.';
+  stationRenderControlsDock('recordings');
+}
+
+function stationRenderRecordingDefaultsEditor(parent) {
+  const section = stationDockSection(parent, 'Recording defaults');
+  const enabled = !!stationRecordingSettingValue('set-recording-enabled', false);
+  const framerate = stationRecordingSettingValue('set-recording-framerate', '15');
+  const quality = stationRecordingSettingValue('set-recording-quality', 'medium');
+  stationDockRow(section, 'enabled', enabled ? 'yes' : 'no');
+  stationDockRow(section, 'framerate', `${framerate || 15} fps`);
+  stationDockRow(section, 'quality', quality || 'medium');
+  const enabledBox = stationDockCheckbox(section, 'Enabled', enabled, { id: 'station-recording-enabled' });
+  enabledBox.addEventListener('change', ev => stationSetRecordingSetting('set-recording-enabled', ev.target.checked));
+  const fps = stationDockInput(section, 'Framerate', framerate || '15', {
+    id: 'station-recording-framerate',
+    type: 'number',
+    min: 1,
+    max: 60,
+  });
+  fps.addEventListener('change', ev => stationSetRecordingSetting('set-recording-framerate', ev.target.value || '15'));
+  fps.addEventListener('blur', ev => stationSetRecordingSetting('set-recording-framerate', ev.target.value || '15'));
+  const qualitySelect = stationDockSelect(section, 'Quality', quality || 'medium', [
+    ['low', 'Low'],
+    ['medium', 'Medium'],
+    ['high', 'High'],
+  ], { id: 'station-recording-quality' });
+  qualitySelect.addEventListener('change', ev => stationSetRecordingSetting('set-recording-quality', ev.target.value || 'medium'));
+  if (Number.parseInt(framerate, 10) > 15) {
+    stationDockEmpty(section, 'The screencapture backend caps at 15 fps.');
+  }
+  if (stationRecordingSettingsStatus) stationDockEmpty(section, stationRecordingSettingsStatus);
+  stationDockActions(section, [
+    { label: stationRecordingSettingsSaving ? 'Saving...' : 'Save recording', primary: true, disabled: stationRecordingSettingsSaving, onClick: stationSaveRecordingSettingsFromDock },
+    { label: 'Reload', disabled: stationRecordingSettingsSaving, onClick: stationReloadRecordingSettingsForDock },
+    stationDockRouteAction('Route recording settings', 'settings', 'agent', () => document.getElementById('set-recording-enabled')?.focus()),
+  ]);
+}
+
 function stationPendingApprovalRows() {
   const rows = [];
   if (stationCurrentApproval?.id) {
@@ -15849,6 +15929,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
 
   if (sectionName === 'browser' || sectionName === 'overview') stationRenderBrowserWorkspaceSection(body);
   if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingSection(body);
+  if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingDefaultsEditor(body);
 
   stationRenderComputerUseDefaultsEditor(body, controls);
 
