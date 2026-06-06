@@ -10637,6 +10637,7 @@ function stationLogEntryEvent(entry, index, options = {}) {
   const source = entry.querySelector('.log-level')?.textContent?.trim() || level;
   const content = entry.querySelector('.log-content')?.textContent || entry.textContent || '';
   const itemId = entry.dataset.itemId || '';
+  const editButton = entry.querySelector(':scope > .log-edit-message');
   const eventId = stationLogEventId({
     stationEventId: entry.dataset.stationEventId || '',
     item_id: itemId,
@@ -10656,6 +10657,8 @@ function stationLogEntryEvent(entry, index, options = {}) {
     ts,
     level,
     msg: msg || source || level,
+    editable: !!editButton,
+    historical: editButton?.dataset?.historical === 'true',
   };
 }
 
@@ -12307,6 +12310,17 @@ function stationActivityLogEntryForEventId(eventId) {
     document.querySelector(`.log-entry[data-item-id="${escaped}"]`);
 }
 
+function stationEditActivityEvent(eventId) {
+  const entry = stationActivityLogEntryForEventId(eventId);
+  const editButton = entry?.querySelector(':scope > .log-edit-message');
+  if (!editButton) {
+    showControlToast?.('error', 'This Station activity row is not editable');
+    return;
+  }
+  focusActivityLogEvent(eventId);
+  editButton.click();
+}
+
 function stationActivityEventCopyText(ev) {
   const entry = stationActivityLogEntryForEventId(ev?.id || '');
   if (entry && typeof getLogEntryCopyText === 'function') {
@@ -12408,6 +12422,7 @@ function stationRenderActivityDock(focusId = '') {
       actions: [
         ev.id ? { label: 'Pin', onClick: () => stationRenderActivityDock(ev.id) } : null,
         ev.id ? { label: 'Show', primary: true, onClick: () => focusActivityLogEvent(ev.id) } : null,
+        ev.editable ? { label: ev.historical ? 'Branch' : 'Edit', onClick: () => stationEditActivityEvent(ev.id) } : null,
         { label: 'Copy text', onClick: () => copyTextToClipboard(stationActivityEventCopyText(ev)) },
         ev.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(ev.id) } : null,
       ],
