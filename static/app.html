@@ -13074,6 +13074,18 @@ async function stationApplyManagedAction(op, id = '', sessionId = '') {
   }
 }
 
+function stationManagedPercentLabel(value) {
+  return value === null || value === undefined ? '--' : `${value.toFixed(1)}%`;
+}
+
+async function stationRunManagedRecordBackout(row, mode = 'inspect') {
+  if (!row?.id) return;
+  await stationApplyManagedAction('record', row.id, row.sessionId);
+  stationRememberManagedDraftValue('backoutMode', mode || 'inspect');
+  await stationSubmitManagedBackoutFromDock(mode || 'inspect');
+  stationRenderManagedDock('backout');
+}
+
 function stationClearManagedTarget(kind) {
   if (kind === 'record') {
     stationSelectedManagedRecord = '';
@@ -13090,6 +13102,26 @@ function stationClearManagedTarget(kind) {
     const stationAnchor = document.getElementById('station-managed-anchor');
     if (stationAnchor) stationAnchor.value = '';
   }
+}
+
+function stationRenderManagedInsightSection(body, managed) {
+  const insight = stationDockSection(body, 'Insight');
+  const mode = managed.mode || 'unknown';
+  const status = managed.status || 'unknown';
+  const cacheSuffix = managed.live ? '' : ' / cached';
+  const effectiveValue = `${managedContextFormatNumber(managed.usedTokens)} / ${managedContextFormatNumber(managed.effectiveWindow)} (${stationManagedPercentLabel(managed.effectivePct)})`;
+  const hardValue = `${managedContextFormatNumber(managed.usedTokens)} / ${managedContextFormatNumber(managed.hardWindow)} (${stationManagedPercentLabel(managed.hardPct)})`;
+  const softValue = managed.rewindOnlyLimit === null
+    ? '--'
+    : `${managedContextFormatNumber(managed.rewindOnlyLimit)}${managed.remainingToRewindOnly === null ? '' : ` / ${managedContextFormatNumber(managed.remainingToRewindOnly)} left`}`;
+  const latestRecord = managed.recentRecords?.[0];
+  stationDockRow(insight, 'state', `${mode} / ${status}${cacheSuffix}`);
+  stationDockRow(insight, 'effective', effectiveValue);
+  stationDockRow(insight, 'hard', hardValue);
+  stationDockRow(insight, 'soft rewind', softValue);
+  stationDockRow(insight, 'rewind-only', managed.rewindOnly ? 'on' : 'off');
+  stationDockRow(insight, 'latest record', latestRecord ? (latestRecord.label || latestRecord.id) : 'none');
+  stationDockRow(insight, 'readiness', stationManagedActionReadyText(managed) || 'ready');
 }
 
 function stationRenderManagedDock(mode = '') {
@@ -13128,6 +13160,7 @@ function stationRenderManagedDock(mode = '') {
     { label: 'Backout', primary: mode === 'backout', onClick: () => stationRenderManagedDock('backout') },
     stationDockRouteAction('Route managed tab', 'activity', 'managed'),
   ]);
+  stationRenderManagedInsightSection(body, managed);
 
   const form = stationDockSection(body, mode === 'backout' ? 'Backout' : 'Rewind');
   const anchorDefault = stationManagedDraftValue('anchor', 'managed-context-anchor', managed.recentAnchors?.[0]?.id || '');
@@ -13215,6 +13248,7 @@ function stationRenderManagedDock(mode = '') {
     stationDockEmpty(records, 'No rewind records for this session.');
   } else {
     for (const row of managed.recentRecords) {
+      const readOnlyTitle = actionReadyText || '';
       stationDockCard(records, {
         title: row.label || row.id,
         meta: row.value || 'record',
@@ -13222,7 +13256,10 @@ function stationRenderManagedDock(mode = '') {
         active: row.id && row.id === (stationSelectedManagedRecord || recordDefault),
         actions: [
           { label: 'Select', onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); stationRenderManagedDock('backout'); } },
-          { label: 'Inspect', primary: true, onClick: async () => { await stationApplyManagedAction('record', row.id, row.sessionId); stationRememberManagedDraftValue('backoutMode', 'inspect'); await stationSubmitManagedBackoutFromDock('inspect'); stationRenderManagedDock('backout'); } },
+          { label: 'Inspect', primary: true, onClick: async () => stationRunManagedRecordBackout(row, 'inspect') },
+          { label: 'Restore', disabled: !!readOnlyTitle, title: readOnlyTitle, onClick: async () => stationRunManagedRecordBackout(row, 'restore') },
+          { label: 'Fork', disabled: !!readOnlyTitle, title: readOnlyTitle, onClick: async () => stationRunManagedRecordBackout(row, 'fork') },
+          { label: 'Backout', danger: true, disabled: !!readOnlyTitle, title: readOnlyTitle, onClick: async () => stationRunManagedRecordBackout(row, 'backout') },
           { label: 'Copy', onClick: () => copyTextToClipboard(row.id) },
         ],
       });
@@ -15578,16 +15615,23 @@ function stationBuildManagedSummary(contextSummary) {
     contextSummary.hardWindow ||
     effectiveWindow
   );
+  const usedTokens = stationNum(pressure.used_tokens || contextSummary.tokens);
+  const rewindOnlyLimit = live ? managedContextPositiveNumber(pressure.rewind_only_limit) : null;
   const mode = sessionId
     ? managedContextEffectiveMode(sessionId, meta)
     : (controlCodexConfig.managed_context || 'vanilla');
   return {
     sessionId: sessionId || '',
+    live,
     mode,
     status: live ? (pressure.status || 'unknown') : (sessionId ? 'historical' : 'unknown'),
-    usedTokens: stationNum(pressure.used_tokens || contextSummary.tokens),
+    usedTokens,
     effectiveWindow,
     hardWindow,
+    effectivePct: managedContextPercent(usedTokens, effectiveWindow),
+    hardPct: managedContextPercent(usedTokens, hardWindow),
+    rewindOnlyLimit,
+    remainingToRewindOnly: rewindOnlyLimit === null ? null : Math.max(0, rewindOnlyLimit - usedTokens),
     rewindOnly: !!pressure.rewind_only,
     records: Array.isArray(managedContextRecords) ? managedContextRecords.length : 0,
     anchors: stationManagedAnchorCount(sessionId),
