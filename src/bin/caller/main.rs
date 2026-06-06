@@ -1421,6 +1421,7 @@ const EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT: usize = 4 * 1024;
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_HEAD_LIMIT: usize = 2 * 1024;
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT: usize = 2 * 1024;
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT: usize = 24 * 1024;
+const EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT: usize = 6 * 1024;
 const EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT: usize = 512;
 const EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT: usize = 2;
 
@@ -1435,6 +1436,8 @@ struct ExternalToolOutputLimiter {
     items: std::collections::HashMap<String, ExternalToolOutputState>,
     total_emitted_bytes: usize,
     total_truncated: bool,
+    source_emitted_bytes: usize,
+    source_truncated: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1444,6 +1447,7 @@ struct ExternalToolOutputState {
     tail: String,
     omitting: bool,
     omission_notice_emitted: bool,
+    source_like: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1478,9 +1482,11 @@ impl ExternalToolOutputLimiter {
         } else {
             item_id.to_string()
         };
+        let source_like = external_tool_output_looks_like_large_source(&text);
         let emit = {
             let state = self.items.entry(key).or_default();
             state.seen_bytes = state.seen_bytes.saturating_add(text.len());
+            state.source_like |= source_like;
 
             if state.omitting {
                 state.push_tail(&text);
@@ -1511,7 +1517,16 @@ impl ExternalToolOutputLimiter {
                 }
             }
         };
-        emit.and_then(|out| self.emit_with_total_cap(out))
+        let item_source_like = self
+            .items
+            .get(if item_id.is_empty() {
+                "<unknown>"
+            } else {
+                item_id
+            })
+            .map(|state| state.source_like)
+            .unwrap_or(source_like);
+        emit.and_then(|out| self.emit_with_caps(out, item_source_like))
     }
 
     fn complete(&mut self, item_id: &str) -> Option<String> {
@@ -1537,7 +1552,43 @@ impl ExternalToolOutputLimiter {
             omitted_middle_bytes,
         );
         out.push_str(&tail);
-        self.emit_with_total_cap(out)
+        self.emit_with_caps(out, state.source_like)
+    }
+
+    fn emit_with_caps(&mut self, text: String, source_like: bool) -> Option<String> {
+        if source_like {
+            self.emit_with_source_cap(text)
+                .and_then(|out| self.emit_with_total_cap(out))
+        } else {
+            self.emit_with_total_cap(text)
+        }
+    }
+
+    fn emit_with_source_cap(&mut self, text: String) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        if self.source_emitted_bytes >= EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT {
+            if self.source_truncated {
+                return None;
+            }
+            self.source_truncated = true;
+            return Some(external_tool_source_output_total_truncation_notice());
+        }
+
+        let remaining =
+            EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT - self.source_emitted_bytes;
+        if text.len() <= remaining {
+            self.source_emitted_bytes += text.len();
+            return Some(text);
+        }
+
+        let split_at = char_boundary_at_or_before(&text, remaining);
+        let mut out = text[..split_at].to_string();
+        self.source_emitted_bytes = EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT;
+        self.source_truncated = true;
+        out.push_str(&external_tool_source_output_total_truncation_notice());
+        Some(out)
     }
 
     fn emit_with_total_cap(&mut self, text: String) -> Option<String> {
@@ -1625,6 +1676,79 @@ fn external_tool_output_total_truncation_notice() -> String {
         "\n\n[Intendant omitted additional external tool output after the {} KiB per-turn transcript cap]\n",
         EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT / 1024
     )
+}
+
+fn external_tool_source_output_total_truncation_notice() -> String {
+    format!(
+        "\n\n[Intendant omitted additional large source-like external tool output after the {} KiB per-turn source-output cap]\n",
+        EXTERNAL_TOOL_SOURCE_OUTPUT_ACTIVITY_TOTAL_LIMIT / 1024
+    )
+}
+
+fn external_tool_output_looks_like_large_source(text: &str) -> bool {
+    if text.len() <= EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT {
+        return false;
+    }
+
+    let mut non_empty_lines = 0usize;
+    let mut code_like_lines = 0usize;
+    let mut structural_lines = 0usize;
+
+    for line in text.lines().take(200) {
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        non_empty_lines += 1;
+        if external_tool_source_line_has_code_token(trimmed) {
+            code_like_lines += 1;
+        }
+        if trimmed.contains('{')
+            || trimmed.contains('}')
+            || trimmed.ends_with(';')
+            || trimmed.ends_with(',')
+            || trimmed.contains("=>")
+        {
+            structural_lines += 1;
+        }
+    }
+
+    non_empty_lines >= 24
+        && code_like_lines >= 8
+        && structural_lines >= 8
+        && code_like_lines * 100 / non_empty_lines >= 20
+}
+
+fn external_tool_source_line_has_code_token(line: &str) -> bool {
+    const TOKENS: &[&str] = &[
+        "fn ",
+        "impl ",
+        "pub ",
+        "struct ",
+        "enum ",
+        "use ",
+        "mod ",
+        "let ",
+        "const ",
+        "static ",
+        "async ",
+        "await",
+        "match ",
+        "if ",
+        "else",
+        "for ",
+        "while ",
+        "return ",
+        "function ",
+        "class ",
+        "import ",
+        "export ",
+        "type ",
+        "interface ",
+        "const ",
+        "var ",
+    ];
+    TOKENS.iter().any(|token| line.contains(token))
 }
 
 fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
@@ -12745,6 +12869,62 @@ Also: {"source": "bare"}"#;
                 .is_none(),
             "further output after the turn cap should be suppressed"
         );
+    }
+
+    #[test]
+    fn external_tool_output_limiter_caps_repeated_large_source_output() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let source = large_rust_source_output();
+
+        let first_head = limiter.filter("item-1", source.clone()).unwrap();
+        assert!(first_head.contains("fn generated_function_0"));
+        assert!(!first_head.contains("source-output cap"));
+        let first_tail = limiter.complete("item-1").unwrap();
+        assert!(first_tail.contains("Intendant omitted"));
+        assert!(!first_tail.contains("source-output cap"));
+
+        let second_head = limiter.filter("item-2", source.clone()).unwrap();
+        assert!(second_head.contains("fn generated_function_0"));
+        assert!(second_head.contains("source-output cap"));
+        assert!(
+            limiter.complete("item-2").is_none(),
+            "source cap should suppress later tail re-emission"
+        );
+        assert!(
+            limiter.filter("item-3", source).is_none(),
+            "source cap should suppress further repeated source dumps"
+        );
+    }
+
+    #[test]
+    fn external_tool_output_limiter_does_not_source_cap_large_non_source_output() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let log = (0..160)
+            .map(|i| {
+                format!(
+                    "2026-06-06T12:00:{:02}Z INFO worker event number {}\n",
+                    i % 60,
+                    i
+                )
+            })
+            .collect::<String>();
+
+        let first = limiter.filter("item-1", log.clone()).unwrap();
+        assert!(!first.contains("source-output cap"));
+        let _ = limiter.complete("item-1");
+
+        let second = limiter.filter("item-2", log).unwrap();
+        assert!(!second.contains("source-output cap"));
+    }
+
+    fn large_rust_source_output() -> String {
+        (0..140)
+            .map(|i| {
+                format!(
+                    "pub async fn generated_function_{i}(input: usize) -> usize {{\n    let value = input + {i};\n    if value > 10 {{\n        return value;\n    }}\n    value\n}}\n"
+                )
+            })
+            .collect()
     }
 
     #[test]
