@@ -13131,6 +13131,46 @@ function stationManagedResultText() {
   return stationManagedActionResult || managedContextEl?.('managed-context-action-result')?.textContent || '';
 }
 
+function stationManagedStatusExportPayload(managed, contextSummary) {
+  return {
+    generated_at: new Date().toISOString(),
+    session_id: managed.sessionId || '',
+    mode: managed.mode || '',
+    status: managed.status || '',
+    live: !!managed.live,
+    context: {
+      source: contextSummary?.source || '',
+      used_tokens: managed.usedTokens || 0,
+      effective_window: managed.effectiveWindow || 0,
+      hard_window: managed.hardWindow || 0,
+      effective_pct: managed.effectivePct,
+      hard_pct: managed.hardPct,
+      rewind_only_limit: managed.rewindOnlyLimit,
+      remaining_to_rewind_only: managed.remainingToRewindOnly,
+      rewind_only: !!managed.rewindOnly,
+    },
+    catalog: {
+      anchors: managed.anchors || 0,
+      records: managed.records || 0,
+      lineage_groups: managed.lineageGroups || 0,
+      fission_groups: managed.fissionGroups || 0,
+      branches: managed.branches || 0,
+    },
+    recent: {
+      anchors: managed.recentAnchors || [],
+      records: managed.recentRecords || [],
+      branches: managed.recentBranches || [],
+    },
+    raw_status: managedContextStatus || {},
+  };
+}
+
+async function stationCopyManagedStatusFromDock(managed, contextSummary) {
+  const payload = stationManagedStatusExportPayload(managed, contextSummary);
+  await copyTextToClipboard(JSON.stringify(payload, null, 2));
+  showControlToast?.('success', 'Managed status JSON copied');
+}
+
 function stationSetManagedResult(text) {
   stationManagedActionResult = text || 'No action yet';
   const result = managedContextEl?.('managed-context-action-result');
@@ -13476,6 +13516,7 @@ function stationRenderManagedDock(mode = '') {
   if (actionReadyText) stationDockEmpty(overview, actionReadyText);
   stationDockActions(overview, [
     { label: 'Refresh', primary: mode === 'refresh', onClick: async () => { await stationApplyManagedAction('refresh', '', managed.sessionId); stationRenderManagedDock('refresh'); } },
+    { label: 'Copy status JSON', onClick: async () => stationCopyManagedStatusFromDock(managed, context) },
     { label: 'Prepare rewind', primary: mode === 'rewind', onClick: () => stationRenderManagedDock('rewind') },
     { label: 'Backout', primary: mode === 'backout', onClick: () => stationRenderManagedDock('backout') },
     stationDockRouteAction('Route managed tab', 'activity', 'managed'),
