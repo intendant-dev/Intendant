@@ -11,7 +11,8 @@ const os = require('os');
 const path = require('path');
 const tls = require('tls');
 const { EventEmitter } = require('events');
-const { spawn } = require('child_process');
+const vm = require('vm');
+const { spawn, spawnSync } = require('child_process');
 
 const DEFAULT_TIMEOUT_MS = 15000;
 const DEFAULT_CDP_TIMEOUT_MS = 10000;
@@ -60,11 +61,14 @@ Options:
   --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or target/{release,debug}/intendant)
   --dashboard-arg ARG        Extra arg appended to the launched dashboard command; repeatable
   --dashboard-timeout MS     Temporary dashboard readiness timeout (default: ${DEFAULT_DASHBOARD_TIMEOUT_MS})
+  --check-static-scripts     Parse inline classic/module scripts in static/app.html without executing them
+  --app-html PATH            HTML file for --check-static-scripts (default: static/app.html)
   --json                     Print one compact JSON result
   --self-test                Run parser/formatter self-tests; does not launch a browser
 
 If --url/--port are omitted, the script derives the dashboard port from
-INTENDANT_MCP_URL when available. It never defaults to port 8765.`);
+INTENDANT_MCP_URL when available. It never defaults to port 8765.
+--check-static-scripts may run by itself without --url/--port.`);
 }
 
 function parseArgs(argv, env = process.env) {
@@ -84,6 +88,9 @@ function parseArgs(argv, env = process.env) {
     noSandbox: true,
     json: false,
     selfTest: false,
+    checkStaticScripts: false,
+    appHtmlPath: path.join('static', 'app.html'),
+    explicitDashboardTarget: false,
   };
 
   for (let i = 0; i < argv.length; i += 1) {
@@ -109,12 +116,16 @@ function parseArgs(argv, env = process.env) {
       opts.selfTest = true;
     } else if (arg === '--url') {
       opts.url = readValue();
+      opts.explicitDashboardTarget = true;
     } else if (arg.startsWith('--url=')) {
       opts.url = arg.slice('--url='.length);
+      opts.explicitDashboardTarget = true;
     } else if (arg === '--port') {
       opts.port = readNumber('--port');
+      opts.explicitDashboardTarget = true;
     } else if (arg.startsWith('--port=')) {
       opts.port = parsePositiveInt(arg.slice('--port='.length), '--port');
+      opts.explicitDashboardTarget = true;
     } else if (arg === '--host') {
       opts.host = readValue();
     } else if (arg.startsWith('--host=')) {
@@ -169,6 +180,12 @@ function parseArgs(argv, env = process.env) {
       opts.dashboardTimeoutMs = readNumber('--dashboard-timeout');
     } else if (arg.startsWith('--dashboard-timeout=')) {
       opts.dashboardTimeoutMs = parsePositiveInt(arg.slice('--dashboard-timeout='.length), '--dashboard-timeout');
+    } else if (arg === '--check-static-scripts') {
+      opts.checkStaticScripts = true;
+    } else if (arg === '--app-html') {
+      opts.appHtmlPath = readValue();
+    } else if (arg.startsWith('--app-html=')) {
+      opts.appHtmlPath = arg.slice('--app-html='.length);
     } else if (arg === '--json') {
       opts.json = true;
     } else {
@@ -298,6 +315,15 @@ async function main() {
     return;
   }
 
+  let staticScriptResult;
+  if (opts.checkStaticScripts) {
+    staticScriptResult = validateInlineScriptsInHtmlFile(opts.appHtmlPath);
+    if (staticScriptsOnly(opts)) {
+      printStaticScriptResult(opts, staticScriptResult);
+      return;
+    }
+  }
+
   if (!opts.url) {
     console.error('FAIL dashboard-validation reason="missing --url/--port and INTENDANT_MCP_URL"');
     console.error('Run scripts/validate-dashboard.cjs --help for usage.');
@@ -335,6 +361,7 @@ async function main() {
       websocket: harness.websocketKind,
       selectors: opts.selectors.length,
       functions: opts.functions.length,
+      staticScripts: staticScriptResult,
     };
     printResult(opts, result);
   } catch (error) {
@@ -359,6 +386,16 @@ async function main() {
     await closeOwnedProcesses();
     removeSignalCleanup();
   }
+}
+
+function staticScriptsOnly(opts) {
+  return Boolean(
+    opts.checkStaticScripts
+      && !opts.explicitDashboardTarget
+      && !opts.launchDashboard
+      && opts.selectors.length === 0
+      && opts.functions.length === 0,
+  );
 }
 
 class TemporaryDashboard {
@@ -450,6 +487,9 @@ function printResult(opts, result) {
     console.log(
       `PASS dashboard-validation url=${quote(displayResult.url)} selectors=${displayResult.selectors} functions=${displayResult.functions} ms=${displayResult.ms} websocket=${displayResult.websocket || 'unknown'}`,
     );
+    if (displayResult.staticScripts) {
+      console.log(formatStaticScriptPass(displayResult.staticScripts));
+    }
     return;
   }
   console.error(
@@ -464,6 +504,18 @@ function printResult(opts, result) {
   if (displayResult.next) {
     console.error(`  next=${quote(displayResult.next)}`);
   }
+}
+
+function printStaticScriptResult(opts, result) {
+  if (opts.json) {
+    console.log(JSON.stringify({ status: 'pass', staticScripts: result }));
+    return;
+  }
+  console.log(formatStaticScriptPass(result));
+}
+
+function formatStaticScriptPass(result) {
+  return `PASS dashboard-static-scripts file=${quote(result.file)} scripts=${result.scripts} classic=${result.classic} modules=${result.modules}`;
 }
 
 function collectFailureLogs(lineCount, dashboard, harness) {
@@ -570,6 +622,121 @@ function httpReady(url) {
       resolve(false);
     });
   });
+}
+
+function validateInlineScriptsInHtmlFile(filePath) {
+  const html = fs.readFileSync(filePath, 'utf8');
+  const scripts = extractInlineJavaScript(html);
+  const counts = { classic: 0, modules: 0 };
+  for (const script of scripts) {
+    if (script.goal === 'module') {
+      counts.modules += 1;
+      checkModuleSyntax(script.source, scriptLabel(filePath, script));
+    } else {
+      counts.classic += 1;
+      checkClassicScriptSyntax(script.source, scriptLabel(filePath, script));
+    }
+  }
+  return {
+    file: filePath,
+    scripts: scripts.length,
+    classic: counts.classic,
+    modules: counts.modules,
+  };
+}
+
+function extractInlineJavaScript(html) {
+  const scripts = [];
+  const scriptTag = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
+  let match;
+  while ((match = scriptTag.exec(html)) !== null) {
+    const attrs = parseHtmlAttributes(match[1] || '');
+    if (attrs.has('src')) {
+      continue;
+    }
+    const goal = scriptGoal(attrs.get('type'));
+    if (!goal) {
+      continue;
+    }
+    scripts.push({
+      index: scripts.length + 1,
+      line: lineNumberAt(html, match.index),
+      goal,
+      source: match[2] || '',
+    });
+  }
+  return scripts;
+}
+
+function parseHtmlAttributes(raw) {
+  const attrs = new Map();
+  const attrPattern = /([^\s"'<>/=]+)(?:\s*=\s*(?:"([^"]*)"|'([^']*)'|([^\s"'=<>`]+)))?/g;
+  let match;
+  while ((match = attrPattern.exec(raw)) !== null) {
+    attrs.set(String(match[1]).toLowerCase(), match[2] ?? match[3] ?? match[4] ?? '');
+  }
+  return attrs;
+}
+
+function scriptGoal(rawType) {
+  const type = String(rawType || '').trim().toLowerCase();
+  if (!type || isClassicScriptType(type)) {
+    return 'classic';
+  }
+  if (type === 'module') {
+    return 'module';
+  }
+  return undefined;
+}
+
+function isClassicScriptType(type) {
+  return [
+    'text/javascript',
+    'application/javascript',
+    'application/ecmascript',
+    'text/ecmascript',
+    'text/jscript',
+  ].includes(type);
+}
+
+function lineNumberAt(text, offset) {
+  const prefix = text.slice(0, offset);
+  const newlines = prefix.match(/\n/g);
+  return newlines ? newlines.length + 1 : 1;
+}
+
+function scriptLabel(filePath, script) {
+  return `${filePath}:script#${script.index}:${script.goal}:line${script.line}`;
+}
+
+function checkClassicScriptSyntax(source, filename) {
+  try {
+    new vm.Script(source, { filename });
+  } catch (error) {
+    throw new Error(`classic inline script syntax check failed in ${filename}: ${error.message}`);
+  }
+}
+
+function checkModuleSyntax(source, filename) {
+  const result = spawnSync(process.execPath, ['--check', '--input-type=module', '-'], {
+    input: source,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error) {
+    throw new Error(`module inline script syntax check failed in ${filename}: ${result.error.message}`);
+  }
+  if (result.status !== 0) {
+    const details = firstMeaningfulLine(result.stderr || result.stdout || `node exited ${result.status}`);
+    throw new Error(`module inline script syntax check failed in ${filename}: ${details}`);
+  }
+}
+
+function firstMeaningfulLine(text) {
+  return String(text)
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .find(Boolean) || 'syntax check failed';
 }
 
 function recordChildOutput(stream, logs, kind) {
@@ -1682,6 +1849,14 @@ async function runSelfTest() {
   assert.strictEqual(parsed.timeoutMs, 2500);
   assert.strictEqual(parsed.logLines, 3);
   assert.strictEqual(parsed.diagnostics, true);
+  assert.strictEqual(staticScriptsOnly(parseArgs(['--check-static-scripts'], {
+    INTENDANT_MCP_URL: 'http://127.0.0.1:7777/mcp',
+  })), true);
+  assert.strictEqual(staticScriptsOnly(parseArgs([
+    '--check-static-scripts',
+    '--port',
+    '7777',
+  ], {})), false);
   const launchParsed = parseArgs(
     [
       '--launch-dashboard',
@@ -1719,6 +1894,25 @@ async function runSelfTest() {
   assert.strictEqual(
     dashboardUrlFromMcpUrl('http://localhost:7777/mcp?managed_context=managed'),
     'http://localhost:7777/',
+  );
+  const inlineScripts = extractInlineJavaScript(`
+    <script>const classicOk = 1;</script>
+    <script type="module">import missing from './missing.js'; const moduleOk = missing;</script>
+    <script src="/external.js"></script>
+    <script type="application/json">{"ignored": true}</script>
+  `);
+  assert.strictEqual(inlineScripts.length, 2);
+  assert.strictEqual(inlineScripts[0].goal, 'classic');
+  assert.strictEqual(inlineScripts[1].goal, 'module');
+  checkClassicScriptSyntax(inlineScripts[0].source, 'self-test-classic');
+  checkModuleSyntax(inlineScripts[1].source, 'self-test-module');
+  assert.throws(
+    () => checkClassicScriptSyntax(inlineScripts[1].source, 'self-test-classic-import'),
+    /Cannot use import statement|Unexpected identifier|import declarations/i,
+  );
+  assert.throws(
+    () => checkModuleSyntax('import x from "./missing.js"; const broken = ;', 'self-test-module-broken'),
+    /module inline script syntax check failed/,
   );
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
   assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
