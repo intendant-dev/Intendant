@@ -14478,10 +14478,26 @@ function stationRenderSessionCleanupSection(parent, session) {
   if (!sid) return;
   const targets = stationSessionCleanupTargets(session);
   const section = stationDockSection(parent, 'Session data');
+  const reportId = stationSessionReportId(session);
   stationDockRow(section, 'size', _fmtBytes(session?.total_bytes || session?.totalBytes || 0));
   stationDockRow(section, 'recordings', String(session?.recordings || 0));
   stationDockRow(section, 'frames', _fmtBytes(session?.frames_bytes || session?.framesBytes || 0));
   stationDockRow(section, 'turns', _fmtBytes(session?.turns_bytes || session?.turnsBytes || 0));
+  stationDockRow(section, 'report', reportId ? shortSessionId(reportId) : '--');
+  stationDockActions(section, [
+    {
+      label: 'Download report',
+      primary: !!reportId,
+      disabled: !reportId,
+      title: reportId ? 'Download a text-only session report zip' : 'No local Intendant session log is available for this session',
+      onClick: () => stationDownloadSessionReport(session),
+    },
+    {
+      label: 'Copy report URL',
+      disabled: !reportId,
+      onClick: () => stationCopySessionReportUrl(session),
+    },
+  ]);
   if (!targets.length) {
     stationDockEmpty(section, 'No Station cleanup actions are available for this session.');
     return;
@@ -14491,6 +14507,53 @@ function stationRenderSessionCleanupSection(parent, session) {
     danger: !!item.danger,
     onClick: () => deleteSessionData(sid, item.target, item.label),
   })));
+}
+
+function stationSessionReportId(session) {
+  const meta = sessionConfigMetadata(session || {});
+  const sid = stationSessionId(session);
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || 'intendant';
+  if (source && source !== 'intendant') {
+    return String(
+      session?.intendant_session_id ||
+      session?.intendantSessionId ||
+      meta.intendantSessionId ||
+      meta.intendant_session_id ||
+      ''
+    ).trim();
+  }
+  return sid;
+}
+
+function stationSessionReportUrl(session) {
+  const id = stationSessionReportId(session);
+  return id ? `/api/session/${encodeURIComponent(id)}/report` : '';
+}
+
+function stationDownloadSessionReport(session) {
+  const url = stationSessionReportUrl(session);
+  if (!url) {
+    showControlToast?.('error', 'No local session report is available for this session');
+    return;
+  }
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = '';
+  a.rel = 'noopener';
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+}
+
+async function stationCopySessionReportUrl(session) {
+  const url = stationSessionReportUrl(session);
+  if (!url) {
+    showControlToast?.('error', 'No local session report is available for this session');
+    return;
+  }
+  const absolute = new URL(url, window.location.href).toString();
+  await copyTextToClipboard(absolute);
+  showControlToast?.('success', 'Copied Station session report URL');
 }
 
 function stationSessionLogSource(session) {
