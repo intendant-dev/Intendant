@@ -1408,7 +1408,10 @@ fn mark_pending_runtime_steers_delivered_at_model_checkpoint(
 }
 
 const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
-const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 64 * 1024;
+const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 8 * 1024;
+const EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT: usize = 24 * 1024;
+const EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT: usize = 512;
+const EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT: usize = 2;
 
 #[derive(Default)]
 struct ExternalContextSnapshotState {
@@ -1419,12 +1422,19 @@ struct ExternalContextSnapshotState {
 #[derive(Default)]
 struct ExternalToolOutputLimiter {
     items: std::collections::HashMap<String, ExternalToolOutputState>,
+    total_emitted_bytes: usize,
+    total_truncated: bool,
 }
 
 #[derive(Default)]
 struct ExternalToolOutputState {
     emitted_bytes: usize,
     truncated: bool,
+}
+
+#[derive(Default)]
+struct ExternalToolFailureLogLimiter {
+    counts: std::collections::HashMap<String, usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1439,6 +1449,14 @@ impl ExternalToolOutputLimiter {
     fn filter(&mut self, item_id: &str, text: String) -> Option<String> {
         if text.is_empty() {
             return None;
+        }
+
+        if self.total_emitted_bytes >= EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT {
+            if self.total_truncated {
+                return None;
+            }
+            self.total_truncated = true;
+            return Some(external_tool_output_total_truncation_notice());
         }
 
         let key = if item_id.is_empty() {
@@ -1456,17 +1474,27 @@ impl ExternalToolOutputLimiter {
             return Some(external_tool_output_truncation_notice());
         }
 
-        let remaining = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - state.emitted_bytes;
+        let remaining = (EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - state.emitted_bytes)
+            .min(EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT - self.total_emitted_bytes);
         if text.len() <= remaining {
             state.emitted_bytes += text.len();
+            self.total_emitted_bytes += text.len();
             return Some(text);
         }
 
         let split_at = char_boundary_at_or_before(&text, remaining);
         let mut out = text[..split_at].to_string();
-        out.push_str(&external_tool_output_truncation_notice());
-        state.emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT;
-        state.truncated = true;
+        state.emitted_bytes += split_at;
+        self.total_emitted_bytes += split_at;
+        if self.total_emitted_bytes >= EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT {
+            self.total_emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT;
+            self.total_truncated = true;
+            out.push_str(&external_tool_output_total_truncation_notice());
+        } else {
+            state.emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT;
+            state.truncated = true;
+            out.push_str(&external_tool_output_truncation_notice());
+        }
         Some(out)
     }
 
@@ -1480,10 +1508,35 @@ impl ExternalToolOutputLimiter {
     }
 }
 
+impl ExternalToolFailureLogLimiter {
+    fn filter(&mut self, content: String) -> Option<String> {
+        if content.trim().is_empty() {
+            return None;
+        }
+        let key = external_tool_failure_repeat_key(&content);
+        let count = self.counts.entry(key).or_insert(0);
+        *count += 1;
+        if *count <= EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT {
+            return Some(content);
+        }
+        if *count == EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT + 1 {
+            return Some(external_tool_failure_repeat_notice(&content));
+        }
+        None
+    }
+}
+
 fn external_tool_output_truncation_notice() -> String {
     format!(
         "\n\n[output truncated by Intendant after {} KiB for this tool; further output is hidden from Activity]\n",
         EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT / 1024
+    )
+}
+
+fn external_tool_output_total_truncation_notice() -> String {
+    format!(
+        "\n\n[external tool output truncated by Intendant after {} KiB for this turn; further tool output is hidden from Activity]\n",
+        EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT / 1024
     )
 }
 
@@ -1498,12 +1551,43 @@ fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     idx
 }
 
+fn summarize_external_activity_text(text: &str, max_bytes: usize) -> String {
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        return String::new();
+    }
+
+    let total_bytes = trimmed.len();
+    let total_lines = trimmed.lines().count().max(1);
+    let multiline = total_lines > 1;
+    let candidate = if multiline {
+        trimmed.lines().next().unwrap_or(trimmed).trim()
+    } else {
+        trimmed
+    };
+    let split_at = char_boundary_at_or_before(candidate, max_bytes);
+    let mut summary = candidate[..split_at].trim_end().to_string();
+    let truncated = multiline || split_at < candidate.len();
+    if truncated {
+        summary.push_str(" [truncated by Intendant; original ");
+        summary.push_str(&total_bytes.to_string());
+        summary.push_str(" bytes");
+        if total_lines > 1 {
+            summary.push_str(", ");
+            summary.push_str(&total_lines.to_string());
+            summary.push_str(" lines");
+        }
+        summary.push(']');
+    }
+    summary
+}
+
 fn external_tool_preview_text(tool_name: &str, preview: &str) -> Option<String> {
     let tool_name = tool_name.trim();
-    let preview = preview.trim();
+    let preview = summarize_external_activity_text(preview, EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT);
     match (tool_name.is_empty(), preview.is_empty()) {
         (true, true) => None,
-        (true, false) => Some(preview.to_string()),
+        (true, false) => Some(preview),
         (false, true) => Some(tool_name.to_string()),
         (false, false) => Some(format!("{tool_name}: {preview}")),
     }
@@ -1522,7 +1606,9 @@ fn external_tool_failure_content(
     tool_preview: Option<&str>,
 ) -> String {
     let preview = tool_preview.map(str::trim).filter(|s| !s.is_empty());
-    let command = preview.and_then(|preview| preview.strip_prefix("command: ").map(str::trim));
+    let command = preview
+        .and_then(|preview| preview.strip_prefix("command: ").map(str::trim))
+        .filter(|command| !command.is_empty());
     let label = if command.is_some() {
         "Command failed"
     } else {
@@ -1537,12 +1623,67 @@ fn external_tool_failure_content(
 
     if let Some(command) = command {
         content.push_str("\nCommand: ");
-        content.push_str(command);
+        content.push_str(&summarize_external_activity_text(
+            command,
+            EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT,
+        ));
     } else if let Some(preview) = preview {
         content.push_str("\nTool: ");
-        content.push_str(preview);
+        content.push_str(&summarize_external_activity_text(
+            preview,
+            EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT,
+        ));
     }
     content
+}
+
+fn external_tool_failure_repeat_key(content: &str) -> String {
+    let mut lines = content.lines();
+    let first = normalize_external_tool_failure_first_line(lines.next().unwrap_or_default());
+    let detail = lines
+        .find(|line| {
+            let trimmed = line.trim_start();
+            trimmed.starts_with("Command: ") || trimmed.starts_with("Tool: ")
+        })
+        .map(str::trim)
+        .unwrap_or_default();
+    format!("{first}\n{detail}")
+}
+
+fn normalize_external_tool_failure_first_line(line: &str) -> String {
+    let line = line.trim();
+    for prefix in ["Command failed", "Tool failed"] {
+        let Some(rest) = line.strip_prefix(prefix) else {
+            continue;
+        };
+        let Some(rest) = rest.strip_prefix(" (") else {
+            continue;
+        };
+        let Some((_, suffix)) = rest.split_once("): ") else {
+            continue;
+        };
+        return format!("{prefix}: {suffix}");
+    }
+    line.to_string()
+}
+
+fn external_tool_failure_repeat_notice(content: &str) -> String {
+    let summary = external_tool_failure_repeat_key(content)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>()
+        .join(" | ");
+    if summary.is_empty() {
+        format!(
+            "Repeated similar external tool failures suppressed after {} entries",
+            EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT
+        )
+    } else {
+        format!(
+            "Repeated similar external tool failures suppressed after {} entries: {}",
+            EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT, summary
+        )
+    }
 }
 
 /// Result of draining one batch of external agent events.
@@ -5754,6 +5895,8 @@ fn handle_idle_codex_subagent_event(
             tool_name,
             preview,
         } => {
+            let commands_preview = external_tool_preview_text(&tool_name, &preview)
+                .unwrap_or_else(|| tool_name.clone());
             let turn = stats
                 .codex_subagent_rounds
                 .entry(child_thread_id.clone())
@@ -5762,17 +5905,21 @@ fn handle_idle_codex_subagent_event(
             config.bus.send(AppEvent::AgentStarted {
                 session_id,
                 turn: *turn,
-                commands_preview: format!("{tool_name}: {preview}"),
+                commands_preview,
                 item_id: Some(item_id),
                 source: config.agent_source.clone(),
             });
         }
-        external_agent::AgentEvent::ToolOutputDelta { text, .. } => {
+        external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
+            let mut tool_output_limiter = ExternalToolOutputLimiter::default();
+            let Some(stdout) = tool_output_limiter.filter(&item_id, text) else {
+                return;
+            };
             let output_id = event::next_agent_output_id();
             slog(config.session_log, |l| {
                 l.agent_output_with_session_id(
                     Some(&child_thread_id),
-                    &text,
+                    &stdout,
                     "",
                     config.agent_source.as_deref(),
                     Some(&output_id),
@@ -5780,7 +5927,7 @@ fn handle_idle_codex_subagent_event(
             });
             config.bus.send(AppEvent::AgentOutput {
                 session_id,
-                stdout: text,
+                stdout,
                 stderr: String::new(),
                 source: config.agent_source.clone(),
                 output_id: Some(output_id),
@@ -5914,6 +6061,7 @@ async fn drain_external_agent_events(
     let mut last_diff_hash: Option<u64> = None;
     let mut context_snapshot_state = ExternalContextSnapshotState::default();
     let mut tool_output_limiter = ExternalToolOutputLimiter::default();
+    let mut tool_failure_limiter = ExternalToolFailureLogLimiter::default();
     let mut tool_previews: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
     let mut context_snapshot_tick = tokio::time::interval_at(
@@ -6812,14 +6960,15 @@ async fn drain_external_agent_events(
                 tool_name,
             } => {
                 turns_in_round += 1;
-                if let Some(preview_text) = external_tool_preview_text(&tool_name, &preview) {
+                let preview_text = external_tool_preview_text(&tool_name, &preview);
+                if let Some(preview_text) = preview_text.as_deref() {
                     if !item_id.is_empty() {
-                        tool_previews.insert(item_id.clone(), preview_text);
+                        tool_previews.insert(item_id.clone(), preview_text.to_string());
                     }
                 }
                 if !config.suppress_agent_started {
                     stats.turns += 1;
-                    let preview_text = format!("{}: {}", tool_name, preview);
+                    let preview_text = preview_text.unwrap_or_else(|| tool_name.clone());
                     config.bus.send(AppEvent::AgentStarted {
                         session_id: config.session_id.clone(),
                         turn: stats.turns,
@@ -6884,6 +7033,9 @@ async fn drain_external_agent_events(
                             message,
                             tool_preview.as_deref(),
                         );
+                        let Some(content) = tool_failure_limiter.filter(content) else {
+                            continue;
+                        };
                         slog(config.session_log, |l| l.warn(&content));
                         config.bus.send(AppEvent::LogEntry {
                             session_id: config.session_id.clone(),
@@ -12245,6 +12397,28 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
+    fn external_tool_output_limiter_caps_total_turn_output() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let chunk = "a".repeat(4 * 1024);
+        let chunks = EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT / chunk.len();
+        for i in 0..chunks {
+            let out = limiter.filter(&format!("item-{i}"), chunk.clone()).unwrap();
+            assert_eq!(out.len(), chunk.len());
+        }
+
+        let out = limiter
+            .filter("item-over-total", "tail".to_string())
+            .unwrap();
+        assert!(out.contains("external tool output truncated by Intendant"));
+        assert!(
+            limiter
+                .filter("item-over-total-2", "more".to_string())
+                .is_none(),
+            "further output after the turn cap should be suppressed"
+        );
+    }
+
+    #[test]
     fn external_tool_failure_content_includes_item_and_preview() {
         let content = external_tool_failure_content(
             "call-1",
@@ -12256,6 +12430,72 @@ Also: {"source": "bare"}"#;
             content,
             "Command failed (call-1): command exited 1\nCommand: rg missing static/app.html"
         );
+    }
+
+    #[test]
+    fn external_tool_preview_text_summarizes_multiline_command() {
+        let mut command = String::from("/bin/bash -lc \"node <<'NODE'\n");
+        for i in 0..120 {
+            command.push_str(&format!("console.log('CDP_ATTEMPT_{i}');\n"));
+        }
+        command.push_str("NODE\"");
+
+        let preview = external_tool_preview_text("command", &command).unwrap();
+
+        assert!(preview.starts_with("command: /bin/bash -lc \"node <<'NODE'"));
+        assert!(preview.contains("truncated by Intendant"));
+        assert!(preview.contains("original "));
+        assert!(!preview.contains("CDP_ATTEMPT_119"));
+        assert!(preview.len() < 700);
+    }
+
+    #[test]
+    fn external_tool_failure_content_summarizes_heredoc_command() {
+        let mut command = String::from("command: /bin/bash -lc \"node <<'NODE'\n");
+        for i in 0..160 {
+            command.push_str(&format!("console.warn('browser validation retry {i}');\n"));
+        }
+        command.push_str("NODE\"");
+
+        let content = external_tool_failure_content("call-1", "command exited 1", Some(&command));
+
+        assert!(content.starts_with("Command failed (call-1): command exited 1\nCommand: "));
+        assert!(content.contains("node <<'NODE'"));
+        assert!(content.contains("truncated by Intendant"));
+        assert!(!content.contains("browser validation retry 159"));
+        assert!(content.len() < 800);
+    }
+
+    #[test]
+    fn external_tool_failure_content_summarizes_long_single_line_command() {
+        let command = format!("command: node -e '{}'", "x".repeat(2_000));
+
+        let content = external_tool_failure_content("call-1", "command exited 1", Some(&command));
+
+        assert!(content.contains("Command failed (call-1): command exited 1"));
+        assert!(content.contains("truncated by Intendant"));
+        assert!(content.len() < 800);
+    }
+
+    #[test]
+    fn external_tool_failure_log_limiter_suppresses_repeated_commands() {
+        let mut limiter = ExternalToolFailureLogLimiter::default();
+        let command =
+            "command: /bin/bash -lc \"node <<'NODE'\nconsole.warn('cdp-ready failed')\nNODE\"";
+
+        let first = external_tool_failure_content("call-1", "command exited 1", Some(command));
+        let second = external_tool_failure_content("call-2", "command exited 1", Some(command));
+        let third = external_tool_failure_content("call-3", "command exited 1", Some(command));
+        let fourth = external_tool_failure_content("call-4", "command exited 1", Some(command));
+
+        assert!(limiter.filter(first).unwrap().contains("call-1"));
+        assert!(limiter.filter(second).unwrap().contains("call-2"));
+        let notice = limiter.filter(third).unwrap();
+        assert!(notice.contains("Repeated similar external tool failures suppressed"));
+        assert!(notice.contains("Command failed: command exited 1"));
+        assert!(notice.contains("node <<'NODE'"));
+        assert!(!notice.contains("call-3"));
+        assert!(limiter.filter(fourth).is_none());
     }
 
     #[test]
