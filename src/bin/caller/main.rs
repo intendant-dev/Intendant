@@ -1417,7 +1417,9 @@ fn mark_pending_runtime_steers_delivered_at_model_checkpoint(
 }
 
 const EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL: Duration = Duration::from_secs(1);
-const EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT: usize = 8 * 1024;
+const EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT: usize = 4 * 1024;
+const EXTERNAL_TOOL_OUTPUT_ACTIVITY_HEAD_LIMIT: usize = 2 * 1024;
+const EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT: usize = 2 * 1024;
 const EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT: usize = 24 * 1024;
 const EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT: usize = 512;
 const EXTERNAL_TOOL_FAILURE_REPEAT_LIMIT: usize = 2;
@@ -1437,8 +1439,11 @@ struct ExternalToolOutputLimiter {
 
 #[derive(Debug, Clone, Default)]
 struct ExternalToolOutputState {
-    emitted_bytes: usize,
-    truncated: bool,
+    seen_bytes: usize,
+    emitted_head_bytes: usize,
+    tail: String,
+    omitting: bool,
+    omission_notice_emitted: bool,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1473,47 +1478,110 @@ impl ExternalToolOutputLimiter {
         } else {
             item_id.to_string()
         };
-        let state = self.items.entry(key).or_default();
+        let emit = {
+            let state = self.items.entry(key).or_default();
+            state.seen_bytes = state.seen_bytes.saturating_add(text.len());
 
-        if state.emitted_bytes >= EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT {
-            if state.truncated {
+            if state.omitting {
+                state.push_tail(&text);
+                None
+            } else {
+                let head_limit = if state.emitted_head_bytes == 0
+                    && text.len() > EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT
+                {
+                    EXTERNAL_TOOL_OUTPUT_ACTIVITY_HEAD_LIMIT
+                } else {
+                    EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT
+                };
+                let remaining_for_head = head_limit.saturating_sub(state.emitted_head_bytes);
+                if text.len() <= remaining_for_head {
+                    state.emitted_head_bytes += text.len();
+                    Some(text)
+                } else {
+                    let split_at = char_boundary_at_or_before(&text, remaining_for_head);
+                    let mut out = text[..split_at].to_string();
+                    state.emitted_head_bytes += split_at;
+                    state.omitting = true;
+                    state.omission_notice_emitted = true;
+                    state.push_tail(&text[split_at..]);
+                    out.push_str(&external_tool_output_omission_start_notice(
+                        state.emitted_head_bytes,
+                    ));
+                    Some(out)
+                }
+            }
+        };
+        emit.and_then(|out| self.emit_with_total_cap(out))
+    }
+
+    fn complete(&mut self, item_id: &str) -> Option<String> {
+        let key = if item_id.is_empty() {
+            "<unknown>"
+        } else {
+            item_id
+        };
+        let state = self.items.remove(key)?;
+        if !state.omission_notice_emitted {
+            return None;
+        }
+        let tail = state.tail;
+        let tail_bytes = tail.len();
+        let omitted_middle_bytes = state
+            .seen_bytes
+            .saturating_sub(state.emitted_head_bytes)
+            .saturating_sub(tail_bytes);
+        let mut out = external_tool_output_omission_tail_notice(
+            state.seen_bytes,
+            state.emitted_head_bytes,
+            tail_bytes,
+            omitted_middle_bytes,
+        );
+        out.push_str(&tail);
+        self.emit_with_total_cap(out)
+    }
+
+    fn emit_with_total_cap(&mut self, text: String) -> Option<String> {
+        if text.is_empty() {
+            return None;
+        }
+        if self.total_emitted_bytes >= EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT {
+            if self.total_truncated {
                 return None;
             }
-            state.truncated = true;
-            return Some(external_tool_output_truncation_notice());
+            self.total_truncated = true;
+            return Some(external_tool_output_total_truncation_notice());
         }
 
-        let remaining = (EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - state.emitted_bytes)
-            .min(EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT - self.total_emitted_bytes);
+        let remaining = EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT - self.total_emitted_bytes;
         if text.len() <= remaining {
-            state.emitted_bytes += text.len();
             self.total_emitted_bytes += text.len();
             return Some(text);
         }
 
         let split_at = char_boundary_at_or_before(&text, remaining);
         let mut out = text[..split_at].to_string();
-        state.emitted_bytes += split_at;
-        self.total_emitted_bytes += split_at;
-        if self.total_emitted_bytes >= EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT {
-            self.total_emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT;
-            self.total_truncated = true;
-            out.push_str(&external_tool_output_total_truncation_notice());
-        } else {
-            state.emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT;
-            state.truncated = true;
-            out.push_str(&external_tool_output_truncation_notice());
-        }
+        self.total_emitted_bytes = EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT;
+        self.total_truncated = true;
+        out.push_str(&external_tool_output_total_truncation_notice());
         Some(out)
     }
+}
 
-    fn complete(&mut self, item_id: &str) {
-        let key = if item_id.is_empty() {
-            "<unknown>"
-        } else {
-            item_id
-        };
-        self.items.remove(key);
+impl ExternalToolOutputState {
+    fn push_tail(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.tail.push_str(text);
+        if self.tail.len() <= EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT {
+            return;
+        }
+        let trim_to = self
+            .tail
+            .len()
+            .saturating_sub(EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT);
+        let split_at = char_boundary_at_or_after(&self.tail, trim_to);
+        self.tail.drain(..split_at);
     }
 }
 
@@ -1535,16 +1603,26 @@ impl ExternalToolFailureLogLimiter {
     }
 }
 
-fn external_tool_output_truncation_notice() -> String {
+fn external_tool_output_omission_start_notice(shown_head_bytes: usize) -> String {
     format!(
-        "\n\n[output truncated by Intendant after {} KiB for this tool; further output is hidden from Activity]\n",
-        EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT / 1024
+        "\n\n[Intendant is omitting additional external tool output; shown first {shown_head_bytes} bytes, final tail will be shown when the tool completes]\n",
+    )
+}
+
+fn external_tool_output_omission_tail_notice(
+    total_bytes: usize,
+    head_bytes: usize,
+    tail_bytes: usize,
+    omitted_middle_bytes: usize,
+) -> String {
+    format!(
+        "\n\n[Intendant omitted {omitted_middle_bytes} bytes from the middle of {total_bytes} bytes of external tool output; shown head {head_bytes} bytes, final tail {tail_bytes} bytes]\n",
     )
 }
 
 fn external_tool_output_total_truncation_notice() -> String {
     format!(
-        "\n\n[external tool output truncated by Intendant after {} KiB for this turn; further tool output is hidden from Activity]\n",
+        "\n\n[Intendant omitted additional external tool output after the {} KiB per-turn transcript cap]\n",
         EXTERNAL_TOOL_OUTPUT_ACTIVITY_TOTAL_LIMIT / 1024
     )
 }
@@ -1556,6 +1634,17 @@ fn char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
     let mut idx = max_bytes;
     while idx > 0 && !text.is_char_boundary(idx) {
         idx -= 1;
+    }
+    idx
+}
+
+fn char_boundary_at_or_after(text: &str, min_bytes: usize) -> usize {
+    if min_bytes >= text.len() {
+        return text.len();
+    }
+    let mut idx = min_bytes;
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
     }
     idx
 }
@@ -5775,6 +5864,29 @@ fn persist_external_model_response_for_session_if_needed(
     }
 }
 
+fn emit_external_tool_output(config: &DrainConfig<'_>, session_id: Option<&str>, stdout: String) {
+    if stdout.is_empty() {
+        return;
+    }
+    let output_id = event::next_agent_output_id();
+    slog(config.session_log, |l| {
+        l.agent_output_with_session_id(
+            session_id,
+            &stdout,
+            "",
+            config.agent_source.as_deref(),
+            Some(&output_id),
+        )
+    });
+    config.bus.send(AppEvent::AgentOutput {
+        session_id: session_id.map(str::to_string),
+        stdout,
+        stderr: String::new(),
+        source: config.agent_source.clone(),
+        output_id: Some(output_id),
+    });
+}
+
 fn scoped_event_codex_subagent_thread_id(
     event_thread_id: &Option<String>,
     stats: &LoopStats,
@@ -5927,30 +6039,16 @@ fn handle_idle_codex_subagent_event(
             let Some(stdout) = tool_output_limiter.filter(&item_id, text) else {
                 return;
             };
-            let output_id = event::next_agent_output_id();
-            slog(config.session_log, |l| {
-                l.agent_output_with_session_id(
-                    Some(&child_thread_id),
-                    &stdout,
-                    "",
-                    config.agent_source.as_deref(),
-                    Some(&output_id),
-                )
-            });
-            config.bus.send(AppEvent::AgentOutput {
-                session_id,
-                stdout,
-                stderr: String::new(),
-                source: config.agent_source.clone(),
-                output_id: Some(output_id),
-            });
+            emit_external_tool_output(config, Some(&child_thread_id), stdout);
         }
         external_agent::AgentEvent::ToolCompleted { item_id, status } => {
             if let Some(limiter) = stats
                 .codex_subagent_tool_output_limiters
                 .get_mut(&child_thread_id)
             {
-                limiter.complete(&item_id);
+                if let Some(stdout) = limiter.complete(&item_id) {
+                    emit_external_tool_output(config, Some(&child_thread_id), stdout);
+                }
             }
             if let external_agent::ToolCompletionStatus::Failed { message } = status {
                 let content = external_tool_failure_content(&item_id, &message, None);
@@ -7028,27 +7126,13 @@ async fn drain_external_agent_events(
                     text
                 };
                 if let Some(stdout) = tool_output_limiter.filter(&item_id, stdout) {
-                    let output_id = event::next_agent_output_id();
-                    slog(config.session_log, |l| {
-                        l.agent_output_with_session_id(
-                            config.session_id.as_deref(),
-                            &stdout,
-                            "",
-                            config.agent_source.as_deref(),
-                            Some(&output_id),
-                        )
-                    });
-                    config.bus.send(AppEvent::AgentOutput {
-                        session_id: config.session_id.clone(),
-                        stdout,
-                        stderr: String::new(),
-                        source: config.agent_source.clone(),
-                        output_id: Some(output_id),
-                    });
+                    emit_external_tool_output(config, config.session_id.as_deref(), stdout);
                 }
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
-                tool_output_limiter.complete(&item_id);
+                if let Some(stdout) = tool_output_limiter.complete(&item_id) {
+                    emit_external_tool_output(config, config.session_id.as_deref(), stdout);
+                }
                 let tool_preview = tool_previews.remove(&item_id);
                 // Success: nothing to emit.  The tool command was already
                 // shown via AgentStarted at start, and any output streamed
@@ -9612,7 +9696,7 @@ mod tests {
     }
 
     #[test]
-    fn idle_codex_subagent_tool_output_is_capped_across_deltas() {
+    fn idle_codex_subagent_tool_output_omits_middle_and_keeps_completion_tail() {
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
         let dir = tempfile::tempdir().unwrap();
@@ -9648,7 +9732,10 @@ mod tests {
             "child-thread".to_string(),
             external_agent::AgentEvent::ToolOutputDelta {
                 item_id: "call-1".to_string(),
-                text: "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT + 10),
+                text: format!(
+                    "BEGIN\n{}END-MARKER\n",
+                    "middle\n".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT)
+                ),
             },
         );
 
@@ -9657,7 +9744,9 @@ mod tests {
                 session_id, stdout, ..
             } => {
                 assert_eq!(session_id.as_deref(), Some("child-thread"));
-                assert!(stdout.contains("output truncated by Intendant"));
+                assert!(stdout.starts_with("BEGIN\n"));
+                assert!(stdout.contains("omitting additional external tool output"));
+                assert!(!stdout.contains("END-MARKER"));
             }
             other => panic!("expected child AgentOutput, got {:?}", other),
         }
@@ -9676,6 +9765,28 @@ mod tests {
             rx.try_recv().is_err(),
             "second delta after per-tool cap should be suppressed"
         );
+
+        handle_idle_codex_subagent_event(
+            &config,
+            &mut stats,
+            "child-thread".to_string(),
+            external_agent::AgentEvent::ToolCompleted {
+                item_id: "call-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            },
+        );
+
+        match rx.try_recv().expect("completion tail") {
+            AppEvent::AgentOutput {
+                session_id, stdout, ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("child-thread"));
+                assert!(stdout.contains("bytes from the middle"));
+                assert!(stdout.contains("END-MARKER"));
+                assert!(stdout.contains("more"));
+            }
+            other => panic!("expected child completion AgentOutput, got {:?}", other),
+        }
     }
 
     #[test]
@@ -12554,32 +12665,64 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn external_tool_output_limiter_caps_each_tool() {
+    fn external_tool_output_limiter_leaves_small_output_unchanged() {
         let mut limiter = ExternalToolOutputLimiter::default();
-        let first = "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT - 2);
-        let out = limiter.filter("item-1", first.clone()).unwrap();
-        assert_eq!(out, first);
+        let small = "normal diagnostic output\n".repeat(8);
 
-        let out = limiter.filter("item-1", "bcdef".to_string()).unwrap();
-        assert!(out.starts_with("bc"));
-        assert!(out.contains("output truncated by Intendant"));
+        let out = limiter.filter("item-1", small.clone()).unwrap();
+
+        assert_eq!(out, small);
         assert!(
-            limiter.filter("item-1", "more".to_string()).is_none(),
-            "further output after truncation should be suppressed"
+            limiter.complete("item-1").is_none(),
+            "unchanged small output should not emit a completion notice"
         );
+    }
+
+    #[test]
+    fn external_tool_output_limiter_omits_middle_and_emits_tail_on_completion() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+        let oversized = format!(
+            "BEGIN\n{}{}END-MARKER\n",
+            "middle\n".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT),
+            "tail\n".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_TAIL_LIMIT / 5)
+        );
+
+        let head = limiter.filter("item-1", oversized).unwrap();
+        assert!(head.starts_with("BEGIN\n"));
+        assert!(head.contains("omitting additional external tool output"));
+        assert!(!head.contains("END-MARKER"));
+        assert!(
+            limiter
+                .filter("item-1", "extra suppressed\n".to_string())
+                .is_none(),
+            "middle deltas after omission starts should be suppressed"
+        );
+
+        let tail = limiter.complete("item-1").unwrap();
+        assert!(tail.contains("Intendant omitted"));
+        assert!(tail.contains("bytes from the middle"));
+        assert!(tail.contains("END-MARKER"));
     }
 
     #[test]
     fn external_tool_output_limiter_resets_on_completion() {
         let mut limiter = ExternalToolOutputLimiter::default();
-        let oversized = "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_LIMIT + 10);
+        let oversized = "a".repeat(EXTERNAL_TOOL_OUTPUT_ACTIVITY_INLINE_LIMIT + 10);
         let out = limiter.filter("item-1", oversized).unwrap();
-        assert!(out.contains("output truncated by Intendant"));
+        assert!(out.contains("omitting additional external tool output"));
 
-        limiter.complete("item-1");
+        let _ = limiter.complete("item-1");
 
         let out = limiter.filter("item-1", "fresh".to_string()).unwrap();
         assert_eq!(out, "fresh");
+    }
+
+    #[test]
+    fn external_tool_output_limiter_is_silent_for_quiet_completion() {
+        let mut limiter = ExternalToolOutputLimiter::default();
+
+        assert!(limiter.filter("item-1", String::new()).is_none());
+        assert!(limiter.complete("item-1").is_none());
     }
 
     #[test]
@@ -12595,7 +12738,7 @@ Also: {"source": "bare"}"#;
         let out = limiter
             .filter("item-over-total", "tail".to_string())
             .unwrap();
-        assert!(out.contains("external tool output truncated by Intendant"));
+        assert!(out.contains("per-turn transcript cap"));
         assert!(
             limiter
                 .filter("item-over-total-2", "more".to_string())
