@@ -390,6 +390,35 @@ impl McpAppState {
         None
     }
 
+    fn record_session_usage_snapshot(
+        &mut self,
+        session_id: Option<&str>,
+        usage: frontend::ModelUsageSnapshot,
+    ) {
+        let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return;
+        };
+        let mut keys = self.session_related_ids(id);
+        if keys.is_empty() {
+            keys.push(id.to_string());
+        }
+        for key in keys {
+            self.session_usage.insert(key, usage.clone());
+        }
+    }
+
+    fn session_id_applies_to_current_session(&self, session_id: Option<&str>) -> bool {
+        let Some(id) = session_id.map(str::trim).filter(|id| !id.is_empty()) else {
+            return true;
+        };
+        self.session_id.is_empty()
+            || id == self.session_id
+            || self
+                .session_related_ids(id)
+                .iter()
+                .any(|related| related == &self.session_id)
+    }
+
     fn session_status_for_id(&self, session_id: &str) -> Option<&SessionStatusState> {
         for related in self.session_related_ids(session_id) {
             if let Some(status) = self.session_status.get(&related) {
@@ -3583,16 +3612,9 @@ pub fn spawn_event_listener(
                     } => {
                         let main =
                             s.normalize_main_usage_snapshot(session_id.as_deref(), main.clone());
-                        if let Some(id) = session_id
-                            .as_deref()
-                            .map(str::trim)
-                            .filter(|id| !id.is_empty())
-                        {
-                            s.session_usage.insert(id.to_string(), main.clone());
-                        }
-                        let applies_to_current_session = session_id
-                            .as_deref()
-                            .is_none_or(|id| s.session_id.is_empty() || id == s.session_id);
+                        s.record_session_usage_snapshot(session_id.as_deref(), main.clone());
+                        let applies_to_current_session =
+                            s.session_id_applies_to_current_session(session_id.as_deref());
                         if applies_to_current_session {
                             s.apply_main_usage_snapshot(main);
                             if let Some(presence) = presence {
@@ -4440,13 +4462,7 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
                 .map(str::trim)
                 .filter(|id| !id.is_empty())
             {
-                let mut keys = s.session_related_ids(id);
-                if keys.is_empty() {
-                    keys.push(id.to_string());
-                }
-                for key in keys {
-                    s.session_usage.insert(key, main.clone());
-                }
+                s.record_session_usage_snapshot(Some(id), main.clone());
                 if s.session_id.is_empty() {
                     s.session_id = id.to_string();
                 }
@@ -4454,9 +4470,8 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
                     s.active_session_source = Some(source);
                 }
             }
-            let applies_to_current_session = session_id
-                .as_deref()
-                .is_none_or(|id| s.session_id.is_empty() || id == s.session_id);
+            let applies_to_current_session =
+                s.session_id_applies_to_current_session(session_id.as_deref());
             if applies_to_current_session {
                 s.apply_main_usage_snapshot(main.clone());
                 if let Some(presence) = presence {
@@ -9185,6 +9200,128 @@ mod tests {
     }
 
     #[test]
+    fn spawn_event_listener_updates_wrapper_usage_from_backend_alias_sample() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_id = "wrapper-session".to_string();
+                s.active_session_source = Some("codex".to_string());
+                s.codex_managed_context = true;
+                s.configured_codex_managed_context = true;
+            }
+            let bus = EventBus::new();
+            let listener = spawn_event_listener(
+                state.clone(),
+                bus.subscribe(),
+                Arc::new(Mutex::new(None)),
+                bus.clone(),
+                None,
+                None,
+            );
+
+            bus.send(AppEvent::SessionCapabilities {
+                session_id: "wrapper-session".to_string(),
+                capabilities: crate::types::SessionCapabilities {
+                    follow_up: true,
+                    steer: true,
+                    interrupt: true,
+                    codex_thread_actions: vec!["rewind_context".to_string()],
+                    codex_managed_context: Some("managed".to_string()),
+                    codex_context_archive: None,
+                    codex_command: Some("/tmp/codex".to_string()),
+                    codex_fast_mode: None,
+                    codex_service_tier: None,
+                },
+            });
+            bus.send(AppEvent::SessionIdentity {
+                session_id: "wrapper-session".to_string(),
+                source: "codex".to_string(),
+                backend_session_id: "codex-thread".to_string(),
+            });
+            bus.send(AppEvent::UsageSnapshot {
+                session_id: Some("wrapper-session".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 260_000,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 100.6,
+                    prompt_tokens: 259_000,
+                    completion_tokens: 1_000,
+                    cached_tokens: 10_000,
+                },
+                presence: None,
+            });
+            bus.send(AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 70_046,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 27.1,
+                    prompt_tokens: 69_000,
+                    completion_tokens: 1_046,
+                    cached_tokens: 50_000,
+                },
+                presence: None,
+            });
+
+            timeout(Duration::from_secs(1), async {
+                loop {
+                    let backend_seen = state
+                        .read()
+                        .await
+                        .session_usage
+                        .get("codex-thread")
+                        .is_some_and(|usage| usage.tokens_used == 70_046);
+                    if backend_seen {
+                        break;
+                    }
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("listener should observe backend usage sample");
+
+            let server = IntendantServer::new(state.clone(), EventBus::new());
+            let status = server
+                .get_status_for_session(Some("wrapper-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&70_046.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"ok".into())
+            );
+            assert_eq!(
+                value.pointer("/usage/main/tokens_used"),
+                Some(&70_046.into())
+            );
+            assert!(
+                state
+                    .read()
+                    .await
+                    .rewind_only_gate_message("execute_cu_actions")
+                    .is_none(),
+                "latest backend alias usage should clear the default active-session gate"
+            );
+
+            listener.abort();
+        });
+    }
+
+    #[test]
     fn observed_session_identity_and_usage_enable_codex_gate() {
         let mut s = McpAppState::new(
             "none".to_string(),
@@ -9599,6 +9736,67 @@ mod tests {
             assert_eq!(
                 value.pointer("/usage/main/tokens_used"),
                 Some(&70_046.into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_for_wrapper_after_identity_without_usage_reports_unknown_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionCapabilities {
+                        session_id: "wrapper-session".to_string(),
+                        capabilities: crate::types::SessionCapabilities {
+                            follow_up: true,
+                            steer: true,
+                            interrupt: true,
+                            codex_thread_actions: vec!["rewind_context".to_string()],
+                            codex_managed_context: Some("managed".to_string()),
+                            codex_context_archive: None,
+                            codex_command: Some("/tmp/codex".to_string()),
+                            codex_fast_mode: None,
+                            codex_service_tier: None,
+                        },
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: "wrapper-session".to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: "codex-thread".to_string(),
+                    },
+                );
+            }
+
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("wrapper-session"), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"unknown".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&0.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/context_window"),
+                Some(&serde_json::Value::Null)
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
             );
         });
     }
