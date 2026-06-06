@@ -1436,31 +1436,34 @@ fn active_external_wrappers_from_index(
         return Vec::new();
     };
     let mut seen_backend_ids = HashSet::new();
-    crate::external_wrapper_index::wrappers_for_source(&home, "codex")
-        .into_iter()
-        .filter_map(|record| {
-            if !seen_backend_ids.insert(record.backend_session_id.clone()) {
-                return None;
-            }
-            let status = session_meta_status(std::path::Path::new(&record.log_path));
-            if external_wrapper_status_is_terminal(status.as_deref()) {
-                return None;
-            }
-            Some(serde_json::json!({
-                "run_id": serde_json::Value::Null,
-                "pid": serde_json::Value::Null,
-                "codex_pid": live_codex_pids.first().copied(),
-                "source": "external_wrapper_index",
-                "backend_source": record.source,
-                "backend_session_id": record.backend_session_id,
-                "intendant_session_id": record.intendant_session_id,
-                "log_path": record.log_path,
-                "project_root": record.project_root,
-                "status": status.unwrap_or_else(|| "active".to_string()),
-                "updated_at_secs": record.updated_at_secs,
-            }))
-        })
-        .collect()
+    let mut wrappers = Vec::new();
+    for record in crate::external_wrapper_index::wrappers_for_source(&home, "codex") {
+        if wrappers.len() >= live_codex_pids.len() {
+            break;
+        }
+        if !seen_backend_ids.insert(record.backend_session_id.clone()) {
+            continue;
+        }
+        let status = session_meta_status(std::path::Path::new(&record.log_path));
+        if external_wrapper_status_is_terminal(status.as_deref()) {
+            continue;
+        }
+        let codex_pid = live_codex_pids.get(wrappers.len()).copied();
+        wrappers.push(serde_json::json!({
+            "run_id": serde_json::Value::Null,
+            "pid": serde_json::Value::Null,
+            "codex_pid": codex_pid,
+            "source": "external_wrapper_index",
+            "backend_source": record.source,
+            "backend_session_id": record.backend_session_id,
+            "intendant_session_id": record.intendant_session_id,
+            "log_path": record.log_path,
+            "project_root": record.project_root,
+            "status": status.unwrap_or_else(|| "active".to_string()),
+            "updated_at_secs": record.updated_at_secs,
+        }));
+    }
+    wrappers
 }
 
 fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<serde_json::Value> {
@@ -9839,6 +9842,44 @@ mod tests {
         assert_eq!(
             latest.get("state").and_then(|value| value.as_str()),
             Some("running")
+        );
+    }
+
+    #[test]
+    fn controller_loop_status_does_not_overreport_index_wrappers_without_live_pids() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let loop_dir = home.join(".intendant/controller-loop");
+        std::fs::create_dir_all(&loop_dir).unwrap();
+        for idx in 0..2 {
+            let log_dir = home.join(format!(".intendant/logs/wrapper-session-{idx}"));
+            std::fs::create_dir_all(&log_dir).unwrap();
+            std::fs::write(
+                log_dir.join("session_meta.json"),
+                serde_json::json!({
+                    "session_id": format!("wrapper-session-{idx}"),
+                    "created_at": "2026-01-01T00:00:00Z",
+                    "status": "running"
+                })
+                .to_string(),
+            )
+            .unwrap();
+            crate::external_wrapper_index::upsert(
+                home,
+                "codex",
+                &format!("019e9b9a-8557-7b01-99ef-187e8840327{idx}"),
+                &format!("wrapper-session-{idx}"),
+                &log_dir,
+                None,
+            )
+            .unwrap();
+        }
+
+        let wrappers = active_external_wrappers_from_index(&loop_dir, &[1084559]);
+        assert_eq!(wrappers.len(), 1);
+        assert_eq!(
+            wrappers[0].get("codex_pid").and_then(|value| value.as_u64()),
+            Some(1084559)
         );
     }
 
