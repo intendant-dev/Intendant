@@ -15861,6 +15861,33 @@ function stationRenderExternalBackendEditor(parent, controls) {
   ]);
 }
 
+function stationRunGeminiThreadAction(op = 'new') {
+  const action = String(op || 'new').trim() || 'new';
+  markActionPending(action);
+  dispatchControlMsg({ action: 'gemini_thread_action', op: action, params: {} });
+  stationRenderControlsDock('launch');
+}
+
+function stationRenderGeminiSessionSection(parent, controls) {
+  const active = controls.backend === 'gemini' || controls.newSessionAgent === 'gemini';
+  const section = stationDockSection(parent, 'Gemini session');
+  stationDockRow(section, 'backend', active ? 'selected' : 'not selected');
+  stationDockRow(section, 'approval', controlGeminiConfig.approval_mode || 'default');
+  stationDockRow(section, 'sandbox', controlGeminiConfig.sandbox ? 'on' : 'off');
+  stationDockActions(section, [
+    { label: 'Use Gemini', primary: active, onClick: () => stationApplyExternalBackendFromDock('gemini') },
+    {
+      id: 'station-gemini-new-session',
+      label: 'New Gemini session',
+      primary: active,
+      disabled: !active,
+      title: active ? 'Restart Gemini so the next task starts fresh' : 'Select Gemini as the external backend first',
+      onClick: () => stationRunGeminiThreadAction('new'),
+    },
+    stationDockRouteAction('Route Gemini controls', 'activity', 'control', () => document.querySelector('[data-gemini-action="new"]')?.focus()),
+  ]);
+}
+
 function stationApplyCodexCommandFromDock(value) {
   const command = String(value || '').trim() || 'codex';
   const settingsInput = document.getElementById('set-codex-command');
@@ -16101,6 +16128,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   stationRenderLiveStatusSection(body, controls);
   stationRenderDashboardRoutesSection(body);
   stationRenderExternalBackendEditor(body, controls);
+  stationRenderGeminiSessionSection(body, controls);
   stationRenderLaunchReadinessSection(body, {
     title: 'Next launch',
     rerender: () => stationRenderControlsDock('launch'),
