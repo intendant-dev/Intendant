@@ -11597,8 +11597,9 @@ function stationDockRow(parent, key, value) {
 
 function stationDockCard(parent, item) {
   const card = document.createElement('div');
-  card.className = 'station-dock-card' + (item.active ? ' active' : '');
-  if (item.className) card.className += ' ' + item.className;
+  card.className = 'station-dock-card' +
+    (item.className ? ` ${item.className}` : '') +
+    (item.active ? ' active' : '');
   if (item.onClick) {
     card.style.cursor = 'pointer';
     card.addEventListener('click', item.onClick);
@@ -11624,6 +11625,19 @@ function stationDockCard(parent, item) {
   }
   parent.appendChild(card);
   return card;
+}
+
+function stationRefreshPeersDockIfOpen() {
+  const dock = document.getElementById('station-dock');
+  if (!dock || dock.classList.contains('hidden') || dock.dataset.kind !== 'peers') return;
+  if (stationRefreshPeersDockIfOpen._pending) return;
+  stationRefreshPeersDockIfOpen._pending = true;
+  requestAnimationFrame(() => {
+    stationRefreshPeersDockIfOpen._pending = false;
+    const current = document.getElementById('station-dock');
+    if (!current || current.classList.contains('hidden') || current.dataset.kind !== 'peers') return;
+    stationRenderPeersDock();
+  });
 }
 
 function stationDockField(parent, label, control) {
@@ -34639,12 +34653,14 @@ class PeerDisplayConnection {
 
   setStatus(text, kind) {
     const container = document.getElementById(`peer-display-${this.hostId}`);
-    if (!container) return;
-    const statusEl = container.querySelector('.peer-display-status');
-    if (statusEl) {
-      statusEl.textContent = text;
-      statusEl.className = `peer-display-status ${kind || ''}`;
+    if (container) {
+      const statusEl = container.querySelector('.peer-display-status');
+      if (statusEl) {
+        statusEl.textContent = text;
+        statusEl.className = `peer-display-status ${kind || ''}`;
+      }
     }
+    stationRefreshPeersDockIfOpen();
   }
 
   async connect() {
@@ -35603,8 +35619,10 @@ async function openPeerDisplay(hostId, displayId, advertiseTcpViaUrl) {
   const conn = new PeerDisplayConnection(hostId, displayId, sessionId, effectiveUrl);
   peerDisplayConnections.set(conn.sessionKey(), conn);
   conn.attachToDom();
+  stationRefreshPeersDockIfOpen();
   await conn.connect();
   stationScheduleUpdate();
+  stationRefreshPeersDockIfOpen();
 }
 
 async function closePeerDisplaysForHost(hostId) {
@@ -35622,6 +35640,8 @@ async function closePeerDisplaysForHost(hostId) {
     container.innerHTML = '';
     container.style.display = 'none';
   }
+  stationScheduleUpdate();
+  stationRefreshPeersDockIfOpen();
 }
 
 function handlePeerWebRtcSignal(hostId, displayId, sessionId, signal) {
