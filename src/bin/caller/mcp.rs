@@ -11,6 +11,7 @@
 //! types as the TUI. Adding a new `UserAction` variant forces both this module
 //! and the TUI key handler to handle it (Rust exhaustive match, no wildcards).
 
+use std::collections::HashSet;
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -1327,6 +1328,7 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
 
     let mut active_wrappers = Vec::new();
     let mut active_codex = Vec::new();
+    let mut known_codex_pids = HashSet::new();
     for run in loop_run_dirs(loop_dir) {
         let run_id = run
             .file_name()
@@ -1342,14 +1344,20 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
             }
         }
         if let Some(pid) = parse_pid_file(&run.join("codex.pid")) {
+            known_codex_pids.insert(pid);
             if super::platform::process_alive(pid) {
                 active_codex.push(serde_json::json!({
                     "run_id": run_id,
-                    "pid": pid
+                    "pid": pid,
+                    "source": "controller_loop"
                 }));
             }
         }
     }
+    active_codex.extend(live_codex_app_server_processes(
+        std::process::id(),
+        &known_codex_pids,
+    ));
 
     let latest_run_id = read_trimmed(&loop_dir.join("latest.run_id"));
     let latest_status = read_json_file(&loop_dir.join("latest.status.json"));
@@ -1401,6 +1409,35 @@ fn collect_controller_loop_status(loop_dir: &std::path::Path) -> serde_json::Val
             "codex": active_codex,
         }
     })
+}
+
+fn live_codex_app_server_processes(
+    root_pid: u32,
+    known_codex_pids: &HashSet<u32>,
+) -> Vec<serde_json::Value> {
+    let mut processes = Vec::new();
+    for pid in super::platform::process_descendants(root_pid) {
+        if known_codex_pids.contains(&pid) {
+            continue;
+        }
+        let Some(cmdline) = super::platform::process_cmdline(pid) else {
+            continue;
+        };
+        if !is_codex_app_server_cmdline(&cmdline) {
+            continue;
+        }
+        processes.push(serde_json::json!({
+            "run_id": serde_json::Value::Null,
+            "pid": pid,
+            "source": "process_tree",
+        }));
+    }
+    processes
+}
+
+fn is_codex_app_server_cmdline(cmdline: &str) -> bool {
+    let mut args = cmdline.split_whitespace();
+    args.any(|arg| arg.ends_with("codex")) && args.any(|arg| arg == "app-server")
 }
 
 fn request_loop_halt_marker(loop_dir: &std::path::Path, persistent: bool) -> Result<(), String> {
@@ -9404,6 +9441,23 @@ mod tests {
                 .and_then(|v| v.as_str()),
             Some("20260101T000000Z-1234")
         );
+    }
+
+    #[test]
+    fn controller_loop_status_recognizes_codex_app_server_cmdlines() {
+        assert!(is_codex_app_server_cmdline(
+            "/home/user/projects/codex/codex-rs/target/debug/codex --dangerously-bypass-approvals-and-sandbox app-server -c mcp_servers.intendant.url=..."
+        ));
+        assert!(is_codex_app_server_cmdline(
+            "/opt/homebrew/bin/codex app-server -c model_auto_compact_token_limit=9223372036854775807"
+        ));
+        assert!(!is_codex_app_server_cmdline(
+            "/home/user/projects/intendant/target/release/intendant --web 8892"
+        ));
+        assert!(!is_codex_app_server_cmdline("[codex] <defunct>"));
+        assert!(!is_codex_app_server_cmdline(
+            "/usr/bin/codex completion bash"
+        ));
     }
 
     #[test]
