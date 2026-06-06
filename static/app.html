@@ -11555,7 +11555,12 @@ function stationPeerDisplayIdForHost(hostId, fallback = stationPeerDisplayId()) 
 function stationRememberPeerDisplayTarget(hostId = stationPeerDraft.selectedHostId, displayId = stationPeerDisplayId()) {
   const id = String(hostId || '').trim();
   if (!id) return;
-  stationPeerDisplayTargets.set(id, stationPeerDisplayIdForHost(id, displayId));
+  const parsed = Number.parseInt(String(displayId ?? 0), 10);
+  const did = Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+  stationPeerDisplayTargets.set(id, did);
+  if (id === String(stationPeerDraft.selectedHostId || '').trim()) {
+    stationPeerDraft.displayId = String(did);
+  }
 }
 
 function stationSetPeerTarget(hostId, displayId = undefined) {
