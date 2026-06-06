@@ -56,7 +56,9 @@ Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
 - For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
 - For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. The helper launches isolated headless Chromium, waits for CDP and selectors/functions, handles WebSocket fallbacks, and prints compact PASS/FAIL output with bounded failure excerpts.
+- Browser validation retry discipline: run one primary helper smoke. If it fails or times out, run at most one compact diagnostic retry with `--diagnostics --json` and a targeted selector/function. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the helper reason/logs/diagnostics. Do not cycle through raw CDP, Node, Python, Browser, Chrome, and plugin automation stacks unless the user explicitly asks for deeper manual investigation or the helper itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
+- While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors. Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After noisy or unexpectedly large tool output, failed exploration, broad research, or finishing a coherent subtask, crystallize durable facts and use Intendant managed-context tools before continuing broad ordinary-tool work.
 - Use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
@@ -1651,6 +1653,52 @@ impl CodexAgent {
                 .ok_or_else(|| CallerError::ExternalAgent(format!("no active turn to {action}")))?,
         };
         Ok((thread_id, turn_id))
+    }
+
+    async fn active_turn_interrupt_targets(
+        &self,
+        action: &str,
+    ) -> Result<Vec<(String, String)>, CallerError> {
+        let active_thread_id = self.active_thread_id.lock().await.clone();
+        let fallback_turn_id = self.active_turn_id.lock().await.clone();
+        let active_turns = self.active_turns.lock().await.clone();
+        if active_thread_id.is_none() && active_turns.is_empty() {
+            if fallback_turn_id.is_some() {
+                return Err(CallerError::ExternalAgent(format!(
+                    "no active thread to {action}"
+                )));
+            }
+            return Err(CallerError::ExternalAgent(format!(
+                "no active turn to {action}"
+            )));
+        }
+
+        let mut targets = Vec::new();
+        if let Some(thread_id) = active_thread_id.as_deref() {
+            if let Some(turn_id) = active_turns
+                .get(thread_id)
+                .cloned()
+                .or_else(|| fallback_turn_id.clone())
+            {
+                targets.push((thread_id.to_string(), turn_id));
+            }
+        }
+        for (thread_id, turn_id) in active_turns {
+            if targets
+                .iter()
+                .any(|(seen_thread_id, _)| seen_thread_id == &thread_id)
+            {
+                continue;
+            }
+            targets.push((thread_id, turn_id));
+        }
+
+        if targets.is_empty() {
+            return Err(CallerError::ExternalAgent(format!(
+                "no active turn to {action}"
+            )));
+        }
+        Ok(targets)
     }
 
     async fn remember_active_turn_for_thread(&self, thread_id: &str, turn_id: &str) {
@@ -3966,6 +4014,88 @@ fn codex_error_near_context_limit(
     incomplete || context_limit || terminal_stream_failure
 }
 
+fn is_codex_noop_tool_wait_message(text: &str) -> bool {
+    let normalized = text
+        .trim()
+        .trim_matches(|ch: char| ch.is_ascii_punctuation() || ch.is_whitespace())
+        .to_ascii_lowercase();
+    if normalized.is_empty() || normalized.len() > 240 {
+        return false;
+    }
+
+    let waiting = [
+        "still",
+        "waiting",
+        "awaiting",
+        "continuing",
+        "ongoing",
+        "in progress",
+        "running",
+        "building",
+        "compiling",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    if !waiting {
+        return false;
+    }
+
+    let tool_context = [
+        "tool",
+        "command",
+        "process",
+        "build",
+        "building",
+        "compile",
+        "compiling",
+        "cargo",
+        "test",
+        "tests",
+        "check",
+        "release",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    if !tool_context {
+        return false;
+    }
+
+    let no_material_output = [
+        "no output",
+        "no new output",
+        "no error output",
+        "no errors",
+        "no error",
+        "nothing new",
+        "no update",
+        "no updates",
+        "quiet",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    if !no_material_output {
+        return false;
+    }
+
+    let material_markers = [
+        "failed",
+        "failure",
+        "error:",
+        "completed",
+        "finished",
+        "succeeded",
+        "success",
+        "done",
+        "next",
+        "found",
+        "changed",
+        "fixed",
+    ];
+    !material_markers
+        .iter()
+        .any(|needle| normalized.contains(needle))
+}
+
 /// Translate a Codex notification into one or more `AgentEvent`s.
 #[cfg(test)]
 fn translate_notification(
@@ -4191,6 +4321,17 @@ fn translate_notification_with_scope(
             // final message is not a tool.
             if item_type == "agentMessage" {
                 let text = item.get("text").and_then(|v| v.as_str());
+                if text.is_some_and(is_codex_noop_tool_wait_message) {
+                    if codex_item_completed_final_answer(params) {
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::TurnCompleted { message: None },
+                        );
+                    }
+                    return;
+                }
                 if let Some(text) = text {
                     if !text.is_empty() {
                         send_scoped_agent_event(
@@ -5074,30 +5215,40 @@ impl ExternalAgent for CodexAgent {
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
-        let (thread_id, turn_id) = self.active_thread_and_turn("interrupt").await?;
-        let params = serde_json::json!({
-            "threadId": thread_id,
-            "turnId": turn_id,
-        });
-        // turn/interrupt is a JSON-RPC request; Codex responds with `{}` and
-        // emits a `turn/completed` notification with status="interrupted"
-        // shortly after. The reader task handles that notification like any
-        // other turn completion.
-        let interrupt_result = self.send_request("turn/interrupt", Some(params)).await;
-        match interrupt_result {
-            Ok(_) => {}
-            Err(err) => {
-                let Some(actual_turn_id) = self
-                    .refresh_active_turn_after_expected_mismatch(&thread_id, &turn_id, &err)
-                    .await
-                else {
-                    return Err(err);
-                };
-                let params = serde_json::json!({
-                    "threadId": thread_id,
-                    "turnId": actual_turn_id,
-                });
-                let _ = self.send_request("turn/interrupt", Some(params)).await?;
+        let targets = self.active_turn_interrupt_targets("interrupt").await?;
+        let mut first_error: Option<CallerError> = None;
+        for (thread_id, turn_id) in targets {
+            let params = serde_json::json!({
+                "threadId": thread_id,
+                "turnId": turn_id,
+            });
+            // turn/interrupt is a JSON-RPC request; Codex responds with `{}`
+            // and emits a `turn/completed` notification with
+            // status="interrupted" shortly after. The reader task handles that
+            // notification like any other turn completion.
+            let interrupt_result = self.send_request("turn/interrupt", Some(params)).await;
+            match interrupt_result {
+                Ok(_) => {}
+                Err(err) => {
+                    let Some(actual_turn_id) = self
+                        .refresh_active_turn_after_expected_mismatch(&thread_id, &turn_id, &err)
+                        .await
+                    else {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                        continue;
+                    };
+                    let params = serde_json::json!({
+                        "threadId": thread_id,
+                        "turnId": actual_turn_id,
+                    });
+                    if let Err(err) = self.send_request("turn/interrupt", Some(params)).await {
+                        if first_error.is_none() {
+                            first_error = Some(err);
+                        }
+                    }
+                }
             }
         }
         if let Some(pid) = self.child.as_ref().and_then(|child| child.id()) {
@@ -5109,6 +5260,9 @@ impl ExternalAgent for CodexAgent {
         // them, but clearing here makes the agent's state consistent if the
         // caller forgets.
         self.pending_approvals.lock().await.clear();
+        if let Some(err) = first_error {
+            return Err(err);
+        }
         Ok(())
     }
 
@@ -6841,6 +6995,68 @@ mod tests {
     }
 
     #[test]
+    fn translate_item_completed_suppresses_noop_tool_wait_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "msg_wait",
+                "type": "agentMessage",
+                "text": "Still building; no error output.",
+                "status": "completed"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "quiet tool wait chatter should not become durable model output"
+        );
+    }
+
+    #[test]
+    fn translate_final_answer_noop_tool_wait_completes_without_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "msg_wait_final",
+                "type": "agentMessage",
+                "text": "Still waiting on the cargo build; no new output yet.",
+                "phase": "final_answer",
+                "status": "completed"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::TurnCompleted { message } => assert_eq!(message, None),
+            other => panic!("expected TurnCompleted without chatter, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn translate_item_completed_keeps_material_progress_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "msg_progress",
+                "type": "agentMessage",
+                "text": "The release build finished; next I am checking the binary.",
+                "status": "completed"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Message { text } => {
+                assert_eq!(
+                    text,
+                    "The release build finished; next I am checking the binary."
+                );
+            }
+            other => panic!("expected material Message, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
     fn translate_final_answer_agent_message_completes_turn() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -7554,6 +7770,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn active_turn_interrupt_targets_include_side_turns() {
+        let agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        *agent.active_thread_id.lock().await = Some("parent-thread".into());
+        *agent.active_turn_id.lock().await = Some("fallback-parent-turn".into());
+        {
+            let mut active_turns = agent.active_turns.lock().await;
+            active_turns.insert("parent-thread".into(), "parent-turn".into());
+            active_turns.insert("side-thread".into(), "side-turn".into());
+        }
+
+        let targets = agent
+            .active_turn_interrupt_targets("interrupt")
+            .await
+            .unwrap();
+
+        assert_eq!(
+            targets
+                .first()
+                .map(|(thread_id, turn_id)| { (thread_id.as_str(), turn_id.as_str()) }),
+            Some(("parent-thread", "parent-turn"))
+        );
+        assert_eq!(targets.len(), 2);
+        assert!(targets
+            .iter()
+            .any(|(thread_id, turn_id)| thread_id == "side-thread" && turn_id == "side-turn"));
+    }
+
+    #[tokio::test]
+    async fn active_turn_interrupt_targets_use_thread_map_without_active_thread_cache() {
+        let agent = CodexAgent::new(
+            "codex".into(),
+            None,
+            "on-request".into(),
+            "danger-full-access".into(),
+            None,
+        );
+        agent
+            .active_turns
+            .lock()
+            .await
+            .insert("side-thread".into(), "side-turn".into());
+
+        let targets = agent
+            .active_turn_interrupt_targets("interrupt")
+            .await
+            .unwrap();
+
+        assert_eq!(targets, vec![("side-thread".into(), "side-turn".into())]);
+    }
+
+    #[tokio::test]
     async fn expected_turn_mismatch_refreshes_active_turn_cache() {
         let agent = CodexAgent::new(
             "codex".into(),
@@ -7846,6 +8119,9 @@ mod tests {
         assert!(developer_instructions.contains("execute_cu_actions"));
         assert!(developer_instructions.contains("scripts/validate-dashboard.cjs"));
         assert!(developer_instructions.contains("compact PASS/FAIL"));
+        assert!(developer_instructions.contains("--diagnostics --json"));
+        assert!(developer_instructions.contains("one primary helper smoke"));
+        assert!(developer_instructions.contains("Do not cycle through raw CDP"));
         assert!(developer_instructions.contains("cliclick"));
         assert!(developer_instructions.contains("osascript"));
         assert!(developer_instructions.contains("already-built binaries"));
