@@ -10497,7 +10497,10 @@ async function ensureStation() {
     stationSyncHotspots();
     stationUpdateSnapshot();
     stationRegisterExistingSources();
-    if (active) stationRefreshSharedCaches();
+    if (active) {
+      stationRefreshSharedCaches();
+      stationMaybeRestoreDock();
+    }
     return station;
   })().catch(err => {
     stationInitPromise = null;
