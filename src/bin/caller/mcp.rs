@@ -5119,6 +5119,9 @@ pub struct InterveneControllerLoopParams {
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct GetLogsParams {
+    /// Optional Intendant session id. HTTP MCP requests also default this from the session_id query parameter.
+    #[serde(default, alias = "sessionId")]
+    pub session_id: Option<String>,
     /// Only return log entries with IDs greater than this value (cursor-based pagination).
     #[serde(default)]
     pub since_id: Option<u64>,
@@ -5128,6 +5131,91 @@ pub struct GetLogsParams {
     /// Maximum number of entries to return (default: 100).
     #[serde(default)]
     pub limit: Option<usize>,
+}
+
+fn read_persisted_log_entries_for_session(
+    session_id: Option<&str>,
+    params: &GetLogsParams,
+) -> Option<Vec<LogEntrySnapshot>> {
+    let session_id = session_id.map(str::trim).filter(|id| !id.is_empty())?;
+    let log_dir = crate::session_log::SessionLog::find_session_by_id(session_id)?;
+    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).ok()?;
+    let limit = params.limit.unwrap_or(100);
+    let mut entries = Vec::new();
+
+    for (line_idx, line) in contents.lines().enumerate() {
+        if entries.len() >= limit {
+            break;
+        }
+        let line_id = line_idx as u64;
+        if params
+            .since_id
+            .map(|since| line_id <= since)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let level = persisted_log_entry_level(&value);
+        if params
+            .level_filter
+            .as_deref()
+            .map(|filter| filter != level)
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        entries.push(LogEntrySnapshot {
+            id: line_id,
+            ts: persisted_log_entry_ts(&value),
+            level,
+            content: persisted_log_entry_content(&value),
+        });
+    }
+
+    Some(entries)
+}
+
+fn persisted_log_entry_level(value: &serde_json::Value) -> String {
+    match value.get("event").and_then(serde_json::Value::as_str) {
+        Some("model_response") | Some("reasoning") => "model".to_string(),
+        Some("agent_output") | Some("agent_input") => "agent".to_string(),
+        Some("error") => "error".to_string(),
+        Some("warn") => "warn".to_string(),
+        _ => value
+            .get("level")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("info")
+            .to_string(),
+    }
+}
+
+fn persisted_log_entry_ts(value: &serde_json::Value) -> String {
+    value
+        .get("ts")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+fn persisted_log_entry_content(value: &serde_json::Value) -> String {
+    let event = value
+        .get("event")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("log");
+    if let Some(message) = value
+        .get("message")
+        .and_then(serde_json::Value::as_str)
+        .filter(|message| !message.is_empty())
+    {
+        return message.to_string();
+    }
+    if let Some(turn) = value.get("turn").and_then(serde_json::Value::as_u64) {
+        return format!("{event} (turn {turn})");
+    }
+    event.to_string()
 }
 
 // ---------------------------------------------------------------------------
@@ -5307,8 +5395,10 @@ impl IntendantServer {
                     .await,
             )),
             "get_logs" => {
-                let params = parse_params::<GetLogsParams>(args)?;
-                Ok(text_tool_result(self.get_logs(params).await))
+                let Parameters(params) = parse_params::<GetLogsParams>(args)?;
+                Ok(text_tool_result(
+                    self.get_logs_for_session(params, session_id).await,
+                ))
             }
             "get_pending_approval" => Ok(text_tool_result(self.get_pending_approval().await)),
             "get_pending_input" => Ok(text_tool_result(self.get_pending_input().await)),
@@ -5849,6 +5939,19 @@ impl IntendantServer {
         description = "Get log entries. Supports cursor-based pagination via since_id and filtering by level."
     )]
     async fn get_logs(&self, Parameters(params): Parameters<GetLogsParams>) -> String {
+        self.get_logs_for_session(params, None).await
+    }
+
+    async fn get_logs_for_session(
+        &self,
+        params: GetLogsParams,
+        session_id: Option<&str>,
+    ) -> String {
+        let target_session_id = params.session_id.as_deref().or(session_id);
+        if let Some(entries) = read_persisted_log_entries_for_session(target_session_id, &params) {
+            return serde_json::to_string_pretty(&entries).unwrap_or_else(|_| "[]".to_string());
+        }
+
         let s = self.state.read().await;
         let limit = params.limit.unwrap_or(100);
         let entries: Vec<&LogEntrySnapshot> = s
@@ -7788,6 +7891,8 @@ mod tests {
     use tempfile::tempdir;
     use tokio::time::{timeout, Duration};
 
+    static TEST_ENV_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
     fn test_state() -> SharedMcpState {
         test_state_with_log_dir(std::path::PathBuf::from("/tmp/test_session"))
     }
@@ -8462,6 +8567,107 @@ mod tests {
                 .unwrap();
             let rendered = format!("{result:?}");
             assert!(rendered.contains("managed context is disabled"));
+        });
+    }
+
+    #[test]
+    fn get_logs_reads_session_scoped_wrapper_session_jsonl() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            let prior_home = std::env::var_os("HOME");
+            let prior_userprofile = std::env::var_os("USERPROFILE");
+            let home = tempdir().unwrap();
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+
+            let wrapper_session_id = "6eee2a11-51f2-453b-b993-b47744f34792";
+            let wrapper_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(wrapper_session_id);
+            std::fs::create_dir_all(&wrapper_dir).unwrap();
+            std::fs::write(
+                wrapper_dir.join("session.jsonl"),
+                [
+                    serde_json::json!({
+                        "ts": "2026-06-06T12:00:00",
+                        "event": "info",
+                        "level": "info",
+                        "message": "wrapper started"
+                    })
+                    .to_string(),
+                    serde_json::json!({
+                        "ts": "2026-06-06T12:00:01",
+                        "event": "agent_output",
+                        "level": "info",
+                        "message": "codex output"
+                    })
+                    .to_string(),
+                ]
+                .join("\n")
+                    + "\n",
+            )
+            .unwrap();
+
+            let server = IntendantServer::new(test_state(), EventBus::new());
+            let result = server
+                .call_tool_by_name_for_session(
+                    "get_logs",
+                    serde_json::json!({ "limit": 40 }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false));
+
+            let result_json = serde_json::to_value(&result).unwrap();
+            let text = result_json
+                .pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let entries: Vec<LogEntrySnapshot> = serde_json::from_str(text).unwrap();
+            assert_eq!(entries.len(), 2);
+            assert_eq!(entries[0].content, "wrapper started");
+            assert_eq!(entries[1].level, "agent");
+            assert_eq!(entries[1].content, "codex output");
+
+            let result = server
+                .call_tool_by_name(
+                    "get_logs",
+                    serde_json::json!({
+                        "session_id": wrapper_session_id,
+                        "since_id": 0,
+                        "level_filter": "agent"
+                    }),
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            let text = result_json
+                .pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let entries: Vec<LogEntrySnapshot> = serde_json::from_str(text).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].id, 1);
+            assert_eq!(entries[0].level, "agent");
+            assert_eq!(entries[0].content, "codex output");
+
+            match prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prior_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
         });
     }
 
