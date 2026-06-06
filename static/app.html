@@ -12552,6 +12552,12 @@ function stationDockCard(parent, item) {
     detail.textContent = item.detail;
     card.appendChild(detail);
   }
+  if (Array.isArray(item.rows)) {
+    for (const rowSpec of item.rows.filter(Boolean)) {
+      const [key, value] = rowSpec;
+      stationDockRow(card, key, value);
+    }
+  }
   if (Array.isArray(item.actions) && item.actions.length) {
     stationDockActions(card, item.actions);
   }
@@ -14767,6 +14773,28 @@ async function stationLoadWorktreesForDock(forceScan = false) {
   stationRenderWorktreesDock();
 }
 
+function stationWorktreeDetailRowsForDock(wt) {
+  const rows = [];
+  if (wt.safety) rows.push(['safety', wt.safety]);
+  if (wt.default_branch && (wt.default_ahead || wt.default_behind)) {
+    rows.push(['base', formatWorktreeDivergence(wt.default_branch, wt.default_ahead, wt.default_behind)]);
+  }
+  if (wt.upstream && (!wt.default_branch || wt.upstream !== wt.default_branch) && (wt.ahead || wt.behind)) {
+    rows.push(['tracking', formatWorktreeDivergence(wt.upstream, wt.ahead, wt.behind)]);
+  }
+  if (wt.dirty) {
+    rows.push(['changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`]);
+  }
+  if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
+    rows.push(['sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`]);
+  }
+  if (Array.isArray(wt.labels) && wt.labels.length) rows.push(['labels', wt.labels.join(', ')]);
+  if (wt.last_changed_at) rows.push(['changed', fmtWorktreeMinute(wt.last_changed_at)]);
+  if (wt.head_author_time) rows.push(['commit', fmtWorktreeMinute(wt.head_author_time)]);
+  if (wt.file_count) rows.push(['files', `${Number(wt.file_count || 0).toLocaleString()} files`]);
+  return rows;
+}
+
 function stationRenderWorktreesDock(focusPath = '') {
   const rows = stationWorktreeRowsForDock();
   const summary = stationBuildWorktreesSummary();
@@ -14815,12 +14843,15 @@ function stationRenderWorktreesDock(focusPath = '') {
         { label: 'Copy path', onClick: () => copyTextToClipboard(path) },
       ];
       if (wt.safe_to_remove) {
+        const command = worktreeRemoveCommand(wt);
+        actions.push({ label: 'Copy remove command', onClick: () => copyTextToClipboard(command) });
         actions.push({ label: 'Remove...', danger: true, onClick: (_, button) => removeWorktree(wt, button).then(() => stationRenderWorktreesDock()) });
       }
       stationDockCard(list, {
         title: branch,
         meta: status,
         detail: [wt.repo_name, _fmtBytes(stationNum(wt.size_bytes || 0)), wt.merge_status, path].filter(Boolean).join(' / '),
+        rows: stationWorktreeDetailRowsForDock(wt),
         active: focusPath && focusPath === path,
         actions,
       });
