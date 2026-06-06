@@ -11098,6 +11098,8 @@ let stationComputerUseStatus = '';
 let stationComputerUseSaving = false;
 let stationRecordingSettingsStatus = '';
 let stationRecordingSettingsSaving = false;
+let stationPresenceSettingsStatus = '';
+let stationPresenceSettingsSaving = false;
 let stationAudioSettingsStatus = '';
 let stationAudioSettingsSaving = false;
 let stationManagedDraft = {
@@ -15397,6 +15399,114 @@ function stationRenderRecordingDefaultsEditor(parent) {
   ]);
 }
 
+function stationPresenceSettingValue(id, fallback = '') {
+  const el = document.getElementById(id);
+  if (!el) return fallback;
+  if (el.type === 'checkbox') return el.checked;
+  return el.value || fallback;
+}
+
+function stationSetPresenceSetting(id, value) {
+  const el = document.getElementById(id);
+  if (!el) return;
+  if (el.type === 'checkbox') el.checked = !!value;
+  else el.value = value || '';
+  stationPresenceSettingsStatus = 'Unsaved presence settings.';
+  stationRenderControlsDock('presence');
+}
+
+async function stationSavePresenceSettingsFromDock() {
+  stationPresenceSettingsSaving = true;
+  stationPresenceSettingsStatus = 'Saving presence settings...';
+  stationRenderControlsDock('presence');
+  try {
+    await saveSettings();
+    stationPresenceSettingsStatus = 'Saved presence settings.';
+    showControlToast?.('success', 'Presence settings saved');
+  } catch (err) {
+    stationPresenceSettingsStatus = err?.message || 'Presence settings save failed.';
+    showControlToast?.('error', stationPresenceSettingsStatus);
+  } finally {
+    stationPresenceSettingsSaving = false;
+    stationRenderControlsDock('presence');
+  }
+}
+
+async function stationReloadPresenceSettingsForDock() {
+  stationPresenceSettingsStatus = 'Reloading presence settings...';
+  stationRenderControlsDock('presence');
+  settingsLoaded = false;
+  await loadSettings();
+  stationPresenceSettingsStatus = 'Reloaded presence settings.';
+  stationRenderControlsDock('presence');
+}
+
+function stationPresenceProviderOptions(includeAnthropic = true) {
+  const options = [
+    ['', 'Auto'],
+    ['gemini', 'Gemini'],
+    ['openai', 'OpenAI'],
+  ];
+  if (includeAnthropic) options.push(['anthropic', 'Anthropic']);
+  return options;
+}
+
+function stationPresenceTextModelOptions() {
+  return [
+    ['', 'Default'],
+    ['gemini-3-flash-preview', 'gemini-3-flash-preview'],
+    ['gemini-2.5-flash', 'gemini-2.5-flash'],
+    ['gemini-2.5-pro', 'gemini-2.5-pro'],
+    ['gpt-5.4-mini', 'gpt-5.4-mini'],
+    ['gpt-5.4', 'gpt-5.4'],
+    ['gpt-4.1-mini', 'gpt-4.1-mini'],
+    ['claude-haiku-4-5-20251001', 'claude-haiku-4-5'],
+    ['claude-sonnet-4-6', 'claude-sonnet-4-6'],
+    ['claude-opus-4-6', 'claude-opus-4-6'],
+  ];
+}
+
+function stationPresenceLiveModelOptions() {
+  return [
+    ['', 'Default'],
+    ['gemini-3.1-flash-live-preview', 'gemini-3.1-flash-live-preview'],
+    ['gemini-2.5-flash-native-audio-preview-12-2025', 'gemini-2.5-flash-native-audio'],
+    ['gpt-realtime-1.5', 'gpt-realtime-1.5'],
+    ['gpt-realtime', 'gpt-realtime'],
+    ['gpt-realtime-mini', 'gpt-realtime-mini'],
+  ];
+}
+
+function stationRenderPresenceDefaultsEditor(parent) {
+  const section = stationDockSection(parent, 'Presence defaults');
+  const enabled = !!stationPresenceSettingValue('set-presence-enabled', false);
+  const provider = stationPresenceSettingValue('set-presence-provider', '');
+  const model = stationPresenceSettingValue('set-presence-model', '');
+  const liveProvider = stationPresenceSettingValue('set-presence-live-provider', '');
+  const liveModel = stationPresenceSettingValue('set-presence-live-model', '');
+  stationDockRow(section, 'enabled', enabled ? 'yes' : 'no');
+  stationDockRow(section, 'text model', `${provider || 'auto'} / ${model || 'default'}`);
+  stationDockRow(section, 'live model', `${liveProvider || 'auto'} / ${liveModel || 'default'}`);
+
+  const enabledBox = stationDockCheckbox(section, 'Enabled', enabled, { id: 'station-presence-enabled' });
+  enabledBox.addEventListener('change', ev => stationSetPresenceSetting('set-presence-enabled', ev.target.checked));
+  const providerSelect = stationDockSelect(section, 'Text provider', provider, stationPresenceProviderOptions(true), { id: 'station-presence-provider' });
+  providerSelect.addEventListener('change', ev => stationSetPresenceSetting('set-presence-provider', ev.target.value));
+  const modelSelect = stationDockSelect(section, 'Text model', model, stationPresenceTextModelOptions(), { id: 'station-presence-model' });
+  modelSelect.addEventListener('change', ev => stationSetPresenceSetting('set-presence-model', ev.target.value));
+  const liveProviderSelect = stationDockSelect(section, 'Live provider', liveProvider, stationPresenceProviderOptions(false), { id: 'station-presence-live-provider' });
+  liveProviderSelect.addEventListener('change', ev => stationSetPresenceSetting('set-presence-live-provider', ev.target.value));
+  const liveModelSelect = stationDockSelect(section, 'Live model', liveModel, stationPresenceLiveModelOptions(), { id: 'station-presence-live-model' });
+  liveModelSelect.addEventListener('change', ev => stationSetPresenceSetting('set-presence-live-model', ev.target.value));
+
+  if (stationPresenceSettingsStatus) stationDockEmpty(section, stationPresenceSettingsStatus);
+  stationDockActions(section, [
+    { label: stationPresenceSettingsSaving ? 'Saving...' : 'Save presence', primary: true, disabled: stationPresenceSettingsSaving, onClick: stationSavePresenceSettingsFromDock },
+    { label: 'Reload', disabled: stationPresenceSettingsSaving, onClick: stationReloadPresenceSettingsForDock },
+    stationDockRouteAction('Route presence settings', 'settings', 'agent', () => document.getElementById('set-presence-enabled')?.focus()),
+  ]);
+}
+
 function stationAudioSettingValue(id, fallback = '') {
   const el = document.getElementById(id);
   if (!el) return fallback;
@@ -16029,6 +16139,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   if (sectionName === 'browser' || sectionName === 'overview') stationRenderBrowserWorkspaceSection(body);
   if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingSection(body);
   if (sectionName === 'recordings' || sectionName === 'overview') stationRenderRecordingDefaultsEditor(body);
+  if (sectionName === 'presence' || sectionName === 'overview') stationRenderPresenceDefaultsEditor(body);
   if (sectionName === 'audio' || sectionName === 'overview') stationRenderAudioDefaultsEditor(body);
 
   stationRenderComputerUseDefaultsEditor(body, controls);
