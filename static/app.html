@@ -10836,6 +10836,7 @@ let stationSelectedChangePath = '';
 let stationSelectedManagedAnchor = '';
 let stationSelectedManagedRecord = '';
 let stationSelectedPeerHost = '';
+const stationPeerDisplayTargets = new Map();
 let stationPeerStatus = '';
 let stationPeerStatusKind = '';
 let stationPeerEligibleRows = [];
@@ -11544,13 +11545,30 @@ function stationPeerDisplayId() {
   return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
 }
 
-function stationSetPeerTarget(hostId, displayId = stationPeerDisplayId()) {
+function stationPeerDisplayIdForHost(hostId, fallback = stationPeerDisplayId()) {
+  const id = String(hostId || '').trim();
+  const stored = id ? stationPeerDisplayTargets.get(id) : undefined;
+  const parsed = Number.parseInt(String(stored ?? fallback ?? 0), 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
+}
+
+function stationRememberPeerDisplayTarget(hostId = stationPeerDraft.selectedHostId, displayId = stationPeerDisplayId()) {
+  const id = String(hostId || '').trim();
+  if (!id) return;
+  stationPeerDisplayTargets.set(id, stationPeerDisplayIdForHost(id, displayId));
+}
+
+function stationSetPeerTarget(hostId, displayId = undefined) {
   const id = String(hostId || '').trim();
   if (id) {
     stationSelectedPeerHost = id;
     stationPeerDraft.selectedHostId = id;
   }
-  stationPeerDraft.displayId = String(displayId ?? 0);
+  const did = displayId === undefined
+    ? stationPeerDisplayIdForHost(id || stationPeerDraft.selectedHostId)
+    : stationPeerDisplayIdForHost(id || stationPeerDraft.selectedHostId, displayId);
+  stationPeerDraft.displayId = String(did);
+  if (id) stationPeerDisplayTargets.set(id, did);
 }
 
 function stationPeerDisplayName(peer) {
@@ -11801,13 +11819,22 @@ function stationRenderPeerCommandSection(parent) {
   const displayId = stationDockInput(section, 'Display ID', stationPeerDraftValue('displayId', '0'), { id: 'station-peer-display-id', type: 'number', placeholder: '0' });
   displayId.min = '0';
   displayId.step = '1';
-  displayId.addEventListener('input', stationRememberPeerDraft);
+  displayId.addEventListener('input', () => {
+    stationRememberPeerDraft();
+    stationRememberPeerDisplayTarget(stationPeerDraft.selectedHostId, stationPeerDisplayId());
+  });
+  displayId.addEventListener('change', () => {
+    stationRememberPeerDraft();
+    stationRememberPeerDisplayTarget(stationPeerDraft.selectedHostId, stationPeerDisplayId());
+    stationRenderPeersDock();
+  });
   const message = stationDockInput(section, 'Message/task', stationPeerDraftValue('message'), { id: 'station-peer-message', placeholder: 'Follow-up message or task instructions', multiline: true, rows: 3 });
   message.addEventListener('input', stationRememberPeerDraft);
   const selectedPeer = stationSelectedPeer();
   const canOpenDisplay = !!selectedPeer && peerCanShareDisplay(selectedPeer);
+  stationDockRow(section, 'target', selectedPeer ? `${stationPeerDisplayName(selectedPeer)} :${stationPeerDisplayIdForHost(selectedPeer.host_id)}` : '--');
   stationDockActions(section, [
-    { label: 'Open display', disabled: !canOpenDisplay, title: canOpenDisplay ? '' : 'Peer does not advertise display capability', onClick: () => stationOpenDisplay(stationPeerDraft.selectedHostId || selected, stationPeerDisplayId()) },
+    { label: 'Open display', disabled: !canOpenDisplay, title: canOpenDisplay ? '' : 'Peer does not advertise display capability', onClick: () => stationOpenDisplay(stationPeerDraft.selectedHostId || selected, stationPeerDisplayIdForHost(stationPeerDraft.selectedHostId || selected)) },
     { label: 'Send message', primary: true, onClick: () => stationSubmitPeerInputFromDock('message') },
     { label: 'Start task', onClick: () => stationSubmitPeerInputFromDock('task') },
   ]);
@@ -11832,7 +11859,7 @@ function stationRenderPeersDock() {
         detail: d.url || daemonPlatformLabel(d) || '',
         active: stationSelectedPeerHost === d.host_id || stationPeerDraft.selectedHostId === d.host_id,
         actions: [
-          peerCanShareDisplay(d) ? { label: `Open :${stationPeerDisplayId()}`, primary: true, onClick: () => { stationSetPeerTarget(d.host_id); stationOpenDisplay(d.host_id, stationPeerDisplayId()); } } : null,
+          peerCanShareDisplay(d) ? { label: `Open :${stationPeerDisplayIdForHost(d.host_id)}`, primary: true, onClick: () => { stationSetPeerTarget(d.host_id); stationOpenDisplay(d.host_id, stationPeerDisplayIdForHost(d.host_id)); } } : null,
           { label: 'Select', onClick: () => { stationSetPeerTarget(d.host_id); stationRenderPeersDock(); } },
           { label: 'Message', onClick: () => { stationSetPeerTarget(d.host_id); stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
           { label: 'Task', onClick: () => { stationSetPeerTarget(d.host_id); stationRenderPeersDock(); setTimeout(() => document.getElementById('station-peer-message')?.focus(), 0); } },
