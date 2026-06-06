@@ -8168,6 +8168,7 @@ body.display-fullscreen-open {
           <button class="station-hotspot" type="button" data-station-hotspot="system:managed" title="Managed context"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:changes" title="Changes"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:sessions" title="Sessions"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:worktrees" title="Worktrees"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:peers" title="Peers and displays"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:controls" title="Control surfaces"></button>
           <button class="station-hotspot" type="button" data-station-hotspot="system:view" title="Station view"></button>
@@ -8186,6 +8187,7 @@ body.display-fullscreen-open {
               <button type="button" data-station-dock-nav="system:managed">Managed</button>
               <button type="button" data-station-dock-nav="system:changes">Changes</button>
               <button type="button" data-station-dock-nav="system:sessions">Sessions</button>
+              <button type="button" data-station-dock-nav="system:worktrees">Worktrees</button>
               <button type="button" data-station-dock-nav="system:peers">Peers</button>
               <button type="button" data-station-dock-nav="system:controls">Controls</button>
               <button type="button" data-station-dock-nav="system:view">View</button>
@@ -10774,6 +10776,7 @@ const STATION_SYSTEM_TARGETS = Object.freeze([
   ['system:managed', 'Managed'],
   ['system:changes', 'Changes'],
   ['system:sessions', 'Sessions'],
+  ['system:worktrees', 'Worktrees'],
   ['system:peers', 'Peers'],
   ['system:controls', 'Controls'],
   ['system:view', 'View'],
@@ -10827,7 +10830,6 @@ document.getElementById('station-dock-close')?.addEventListener('click', station
 
 function stationDockSystemTarget(kind) {
   const value = String(kind || '').trim();
-  if (value === 'worktrees') return 'system:sessions';
   return STATION_SYSTEM_TARGETS.some(([target]) => target === `system:${value}`)
     ? `system:${value}`
     : '';
@@ -10940,6 +10942,7 @@ function stationFallbackHotspotDetail(name) {
   if (name === 'system:managed') return `${snapshot.managed.mode || 'managed'} · ${snapshot.managed.status || 'unknown'}`;
   if (name === 'system:changes') return snapshot.changes.count ? `${snapshot.changes.count} files` : (snapshot.changes.status || 'clean');
   if (name === 'system:sessions') return `${snapshot.sessions.total} total · ${snapshot.sessions.active} active`;
+  if (name === 'system:worktrees') return `${snapshot.sessions.worktrees || 0} scanned · ${snapshot.sessions.worktreeCleanup || 0} cleanup`;
   if (name === 'system:peers') return `${Math.max(0, snapshot.hosts.length - 1)} peers · ${displaySlots.size + peerDisplayConnections.size} displays`;
   if (name === 'system:controls') return `${snapshot.controls.backend || 'agent'} · ${snapshot.controls.sandbox || 'sandbox'}`;
   return '';
@@ -11442,6 +11445,7 @@ function stationHandleHotspot(name) {
     'system:managed': stationRenderManagedDock,
     'system:changes': stationRenderChangesDock,
     'system:sessions': stationRenderSessionsDock,
+    'system:worktrees': stationRenderWorktreesDock,
     'system:peers': stationRenderPeersDock,
     'system:controls': stationRenderControlsDock,
     'system:view': stationRenderViewDock,

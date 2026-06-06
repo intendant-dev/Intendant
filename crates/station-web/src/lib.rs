@@ -664,8 +664,10 @@ impl StationInner {
                     | "system:managed"
                     | "system:changes"
                     | "system:sessions"
+                    | "system:worktrees"
                     | "system:peers"
                     | "system:controls"
+                    | "system:view"
             )
             || self
                 .snapshot
@@ -1269,7 +1271,7 @@ impl StationInner {
         let x = if compact_grid { 246.0 } else { 12.0 };
         let y = if compact_grid { 52.0 } else { 242.0 };
         let w = if compact_grid { 390.0 } else { 222.0 };
-        let card_count = 7.0;
+        let card_count = 9.0;
         let rows = if compact_grid {
             (card_count / 2.0_f32).ceil()
         } else {
@@ -1471,6 +1473,37 @@ impl StationInner {
             "system:sessions",
         );
 
+        let worktree_value = format!(
+            "{} scanned · {} cleanup",
+            self.snapshot.sessions.worktrees, self.snapshot.sessions.worktree_cleanup
+        );
+        let worktree_detail = format!(
+            "{} dirty · {} unmerged · {} active",
+            self.snapshot.sessions.worktree_dirty,
+            self.snapshot.sessions.worktree_unmerged,
+            self.snapshot.sessions.worktree_active
+        );
+        let (card_x, card_y) = card_slot(card_idx);
+        card_idx += 1;
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "Worktrees",
+            &worktree_value,
+            &worktree_detail,
+            if self.snapshot.sessions.worktree_dirty > 0
+                || self.snapshot.sessions.worktree_unmerged > 0
+                || self.snapshot.sessions.worktree_active > 0
+            {
+                C_YELLOW_CSS
+            } else {
+                C_BLUE_CSS
+            },
+            "system:worktrees",
+        );
+
         let peer_count = self.snapshot.hosts.len().saturating_sub(1);
         let display_count = self.display_sources.len();
         let peer_value = format!("{peer_count} peers · {display_count} displays");
@@ -1526,6 +1559,26 @@ impl StationInner {
             &control_detail,
             C_MAUVE_CSS,
             "system:controls",
+        );
+        card_idx += 1;
+
+        let view_value = format!("{} · {}", self.layout.label(), self.mood.label());
+        let view_detail = format!(
+            "fov {} · density {:.1}",
+            self.fov_deg.round() as i32,
+            self.density
+        );
+        let (card_x, card_y) = card_slot(card_idx);
+        self.summary_card(
+            card_x,
+            card_y,
+            card_w,
+            card_h,
+            "View",
+            &view_value,
+            &view_detail,
+            C_MAUVE_CSS,
+            "system:view",
         );
     }
 
@@ -1799,12 +1852,20 @@ impl StationInner {
             self.draw_sessions_info(x, y, panel_w);
             return;
         }
+        if id == "system:worktrees" {
+            self.draw_worktrees_info(x, y, panel_w);
+            return;
+        }
         if id == "system:peers" {
             self.draw_peers_info(x, y, panel_w);
             return;
         }
         if id == "system:controls" {
             self.draw_controls_info(x, y, panel_w);
+            return;
+        }
+        if id == "system:view" {
+            self.draw_view_info(x, y, panel_w);
             return;
         }
 
@@ -2904,6 +2965,118 @@ impl StationInner {
         );
     }
 
+    fn draw_worktrees_info(&mut self, x: f32, y: f32, panel_w: f32) {
+        let sessions = self.snapshot.sessions.clone();
+        self.text("worktrees", x + 12.0, y + 25.0, 10.0, C_BLUE_CSS, "bold");
+        self.text(
+            &format!("{} scanned", sessions.worktrees),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.nav_button(
+            x + 14.0,
+            y + 38.0,
+            102.0,
+            "route worktrees",
+            "sessions",
+            Some("worktrees"),
+            C_BLUE_CSS,
+        );
+
+        let mut yy = y + 82.0 - self.panel_scroll;
+        self.panel_row(
+            x,
+            yy,
+            "cleanup",
+            &format!("{} candidates", sessions.worktree_cleanup),
+        );
+        yy += 22.0;
+        self.panel_row_color(
+            x,
+            yy,
+            "dirty",
+            &format!("{} worktrees", sessions.worktree_dirty),
+            if sessions.worktree_dirty > 0 {
+                C_YELLOW_CSS
+            } else {
+                C_TEXT_CSS
+            },
+        );
+        yy += 22.0;
+        self.panel_row_color(
+            x,
+            yy,
+            "unmerged",
+            &format!("{} worktrees", sessions.worktree_unmerged),
+            if sessions.worktree_unmerged > 0 {
+                C_RED_CSS
+            } else {
+                C_TEXT_CSS
+            },
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "active", &sessions.worktree_active.to_string());
+        yy += 22.0;
+        self.panel_row(x, yy, "disk", &format_bytes(sessions.worktree_bytes));
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "scan",
+            &nonempty(&sessions.worktree_scan_status, "cold"),
+        );
+        yy += 30.0;
+        self.section_title_color(x, yy, "Actions", C_BLUE_CSS);
+        yy += 22.0;
+        self.pill_at(x + 14.0, yy - 14.0, 78.0, 21.0, "search", C_TEAL_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 14.0,
+            yy - 14.0,
+            78.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "worktree-search".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        self.pill_at(x + 104.0, yy - 14.0, 56.0, 21.0, "scan", C_PEACH_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 104.0,
+            yy - 14.0,
+            56.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "worktrees-scan".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        self.pill_at(x + 172.0, yy - 14.0, 66.0, 21.0, "cached", C_BLUE_CSS);
+        self.hit_zones.push(HitZone::new(
+            x + 172.0,
+            yy - 14.0,
+            66.0,
+            21.0,
+            HitAction::SessionAction {
+                action: "worktrees-cache".to_string(),
+                session_id: String::new(),
+            },
+        ));
+        yy += 30.0;
+        self.section_title_color(x, yy, "Watchlist", C_BLUE_CSS);
+        yy += 18.0;
+        self.session_detail_rows(
+            x,
+            yy,
+            panel_w,
+            &sessions.recent_worktrees,
+            "No worktree scan yet",
+            7,
+        );
+    }
+
     fn draw_peers_info(&mut self, x: f32, y: f32, panel_w: f32) {
         let hosts = self.snapshot.hosts.clone();
         let local_host_id = hosts
@@ -3599,6 +3772,43 @@ impl StationInner {
             &maintenance_actions,
             &codex_target,
         );
+    }
+
+    fn draw_view_info(&mut self, x: f32, y: f32, _panel_w: f32) {
+        self.text("view", x + 12.0, y + 25.0, 10.0, C_MAUVE_CSS, "bold");
+        self.text(
+            self.layout.label(),
+            x + 92.0,
+            y + 25.0,
+            13.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        let mut yy = y + 82.0 - self.panel_scroll;
+        self.panel_row(x, yy, "layout", self.layout.label());
+        yy += 22.0;
+        self.panel_row(x, yy, "mood", self.mood.label());
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "fov",
+            &format!("{} deg", self.fov_deg.round() as i32),
+        );
+        yy += 22.0;
+        self.panel_row(x, yy, "motion", &format!("{:.1}", self.motion));
+        yy += 22.0;
+        self.panel_row(x, yy, "ar", &format!("{:.1}", self.ar_strength));
+        yy += 22.0;
+        self.panel_row(x, yy, "density", &format!("{:.1}", self.density));
+        yy += 30.0;
+        self.section_title_color(x, yy, "Canvas controls", C_MAUVE_CSS);
+        yy += 22.0;
+        self.panel_row(x, yy, "toolbar", "layout buttons");
+        yy += 22.0;
+        self.panel_row(x, yy, "tweaks", "mood and sliders");
+        yy += 22.0;
+        self.panel_row(x, yy, "dock", "Station View");
     }
 
     fn draw_thread_action_pills(
@@ -5562,6 +5772,13 @@ impl LayoutName {
             _ => Self::Orbital,
         }
     }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Orbital => "orbital",
+            Self::Constellation => "constellation",
+        }
+    }
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -5575,6 +5792,13 @@ impl Mood {
         match s {
             "calm" => Self::Calm,
             _ => Self::Cockpit,
+        }
+    }
+
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Cockpit => "cockpit",
+            Self::Calm => "calm",
         }
     }
 }
