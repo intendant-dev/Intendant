@@ -11010,10 +11010,10 @@ function stationActivityEvents() {
   const seen = new Set();
   const add = event => {
     if (!event) return;
-    const id = String(event.id || '').trim() || `${event.hostId || selfPeerId}:${event.ts || ''}:${event.msg || ''}`;
+    const id = stationActivityEventKey(event);
     if (seen.has(id)) return;
     seen.add(id);
-    events.push(event);
+    events.push(event.id ? event : { ...event, id });
   };
   for (const event of stationDomLogEvents()) add(event);
   for (const event of stationSessionWindowHistoryEvents()) add(event);
@@ -12769,6 +12769,11 @@ function stationActivitySourceFor(ev) {
   return compactSessionText(ev?.source || ev?.event || ev?.level || 'info') || 'info';
 }
 
+function stationActivityEventKey(ev) {
+  return String(ev?.id || '').trim() ||
+    `${ev?.hostId || ev?.host_id || selfPeerId || 'local'}:${ev?.ts || ''}:${ev?.msg || ''}`;
+}
+
 function stationActivityCountOptions(events, accessor, allLabel) {
   const counts = new Map();
   for (const ev of events || []) {
@@ -12869,6 +12874,52 @@ function stationOpenManagedFromActivity(ev) {
   stationRenderManagedDock(/\b(backout|record)\b/i.test(ev?.msg || ev?.source || '') ? 'backout' : '');
 }
 
+async function stationCopyActivityEventJson(ev) {
+  if (!ev) return;
+  const payload = {
+    ...ev,
+    id: stationActivityEventKey(ev),
+    source: stationActivitySourceFor(ev),
+    level: stationActivityLevelFor(ev),
+    copy_text: stationActivityEventCopyText(ev),
+  };
+  await copyTextToClipboard(JSON.stringify(payload, null, 2));
+  showControlToast?.('success', 'Copied Station activity event JSON');
+}
+
+function stationRenderActivityDetailSection(parent, events, focusId = '') {
+  const id = String(focusId || '').trim();
+  if (!id) return;
+  const ev = (events || []).find(row => stationActivityEventKey(row) === id);
+  const section = stationDockSection(parent, 'Pinned event');
+  if (!ev) {
+    stationDockEmpty(section, 'Pinned event is no longer in the retained Station activity buffer.');
+    stationDockActions(section, [
+      { label: 'Clear pin', onClick: () => stationRenderActivityDock() },
+    ]);
+    return;
+  }
+  const eventId = stationActivityEventKey(ev);
+  stationDockRow(section, 'id', eventId);
+  stationDockRow(section, 'time', ev.ts || '--');
+  stationDockRow(section, 'level', stationActivityLevelFor(ev));
+  stationDockRow(section, 'source', stationActivitySourceFor(ev));
+  stationDockRow(section, 'host', ev.hostId || ev.host_id || selfPeerId || 'local');
+  stationDockRow(section, 'session', ev.sessionId || '--');
+  const text = stationActivityEventCopyText(ev) || ev.msg || '';
+  const fullText = stationDockInput(section, 'Text', text, { id: 'station-activity-pinned-text', multiline: true, rows: 5 });
+  fullText.readOnly = true;
+  stationDockActions(section, [
+    { label: 'Show in log', primary: true, onClick: () => focusActivityLogEvent(eventId) },
+    ev.sessionId ? { label: 'Session', onClick: () => stationRenderSessionsDock(ev.sessionId) } : null,
+    stationActivityEventIsManaged(ev) ? { label: 'Managed', onClick: () => stationOpenManagedFromActivity(ev) } : null,
+    ev.editable ? { label: ev.historical ? 'Branch' : 'Edit', onClick: () => stationEditActivityEvent(eventId) } : null,
+    { label: 'Copy text', onClick: () => copyTextToClipboard(text) },
+    { label: 'Copy JSON', onClick: () => stationCopyActivityEventJson(ev) },
+    { label: 'Clear pin', onClick: () => stationRenderActivityDock() },
+  ]);
+}
+
 function stationRenderActivityDock(focusId = '') {
   const allEvents = stationLastSnapshotForFallback().events || [];
   const hostFilter = String(stationActivityDockHost || activeHostFilter || '').trim();
@@ -12925,25 +12976,27 @@ function stationRenderActivityDock(focusId = '') {
   stationDockRow(triage, 'levels', stationActivityTopSummary(events, stationActivityLevelFor));
   stationDockRow(triage, 'sources', stationActivityTopSummary(events, stationActivitySourceFor));
   stationDockRow(triage, 'host', hostFilter || 'all');
+  stationRenderActivityDetailSection(body, events, focusId);
   const list = stationDockSection(body, 'Recent events');
   if (!events.length) {
     stationDockEmpty(list, allEvents.length ? 'No events match the Station filters.' : 'Waiting for dashboard events.');
     return;
   }
   for (const ev of events.slice(-14).reverse()) {
+    const eventId = stationActivityEventKey(ev);
     stationDockCard(list, {
       title: `${ev.ts || '--'}  ${ev.level || 'info'}`,
       meta: [ev.hostId || ev.host_id || selfPeerId || 'local', stationActivitySourceFor(ev), ev.sessionId || ''].filter(Boolean).join(' / '),
       detail: ev.msg || '',
-      active: focusId && ev.id === focusId,
+      active: focusId && eventId === focusId,
       actions: [
-        ev.id ? { label: 'Pin', onClick: () => stationRenderActivityDock(ev.id) } : null,
-        ev.id ? { label: 'Show', primary: true, onClick: () => focusActivityLogEvent(ev.id) } : null,
+        { label: 'Pin', onClick: () => stationRenderActivityDock(eventId) },
+        { label: 'Show', primary: true, onClick: () => focusActivityLogEvent(eventId) },
         ev.sessionId ? { label: 'Session', onClick: () => stationRenderSessionsDock(ev.sessionId) } : null,
         stationActivityEventIsManaged(ev) ? { label: 'Managed', onClick: () => stationOpenManagedFromActivity(ev) } : null,
-        ev.editable ? { label: ev.historical ? 'Branch' : 'Edit', onClick: () => stationEditActivityEvent(ev.id) } : null,
+        ev.editable ? { label: ev.historical ? 'Branch' : 'Edit', onClick: () => stationEditActivityEvent(eventId) } : null,
         { label: 'Copy text', onClick: () => copyTextToClipboard(stationActivityEventCopyText(ev)) },
-        ev.id ? { label: 'Copy id', onClick: () => copyTextToClipboard(ev.id) } : null,
+        { label: 'Copy id', onClick: () => copyTextToClipboard(eventId) },
       ],
     });
   }
