@@ -190,6 +190,8 @@ struct StationInner {
     hovered_id: Option<String>,
     focus_id: Option<String>,
     pointer_down: Option<PointerDrag>,
+    active_pointers: HashMap<i32, Vec2>,
+    pinch_zoom: Option<PinchZoom>,
     drag_slider: Option<SliderKind>,
     ar_x: f32,
     ar_y: f32,
@@ -257,6 +259,8 @@ impl StationInner {
             hovered_id: None,
             focus_id: None,
             pointer_down: None,
+            active_pointers: HashMap::new(),
+            pinch_zoom: None,
             drag_slider: None,
             ar_x: 0.0,
             ar_y: 0.0,
@@ -275,23 +279,35 @@ impl StationInner {
     }
 
     fn install_events(inner: Rc<RefCell<Self>>) -> Result<(), JsValue> {
-        let target: web_sys::EventTarget = inner.borrow().hud_canvas.clone().into();
+        let target_canvas = inner.borrow().hud_canvas.clone();
+        let target: web_sys::EventTarget = target_canvas.clone().into();
         let window = web_sys::window().ok_or_else(|| JsValue::from_str("window unavailable"))?;
 
         let down_inner = inner.clone();
+        let down_canvas = target_canvas.clone();
         let down = Closure::wrap(Box::new(move |event: Event| {
             let Some(e) = event.dyn_ref::<PointerEvent>() else {
                 return;
             };
             e.prevent_default();
+            let _ = down_canvas.set_pointer_capture(e.pointer_id());
             let mut s = down_inner.borrow_mut();
             s.mark_input();
             let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+            s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
+            if s.active_pointers.len() >= 2 {
+                s.begin_pinch();
+                s.pointer_down = None;
+                s.drag_slider = None;
+                s.set_cursor("drag");
+                return;
+            }
             if let Some(action) = s.hit_action_at(x, y) {
                 match action {
                     HitAction::Slider(kind) => {
                         s.drag_slider = Some(kind);
                         s.apply_slider_at(kind, x);
+                        s.set_cursor("drag");
                     }
                     _ => {
                         s.pointer_down = Some(PointerDrag {
@@ -302,6 +318,7 @@ impl StationInner {
                             moved: false,
                             pending_action: Some(action),
                         });
+                        s.set_cursor("pointer");
                     }
                 }
                 return;
@@ -314,6 +331,7 @@ impl StationInner {
                 moved: false,
                 pending_action: None,
             });
+            s.set_cursor("drag");
         }) as Box<dyn FnMut(_)>);
         target.add_event_listener_with_callback("pointerdown", down.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(down);
@@ -325,8 +343,18 @@ impl StationInner {
             };
             let mut s = move_inner.borrow_mut();
             let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+            if s.active_pointers.contains_key(&e.pointer_id()) {
+                s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
+            }
+            if s.active_pointers.len() >= 2 {
+                s.apply_pinch();
+                s.mark_input();
+                s.set_cursor("drag");
+                return;
+            }
             if let Some(kind) = s.drag_slider {
                 s.apply_slider_at(kind, x);
+                s.set_cursor("drag");
                 return;
             }
             if let Some(drag) = s.pointer_down.as_mut() {
@@ -346,22 +374,34 @@ impl StationInner {
                 s.yaw -= dx * 0.006;
                 s.pitch = (s.pitch + dy * 0.005).clamp(-1.05, 1.05);
                 s.mark_input();
+                s.set_cursor("drag");
             } else {
                 s.hovered_id = s.pick_node(x, y);
+                if s.hit_action_at(x, y).is_some() || s.hovered_id.is_some() {
+                    s.set_cursor("pointer");
+                } else {
+                    s.set_cursor("grab");
+                }
             }
         }) as Box<dyn FnMut(_)>);
         target.add_event_listener_with_callback("pointermove", mv.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(mv);
 
         let up_inner = inner.clone();
+        let up_canvas = target_canvas.clone();
         let up = Closure::wrap(Box::new(move |event: Event| {
             let Some(e) = event.dyn_ref::<PointerEvent>() else {
                 return;
             };
             e.prevent_default();
+            let _ = up_canvas.release_pointer_capture(e.pointer_id());
             let outbound = {
                 let mut s = up_inner.borrow_mut();
                 let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+                s.active_pointers.remove(&e.pointer_id());
+                if s.active_pointers.len() < 2 {
+                    s.pinch_zoom = None;
+                }
                 if s.drag_slider.take().is_some() {
                     None
                 } else if let Some(drag) = s.pointer_down.take() {
@@ -383,6 +423,7 @@ impl StationInner {
                     None
                 }
             };
+            up_inner.borrow_mut().set_cursor("grab");
             if let Some(action) = outbound {
                 let callback = up_inner.borrow().action_callback.clone();
                 StationInner::emit_action(callback, action);
@@ -4454,6 +4495,46 @@ impl StationInner {
         self.last_render_ms = 0.0;
     }
 
+    fn first_two_pointer_positions(&self) -> Option<(Vec2, Vec2)> {
+        let mut iter = self.active_pointers.values().copied();
+        Some((iter.next()?, iter.next()?))
+    }
+
+    fn begin_pinch(&mut self) {
+        let Some((a, b)) = self.first_two_pointer_positions() else {
+            return;
+        };
+        let dist = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
+        self.pinch_zoom = Some(PinchZoom {
+            start_distance: dist,
+            start_camera_distance: self.distance,
+        });
+    }
+
+    fn apply_pinch(&mut self) {
+        let Some((a, b)) = self.first_two_pointer_positions() else {
+            return;
+        };
+        if self.pinch_zoom.is_none() {
+            self.begin_pinch();
+        }
+        let Some(pinch) = self.pinch_zoom else {
+            return;
+        };
+        let dist = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
+        let scale = (pinch.start_distance / dist).clamp(0.25, 4.0);
+        self.distance = (pinch.start_camera_distance * scale).clamp(4.2, 25.0);
+        self.last_render_ms = 0.0;
+    }
+
+    fn set_cursor(&self, cursor: &str) {
+        if cursor == "grab" {
+            let _ = self.hud_canvas.remove_attribute("data-station-cursor");
+        } else {
+            let _ = self.hud_canvas.set_attribute("data-station-cursor", cursor);
+        }
+    }
+
     fn hit_action_at(&self, x: f32, y: f32) -> Option<HitAction> {
         self.hit_zones
             .iter()
@@ -5546,6 +5627,12 @@ struct PointerDrag {
     last_y: f32,
     moved: bool,
     pending_action: Option<HitAction>,
+}
+
+#[derive(Clone, Copy)]
+struct PinchZoom {
+    start_distance: f32,
+    start_camera_distance: f32,
 }
 
 struct Particle {

@@ -346,6 +346,13 @@ html, body {
 #station-hud-canvas {
   z-index: 2;
   pointer-events: auto;
+  cursor: grab;
+}
+#station-hud-canvas[data-station-cursor="drag"] {
+  cursor: grabbing;
+}
+#station-hud-canvas[data-station-cursor="pointer"] {
+  cursor: pointer;
 }
 .station-hotspots {
   position: absolute;
