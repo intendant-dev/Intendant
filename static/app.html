@@ -10433,8 +10433,46 @@ function stationStatus(text) {
   if (el) el.textContent = text;
 }
 
+function stationWebgpuRequested() {
+  return window.location.href.includes('station_gpu=webgpu');
+}
+
 function stationShouldUseWebgpu() {
-  return window.location.href.includes('station_gpu=webgpu') && !stationWebgpuUnavailable;
+  return stationWebgpuRequested() && !stationWebgpuUnavailable;
+}
+
+function stationWebgpuStatusLabel() {
+  if (!stationWebgpuRequested()) return 'off';
+  if (stationWebgpuUnavailable) return 'unavailable';
+  const state = station?.debug_state?.() || '';
+  if (state.includes('gpu=true')) return 'active';
+  if (state.includes('gpu=false')) return 'unavailable';
+  return 'requested';
+}
+
+function stationRendererLabel() {
+  if (station) {
+    const state = station.debug_state?.() || '';
+    if (state.includes('gpu=true')) return 'WebGPU';
+    if (state.includes('gpu=false')) return 'Canvas';
+    return state || 'Canvas';
+  }
+  if (stationDomFallback) {
+    return stationWebgpuUnavailable ? 'DOM fallback (WebGPU unavailable)' : 'DOM fallback';
+  }
+  return 'Canvas';
+}
+
+function stationRendererStateLabel() {
+  return station?.debug_state?.()
+    || (stationDomFallback ? 'dom-fallback' : 'not initialized');
+}
+
+function stationViewDockSubtitle() {
+  if (stationDomFallback) {
+    return stationWebgpuUnavailable ? 'WebGPU unavailable / DOM fallback controls' : 'DOM fallback controls';
+  }
+  return stationShouldUseWebgpu() ? 'WebGPU visual controls' : 'Canvas visual controls';
 }
 
 function stationSetFallbackClass(enabled) {
@@ -10443,7 +10481,7 @@ function stationSetFallbackClass(enabled) {
 }
 
 function stationFallbackFromUnavailableWebgpu(instance) {
-  if (!instance || instance !== station || !window.location.href.includes('station_gpu=webgpu')) return;
+  if (!instance || instance !== station || !stationWebgpuRequested()) return;
   const state = instance.debug_state?.() || '';
   if (!state.includes('gpu=false')) return;
   stationWebgpuUnavailable = true;
@@ -10580,7 +10618,7 @@ function stationUpdateSnapshot() {
     const snapshot = buildStationSnapshot();
     stationLastFallbackSnapshot = snapshot;
     if (stationDomFallback && !station) {
-      stationStatus(`station hosts=${snapshot.hosts.length} agents=${snapshot.agents.length} events=${snapshot.events.length} displays=${displaySlots.size + peerDisplayConnections.size} gpu=false`);
+      stationStatus(`station hosts=${snapshot.hosts.length} agents=${snapshot.agents.length} events=${snapshot.events.length} displays=${displaySlots.size + peerDisplayConnections.size} renderer=${stationRendererLabel()} webgpu=${stationWebgpuStatusLabel()}`);
       stationSyncHotspots();
       return;
     }
@@ -11504,12 +11542,13 @@ function stationRenderViewDock() {
   const body = stationDockBegin(
     'view',
     'Station View',
-    stationDomFallback ? 'DOM fallback controls' : (stationShouldUseWebgpu() ? 'WebGPU visual controls' : 'Canvas visual controls')
+    stationViewDockSubtitle()
   );
   if (!body) return;
   const layout = stationDockSection(body, 'Scene');
-  stationDockRow(layout, 'renderer', stationDomFallback ? 'DOM fallback' : (station?.debug_state?.() || 'canvas'));
-  stationDockRow(layout, 'webgpu', stationShouldUseWebgpu() ? (stationWebgpuUnavailable ? 'unavailable' : 'requested') : 'off');
+  stationDockRow(layout, 'renderer', stationRendererLabel());
+  stationDockRow(layout, 'engine', stationRendererStateLabel());
+  stationDockRow(layout, 'webgpu', stationWebgpuStatusLabel());
   stationDockRow(layout, 'profile', stationViewProfileLabel());
   stationDockRow(layout, 'persisted', localStorage.getItem(STATION_VIEW_KEY) ? 'yes' : 'defaults');
   stationDockActions(layout, [
@@ -12058,11 +12097,16 @@ function stationRenderPeersDock() {
     remote.appendChild(remoteGrid);
     for (const conn of peerDisplayConnections.values()) {
       const authority = conn.peerAuthorityState || 'unknown';
+      const status = conn.displayStatusText || 'Connecting...';
+      const detail = [
+        conn.sessionId || '',
+        conn.advertiseTcpViaUrl ? `via ${conn.advertiseTcpViaUrl}` : '',
+      ].filter(Boolean).join(' / ');
       stationDockCard(remoteGrid, {
         className: 'station-peer-card',
         title: stationHostLabel(conn.hostId),
-        meta: `display ${conn.displayId} / input ${authority}`,
-        detail: conn.sessionId || '',
+        meta: `display ${conn.displayId} / ${status} / input ${authority}`,
+        detail,
         actions: [
           { label: 'Focus', onClick: () => { stationSetPeerTarget(conn.hostId, conn.displayId); stationOpenDisplay(conn.hostId, conn.displayId); } },
           authority === 'you'
@@ -16299,25 +16343,51 @@ function stationHostLabel(hostId) {
   return d && (d.label || d.host_id) || hostId;
 }
 
-function stationPeerDisplayContainer(hostId, createFallback) {
+function stationPeerDisplayContainer(hostId, createFallback, preferFallback = false) {
   const id = `peer-display-${hostId}`;
-  const existing = document.getElementById(id);
   const fallbackId = `station-peer-display-${hostId}`;
+  let fallback = document.getElementById(fallbackId);
+  const ensureFallback = () => {
+    if (!fallback && createFallback) {
+      const root = document.getElementById('station-display-endpoints') || document.body;
+      fallback = document.createElement('div');
+      fallback.id = fallbackId;
+      fallback.className = 'peer-display-container station-peer-display-endpoint';
+      fallback.style.cssText = 'position:absolute;left:-10000px;top:-10000px;width:320px;height:180px;opacity:0;pointer-events:none;overflow:hidden;';
+      root.appendChild(fallback);
+    }
+    return fallback;
+  };
+  if (preferFallback) return ensureFallback();
+  const existing = document.getElementById(id);
   if (existing) {
-    const fallback = document.getElementById(fallbackId);
-    if (fallback) fallback.remove();
+    if (fallback && !stationPeerDisplayPrefersStationEndpoint()) fallback.remove();
     return existing;
   }
-  let fallback = document.getElementById(fallbackId);
-  if (!fallback && createFallback) {
-    const root = document.getElementById('station-display-endpoints') || document.body;
-    fallback = document.createElement('div');
-    fallback.id = fallbackId;
-    fallback.className = 'peer-display-container station-peer-display-endpoint';
-    fallback.style.cssText = 'position:absolute;left:-10000px;top:-10000px;width:320px;height:180px;opacity:0;pointer-events:none;overflow:hidden;';
-    root.appendChild(fallback);
+  return ensureFallback();
+}
+
+function stationPeerDisplayPrefersStationEndpoint() {
+  const stationPaneActive = activeTab === 'station'
+    || document.getElementById('tab-station')?.classList.contains('active');
+  const dock = document.getElementById('station-dock');
+  const peersDockOpen = dock
+    && !dock.classList.contains('hidden')
+    && dock.dataset.kind === 'peers';
+  return !!(stationPaneActive || peersDockOpen);
+}
+
+function stationPeerDisplayContainersForHost(hostId) {
+  const containers = [];
+  const seen = new Set();
+  for (const id of [`peer-display-${hostId}`, `station-peer-display-${hostId}`]) {
+    const el = document.getElementById(id);
+    if (el && !seen.has(el)) {
+      seen.add(el);
+      containers.push(el);
+    }
   }
-  return fallback;
+  return containers;
 }
 
 // Activity display strip
@@ -35853,6 +35923,8 @@ class PeerDisplayConnection {
     // videoHeight report real numbers) and torn down by `close()`
     // alongside the rest of the per-connection state.
     this._diagSampler = null;
+    this.displayStatusText = 'Connecting...';
+    this.displayStatusKind = '';
   }
 
   sessionKey() {
@@ -35869,15 +35941,17 @@ class PeerDisplayConnection {
   // `peerAuthorityState`, not the default 'unknown' — so this
   // function calls `_renderAuthorityChip()` after binding handlers.
   attachToDom() {
-    const container = document.getElementById(`peer-display-${this.hostId}`)
-      || stationPeerDisplayContainer(this.hostId, activeTab === 'station');
+    const preferStationEndpoint = stationPeerDisplayPrefersStationEndpoint();
+    const container = (preferStationEndpoint && stationPeerDisplayContainer(this.hostId, true, true))
+      || document.getElementById(`peer-display-${this.hostId}`)
+      || stationPeerDisplayContainer(this.hostId, preferStationEndpoint);
     if (!container) return;
     if (!container.querySelector('.peer-display-pane')) {
       container.innerHTML = `
         <div class="peer-display-pane" data-host-id="${escapeHtml(this.hostId)}">
           <video class="peer-display-video" autoplay playsinline muted></video>
           <div class="peer-display-controls">
-            <span class="peer-display-status">Connecting…</span>
+            <span class="peer-display-status">${escapeHtml(this.displayStatusText)}</span>
             <span class="peer-display-authority display-input-authority"
                   data-host-id="${escapeHtml(this.hostId)}"
                   style="display:none"
@@ -35950,12 +36024,13 @@ class PeerDisplayConnection {
   }
 
   setStatus(text, kind) {
-    const container = document.getElementById(`peer-display-${this.hostId}`);
-    if (container) {
+    this.displayStatusText = text || '';
+    this.displayStatusKind = kind || '';
+    for (const container of stationPeerDisplayContainersForHost(this.hostId)) {
       const statusEl = container.querySelector('.peer-display-status');
       if (statusEl) {
-        statusEl.textContent = text;
-        statusEl.className = `peer-display-status ${kind || ''}`;
+        statusEl.textContent = this.displayStatusText;
+        statusEl.className = `peer-display-status ${this.displayStatusKind}`;
       }
     }
     stationRefreshPeersDockIfOpen();
@@ -36188,8 +36263,10 @@ class PeerDisplayConnection {
 
     this.pc.ontrack = (e) => {
       this.stream = e.streams[0];
-      const container = document.getElementById(`peer-display-${this.hostId}`)
-        || stationPeerDisplayContainer(this.hostId, activeTab === 'station');
+      const preferStationEndpoint = stationPeerDisplayPrefersStationEndpoint();
+      const container = (preferStationEndpoint && stationPeerDisplayContainer(this.hostId, true, true))
+        || document.getElementById(`peer-display-${this.hostId}`)
+        || stationPeerDisplayContainer(this.hostId, preferStationEndpoint);
       const videoEl = container && container.querySelector('.peer-display-video');
       if (videoEl) videoEl.srcObject = this.stream;
       if (videoEl) {
@@ -36932,9 +37009,7 @@ async function closePeerDisplaysForHost(hostId) {
     }
   }
   await Promise.all(closes);
-  const container = document.getElementById(`peer-display-${hostId}`)
-    || document.getElementById(`station-peer-display-${hostId}`);
-  if (container) {
+  for (const container of stationPeerDisplayContainersForHost(hostId)) {
     container.innerHTML = '';
     container.style.display = 'none';
   }
