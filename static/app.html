@@ -14068,10 +14068,11 @@ function stationSessionActionsForDock(sessionOrId, opts = {}) {
   return actions;
 }
 
-function stationRenderCodexThreadActionsSection(parent, sessionId) {
+function stationRenderCodexThreadActionsSection(parent, sessionId, sessionOrMeta = null) {
   const sid = String(sessionId || '').trim();
-  if (!sid || !sessionWindowIsCodex(sid)) return;
-  const meta = sessionConfigMetadata(sid);
+  if (!sid) return;
+  const meta = sessionConfigMetadata(sessionOrMeta || sid);
+  if (!sessionWindowIsCodex(sid) && sessionConfigSource(meta) !== 'codex') return;
   const goal = normalizeSessionGoal(meta.goal || meta.session_goal || meta.sessionGoal || null);
   const capabilities = stationSessionCapabilities(sid) || meta.capabilities || {};
   const serviceTier = normalizeCodexServiceTier(
@@ -14141,6 +14142,14 @@ function stationExternalLiveThreadDescriptor(sessionOrId) {
     || {};
   const liveWin = liveId ? sessionWindows.get(liveId) : null;
   const liveMeta = liveId ? (sessionMetadataById.get(liveId) || {}) : {};
+  const actionIds = Array.from(new Set([
+    liveId,
+    backendId,
+    sid,
+    wrapperId,
+    ...ids,
+  ].map(id => String(id || '').trim()).filter(Boolean)));
+  const actionId = actionIds.find(id => sessionWindowIsCodex(id)) || '';
   return {
     sid,
     source,
@@ -14148,6 +14157,7 @@ function stationExternalLiveThreadDescriptor(sessionOrId) {
     backendId,
     wrapperId,
     liveId,
+    actionId,
     target,
     attachId,
     stopId,
@@ -14163,12 +14173,13 @@ function stationExternalLiveThreadDescriptor(sessionOrId) {
 
 function stationRenderExternalLiveThreadSection(parent, sessionOrId) {
   const live = stationExternalLiveThreadDescriptor(sessionOrId);
-  if (!live) return;
+  if (!live) return null;
   const section = stationDockSection(parent, 'External live thread');
   stationDockRow(section, 'backend', prettyAgentName(live.source) || live.source);
   stationDockRow(section, 'thread', shortSessionId(live.canonicalId));
   if (live.wrapperId) stationDockRow(section, 'wrapper', shortSessionId(live.wrapperId));
   stationDockRow(section, 'window', live.liveId ? shortSessionId(live.liveId) : 'not attached');
+  stationDockRow(section, 'actions', live.actionId ? shortSessionId(live.actionId) : '--');
   stationDockRow(section, 'phase', live.phase || 'idle');
   stationDockRow(section, 'target', live.target ? 'prompt target' : '--');
   stationDockRow(section, 'detached', live.detached ? 'yes' : 'no');
@@ -14188,6 +14199,28 @@ function stationRenderExternalLiveThreadSection(parent, sessionOrId) {
     live.stopId ? { label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: live.stopId }) } : null,
     { label: 'Copy thread', onClick: () => copyTextToClipboard(live.canonicalId) },
   ]);
+  return live;
+}
+
+function stationCodexThreadActionSessionId(sessionOrId, live = null) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  const descriptor = live || stationExternalLiveThreadDescriptor(session || sid);
+  const meta = sessionConfigMetadata(session || sid);
+  const candidates = Array.from(new Set([
+    descriptor?.actionId,
+    descriptor?.liveId,
+    descriptor?.backendId,
+    descriptor?.canonicalId,
+    sid,
+    descriptor?.wrapperId,
+    meta.backendSessionId,
+    meta.backend_session_id,
+    meta.intendantSessionId,
+    meta.intendant_session_id,
+    ...relatedSessionIdsForSession(sid),
+  ].map(id => String(id || '').trim()).filter(Boolean)));
+  return candidates.find(id => stationSessionLooksCodex(id)) || (stationSessionLooksCodex(session || sid) ? sid : '');
 }
 
 function stationSessionConfigEditingFor(sessionOrId) {
@@ -14377,9 +14410,9 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockRow(section, 'status', session?.status || meta.phase || '--');
   stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
-  stationRenderExternalLiveThreadSection(parent, session);
+  const live = stationRenderExternalLiveThreadSection(parent, session);
   stationRenderSessionConfigSection(parent, session);
-  stationRenderCodexThreadActionsSection(parent, sid);
+  stationRenderCodexThreadActionsSection(parent, stationCodexThreadActionSessionId(session, live) || sid, session);
 }
 
 function stationSessionDockSourceOptions() {
@@ -16502,6 +16535,14 @@ function stationSessionShortLabel(sessionId) {
 function stationSessionCapabilities(sessionId) {
   if (!sessionId || typeof getSessionCapabilities !== 'function') return null;
   return getSessionCapabilities(sessionId);
+}
+
+function stationSessionLooksCodex(sessionOrId) {
+  const sid = typeof sessionOrId === 'object'
+    ? stationSessionId(sessionOrId)
+    : String(sessionOrId || '').trim();
+  if (sid && sessionWindowIsCodex(sid)) return true;
+  return sessionConfigSource(sessionConfigMetadata(sessionOrId || sid)) === 'codex';
 }
 
 function buildStationSnapshot() {
