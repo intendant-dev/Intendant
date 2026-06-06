@@ -486,6 +486,66 @@ html, body {
   color: var(--text);
   font-weight: 700;
 }
+.station-command {
+  grid-column: 1 / -1;
+  display: grid;
+  gap: 6px;
+}
+.station-command input {
+  width: 100%;
+  min-width: 0;
+  height: 28px;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: rgba(17, 17, 27, 0.84);
+  color: var(--text);
+  font-size: 12px;
+  padding: 0 9px;
+}
+.station-command input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.station-command-results {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  gap: 6px;
+}
+.station-command-results[hidden] {
+  display: none;
+}
+.station-command-result {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 5px;
+  background: rgba(24, 24, 37, 0.86);
+  color: var(--subtext0);
+  font-size: 11px;
+  text-align: left;
+  cursor: pointer;
+  padding: 6px 7px;
+}
+.station-command-result strong {
+  display: block;
+  color: var(--text);
+  font-size: 11px;
+  font-weight: 700;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.station-command-result span {
+  display: block;
+  margin-top: 2px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.station-command-result:hover,
+.station-command-result:focus {
+  border-color: var(--blue);
+  color: var(--text);
+}
 .station-dock-close {
   width: 26px;
   height: 26px;
@@ -8192,6 +8252,10 @@ body.display-fullscreen-open {
               <button type="button" data-station-dock-nav="system:controls">Controls</button>
               <button type="button" data-station-dock-nav="system:view">View</button>
             </nav>
+            <div class="station-command">
+              <input id="station-command-input" type="search" autocomplete="off" spellcheck="false" placeholder="Find Station command...">
+              <div id="station-command-results" class="station-command-results" hidden></div>
+            </div>
           </div>
           <div id="station-dock-body" class="station-dock-body"></div>
         </aside>
@@ -10734,6 +10798,7 @@ let stationSessionDeepDraft = {
 let stationWorktreeDockFilter = '';
 let stationActivityDockFilter = '';
 let stationActivityDockHost = activeHostFilter || '';
+let stationCommandQuery = '';
 let stationHumanDraft = '';
 let stationSelectedContextPart = '';
 let stationSelectedChangePath = '';
@@ -10883,6 +10948,145 @@ const STATION_HUD_GEOMETRY = Object.freeze({
   bottomInset: 14,
 });
 
+function stationCurrentDockKind() {
+  return document.getElementById('station-dock')?.dataset.kind || stationDockState.kind || 'controls';
+}
+
+function stationCommandEntries() {
+  const surfaceEntries = STATION_SYSTEM_TARGETS.map(([target, label]) => ({
+    label,
+    detail: `Open ${label} panel`,
+    tokens: `${label} panel surface dock station ${target}`,
+    run: () => stationHandleHotspot(target),
+  }));
+  return [
+    ...surfaceEntries,
+    {
+      label: 'Refresh Station',
+      detail: 'Reload shared state and redraw current panel',
+      tokens: 'refresh reload sync caches state',
+      run: () => {
+        stationRefreshSharedCaches();
+        stationHandleHotspot(stationDockSystemTarget(stationCurrentDockKind()) || 'system:controls');
+      },
+    },
+    {
+      label: 'New session',
+      detail: 'Open the Station launch form',
+      tokens: 'new session launch start task',
+      run: () => {
+        stationHandleHotspot('system:sessions');
+        setTimeout(() => document.getElementById('station-launch-task')?.focus(), 0);
+      },
+    },
+    {
+      label: userDisplayGranted ? 'Revoke local display' : 'Share local display',
+      detail: 'Toggle local display access',
+      tokens: 'display share revoke local screen stream',
+      run: () => {
+        window.toggleUserDisplay?.();
+        stationHandleHotspot('system:peers');
+      },
+    },
+    {
+      label: 'Open peer display',
+      detail: 'Select a peer and display id',
+      tokens: 'peer remote display webrtc view stream',
+      run: () => {
+        stationHandleHotspot('system:peers');
+        setTimeout(() => document.getElementById('station-peer-display-id')?.focus(), 0);
+      },
+    },
+    {
+      label: 'Managed rewind',
+      detail: 'Prepare managed-context rewind',
+      tokens: 'managed context rewind anchor primer',
+      run: () => stationRenderManagedDock('rewind'),
+    },
+    {
+      label: 'Managed backout',
+      detail: 'Inspect or restore a rewind record',
+      tokens: 'managed context backout restore record fork',
+      run: () => stationRenderManagedDock('backout'),
+    },
+    {
+      label: 'Search sessions',
+      detail: 'Focus Station session filter',
+      tokens: 'sessions search filter resume config',
+      run: () => {
+        stationHandleHotspot('system:sessions');
+        setTimeout(() => document.getElementById('station-session-search')?.focus(), 0);
+      },
+    },
+    {
+      label: 'Operator controls',
+      detail: 'Input, approvals, backends, voice, browser',
+      tokens: 'controls approvals backend codex gemini voice browser input',
+      run: () => stationHandleHotspot('system:controls'),
+    },
+  ];
+}
+
+function stationCommandMatches(entry, query) {
+  if (!query) return true;
+  return [entry.label, entry.detail, entry.tokens]
+    .join(' ')
+    .toLowerCase()
+    .includes(query);
+}
+
+function stationCommandFilteredEntries() {
+  const query = stationCommandQuery.trim().toLowerCase();
+  const entries = stationCommandEntries().filter(entry => stationCommandMatches(entry, query));
+  return (query ? entries : entries.slice(0, 6)).slice(0, 8);
+}
+
+function stationRunCommand(entry) {
+  const input = document.getElementById('station-command-input');
+  stationCommandQuery = '';
+  if (input) input.value = '';
+  stationRenderCommandResults();
+  entry?.run?.();
+}
+
+function stationRenderCommandResults() {
+  const input = document.getElementById('station-command-input');
+  const results = document.getElementById('station-command-results');
+  if (!input || !results) return;
+  if (!stationCommandQuery.trim() && document.activeElement !== input) {
+    results.hidden = true;
+    results.innerHTML = '';
+    return;
+  }
+  const entries = stationCommandFilteredEntries();
+  results.hidden = entries.length === 0;
+  results.innerHTML = '';
+  for (const entry of entries) {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'station-command-result';
+    const title = document.createElement('strong');
+    title.textContent = entry.label;
+    const detail = document.createElement('span');
+    detail.textContent = entry.detail || '';
+    btn.appendChild(title);
+    btn.appendChild(detail);
+    btn.addEventListener('click', ev => {
+      ev.preventDefault();
+      ev.stopPropagation();
+      stationRunCommand(entry);
+    });
+    results.appendChild(btn);
+  }
+  if (!entries.length && stationCommandQuery.trim()) {
+    results.hidden = false;
+    const empty = document.createElement('div');
+    empty.className = 'station-dock-empty';
+    empty.textContent = 'No Station command matches.';
+    results.appendChild(empty);
+  }
+}
+
 function stationDockBegin(kind, title, subtitle = '') {
   const dock = document.getElementById('station-dock');
   const titleEl = document.getElementById('station-dock-title');
@@ -10900,6 +11104,7 @@ function stationDockBegin(kind, title, subtitle = '') {
   if (subtitleEl) subtitleEl.textContent = subtitle || '';
   body.innerHTML = '';
   stationSyncDockNav(kind);
+  stationRenderCommandResults();
   return body;
 }
 
@@ -10952,6 +11157,32 @@ document.getElementById('station-dock-nav')?.addEventListener('click', ev => {
   ev.preventDefault();
   ev.stopPropagation();
   stationHandleHotspot(button.dataset.stationDockNav);
+});
+
+document.getElementById('station-command-input')?.addEventListener('input', ev => {
+  stationCommandQuery = ev.target.value || '';
+  stationRenderCommandResults();
+});
+
+document.getElementById('station-command-input')?.addEventListener('focus', stationRenderCommandResults);
+
+document.getElementById('station-command-input')?.addEventListener('blur', () => {
+  setTimeout(stationRenderCommandResults, 120);
+});
+
+document.getElementById('station-command-input')?.addEventListener('keydown', ev => {
+  if (ev.key === 'Escape') {
+    ev.preventDefault();
+    stationCommandQuery = '';
+    ev.target.value = '';
+    stationRenderCommandResults();
+    return;
+  }
+  if (ev.key !== 'Enter') return;
+  const first = stationCommandFilteredEntries()[0];
+  if (!first) return;
+  ev.preventDefault();
+  stationRunCommand(first);
 });
 
 function stationHudRect() {
