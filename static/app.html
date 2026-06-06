@@ -10863,6 +10863,9 @@ let stationPeerStatus = '';
 let stationPeerStatusKind = '';
 let stationPeerEligibleRows = [];
 let stationPeerRouteResult = null;
+let stationLocalDisplays = [];
+let stationLocalDisplaysLoading = false;
+let stationLocalDisplayStatus = '';
 let stationPeerDraft = {
   url: '',
   label: '',
@@ -11557,6 +11560,69 @@ function stationSetPeerStatus(message = '', kind = '') {
   }
 }
 
+function stationLocalDisplayRows() {
+  const rows = Array.isArray(cachedDisplays) && cachedDisplays.length
+    ? cachedDisplays
+    : stationLocalDisplays;
+  return Array.isArray(rows) ? rows : [];
+}
+
+function stationLocalDisplayLabel(display) {
+  const id = Number(display?.id ?? 0);
+  const name = display?.name || displayLabel(id);
+  const size = display?.width && display?.height ? `${display.width}x${display.height}` : '';
+  return [name, size].filter(Boolean).join(' ');
+}
+
+async function stationLoadLocalDisplaysForDock(force = false) {
+  if (stationLocalDisplaysLoading) return;
+  if (!force && stationLocalDisplayRows().length) {
+    stationRenderPeersDock();
+    return;
+  }
+  stationLocalDisplaysLoading = true;
+  stationLocalDisplayStatus = 'Listing local displays...';
+  stationRenderPeersDock();
+  try {
+    const resp = await authedFetch('/api/displays');
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    stationLocalDisplays = Array.isArray(data.displays) ? data.displays : [];
+    cachedDisplays = stationLocalDisplays;
+    stationLocalDisplayStatus = stationLocalDisplays.length
+      ? `Found ${stationLocalDisplays.length} local display${stationLocalDisplays.length === 1 ? '' : 's'}`
+      : 'No local displays reported';
+  } catch (err) {
+    stationLocalDisplayStatus = `Display list failed: ${err?.message || err}`;
+  } finally {
+    stationLocalDisplaysLoading = false;
+    stationRenderPeersDock();
+  }
+}
+
+function stationGrantLocalDisplayFromDock(displayId) {
+  if (!app) {
+    showControlToast?.('error', 'Dashboard is not connected');
+    return;
+  }
+  const id = Number(displayId);
+  if (!Number.isFinite(id) || id < 0) return;
+  if (userDisplayGranted && Number(grantedDisplayId) === id) {
+    stationLocalDisplayStatus = `${displayLabel(id)} is already shared`;
+    stationRenderPeersDock();
+    return;
+  }
+  if (userDisplayGranted) {
+    removeDisplaySlot(Number(grantedDisplayId));
+    app.revoke_user_display_with_id(grantedDisplayId);
+  }
+  app.grant_user_display_with_id(id);
+  grantedDisplayId = id;
+  setUserDisplayState(true);
+  stationLocalDisplayStatus = `Sharing ${displayLabel(id)}`;
+  stationRenderPeersDock();
+}
+
 function stationPeerDraftValue(key, fallback = '') {
   const value = stationPeerDraft[key];
   return value === undefined || value === null || value === '' ? fallback : value;
@@ -11830,6 +11896,39 @@ function stationRenderPeerAddSection(parent) {
   ]);
 }
 
+function stationRenderLocalDisplayPickerSection(parent) {
+  const section = stationDockSection(parent, 'Available local displays');
+  const rows = stationLocalDisplayRows();
+  stationDockRow(section, 'shared', userDisplayGranted ? displayLabel(grantedDisplayId) : 'off');
+  if (stationLocalDisplayStatus) stationDockEmpty(section, stationLocalDisplayStatus);
+  stationDockActions(section, [
+    { label: stationLocalDisplaysLoading ? 'Listing...' : 'List displays', primary: !rows.length, disabled: stationLocalDisplaysLoading, onClick: () => stationLoadLocalDisplaysForDock(false) },
+    { label: 'Refresh list', disabled: stationLocalDisplaysLoading, onClick: () => stationLoadLocalDisplaysForDock(true) },
+    userDisplayGranted ? { label: 'Revoke shared', danger: true, onClick: () => { window.toggleUserDisplay?.(); stationLocalDisplayStatus = 'Local display revoked'; stationRenderPeersDock(); } } : null,
+  ]);
+  if (!rows.length) {
+    stationDockEmpty(section, 'List displays to choose a specific local screen from Station.');
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'station-dock-grid station-peer-grid';
+  section.appendChild(grid);
+  for (const display of rows) {
+    const id = Number(display?.id ?? 0);
+    const active = userDisplayGranted && Number(grantedDisplayId) === id;
+    stationDockCard(grid, {
+      className: 'station-peer-card',
+      title: stationLocalDisplayLabel(display),
+      meta: active ? 'shared' : (display?.is_primary ? 'primary' : 'available'),
+      detail: `display ${Number.isFinite(id) ? id : 0}`,
+      active,
+      actions: [
+        { label: active ? 'Shared' : (userDisplayGranted ? 'Switch' : 'Share'), primary: !active, disabled: active, onClick: () => stationGrantLocalDisplayFromDock(id) },
+      ],
+    });
+  }
+}
+
 function stationRenderPeerCoordinatorSection(parent) {
   const section = stationDockSection(parent, 'Coordinator');
   const caps = stationDockInput(section, 'Find caps', stationPeerDraftValue('capabilityFilter', 'display'), { id: 'station-peer-capabilities', placeholder: 'display, computer-use' });
@@ -11991,6 +12090,7 @@ function stationRenderPeersDock() {
     status.textContent = stationPeerStatus;
     overview.appendChild(status);
   }
+  stationRenderLocalDisplayPickerSection(body);
   stationRenderPeerAddSection(body);
   stationRenderPeerCommandSection(body);
   stationRenderPeerCoordinatorSection(body);
