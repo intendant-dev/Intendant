@@ -12632,6 +12632,35 @@ function stationContextExactStatus(snapshot) {
   return 'compact';
 }
 
+function stationContextSnapshotText(snapshot) {
+  if (!snapshot) return '';
+  return contextFullText(snapshot);
+}
+
+function stationContextPartText(part) {
+  if (!part) return '';
+  return contextFullText(part.value ?? part.preview ?? part.text ?? part.title ?? '');
+}
+
+function stationCopyContextSnapshot(snapshot = stationSnapshotForContext()) {
+  const text = stationContextSnapshotText(snapshot);
+  if (!text) return;
+  copyTextToClipboard(text);
+}
+
+function stationCopyContextPart(part) {
+  const text = stationContextPartText(part);
+  if (!text) return;
+  copyTextToClipboard(text);
+}
+
+async function stationLoadExactContextSnapshot(partId = stationSelectedContextPart) {
+  const snapshot = stationSnapshotForContext();
+  if (!snapshot || typeof ensureExactContextSnapshot !== 'function') return;
+  await ensureExactContextSnapshot(snapshot);
+  stationRenderContextDock(partId || stationSelectedContextPart);
+}
+
 function stationSelectedContextPartDetail(partId = stationSelectedContextPart) {
   const id = String(partId || '').trim();
   const snapshot = stationSnapshotForContext();
@@ -12665,8 +12694,9 @@ function stationRenderContextReplaySection(parent) {
     { label: 'Next', disabled: !timeline.length || index >= max, onClick: () => { stationSetContextReplayIndex(index + 1); stationRenderContextDock(''); } },
     { label: 'Latest', primary: true, disabled: !timeline.length, onClick: () => { stationSetContextReplayIndex(max); stationRenderContextDock(''); } },
     { label: 'Live', onClick: () => { stationApplyContextAction('live'); stationRenderContextDock(''); } },
+    { label: 'Copy snapshot', disabled: !snapshot, onClick: () => stationCopyContextSnapshot(snapshot) },
     snapshot && typeof ensureExactContextSnapshot === 'function' && typeof contextSnapshotNeedsExact === 'function' && contextSnapshotNeedsExact(snapshot)
-      ? { label: 'Load exact', onClick: async () => { await ensureExactContextSnapshot(snapshot); stationRenderContextDock(stationSelectedContextPart); } }
+      ? { label: 'Load exact', onClick: async () => stationLoadExactContextSnapshot(stationSelectedContextPart) }
       : null,
   ]);
 }
@@ -12710,7 +12740,11 @@ function stationRenderContextDock(focusId = stationSelectedContextPart) {
       detail: compactSessionText(selectedPart.preview || selectedPart.text || ''),
       actions: [
         { label: 'Refocus', primary: true, onClick: () => { stationApplyContextAction('part', selectedPart.id); stationRenderContextDock(selectedPart.id); } },
+        { label: 'Copy text', onClick: () => stationCopyContextPart(selectedPart) },
         { label: 'Copy id', onClick: () => copyTextToClipboard(selectedPart.id || '') },
+        stationSnapshotForContext() && typeof contextSnapshotNeedsExact === 'function' && contextSnapshotNeedsExact(stationSnapshotForContext())
+          ? { label: 'Load exact', onClick: async () => stationLoadExactContextSnapshot(selectedPart.id) }
+          : null,
       ],
     });
   }
