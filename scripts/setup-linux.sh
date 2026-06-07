@@ -163,6 +163,7 @@ APT_PACKAGES=(
     libgbm1
     libdrm2
     libxkbcommon0
+    libwayland-dev
     libcups2
 
     # AT-SPI accessibility (optional, used by test automation)

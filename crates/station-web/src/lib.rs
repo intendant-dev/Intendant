@@ -1021,6 +1021,10 @@ impl StationInner {
         self.draw_tweaks_panel();
         self.draw_systems_panel();
         self.draw_execution_deck(w, h);
+        self.draw_signal_runway(w, h);
+        self.draw_operations_runway(w, h);
+        self.draw_display_switchboard(w, h);
+        self.draw_activity_detail_rail(w, h);
         self.draw_command_lane(w, h);
         self.draw_attention_strip(w, h);
         self.draw_corners(w, h);
@@ -1985,6 +1989,775 @@ impl StationInner {
             C_SUBTEXT0_CSS,
             "normal",
         );
+    }
+
+    fn draw_signal_runway(&mut self, w: f32, h: f32) {
+        if w < 1040.0 || h < 700.0 || self.selected_id.is_some() {
+            return;
+        }
+        let attention_clear = if !self.attention_items().is_empty() && w >= 900.0 && h >= 520.0 {
+            270.0
+        } else {
+            14.0
+        };
+        let x = 246.0;
+        let y = 206.0;
+        let runway_w = (w - x - attention_clear).min(760.0);
+        if runway_w < 420.0 {
+            return;
+        }
+        let runway_h = 154.0;
+        self.round_rect(
+            x,
+            y,
+            runway_w,
+            runway_h,
+            6.0,
+            "rgba(17,17,27,0.72)",
+            "rgba(137,180,250,0.48)",
+        );
+        self.text(
+            "SIGNAL RUNWAY",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_OVERLAY1_CSS,
+            "bold",
+        );
+        self.text(
+            "activity / context / managed",
+            x + 116.0,
+            y + 20.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let latest_event = self.snapshot.events.last();
+        let activity_value = latest_event
+            .map(|ev| format!("{} {}", ev.level, nonempty(&ev.ts, "--")))
+            .unwrap_or_else(|| format!("{} events", self.snapshot.events.len()));
+        let activity_detail = latest_event
+            .map(|ev| truncate(&ev.msg, 68))
+            .unwrap_or_else(|| "Waiting for retained activity".to_string());
+        self.signal_runway_row(
+            x + 10.0,
+            y + 34.0,
+            runway_w - 20.0,
+            "Activity",
+            &activity_value,
+            &activity_detail,
+            latest_event
+                .map(|ev| level_color_css(&ev.level))
+                .unwrap_or(C_TEAL_CSS),
+            vec![
+                RunwayAction::activity("latest", "bottom", 62.0, C_TEAL_CSS),
+                RunwayAction::activity("copy", "copy-visible", 50.0, C_BLUE_CSS),
+                RunwayAction::select("panel", "system:activity", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
+
+        let ctx_pct = percent(
+            self.snapshot.context.tokens,
+            self.snapshot.context.effective_window,
+        );
+        let context_value = if self.snapshot.context.available {
+            format!(
+                "{} / {} items",
+                pct_label(ctx_pct),
+                self.snapshot.context.item_count
+            )
+        } else {
+            "waiting".to_string()
+        };
+        let context_detail = if self.snapshot.context.available {
+            truncate(
+                &format!(
+                    "{} {}",
+                    nonempty(&self.snapshot.context.source, "snapshot"),
+                    nonempty(&self.snapshot.context.turn, "--")
+                ),
+                68,
+            )
+        } else {
+            "No context snapshot available".to_string()
+        };
+        self.signal_runway_row(
+            x + 10.0,
+            y + 74.0,
+            runway_w - 20.0,
+            "Context",
+            &context_value,
+            &context_detail,
+            pressure_color(ctx_pct),
+            vec![
+                RunwayAction::context("live", "live", 46.0, C_BLUE_CSS),
+                RunwayAction::context("replay", "replay", 58.0, C_MAUVE_CSS),
+                RunwayAction::context("copy", "copy-snapshot", 50.0, C_TEAL_CSS),
+                RunwayAction::select("panel", "system:context", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
+
+        let managed_pct = percent(
+            self.snapshot.managed.used_tokens,
+            self.snapshot.managed.effective_window,
+        );
+        let managed_value = format!(
+            "{} / {}",
+            nonempty(&self.snapshot.managed.mode, "managed"),
+            nonempty(&self.snapshot.managed.status, "unknown")
+        );
+        let managed_detail = format!(
+            "{} records / {} anchors / {} branches",
+            self.snapshot.managed.records,
+            self.snapshot.managed.anchors,
+            self.snapshot.managed.branches
+        );
+        self.signal_runway_row(
+            x + 10.0,
+            y + 114.0,
+            runway_w - 20.0,
+            "Managed",
+            &managed_value,
+            &managed_detail,
+            pressure_color(managed_pct),
+            vec![
+                RunwayAction::managed(
+                    "target",
+                    "use-target",
+                    "",
+                    &self.snapshot.managed.session_id,
+                    58.0,
+                    C_TEAL_CSS,
+                ),
+                RunwayAction::managed(
+                    "rewind",
+                    "rewind",
+                    "",
+                    &self.snapshot.managed.session_id,
+                    64.0,
+                    C_MAUVE_CSS,
+                ),
+                RunwayAction::managed(
+                    "copy",
+                    "copy-status",
+                    "",
+                    &self.snapshot.managed.session_id,
+                    50.0,
+                    C_BLUE_CSS,
+                ),
+                RunwayAction::select("panel", "system:managed", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
+    }
+
+    fn signal_runway_row(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        value: &str,
+        detail: &str,
+        color: &str,
+        actions: Vec<RunwayAction>,
+    ) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            34.0,
+            4.0,
+            "rgba(24,24,37,0.70)",
+            "rgba(49,50,68,0.72)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 7.0) as f64, (y + 7.0) as f64, 3.0, 20.0);
+        self.text(title, x + 16.0, y + 14.0, 8.5, C_OVERLAY1_CSS, "bold");
+        self.text(&truncate(value, 28), x + 88.0, y + 14.0, 9.0, color, "bold");
+        self.text(
+            &truncate(detail, 64),
+            x + 16.0,
+            y + 28.0,
+            8.5,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut ax = x + w - 8.0;
+        for action in actions.into_iter().rev() {
+            ax -= action.width;
+            if ax < x + 245.0 {
+                break;
+            }
+            self.pill_at(ax, y + 7.0, action.width, 20.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, y + 7.0, action.width, 20.0, action.hit));
+            ax -= 6.0;
+        }
+    }
+
+    fn draw_operations_runway(&mut self, w: f32, h: f32) {
+        if w < 1040.0 || h < 720.0 || self.selected_id.is_some() {
+            return;
+        }
+        let attention_clear = if !self.attention_items().is_empty() && w >= 900.0 && h >= 520.0 {
+            270.0
+        } else {
+            14.0
+        };
+        let x = 246.0;
+        let y = 368.0;
+        let runway_w = (w - x - attention_clear).min(760.0);
+        if runway_w < 420.0 {
+            return;
+        }
+        let runway_h = 154.0;
+        self.round_rect(
+            x,
+            y,
+            runway_w,
+            runway_h,
+            6.0,
+            "rgba(17,17,27,0.72)",
+            "rgba(148,226,213,0.48)",
+        );
+        self.text(
+            "OPERATIONS RUNWAY",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_OVERLAY1_CSS,
+            "bold",
+        );
+        self.text(
+            "sessions / displays / changes",
+            x + 146.0,
+            y + 20.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let controls = self.snapshot.controls.clone();
+        let session_state = if controls.session_detached {
+            "detached"
+        } else if controls.session_active {
+            "active"
+        } else if controls.session_id.is_empty() {
+            "idle"
+        } else {
+            "selected"
+        };
+        let session_value = format!(
+            "{} total / {} active / {} external",
+            self.snapshot.sessions.total,
+            self.snapshot.sessions.active,
+            self.snapshot.sessions.external
+        );
+        let session_detail = truncate(
+            &format!(
+                "{} / {} / {}",
+                nonempty(&controls.session_selection, "no target"),
+                session_state,
+                nonempty(&self.snapshot.sessions.latest_source, "sessions")
+            ),
+            68,
+        );
+        let mut session_actions = vec![
+            RunwayAction::activity("new", "new-session", 44.0, C_TEAL_CSS),
+            RunwayAction::select("panel", "system:sessions", 54.0, C_OVERLAY1_CSS),
+        ];
+        if controls.session_can_attach && !controls.session_id.is_empty() {
+            session_actions.insert(
+                1,
+                RunwayAction::session("attach", "attach", &controls.session_id, 58.0, C_PEACH_CSS),
+            );
+        }
+        if controls.session_can_focus {
+            session_actions.insert(
+                1,
+                RunwayAction::activity("focus", "target", 54.0, C_BLUE_CSS),
+            );
+        }
+        if controls.session_can_interrupt {
+            session_actions.insert(1, RunwayAction::activity("stop", "stop", 46.0, C_RED_CSS));
+        }
+        self.signal_runway_row(
+            x + 10.0,
+            y + 34.0,
+            runway_w - 20.0,
+            "Sessions",
+            &session_value,
+            &session_detail,
+            if self.snapshot.sessions.active > 0 {
+                C_TEAL_CSS
+            } else {
+                C_BLUE_CSS
+            },
+            session_actions,
+        );
+
+        let peer_count = self.snapshot.hosts.len().saturating_sub(1);
+        let display_count = self.display_sources.len();
+        let display_value = format!("{peer_count} peers / {display_count} displays");
+        let display_source = self.display_sources.values().next().map(|source| {
+            (
+                source.host_id.clone(),
+                source.display_id.clone(),
+                truncate(&source.label, 60),
+            )
+        });
+        let display_detail = display_source
+            .as_ref()
+            .map(|(_, _, label)| label.clone())
+            .unwrap_or_else(|| {
+                format!(
+                    "{} / {} / {}",
+                    nonempty(&controls.display_access, "display"),
+                    if controls.shared_view_visible {
+                        "shared view"
+                    } else {
+                        "no shared view"
+                    },
+                    nonempty(&controls.cu_backend, "cu")
+                )
+            });
+        let mut display_actions = vec![
+            RunwayAction::controls("share", "display-toggle", 54.0, C_BLUE_CSS),
+            RunwayAction::select("panel", "system:peers", 54.0, C_OVERLAY1_CSS),
+        ];
+        if let Some((host_id, display_id, _)) = display_source {
+            display_actions.insert(
+                0,
+                RunwayAction::open_display("open", &host_id, &display_id, 48.0, C_PEACH_CSS),
+            );
+        }
+        if controls.shared_view_can_take_input {
+            display_actions.insert(
+                0,
+                RunwayAction::controls("input", "shared-view-take-input", 52.0, C_GREEN_CSS),
+            );
+        }
+        self.signal_runway_row(
+            x + 10.0,
+            y + 74.0,
+            runway_w - 20.0,
+            "Displays",
+            &display_value,
+            &display_detail,
+            if display_count > 0 {
+                C_PEACH_CSS
+            } else {
+                C_BLUE_CSS
+            },
+            display_actions,
+        );
+
+        let changes = self.snapshot.changes.clone();
+        let changes_value = if changes.count > 0 {
+            format!(
+                "{} files / +{} -{}",
+                changes.count,
+                compact_number(changes.total_added as f64),
+                compact_number(changes.total_removed as f64)
+            )
+        } else {
+            nonempty(&changes.status, "clean")
+        };
+        let changes_detail = if changes.latest_path.is_empty() {
+            "No tracked working tree changes".to_string()
+        } else {
+            truncate(
+                &format!("{} {}", changes.latest_kind, changes.latest_path),
+                68,
+            )
+        };
+        self.signal_runway_row(
+            x + 10.0,
+            y + 114.0,
+            runway_w - 20.0,
+            "Changes",
+            &changes_value,
+            &changes_detail,
+            if changes.count > 0 || changes.status == "mismatch" {
+                C_YELLOW_CSS
+            } else {
+                C_GREEN_CSS
+            },
+            vec![
+                RunwayAction::changes("refresh", "refresh", "", 66.0, C_BLUE_CSS),
+                RunwayAction::changes("copy", "copy-paths", "", 50.0, C_TEAL_CSS),
+                RunwayAction::select("panel", "system:changes", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
+    }
+
+    fn draw_display_switchboard(&mut self, w: f32, h: f32) {
+        if w < 1180.0
+            || h < 700.0
+            || self.selected_id.is_some()
+            || !self.attention_items().is_empty()
+        {
+            return;
+        }
+        let panel_w = 264.0;
+        let panel_h = 220.0;
+        let x = w - panel_w - 14.0;
+        let y = 206.0;
+        self.round_rect(
+            x,
+            y,
+            panel_w,
+            panel_h,
+            6.0,
+            "rgba(17,17,27,0.76)",
+            "rgba(250,179,135,0.52)",
+        );
+        self.text(
+            "DISPLAY SWITCHBOARD",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_PEACH_CSS,
+            "bold",
+        );
+
+        let controls = self.snapshot.controls.clone();
+        let tiles = self.display_tiles();
+        let tile_y = y + 34.0;
+        if tiles.is_empty() {
+            self.round_rect(
+                x + 10.0,
+                tile_y,
+                panel_w - 20.0,
+                82.0,
+                4.0,
+                "rgba(24,24,37,0.70)",
+                "rgba(49,50,68,0.74)",
+            );
+            self.text(
+                "No live streams",
+                x + 22.0,
+                tile_y + 24.0,
+                11.0,
+                C_TEXT_CSS,
+                "bold",
+            );
+            self.text(
+                &truncate(
+                    &format!(
+                        "{} / {}",
+                        nonempty(&controls.display_access, "display access"),
+                        nonempty(&controls.cu_backend, "computer use")
+                    ),
+                    34,
+                ),
+                x + 22.0,
+                tile_y + 43.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+        } else {
+            for (idx, tile) in tiles.iter().take(2).enumerate() {
+                let yy = tile_y + idx as f32 * 74.0;
+                self.display_switchboard_tile(x + 10.0, yy, panel_w - 20.0, tile);
+            }
+        }
+
+        let shared_label = if controls.shared_view_visible {
+            truncate(&nonempty(&controls.shared_view_target, "shared view"), 28)
+        } else {
+            "shared view off".to_string()
+        };
+        self.text(
+            "shared",
+            x + 12.0,
+            y + panel_h - 49.0,
+            9.0,
+            C_OVERLAY1_CSS,
+            "bold",
+        );
+        self.text(
+            &shared_label,
+            x + 68.0,
+            y + panel_h - 49.0,
+            9.0,
+            if controls.shared_view_visible {
+                C_GREEN_CSS
+            } else {
+                C_SUBTEXT0_CSS
+            },
+            "normal",
+        );
+
+        let mut actions = vec![
+            RunwayAction::controls("share", "display-toggle", 54.0, C_PEACH_CSS),
+            RunwayAction::select("peers", "system:peers", 52.0, C_OVERLAY1_CSS),
+        ];
+        if controls.shared_view_can_take_input {
+            actions.insert(
+                0,
+                RunwayAction::controls("input", "shared-view-take-input", 52.0, C_GREEN_CSS),
+            );
+        }
+        if controls.shared_view_visible {
+            actions.push(RunwayAction::controls(
+                "hide",
+                "shared-view-hide",
+                44.0,
+                C_YELLOW_CSS,
+            ));
+        }
+        let mut ax = x + 12.0;
+        let ay = y + panel_h - 31.0;
+        for action in actions {
+            if ax + action.width > x + panel_w - 12.0 {
+                break;
+            }
+            self.pill_at(ax, ay, action.width, 20.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, ay, action.width, 20.0, action.hit));
+            ax += action.width + 7.0;
+        }
+    }
+
+    fn display_tiles(&self) -> Vec<DisplayTile> {
+        self.display_sources
+            .values()
+            .map(|source| DisplayTile {
+                host_id: source.host_id.clone(),
+                display_id: source.display_id.clone(),
+                label: source.label.clone(),
+                kind: source.kind.clone(),
+                ready: source.video.video_width() > 0 && source.video.video_height() > 0,
+                video: source.video.clone(),
+            })
+            .collect()
+    }
+
+    fn display_switchboard_tile(&mut self, x: f32, y: f32, w: f32, tile: &DisplayTile) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            64.0,
+            4.0,
+            "rgba(24,24,37,0.72)",
+            "rgba(49,50,68,0.76)",
+        );
+        let preview_w = 86.0;
+        let preview_h = 48.0;
+        let px = x + 8.0;
+        let py = y + 8.0;
+        self.round_rect(
+            px,
+            py,
+            preview_w,
+            preview_h,
+            3.0,
+            "rgba(17,17,27,0.86)",
+            if tile.ready {
+                C_GREEN_CSS
+            } else {
+                C_YELLOW_CSS
+            },
+        );
+        if tile.ready {
+            let _ = self.ctx.draw_image_with_html_video_element_and_dw_and_dh(
+                &tile.video,
+                (px + 2.0) as f64,
+                (py + 2.0) as f64,
+                (preview_w - 4.0) as f64,
+                (preview_h - 4.0) as f64,
+            );
+        } else {
+            self.text(
+                "linking",
+                px + 14.0,
+                py + 28.0,
+                9.0,
+                C_OVERLAY1_CSS,
+                "normal",
+            );
+        }
+        self.text(
+            &truncate(&tile.label, 26),
+            x + 104.0,
+            y + 19.0,
+            9.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.text(
+            &format!(
+                "{} :{} / {}",
+                truncate(&self.host_name(&tile.host_id), 13),
+                tile.display_id,
+                nonempty(&tile.kind, "stream")
+            ),
+            x + 104.0,
+            y + 35.0,
+            8.5,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        self.pill_at(x + 104.0, y + 42.0, 48.0, 18.0, "open", C_PEACH_CSS);
+        self.hit_zones.push(HitZone::new(
+            x,
+            y,
+            w,
+            64.0,
+            HitAction::OpenDisplay {
+                host_id: tile.host_id.clone(),
+                display_id: tile.display_id.clone(),
+            },
+        ));
+    }
+
+    fn draw_activity_detail_rail(&mut self, w: f32, h: f32) {
+        if w < 1180.0
+            || h < 720.0
+            || self.selected_id.is_some()
+            || !self.attention_items().is_empty()
+        {
+            return;
+        }
+        let panel_w = 264.0;
+        let x = w - panel_w - 14.0;
+        let y = 434.0;
+        let panel_h = (h - y - 102.0).clamp(132.0, 190.0);
+        self.round_rect(
+            x,
+            y,
+            panel_w,
+            panel_h,
+            6.0,
+            "rgba(17,17,27,0.76)",
+            "rgba(148,226,213,0.50)",
+        );
+        self.text(
+            "ACTIVITY DETAIL",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_TEAL_CSS,
+            "bold",
+        );
+        self.text(
+            &format!("{} retained", self.snapshot.events.len()),
+            x + panel_w - 91.0,
+            y + 20.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let actions = [
+            RunwayAction::activity("latest", "bottom", 58.0, C_TEAL_CSS),
+            RunwayAction::activity("copy", "copy-visible", 48.0, C_BLUE_CSS),
+            RunwayAction::select("panel", "system:activity", 52.0, C_OVERLAY1_CSS),
+        ];
+        let mut ax = x + 12.0;
+        for action in actions {
+            self.pill_at(ax, y + 31.0, action.width, 20.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, y + 31.0, action.width, 20.0, action.hit));
+            ax += action.width + 7.0;
+        }
+
+        let events = self
+            .snapshot
+            .events
+            .iter()
+            .rev()
+            .take(5)
+            .cloned()
+            .collect::<Vec<_>>();
+        if events.is_empty() {
+            self.round_rect(
+                x + 10.0,
+                y + 63.0,
+                panel_w - 20.0,
+                54.0,
+                4.0,
+                "rgba(24,24,37,0.70)",
+                "rgba(49,50,68,0.72)",
+            );
+            self.text(
+                "Waiting for dashboard events",
+                x + 20.0,
+                y + 91.0,
+                10.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            return;
+        }
+
+        let row_h = 24.0;
+        let max_rows = ((panel_h - 63.0) / row_h).floor().max(1.0) as usize;
+        for (idx, event) in events.into_iter().rev().take(max_rows).enumerate() {
+            let row_y = y + 63.0 + idx as f32 * row_h;
+            self.activity_detail_row(x + 10.0, row_y, panel_w - 20.0, event);
+        }
+    }
+
+    fn activity_detail_row(&mut self, x: f32, y: f32, w: f32, event: StationEvent) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            20.0,
+            4.0,
+            "rgba(24,24,37,0.64)",
+            "rgba(49,50,68,0.64)",
+        );
+        let color = level_color_css(&event.level);
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 7.0) as f64, (y + 5.0) as f64, 3.0, 10.0);
+        self.text(
+            &truncate(&nonempty(&event.ts, "--"), 8),
+            x + 16.0,
+            y + 13.0,
+            8.0,
+            C_OVERLAY1_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(&event.level, 6),
+            x + 62.0,
+            y + 13.0,
+            8.0,
+            color,
+            "bold",
+        );
+        let detail = if event.action.is_empty() {
+            truncate(&event.msg, 34)
+        } else {
+            truncate(&format!("{} / {}", event.action, event.msg), 34)
+        };
+        self.text(
+            &truncate(&nonempty(&event.host_id, "local"), 10),
+            x + 100.0,
+            y + 13.0,
+            8.0,
+            C_PEACH_CSS,
+            "normal",
+        );
+        self.text(&detail, x + 154.0, y + 13.0, 8.0, C_SUBTEXT0_CSS, "normal");
+        let hit = if event.action == "log" && !event.id.is_empty() {
+            HitAction::ActivityAction {
+                action: event.action,
+                id: event.id,
+            }
+        } else {
+            HitAction::Select("system:activity".to_string())
+        };
+        self.hit_zones.push(HitZone::new(x, y, w, 20.0, hit));
     }
 
     fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
@@ -5424,12 +6197,9 @@ impl GpuState {
     async fn new(canvas: HtmlCanvasElement) -> Result<Self, JsValue> {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU,
-            dx12_shader_compiler: Default::default(),
-            flags: wgpu::InstanceFlags::default(),
-            gles_minor_version: wgpu::Gles3MinorVersion::Automatic,
-        });
+        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_desc.backends = wgpu::Backends::BROWSER_WEBGPU;
+        let instance = wgpu::Instance::new(instance_desc);
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
             .map_err(|e| JsValue::from_str(&format!("create WebGPU surface failed: {e:?}")))?;
@@ -5440,16 +6210,14 @@ impl GpuState {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or_else(|| JsValue::from_str("no WebGPU adapter available"))?;
+            .map_err(|e| JsValue::from_str(&format!("no WebGPU adapter available: {e:?}")))?;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Intendant Station Device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Intendant Station Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| JsValue::from_str(&format!("request WebGPU device failed: {e:?}")))?;
 
@@ -5483,7 +6251,7 @@ impl GpuState {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Station Pipeline Layout"),
             bind_group_layouts: &[],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
         let make_pipeline = |topology| {
             let vertex_layout = GpuVertex::layout();
@@ -5492,13 +6260,13 @@ impl GpuState {
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     buffers: &[vertex_layout],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -5517,7 +6285,8 @@ impl GpuState {
                 },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
+                cache: None,
             })
         };
         let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList);
@@ -5542,14 +6311,27 @@ impl GpuState {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self, frame: &GpuFrame) -> Result<(), wgpu::SurfaceError> {
+    fn render(&mut self, frame: &GpuFrame) -> Result<(), JsValue> {
         let output = match self.surface.get_current_texture() {
-            Ok(output) => output,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                self.surface.get_current_texture()?
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(output)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+                    state => {
+                        return Err(JsValue::from_str(&format!(
+                            "surface unavailable after reconfigure: {state:?}"
+                        )))
+                    }
+                }
             }
-            Err(err) => return Err(err),
+            state => {
+                return Err(JsValue::from_str(&format!(
+                    "surface unavailable: {state:?}"
+                )))
+            }
         };
         let view = output
             .texture
@@ -5580,6 +6362,7 @@ impl GpuState {
                 label: Some("Station Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -5594,6 +6377,7 @@ impl GpuState {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             if !frame.line_vertices.is_empty() {
                 pass.set_pipeline(&self.line_pipeline);
@@ -6377,6 +7161,15 @@ struct DisplaySource {
     video: HtmlVideoElement,
 }
 
+struct DisplayTile {
+    host_id: String,
+    display_id: String,
+    label: String,
+    kind: String,
+    ready: bool,
+    video: HtmlVideoElement,
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum LayoutName {
     Orbital,
@@ -6553,6 +7346,143 @@ impl LaneAction {
             color,
             hit: HitAction::SessionAction {
                 action: action.to_string(),
+                session_id: session_id.to_string(),
+            },
+        }
+    }
+}
+
+struct RunwayAction {
+    label: &'static str,
+    width: f32,
+    color: &'static str,
+    hit: HitAction,
+}
+
+impl RunwayAction {
+    fn select(label: &'static str, id: &'static str, width: f32, color: &'static str) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::Select(id.to_string()),
+        }
+    }
+
+    fn activity(
+        label: &'static str,
+        action: &'static str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ActivityAction {
+                action: action.to_string(),
+                id: String::new(),
+            },
+        }
+    }
+
+    fn context(label: &'static str, action: &'static str, width: f32, color: &'static str) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ContextAction {
+                action: action.to_string(),
+                id: String::new(),
+            },
+        }
+    }
+
+    fn controls(
+        label: &'static str,
+        action: &'static str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ControlsAction {
+                action: action.to_string(),
+            },
+        }
+    }
+
+    fn changes(
+        label: &'static str,
+        action: &'static str,
+        path: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ChangesAction {
+                action: action.to_string(),
+                path: path.to_string(),
+            },
+        }
+    }
+
+    fn session(
+        label: &'static str,
+        action: &'static str,
+        session_id: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::SessionAction {
+                action: action.to_string(),
+                session_id: session_id.to_string(),
+            },
+        }
+    }
+
+    fn open_display(
+        label: &'static str,
+        host_id: &str,
+        display_id: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::OpenDisplay {
+                host_id: host_id.to_string(),
+                display_id: display_id.to_string(),
+            },
+        }
+    }
+
+    fn managed(
+        label: &'static str,
+        action: &'static str,
+        id: &str,
+        session_id: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ManagedAction {
+                action: action.to_string(),
+                id: id.to_string(),
                 session_id: session_id.to_string(),
             },
         }

@@ -1579,6 +1579,14 @@ struct ManagedContextRewindOnlyPressure {
     status: &'static str,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ManagedContextDensityPressure {
+    used_tokens: u64,
+    recommended_rewind_limit: u64,
+    rewind_only_limit: u64,
+    hard_context_window: Option<u64>,
+}
+
 impl ExternalToolOutputLimiter {
     fn filter(&mut self, item_id: &str, text: String) -> Option<String> {
         if text.is_empty() {
@@ -2575,6 +2583,12 @@ fn validate_context_rewind_anchor_restore_headroom(
         return Ok(());
     };
 
+    if let Some(start_line) = anchor.managed_context_recovery_start_line {
+        return Err(format!(
+            "rewind anchor item_id `{requested_item_id}` is inside the active managed-context recovery span that starts at rollout line {start_line}; choosing it would preserve the recovery kickstart prompt or its list/inspect calls. Call list_rewind_anchors again without include_non_recovery and choose an anchor before that managed-context recovery span."
+        ));
+    }
+
     let Some((usage_kind, used_tokens, rewind_only_limit)) =
         context_rewind_anchor_restore_usage_for_headroom(&anchor, position)
     else {
@@ -2979,6 +2993,8 @@ struct ContextRewindAnchorCatalogEntry {
     recovery_eligible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_eligible_positions: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_context_recovery_start_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3258,6 +3274,7 @@ fn scan_context_rewind_anchor_catalog(
     let mut latest_rewind_outcomes = HashMap::<String, ContextRewindBackendUsageAtLine>::new();
     let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
     let mut prefix_estimated_tokens = 0_u64;
+    let mut managed_context_recovery_start_line = None::<usize>;
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -3293,6 +3310,11 @@ fn scan_context_rewind_anchor_catalog(
         let Some(payload) = entry.get("payload") else {
             continue;
         };
+        if managed_context_recovery_start_line.is_none()
+            && response_item_is_managed_context_recovery_kickstart(payload)
+        {
+            managed_context_recovery_start_line = Some(line_number);
+        }
         let prefix_before_item = prefix_estimated_tokens;
         prefix_estimated_tokens =
             prefix_estimated_tokens.saturating_add(context_rewind_estimated_tokens(payload));
@@ -3350,6 +3372,7 @@ fn scan_context_rewind_anchor_catalog(
                 latest_rewind_limit_after_anchor: None,
                 recovery_eligible: None,
                 recovery_eligible_positions: None,
+                managed_context_recovery_start_line: None,
             });
         }
     }
@@ -3367,6 +3390,13 @@ fn scan_context_rewind_anchor_catalog(
         anchor.approx_pruned_tokens_after = anchor
             .prefix_estimated_tokens_after_anchor
             .map(|prefix_tokens| total_prefix_estimated_tokens.saturating_sub(prefix_tokens));
+        let in_managed_recovery_span = managed_context_recovery_start_line
+            .filter(|start_line| anchor.last_line >= *start_line);
+        if let Some(start_line) = in_managed_recovery_span {
+            anchor.managed_context_recovery_start_line = Some(start_line);
+            anchor.recovery_eligible = Some(false);
+            anchor.recovery_eligible_positions = None;
+        }
         let Some(usage) = backend_usage
             .iter()
             .find(|usage| usage.line >= anchor.last_line)
@@ -3376,6 +3406,9 @@ fn scan_context_rewind_anchor_catalog(
         };
         anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
         anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
+        if in_managed_recovery_span.is_some() {
+            continue;
+        }
         let backend_has_headroom =
             context_rewind_anchor_has_recovery_headroom(usage.used_tokens, usage.rewind_only_limit);
         let restore_prefix_after_has_headroom = anchor
@@ -3639,6 +3672,16 @@ fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogE
                 | "context_rewind_backout"
         )
     })
+}
+
+fn response_item_is_managed_context_recovery_kickstart(item: &serde_json::Value) -> bool {
+    if item.get("type").and_then(|value| value.as_str()) != Some("message") {
+        return false;
+    }
+    if item.get("role").and_then(|value| value.as_str()) != Some("user") {
+        return false;
+    }
+    response_item_content_text(item).any(|text| text.contains("<managed_context_recovery>"))
 }
 
 fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
@@ -4541,6 +4584,29 @@ fn managed_context_rewind_only_pressure(
     managed_context_recovery_pressure(snapshot)
 }
 
+const MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT: f64 = 85.0;
+
+fn managed_context_density_pressure(
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> Option<ManagedContextDensityPressure> {
+    let used_tokens = external_context_snapshot_backend_token_count(snapshot)?;
+    let rewind_only_limit = snapshot.context_window?;
+    if rewind_only_limit == 0 || used_tokens >= rewind_only_limit {
+        return None;
+    }
+    let recommended_rewind_limit =
+        (rewind_only_limit as f64 * MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT / 100.0).floor() as u64;
+    if used_tokens < recommended_rewind_limit {
+        return None;
+    }
+    Some(ManagedContextDensityPressure {
+        used_tokens,
+        recommended_rewind_limit,
+        rewind_only_limit,
+        hard_context_window: snapshot.hard_context_window,
+    })
+}
+
 fn managed_context_rewind_only_pressure_from_usage(
     usage: &external_agent::AgentUsageSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
@@ -4661,6 +4727,20 @@ fn managed_context_recovery_kickstart_text(
         limit = pressure.rewind_only_limit,
         hard = hard,
         held = held,
+    )
+}
+
+fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure) -> String {
+    let hard = pressure
+        .hard_context_window
+        .map(|hard| format!(" hard_limit={hard}"))
+        .unwrap_or_default();
+    format!(
+        "<managed_context_density_handoff>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). The previous implementation turn is complete, but the live transcript is above the recommended density threshold. Before handing control back, do a context-management handoff. If an exact managed-context rewind would materially improve density while preserving completed work, use list_rewind_anchors and inspect_rewind_anchor as needed, then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. If no rewind is worthwhile, do not continue implementation, exploration, or broad ordinary-tool work; reply with a concise handoff that crystallizes durable facts, changed files, verification results, user constraints, and remaining decisions, and state that you are leaving context unchanged. Normal tools are still allowed below rewind_only, but this maintenance turn should avoid ordinary tool use unless needed to inspect current status or anchors. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_handoff>",
+        used = pressure.used_tokens,
+        limit = pressure.rewind_only_limit,
+        recommended = pressure.recommended_rewind_limit,
+        hard = hard,
     )
 }
 
@@ -8723,6 +8803,7 @@ struct FollowUpMessage {
     unresolved_attachment_ids: Vec<String>,
     target_session_id: Option<String>,
     managed_context_recovery_kickstart: bool,
+    managed_context_density_handoff: bool,
 }
 
 impl FollowUpMessage {
@@ -8738,6 +8819,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8753,6 +8835,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8768,6 +8851,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids: Vec::new(),
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8790,6 +8874,7 @@ impl FollowUpMessage {
             unresolved_attachment_ids,
             target_session_id: None,
             managed_context_recovery_kickstart: false,
+            managed_context_density_handoff: false,
         }
     }
 
@@ -8807,6 +8892,11 @@ impl FollowUpMessage {
         self.managed_context_recovery_kickstart = true;
         self
     }
+
+    fn managed_context_density_handoff(mut self) -> Self {
+        self.managed_context_density_handoff = true;
+        self
+    }
 }
 
 const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN: &str =
@@ -8817,7 +8907,7 @@ const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER: &str = "\n\nUser follo
 const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_INSTRUCTIONS: &str =
     "A managed-context rewind requested during this queued follow-up has already succeeded. Continue the user's follow-up below from the rewound context. Do not call rewind_context again merely to satisfy any instruction to rewind first; only rewind again if new context pressure or an invalid anchor genuinely requires it.";
 const MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS: &str =
-    "A managed-context rewind requested during the active follow-up has already succeeded. The active user follow-up is already in the preserved thread history; the model_context_rewind_primer is the authoritative carry-forward summary for the pruned span. Continue with the next unfinished step. Do not repeat already-completed verification, setup, or research steps from the preserved user request, and do not call rewind_context again merely to satisfy any prior instruction to rewind first.";
+    "A managed-context rewind requested during the active follow-up has already succeeded. The active follow-up is already in the preserved thread history; the model_context_rewind_primer is the authoritative carry-forward summary for the pruned span. Continue with the next unfinished step. Do not repeat already-completed verification, setup, or research steps from the preserved request, and do not call rewind_context again merely to satisfy any prior instruction to rewind first.";
 
 fn managed_context_canonical_followup_replay_text(text: &str) -> String {
     let mut current = text.trim();
@@ -8880,10 +8970,11 @@ fn managed_context_followup_replay_after_rewind(
         managed_context_active_followup_resume_text()
     };
 
-    Some(FollowUpMessage::with_attachments(
-        text,
-        active_followup.attachments.clone(),
-    ))
+    let mut followup = FollowUpMessage::with_attachments(text, active_followup.attachments.clone());
+    if active_followup.managed_context_density_handoff {
+        followup = followup.managed_context_density_handoff();
+    }
+    Some(followup)
 }
 
 fn managed_context_sanitize_queued_followup_replay(
@@ -10735,6 +10826,67 @@ mod tests {
     }
 
     #[test]
+    fn managed_context_density_pressure_uses_recommended_threshold_only() {
+        let below = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(219_639),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+        assert_eq!(managed_context_density_pressure(&below), None);
+
+        let watch = external_agent::AgentContextSnapshot {
+            token_count: Some(241_746),
+            ..below.clone()
+        };
+        assert_eq!(
+            managed_context_density_pressure(&watch),
+            Some(ManagedContextDensityPressure {
+                used_tokens: 241_746,
+                recommended_rewind_limit: 219_640,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+            })
+        );
+        assert_eq!(managed_context_rewind_only_pressure(&watch), None);
+
+        let rewind_only = external_agent::AgentContextSnapshot {
+            token_count: Some(258_400),
+            ..below
+        };
+        assert_eq!(managed_context_density_pressure(&rewind_only), None);
+        assert!(managed_context_rewind_only_pressure(&rewind_only).is_some());
+    }
+
+    #[test]
+    fn managed_context_density_handoff_text_preserves_exact_anchor_policy() {
+        let text = managed_context_density_handoff_text(ManagedContextDensityPressure {
+            used_tokens: 241_746,
+            recommended_rewind_limit: 219_640,
+            rewind_only_limit: 258_400,
+            hard_context_window: Some(272_000),
+        });
+
+        assert!(text.contains("context pressure is watch"));
+        assert!(text.contains("recommended_density_threshold=219640"));
+        assert!(text.contains("one exact returned item_id"));
+        assert!(text.contains("crystallizes durable facts"));
+        assert!(text.contains("leaving context unchanged"));
+        assert!(text.contains("Do not use auto anchors"));
+        assert!(text.contains("N-turn rewinds"));
+        assert!(!text.contains("call_"));
+        assert!(!text.contains("rewind N"));
+    }
+
+    #[test]
     fn context_rewind_thread_id_candidates_prefers_session_then_alias() {
         assert_eq!(
             context_rewind_thread_id_candidates(Some("backend-thread"), Some("wrapper-session")),
@@ -10826,7 +10978,7 @@ mod tests {
 
         assert!(continuation
             .text
-            .contains("active user follow-up is already in the preserved thread history"));
+            .contains("active follow-up is already in the preserved thread history"));
         assert!(continuation.text.contains("has already succeeded"));
         assert!(continuation
             .text
@@ -11590,6 +11742,276 @@ mod tests {
             .filter_map(|anchor| anchor["item_id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["call_recovery_list", "call_launch_dashboard"]);
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_excludes_active_recovery_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_before_recovery",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "id": "msg_recovery_kickstart",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<managed_context_recovery>Backend-reported Codex context pressure is high. First call list_rewind_anchors without a query.</managed_context_recovery>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "list_rewind_anchors",
+                        "call_id": "call_recovery_list",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_recovery_list",
+                        "output": "{\"anchors\":[{\"item_id\":\"call_before_recovery\"}]}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "get_status",
+                        "call_id": "call_recovery_status",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_after_recovery_prompt",
+                        "arguments": "{\"cmd\":\"echo healthy now\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 0, "limit": 10 }),
+        )
+        .expect("default recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_before_recovery"]);
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "include_non_recovery": true,
+                "include_management_tools": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchors = catalog["anchors"].as_array().unwrap();
+        let before = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_before_recovery")
+            .expect("pre-recovery anchor");
+        assert_eq!(before["recovery_eligible"].as_bool(), Some(true));
+        assert!(before["managed_context_recovery_start_line"].is_null());
+
+        for item_id in [
+            "msg_recovery_kickstart",
+            "call_recovery_list",
+            "call_recovery_status",
+            "call_after_recovery_prompt",
+        ] {
+            let anchor = anchors
+                .iter()
+                .find(|anchor| anchor["item_id"] == item_id)
+                .unwrap_or_else(|| panic!("missing audit anchor {item_id}: {catalog}"));
+            assert_eq!(
+                anchor["recovery_eligible"].as_bool(),
+                Some(false),
+                "got {anchor}"
+            );
+            assert_eq!(
+                anchor["managed_context_recovery_start_line"].as_u64(),
+                Some(3),
+                "got {anchor}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_rewind_rejects_anchor_inside_active_recovery_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_before_recovery",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "id": "msg_recovery_kickstart",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<managed_context_recovery>First call list_rewind_anchors without a query.</managed_context_recovery>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "get_status",
+                        "call_id": "call_recovery_status",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_before_recovery",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect("pre-recovery anchor should remain valid");
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_recovery_status",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("active recovery span anchor must be rejected");
+        assert!(
+            err.contains("active managed-context recovery span"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("preserve the recovery kickstart prompt"),
+            "got: {err}"
+        );
     }
 
     #[test]
@@ -20116,6 +20538,7 @@ async fn run_external_agent_mode(
         let unresolved_attachment_ids = followup.unresolved_attachment_ids;
         let target_session_id = followup.target_session_id.clone();
         let managed_context_recovery_kickstart = followup.managed_context_recovery_kickstart;
+        let managed_context_density_handoff = followup.managed_context_density_handoff;
 
         if let Some(side_thread_id) = target_session_id
             .as_deref()
@@ -20404,6 +20827,7 @@ async fn run_external_agent_mode(
                                 unresolved_attachment_ids: unresolved_attachment_ids.clone(),
                                 target_session_id: target_session_id.clone(),
                                 managed_context_recovery_kickstart: false,
+                                managed_context_density_handoff: false,
                             });
                             emit_follow_up_status(
                                 &bus,
@@ -21030,6 +21454,52 @@ async fn run_external_agent_mode(
                                     });
                                     next_turn = Some(replay);
                                     continue 'outer;
+                                }
+                                if !managed_context_recovery_kickstart
+                                    && !managed_context_density_handoff
+                                {
+                                    if let Some(pressure) =
+                                        managed_context_density_pressure(&snapshot)
+                                    {
+                                        let handoff_text =
+                                            managed_context_density_handoff_text(pressure);
+                                        slog(&session_log, |l| {
+                                            l.info(&format!(
+                                                "Managed Codex completed at density-watch pressure ({}/{} tokens); sending one-shot context handoff before waiting for follow-up",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit
+                                            ))
+                                        });
+                                        bus.send(AppEvent::LogEntry {
+                                            session_id: live_session_id.clone(),
+                                            level: "info".to_string(),
+                                            source: "Intendant".to_string(),
+                                            content: format!(
+                                                "Managed context is above the recommended density threshold ({}/{} tokens, threshold {}). Sending a one-shot context handoff before waiting for follow-up.",
+                                                pressure.used_tokens,
+                                                pressure.rewind_only_limit,
+                                                pressure.recommended_rewind_limit
+                                            ),
+                                            turn: None,
+                                        });
+                                        record_external_round_inline(
+                                            &session_log,
+                                            persist_model_responses_inline,
+                                            round,
+                                            turns_in_round,
+                                        );
+                                        bus.send(AppEvent::RoundComplete {
+                                            session_id: live_session_id.clone(),
+                                            round,
+                                            turns_in_round,
+                                            native_message_count: None,
+                                        });
+                                        next_turn = Some(
+                                            FollowUpMessage::text(handoff_text)
+                                                .managed_context_density_handoff(),
+                                        );
+                                        continue 'outer;
+                                    }
                                 }
                             }
                         }

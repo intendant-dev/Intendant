@@ -326,6 +326,13 @@ intendant --web --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies
 `--tls-cert` / `--tls-key` must be supplied together; supplying either implies
 `--tls`.
 
+Native HTTPS/WSS is also the direct way to make a remote dashboard origin a
+browser secure context when you need Station WebGPU, microphone/camera, browser
+screen capture, or stricter clipboard APIs. Use a trusted certificate; merely
+clicking through a self-signed certificate warning is not a reliable way to
+unlock these browser APIs. See
+[Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
+
 ### mTLS reverse proxy — `intendant lan`
 
 `src/bin/caller/lan/` ports the old `setup-lan.sh` script to Rust. `intendant lan
@@ -337,11 +344,11 @@ systemd/launchd) is Unix-specific. Subcommands:
 
 | Command | Action |
 |---|---|
-| `intendant lan setup` | Generate CA + server/client certs, render nginx config, start the proxy + cert-distribution server |
+| `intendant lan setup` | Generate CA + server/client certs, render nginx config, start the proxy + strict HTTPS enrollment server |
 | `intendant lan recert` | Re-issue certs |
 | `intendant lan remove` | Tear down the proxy and config |
 | `intendant lan list` | List issued client certs |
-| `intendant lan serve-certs` | Serve the client `.p12` for import onto devices |
+| `intendant lan serve-certs` | Run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
 
 ```bash
 intendant lan setup --name nicks-mac --https-port 8443
@@ -352,6 +359,21 @@ apply there. Cert *generation* is cross-platform, so a Windows daemon can still 
 `--tls` for native HTTPS and `read_server_cert_fingerprint` to publish a pinned
 fingerprint; to put it behind an mTLS proxy, front it with your own reverse proxy.
 See [Windows Support](./windows-support.md).
+
+Enrollment is not a plain unauthenticated download. The temporary
+`serve-certs` endpoint runs HTTPS with the LAN server certificate. The CLI does
+not print the expected server fingerprint or the enrollment secret at startup;
+the operator first copies the SHA-256 fingerprint observed in the browser's
+certificate UI into the CLI. Only a match reveals a one-time secret, and only a
+browser that redeems that secret can download the CA, client certificate, or
+Apple configuration profile. The page detects the browser only to put the most
+likely install path first; all artifacts remain gated by the terminal-paired
+browser session.
+
+The mTLS proxy also solves browser secure-context requirements for LAN clients
+once the CA/client identity are installed. That matters for Station's WebGPU
+renderer, microphone/camera, browser screen capture, and stricter clipboard APIs;
+plain `http://<LAN-IP>:8765` does not expose those features.
 
 ### How auth maps to the Agent Card
 

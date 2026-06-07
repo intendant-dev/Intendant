@@ -10910,7 +10910,7 @@ async function ensureStation(forceRendered = false) {
   stationInitPromise = (async () => {
     if (!stationWasmReady) {
       stationStatus('Loading Station WASM');
-      await stationInit('/wasm-station/station_web_bg.wasm');
+      await stationInit('/wasm-station/station_web_bg.wasm?v=wgpu29');
       stationWasmReady = true;
     }
     const scene = document.getElementById('station-scene-canvas');
