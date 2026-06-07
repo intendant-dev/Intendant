@@ -7257,6 +7257,109 @@ fn filter_session_list_by_ids(body: &str, ids: &[String]) -> String {
     serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".to_string())
 }
 
+fn session_row_source_is_codex(row: &serde_json::Value) -> bool {
+    value_str(row, "backend_source")
+        .or_else(|| value_str(row, "source"))
+        .map(|source| crate::session_names::normalize_source(&source) == "codex")
+        .unwrap_or(false)
+}
+
+fn session_row_id_values(row: &serde_json::Value) -> Vec<String> {
+    [
+        "backend_session_id",
+        "resume_id",
+        "session_id",
+        "intendant_session_id",
+    ]
+    .into_iter()
+    .filter_map(|key| value_str(row, key))
+    .filter(|id| !id.trim().is_empty())
+    .collect()
+}
+
+fn latest_session_goal_from_entries(
+    entries: &[serde_json::Value],
+    session_id: &str,
+) -> Option<Option<SessionGoal>> {
+    let mut latest = None;
+    for entry in entries {
+        if entry.get("event").and_then(|v| v.as_str()) != Some("session_goal") {
+            continue;
+        }
+        let entry_session_id = entry
+            .get("session_id")
+            .and_then(|v| v.as_str())
+            .or_else(|| entry.pointer("/data/session_id").and_then(|v| v.as_str()));
+        if entry_session_id.is_some_and(|id| id != session_id) {
+            continue;
+        }
+        let data = entry.get("data").unwrap_or(entry);
+        let has_goal = data.get("goal").is_some()
+            || data.get("session_goal").is_some()
+            || data.get("sessionGoal").is_some();
+        let goal = data
+            .get("goal")
+            .or_else(|| data.get("session_goal"))
+            .or_else(|| data.get("sessionGoal"));
+        if has_goal {
+            latest = Some(goal.and_then(codex_session_goal_from_value));
+        } else {
+            latest = Some(codex_session_goal_from_value(data));
+        }
+    }
+    latest
+}
+
+fn hydrate_codex_session_goal_for_row(
+    home: &Path,
+    row: &mut serde_json::Value,
+    requested_ids: &HashSet<String>,
+) {
+    if !session_row_source_is_codex(row) {
+        return;
+    }
+    let row_ids = session_row_id_values(row);
+    if !row_ids.iter().any(|id| requested_ids.contains(id)) {
+        return;
+    }
+    for id in row_ids {
+        let Some(entries) = external_session_entries_from_home(home, "codex", &id) else {
+            continue;
+        };
+        let Some(goal) = latest_session_goal_from_entries(&entries, &id) else {
+            continue;
+        };
+        if let Some(obj) = row.as_object_mut() {
+            obj.insert("goal".to_string(), serde_json::json!(goal));
+            obj.insert("session_goal".to_string(), serde_json::json!(goal));
+        }
+        return;
+    }
+}
+
+fn hydrate_codex_session_goals_for_ids(home: &Path, body: &str, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return body.to_string();
+    }
+    let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(body) else {
+        return body.to_string();
+    };
+    let requested_ids: HashSet<String> = ids.iter().cloned().collect();
+    for row in &mut rows {
+        hydrate_codex_session_goal_for_row(home, row, &requested_ids);
+    }
+    serde_json::to_string(&rows).unwrap_or_else(|_| body.to_string())
+}
+
+fn filter_session_list_by_ids_with_codex_goal_hydration(
+    home: &Path,
+    body: &str,
+    ids: &[String],
+) -> String {
+    let filtered = filter_session_list_by_ids(body, ids);
+    hydrate_codex_session_goals_for_ids(home, &filtered, ids)
+}
+
 fn session_list_limit_from_request(request_line: &str) -> Option<usize> {
     let raw = query_param(request_line, "limit")
         .or_else(|| query_param(request_line, "max"))
@@ -7293,8 +7396,15 @@ fn cached_list_sessions_for_ids(ids: &[String]) -> String {
     if ids.is_empty() {
         return "[]".to_string();
     }
+    cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
+}
+
+fn cached_list_sessions_for_ids_from_home(home: &Path, ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "[]".to_string();
+    }
     let body = cached_list_sessions();
-    filter_session_list_by_ids(&body, ids)
+    filter_session_list_by_ids_with_codex_goal_hydration(home, &body, ids)
 }
 
 fn cached_intendant_log_dirs_for_session_id(session_id: &str) -> Vec<PathBuf> {
@@ -21269,6 +21379,97 @@ mod tests {
                 .pointer("/session_goal/tokens_used")
                 .and_then(|v| v.as_u64()),
             Some(39449760)
+        );
+    }
+
+    #[test]
+    fn filtered_codex_sessions_hydrates_goal_outside_list_scan_window() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("07");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let id = "019e5c7a-4d05-78d3-a98a-29999cb9898e";
+        let filler = "x".repeat(4096);
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-06-07T15:00:00Z",
+            "type": "session_meta",
+            "payload": {
+                "id": id,
+                "timestamp": "2026-06-07T15:00:00Z",
+                "cwd": "/repo"
+            }
+        })];
+        for idx in 0..160 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-06-07T15:00:{idx:02}Z"),
+                "type": "noop",
+                "payload": { "blob": filler }
+            }));
+        }
+        lines.push(serde_json::json!({
+            "timestamp": "2026-06-07T15:05:00Z",
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_goal_updated",
+                "threadId": id,
+                "goal": {
+                    "threadId": id,
+                    "objective": "Keep the Station goal moving",
+                    "status": "usageLimited",
+                    "tokensUsed": 39449760,
+                    "timeUsedSeconds": 93019
+                }
+            }
+        }));
+        for idx in 0..160 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-06-07T15:10:{idx:02}Z"),
+                "type": "noop",
+                "payload": { "blob": filler }
+            }));
+        }
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-06-07T15-00-00-{id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let body = list_sessions_from_home(home.path());
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&body).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should be listed");
+        assert_eq!(session.get("goal"), None);
+
+        let filtered = filter_session_list_by_ids_with_codex_goal_hydration(
+            home.path(),
+            &body,
+            &[id.to_string()],
+        );
+        let sessions: Vec<serde_json::Value> = serde_json::from_str(&filtered).unwrap();
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(id))
+            .expect("codex session should still be listed");
+        assert_eq!(
+            session.pointer("/goal/objective").and_then(|v| v.as_str()),
+            Some("Keep the Station goal moving")
+        );
+        assert_eq!(
+            session.pointer("/goal/status").and_then(|v| v.as_str()),
+            Some("usageLimited")
         );
     }
 
