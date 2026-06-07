@@ -17536,6 +17536,19 @@ function stationHandleChangesAction(action) {
       .finally(() => stationRenderChangesDock(activeChangesFile || path));
     return;
   }
+  if (op === 'copy-paths') {
+    stationCopyChangedPathsFromDock();
+    return;
+  }
+  if (op === 'copy-diff') {
+    stationCopyChangeDiffFromDock(path || activeChangesFile || stationSelectedChangePath)
+      .catch(err => showControlToast?.('error', `Copy diff failed: ${err?.message || err}`));
+    return;
+  }
+  if (op === 'history') {
+    stationRefreshChangesHistoryForDock(path || activeChangesFile || stationSelectedChangePath);
+    return;
+  }
   if (op === 'redo') {
     stationRunChangesRedoFromDock(activeChangesFile || path);
     return;

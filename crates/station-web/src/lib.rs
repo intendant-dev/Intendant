@@ -2723,6 +2723,9 @@ impl StationInner {
         yy += 22.0;
         let change_actions = [
             ("refresh", "refresh", 68.0),
+            ("copy-paths", "copy paths", 88.0),
+            ("copy-diff", "copy diff", 80.0),
+            ("history", "history", 68.0),
             ("redo", "redo", 54.0),
             ("prune", "prune", 62.0),
         ];
@@ -2736,7 +2739,11 @@ impl StationInner {
                 21.0,
                 HitAction::ChangesAction {
                     action: action.to_string(),
-                    path: String::new(),
+                    path: if action == "copy-diff" {
+                        changes.latest_path.clone()
+                    } else {
+                        String::new()
+                    },
                 },
             ));
             ax += width + 8.0;
@@ -2744,7 +2751,7 @@ impl StationInner {
         yy += 30.0;
         self.section_title_color(x, yy, "Changed files", C_YELLOW_CSS);
         yy += 18.0;
-        self.changes_detail_rows(
+        yy = self.changes_detail_rows(
             x,
             yy,
             panel_w,
@@ -2756,6 +2763,29 @@ impl StationInner {
             },
             7,
         );
+        yy += 12.0;
+        if !changes.latest_path.is_empty() {
+            self.section_title_color(x, yy, "Selected file", C_PEACH_CSS);
+            yy += 18.0;
+            self.panel_row(x, yy, "path", &truncate(&changes.latest_path, 42));
+            yy += 24.0;
+            let selected_actions = [("file", "view", 52.0), ("copy-diff", "copy diff", 80.0)];
+            let mut ax = x + 14.0;
+            for (action, label, width) in selected_actions {
+                self.pill_at(ax, yy - 14.0, width, 21.0, label, C_PEACH_CSS);
+                self.hit_zones.push(HitZone::new(
+                    ax,
+                    yy - 14.0,
+                    width,
+                    21.0,
+                    HitAction::ChangesAction {
+                        action: action.to_string(),
+                        path: changes.latest_path.clone(),
+                    },
+                ));
+                ax += width + 8.0;
+            }
+        }
     }
 
     fn draw_sessions_info(&mut self, x: f32, y: f32, panel_w: f32) {
