@@ -17032,6 +17032,134 @@ function stationRenderApprovalRulesEditor(parent) {
   }
 }
 
+function stationExternalTargetRowsForDock(limit = 6) {
+  const targetId = String(resolvePromptTargetSessionId() || '').trim();
+  const rows = new Map();
+  const addTarget = (sessionOrId) => {
+    const session = typeof sessionOrId === 'object'
+      ? sessionOrId
+      : (stationFindSessionById(sessionOrId) || { session_id: sessionOrId });
+    const meta = sessionConfigMetadata(session || sessionOrId);
+    const sid = stationSessionId(session) || String(meta.session_id || meta.sessionId || sessionOrId || '').trim();
+    const backendId = String(meta.backendSessionId || meta.backend_session_id || '').trim();
+    const canonicalId = backendId || sid;
+    if (!canonicalId || canonicalId === daemonSessionFullId || rows.has(canonicalId)) return;
+    const source = sessionConfigSource(meta) || normalizeAgentId(stationSessionSource(session));
+    if (!source || source === 'intendant') return;
+    const live = stationExternalLiveThreadDescriptor(session || sid) || stationExternalLiveThreadDescriptor(canonicalId);
+    const relatedIds = new Set([
+      canonicalId,
+      sid,
+      live?.liveId,
+      live?.backendId,
+      live?.wrapperId,
+      live?.actionId,
+      ...relatedSessionIdsForSession(canonicalId),
+      ...relatedSessionIdsForSession(sid),
+    ].map(id => String(id || '').trim()).filter(Boolean));
+    const liveId = live?.liveId || [...relatedIds].find(id => sessionWindows.has(id)) || '';
+    const actionId = live?.actionId || '';
+    const attachId = live?.attachId || [...relatedIds].find(id => canAttachSessionWindow(id)) || '';
+    const stopId = live?.stopId || [...relatedIds].find(id => sessionWindowStopAvailability(id).ok) || '';
+    const updated = Math.max(
+      stationSessionUpdatedMs(session),
+      stationTimestampMs(meta.updatedAt || meta.updated_at),
+    );
+    const active = liveId ? isSessionWindowEffectivelyActive(liveId) : false;
+    const detached = live?.detached || [...relatedIds].some(id => sessionWindowIsDetached(id));
+    const target = !!targetId && relatedIds.has(targetId);
+    rows.set(canonicalId, {
+      id: canonicalId,
+      sid,
+      source,
+      label: stationSessionTask(session) || meta.name || stationSessionShortLabel(canonicalId) || canonicalId,
+      detail: [
+        shortSessionId(canonicalId),
+        sessionProjectDirectory(session) ? compactPathLabel(sessionProjectDirectory(session), true) : '',
+        updated ? formatContextTimestamp(meta.updatedAt || meta.updated_at || session?.updated_at || session?.updatedAt || session?.created_at || session?.createdAt) : '',
+      ].filter(Boolean).join(' / '),
+      status: normalizeSessionPhase(live?.phase || meta.phase || session?.status || '') || (active ? 'active' : (detached ? 'detached' : 'idle')),
+      liveId,
+      actionId,
+      attachId,
+      stopId,
+      active,
+      detached,
+      target,
+      updated,
+      canResume: !session || session.can_resume !== false,
+      canConfig: true,
+      isCodex: source === 'codex' || stationSessionLooksCodex(actionId || canonicalId),
+    });
+  };
+  const { sessions } = stationCollectSessionSet();
+  for (const session of sessions) addTarget(session);
+  for (const [id, meta] of sessionMetadataById) {
+    addTarget({ session_id: id, ...meta });
+  }
+  return [...rows.values()]
+    .sort((a, b) =>
+      Number(b.target) - Number(a.target)
+      || Number(b.active) - Number(a.active)
+      || Number(!!b.liveId) - Number(!!a.liveId)
+      || b.updated - a.updated
+      || a.label.localeCompare(b.label)
+    )
+    .slice(0, limit);
+}
+
+function stationMakeExternalTargetFromDock(row) {
+  const target = row?.liveId || row?.id;
+  if (!target) return;
+  focusSessionWindow(target);
+  stationRenderControlsDock('external');
+}
+
+function stationRenderExternalTargetsSection(parent, controls) {
+  const section = stationDockSection(parent, 'External targets');
+  let rows = [];
+  try {
+    rows = stationExternalTargetRowsForDock(8);
+  } catch (err) {
+    console.warn('Station external target collection failed:', err);
+    stationDockEmpty(section, err?.message || 'External target metadata could not be read.').classList.add('error');
+    return;
+  }
+  stationDockRow(section, 'selected', controls.sessionLabel || controls.sessionSelection || '--');
+  stationDockRow(section, 'available', String(rows.length));
+  if (!rows.length) {
+    stationDockEmpty(section, 'No external sessions are available yet.');
+    stationDockActions(section, [
+      { label: 'New external', onClick: () => stationOpenSessionLaunchDock({ focus: 'agent' }) },
+      stationDockRouteAction('Route sessions tab', 'sessions', 'recent'),
+    ]);
+    return;
+  }
+  for (const row of rows) {
+    const actions = [
+      { label: row.target ? 'Target' : 'Make target', primary: !row.target, disabled: row.target, onClick: () => stationMakeExternalTargetFromDock(row) },
+      row.liveId ? { label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: row.liveId }) } : null,
+      row.attachId ? { label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: row.attachId }) } : null,
+      row.canResume ? { label: 'Resume', onClick: () => stationHandleSessionAction({ action: 'resume', session_id: row.id }) } : null,
+      row.canConfig ? { label: 'Config', onClick: () => stationHandleSessionAction({ action: 'config', session_id: row.id }) } : null,
+      row.stopId ? { label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: row.stopId }) } : null,
+      { label: 'Details', onClick: () => stationRenderSessionsDock(row.id) },
+      { label: 'Copy id', onClick: () => copyTextToClipboard(row.id) },
+    ];
+    stationDockCard(section, {
+      title: row.label,
+      meta: `${prettyAgentName(row.source) || row.source} / ${row.target ? 'target' : row.status}`,
+      detail: row.detail || row.id,
+      active: row.target,
+      rows: [
+        ['window', row.liveId ? shortSessionId(row.liveId) : (row.detached ? 'detached' : 'not attached')],
+        ['actions', row.actionId ? shortSessionId(row.actionId) : '--'],
+      ],
+      actions,
+    });
+  }
+}
+
 function stationRenderControlsDock(sectionName = 'overview') {
   const controls = stationBuildControlsSummary();
   const body = stationDockBegin('controls', 'Control Surfaces', `${controls.backend || 'agent'} / ${controls.sandbox || 'sandbox'}`);
@@ -17052,6 +17180,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   stationRenderExternalBackendEditor(body, controls);
   stationRenderClaudeSessionSection(body, controls);
   stationRenderGeminiSessionSection(body, controls);
+  stationRenderExternalTargetsSection(body, controls);
   stationRenderLaunchReadinessSection(body, {
     title: 'Next launch',
     allowStart: true,
