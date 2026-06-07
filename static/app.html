@@ -376,7 +376,7 @@ html, body {
   background: transparent;
   color: transparent;
   cursor: pointer;
-  pointer-events: auto;
+  pointer-events: none;
 }
 .station-pane.station-dom-fallback .station-hotspots {
   pointer-events: auto;
@@ -390,6 +390,7 @@ html, body {
   border-radius: 4px;
   background: rgba(17, 17, 27, 0.72);
   color: var(--text);
+  pointer-events: auto;
   font-size: 10px;
   line-height: 1.2;
   text-align: left;
@@ -11813,6 +11814,7 @@ function stationSyncDockNav(kind = document.getElementById('station-dock')?.data
 
 function stationMaybeRestoreDock() {
   if (activeTab !== 'station' || stationDockRestorePending) return;
+  if (station && !stationDomFallback) return;
   const dock = document.getElementById('station-dock');
   if (!dock || !dock.classList.contains('hidden')) return;
   const state = stationLoadDockState();
@@ -13118,6 +13120,8 @@ let stationLastHotspotDispatch = { target: '', at: 0 };
 function stationDispatchHotspot(target, ev) {
   const name = String(target || '');
   if (!name) return;
+  const keyboardActivation = ev && ev.detail === 0;
+  if (station && !stationDomFallback && !keyboardActivation) return;
   const at = performance.now();
   if (stationLastHotspotDispatch.target === name && at - stationLastHotspotDispatch.at < 220) {
     ev?.preventDefault?.();
