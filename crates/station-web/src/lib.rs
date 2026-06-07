@@ -2558,16 +2558,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            86.0,
-            "route log",
-            "activity",
-            Some("log"),
-            C_TEAL_CSS,
-        );
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row(x, yy, "retained", &events.len().to_string());
         yy += 22.0;
         let latest = events.last();
@@ -2693,16 +2684,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            94.0,
-            "route context",
-            "activity",
-            Some("context"),
-            C_BLUE_CSS,
-        );
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row(x, yy, "source", &nonempty(&ctx.source, "--"));
         yy += 22.0;
         self.panel_row(x, yy, "session", &truncate(&ctx.session_id, 42));
@@ -2824,16 +2806,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            94.0,
-            "route managed",
-            "activity",
-            Some("managed"),
-            C_MAUVE_CSS,
-        );
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row(x, yy, "session", &truncate(&managed.session_id, 42));
         yy += 22.0;
         self.panel_row_color(
@@ -2997,16 +2970,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            94.0,
-            "route changes",
-            "activity",
-            Some("changes"),
-            C_YELLOW_CSS,
-        );
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row_color(
             x,
             yy,
@@ -3142,16 +3106,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            96.0,
-            "route sessions",
-            "sessions",
-            Some("recent"),
-            C_TEAL_CSS,
-        );
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row(x, yy, "active", &sessions.active.to_string());
         yy += 22.0;
         self.panel_row(x, yy, "external", &sessions.external.to_string());
@@ -3359,17 +3314,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            102.0,
-            "route worktrees",
-            "sessions",
-            Some("worktrees"),
-            C_BLUE_CSS,
-        );
-
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row(
             x,
             yy,
@@ -3484,25 +3429,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            78.0,
-            "route net",
-            "settings",
-            Some("network"),
-            C_PEACH_CSS,
-        );
-        self.nav_button(
-            x + 100.0,
-            y + 38.0,
-            80.0,
-            "route video",
-            "displays",
-            None,
-            C_PEACH_CSS,
-        );
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row(x, yy, "peers", &hosts.len().saturating_sub(1).to_string());
         yy += 22.0;
         self.panel_row(x, yy, "streams", &displays.len().to_string());
@@ -3636,16 +3563,7 @@ impl StationInner {
             C_TEXT_CSS,
             "bold",
         );
-        self.nav_button(
-            x + 14.0,
-            y + 38.0,
-            94.0,
-            "route control",
-            "activity",
-            Some("control"),
-            C_MAUVE_CSS,
-        );
-        let mut yy = y + 82.0 - self.panel_scroll;
+        let mut yy = y + 58.0 - self.panel_scroll;
         self.section_title_color(x, yy, "Operator controls", C_TEAL_CSS);
         yy += 22.0;
         let prompt_label = if controls.prompt_mode == "steer" {
@@ -3977,74 +3895,6 @@ impl StationInner {
         yy += 22.0;
         self.panel_row(x, yy, "backend", &nonempty(&controls.cu_backend, "auto"));
         yy += 30.0;
-
-        self.section_title_color(x, yy, "Dashboard routes", C_TEAL_CSS);
-        yy += 22.0;
-        self.nav_button(
-            x + 14.0,
-            yy - 14.0,
-            58.0,
-            "stats",
-            "stats",
-            None,
-            C_TEAL_CSS,
-        );
-        self.nav_button(
-            x + 82.0,
-            yy - 14.0,
-            68.0,
-            "terminal",
-            "terminal",
-            Some("tui"),
-            C_BLUE_CSS,
-        );
-        self.nav_button(
-            x + 160.0,
-            yy - 14.0,
-            58.0,
-            "shell",
-            "terminal",
-            Some("shell"),
-            C_BLUE_CSS,
-        );
-        self.nav_button(
-            x + 228.0,
-            yy - 14.0,
-            86.0,
-            "agent settings",
-            "settings",
-            Some("agent"),
-            C_MAUVE_CSS,
-        );
-        yy += 25.0;
-        self.nav_button(
-            x + 14.0,
-            yy - 14.0,
-            96.0,
-            "network",
-            "settings",
-            Some("network"),
-            C_PEACH_CSS,
-        );
-        self.nav_button(
-            x + 120.0,
-            yy - 14.0,
-            86.0,
-            "debug",
-            "settings",
-            Some("debug"),
-            C_PEACH_CSS,
-        );
-        self.nav_button(
-            x + 216.0,
-            yy - 14.0,
-            72.0,
-            "account",
-            "settings",
-            Some("account"),
-            C_TEAL_CSS,
-        );
-        yy += 28.0;
 
         self.section_title_color(x, yy, "Active target", C_PEACH_CSS);
         yy += 22.0;
@@ -4872,29 +4722,6 @@ impl StationInner {
             .stroke_rect(x as f64, (y - 6.0) as f64, w as f64, 5.0);
     }
 
-    fn nav_button(
-        &mut self,
-        x: f32,
-        y: f32,
-        w: f32,
-        label: &str,
-        tab: &str,
-        subtab: Option<&str>,
-        color: &str,
-    ) {
-        self.pill_at(x, y, w, 22.0, label, color);
-        self.hit_zones.push(HitZone::new(
-            x,
-            y,
-            w,
-            22.0,
-            HitAction::Navigate {
-                tab: tab.to_string(),
-                subtab: subtab.map(ToString::to_string),
-            },
-        ));
-    }
-
     fn approval_button(
         &mut self,
         x: f32,
@@ -5186,11 +5013,6 @@ impl StationInner {
                     "type": "open_display",
                     "host_id": host_id,
                     "display_id": display_id,
-            })),
-            HitAction::Navigate { tab, subtab } => Some(serde_json::json!({
-                    "type": "navigate",
-                    "tab": tab,
-                    "subtab": subtab,
             })),
             HitAction::ContextAction { action, id } => Some(serde_json::json!({
                     "type": "context_action",
@@ -6393,10 +6215,6 @@ enum HitAction {
     OpenDisplay {
         host_id: String,
         display_id: String,
-    },
-    Navigate {
-        tab: String,
-        subtab: Option<String>,
     },
     ContextAction {
         action: String,
