@@ -17160,6 +17160,184 @@ function stationRenderExternalTargetsSection(parent, controls) {
   }
 }
 
+function stationOperationsLatestActivityEvent() {
+  const events = typeof stationActivityEvents === 'function' ? stationActivityEvents() : [];
+  return Array.isArray(events) && events.length ? events[events.length - 1] : null;
+}
+
+function stationOperationsManagedReadiness(managed) {
+  const ready = stationManagedReadiness(managed);
+  if (ready.base) return ready.base;
+  if (managed?.rewindOnly) return 'rewind-only pressure';
+  if (ready.canRewind) return 'rewind draft ready';
+  if (ready.canBackout) return 'backout record ready';
+  if (ready.canInspect) return 'anchor selected';
+  return 'needs managed draft';
+}
+
+function stationOperationsContextLine(context, managed) {
+  if (!context?.available) return 'No context snapshot yet';
+  const pct = context.effectiveWindow
+    ? `${Math.round((context.tokens / context.effectiveWindow) * 100)}%`
+    : '--';
+  return [
+    `${stationCompactNumber(context.tokens)} / ${stationCompactNumber(context.effectiveWindow)} tokens`,
+    `${pct} effective`,
+    managed?.status || '',
+    context.topCategories?.[0]?.label ? `top ${context.topCategories[0].label}` : '',
+  ].filter(Boolean).join(' / ');
+}
+
+function stationOperationsActivityLine(event) {
+  if (!event) return 'No retained activity yet';
+  return [
+    event.ts || '--',
+    stationActivityLevelFor(event),
+    stationActivitySourceFor(event),
+    compactSessionText(event.msg || '', 96),
+  ].filter(Boolean).join(' / ');
+}
+
+function stationOperationsBriefPayload(context, managed, sessions, controls) {
+  const event = stationOperationsLatestActivityEvent();
+  let targets = [];
+  try {
+    targets = stationExternalTargetRowsForDock(4);
+  } catch (_) {
+    targets = [];
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    target: {
+      id: controls.sessionId || '',
+      label: controls.sessionLabel || '',
+      selection: controls.sessionSelection || '',
+      source: controls.sessionSource || '',
+      state: controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle'),
+      command: controls.sessionCommand || controls.command || '',
+      live_id: controls.sessionLiveId || '',
+      action_id: controls.sessionActionId || '',
+      goal_status: controls.sessionGoalStatus || '',
+      goal: controls.sessionGoalObjective || '',
+    },
+    activity: event ? {
+      id: stationActivityEventKey(event),
+      time: event.ts || '',
+      level: stationActivityLevelFor(event),
+      source: stationActivitySourceFor(event),
+      session_id: event.sessionId || '',
+      text: stationActivityEventCopyText(event),
+    } : null,
+    context: {
+      available: !!context.available,
+      source: context.source || '',
+      session_id: context.sessionId || '',
+      turn: context.turn || '',
+      used_tokens: context.tokens || 0,
+      effective_window: context.effectiveWindow || 0,
+      hard_window: context.hardWindow || 0,
+      top_lanes: (context.topCategories || []).slice(0, 3).map(item => ({
+        label: item.label || item.category || '',
+        tokens: item.value || 0,
+        count: item.count || 0,
+      })),
+    },
+    managed: {
+      session_id: managed.sessionId || '',
+      mode: managed.mode || '',
+      status: managed.status || '',
+      readiness: stationOperationsManagedReadiness(managed),
+      rewind_only: !!managed.rewindOnly,
+      anchors: managed.anchors || 0,
+      records: managed.records || 0,
+      branches: managed.branches || 0,
+      error: managed.error || '',
+    },
+    sessions: {
+      total: sessions.total || 0,
+      active: sessions.active || 0,
+      external: sessions.external || 0,
+      index_status: sessions.indexStatus || '',
+      latest_task: sessions.latestTask || '',
+      latest_source: sessions.latestSource || '',
+      latest_updated: sessions.latestUpdated || '',
+    },
+    external: {
+      backend: controls.backend || 'none',
+      default_command: controls.command || '',
+      targets: targets.map(row => ({
+        id: row.id || '',
+        label: row.label || '',
+        source: row.source || '',
+        status: row.status || '',
+        target: !!row.target,
+        active: !!row.active,
+      })),
+    },
+  };
+}
+
+function stationOperationsBriefText(payload) {
+  const target = payload.target || {};
+  const activity = payload.activity || {};
+  const context = payload.context || {};
+  const managed = payload.managed || {};
+  const sessions = payload.sessions || {};
+  const external = payload.external || {};
+  return [
+    `Target: ${target.label || shortSessionId(target.id) || 'daemon'} (${target.selection || 'current'}, ${target.state || 'idle'}, ${target.source || 'intendant'})`,
+    `Activity: ${activity.text ? compactSessionText(activity.text, 140) : 'no retained activity'}`,
+    `Context: ${context.available ? `${stationCompactNumber(context.used_tokens)} / ${stationCompactNumber(context.effective_window)} tokens` : 'none'}${context.turn ? `, ${context.turn}` : ''}`,
+    `Managed: ${managed.mode || 'vanilla'} / ${managed.status || 'unknown'} / ${managed.readiness || 'unknown'} (${managed.anchors || 0} anchors, ${managed.records || 0} records)`,
+    `Sessions: ${sessions.active || 0} active of ${sessions.total || 0}; ${sessions.external || 0} external; latest ${sessions.latest_task || 'none'}`,
+    `External: ${external.backend || 'none'}${external.targets?.length ? `; targets ${external.targets.map(row => `${row.label || shortSessionId(row.id)}:${row.status}`).join(', ')}` : ''}`,
+  ].join('\n');
+}
+
+async function stationCopyOperationsBrief(payload, asJson = false) {
+  const text = asJson
+    ? JSON.stringify(payload, null, 2)
+    : stationOperationsBriefText(payload);
+  await copyTextToClipboard(text);
+  showControlToast?.('success', asJson ? 'Operations JSON copied' : 'Operations brief copied');
+}
+
+function stationSeedManagedFromOperationsBrief() {
+  stationRenderManagedDock('rewind');
+  requestAnimationFrame(() => {
+    stationSeedManagedDraftFromContext();
+    stationCopyManagedFormToLegacy();
+    stationRefreshManagedDockActionState(stationBuildManagedSummary(stationBuildContextSummary()));
+    document.getElementById('station-managed-reason')?.focus();
+  });
+}
+
+function stationRenderOperationsBriefSection(parent, controls) {
+  const context = stationBuildContextSummary();
+  const managed = stationBuildManagedSummary(context);
+  const sessions = stationBuildSessionsSummary();
+  const payload = stationOperationsBriefPayload(context, managed, sessions, controls);
+  const latestEventId = payload.activity?.id || '';
+  const section = stationDockSection(parent, 'Operations brief');
+  stationDockRow(section, 'target', `${controls.sessionLabel || controls.sessionSelection || 'daemon'} / ${controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle')}`);
+  stationDockRow(section, 'activity', stationOperationsActivityLine(stationOperationsLatestActivityEvent()));
+  stationDockRow(section, 'context', stationOperationsContextLine(context, managed));
+  stationDockRow(section, 'managed', `${managed.mode || 'vanilla'} / ${stationOperationsManagedReadiness(managed)} / ${managed.anchors || 0} anchors`);
+  stationDockRow(section, 'sessions', `${sessions.active || 0} active / ${sessions.total || 0} total / ${sessions.external || 0} external`);
+  stationDockRow(section, 'external', `${controls.backend || 'none'} / ${controls.command || controls.sessionCommand || '--'}`);
+  stationDockActions(section, [
+    { label: 'Activity', onClick: () => stationRenderActivityDock(latestEventId) },
+    { label: 'Context', onClick: () => stationRenderContextDock(stationSelectedContextPart) },
+    { label: 'Managed', onClick: () => stationRenderManagedDock(managed.rewindOnly ? 'rewind' : '') },
+    { label: 'Seed rewind', primary: managed.rewindOnly || !!context.available, disabled: !context.available, onClick: stationSeedManagedFromOperationsBrief },
+    { label: 'Sessions', onClick: () => stationRenderSessionsDock(controls.sessionId || '') },
+    { label: 'Target controls', onClick: () => stationRenderControlsDock('external') },
+    controls.sessionCanFocus ? { label: 'Focus target', onClick: () => stationHandleActivityAction({ action: 'target' }) } : null,
+    { label: 'Copy brief', onClick: () => stationCopyOperationsBrief(payload, false) },
+    { label: 'Copy JSON', onClick: () => stationCopyOperationsBrief(payload, true) },
+  ]);
+}
+
 function stationRenderControlsDock(sectionName = 'overview') {
   const controls = stationBuildControlsSummary();
   const body = stationDockBegin('controls', 'Control Surfaces', `${controls.backend || 'agent'} / ${controls.sandbox || 'sandbox'}`);
@@ -17175,6 +17353,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
     controls.sessionCanInterrupt ? { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) } : null,
   ]);
 
+  stationRenderOperationsBriefSection(body, controls);
   stationRenderLiveStatusSection(body, controls);
   stationRenderDashboardRoutesSection(body);
   stationRenderExternalBackendEditor(body, controls);
