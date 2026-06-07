@@ -15561,6 +15561,176 @@ function stationRenderSessionConfigSection(parent, sessionOrId) {
   ]);
 }
 
+function stationSessionContinuityIds(sessionOrId, live = null) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const meta = sessionConfigMetadata(session || sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  const ids = new Set([
+    sid,
+    meta.session_id,
+    meta.sessionId,
+    meta.backendSessionId,
+    meta.backend_session_id,
+    meta.intendantSessionId,
+    meta.intendant_session_id,
+    live?.canonicalId,
+    live?.backendId,
+    live?.wrapperId,
+    live?.liveId,
+    live?.actionId,
+    sessionWindowTargetForLogSession(sid),
+    ...relatedSessionIdsForSession(sid),
+  ].map(id => String(id || '').trim()).filter(Boolean));
+  for (const id of Array.from(ids)) {
+    for (const related of relatedSessionIdsForSession(id)) ids.add(related);
+    const target = sessionWindowTargetForLogSession(id);
+    if (target) ids.add(target);
+  }
+  return Array.from(ids);
+}
+
+function stationSessionContinuityLatestEvent(ids) {
+  const idSet = new Set((ids || []).map(id => String(id || '').trim()).filter(Boolean));
+  const events = typeof stationActivityEvents === 'function' ? stationActivityEvents() : [];
+  for (let i = events.length - 1; i >= 0; i -= 1) {
+    const eventSessionId = String(events[i]?.sessionId || events[i]?.session_id || '').trim();
+    if (!eventSessionId) continue;
+    if (idSet.has(eventSessionId) || idSet.has(sessionWindowTargetForLogSession(eventSessionId))) {
+      return events[i];
+    }
+  }
+  return null;
+}
+
+function stationSessionContinuityManagedTarget(ids) {
+  const idSet = new Set((ids || []).map(id => String(id || '').trim()).filter(Boolean));
+  const options = typeof managedContextSessionOptions === 'function' ? managedContextSessionOptions() : [];
+  for (const [sessionId] of options) {
+    const sid = String(sessionId || '').trim();
+    if (sid && idSet.has(sid)) return sid;
+  }
+  return '';
+}
+
+function stationSessionContinuityContextScope(context, ids) {
+  if (!context?.available) return 'not loaded';
+  const idSet = new Set((ids || []).map(id => String(id || '').trim()).filter(Boolean));
+  if (!context.sessionId) return 'foreground/global';
+  if (idSet.has(context.sessionId) || idSet.has(sessionWindowTargetForLogSession(context.sessionId))) {
+    return 'selected session';
+  }
+  return `other: ${shortSessionId(context.sessionId)}`;
+}
+
+function stationSessionContinuityPayload(sessionOrId, live = null) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  const descriptor = live || stationExternalLiveThreadDescriptor(session || sid);
+  const ids = stationSessionContinuityIds(session || sid, descriptor);
+  const latestEvent = stationSessionContinuityLatestEvent(ids);
+  const context = stationBuildContextSummary();
+  const managed = stationBuildManagedSummary(context);
+  const managedTarget = stationSessionContinuityManagedTarget(ids);
+  const meta = sessionConfigMetadata(session || sid);
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || '';
+  return {
+    session_id: sid,
+    related_ids: ids,
+    source: source || session?.source || '',
+    title: stationSessionTask(session) || stationSessionShortLabel(sid) || sid,
+    status: session?.status || meta.phase || '',
+    external: descriptor ? {
+      source: descriptor.source || '',
+      canonical_id: descriptor.canonicalId || '',
+      live_id: descriptor.liveId || '',
+      action_id: descriptor.actionId || '',
+      target: !!descriptor.target,
+      detached: !!descriptor.detached,
+      phase: descriptor.phase || '',
+      steer: !!descriptor.steer,
+      interrupt: !!descriptor.interrupt,
+    } : null,
+    activity: latestEvent ? {
+      id: stationActivityEventKey(latestEvent),
+      time: latestEvent.ts || '',
+      level: stationActivityLevelFor(latestEvent),
+      source: stationActivitySourceFor(latestEvent),
+      text: stationActivityEventCopyText(latestEvent),
+    } : null,
+    context: {
+      scope: stationSessionContinuityContextScope(context, ids),
+      source: context.source || '',
+      session_id: context.sessionId || '',
+      turn: context.turn || '',
+      used_tokens: context.tokens || 0,
+      effective_window: context.effectiveWindow || 0,
+      top_lane: context.topCategories?.[0]?.label || '',
+    },
+    managed: {
+      target_session_id: managedTarget || '',
+      current_session_id: managed.sessionId || '',
+      selected: !!managedTarget,
+      mode: managed.mode || '',
+      status: managed.status || '',
+      readiness: stationOperationsManagedReadiness(managed),
+      anchors: managed.anchors || 0,
+      records: managed.records || 0,
+      rewind_only: !!managed.rewindOnly,
+    },
+  };
+}
+
+async function stationCopySessionContinuityPayload(sessionOrId, live = null) {
+  const payload = stationSessionContinuityPayload(sessionOrId, live);
+  await copyTextToClipboard(JSON.stringify(payload, null, 2));
+  showControlToast?.('success', 'Session continuity JSON copied');
+}
+
+function stationOpenManagedForSessionContinuity(sessionOrId, live = null, seed = false) {
+  const payload = stationSessionContinuityPayload(sessionOrId, live);
+  if (payload.managed.target_session_id) stationSetManagedSession(payload.managed.target_session_id);
+  stationRenderManagedDock(seed ? 'rewind' : '');
+  if (!seed) return;
+  requestAnimationFrame(() => {
+    stationSeedManagedDraftFromContext();
+    document.getElementById('station-managed-reason')?.focus();
+  });
+}
+
+function stationRenderSessionContinuitySection(parent, sessionOrId, live = null) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  if (!sid) return;
+  const descriptor = live || stationExternalLiveThreadDescriptor(session || sid);
+  const payload = stationSessionContinuityPayload(session || sid, descriptor);
+  const latestEventId = payload.activity?.id || '';
+  const targetId = descriptor?.liveId || (sessionWindows.has(sid) ? sid : '');
+  const section = stationDockSection(parent, 'Session continuity');
+  stationDockRow(section, 'target', descriptor?.target ? 'prompt target' : (targetId ? 'available' : 'not attached'));
+  stationDockRow(section, 'activity', payload.activity ? `${payload.activity.time || '--'} / ${payload.activity.level} / ${compactSessionText(payload.activity.text)}` : 'no retained event');
+  stationDockRow(section, 'context', `${payload.context.scope} / ${stationCompactNumber(payload.context.used_tokens)} tokens`);
+  stationDockRow(section, 'managed', `${payload.managed.mode || 'vanilla'} / ${payload.managed.readiness || 'unknown'} / ${payload.managed.anchors || 0} anchors`);
+  stationDockRow(section, 'external', payload.external ? `${prettyAgentName(payload.external.source) || payload.external.source} / ${payload.external.phase || 'idle'}${payload.external.detached ? ' / detached' : ''}` : 'internal');
+  stationDockActions(section, [
+    latestEventId ? { label: 'Activity', onClick: () => stationRenderActivityDock(latestEventId) } : null,
+    { label: 'Context', onClick: () => stationRenderContextDock(stationSelectedContextPart) },
+    { label: 'Managed', onClick: () => stationOpenManagedForSessionContinuity(session || sid, descriptor) },
+    { label: 'Seed rewind', primary: payload.context.scope === 'selected session' || payload.managed.rewind_only, disabled: !payload.context.used_tokens, onClick: () => stationOpenManagedForSessionContinuity(session || sid, descriptor, true) },
+    targetId ? {
+      label: descriptor?.target ? 'Focus target' : 'Make target',
+      primary: !descriptor?.target,
+      onClick: () => {
+        focusSessionWindow(targetId);
+        stationRenderSessionsDock(sid);
+      },
+    } : null,
+    descriptor?.attachId ? { label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: descriptor.attachId }) } : null,
+    descriptor?.stopId ? { label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: descriptor.stopId }) } : null,
+    { label: 'Controls', onClick: () => stationRenderControlsDock('external') },
+    { label: 'Copy JSON', onClick: () => stationCopySessionContinuityPayload(session || sid, descriptor) },
+  ]);
+}
+
 function stationRenderSessionDetailSection(parent, sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -15576,11 +15746,13 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockRow(section, 'status', session?.status || meta.phase || '--');
   stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
+  const continuityLive = stationExternalLiveThreadDescriptor(session);
+  stationRenderSessionContinuitySection(parent, session, continuityLive);
   stationRenderSessionRenameSection(parent, session);
   stationRenderSessionCleanupSection(parent, session);
   stationRenderSessionMediaSection(parent, session);
   stationRenderSessionLogSection(parent, session);
-  const live = stationRenderExternalLiveThreadSection(parent, session);
+  const live = stationRenderExternalLiveThreadSection(parent, session) || continuityLive;
   stationRenderSessionConfigSection(parent, session);
   stationRenderCodexThreadActionsSection(parent, stationCodexThreadActionSessionId(session, live) || sid, session);
 }
