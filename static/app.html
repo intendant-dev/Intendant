@@ -11078,14 +11078,17 @@ function stationSessionWindowHistoryEvent(item, win, index) {
 }
 
 function stationSessionWindowHistoryEvents(limit = 80) {
+  const safeLimit = Math.max(1, Number(limit) || 80);
   const events = [];
   for (const win of sessionWindows.values()) {
     const history = ensureSessionWindowHistory(win);
-    history.forEach((item, index) => {
+    const start = Math.max(0, history.length - safeLimit);
+    for (let index = start; index < history.length; index++) {
+      const item = history[index];
       events.push(stationSessionWindowHistoryEvent(item, win, `${win.sessionId || 'session'}:${index}`));
-    });
+    }
   }
-  return events.filter(Boolean).slice(-limit);
+  return events.filter(Boolean).slice(-safeLimit);
 }
 
 function stationLogScanContainers() {
@@ -30234,10 +30237,20 @@ function createLogReplayAppendBatch() {
 
 function flushLogReplayAppendBatch() {
   const batch = logReplayAppendBatch;
-  if (!batch || batch.added <= 0) return;
+  if (!batch) return;
+
+  let hasSessionItems = false;
+  for (const state of batch.sessionFragments.values()) {
+    if (state?.items?.length > 0) {
+      hasSessionItems = true;
+      break;
+    }
+  }
+  const hasMainItems = batch.mainFragment.childNodes.length > 0;
+  if (!hasMainItems && !hasSessionItems) return;
 
   const stream = currentMainLogContainer();
-  if (stream && batch.mainFragment.childNodes.length > 0) {
+  if (stream && hasMainItems) {
     stream.appendChild(batch.mainFragment);
     pruneMainLogContainer(stream);
     const liveStream = document.getElementById('log-stream');
@@ -30253,6 +30266,54 @@ function flushLogReplayAppendBatch() {
   }
   batch.sessionFragments.clear();
   batch.added = 0;
+}
+
+function sessionWindowRecordFromLogCommand(c) {
+  const sid = String(c?.session_id || c?.sessionId || '').trim();
+  if (!sid) return null;
+  const content = c?.content ?? '';
+  if (!content && c?.kind !== 'rollback_marker') return null;
+  return {
+    session_id: sid,
+    ts: c?.ts || c?.timestamp || '',
+    level: c?.level || 'info',
+    source: c?.source || c?.event || c?.level || 'system',
+    content,
+    kind: c?.kind || '',
+    output_id: c?.output_id || c?.outputId || '',
+    item_id: c?.item_id || c?.itemId || '',
+    user_turn_index: c?.user_turn_index ?? c?.userTurnIndex,
+    user_turn_revision: c?.user_turn_revision ?? c?.userTurnRevision,
+    replacement_for_user_turn_index: c?.replacement_for_user_turn_index ?? c?.replacementForUserTurnIndex,
+    superseded: !!c?.superseded,
+    superseded_reason: c?.superseded_reason || c?.supersededReason || '',
+    collapsible: !!c?.collapsible,
+  };
+}
+
+function appendSessionWindowRecord(record, batch = null) {
+  const sid = String(record?.session_id || record?.sessionId || '').trim();
+  if (!sid) return;
+  const targetSid = sessionWindowTargetForLogSession(sid);
+  if (!targetSid) return;
+  const win = sessionWindows.get(targetSid) || (processingLogReplay ? null : ensureSessionWindow(targetSid));
+  if (!win) return;
+  const normalized = { ...record, session_id: targetSid };
+  const shouldFollow = sessionWindowShouldFollowNextOutput(win);
+  if (batch) {
+    let state = batch.sessionFragments.get(targetSid);
+    if (!state || state.win !== win) {
+      state = { win, items: [], shouldFollow };
+      batch.sessionFragments.set(targetSid, state);
+    }
+    state.items.push(normalized);
+    return;
+  }
+  appendSessionWindowHistory(win, normalized, shouldFollow);
+}
+
+function appendLogCommandToSessionWindow(c, batch = null) {
+  appendSessionWindowRecord(sessionWindowRecordFromLogCommand(c), batch);
 }
 
 function appendLogEntryToSessionWindow(entry, batch = null) {
@@ -30707,10 +30768,14 @@ function createLogScaffold(c, extraClass) {
   return { entry, hostId };
 }
 
-function appendLogEntryElement(entry) {
+function appendLogEntryElement(entry, sessionRecord = null) {
   if (logReplayAppendBatch && !entry.classList.contains('command-output-group')) {
     logReplayAppendBatch.mainFragment.appendChild(entry);
-    appendLogEntryToSessionWindow(entry, logReplayAppendBatch);
+    if (sessionRecord) {
+      appendSessionWindowRecord(sessionRecord, logReplayAppendBatch);
+    } else {
+      appendLogEntryToSessionWindow(entry, logReplayAppendBatch);
+    }
     logEntryCount++;
     logReplayAppendBatch.added++;
     return;
@@ -30721,7 +30786,11 @@ function appendLogEntryElement(entry) {
   const container = currentMainLogContainer() || stream;
   if (!container) return;
   container.appendChild(entry);
-  appendLogEntryToSessionWindow(entry);
+  if (processingLogReplay) {
+    appendSessionWindowRecord(sessionRecord);
+  } else {
+    appendLogEntryToSessionWindow(entry);
+  }
   logEntryCount++;
   pruneMainLogContainer(container);
   if (!concurrentLogDetachedFragment && autoScroll && stream) stream.scrollTop = stream.scrollHeight;
@@ -30830,6 +30899,7 @@ function commandOutputSessionCloneView(group, win) {
 }
 
 function ensureCommandOutputSessionClone(group, c) {
+  if (processingLogReplay) return;
   if (!group || !group.entry) return;
   const sid = String(c?.session_id || '').trim();
   if (!sid) return;
@@ -30857,7 +30927,11 @@ function ensureCommandOutputSessionClone(group, c) {
 }
 
 function appendCommandOutputChunk(group, c) {
-  ensureCommandOutputSessionClone(group, c);
+  if (processingLogReplay) {
+    appendLogCommandToSessionWindow(c, logReplayAppendBatch);
+  } else {
+    ensureCommandOutputSessionClone(group, c);
+  }
   const text = c.content ?? '';
   const sessionScrollStates = new Map();
   for (const view of commandOutputCloneViews(group)) {
@@ -30877,7 +30951,7 @@ function appendCommandOutputChunk(group, c) {
   group.chunks += 1;
   if ((c.level || '').toLowerCase() === 'warn') group.warns += 1;
   updateCommandOutputSummary(group);
-  if (!group.finalized && text) {
+  if (!group.finalized && text && !processingLogReplay) {
     appendCommandOutputText(group.body, text);
     for (const view of commandOutputCloneViews(group)) {
       if (view.entry.classList.contains('expanded')) {
@@ -31046,7 +31120,7 @@ function renderDiffLogEntry(c) {
   entry.appendChild(toggle);
   appendCopyLogEntryButton(entry, diffText);
   wireDiffLogEntry(entry);
-  appendLogEntryElement(entry);
+  appendLogEntryElement(entry, sessionWindowRecordFromLogCommand(c));
 }
 
 function shouldRenderMarkdownLog(c) {
@@ -31294,7 +31368,7 @@ function renderLogEntry(c) {
     wireCollapsibleLogEntry(entry, cnt);
   }
 
-  appendLogEntryElement(entry);
+  appendLogEntryElement(entry, sessionWindowRecordFromLogCommand(c));
 }
 
 function appendSessionWindowOnlyLogEntry(entry) {
@@ -31307,6 +31381,10 @@ function renderSessionWindowLogEntryOnly(c) {
   const content = c.content || '';
   if (!content && c.kind !== 'rollback_marker') return;
   inferSessionPhaseFromLog(c);
+  if (processingLogReplay) {
+    appendLogCommandToSessionWindow(c, logReplayAppendBatch);
+    return;
+  }
   const entry = buildSessionWindowLogEntry(c);
   if (entry) appendSessionWindowOnlyLogEntry(entry);
 }
@@ -43744,15 +43822,33 @@ function onSessionEnded(sessionId, reason) {
   if (sessionsLoaded) loadSessions();
 }
 
+const TASK_TEXTAREA_MIN_HEIGHT_PX = 28;
+const TASK_TEXTAREA_MAX_HEIGHT_PX = 120;
+const TASK_TEXTAREA_ESTIMATED_LINE_HEIGHT_PX = 17;
+const TASK_TEXTAREA_VERTICAL_PADDING_PX = 10;
+const TASK_TEXTAREA_ESTIMATED_CHARS_PER_LINE = 72;
+
+function estimateTaskTextareaRows(value) {
+  const text = String(value || '');
+  if (!text) return 1;
+  return text.split('\n').reduce((rows, line) => {
+    return rows + Math.max(1, Math.ceil(line.length / TASK_TEXTAREA_ESTIMATED_CHARS_PER_LINE));
+  }, 0);
+}
+
 function resizeTaskTextarea(input) {
   if (!input || input.tagName !== 'TEXTAREA') return;
   input._taskResizeFrame = 0;
-  if (!Number.isFinite(input._taskMaxHeightPx)) {
-    input._taskMaxHeightPx = Number.parseFloat(window.getComputedStyle(input).maxHeight);
-  }
-  const maxHeight = input._taskMaxHeightPx;
-  input.style.height = 'auto';
-  input.style.height = `${Math.min(input.scrollHeight, Number.isFinite(maxHeight) ? maxHeight : 120)}px`;
+  const rows = estimateTaskTextareaRows(input.value);
+  const height = Math.min(
+    TASK_TEXTAREA_MAX_HEIGHT_PX,
+    Math.max(
+      TASK_TEXTAREA_MIN_HEIGHT_PX,
+      rows * TASK_TEXTAREA_ESTIMATED_LINE_HEIGHT_PX + TASK_TEXTAREA_VERTICAL_PADDING_PX,
+    ),
+  );
+  input.style.height = `${height}px`;
+  input.style.overflowY = height >= TASK_TEXTAREA_MAX_HEIGHT_PX ? 'auto' : 'hidden';
 }
 
 function scheduleTaskTextareaResize(input) {
