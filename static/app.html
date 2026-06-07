@@ -11529,6 +11529,12 @@ function stationCommandEntries() {
       },
     },
     {
+      label: 'Session family',
+      detail: 'Open parent, side, fork, and sub-agent relationships for the current target',
+      tokens: 'session family relationships parent child side fork subagent topology',
+      run: () => stationOpenSessionFamilyDock(),
+    },
+    {
       label: 'Operator controls',
       detail: 'Input, approvals, backends, voice, browser',
       tokens: 'controls approvals backend codex gemini voice browser input',
@@ -16316,6 +16322,162 @@ async function stationCopySessionContinuityPayload(sessionOrId, live = null) {
   showControlToast?.('success', 'Session continuity JSON copied');
 }
 
+function stationSessionFamilyDefaultId() {
+  const candidates = [
+    resolvePromptTargetSessionId?.(),
+    currentSessionFullId,
+    foregroundSessionFullId,
+    daemonSessionFullId,
+    stationBuildSessionsSummary().recent?.[0]?.id,
+  ].map(id => String(id || '').trim()).filter(Boolean);
+  return candidates.find(id => stationFindSessionById(id) || sessionMetadataById.has(id) || sessionWindows.has(id)) || candidates[0] || '';
+}
+
+function stationOpenSessionFamilyDock(sessionId = '') {
+  const sid = String(sessionId || stationSessionFamilyDefaultId() || '').trim();
+  stationRenderSessionsDock(sid);
+}
+
+function stationSessionFamilyMember(id, role, kind = '', ephemeral = false) {
+  const sid = String(id || '').trim();
+  if (!sid) return null;
+  const session = stationFindSessionById(sid) || { session_id: sid };
+  const meta = sessionConfigMetadata(session || sid);
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || meta.source || '';
+  const phase = normalizeSessionPhase(session?.status || meta.phase || '');
+  const win = sessionWindows.get(sid) || null;
+  return {
+    id: sid,
+    role,
+    kind: kind || stationSessionRelationshipKind(session || sid) || '',
+    ephemeral: !!ephemeral,
+    label: stationSessionTask(session) || stationSessionShortLabel(sid) || shortSessionId(sid),
+    source,
+    status: phase || session?.status || meta.status || (win ? 'attached' : ''),
+    attached: !!win && !win.ended,
+    active: isSessionWindowEffectivelyActive(sid),
+    canAttach: canAttachSessionWindow(sid),
+    canStop: sessionWindowStopAvailability(sid).ok,
+  };
+}
+
+function stationSessionFamilyChildRows(parentId, meta = {}) {
+  const sid = String(parentId || '').trim();
+  const seen = new Set();
+  const rows = [];
+  const push = (id, kind = '', ephemeral = false) => {
+    const childId = String(id || '').trim();
+    if (!childId || seen.has(`${kind}:${childId}`)) return;
+    seen.add(`${kind}:${childId}`);
+    const row = stationSessionFamilyMember(childId, 'child', kind, ephemeral);
+    if (row) rows.push(row);
+  };
+  const pruned = pruneClosedSideChildrenForParent(sid, sessionMetadataById.get(sid) || meta || {});
+  for (const child of pruned?.children || []) {
+    push(child?.id, child?.kind, child?.ephemeral);
+  }
+  for (const rel of sessionRelationships.values()) {
+    if (rel.parentId === sid) push(rel.childId, rel.kind, rel.ephemeral);
+  }
+  rows.sort((a, b) =>
+    a.kind.localeCompare(b.kind)
+    || Number(b.active) - Number(a.active)
+    || Number(b.attached) - Number(a.attached)
+    || a.label.localeCompare(b.label)
+  );
+  return rows;
+}
+
+function stationSessionFamilyPayload(sessionOrId) {
+  const session = typeof sessionOrId === 'object' ? sessionOrId : stationFindSessionById(sessionOrId);
+  const sid = stationSessionId(session) || String(sessionOrId || '').trim();
+  if (!sid) return null;
+  const meta = sessionConfigMetadata(session || sid);
+  const parentId = String(meta.parentId || '').trim();
+  const kind = stationSessionRelationshipKind(session || sid);
+  const parent = parentId ? stationSessionFamilyMember(parentId, 'parent', kind, meta.relationshipEphemeral) : null;
+  const children = stationSessionFamilyChildRows(sid, meta);
+  const siblings = parentId
+    ? stationSessionFamilyChildRows(parentId, sessionMetadataById.get(parentId) || {})
+      .filter(row => row.id !== sid)
+      .map(row => ({ ...row, role: 'sibling' }))
+    : [];
+  const self = stationSessionFamilyMember(sid, 'self', kind, meta.relationshipEphemeral);
+  return {
+    generated_at: new Date().toISOString(),
+    session_id: sid,
+    self,
+    parent,
+    children,
+    siblings,
+    counts: {
+      parents: parent ? 1 : 0,
+      children: children.length,
+      siblings: siblings.length,
+      side: children.filter(row => row.kind === 'side').length,
+      fork: children.filter(row => row.kind === 'fork').length,
+      subagent: children.filter(row => row.kind === 'subagent').length,
+    },
+  };
+}
+
+async function stationCopySessionFamilyPayload(sessionOrId) {
+  const payload = stationSessionFamilyPayload(sessionOrId);
+  await copyTextToClipboard(JSON.stringify(payload, null, 2));
+  showControlToast?.('success', 'Session family JSON copied');
+}
+
+function stationSessionFamilyActions(member) {
+  if (!member?.id) return [];
+  return [
+    { label: 'Details', primary: true, onClick: () => stationRenderSessionsDock(member.id) },
+    member.attached ? { label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: member.id }) } : null,
+    member.canAttach ? { label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: member.id }) } : null,
+    member.kind === 'side' && sideCloseParamsForSession(member.id)
+      ? { label: 'Close side', danger: true, onClick: () => stationHandleSessionAction({ action: 'close-side', session_id: member.id }) }
+      : null,
+    member.canStop ? { label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: member.id }) } : null,
+    { label: 'Copy id', onClick: () => copyTextToClipboard(member.id) },
+  ];
+}
+
+function stationRenderSessionFamilyMember(section, member) {
+  if (!member) return;
+  stationDockCard(section, {
+    title: member.label || shortSessionId(member.id),
+    meta: [member.role, member.kind, member.ephemeral ? 'ephemeral' : '', member.active ? 'active' : (member.attached ? 'attached' : '')].filter(Boolean).join(' / '),
+    detail: member.id,
+    rows: [
+      ['source', prettyAgentName(member.source) || member.source || '--'],
+      ['status', member.status || '--'],
+    ],
+    actions: stationSessionFamilyActions(member),
+  });
+}
+
+function stationRenderSessionFamilySection(parent, sessionOrId) {
+  const payload = stationSessionFamilyPayload(sessionOrId);
+  if (!payload) return;
+  const section = stationDockSection(parent, 'Session family');
+  stationDockRow(section, 'parent', payload.parent ? (payload.parent.label || shortSessionId(payload.parent.id)) : '--');
+  stationDockRow(section, 'children', `${payload.counts.children} total / ${payload.counts.side} side / ${payload.counts.fork} fork / ${payload.counts.subagent} sub`);
+  stationDockRow(section, 'siblings', String(payload.counts.siblings));
+  stationDockActions(section, [
+    payload.parent ? { label: 'Parent', primary: true, onClick: () => stationRenderSessionsDock(payload.parent.id) } : null,
+    { label: 'Copy JSON', onClick: () => stationCopySessionFamilyPayload(sessionOrId) },
+  ]);
+  if (!payload.parent && !payload.children.length && !payload.siblings.length) {
+    stationDockEmpty(section, 'No parent, side, fork, or sub-agent relationships are known for this session.');
+    return;
+  }
+  if (payload.parent) stationRenderSessionFamilyMember(section, payload.parent);
+  for (const child of payload.children) stationRenderSessionFamilyMember(section, child);
+  for (const sibling of payload.siblings.slice(0, 6)) stationRenderSessionFamilyMember(section, sibling);
+  if (payload.siblings.length > 6) {
+    stationDockEmpty(section, `Showing 6 of ${payload.siblings.length} siblings.`);
+  }
+}
+
 function stationOpenManagedForSessionContinuity(sessionOrId, live = null, seed = false) {
   const payload = stationSessionContinuityPayload(sessionOrId, live);
   if (payload.managed.target_session_id) stationSetManagedSession(payload.managed.target_session_id);
@@ -16377,6 +16539,7 @@ function stationRenderSessionDetailSection(parent, sessionId) {
   stationDockRow(section, 'tokens', stationCompactNumber(session?.total_tokens || meta.totalTokens || meta.total_tokens || 0));
   stationDockActions(section, stationSessionActionsForDock(session, { omitDetail: true }));
   const continuityLive = stationExternalLiveThreadDescriptor(session);
+  stationRenderSessionFamilySection(parent, session);
   stationRenderSessionContinuitySection(parent, session, continuityLive);
   stationRenderSessionRenameSection(parent, session);
   stationRenderSessionCleanupSection(parent, session);
