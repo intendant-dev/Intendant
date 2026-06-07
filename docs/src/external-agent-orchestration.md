@@ -191,7 +191,10 @@ features they lack.
   `rewind_context` values; audit/inspect rows may also expose per-position
   eligibility as `recovery_eligible_positions`. Passing
   `include_non_recovery=true` is an audit escape hatch, not the normal recovery
-  path. A successful `rewind_context` only proves the lineage mutation was
+  path. Anchors inside the active managed-context recovery span, starting at the
+  recovery kickstart prompt, are not valid recovery targets because they would
+  preserve recovery instructions and anchor-discovery calls. A successful
+  `rewind_context` only proves the lineage mutation was
   applied; Intendant and Codex keep normal tools hidden until a later backend
   token report confirms the active thread is below the rewind-only limit.
   Below the rewind-only threshold, status may be `watch` when density is getting
