@@ -4185,7 +4185,10 @@ impl CodexCommandOutputHygiene {
 
         if start < combined.len() {
             let tail = &combined[start..];
-            if flush || !is_potential_codex_warning_prefix(tail) {
+            if flush
+                || (!self.suppressing_warning_diagnostic
+                    && !is_potential_codex_warning_prefix(tail))
+            {
                 self.push_filtered_line(tail, &mut out);
             } else {
                 self.pending.push_str(tail);
@@ -4714,8 +4717,17 @@ fn is_codex_warning_diagnostic_continuation(line: &str) -> bool {
         || trimmed.starts_with('=')
         || trimmed.starts_with("...")
         || trimmed.starts_with(":::")
+        || is_codex_warning_diagnostic_source_excerpt(trimmed)
         || trimmed.to_ascii_lowercase().starts_with("note:")
         || trimmed.to_ascii_lowercase().starts_with("help:")
+}
+
+fn is_codex_warning_diagnostic_source_excerpt(trimmed: &str) -> bool {
+    let digit_count = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count == 0 || digit_count >= trimmed.len() {
+        return false;
+    }
+    trimmed[digit_count..].trim_start().starts_with('|')
 }
 
 fn codex_backend_error_event(
@@ -7535,6 +7547,45 @@ error: could not compile `demo`
     }
 
     #[test]
+    fn codex_command_output_hygiene_suppresses_rust_warning_source_excerpts() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let mut input = String::new();
+        for idx in 0..6 {
+            input.push_str(&format!(
+                "\
+warning: station warning {idx}
+ --> crates/station-web/src/lib.rs:{line}:9
+  |
+{line} |     let station_warning_fragment_{idx} = render_station();
+  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  = note: `#[warn(dead_code)]` on by default
+
+",
+                line = 100 + idx
+            ));
+        }
+        input.push_str("error: could not compile `station-web`\n");
+
+        let filtered = hygiene.filter(&input, true).unwrap();
+
+        assert!(filtered.contains("warning: station warning 0"));
+        assert!(filtered.contains("station_warning_fragment_0"));
+        assert!(filtered.contains("warning: station warning 2"));
+        assert!(filtered.contains("station_warning_fragment_2"));
+        assert!(!filtered.contains("warning: station warning 3"));
+        assert!(!filtered.contains("station_warning_fragment_3"));
+        assert!(!filtered.contains("warning: station warning 5"));
+        assert!(!filtered.contains("station_warning_fragment_5"));
+        assert_eq!(
+            filtered
+                .matches("suppressed additional repeated warning diagnostics")
+                .count(),
+            1
+        );
+        assert!(filtered.contains("error: could not compile `station-web`"));
+    }
+
+    #[test]
     fn codex_command_output_hygiene_truncates_long_lines() {
         let mut hygiene = CodexCommandOutputHygiene::default();
         let input = format!(
@@ -7736,6 +7787,61 @@ error: could not compile `demo`
         assert!(!joined.contains("warning: noisy diagnostic 3"));
         assert!(!joined.contains("warning: noisy diagnostic 4"));
         assert!(joined.contains("suppressed additional repeated warning diagnostics"));
+        assert!(joined.contains("error: build failed"));
+    }
+
+    #[test]
+    fn translate_output_delta_suppresses_split_warning_source_excerpt() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        for idx in 0..CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT {
+            let params = serde_json::json!({
+                "itemId": "item-1",
+                "delta": format!("warning: inline warning {idx}\n --> src/lib.rs:{idx}:1\n  |\n\n")
+            });
+            translate_notification_with_state(
+                "item/commandExecution/outputDelta",
+                &params,
+                &tx,
+                &mut state,
+            );
+        }
+
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "warning: suppressed warning\n --> crates/station-web/src/lib.rs:404:9\n  |\n404 "
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "|     let split_station_warning_fragment = render_station();\n  |         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^\n  = note: split continuation must stay hidden\n\nerror: build failed\n"
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolOutputDelta { text, .. } => texts.push(text),
+                other => panic!("expected ToolOutputDelta, got {:?}", other),
+            }
+        }
+        let joined = texts.join("");
+        assert!(joined.contains("warning: inline warning 0"));
+        assert!(joined.contains("warning: inline warning 2"));
+        assert!(joined.contains("suppressed additional repeated warning diagnostics"));
+        assert!(!joined.contains("warning: suppressed warning"));
+        assert!(!joined.contains("split_station_warning_fragment"));
+        assert!(!joined.contains("split continuation must stay hidden"));
         assert!(joined.contains("error: build failed"));
     }
 
