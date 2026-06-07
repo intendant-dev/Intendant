@@ -4956,6 +4956,10 @@ fn is_codex_noop_tool_wait_message(text: &str) -> bool {
         return false;
     }
 
+    if normalized.split_whitespace().count() <= 12 {
+        return true;
+    }
+
     let no_material_output = [
         "no output",
         "no new output",
@@ -5017,6 +5021,9 @@ fn translate_notification_with_scope(
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string();
+            if is_codex_noop_tool_wait_message(&text) {
+                return;
+            }
             send_scoped_agent_event(
                 event_tx,
                 thread_id,
@@ -6605,6 +6612,32 @@ mod tests {
         let event = rx.try_recv().unwrap();
         match event {
             AgentEvent::MessageDelta { text } => assert_eq!(text, "Hello world"),
+            other => panic!("expected MessageDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_agent_message_delta_suppresses_tool_wait_chatter() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({"delta": "The build is still running..."});
+        translate_notification("item/agentMessage/delta", &params, &tx);
+        assert!(
+            rx.try_recv().is_err(),
+            "streaming wait chatter should not leave the Codex adapter"
+        );
+    }
+
+    #[test]
+    fn translate_agent_message_delta_keeps_material_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params =
+            serde_json::json!({"delta": "The cargo check failed with a trait bound error."});
+        translate_notification("item/agentMessage/delta", &params, &tx);
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::MessageDelta { text } => {
+                assert_eq!(text, "The cargo check failed with a trait bound error.")
+            }
             other => panic!("expected MessageDelta, got {:?}", other),
         }
     }
@@ -8519,7 +8552,12 @@ error: build failed
 
     #[test]
     fn translate_item_completed_suppresses_short_polling_chatter() {
-        for text in ["No output yet.", "Still active.", "Polling..."] {
+        for text in [
+            "No output yet.",
+            "Still active.",
+            "Polling...",
+            "The build is still running...",
+        ] {
             let (tx, mut rx) = mpsc::unbounded_channel();
             let params = serde_json::json!({
                 "item": {
