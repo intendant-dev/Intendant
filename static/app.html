@@ -12977,6 +12977,32 @@ function stationClearActivityLog() {
   showControlToast?.('success', 'Activity log cleared');
 }
 
+function stationActivityFilteredEvents() {
+  const allEvents = stationLastSnapshotForFallback().events || [];
+  const hostFilter = String(stationActivityDockHost || activeHostFilter || '').trim();
+  const levelFilter = String(stationActivityDockLevel || '').trim();
+  const sourceFilter = String(stationActivityDockSource || '').trim();
+  const query = stationActivityDockFilter.trim().toLowerCase();
+  const events = allEvents.filter(ev => {
+    if (hostFilter && String(ev.hostId || ev.host_id || '') !== hostFilter) return false;
+    if (levelFilter && stationActivityLevelFor(ev) !== levelFilter) return false;
+    if (sourceFilter && stationActivitySourceFor(ev) !== sourceFilter) return false;
+    if (!query) return true;
+    return [ev.id, ev.hostId, ev.host_id, ev.sessionId, ev.source, ev.level, ev.ts, ev.msg]
+      .join(' ')
+      .toLowerCase()
+      .includes(query);
+  });
+  return { allEvents, events, hostFilter, levelFilter, sourceFilter, query };
+}
+
+function stationClearActivityTriage(focusId = '') {
+  stationActivityDockFilter = '';
+  stationActivityDockLevel = '';
+  stationActivityDockSource = '';
+  stationRenderActivityDock(focusId);
+}
+
 function stationApplyActivityHostFilter(hostId) {
   stationActivityDockHost = String(hostId || '').trim();
   activeHostFilter = stationActivityDockHost;
@@ -13043,21 +13069,7 @@ function stationRenderActivityDetailSection(parent, events, focusId = '') {
 }
 
 function stationRenderActivityDock(focusId = '') {
-  const allEvents = stationLastSnapshotForFallback().events || [];
-  const hostFilter = String(stationActivityDockHost || activeHostFilter || '').trim();
-  const levelFilter = String(stationActivityDockLevel || '').trim();
-  const sourceFilter = String(stationActivityDockSource || '').trim();
-  const query = stationActivityDockFilter.trim().toLowerCase();
-  const events = allEvents.filter(ev => {
-    if (hostFilter && String(ev.hostId || ev.host_id || '') !== hostFilter) return false;
-    if (levelFilter && stationActivityLevelFor(ev) !== levelFilter) return false;
-    if (sourceFilter && stationActivitySourceFor(ev) !== sourceFilter) return false;
-    if (!query) return true;
-    return [ev.id, ev.hostId, ev.host_id, ev.sessionId, ev.source, ev.level, ev.ts, ev.msg]
-      .join(' ')
-      .toLowerCase()
-      .includes(query);
-  });
+  const { allEvents, events, hostFilter, levelFilter, sourceFilter } = stationActivityFilteredEvents();
   const body = stationDockBegin('activity', 'Activity Log', `${events.length} shown / ${allEvents.length} retained`);
   if (!body) return;
   const controls = stationDockSection(body, 'Log controls');
@@ -13088,7 +13100,7 @@ function stationRenderActivityDock(focusId = '') {
     { label: 'Verbose', onClick: () => stationSetActivityVerbosity('verbose') },
     { label: 'Debug', onClick: () => stationSetActivityVerbosity('debug') },
     { label: 'All hosts', onClick: () => { stationClearActivityHostFilter(); stationActivityDockHost = ''; stationRenderActivityDock(focusId); } },
-    { label: 'Clear triage', onClick: () => { stationActivityDockFilter = ''; stationActivityDockLevel = ''; stationActivityDockSource = ''; stationRenderActivityDock(focusId); } },
+    { label: 'Clear triage', onClick: () => stationClearActivityTriage(focusId) },
     { label: 'Copy visible', onClick: () => stationCopyActivityEvents(events) },
     { label: 'Bottom', onClick: () => { document.getElementById('scroll-bottom')?.click(); stationRenderActivityDock(events.at(-1)?.id || focusId); } },
     { label: 'Clear log', danger: true, onClick: () => stationClearActivityLog() },
@@ -13194,14 +13206,24 @@ function stationContextPartText(part) {
 
 function stationCopyContextSnapshot(snapshot = stationSnapshotForContext()) {
   const text = stationContextSnapshotText(snapshot);
-  if (!text) return;
-  copyTextToClipboard(text);
+  if (!text) {
+    showControlToast?.('error', 'No context snapshot to copy');
+    return;
+  }
+  copyTextToClipboard(text)
+    .then(() => showControlToast?.('success', 'Copied context snapshot'))
+    .catch(err => showControlToast?.('error', `Copy context snapshot failed: ${err?.message || err}`));
 }
 
 function stationCopyContextPart(part) {
   const text = stationContextPartText(part);
-  if (!text) return;
-  copyTextToClipboard(text);
+  if (!text) {
+    showControlToast?.('error', 'No context item text to copy');
+    return;
+  }
+  copyTextToClipboard(text)
+    .then(() => showControlToast?.('success', 'Copied context item'))
+    .catch(err => showControlToast?.('error', `Copy context item failed: ${err?.message || err}`));
 }
 
 function stationContextLaneParts(category) {
@@ -13290,6 +13312,10 @@ function stationRenderContextDock(focusId = stationSelectedContextPart) {
     { label: 'Focus', onClick: () => { stationApplyContextAction('focus'); stationRenderContextDock(focusId); } },
     { label: 'Raw', onClick: () => { stationApplyContextAction('raw'); stationRenderContextDock(focusId); } },
     { label: 'Reset', onClick: () => { stationApplyContextAction('reset'); stationRenderContextDock(''); } },
+    { label: 'Copy snapshot', disabled: !stationSnapshotForContext(), onClick: () => stationCopyContextSnapshot() },
+    stationSnapshotForContext() && typeof ensureExactContextSnapshot === 'function' && typeof contextSnapshotNeedsExact === 'function' && contextSnapshotNeedsExact(stationSnapshotForContext())
+      ? { label: 'Load exact', onClick: async () => stationLoadExactContextSnapshot(focusId) }
+      : null,
     stationDockRouteAction('Route context tab', 'activity', 'context'),
   ]);
 
@@ -17323,6 +17349,15 @@ function stationHandleContextAction(action) {
     raw: 'context-raw-toggle-btn',
   };
   if (op === 'part' && !id) return;
+  if (op === 'copy-snapshot') {
+    stationCopyContextSnapshot();
+    return;
+  }
+  if (op === 'load-exact') {
+    stationLoadExactContextSnapshot(stationSelectedContextPart || id)
+      .catch(err => showControlToast?.('error', `Load exact context failed: ${err?.message || err}`));
+    return;
+  }
   if (op !== 'part' && !actionButtonByOp[op]) return;
   stationApplyContextAction(op, id);
   stationRenderContextDock(op === 'part' ? id : stationSelectedContextPart);
@@ -17368,6 +17403,18 @@ function stationHandleActivityAction(action) {
   }
   if (op === 'bottom') {
     stationRenderActivityDock(stationActivityEvents().at(-1)?.id || '');
+    return;
+  }
+  if (op === 'copy-visible') {
+    stationCopyActivityEvents(stationActivityFilteredEvents().events);
+    return;
+  }
+  if (op === 'clear-triage') {
+    stationClearActivityTriage();
+    return;
+  }
+  if (op === 'clear-log') {
+    stationClearActivityLog();
     return;
   }
   if (op !== 'log' || !id) return;

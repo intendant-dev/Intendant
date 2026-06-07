@@ -2242,7 +2242,10 @@ impl StationInner {
             ("verbosity:verbose", "verbose", 74.0),
             ("verbosity:debug", "debug", 58.0),
             ("host:all", "all hosts", 76.0),
+            ("copy-visible", "copy visible", 96.0),
+            ("clear-triage", "clear triage", 96.0),
             ("bottom", "bottom", 62.0),
+            ("clear-log", "clear log", 76.0),
         ];
         let mut ax = x + 14.0;
         let mut ay = yy - 14.0;
@@ -2370,6 +2373,8 @@ impl StationInner {
             ("focus", "focus", 58.0),
             ("raw", "raw", 46.0),
             ("reset", "reset", 54.0),
+            ("copy-snapshot", "copy", 54.0),
+            ("load-exact", "exact", 54.0),
         ];
         let mut ax = x + 14.0;
         let mut ay = yy - 14.0;
