@@ -3307,36 +3307,62 @@ fn scan_context_rewind_anchor_catalog(
         anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
         let backend_has_headroom =
             context_rewind_anchor_has_recovery_headroom(usage.used_tokens, usage.rewind_only_limit);
-        let restore_prefix_has_headroom =
-            anchor
-                .prefix_estimated_tokens_after_anchor
-                .is_some_and(|prefix_tokens| {
-                    context_rewind_anchor_has_recovery_headroom(
-                        prefix_tokens,
-                        usage.rewind_only_limit,
-                    )
-                });
-        if !restore_prefix_has_headroom {
+        let restore_prefix_after_has_headroom = anchor
+            .prefix_estimated_tokens_after_anchor
+            .is_some_and(|prefix_tokens| {
+                context_rewind_anchor_has_recovery_headroom(prefix_tokens, usage.rewind_only_limit)
+            });
+        let restore_prefix_before_has_headroom = anchor
+            .prefix_estimated_tokens_before_anchor
+            .is_some_and(|prefix_tokens| {
+                context_rewind_anchor_has_recovery_headroom(prefix_tokens, usage.rewind_only_limit)
+            });
+        if !restore_prefix_after_has_headroom {
             anchor.prefix_tokens_after = anchor.prefix_estimated_tokens_after_anchor;
         }
-        let latest_rewind_outcome = latest_rewind_outcomes
+        let latest_rewind_after_outcome = latest_rewind_outcomes
             .get(&context_rewind_anchor_outcome_key(
                 &anchor.item_id,
                 external_agent::RollbackAnchorPosition::After,
             ))
             .copied();
-        let latest_rewind_has_headroom = latest_rewind_outcome.is_none_or(|outcome| {
+        let latest_rewind_after_has_headroom = latest_rewind_after_outcome.is_none_or(|outcome| {
             context_rewind_anchor_has_recovery_headroom(
                 outcome.used_tokens,
                 outcome.rewind_only_limit,
             )
         });
-        if let Some(outcome) = latest_rewind_outcome.filter(|_| !latest_rewind_has_headroom) {
+        if let Some(outcome) =
+            latest_rewind_after_outcome.filter(|_| !latest_rewind_after_has_headroom)
+        {
             anchor.latest_rewind_usage_after_anchor = Some(outcome.used_tokens);
             anchor.latest_rewind_limit_after_anchor = Some(outcome.rewind_only_limit);
         }
-        anchor.recovery_eligible =
-            Some(backend_has_headroom && restore_prefix_has_headroom && latest_rewind_has_headroom);
+        let latest_rewind_before_has_headroom = latest_rewind_outcomes
+            .get(&context_rewind_anchor_outcome_key(
+                &anchor.item_id,
+                external_agent::RollbackAnchorPosition::Before,
+            ))
+            .is_none_or(|outcome| {
+                context_rewind_anchor_has_recovery_headroom(
+                    outcome.used_tokens,
+                    outcome.rewind_only_limit,
+                )
+            });
+        let after_recovery_eligible = backend_has_headroom
+            && restore_prefix_after_has_headroom
+            && latest_rewind_after_has_headroom;
+        let before_recovery_eligible = !restore_prefix_after_has_headroom
+            && restore_prefix_before_has_headroom
+            && latest_rewind_before_has_headroom;
+        anchor.position_hint = if after_recovery_eligible {
+            "after"
+        } else if before_recovery_eligible {
+            "before"
+        } else {
+            "after"
+        };
+        anchor.recovery_eligible = Some(after_recovery_eligible || before_recovery_eligible);
     }
 
     Ok(anchors)
@@ -11235,6 +11261,94 @@ mod tests {
         .expect_err("oversized restored prefix must be rejected");
         assert!(err.contains("not a valid recovery target"), "got: {err}");
         assert!(err.contains("recovery_eligible"), "got: {err}");
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_surfaces_noisy_completed_tool_before_anchor() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let warning_output = "warning: unused import\n".repeat(20_000);
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_noisy_build",
+                        "arguments": "{\"cmd\":\"cargo build --release --bin intendant -q\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_noisy_build",
+                        "output": warning_output
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 0,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 60000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "query": "cargo build --release --bin intendant",
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": true,
+            }),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchors = catalog["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 1, "got {catalog}");
+        let anchor = &anchors[0];
+        assert_eq!(anchor["item_id"].as_str(), Some("call_noisy_build"));
+        assert_eq!(anchor["position_hint"].as_str(), Some("before"));
+        assert_eq!(anchor["recovery_eligible"].as_bool(), Some(true));
+        assert!(
+            anchor["prefix_tokens_after"]
+                .as_u64()
+                .is_some_and(|tokens| tokens > 22_000),
+            "got {anchor}"
+        );
+
+        validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_noisy_build",
+            external_agent::RollbackAnchorPosition::Before,
+        )
+        .expect("before noisy output should be a valid recovery target");
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_noisy_build",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("after noisy output should not be a valid recovery target");
+        assert!(err.contains("not a valid recovery target"), "got: {err}");
     }
 
     #[test]
