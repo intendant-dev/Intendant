@@ -21001,14 +21001,12 @@ function stationTrackLogAnchor(c) {
 }
 
 function stationTrackSessionWindowHistoryAnchor(item, fallbackSessionId = '') {
-  const node = item instanceof Node ? item : null;
-  const record = node ? null : sessionWindowHistoryRecord(item);
-  const itemId = record?.item_id || record?.itemId || node?.dataset?.itemId || '';
+  const record = sessionWindowHistoryRecord(item);
+  if (!record) return;
+  const itemId = record.item_id || record.itemId || '';
   if (!itemId) return;
-  const sessionId = record?.session_id || record?.sessionId || node?.dataset?.sessionId || fallbackSessionId || '';
-  const detail = record
-    ? (record.content || record.summary || record.message || record.source || record.event || '')
-    : (node.querySelector?.('.log-content')?.textContent || node.textContent || '');
+  const sessionId = record.session_id || record.sessionId || fallbackSessionId || '';
+  const detail = record.content || record.summary || record.message || record.source || record.event || '';
   stationTrackLogAnchorRow(itemId, sessionId, detail, 'log');
 }
 
