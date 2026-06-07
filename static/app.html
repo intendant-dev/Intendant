@@ -19875,6 +19875,7 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'new-session') {
+    if (stationRenderedSelectPanel('system:controls', 'New-session controls stay in Station')) return;
     stationOpenSessionLaunchDock();
     return;
   }
@@ -20054,6 +20055,7 @@ function stationHandleActivityAction(action) {
     return;
   }
   if (op === 'new-session') {
+    if (stationRenderedSelectPanel('system:controls', 'New-session controls stay in Station')) return;
     stationOpenSessionLaunchDock();
     return;
   }
@@ -20132,6 +20134,7 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op === 'launch-dock') {
+    if (stationRenderedSelectPanel('system:controls', 'Launch controls stay in Station')) return;
     stationOpenSessionLaunchDock();
     return;
   }

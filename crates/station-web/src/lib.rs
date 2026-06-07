@@ -33,9 +33,14 @@ impl StationWeb {
             .get_context("2d")?
             .ok_or_else(|| JsValue::from_str("Station HUD canvas has no 2D context"))?
             .dyn_into::<CanvasRenderingContext2d>()?;
-        let scene_ctx = scene_canvas
-            .get_context("2d")?
-            .and_then(|ctx| ctx.dyn_into::<CanvasRenderingContext2d>().ok());
+        let use_webgpu = station_enable_webgpu();
+        let scene_ctx = if use_webgpu {
+            None
+        } else {
+            scene_canvas
+                .get_context("2d")?
+                .and_then(|ctx| ctx.dyn_into::<CanvasRenderingContext2d>().ok())
+        };
 
         let inner = Rc::new(RefCell::new(StationInner::new(
             scene_canvas,
@@ -44,7 +49,7 @@ impl StationWeb {
             scene_ctx,
         )));
         StationInner::install_events(inner.clone())?;
-        if station_enable_webgpu() {
+        if use_webgpu {
             StationInner::start_gpu(inner.clone());
         } else {
             web_sys::console::warn_1(&JsValue::from_str(
@@ -3674,20 +3679,12 @@ impl StationInner {
             &nonempty(&controls.new_session_agent, "--"),
         );
         yy += 30.0;
-        let launch_actions = vec![
-            (
-                "start-session".to_string(),
-                "start session".to_string(),
-                104.0,
-                C_GREEN_CSS.to_string(),
-            ),
-            (
-                "launch-dock".to_string(),
-                "launch dock".to_string(),
-                94.0,
-                C_MAUVE_CSS.to_string(),
-            ),
-        ];
+        let launch_actions = vec![(
+            "start-session".to_string(),
+            "start session".to_string(),
+            104.0,
+            C_GREEN_CSS.to_string(),
+        )];
         yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &launch_actions);
 
         self.section_title_color(x, yy, "Live surfaces", C_BLUE_CSS);
@@ -3785,30 +3782,6 @@ impl StationInner {
                 },
                 104.0,
                 C_BLUE_CSS.to_string(),
-            ),
-            (
-                "cu-settings".to_string(),
-                "CU settings".to_string(),
-                92.0,
-                C_MAUVE_CSS.to_string(),
-            ),
-            (
-                "browser-open".to_string(),
-                "browsers".to_string(),
-                76.0,
-                C_TEAL_CSS.to_string(),
-            ),
-            (
-                "browser-new".to_string(),
-                "new browser".to_string(),
-                96.0,
-                C_TEAL_CSS.to_string(),
-            ),
-            (
-                "recordings".to_string(),
-                "recordings".to_string(),
-                92.0,
-                C_PEACH_CSS.to_string(),
             ),
             (
                 "debug-screen".to_string(),
