@@ -1772,11 +1772,30 @@ where
 fn active_external_wrappers_from_index_homes_with_probe<'a, I, F>(
     candidate_homes: I,
     live_codex_pids: &[u32],
-    mut process_tree_active: F,
+    process_tree_active: F,
 ) -> Vec<serde_json::Value>
 where
     I: IntoIterator<Item = &'a std::path::PathBuf>,
     F: FnMut(u32) -> bool,
+{
+    active_external_wrappers_from_index_homes_with_probe_and_cwd(
+        candidate_homes,
+        live_codex_pids,
+        process_tree_active,
+        live_process_cwd,
+    )
+}
+
+fn active_external_wrappers_from_index_homes_with_probe_and_cwd<'a, I, F, G>(
+    candidate_homes: I,
+    live_codex_pids: &[u32],
+    mut process_tree_active: F,
+    mut process_cwd: G,
+) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = &'a std::path::PathBuf>,
+    F: FnMut(u32) -> bool,
+    G: FnMut(u32) -> Option<std::path::PathBuf>,
 {
     if live_codex_pids.is_empty() {
         return Vec::new();
@@ -1801,6 +1820,13 @@ where
                 .unwrap_or(false);
             let effective_status =
                 effective_external_wrapper_status(status.as_deref(), process_tree_active);
+            let cwd = codex_pid.and_then(|pid| process_cwd(pid));
+            let cwd_string = cwd.as_ref().map(|path| path.to_string_lossy().to_string());
+            let project_root = cwd
+                .as_deref()
+                .and_then(project_root_from_process_cwd)
+                .map(|path| path.to_string_lossy().to_string())
+                .or_else(|| record.project_root.clone());
             wrappers.push(serde_json::json!({
                 "run_id": serde_json::Value::Null,
                 "pid": serde_json::Value::Null,
@@ -1812,7 +1838,8 @@ where
                 "backend_session_id": record.backend_session_id,
                 "intendant_session_id": record.intendant_session_id,
                 "log_path": record.log_path,
-                "project_root": record.project_root,
+                "cwd": cwd_string,
+                "project_root": project_root,
                 "status": effective_status,
                 "session_meta_status": status,
                 "process_tree_active": process_tree_active,
@@ -1824,6 +1851,29 @@ where
         }
     }
     wrappers
+}
+
+fn project_root_from_process_cwd(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
+    let mut current = Some(cwd);
+    while let Some(path) = current {
+        if path.join(".git").exists() {
+            return Some(path.to_path_buf());
+        }
+        current = path.parent();
+    }
+    Some(cwd.to_path_buf())
+}
+
+fn live_process_cwd(pid: u32) -> Option<std::path::PathBuf> {
+    #[cfg(target_os = "linux")]
+    {
+        std::fs::read_link(format!("/proc/{pid}/cwd")).ok()
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = pid;
+        None
+    }
 }
 
 fn controller_loop_latest_status(
@@ -12143,6 +12193,57 @@ mod tests {
                 .get("project_root")
                 .and_then(|value| value.as_str()),
             Some(project_root_string.as_str())
+        );
+    }
+
+    #[test]
+    fn controller_loop_status_prefers_live_codex_cwd_project_root() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let helper_root = home.join("helper-root");
+        let station_root = home.join("station-worktree");
+        let log_dir = home.join(".intendant/logs/wrapper-session");
+        std::fs::create_dir_all(&helper_root).unwrap();
+        std::fs::create_dir_all(station_root.join(".git")).unwrap();
+        std::fs::create_dir_all(&log_dir).unwrap();
+        std::fs::write(
+            log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": "wrapper-session",
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "running",
+                "project_root": helper_root
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home,
+            "codex",
+            "019ea0a9-92fc-7471-85d8-0a281fc54250",
+            "wrapper-session",
+            &log_dir,
+            Some(&helper_root),
+        )
+        .unwrap();
+
+        let wrappers = active_external_wrappers_from_index_homes_with_probe_and_cwd(
+            [home.to_path_buf()].iter(),
+            &[1588453],
+            |pid| pid == 1588453,
+            |pid| (pid == 1588453).then(|| station_root.clone()),
+        );
+        assert_eq!(wrappers.len(), 1);
+        let station_root_string = station_root.to_string_lossy().to_string();
+        assert_eq!(
+            wrappers[0].get("cwd").and_then(|value| value.as_str()),
+            Some(station_root_string.as_str())
+        );
+        assert_eq!(
+            wrappers[0]
+                .get("project_root")
+                .and_then(|value| value.as_str()),
+            Some(station_root_string.as_str())
         );
     }
 
