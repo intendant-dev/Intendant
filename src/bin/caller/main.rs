@@ -4119,6 +4119,7 @@ async fn send_external_context_rewind_resume_turn(
         resume.handled_steer_ids,
         resume.codex_thread_action_dedupe,
         resume.side_sessions.as_deref_mut(),
+        followup.managed_context_recovery_kickstart,
     )
     .await)
 }
@@ -4538,6 +4539,59 @@ fn managed_context_rewind_only_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
     managed_context_recovery_pressure(snapshot)
+}
+
+fn managed_context_rewind_only_pressure_from_usage(
+    usage: &external_agent::AgentUsageSnapshot,
+) -> Option<ManagedContextRewindOnlyPressure> {
+    let rewind_only_limit = usage.context_window;
+    if rewind_only_limit == 0 || usage.tokens_used < rewind_only_limit {
+        return None;
+    }
+    let status = if usage
+        .hard_context_window
+        .is_some_and(|hard| hard > 0 && usage.tokens_used >= hard)
+    {
+        "critical"
+    } else {
+        "high"
+    };
+    Some(ManagedContextRewindOnlyPressure {
+        used_tokens: usage.tokens_used,
+        rewind_only_limit,
+        hard_context_window: usage.hard_context_window,
+        status,
+    })
+}
+
+fn managed_context_rewind_only_tool_allowed(tool_name: &str, preview: &str) -> bool {
+    fn allowed_name(name: &str) -> bool {
+        matches!(
+            name.trim(),
+            "get_status"
+                | "get_logs"
+                | "get_pending_approval"
+                | "get_pending_input"
+                | "get_restart_status"
+                | "get_controller_loop_status"
+                | "list_rewind_anchors"
+                | "inspect_rewind_anchor"
+                | "rewind_context"
+                | "rewind_backout"
+        )
+    }
+
+    if allowed_name(tool_name) {
+        return true;
+    }
+    if tool_name != "mcp" {
+        return false;
+    }
+    let preview = preview.trim();
+    allowed_name(preview)
+        || preview
+            .rsplit_once(':')
+            .is_some_and(|(_, name)| allowed_name(name))
 }
 
 fn managed_context_recovery_pressure(
@@ -6351,6 +6405,7 @@ async fn drain_external_child_turn(
         handled_steer_ids,
         codex_thread_action_dedupe,
         None,
+        false,
     )
     .await
     {
@@ -6767,6 +6822,7 @@ async fn drain_external_agent_events(
     handled_steer_ids: &mut std::collections::HashSet<String>,
     codex_thread_action_dedupe: &mut CodexThreadActionDedupe,
     mut side_sessions: Option<&mut ExternalSideSessionState<'_>>,
+    managed_context_recovery_kickstart: bool,
 ) -> DrainOutcome {
     use std::sync::atomic::Ordering;
 
@@ -6802,6 +6858,9 @@ async fn drain_external_agent_events(
     let mut active_side_turns: HashSet<String> = HashSet::new();
     let mut pending_context_rewind: Option<ExternalContextRewindRequest> = None;
     let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
+    let mut managed_context_rewind_only_pressure: Option<ManagedContextRewindOnlyPressure> = None;
+    let mut managed_context_pressure_interrupt_sent = false;
+    let mut managed_context_blocked_tool_items: HashSet<String> = HashSet::new();
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -7563,19 +7622,64 @@ async fn drain_external_agent_events(
                 stats.usage.completion_tokens = usage.completion_tokens;
                 stats.usage.total_tokens = usage.prompt_tokens + usage.completion_tokens;
                 stats.usage.cached_tokens = usage.cached_tokens;
+                if event_is_primary && agent.supports_item_anchor_rewind() {
+                    if let Some(pressure) = managed_context_rewind_only_pressure_from_usage(&usage)
+                    {
+                        managed_context_rewind_only_pressure = Some(pressure);
+                        pending_backend_recovery.get_or_insert_with(|| ExternalBackendRecovery {
+                            message: format!(
+                                "managed Codex entered rewind-only context pressure ({}/{})",
+                                pressure.used_tokens, pressure.rewind_only_limit
+                            ),
+                            recovery_hint: None,
+                        });
+                        if !managed_context_recovery_kickstart
+                            && !managed_context_pressure_interrupt_sent
+                        {
+                            managed_context_pressure_interrupt_sent = true;
+                            let content = format!(
+                                "Managed Codex context pressure is {} ({}/{} tokens); interrupting the active turn before more normal tools run.",
+                                pressure.status,
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit
+                            );
+                            slog(config.session_log, |l| l.warn(&content));
+                            config.bus.send(AppEvent::LogEntry {
+                                session_id: config.session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "Intendant".to_string(),
+                                content,
+                                turn: None,
+                            });
+                            if let Err(e) = agent.interrupt_turn().await {
+                                let content =
+                                    format!("Managed-context pressure interrupt failed: {}", e);
+                                slog(config.session_log, |l| l.warn(&content));
+                                config.bus.send(AppEvent::LogEntry {
+                                    session_id: config.session_id.clone(),
+                                    level: "warn".to_string(),
+                                    source: "Intendant".to_string(),
+                                    content,
+                                    turn: None,
+                                });
+                            }
+                        }
+                    }
+                }
+                let main = frontend::ModelUsageSnapshot {
+                    provider: usage.provider,
+                    model: usage.model,
+                    tokens_used: usage.tokens_used,
+                    context_window: usage.context_window,
+                    hard_context_window: usage.hard_context_window,
+                    usage_pct: usage.usage_pct,
+                    prompt_tokens: usage.prompt_tokens,
+                    completion_tokens: usage.completion_tokens,
+                    cached_tokens: usage.cached_tokens,
+                };
                 config.bus.send(AppEvent::UsageSnapshot {
                     session_id: config.session_id.clone(),
-                    main: frontend::ModelUsageSnapshot {
-                        provider: usage.provider,
-                        model: usage.model,
-                        tokens_used: usage.tokens_used,
-                        context_window: usage.context_window,
-                        hard_context_window: usage.hard_context_window,
-                        usage_pct: usage.usage_pct,
-                        prompt_tokens: usage.prompt_tokens,
-                        completion_tokens: usage.completion_tokens,
-                        cached_tokens: usage.cached_tokens,
-                    },
+                    main,
                     presence: None,
                 });
             }
@@ -7780,6 +7884,56 @@ async fn drain_external_agent_events(
                 preview,
                 tool_name,
             } => {
+                if event_is_primary
+                    && agent.supports_item_anchor_rewind()
+                    && managed_context_rewind_only_pressure.is_some()
+                    && !managed_context_rewind_only_tool_allowed(&tool_name, &preview)
+                {
+                    let pressure = managed_context_rewind_only_pressure
+                        .expect("checked managed context pressure");
+                    if !item_id.is_empty() {
+                        managed_context_blocked_tool_items.insert(item_id.clone());
+                    }
+                    pending_backend_recovery.get_or_insert_with(|| ExternalBackendRecovery {
+                        message: format!(
+                            "managed Codex attempted normal tool '{}' while context pressure was rewind-only ({}/{})",
+                            tool_name, pressure.used_tokens, pressure.rewind_only_limit
+                        ),
+                        recovery_hint: None,
+                    });
+                    let content = format!(
+                        "Blocked {} tool '{}' while managed context is rewind-only ({}/{} tokens); only status and managed-context recovery tools are allowed until pressure drops.",
+                        agent.name(),
+                        external_tool_preview_text(&tool_name, &preview)
+                            .unwrap_or_else(|| tool_name.clone()),
+                        pressure.used_tokens,
+                        pressure.rewind_only_limit
+                    );
+                    slog(config.session_log, |l| l.warn(&content));
+                    config.bus.send(AppEvent::LogEntry {
+                        session_id: config.session_id.clone(),
+                        level: "warn".to_string(),
+                        source: "Intendant".to_string(),
+                        content,
+                        turn: None,
+                    });
+                    if !managed_context_pressure_interrupt_sent {
+                        managed_context_pressure_interrupt_sent = true;
+                        if let Err(e) = agent.interrupt_turn().await {
+                            let content =
+                                format!("Managed-context tool-gate interrupt failed: {}", e);
+                            slog(config.session_log, |l| l.warn(&content));
+                            config.bus.send(AppEvent::LogEntry {
+                                session_id: config.session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "Intendant".to_string(),
+                                content,
+                                turn: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 turns_in_round += 1;
                 let preview_text = external_tool_preview_text(&tool_name, &preview);
                 if let Some(preview_text) = preview_text.as_deref() {
@@ -7807,6 +7961,9 @@ async fn drain_external_agent_events(
                 .await;
             }
             external_agent::AgentEvent::ToolOutputDelta { item_id, text } => {
+                if managed_context_blocked_tool_items.contains(&item_id) {
+                    continue;
+                }
                 // Gemini CLI strips images from ACP, sending "[Image: image/png]".
                 // Substitute with the latest screenshot from disk so the Activity
                 // tab can render it.
@@ -7822,6 +7979,9 @@ async fn drain_external_agent_events(
                 }
             }
             external_agent::AgentEvent::ToolCompleted { item_id, status } => {
+                if managed_context_blocked_tool_items.remove(&item_id) {
+                    continue;
+                }
                 if let Some(stdout) = tool_output_limiter.complete(&item_id) {
                     emit_external_tool_output(config, config.session_id.as_deref(), stdout);
                 }
@@ -10274,6 +10434,269 @@ mod tests {
             ..at_hard
         };
         assert_eq!(managed_context_rewind_only_pressure(&over_hard), None);
+    }
+
+    #[test]
+    fn managed_context_rewind_only_pressure_from_usage_uses_soft_limit() {
+        let below_soft = external_agent::AgentUsageSnapshot {
+            provider: "openai".to_string(),
+            model: "gpt-5.2-codex".to_string(),
+            tokens_used: 258_399,
+            context_window: 258_400,
+            hard_context_window: Some(272_000),
+            usage_pct: 99.9,
+            prompt_tokens: 258_000,
+            completion_tokens: 399,
+            cached_tokens: 0,
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure_from_usage(&below_soft),
+            None
+        );
+
+        let at_soft = external_agent::AgentUsageSnapshot {
+            tokens_used: 258_400,
+            ..below_soft.clone()
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure_from_usage(&at_soft),
+            Some(ManagedContextRewindOnlyPressure {
+                used_tokens: 258_400,
+                rewind_only_limit: 258_400,
+                hard_context_window: Some(272_000),
+                status: "high",
+            })
+        );
+
+        let at_hard = external_agent::AgentUsageSnapshot {
+            tokens_used: 272_000,
+            ..below_soft
+        };
+        assert_eq!(
+            managed_context_rewind_only_pressure_from_usage(&at_hard)
+                .map(|pressure| pressure.status),
+            Some("critical")
+        );
+    }
+
+    #[test]
+    fn managed_context_rewind_only_tool_classifier_allows_only_safe_tools() {
+        assert!(managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:list_rewind_anchors"
+        ));
+        assert!(managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:rewind_context"
+        ));
+        assert!(managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:get_status"
+        ));
+        assert!(managed_context_rewind_only_tool_allowed(
+            "get_controller_loop_status",
+            ""
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:execute_cu_actions"
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "command",
+            "git status"
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "web_search",
+            "search"
+        ));
+    }
+
+    struct ManagedDrainTestAgent {
+        interrupts: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait::async_trait]
+    impl external_agent::ExternalAgent for ManagedDrainTestAgent {
+        fn name(&self) -> &str {
+            "Codex"
+        }
+
+        async fn initialize(
+            &mut self,
+            _config: external_agent::AgentConfig,
+        ) -> Result<tokio::sync::mpsc::UnboundedReceiver<external_agent::AgentEvent>, CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::unbounded_channel();
+            Ok(rx)
+        }
+
+        async fn start_thread(&mut self) -> Result<external_agent::AgentThread, CallerError> {
+            Ok(external_agent::AgentThread {
+                thread_id: "thread-1".to_string(),
+            })
+        }
+
+        async fn send_message(
+            &mut self,
+            _thread: &external_agent::AgentThread,
+            _message: &str,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn resolve_approval(
+            &mut self,
+            _request_id: &str,
+            _decision: external_agent::ApprovalDecision,
+        ) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
+            self.interrupts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn shutdown(&mut self) -> Result<(), CallerError> {
+            Ok(())
+        }
+
+        fn supports_item_anchor_rewind(&self) -> bool {
+            true
+        }
+    }
+
+    #[tokio::test]
+    async fn managed_context_rewind_only_drain_blocks_native_tool_after_pressure() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let mut observed = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("thread-1".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::Usage {
+                usage: external_agent::AgentUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 261_000,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 101.0,
+                    prompt_tokens: 260_000,
+                    completion_tokens: 1_000,
+                    cached_tokens: 0,
+                },
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "cmd-1".to_string(),
+                tool_name: "command".to_string(),
+                preview: "git status".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolOutputDelta {
+                item_id: "cmd-1".to_string(),
+                text: "git status output that must not leak".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "cmd-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut dedupe,
+            None,
+            false,
+        )
+        .await;
+
+        match outcome {
+            DrainOutcome::RecoveryRequired { message, .. } => {
+                assert!(message.contains("managed Codex entered rewind-only"));
+            }
+            _ => panic!("expected RecoveryRequired"),
+        }
+        assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
+
+        let mut saw_block_log = false;
+        loop {
+            match observed.try_recv() {
+                Ok(AppEvent::LogEntry { content, .. }) => {
+                    if content.contains("Blocked Codex tool") {
+                        saw_block_log = true;
+                    }
+                    assert!(
+                        !content.contains("git status output that must not leak"),
+                        "blocked command output leaked through log entry"
+                    );
+                }
+                Ok(AppEvent::AgentStarted {
+                    commands_preview, ..
+                }) => {
+                    panic!("blocked native tool emitted AgentStarted: {commands_preview}");
+                }
+                Ok(AppEvent::AgentOutput { stdout, .. }) => {
+                    panic!("blocked native tool output leaked: {stdout}");
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        assert!(saw_block_log);
     }
 
     #[test]
@@ -18147,6 +18570,7 @@ async fn run_with_presence(
                 &mut persistent_handled_steer_ids,
                 &mut codex_thread_action_dedupe,
                 Some(&mut side_session_state),
+                false,
             )
             .await
             {
@@ -20214,6 +20638,7 @@ async fn run_external_agent_mode(
                         &mut handled_steer_ids,
                         &mut codex_thread_action_dedupe,
                         Some(&mut side_session_state),
+                        false,
                     )
                     .await
                     {
@@ -20477,6 +20902,7 @@ async fn run_external_agent_mode(
             &mut handled_steer_ids,
             &mut codex_thread_action_dedupe,
             Some(&mut side_session_state),
+            managed_context_recovery_kickstart,
         )
         .await
         {
