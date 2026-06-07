@@ -5424,12 +5424,9 @@ impl GpuState {
     async fn new(canvas: HtmlCanvasElement) -> Result<Self, JsValue> {
         let width = canvas.width().max(1);
         let height = canvas.height().max(1);
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-            backends: wgpu::Backends::BROWSER_WEBGPU,
-            dx12_shader_compiler: Default::default(),
-            flags: wgpu::InstanceFlags::default(),
-            gles_minor_version: wgpu::Gles3MinorVersion::Automatic,
-        });
+        let mut instance_desc = wgpu::InstanceDescriptor::new_without_display_handle();
+        instance_desc.backends = wgpu::Backends::BROWSER_WEBGPU;
+        let instance = wgpu::Instance::new(instance_desc);
         let surface = instance
             .create_surface(wgpu::SurfaceTarget::Canvas(canvas))
             .map_err(|e| JsValue::from_str(&format!("create WebGPU surface failed: {e:?}")))?;
@@ -5440,16 +5437,14 @@ impl GpuState {
                 force_fallback_adapter: false,
             })
             .await
-            .ok_or_else(|| JsValue::from_str("no WebGPU adapter available"))?;
+            .map_err(|e| JsValue::from_str(&format!("no WebGPU adapter available: {e:?}")))?;
         let (device, queue) = adapter
-            .request_device(
-                &wgpu::DeviceDescriptor {
-                    label: Some("Intendant Station Device"),
-                    required_features: wgpu::Features::empty(),
-                    required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
-                },
-                None,
-            )
+            .request_device(&wgpu::DeviceDescriptor {
+                label: Some("Intendant Station Device"),
+                required_features: wgpu::Features::empty(),
+                required_limits: wgpu::Limits::downlevel_webgl2_defaults(),
+                ..Default::default()
+            })
             .await
             .map_err(|e| JsValue::from_str(&format!("request WebGPU device failed: {e:?}")))?;
 
@@ -5483,7 +5478,7 @@ impl GpuState {
         let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
             label: Some("Station Pipeline Layout"),
             bind_group_layouts: &[],
-            push_constant_ranges: &[],
+            immediate_size: 0,
         });
         let make_pipeline = |topology| {
             let vertex_layout = GpuVertex::layout();
@@ -5492,13 +5487,13 @@ impl GpuState {
                 layout: Some(&pipeline_layout),
                 vertex: wgpu::VertexState {
                     module: &shader,
-                    entry_point: "vs_main",
+                    entry_point: Some("vs_main"),
                     buffers: &[vertex_layout],
                     compilation_options: wgpu::PipelineCompilationOptions::default(),
                 },
                 fragment: Some(wgpu::FragmentState {
                     module: &shader,
-                    entry_point: "fs_main",
+                    entry_point: Some("fs_main"),
                     targets: &[Some(wgpu::ColorTargetState {
                         format,
                         blend: Some(wgpu::BlendState::ALPHA_BLENDING),
@@ -5517,7 +5512,8 @@ impl GpuState {
                 },
                 depth_stencil: None,
                 multisample: wgpu::MultisampleState::default(),
-                multiview: None,
+                multiview_mask: None,
+                cache: None,
             })
         };
         let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList);
@@ -5542,14 +5538,27 @@ impl GpuState {
         self.surface.configure(&self.device, &self.config);
     }
 
-    fn render(&mut self, frame: &GpuFrame) -> Result<(), wgpu::SurfaceError> {
+    fn render(&mut self, frame: &GpuFrame) -> Result<(), JsValue> {
         let output = match self.surface.get_current_texture() {
-            Ok(output) => output,
-            Err(wgpu::SurfaceError::Lost | wgpu::SurfaceError::Outdated) => {
+            wgpu::CurrentSurfaceTexture::Success(output)
+            | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+            wgpu::CurrentSurfaceTexture::Lost | wgpu::CurrentSurfaceTexture::Outdated => {
                 self.surface.configure(&self.device, &self.config);
-                self.surface.get_current_texture()?
+                match self.surface.get_current_texture() {
+                    wgpu::CurrentSurfaceTexture::Success(output)
+                    | wgpu::CurrentSurfaceTexture::Suboptimal(output) => output,
+                    state => {
+                        return Err(JsValue::from_str(&format!(
+                            "surface unavailable after reconfigure: {state:?}"
+                        )))
+                    }
+                }
             }
-            Err(err) => return Err(err),
+            state => {
+                return Err(JsValue::from_str(&format!(
+                    "surface unavailable: {state:?}"
+                )))
+            }
         };
         let view = output
             .texture
@@ -5580,6 +5589,7 @@ impl GpuState {
                 label: Some("Station Pass"),
                 color_attachments: &[Some(wgpu::RenderPassColorAttachment {
                     view: &view,
+                    depth_slice: None,
                     resolve_target: None,
                     ops: wgpu::Operations {
                         load: wgpu::LoadOp::Clear(wgpu::Color {
@@ -5594,6 +5604,7 @@ impl GpuState {
                 depth_stencil_attachment: None,
                 timestamp_writes: None,
                 occlusion_query_set: None,
+                multiview_mask: None,
             });
             if !frame.line_vertices.is_empty() {
                 pass.set_pipeline(&self.line_pipeline);

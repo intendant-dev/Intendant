@@ -69,6 +69,15 @@ check_core() {
         all_ok=false
     fi
 
+    # Xcode Command Line Tools provide the macOS SDK and Metal frameworks used
+    # by native GPU crates such as wgpu.
+    if xcrun --sdk macosx --show-sdk-path >/dev/null 2>&1; then
+        ok "Xcode Command Line Tools"
+    else
+        miss "Xcode Command Line Tools" "xcode-select --install"
+        all_ok=false
+    fi
+
     if has_cmd bash; then
         ok "bash"
     else
