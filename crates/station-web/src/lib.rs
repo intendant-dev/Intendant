@@ -3331,6 +3331,31 @@ impl StationInner {
         yy += 22.0;
         self.panel_row(x, yy, "display", &nonempty(&controls.display_access, "--"));
         yy += 22.0;
+        let shared_view_label = if controls.shared_view_visible {
+            nonempty(&controls.shared_view_target, "active")
+        } else {
+            "none".to_string()
+        };
+        self.panel_row(x, yy, "shared", &shared_view_label);
+        yy += 22.0;
+        if controls.shared_view_visible {
+            self.panel_row(
+                x,
+                yy,
+                "shared op",
+                &nonempty(&controls.shared_view_action, "visible"),
+            );
+            yy += 22.0;
+            if !controls.shared_view_note.is_empty() {
+                self.panel_row(
+                    x,
+                    yy,
+                    "shared note",
+                    &truncate(&controls.shared_view_note, 38),
+                );
+                yy += 22.0;
+            }
+        }
         self.panel_row(
             x,
             yy,
@@ -3481,7 +3506,32 @@ impl StationInner {
                 C_RED_CSS.to_string(),
             ));
         }
+        if controls.shared_view_can_take_input {
+            surface_actions.push((
+                "shared-view-take-input".to_string(),
+                "take input".to_string(),
+                88.0,
+                C_GREEN_CSS.to_string(),
+            ));
+        }
+        if controls.shared_view_visible {
+            surface_actions.push((
+                "shared-view-hide".to_string(),
+                "hide shared".to_string(),
+                94.0,
+                C_YELLOW_CSS.to_string(),
+            ));
+        }
         yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &surface_actions);
+
+        self.section_title_color(x, yy, "Computer use", C_MAUVE_CSS);
+        yy += 22.0;
+        self.panel_row(x, yy, "provider", &nonempty(&controls.cu_provider, "auto"));
+        yy += 22.0;
+        self.panel_row(x, yy, "model", &nonempty(&controls.cu_model, "default"));
+        yy += 22.0;
+        self.panel_row(x, yy, "backend", &nonempty(&controls.cu_backend, "auto"));
+        yy += 30.0;
 
         self.section_title_color(x, yy, "Dashboard routes", C_TEAL_CSS);
         yy += 22.0;
@@ -3591,6 +3641,47 @@ impl StationInner {
         yy += 22.0;
         self.panel_row(x, yy, "source", &nonempty(&controls.session_source, "--"));
         yy += 22.0;
+        if !controls.session_live_id.is_empty() || !controls.session_action_id.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "window",
+                &truncate(&nonempty(&controls.session_live_id, "--"), 42),
+            );
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "actions",
+                &truncate(&nonempty(&controls.session_action_id, "--"), 42),
+            );
+            yy += 22.0;
+            if !controls.session_attach_id.is_empty() || !controls.session_stop_id.is_empty() {
+                self.panel_row(
+                    x,
+                    yy,
+                    "op ids",
+                    &truncate(
+                        &format!(
+                            "attach {} · stop {}",
+                            nonempty(&controls.session_attach_id, "--"),
+                            nonempty(&controls.session_stop_id, "--")
+                        ),
+                        42,
+                    ),
+                );
+                yy += 22.0;
+            }
+        }
+        if !controls.session_live_phase.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "phase",
+                &nonempty(&controls.session_live_phase, "--"),
+            );
+            yy += 22.0;
+        }
         self.panel_row(
             x,
             yy,
@@ -3734,7 +3825,7 @@ impl StationInner {
         self.section_title_color(x, yy, "Thread actions", C_MAUVE_CSS);
         yy += 22.0;
         let codex_target = if controls.session_source == "codex" {
-            controls.session_id.clone()
+            nonempty(&controls.session_action_id, &controls.session_id)
         } else {
             String::new()
         };
@@ -5612,6 +5703,11 @@ struct StationControlsSummary {
     session_selection: String,
     session_source: String,
     session_command: String,
+    session_live_id: String,
+    session_live_phase: String,
+    session_action_id: String,
+    session_attach_id: String,
+    session_stop_id: String,
     session_managed_context: String,
     session_context_archive: String,
     session_can_config: bool,
@@ -5639,9 +5735,17 @@ struct StationControlsSummary {
     browser_workspaces: u32,
     recordings: u32,
     active_recording: String,
+    cu_provider: String,
+    cu_model: String,
+    cu_backend: String,
     debug_screen: bool,
     debug_recording: bool,
     pending_attachments: u32,
+    shared_view_visible: bool,
+    shared_view_target: String,
+    shared_view_action: String,
+    shared_view_note: String,
+    shared_view_can_take_input: bool,
 }
 
 impl Default for StationControlsSummary {
@@ -5665,6 +5769,11 @@ impl Default for StationControlsSummary {
             session_selection: String::new(),
             session_source: String::new(),
             session_command: String::new(),
+            session_live_id: String::new(),
+            session_live_phase: String::new(),
+            session_action_id: String::new(),
+            session_attach_id: String::new(),
+            session_stop_id: String::new(),
             session_managed_context: String::new(),
             session_context_archive: String::new(),
             session_can_config: false,
@@ -5692,9 +5801,17 @@ impl Default for StationControlsSummary {
             browser_workspaces: 0,
             recordings: 0,
             active_recording: String::new(),
+            cu_provider: String::new(),
+            cu_model: String::new(),
+            cu_backend: String::new(),
             debug_screen: false,
             debug_recording: false,
             pending_attachments: 0,
+            shared_view_visible: false,
+            shared_view_target: String::new(),
+            shared_view_action: String::new(),
+            shared_view_note: String::new(),
+            shared_view_can_take_input: false,
         }
     }
 }

@@ -12301,6 +12301,87 @@ function stationRenderLocalDisplayPickerSection(parent) {
   }
 }
 
+function stationSharedViewStatusPayload() {
+  return {
+    visible: !!sharedViewState.visible,
+    action: sharedViewState.action || '',
+    display_id: sharedViewState.displayId,
+    display_target: sharedViewState.displayTarget || '',
+    target: sharedViewState.visible
+      ? sharedViewDisplayLabel(sharedViewState.displayId, sharedViewState.displayTarget)
+      : '',
+    reason: sharedViewState.reason || '',
+    note: sharedViewState.note || '',
+    region: sharedViewState.region || null,
+    can_take_input: sharedViewState.visible
+      && sharedViewState.action === 'input_request'
+      && sharedViewState.displayId !== null
+      && displaySlots.has(sharedViewState.displayId),
+  };
+}
+
+async function stationCopySharedViewStatusFromDock() {
+  await copyTextToClipboard(JSON.stringify(stationSharedViewStatusPayload(), null, 2));
+  stationSetPeerStatus('Shared-view status JSON copied', 'ok');
+  stationRenderPeersDock();
+}
+
+function stationFocusSharedViewDisplayFromDock() {
+  if (sharedViewState.displayId === null) {
+    stationSetPeerStatus('No shared-view display is selected.', 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  const slot = displaySlots.get(sharedViewState.displayId);
+  if (!slot) {
+    stationSetPeerStatus('Shared-view display is not currently streamed in this browser.', 'error');
+    stationRenderPeersDock();
+    return;
+  }
+  slot.el?.scrollIntoView?.({ block: 'center', inline: 'center', behavior: 'smooth' });
+  slot.el?.classList.add('shared-view-active');
+  renderSharedViewFocus(slot, sharedViewState.region, sharedViewState.note);
+}
+
+function stationRenderSharedViewSection(parent) {
+  const state = stationSharedViewStatusPayload();
+  const section = stationDockSection(parent, 'Shared view');
+  stationDockRow(section, 'status', state.visible ? 'visible' : 'hidden');
+  stationDockRow(section, 'target', state.target || '--');
+  stationDockRow(section, 'action', state.action || '--');
+  if (state.note || state.reason) {
+    stationDockRow(section, 'note', compactSessionText([state.reason, state.note].filter(Boolean).join(' / ')));
+  }
+  stationDockActions(section, [
+    {
+      id: 'station-peers-shared-view-focus',
+      label: 'Focus stream',
+      disabled: !state.visible || sharedViewState.displayId === null || !displaySlots.has(sharedViewState.displayId),
+      onClick: stationFocusSharedViewDisplayFromDock,
+    },
+    {
+      id: 'station-peers-shared-view-take-input',
+      label: 'Take input',
+      primary: state.can_take_input,
+      disabled: !state.can_take_input,
+      onClick: () => {
+        document.querySelector('[data-shared-view-take-input]')?.click();
+        stationScheduleUpdate();
+        stationRenderPeersDock();
+      },
+    },
+    state.visible ? {
+      label: 'Hide shared',
+      onClick: () => {
+        document.querySelector('[data-shared-view-close]')?.click();
+        stationScheduleUpdate();
+        stationRenderPeersDock();
+      },
+    } : null,
+    { label: 'Copy status', onClick: stationCopySharedViewStatusFromDock },
+  ]);
+}
+
 function stationRenderPeerCoordinatorSection(parent) {
   const section = stationDockSection(parent, 'Coordinator');
   const caps = stationDockInput(section, 'Find caps', stationPeerDraftValue('capabilityFilter', 'display'), { id: 'station-peer-capabilities', placeholder: 'display, computer-use' });
@@ -12476,6 +12557,7 @@ function stationRenderPeersDock() {
     status.textContent = stationPeerStatus;
     overview.appendChild(status);
   }
+  stationRenderSharedViewSection(body);
   stationRenderLocalDisplayPickerSection(body);
   stationRenderPeerAddSection(body);
   stationRenderPeerCommandSection(body);
@@ -16924,9 +17006,20 @@ function stationRenderControlsDock(sectionName = 'overview') {
       primary: controls.sharedViewCanTakeInput,
       disabled: !controls.sharedViewCanTakeInput,
       title: controls.sharedViewCanTakeInput ? 'Take input authority for the shared display' : 'No shared-view input request is available',
-      onClick: () => document.querySelector('[data-shared-view-take-input]')?.click(),
+      onClick: () => {
+        document.querySelector('[data-shared-view-take-input]')?.click();
+        stationScheduleUpdate();
+        stationRenderControlsDock('overview');
+      },
     },
-    controls.sharedViewVisible ? { label: 'Hide shared view', onClick: () => document.querySelector('[data-shared-view-close]')?.click() } : null,
+    controls.sharedViewVisible ? {
+      label: 'Hide shared view',
+      onClick: () => {
+        document.querySelector('[data-shared-view-close]')?.click();
+        stationScheduleUpdate();
+        stationRenderControlsDock('overview');
+      },
+    } : null,
     controls.pendingAttachments > 0 ? { label: 'Clear attach', danger: true, onClick: () => document.querySelector('[data-pending-attachments-clear]')?.click() } : null,
   ]);
 
@@ -16953,6 +17046,9 @@ function stationRenderControlsDock(sectionName = 'overview') {
   const external = stationDockSection(body, 'Selected external session');
   stationDockRow(external, 'source', prettyAgentName(controls.sessionSource) || controls.sessionSource || '--');
   stationDockRow(external, 'selection', controls.sessionSelection || '--');
+  if (controls.sessionLiveId) stationDockRow(external, 'window', shortSessionId(controls.sessionLiveId));
+  if (controls.sessionActionId && controls.sessionActionId !== controls.sessionId) stationDockRow(external, 'actions', shortSessionId(controls.sessionActionId));
+  if (controls.sessionLivePhase) stationDockRow(external, 'phase', controls.sessionLivePhase);
   stationDockRow(external, 'command', controls.sessionCommand || '--');
   stationDockRow(external, 'state', controls.sessionActive ? 'active' : (controls.sessionDetached ? 'detached' : 'idle'));
   if (controls.sessionSource === 'codex') {
@@ -16965,19 +17061,21 @@ function stationRenderControlsDock(sectionName = 'overview') {
   }
   if (controls.sessionId) {
     const targetActions = [];
-    if (controls.sessionCanFocus) targetActions.push({ label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: controls.sessionId }) });
-    if (controls.sessionCanAttach) targetActions.push({ label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: controls.sessionId }) });
+    if (controls.sessionCanFocus) targetActions.push({ label: 'Focus', onClick: () => stationHandleSessionAction({ action: 'focus', session_id: controls.sessionLiveId || controls.sessionId }) });
+    if (controls.sessionCanAttach) targetActions.push({ label: 'Attach', onClick: () => stationHandleSessionAction({ action: 'attach', session_id: controls.sessionAttachId || controls.sessionId }) });
     if (controls.sessionCanConfig) targetActions.push({ label: 'Launch config', onClick: () => stationHandleSessionAction({ action: 'config', session_id: controls.sessionId }) });
     if (controls.sessionCanConfig) targetActions.push({ label: 'Restart', onClick: () => stationHandleSessionAction({ action: 'restart', session_id: controls.sessionId }) });
     if (controls.sessionCanRename) targetActions.push({ label: 'Rename', onClick: () => stationHandleSessionAction({ action: 'rename', session_id: controls.sessionId }) });
     if (sideCloseParamsForSession(controls.sessionId)) targetActions.push({ label: 'Close side', danger: true, onClick: () => stationHandleSessionAction({ action: 'close-side', session_id: controls.sessionId }) });
-    if (controls.sessionCanStop) targetActions.push({ label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: controls.sessionId }) });
+    if (controls.sessionCanStop) targetActions.push({ label: 'Stop', danger: true, onClick: () => stationHandleSessionAction({ action: 'stop', session_id: controls.sessionStopId || controls.sessionId }) });
     targetActions.push({ label: 'Copy id', onClick: () => copyTextToClipboard(controls.sessionId) });
     stationDockActions(external, targetActions);
   } else {
     stationDockEmpty(external, 'Select or launch an external session to operate on it from Station.');
   }
-  if (controls.sessionIsCodex && controls.sessionId) stationRenderCodexThreadActionsSection(body, controls.sessionId);
+  if (controls.sessionIsCodex && (controls.sessionActionId || controls.sessionId)) {
+    stationRenderCodexThreadActionsSection(body, controls.sessionActionId || controls.sessionId, controls.sessionId);
+  }
 }
 
 function stationFindSessionById(sessionId) {
@@ -17059,8 +17157,9 @@ function stationHandleSessionAction(action) {
   }
   if (!sessionId) return;
   const session = stationFindSessionById(sessionId) || { session_id: sessionId };
+  const live = stationExternalLiveThreadDescriptor(session) || stationExternalLiveThreadDescriptor(sessionId);
   if (op === 'focus' || op === 'target') {
-    focusSessionWindow(sessionId);
+    focusSessionWindow(live?.liveId || sessionId);
     return;
   }
   if (op === 'copy') {
@@ -17074,7 +17173,7 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'attach') {
-    attachSessionWindowAction(sessionId);
+    attachSessionWindowAction(live?.attachId || sessionId);
     return;
   }
   if (op === 'config') {
@@ -17087,7 +17186,7 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'stop') {
-    stopSessionWindowAction(sessionId);
+    stopSessionWindowAction(live?.stopId || sessionId);
     return;
   }
   if (op === 'rename') {
@@ -17265,6 +17364,16 @@ function stationHandleControlsAction(action) {
   }
   if (op === 'attachments-clear') {
     document.querySelector('[data-pending-attachments-clear]')?.click();
+    return;
+  }
+  if (op === 'shared-view-take-input') {
+    document.querySelector('[data-shared-view-take-input]')?.click();
+    stationScheduleUpdate();
+    return;
+  }
+  if (op === 'shared-view-hide') {
+    document.querySelector('[data-shared-view-close]')?.click();
+    stationScheduleUpdate();
     return;
   }
   if (op === 'cu-settings') {
@@ -17984,21 +18093,42 @@ function stationBuildControlsSummary() {
     : (sessionSource === 'intendant' ? 'internal' : (rawSessionCommand || 'global default'));
   const sessionManagedContext = sessionSource === 'codex' ? sessionConfigManagedMode(sessionMeta) : '';
   const sessionContextArchive = sessionSource === 'codex' ? sessionConfigArchiveMode(sessionMeta) : '';
-  const sessionCanConfig = !!sessionId && !!rawSessionSource && rawSessionSource !== 'intendant';
-  const sessionCapabilities = stationSessionCapabilities(sessionId) || {};
+  let sessionCanConfig = !!sessionId && !!rawSessionSource && rawSessionSource !== 'intendant';
+  const externalLive = sessionId ? stationExternalLiveThreadDescriptor(sessionId) : null;
+  if (externalLive?.source && externalLive.source !== 'intendant') sessionCanConfig = true;
+  const sessionLiveId = externalLive?.liveId || '';
+  const sessionActionId = externalLive?.actionId || '';
+  const sessionAttachId = externalLive?.attachId || '';
+  const sessionStopId = externalLive?.stopId || '';
+  const sessionCapabilities = stationSessionCapabilities(sessionActionId || sessionId)
+    || stationSessionCapabilities(sessionId)
+    || {};
   const sessionGoal = normalizeSessionGoal(sessionMeta.goal || sessionMeta.session_goal || sessionMeta.sessionGoal || null);
-  const sessionActive = sessionId
-    ? isSessionWindowEffectivelyActive(sessionId)
-    : isAgentActivePhase(currentPhase);
-  const sessionDetached = sessionId ? sessionWindowIsDetached(sessionId) : false;
-  const sessionCanSteer = sessionId ? sessionSupportsSteer(sessionId) : true;
-  const sessionCanInterrupt = sessionId
-    ? sessionActive && sessionSupportsInterrupt(sessionId) && !sessionDetached
-    : isAgentActivePhase(currentPhase);
-  const sessionCanAttach = sessionId ? canAttachSessionWindow(sessionId) : false;
-  const sessionCanStop = sessionId ? sessionWindowStopAvailability(sessionId).ok : false;
-  const sessionCanFocus = !!(sessionId && sessionWindows.has(sessionId));
-  const sessionIsCodex = sessionId ? sessionWindowIsCodex(sessionId) : backend === 'codex';
+  const sessionActive = sessionLiveId
+    ? isSessionWindowEffectivelyActive(sessionLiveId)
+    : (sessionId
+      ? isSessionWindowEffectivelyActive(sessionId)
+      : isAgentActivePhase(currentPhase));
+  const sessionDetached = externalLive
+    ? externalLive.detached
+    : (sessionId ? sessionWindowIsDetached(sessionId) : false);
+  const sessionCanSteer = externalLive
+    ? externalLive.steer
+    : (sessionId ? sessionSupportsSteer(sessionId) : true);
+  const sessionCanInterrupt = externalLive
+    ? !!sessionStopId
+    : (sessionId
+      ? sessionActive && sessionSupportsInterrupt(sessionId) && !sessionDetached
+      : isAgentActivePhase(currentPhase));
+  const sessionCanAttach = externalLive ? !!sessionAttachId : (sessionId ? canAttachSessionWindow(sessionId) : false);
+  const sessionCanStop = externalLive ? !!sessionStopId : (sessionId ? sessionWindowStopAvailability(sessionId).ok : false);
+  const sessionCanFocus = externalLive ? !!sessionLiveId : !!(sessionId && sessionWindows.has(sessionId));
+  const sessionIsCodex = sessionId
+    ? stationSessionLooksCodex(sessionActionId || sessionId)
+      || stationSessionLooksCodex(sessionId)
+      || sessionSource === 'codex'
+    : backend === 'codex';
+  const sessionLivePhase = externalLive?.phase || '';
   const sessionServiceTier = sessionSource === 'codex'
     ? normalizeCodexServiceTier(
       sessionCapabilities.codexServiceTier ||
@@ -18023,6 +18153,10 @@ function stationBuildControlsSummary() {
   const sharedViewTarget = sharedViewVisible
     ? sharedViewDisplayLabel(sharedViewState.displayId, sharedViewState.displayTarget)
     : '';
+  const sharedViewNote = [sharedViewState.reason, sharedViewState.note]
+    .map(value => String(value || '').trim())
+    .filter(Boolean)
+    .join(' / ');
   const sharedViewCanTakeInput = sharedViewVisible
     && sharedViewState.action === 'input_request'
     && sharedViewState.displayId !== null
@@ -18054,6 +18188,11 @@ function stationBuildControlsSummary() {
     sessionSelection,
     sessionSource,
     sessionCommand,
+    sessionLiveId,
+    sessionLivePhase,
+    sessionActionId,
+    sessionAttachId,
+    sessionStopId,
     sessionManagedContext,
     sessionContextArchive,
     sessionCanConfig,
@@ -18091,6 +18230,8 @@ function stationBuildControlsSummary() {
     pendingAttachments: pendingAttachmentCount,
     sharedViewVisible,
     sharedViewTarget,
+    sharedViewAction: sharedViewState.action || '',
+    sharedViewNote,
     sharedViewCanTakeInput,
   };
 }
