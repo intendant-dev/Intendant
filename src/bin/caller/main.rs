@@ -8354,6 +8354,48 @@ impl FollowUpMessage {
     }
 }
 
+const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN: &str =
+    "<managed_context_rewind_followup_replay>";
+const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE: &str =
+    "</managed_context_rewind_followup_replay>";
+const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER: &str = "\n\nUser follow-up:\n";
+const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_INSTRUCTIONS: &str =
+    "A managed-context rewind requested during this queued follow-up has already succeeded. Continue the user's follow-up below from the rewound context. Do not call rewind_context again merely to satisfy any instruction to rewind first; only rewind again if new context pressure or an invalid anchor genuinely requires it.";
+
+fn managed_context_canonical_followup_replay_text(text: &str) -> String {
+    let mut current = text.trim();
+    loop {
+        let Some(inner) = current
+            .strip_prefix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
+            .and_then(|inner| inner.strip_suffix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE))
+        else {
+            break;
+        };
+        let Some((_, user_followup)) =
+            inner.split_once(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER)
+        else {
+            break;
+        };
+        let next = user_followup.trim();
+        if next == current {
+            break;
+        }
+        current = next;
+    }
+    current.to_string()
+}
+
+fn managed_context_followup_replay_text(user_followup: &str) -> String {
+    format!(
+        "{open}\n{instructions}{marker}{user_followup}\n{close}",
+        open = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN,
+        instructions = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_INSTRUCTIONS,
+        marker = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER,
+        user_followup = user_followup.trim(),
+        close = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE,
+    )
+}
+
 fn managed_context_followup_replay_after_rewind(
     active_followup: &FollowUpMessage,
 ) -> Option<FollowUpMessage> {
@@ -8362,15 +8404,26 @@ fn managed_context_followup_replay_after_rewind(
         return None;
     }
 
-    let text = format!(
-        "<managed_context_rewind_followup_replay>\nA managed-context rewind requested during this queued follow-up has already succeeded. Continue the user's follow-up below from the rewound context. Do not call rewind_context again merely to satisfy any instruction to rewind first; only rewind again if new context pressure or an invalid anchor genuinely requires it.\n\nUser follow-up:\n{}\n</managed_context_rewind_followup_replay>",
-        active_followup.text.trim()
-    );
+    let user_followup = managed_context_canonical_followup_replay_text(&active_followup.text);
+    if user_followup.trim().is_empty() {
+        return None;
+    }
+    let text = managed_context_followup_replay_text(&user_followup);
 
     Some(FollowUpMessage::with_attachments(
         text,
         active_followup.attachments.clone(),
     ))
+}
+
+fn managed_context_sanitize_queued_followup_replay(
+    mut followup: FollowUpMessage,
+) -> FollowUpMessage {
+    let canonical = managed_context_canonical_followup_replay_text(&followup.text);
+    if canonical.trim() != followup.text.trim() {
+        followup.text = managed_context_followup_replay_text(&canonical);
+    }
+    followup
 }
 
 fn managed_context_rewind_continuation(
@@ -8380,6 +8433,7 @@ fn managed_context_rewind_continuation(
 ) -> Option<FollowUpMessage> {
     pending_replays
         .pop_front()
+        .map(managed_context_sanitize_queued_followup_replay)
         .or_else(|| managed_context_followup_replay_after_rewind(active_followup))
         .or(automatic_resume)
 }
@@ -9991,6 +10045,85 @@ mod tests {
             .contains("Do not call rewind_context again"));
         assert_eq!(continuation.follow_up_id, None);
         assert!(!continuation.managed_context_recovery_kickstart);
+    }
+
+    #[test]
+    fn managed_context_rewind_replay_is_idempotent_for_active_followup() {
+        let original = "First inspect the failing harness log.\nThen patch the replay builder.";
+        let active = FollowUpMessage::text(original.into());
+        let first = managed_context_followup_replay_after_rewind(&active).expect("first replay");
+        let second = managed_context_followup_replay_after_rewind(&first).expect("second replay");
+
+        assert_eq!(second.text, first.text);
+        assert_eq!(
+            second
+                .text
+                .matches(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
+                .count(),
+            1
+        );
+        assert_eq!(
+            second
+                .text
+                .matches(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE)
+                .count(),
+            1
+        );
+        assert_eq!(
+            second
+                .text
+                .matches(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER)
+                .count(),
+            1
+        );
+        assert_eq!(second.text.matches(original).count(), 1);
+        assert!(second
+            .text
+            .contains("Do not call rewind_context again merely to satisfy"));
+    }
+
+    #[test]
+    fn managed_context_rewind_replay_unwraps_nested_active_replay() {
+        let original = "Apply the focused fix and run the harness unit test.";
+        let nested =
+            managed_context_followup_replay_text(&managed_context_followup_replay_text(original));
+        let active = FollowUpMessage::text(nested);
+        let mut pending = std::collections::VecDeque::new();
+
+        let continuation =
+            managed_context_rewind_continuation(&mut pending, &active, None).expect("continuation");
+
+        assert_eq!(
+            continuation.text,
+            managed_context_followup_replay_text(original)
+        );
+        assert_eq!(
+            continuation
+                .text
+                .matches(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
+                .count(),
+            1
+        );
+        assert_eq!(continuation.text.matches(original).count(), 1);
+    }
+
+    #[test]
+    fn managed_context_rewind_replay_sanitizes_nested_queued_replay() {
+        let original = "Preserve the user's exact queued intent.";
+        let nested =
+            managed_context_followup_replay_text(&managed_context_followup_replay_text(original));
+        let active =
+            FollowUpMessage::text("recovery kickstart".into()).managed_context_recovery_kickstart();
+        let mut pending = std::collections::VecDeque::from([FollowUpMessage::text(nested)]);
+
+        let continuation =
+            managed_context_rewind_continuation(&mut pending, &active, None).expect("continuation");
+
+        assert_eq!(
+            continuation.text,
+            managed_context_followup_replay_text(original)
+        );
+        assert!(pending.is_empty());
     }
 
     #[test]
