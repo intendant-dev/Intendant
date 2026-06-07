@@ -120,6 +120,10 @@ pub struct SessionCapabilities {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_managed_context: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_approval_policy: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_context_archive: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub codex_command: Option<String>,

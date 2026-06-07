@@ -4188,6 +4188,8 @@ mod tests {
                 interrupt: false,
                 codex_thread_actions: vec!["undo".to_string()],
                 codex_managed_context: Some("managed".to_string()),
+                codex_sandbox: Some("danger-full-access".to_string()),
+                codex_approval_policy: Some("never".to_string()),
                 codex_context_archive: Some("summary".to_string()),
                 codex_command: Some("/opt/codex/bin/codex".to_string()),
                 codex_fast_mode: Some(true),
@@ -4202,6 +4204,8 @@ mod tests {
         assert!(json.contains("\"steer\":false"));
         assert!(json.contains("\"codex_thread_actions\":[\"undo\"]"));
         assert!(json.contains("\"codex_managed_context\":\"managed\""));
+        assert!(json.contains("\"codex_sandbox\":\"danger-full-access\""));
+        assert!(json.contains("\"codex_approval_policy\":\"never\""));
         assert!(json.contains("\"codex_context_archive\":\"summary\""));
         assert!(json.contains("\"codex_command\":\"/opt/codex/bin/codex\""));
         assert!(json.contains("\"codex_fast_mode\":true"));

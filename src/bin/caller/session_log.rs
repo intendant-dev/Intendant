@@ -5099,6 +5099,8 @@ mod tests {
                 interrupt: false,
                 codex_thread_actions: vec![],
                 codex_managed_context: Some("managed".to_string()),
+                codex_sandbox: Some("danger-full-access".to_string()),
+                codex_approval_policy: Some("never".to_string()),
                 codex_context_archive: Some("summary".to_string()),
                 codex_command: Some("/opt/codex/bin/codex".to_string()),
                 codex_fast_mode: Some(false),
@@ -5171,6 +5173,11 @@ mod tests {
                     capabilities.codex_managed_context.as_deref(),
                     Some("managed")
                 );
+                assert_eq!(
+                    capabilities.codex_sandbox.as_deref(),
+                    Some("danger-full-access")
+                );
+                assert_eq!(capabilities.codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(
                     capabilities.codex_context_archive.as_deref(),
                     Some("summary")

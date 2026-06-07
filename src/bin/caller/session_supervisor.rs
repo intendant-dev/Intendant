@@ -1168,15 +1168,22 @@ impl SessionSupervisor {
                 {
                     crate::session_config::apply_to_project(&mut project, backend, config);
                 }
+                let effective_session_agent_config = external_backend.as_ref().map(|backend| {
+                    effective_session_agent_config_from_project(
+                        backend,
+                        &project,
+                        session_agent_config.as_ref(),
+                    )
+                });
 
                 write_session_meta(&session_log, &project.root, None, None);
-                if let Some(config) = session_agent_config.as_ref() {
+                if let Some(config) = effective_session_agent_config.as_ref() {
                     let _ = crate::session_config::write_log_dir_config(&log_dir, config);
                 }
-                let codex_service_tier = session_agent_config
+                let codex_service_tier = effective_session_agent_config
                     .as_ref()
                     .and_then(|config| config.codex_service_tier.clone());
-                let codex_home = session_agent_config
+                let codex_home = effective_session_agent_config
                     .as_ref()
                     .and_then(|config| config.codex_home.clone());
                 let intendant_session_id = session_log
@@ -1274,15 +1281,22 @@ impl SessionSupervisor {
         {
             crate::session_config::apply_to_project(&mut project, backend, config);
         }
+        let effective_session_agent_config = external_backend.as_ref().map(|backend| {
+            effective_session_agent_config_from_project(
+                backend,
+                &project,
+                session_agent_config.as_ref(),
+            )
+        });
 
         write_session_meta(&session_log, &project.root, Some(&resume_task), None);
-        if let Some(config) = session_agent_config.as_ref() {
+        if let Some(config) = effective_session_agent_config.as_ref() {
             let _ = crate::session_config::write_log_dir_config(&log_dir, config);
         }
-        let codex_service_tier = session_agent_config
+        let codex_service_tier = effective_session_agent_config
             .as_ref()
             .and_then(|config| config.codex_service_tier.clone());
-        let codex_home = session_agent_config
+        let codex_home = effective_session_agent_config
             .as_ref()
             .and_then(|config| config.codex_home.clone());
         self.activate_shared_session(session_log.clone()).await;
@@ -3271,6 +3285,25 @@ fn apply_session_codex_context_archive(
         }
         _ => Err("codex_context_archive requires Codex".to_string()),
     }
+}
+
+fn effective_session_agent_config_from_project(
+    backend: &external_agent::AgentBackend,
+    project: &Project,
+    overrides: Option<&crate::session_config::SessionAgentConfig>,
+) -> crate::session_config::SessionAgentConfig {
+    let mut config = crate::session_config::from_project(backend, project);
+    if matches!(backend, external_agent::AgentBackend::Codex) {
+        if let Some(overrides) = overrides {
+            if overrides.codex_service_tier.is_some() {
+                config.codex_service_tier = overrides.codex_service_tier.clone();
+            }
+            if overrides.codex_home.is_some() {
+                config.codex_home = overrides.codex_home.clone();
+            }
+        }
+    }
+    config
 }
 
 fn write_session_meta(

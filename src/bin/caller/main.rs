@@ -4771,6 +4771,12 @@ fn codex_external_session_capabilities(
         codex_managed_context: Some(project::normalize_codex_managed_context(
             &project.config.agent.codex.managed_context,
         )),
+        codex_sandbox: Some(project::normalize_sandbox_mode(
+            &project.config.agent.codex.sandbox,
+        )),
+        codex_approval_policy: Some(project::normalize_approval_policy(
+            &project.config.agent.codex.approval_policy,
+        )),
         codex_context_archive: Some(project::normalize_codex_context_archive(
             &project.config.agent.codex.context_archive,
         )),
@@ -4813,6 +4819,10 @@ fn codex_drain_session_capabilities(
         codex_managed_context: launch
             .as_ref()
             .and_then(|cfg| cfg.codex_managed_context.clone()),
+        codex_sandbox: launch.as_ref().and_then(|cfg| cfg.codex_sandbox.clone()),
+        codex_approval_policy: launch
+            .as_ref()
+            .and_then(|cfg| cfg.codex_approval_policy.clone()),
         codex_context_archive: launch
             .as_ref()
             .and_then(|cfg| cfg.codex_context_archive.clone()),
@@ -5839,6 +5849,8 @@ fn emit_codex_subagent_started(
             interrupt: false,
             codex_thread_actions: Vec::new(),
             codex_managed_context: None,
+            codex_sandbox: None,
+            codex_approval_policy: None,
             codex_context_archive: None,
             codex_command: None,
             codex_fast_mode: None,

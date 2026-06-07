@@ -248,7 +248,20 @@ pub fn write_log_dir_config(log_dir: &Path, config: &SessionAgentConfig) -> Resu
 
 pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
     let raw = std::fs::read_to_string(log_dir.join(SESSION_AGENT_CONFIG_FILE)).ok()?;
-    let mut config: SessionAgentConfig = serde_json::from_str(&raw).ok()?;
+    let config: SessionAgentConfig = serde_json::from_str(&raw).ok()?;
+    let config = normalize_session_agent_config(config, None);
+    (!config.is_empty()).then_some(config)
+}
+
+fn normalize_session_agent_config(
+    mut config: SessionAgentConfig,
+    default_source: Option<&str>,
+) -> SessionAgentConfig {
+    if config.source.is_none() {
+        config.source = default_source
+            .map(crate::session_names::normalize_source)
+            .filter(|source| !source.is_empty());
+    }
     if let Some(source) = config.source.take() {
         config.source = Some(crate::session_names::normalize_source(&source));
     }
@@ -273,7 +286,7 @@ pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
     if let Some(home) = config.codex_home.take() {
         config.codex_home = normalize_codex_home(Some(&home));
     }
-    (!config.is_empty()).then_some(config)
+    config
 }
 
 pub fn write_external_overlay(
@@ -325,13 +338,18 @@ pub fn write_external_overlay(
         if !source_value.is_object() {
             *source_value = Value::Object(Map::new());
         }
-        source_value
-            .as_object_mut()
-            .expect("source is object")
-            .insert(
-                session_id.to_string(),
-                serde_json::to_value(config).map_err(|e| format!("serialize config: {e}"))?,
-            );
+        let source_entries = source_value.as_object_mut().expect("source is object");
+        let mut merged = normalize_session_agent_config(config.clone(), Some(&source));
+        if let Some(existing) = source_entries
+            .get(session_id)
+            .and_then(|value| serde_json::from_value::<SessionAgentConfig>(value.clone()).ok())
+        {
+            merged.merge_missing_from(normalize_session_agent_config(existing, Some(&source)));
+        }
+        source_entries.insert(
+            session_id.to_string(),
+            serde_json::to_value(&merged).map_err(|e| format!("serialize config: {e}"))?,
+        );
         let json =
             serde_json::to_string_pretty(&root).map_err(|e| format!("serialize overlay: {e}"))?;
         // Atomic write so a concurrent reader never sees a torn file and collapses
@@ -567,35 +585,10 @@ fn read_overlay_map(home: &Path) -> HashMap<String, HashMap<String, SessionAgent
         };
         let mut by_id = HashMap::new();
         for (session_id, value) in entries {
-            let Ok(mut config) = serde_json::from_value::<SessionAgentConfig>(value.clone()) else {
+            let Ok(config) = serde_json::from_value::<SessionAgentConfig>(value.clone()) else {
                 continue;
             };
-            if config.source.is_none() {
-                config.source = Some(source.clone());
-            }
-            if let Some(source) = config.source.take() {
-                config.source = Some(crate::session_names::normalize_source(&source));
-            }
-            if let Some(command) = config.agent_command.take() {
-                config.agent_command = normalize_agent_command(Some(&command));
-            }
-            if let Some(mode) = config.codex_sandbox.take() {
-                config.codex_sandbox = normalize_codex_sandbox(Some(&mode));
-            }
-            if let Some(policy) = config.codex_approval_policy.take() {
-                config.codex_approval_policy = normalize_codex_approval_policy(Some(&policy));
-            }
-            if let Some(mode) = config.codex_managed_context.take() {
-                config.codex_managed_context =
-                    Some(crate::project::normalize_codex_managed_context(&mode));
-            }
-            if let Some(mode) = config.codex_context_archive.take() {
-                config.codex_context_archive =
-                    Some(crate::project::normalize_codex_context_archive(&mode));
-            }
-            if let Some(home) = config.codex_home.take() {
-                config.codex_home = normalize_codex_home(Some(&home));
-            }
+            let config = normalize_session_agent_config(config, Some(&source));
             if !config.is_empty() {
                 by_id.insert(session_id.clone(), config);
             }
@@ -703,6 +696,31 @@ mod tests {
         write_external_overlay(home.path(), "codex", "thread-1", &cfg).unwrap();
         let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
         assert_eq!(loaded, cfg);
+    }
+
+    #[test]
+    fn partial_overlay_write_preserves_existing_launch_sandbox() {
+        let home = tempfile::tempdir().unwrap();
+        let full = from_wire(
+            Some("codex"),
+            Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("vanilla"),
+            Some("summary"),
+            None,
+        );
+        write_external_overlay(home.path(), "codex", "thread-1", &full).unwrap();
+
+        let partial = from_wire(Some("codex"), None, None, None, Some("managed"), None, None);
+        write_external_overlay(home.path(), "codex", "thread-1", &partial).unwrap();
+
+        let loaded = lookup_external_overlay(home.path(), "codex", "thread-1").unwrap();
+        assert_eq!(loaded.agent_command.as_deref(), Some("/tmp/codex"));
+        assert_eq!(loaded.codex_sandbox.as_deref(), Some("danger-full-access"));
+        assert_eq!(loaded.codex_approval_policy.as_deref(), Some("never"));
+        assert_eq!(loaded.codex_managed_context.as_deref(), Some("managed"));
+        assert_eq!(loaded.codex_context_archive.as_deref(), Some("summary"));
     }
 
     #[test]
