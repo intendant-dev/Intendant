@@ -10495,6 +10495,9 @@ const sessionRelationshipHydrationInFlight = new Set();
 let processingLogReplay = false;
 let logReplayAppendBatch = null;
 const sessionMetadataById = new Map();
+let promptTargetLogBadgeRenderedTarget = null;
+let promptTargetLogBadgeScheduledTarget = null;
+let promptTargetLogBadgeRefreshFrame = 0;
 const sessionUsageById = new Map();
 let latestGlobalUsage = null;
 let dashboardProjectRoot = '';
@@ -26735,12 +26738,12 @@ function markSessionWindowPendingActive(sessionId) {
 }
 
 function updateTaskTargetChip() {
-  updatePromptTargetSessionHighlight();
-  updatePromptTargetLogSessionBadges();
+  const sid = resolvePromptTargetSessionId();
+  updatePromptTargetSessionHighlight(sid);
+  schedulePromptTargetLogSessionBadgeRefresh(sid);
   updateControlFastButtonState();
   const chip = document.getElementById('task-target-chip');
   if (!chip) return;
-  const sid = resolvePromptTargetSessionId();
   clearSessionBadgeStyle(chip);
   if (!sid) {
     chip.style.display = 'none';
@@ -26765,23 +26768,39 @@ function updateTaskTargetChip() {
   chip.setAttribute('aria-label', title);
 }
 
-function updatePromptTargetSessionHighlight() {
-  const target = resolvePromptTargetSessionId();
+function updatePromptTargetSessionHighlight(target = resolvePromptTargetSessionId()) {
   for (const [sid, win] of sessionWindows) {
     win.el.classList.toggle('prompt-target', !!target && sid === target && !win.ended);
   }
 }
 
-function updatePromptTargetLogSessionBadges() {
-  const target = resolvePromptTargetSessionId();
+function schedulePromptTargetLogSessionBadgeRefresh(target = resolvePromptTargetSessionId(), options = {}) {
+  const normalizedTarget = String(target || '').trim();
+  if (!options.force && !promptTargetLogBadgeRefreshFrame && promptTargetLogBadgeRenderedTarget === normalizedTarget) return;
+  promptTargetLogBadgeScheduledTarget = normalizedTarget;
+  if (promptTargetLogBadgeRefreshFrame) return;
+  promptTargetLogBadgeRefreshFrame = requestAnimationFrame(() => {
+    promptTargetLogBadgeRefreshFrame = 0;
+    updatePromptTargetLogSessionBadges(promptTargetLogBadgeScheduledTarget);
+  });
+}
+
+function updatePromptTargetLogSessionBadges(target = resolvePromptTargetSessionId()) {
+  const normalizedTarget = String(target || '').trim();
+  if (promptTargetLogBadgeRefreshFrame) {
+    cancelAnimationFrame(promptTargetLogBadgeRefreshFrame);
+    promptTargetLogBadgeRefreshFrame = 0;
+  }
+  promptTargetLogBadgeScheduledTarget = normalizedTarget;
   document.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
-    applyPromptTargetLogSessionBadgeState(entry, target);
+    applyPromptTargetLogSessionBadgeState(entry, normalizedTarget);
   });
   if (concurrentLogDetachedFragment) {
     concurrentLogDetachedFragment.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
-      applyPromptTargetLogSessionBadgeState(entry, target);
+      applyPromptTargetLogSessionBadgeState(entry, normalizedTarget);
     });
   }
+  promptTargetLogBadgeRenderedTarget = normalizedTarget;
 }
 
 function applyPromptTargetLogSessionBadgeState(entry, target = resolvePromptTargetSessionId()) {
@@ -26949,7 +26968,8 @@ function refreshSessionWindowPathLabels(win) {
 function refreshSessionIdentityLabels(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
-  if (sid === resolvePromptTargetSessionId()) updateTaskTargetChip();
+  const target = resolvePromptTargetSessionId();
+  if (sid === target) updateTaskTargetChip();
   const selector = window.CSS?.escape
     ? `.log-entry[data-session-id="${CSS.escape(sid)}"]`
     : '.log-entry[data-session-id]';
@@ -26958,7 +26978,7 @@ function refreshSessionIdentityLabels(sessionId) {
     for (const child of entry.children) {
       if (child.classList?.contains('log-session')) {
         renderSessionIdentity(child, sid, { showName: false });
-        applyPromptTargetLogSessionBadgeState(entry);
+        applyPromptTargetLogSessionBadgeState(entry, target);
       }
     }
   });
