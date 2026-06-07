@@ -1025,6 +1025,7 @@ impl StationInner {
         self.draw_operations_runway(w, h);
         self.draw_display_switchboard(w, h);
         self.draw_activity_detail_rail(w, h);
+        self.draw_continuity_detail_bar(w, h);
         self.draw_command_lane(w, h);
         self.draw_attention_strip(w, h);
         self.draw_corners(w, h);
@@ -2758,6 +2759,241 @@ impl StationInner {
             HitAction::Select("system:activity".to_string())
         };
         self.hit_zones.push(HitZone::new(x, y, w, 20.0, hit));
+    }
+
+    fn draw_continuity_detail_bar(&mut self, w: f32, h: f32) {
+        if w < 1040.0
+            || h < 520.0
+            || self.selected_id.is_some()
+            || !self.attention_items().is_empty()
+        {
+            return;
+        }
+        let x = 246.0;
+        let right_rail_x = w - 264.0 - 14.0;
+        let bar_w = (right_rail_x - x - 10.0).min(760.0);
+        if bar_w < 560.0 {
+            return;
+        }
+        let y = if h >= 700.0 { 530.0 } else { 206.0 };
+        let command_top = (h - 78.0 - 14.0).max(52.0);
+        let bar_h = (command_top - y - 8.0).min(124.0);
+        if bar_h < 88.0 {
+            return;
+        }
+
+        self.round_rect(
+            x,
+            y,
+            bar_w,
+            bar_h,
+            6.0,
+            "rgba(17,17,27,0.76)",
+            "rgba(203,166,247,0.50)",
+        );
+        self.text(
+            "CONTINUITY DETAIL",
+            x + 12.0,
+            y + 19.0,
+            10.0,
+            C_MAUVE_CSS,
+            "bold",
+        );
+        self.text(
+            "context / managed",
+            x + 133.0,
+            y + 19.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let card_gap = 8.0;
+        let card_y = y + 30.0;
+        let card_h = bar_h - 40.0;
+        let context_w = ((bar_w - 28.0 - card_gap) * 0.54).clamp(294.0, 406.0);
+        let managed_w = bar_w - 28.0 - card_gap - context_w;
+        let context = self.snapshot.context.clone();
+        let managed = self.snapshot.managed.clone();
+        self.continuity_context_card(x + 10.0, card_y, context_w, card_h, &context);
+        self.continuity_managed_card(x + 18.0 + context_w, card_y, managed_w, card_h, &managed);
+    }
+
+    fn continuity_context_card(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        ctx: &StationContextSummary,
+    ) {
+        let pct = percent(ctx.tokens, ctx.effective_window);
+        let color = if ctx.available {
+            pressure_color(pct)
+        } else {
+            C_OVERLAY1_CSS
+        };
+        self.round_rect(
+            x,
+            y,
+            w,
+            h,
+            4.0,
+            "rgba(24,24,37,0.70)",
+            "rgba(137,180,250,0.48)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 7.0) as f64, (y + 8.0) as f64, 3.0, (h - 16.0) as f64);
+        self.text("Context", x + 16.0, y + 14.0, 8.5, C_BLUE_CSS, "bold");
+        let value = if ctx.available {
+            format!(
+                "{} / {} items",
+                pct_label(pct),
+                compact_number(ctx.item_count as f64)
+            )
+        } else {
+            "waiting".to_string()
+        };
+        self.text(
+            &truncate(&value, 24),
+            x + 72.0,
+            y + 14.0,
+            8.5,
+            color,
+            "bold",
+        );
+
+        let detail = ctx
+            .top_items
+            .first()
+            .map(|row| {
+                truncate(
+                    &format!("{} {}", nonempty(&row.label, "item"), row.value),
+                    42,
+                )
+            })
+            .or_else(|| {
+                ctx.top_categories.first().map(|row| {
+                    truncate(
+                        &format!(
+                            "{} {} tokens",
+                            nonempty(&row.label, "lane"),
+                            compact_number(row.value as f64)
+                        ),
+                        42,
+                    )
+                })
+            })
+            .unwrap_or_else(|| {
+                truncate(
+                    &format!(
+                        "{} / {}",
+                        nonempty(&ctx.source, "snapshot"),
+                        nonempty(&ctx.turn, "--")
+                    ),
+                    42,
+                )
+            });
+        self.text(&detail, x + 16.0, y + 32.0, 8.5, C_SUBTEXT0_CSS, "normal");
+        self.meter(x + 16.0, y + h - 4.0, w - 32.0, pct, color);
+
+        let actions = [
+            RunwayAction::context("live", "live", 42.0, C_BLUE_CSS),
+            RunwayAction::context("copy", "copy-snapshot", 44.0, C_TEAL_CSS),
+            RunwayAction::select("panel", "system:context", 48.0, C_OVERLAY1_CSS),
+        ];
+        let mut ax = x + w - 8.0;
+        for action in actions.into_iter().rev() {
+            ax -= action.width;
+            if ax < x + 142.0 {
+                break;
+            }
+            self.pill_at(ax, y + 5.0, action.width, 18.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, y + 5.0, action.width, 18.0, action.hit));
+            ax -= 6.0;
+        }
+    }
+
+    fn continuity_managed_card(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        managed: &StationManagedSummary,
+    ) {
+        let pct = percent(managed.used_tokens, managed.effective_window);
+        let color = pressure_color(pct);
+        self.round_rect(
+            x,
+            y,
+            w,
+            h,
+            4.0,
+            "rgba(24,24,37,0.70)",
+            "rgba(203,166,247,0.48)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 7.0) as f64, (y + 8.0) as f64, 3.0, (h - 16.0) as f64);
+        self.text("Managed", x + 16.0, y + 14.0, 8.5, C_MAUVE_CSS, "bold");
+        self.text(
+            &truncate(&nonempty(&managed.status, "unknown"), 18),
+            x + 76.0,
+            y + 14.0,
+            8.5,
+            color,
+            "bold",
+        );
+
+        let detail = if !managed.error.is_empty() {
+            truncate(&managed.error, 42)
+        } else if managed.rewind_only {
+            "rewind-only pressure".to_string()
+        } else {
+            truncate(
+                &format!(
+                    "{} records / {} anchors / {} branches",
+                    managed.records, managed.anchors, managed.branches
+                ),
+                42,
+            )
+        };
+        self.text(&detail, x + 16.0, y + 32.0, 8.5, C_SUBTEXT0_CSS, "normal");
+        self.meter(x + 16.0, y + h - 4.0, w - 32.0, pct, color);
+
+        let actions = [
+            RunwayAction::managed(
+                "target",
+                "use-target",
+                "",
+                &managed.session_id,
+                52.0,
+                C_TEAL_CSS,
+            ),
+            RunwayAction::managed(
+                "rewind",
+                "rewind",
+                "",
+                &managed.session_id,
+                56.0,
+                C_MAUVE_CSS,
+            ),
+            RunwayAction::select("panel", "system:managed", 48.0, C_OVERLAY1_CSS),
+        ];
+        let mut ax = x + w - 8.0;
+        for action in actions.into_iter().rev() {
+            ax -= action.width;
+            if ax < x + 142.0 {
+                break;
+            }
+            self.pill_at(ax, y + 5.0, action.width, 18.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, y + 5.0, action.width, 18.0, action.hit));
+            ax -= 6.0;
+        }
     }
 
     fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
