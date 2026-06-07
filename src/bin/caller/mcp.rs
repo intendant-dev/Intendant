@@ -895,7 +895,7 @@ impl McpAppState {
         let (used_tokens, rewind_only_limit, status) =
             self.context_pressure_rewind_only_for(session_id)?;
         let mut message = format!(
-            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout are available until pressure is reduced below the threshold. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. Call list_rewind_anchors to inspect valid recovery candidates; pass include_non_recovery=true only to audit anchors known not to clear recovery. Inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id and a dense carry-forward primer before using other tools. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls."
+            "Backend-reported Codex context pressure is {status} ({used_tokens}/{rewind_only_limit} tokens). Managed context is now in density-preservation mode: model-facing tools are limited to get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout until pressure is reduced below the threshold. Read-only supervisor observability tools such as get_logs and controller status remain available. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are available; any earlier transcript claim that either is unavailable is stale. Call list_rewind_anchors to inspect valid recovery candidates; pass include_non_recovery=true only to audit anchors known not to clear recovery. Inspect a candidate if the compact row is ambiguous, then call rewind_context with an exact returned item_id and a dense carry-forward primer before using other tools. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure is below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls."
         );
         if let Some(notice) = self.insufficient_rewind_notice_for(session_id) {
             message.push_str(&format!(
@@ -922,6 +922,10 @@ impl McpAppState {
 }
 
 fn rewind_only_allowed_tool(name: &str) -> bool {
+    rewind_only_recovery_tool(name) || rewind_only_supervisor_observability_tool(name)
+}
+
+fn rewind_only_recovery_tool(name: &str) -> bool {
     matches!(
         name,
         "get_status"
@@ -929,6 +933,17 @@ fn rewind_only_allowed_tool(name: &str) -> bool {
             | "inspect_rewind_anchor"
             | "rewind_context"
             | "rewind_backout"
+    )
+}
+
+fn rewind_only_supervisor_observability_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "get_logs"
+            | "get_pending_approval"
+            | "get_pending_input"
+            | "get_restart_status"
+            | "get_controller_loop_status"
     )
 }
 
@@ -8723,13 +8738,112 @@ mod tests {
                 .rewind_only_gate_message("take_screenshot")
                 .expect("Codex action tool should be gated");
             assert!(message.contains(
-                "only get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout"
+                "model-facing tools are limited to get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout"
             ));
+            assert!(message.contains("Read-only supervisor observability tools"));
             assert!(s.rewind_only_gate_message("get_status").is_none());
             assert!(s.rewind_only_gate_message("list_rewind_anchors").is_none());
             assert!(s.rewind_only_gate_message("inspect_rewind_anchor").is_none());
             assert!(s.rewind_only_gate_message("rewind_context").is_none());
             assert!(s.rewind_only_gate_message("rewind_backout").is_none());
+        });
+    }
+
+    #[test]
+    fn rewind_only_gate_allows_supervisor_observability_tools() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 258_400,
+                context_window: 258_400,
+                hard_context_window: Some(272_000),
+                usage_pct: 100.0,
+                prompt_tokens: 258_000,
+                completion_tokens: 400,
+                cached_tokens: 0,
+            });
+
+            assert!(s.rewind_only_gate_message("get_logs").is_none());
+            assert!(s.rewind_only_gate_message("get_pending_approval").is_none());
+            assert!(s.rewind_only_gate_message("get_pending_input").is_none());
+            assert!(s
+                .rewind_only_gate_message("get_controller_loop_status")
+                .is_none());
+            assert!(s.rewind_only_gate_message("get_restart_status").is_none());
+            assert!(s
+                .rewind_only_gate_message("request_controller_loop_halt")
+                .is_some());
+        });
+    }
+
+    #[test]
+    fn get_logs_remains_callable_under_managed_rewind_only_pressure() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.active_session_source = Some("codex".to_string());
+                s.codex_managed_context = true;
+                s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 258_400,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 100.0,
+                    prompt_tokens: 258_000,
+                    completion_tokens: 400,
+                    cached_tokens: 0,
+                });
+                s.push_log(
+                    LogLevel::Info,
+                    "supervisor log is still readable".to_string(),
+                );
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "get_logs",
+                    serde_json::json!({ "limit": 160 }),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!result.is_error.unwrap_or(false));
+            let result_json = serde_json::to_value(&result).unwrap();
+            let text = result_json
+                .pointer("/content/0/text")
+                .and_then(serde_json::Value::as_str)
+                .unwrap();
+            let entries: Vec<LogEntrySnapshot> = serde_json::from_str(text).unwrap();
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].content, "supervisor log is still readable");
+
+            let controller_status = server
+                .call_tool_by_name_for_session(
+                    "get_controller_loop_status",
+                    serde_json::json!({}),
+                    None,
+                    None,
+                )
+                .await
+                .unwrap();
+            assert!(!controller_status.is_error.unwrap_or(false));
         });
     }
 
