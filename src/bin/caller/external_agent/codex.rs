@@ -58,7 +58,7 @@ Keep the live transcript informationally dense:
 - For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. For a temporary local dashboard smoke, prefer one owned-lifecycle command such as `node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> --selector <css>`; the helper launches the built intendant binary as `--web <port> --no-tui`, waits for HTTP readiness, and stops it afterward. Do not start a separate foreground/nohup dashboard just so the helper can connect. The helper launches isolated headless Chromium, waits for CDP and selectors/functions, handles WebSocket fallbacks, and prints compact PASS/FAIL output with bounded failure excerpts.
 - Browser validation retry discipline: run one primary helper smoke. If it fails or times out, run at most one compact diagnostic retry with `--diagnostics --json` and a targeted selector/function. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the helper reason/logs/diagnostics. Do not cycle through raw CDP, Node, Python, Browser, Chrome, and plugin automation stacks unless the user explicitly asks for deeper manual investigation or the helper itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
-- While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors. Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
+- While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors, such as "No output yet", "Still active", or "Polling". Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After noisy or unexpectedly large tool output, failed exploration, broad research, or finishing a coherent subtask, crystallize durable facts and use Intendant managed-context tools before continuing broad ordinary-tool work.
 - Use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
@@ -4866,6 +4866,59 @@ fn is_codex_noop_tool_wait_message(text: &str) -> bool {
         return false;
     }
 
+    let material_markers = [
+        "failed",
+        "failure",
+        "error:",
+        "completed",
+        "finished",
+        "succeeded",
+        "success",
+        "done",
+        "next",
+        "found",
+        "changed",
+        "fixed",
+    ];
+    if material_markers
+        .iter()
+        .any(|needle| normalized.contains(needle))
+    {
+        return false;
+    }
+
+    let standalone_wait_status = [
+        "polling",
+        "still active",
+        "still polling",
+        "still running",
+        "still waiting",
+        "waiting",
+        "awaiting output",
+        "waiting for output",
+        "polling for output",
+        "ongoing",
+        "in progress",
+    ]
+    .iter()
+    .any(|status| normalized == *status);
+    if standalone_wait_status {
+        return true;
+    }
+
+    let no_new_output_status = [
+        "no output",
+        "no new output",
+        "nothing new",
+        "no update",
+        "no updates",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle));
+    if no_new_output_status && normalized.split_whitespace().count() <= 6 {
+        return true;
+    }
+
     let waiting = [
         "still",
         "waiting",
@@ -4920,23 +4973,7 @@ fn is_codex_noop_tool_wait_message(text: &str) -> bool {
         return false;
     }
 
-    let material_markers = [
-        "failed",
-        "failure",
-        "error:",
-        "completed",
-        "finished",
-        "succeeded",
-        "success",
-        "done",
-        "next",
-        "found",
-        "changed",
-        "fixed",
-    ];
-    !material_markers
-        .iter()
-        .any(|needle| normalized.contains(needle))
+    true
 }
 
 /// Translate a Codex notification into one or more `AgentEvent`s.
@@ -8481,6 +8518,26 @@ error: build failed
     }
 
     #[test]
+    fn translate_item_completed_suppresses_short_polling_chatter() {
+        for text in ["No output yet.", "Still active.", "Polling..."] {
+            let (tx, mut rx) = mpsc::unbounded_channel();
+            let params = serde_json::json!({
+                "item": {
+                    "id": "msg_wait",
+                    "type": "agentMessage",
+                    "text": text,
+                    "status": "completed"
+                }
+            });
+            translate_notification("item/completed", &params, &tx);
+            assert!(
+                rx.try_recv().is_err(),
+                "{text:?} should not become durable model output"
+            );
+        }
+    }
+
+    #[test]
     fn translate_final_answer_noop_tool_wait_completes_without_message() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -8496,6 +8553,30 @@ error: build failed
         match rx.try_recv().unwrap() {
             AgentEvent::TurnCompleted { message } => assert_eq!(message, None),
             other => panic!("expected TurnCompleted without chatter, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn translate_item_completed_keeps_material_no_output_message() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "id": "msg_material",
+                "type": "agentMessage",
+                "text": "No output yet, but I found the hung process and changed the timeout.",
+                "status": "completed"
+            }
+        });
+        translate_notification("item/completed", &params, &tx);
+        match rx.try_recv().unwrap() {
+            AgentEvent::Message { text } => {
+                assert_eq!(
+                    text,
+                    "No output yet, but I found the hung process and changed the timeout."
+                );
+            }
+            other => panic!("expected material Message, got {:?}", other),
         }
         assert!(rx.try_recv().is_err());
     }
