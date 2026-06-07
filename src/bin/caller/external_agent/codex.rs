@@ -69,6 +69,8 @@ const GENERATION_STARVATION_NEAR_LIMIT_PCT: f64 = 85.0;
 const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
 const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
 pub(crate) const CODEX_FAST_SERVICE_TIER: &str = "priority";
+const CODEX_DANGER_FULL_ACCESS_SANDBOX: &str = "danger-full-access";
+const CODEX_NEVER_APPROVAL_POLICY: &str = "never";
 
 /// Codex-specific thread-action helpers. Each wraps one of Codex's app-server
 /// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/inject_items`,
@@ -407,10 +409,11 @@ impl CodexAgent {
         if let Some(ref model) = self.model {
             obj.insert("model".into(), serde_json::Value::String(model.clone()));
         }
-        if !self.approval_policy.trim().is_empty() {
+        let approval_policy = self.effective_approval_policy().trim();
+        if !approval_policy.is_empty() {
             obj.insert(
                 "approvalPolicy".into(),
-                serde_json::Value::String(self.approval_policy.clone()),
+                serde_json::Value::String(approval_policy.to_string()),
             );
         }
         if !self.sandbox.trim().is_empty() {
@@ -843,6 +846,14 @@ fn side_boundary_prompt_item() -> serde_json::Value {
     })
 }
 
+fn effective_approval_policy_for_sandbox<'a>(sandbox: &str, approval_policy: &'a str) -> &'a str {
+    if sandbox.trim() == CODEX_DANGER_FULL_ACCESS_SANDBOX {
+        CODEX_NEVER_APPROVAL_POLICY
+    } else {
+        approval_policy
+    }
+}
+
 fn extract_thread_id(value: &serde_json::Value) -> Option<String> {
     value
         .pointer("/thread/id")
@@ -1054,8 +1065,16 @@ type PendingRequests = Arc<Mutex<HashMap<u64, oneshot::Sender<RequestResult>>>>;
 
 /// Maps our synthetic `request_id` strings back to the JSON-RPC `id` from
 /// server-initiated approval requests.
-/// Stores (jsonrpc_id, method) so resolve_approval knows the response format.
-type PendingApprovals = Arc<Mutex<HashMap<String, (u64, String)>>>;
+/// Stores the original request shape so resolve_approval can answer each
+/// approval method with the correct protocol response.
+type PendingApprovals = Arc<Mutex<HashMap<String, PendingApproval>>>;
+
+#[derive(Debug, Clone)]
+struct PendingApproval {
+    jsonrpc_id: u64,
+    method: String,
+    params: serde_json::Value,
+}
 
 /// Active Codex turns keyed by native thread id. Codex can run multiple
 /// threads through one app-server process, so one global active turn is not
@@ -1228,6 +1247,10 @@ impl CodexAgent {
         }
     }
 
+    fn effective_approval_policy(&self) -> &str {
+        effective_approval_policy_for_sandbox(&self.sandbox, &self.approval_policy)
+    }
+
     fn update_service_tier_from_thread_response(&mut self, response: &serde_json::Value) {
         let Some(value) = response.get("serviceTier") else {
             return;
@@ -1263,7 +1286,7 @@ impl CodexAgent {
         }
         params.insert(
             "approvalPolicy".into(),
-            serde_json::Value::String(self.approval_policy.clone()),
+            serde_json::Value::String(self.effective_approval_policy().to_string()),
         );
         // Codex accepts `read-only`, `workspace-write`, or
         // `danger-full-access`. Pass the configured value through verbatim
@@ -1309,10 +1332,11 @@ impl CodexAgent {
                 serde_json::Value::String(cwd.to_string_lossy().to_string()),
             );
         }
-        if !self.approval_policy.trim().is_empty() {
+        let approval_policy = self.effective_approval_policy().trim();
+        if !approval_policy.is_empty() {
             params.insert(
                 "approvalPolicy".into(),
-                serde_json::Value::String(self.approval_policy.clone()),
+                serde_json::Value::String(approval_policy.to_string()),
             );
         }
         if let Some(profile) = self.sandbox_permission_profile() {
@@ -1430,6 +1454,69 @@ impl CodexAgent {
         if let Some(home) = codex_home {
             command.env("CODEX_HOME", home);
         }
+    }
+
+    fn app_server_args(&self, effective_web_port: u16) -> Vec<String> {
+        let mcp_url = self.intendant_mcp_url(effective_web_port);
+        let mut args: Vec<String> = Vec::new();
+        if self.sandbox.trim() == CODEX_DANGER_FULL_ACCESS_SANDBOX {
+            args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
+        }
+        args.extend([
+            "app-server".to_string(),
+            "-c".to_string(),
+            "mcp_servers.intendant.type=\"http\"".to_string(),
+            "-c".to_string(),
+            format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
+        ]);
+        if self.sandbox.trim() == CODEX_DANGER_FULL_ACCESS_SANDBOX {
+            args.push("-c".to_string());
+            args.push(format!(
+                "approval_policy=\"{}\"",
+                self.effective_approval_policy()
+            ));
+            args.push("-c".to_string());
+            args.push("sandbox_mode=\"danger-full-access\"".to_string());
+        }
+        if self.managed_context {
+            // Intendant owns context rewind/backout policy for managed Codex
+            // sessions. Our minimal Codex fork treats this sentinel as
+            // disabling automatic compaction; stock Codex treats it as an
+            // unreachable body-after-prefix budget instead of compacting
+            // eagerly.
+            args.push("-c".to_string());
+            args.push("model_auto_compact_token_limit=9223372036854775807".to_string());
+            args.push("-c".to_string());
+            args.push("model_auto_compact_token_limit_scope=\"body_after_prefix\"".to_string());
+        }
+        if self.web_search {
+            args.push("-c".to_string());
+            args.push("tools.web_search=true".to_string());
+        }
+        if let Some(ref effort) = self.reasoning_effort {
+            // TOML-quote the value explicitly; `-c` parses the RHS as TOML.
+            args.push("-c".to_string());
+            args.push(format!("model_reasoning_effort=\"{}\"", effort));
+        }
+        if self.network_access && self.sandbox == "workspace-write" {
+            args.push("-c".to_string());
+            args.push("sandbox_workspace_write.network_access=true".to_string());
+        }
+        if !self.writable_roots.is_empty() {
+            // TOML array of strings. Quote and escape each path so whitespace
+            // and backslashes don't break the parse.
+            let quoted: Vec<String> = self
+                .writable_roots
+                .iter()
+                .map(|p| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\"")))
+                .collect();
+            args.push("-c".to_string());
+            args.push(format!(
+                "sandbox_workspace_write.writable_roots=[{}]",
+                quoted.join(", ")
+            ));
+        }
+        args
     }
 
     pub fn new(
@@ -3323,12 +3410,16 @@ async fn reader_task(
                 "approval-{}",
                 approval_counter.fetch_add(1, Ordering::Relaxed)
             );
-            pending_approvals
-                .lock()
-                .await
-                .insert(request_id.clone(), (jsonrpc_id, method.to_string()));
 
             let params = msg.params.unwrap_or(serde_json::Value::Null);
+            pending_approvals.lock().await.insert(
+                request_id.clone(),
+                PendingApproval {
+                    jsonrpc_id,
+                    method: method.to_string(),
+                    params: params.clone(),
+                },
+            );
 
             let (thread_id, turn_id) = codex_event_scope(&params);
 
@@ -3361,6 +3452,17 @@ async fn reader_task(
                         request_id,
                         command: label,
                         category: ApprovalCategory::McpTool,
+                    },
+                );
+            } else if method == "item/permissions/requestApproval" {
+                send_scoped_agent_event(
+                    &event_tx,
+                    thread_id.as_deref(),
+                    turn_id.as_deref(),
+                    AgentEvent::ApprovalRequest {
+                        request_id,
+                        command: codex_permissions_approval_label(&params),
+                        category: ApprovalCategory::PermissionGrant,
                     },
                 );
             } else if method == "item/fileChange/requestApproval" {
@@ -3580,6 +3682,78 @@ fn extract_turn_id(value: &serde_json::Value) -> Option<String> {
 
 fn codex_event_scope(params: &serde_json::Value) -> (Option<String>, Option<String>) {
     (extract_thread_id(params), extract_turn_id(params))
+}
+
+fn codex_permissions_approval_label(params: &serde_json::Value) -> String {
+    let reason = params
+        .pointer("/reason")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let cwd = params
+        .pointer("/cwd")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let permissions = params
+        .pointer("/permissions")
+        .unwrap_or(&serde_json::Value::Null);
+
+    let mut requested = Vec::new();
+    if permissions
+        .pointer("/network/enabled")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false)
+    {
+        requested.push("network");
+    }
+    if permissions
+        .pointer("/fileSystem")
+        .or_else(|| permissions.pointer("/file_system"))
+        .is_some()
+    {
+        requested.push("filesystem");
+    }
+    let requested = if requested.is_empty() {
+        "permissions".to_string()
+    } else {
+        requested.join(", ")
+    };
+
+    match (reason, cwd) {
+        (Some(reason), Some(cwd)) => format!("permission grant: {requested}; {reason}; cwd {cwd}"),
+        (Some(reason), None) => format!("permission grant: {requested}; {reason}"),
+        (None, Some(cwd)) => format!("permission grant: {requested}; cwd {cwd}"),
+        (None, None) => format!("permission grant: {requested}"),
+    }
+}
+
+fn codex_permissions_approval_response(
+    params: &serde_json::Value,
+    decision: ApprovalDecision,
+) -> serde_json::Value {
+    match decision {
+        ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => {
+            let permissions = params
+                .pointer("/permissions")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({}));
+            let scope = match decision {
+                ApprovalDecision::AcceptForSession => "session",
+                _ => "turn",
+            };
+            serde_json::json!({
+                "permissions": permissions,
+                "scope": scope,
+                "strictAutoReview": false,
+            })
+        }
+        ApprovalDecision::Decline | ApprovalDecision::Cancel => serde_json::json!({
+            "permissions": {},
+            "scope": "turn",
+            "strictAutoReview": false,
+        }),
+    }
 }
 
 fn send_scoped_agent_event(
@@ -5026,52 +5200,7 @@ impl ExternalAgent for CodexAgent {
         // them up exactly as if they had been written to `~/.codex/config.toml`
         // before launch.
         let effective_web_port = web_port.unwrap_or(8765);
-        let mcp_url = self.intendant_mcp_url(effective_web_port);
-        let mut args: Vec<String> = vec![
-            "app-server".to_string(),
-            "-c".to_string(),
-            "mcp_servers.intendant.type=\"http\"".to_string(),
-            "-c".to_string(),
-            format!("mcp_servers.intendant.url=\"{}\"", mcp_url),
-        ];
-        if self.managed_context {
-            // Intendant owns context rewind/backout policy for managed Codex
-            // sessions. Our minimal Codex fork treats this sentinel as
-            // disabling automatic compaction; stock Codex treats it as an
-            // unreachable body-after-prefix budget instead of compacting
-            // eagerly.
-            args.push("-c".to_string());
-            args.push("model_auto_compact_token_limit=9223372036854775807".to_string());
-            args.push("-c".to_string());
-            args.push("model_auto_compact_token_limit_scope=\"body_after_prefix\"".to_string());
-        }
-        if self.web_search {
-            args.push("-c".to_string());
-            args.push("tools.web_search=true".to_string());
-        }
-        if let Some(ref effort) = self.reasoning_effort {
-            // TOML-quote the value explicitly; `-c` parses the RHS as TOML.
-            args.push("-c".to_string());
-            args.push(format!("model_reasoning_effort=\"{}\"", effort));
-        }
-        if self.network_access && self.sandbox == "workspace-write" {
-            args.push("-c".to_string());
-            args.push("sandbox_workspace_write.network_access=true".to_string());
-        }
-        if !self.writable_roots.is_empty() {
-            // TOML array of strings. Quote and escape each path so whitespace
-            // and backslashes don't break the parse.
-            let quoted: Vec<String> = self
-                .writable_roots
-                .iter()
-                .map(|p| format!("\"{}\"", p.replace('\\', "\\\\").replace('"', "\\\"")))
-                .collect();
-            args.push("-c".to_string());
-            args.push(format!(
-                "sandbox_workspace_write.writable_roots=[{}]",
-                quoted.join(", ")
-            ));
-        }
+        let args = self.app_server_args(effective_web_port);
         let mut command = crate::platform::spawn_command(&self.command);
         command
             .args(&args)
@@ -5413,7 +5542,7 @@ impl ExternalAgent for CodexAgent {
         request_id: &str,
         decision: ApprovalDecision,
     ) -> Result<(), CallerError> {
-        let (jsonrpc_id, method) = self
+        let pending = self
             .pending_approvals
             .lock()
             .await
@@ -5426,13 +5555,16 @@ impl ExternalAgent for CodexAgent {
             })?;
 
         // MCP elicitation requests use {"action": "allow/deny"} format.
-        // Command/file approval requests use {"decision": "accept/decline"} format.
-        let result = if method.contains("mcpServer") || method.contains("elicit") {
+        // Permissions requests use a granted-permissions response. Command/file
+        // approval requests use {"decision": "accept/decline"} format.
+        let result = if pending.method.contains("mcpServer") || pending.method.contains("elicit") {
             let action = match decision {
                 ApprovalDecision::Accept | ApprovalDecision::AcceptForSession => "accept",
                 ApprovalDecision::Decline | ApprovalDecision::Cancel => "decline",
             };
             serde_json::json!({ "action": action, "content": {} })
+        } else if pending.method == "item/permissions/requestApproval" {
+            codex_permissions_approval_response(&pending.params, decision)
         } else {
             let decision_str = match decision {
                 ApprovalDecision::Accept => "accept",
@@ -5443,7 +5575,7 @@ impl ExternalAgent for CodexAgent {
             serde_json::json!({ "decision": decision_str })
         };
 
-        self.send_response(jsonrpc_id, result).await
+        self.send_response(pending.jsonrpc_id, result).await
     }
 
     async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
@@ -7926,6 +8058,26 @@ error: could not compile `demo`
     }
 
     #[test]
+    fn danger_full_access_forces_effective_approval_policy_never() {
+        assert_eq!(
+            effective_approval_policy_for_sandbox("danger-full-access", "on-request"),
+            "never"
+        );
+        assert_eq!(
+            effective_approval_policy_for_sandbox("danger-full-access", "untrusted"),
+            "never"
+        );
+        assert_eq!(
+            effective_approval_policy_for_sandbox("workspace-write", "on-request"),
+            "on-request"
+        );
+        assert_eq!(
+            effective_approval_policy_for_sandbox("read-only", "untrusted"),
+            "untrusted"
+        );
+    }
+
+    #[test]
     fn turn_start_thread_not_found_error_is_resumable() {
         let err = CallerError::ExternalAgent(
             "JSON-RPC error -32600: thread not found: 019e-child".to_string(),
@@ -8445,6 +8597,18 @@ error: could not compile `demo`
     }
 
     #[test]
+    fn thread_lifecycle_params_disable_approvals_for_danger_full_access() {
+        let mut agent = test_agent();
+        agent.approval_policy = "on-request".to_string();
+        agent.sandbox = "danger-full-access".to_string();
+
+        let params = agent.thread_lifecycle_params();
+
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "danger-full-access");
+    }
+
+    #[test]
     fn thread_lifecycle_params_leave_developer_instructions_unset_by_default() {
         let mut agent = test_agent();
         agent.managed_context = false;
@@ -8492,7 +8656,7 @@ error: could not compile `demo`
     fn resumed_thread_settings_update_uses_permission_profile() {
         let mut agent = test_agent();
         agent.model = Some("gpt-5.5".to_string());
-        agent.approval_policy = "never".to_string();
+        agent.approval_policy = "on-request".to_string();
         agent.sandbox = "danger-full-access".to_string();
         agent.working_dir = Some(PathBuf::from("/tmp/intendant-workspace"));
 
@@ -8505,6 +8669,109 @@ error: could not compile `demo`
         assert_eq!(params["cwd"], "/tmp/intendant-workspace");
         assert!(params.get("sandbox").is_none());
         assert!(params.get("sandboxPolicy").is_none());
+    }
+
+    #[test]
+    fn app_server_args_bypass_approvals_for_danger_full_access() {
+        let mut agent = test_agent();
+        agent.approval_policy = "on-request".to_string();
+        agent.sandbox = "danger-full-access".to_string();
+
+        let args = agent.app_server_args(8765);
+
+        assert_eq!(
+            args.first().map(String::as_str),
+            Some("--dangerously-bypass-approvals-and-sandbox")
+        );
+        assert!(args.iter().any(|arg| arg == "approval_policy=\"never\""));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "sandbox_mode=\"danger-full-access\""));
+        assert!(args.iter().any(|arg| arg == "app-server"));
+    }
+
+    #[test]
+    fn app_server_args_preserve_workspace_approval_flow() {
+        let agent = test_agent();
+
+        let args = agent.app_server_args(8765);
+
+        assert_eq!(args.first().map(String::as_str), Some("app-server"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
+        assert!(!args.iter().any(|arg| arg.starts_with("approval_policy=")));
+    }
+
+    #[test]
+    fn permission_approval_label_summarizes_requested_grant() {
+        let params = serde_json::json!({
+            "cwd": "/tmp/repo",
+            "reason": "need wasm cache",
+            "permissions": {
+                "network": {"enabled": true},
+                "fileSystem": {"write": ["/tmp/repo"]}
+            }
+        });
+
+        let label = codex_permissions_approval_label(&params);
+
+        assert!(label.contains("permission grant"));
+        assert!(label.contains("network"));
+        assert!(label.contains("filesystem"));
+        assert!(label.contains("need wasm cache"));
+        assert!(label.contains("/tmp/repo"));
+    }
+
+    #[test]
+    fn permission_approval_accept_grants_requested_permissions() {
+        let requested = serde_json::json!({
+            "network": {"enabled": true},
+            "fileSystem": {"write": ["/tmp/repo"]}
+        });
+        let params = serde_json::json!({
+            "permissions": requested.clone()
+        });
+
+        let response = codex_permissions_approval_response(&params, ApprovalDecision::Accept);
+
+        assert_eq!(response["permissions"], requested);
+        assert_eq!(response["scope"], "turn");
+        assert_eq!(response["strictAutoReview"], false);
+    }
+
+    #[test]
+    fn permission_approval_accept_for_session_uses_session_scope() {
+        let params = serde_json::json!({
+            "permissions": {
+                "fileSystem": {"write": ["/tmp/repo"]}
+            }
+        });
+
+        let response =
+            codex_permissions_approval_response(&params, ApprovalDecision::AcceptForSession);
+
+        assert_eq!(response["scope"], "session");
+        assert_eq!(
+            response["permissions"],
+            serde_json::json!({"fileSystem": {"write": ["/tmp/repo"]}})
+        );
+    }
+
+    #[test]
+    fn permission_approval_decline_grants_empty_permissions() {
+        let params = serde_json::json!({
+            "permissions": {
+                "network": {"enabled": true},
+                "fileSystem": {"write": ["/tmp/repo"]}
+            }
+        });
+
+        let response = codex_permissions_approval_response(&params, ApprovalDecision::Decline);
+
+        assert_eq!(response["permissions"], serde_json::json!({}));
+        assert_eq!(response["scope"], "turn");
+        assert_eq!(response["strictAutoReview"], false);
     }
 
     #[test]
@@ -8847,6 +9114,18 @@ error: could not compile `demo`
             .as_str()
             .unwrap()
             .contains("You are in a side conversation"));
+    }
+
+    #[test]
+    fn thread_side_fork_disables_approvals_for_danger_full_access() {
+        let mut agent = test_agent();
+        agent.approval_policy = "on-request".to_string();
+        agent.sandbox = "danger-full-access".to_string();
+
+        let params = agent.side_fork_params("thread-abc", side_developer_instructions(None));
+
+        assert_eq!(params["approvalPolicy"], "never");
+        assert_eq!(params["sandbox"], "danger-full-access");
     }
 
     #[test]

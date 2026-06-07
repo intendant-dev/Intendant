@@ -7591,6 +7591,9 @@ async fn drain_external_agent_events(
                     external_agent::ApprovalCategory::CommandExecution => {
                         autonomy::ActionCategory::CommandExec
                     }
+                    external_agent::ApprovalCategory::PermissionGrant => {
+                        autonomy::ActionCategory::CommandExec
+                    }
                     external_agent::ApprovalCategory::FileChange => {
                         autonomy::ActionCategory::FileWrite
                     }

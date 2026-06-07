@@ -403,6 +403,7 @@ pub enum ToolCompletionStatus {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ApprovalCategory {
     CommandExecution,
+    PermissionGrant,
     FileChange,
     /// A tool / MCP call the external agent wants to make (e.g. Codex
     /// invoking Intendant's own MCP server tools like computer-use
