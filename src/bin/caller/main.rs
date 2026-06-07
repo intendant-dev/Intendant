@@ -8532,6 +8532,8 @@ const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE: &str =
 const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER: &str = "\n\nUser follow-up:\n";
 const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_INSTRUCTIONS: &str =
     "A managed-context rewind requested during this queued follow-up has already succeeded. Continue the user's follow-up below from the rewound context. Do not call rewind_context again merely to satisfy any instruction to rewind first; only rewind again if new context pressure or an invalid anchor genuinely requires it.";
+const MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS: &str =
+    "A managed-context rewind requested during the active follow-up has already succeeded. The active user follow-up is already in the preserved thread history; the model_context_rewind_primer is the authoritative carry-forward summary for the pruned span. Continue with the next unfinished step. Do not repeat already-completed verification, setup, or research steps from the preserved user request, and do not call rewind_context again merely to satisfy any prior instruction to rewind first.";
 
 fn managed_context_canonical_followup_replay_text(text: &str) -> String {
     let mut current = text.trim();
@@ -8567,6 +8569,19 @@ fn managed_context_followup_replay_text(user_followup: &str) -> String {
     )
 }
 
+fn managed_context_active_followup_resume_text() -> String {
+    format!(
+        "{open}\n{instructions}\n{close}",
+        open = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN,
+        instructions = MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS,
+        close = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE,
+    )
+}
+
+fn managed_context_is_active_followup_resume(text: &str) -> bool {
+    text.trim() == managed_context_active_followup_resume_text()
+}
+
 fn managed_context_followup_replay_after_rewind(
     active_followup: &FollowUpMessage,
 ) -> Option<FollowUpMessage> {
@@ -8575,11 +8590,11 @@ fn managed_context_followup_replay_after_rewind(
         return None;
     }
 
-    let user_followup = managed_context_canonical_followup_replay_text(&active_followup.text);
-    if user_followup.trim().is_empty() {
-        return None;
-    }
-    let text = managed_context_followup_replay_text(&user_followup);
+    let text = if managed_context_is_active_followup_resume(&active_followup.text) {
+        active_followup.text.trim().to_string()
+    } else {
+        managed_context_active_followup_resume_text()
+    };
 
     Some(FollowUpMessage::with_attachments(
         text,
@@ -10272,11 +10287,14 @@ mod tests {
 
         assert!(continuation
             .text
-            .contains("implement the next Station slice"));
+            .contains("active user follow-up is already in the preserved thread history"));
         assert!(continuation.text.contains("has already succeeded"));
         assert!(continuation
             .text
-            .contains("Do not call rewind_context again"));
+            .contains("Do not repeat already-completed verification"));
+        assert!(!continuation
+            .text
+            .contains("then implement the next Station slice"));
         assert_eq!(continuation.follow_up_id, None);
         assert!(!continuation.managed_context_recovery_kickstart);
     }
@@ -10289,6 +10307,10 @@ mod tests {
         let second = managed_context_followup_replay_after_rewind(&first).expect("second replay");
 
         assert_eq!(second.text, first.text);
+        assert!(!first.text.contains(original));
+        assert!(first.text.contains(
+            "the model_context_rewind_primer is the authoritative carry-forward summary"
+        ));
         assert_eq!(
             second
                 .text
@@ -10308,12 +10330,9 @@ mod tests {
                 .text
                 .matches(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER)
                 .count(),
-            1
+            0
         );
-        assert_eq!(second.text.matches(original).count(), 1);
-        assert!(second
-            .text
-            .contains("Do not call rewind_context again merely to satisfy"));
+        assert!(second.text.contains("Do not repeat already-completed"));
     }
 
     #[test]
@@ -10329,7 +10348,7 @@ mod tests {
 
         assert_eq!(
             continuation.text,
-            managed_context_followup_replay_text(original)
+            managed_context_active_followup_resume_text()
         );
         assert_eq!(
             continuation
@@ -10338,7 +10357,7 @@ mod tests {
                 .count(),
             1
         );
-        assert_eq!(continuation.text.matches(original).count(), 1);
+        assert_eq!(continuation.text.matches(original).count(), 0);
     }
 
     #[test]
