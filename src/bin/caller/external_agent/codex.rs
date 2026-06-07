@@ -62,6 +62,7 @@ Keep the live transcript informationally dense:
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After noisy or unexpectedly large tool output, failed exploration, broad research, or finishing a coherent subtask, crystallize durable facts and use Intendant managed-context tools before continuing broad ordinary-tool work.
 - Use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
+- Do not use recovery_candidates_only=false to look for newer rewind targets. Non-recovery rows require include_non_recovery=true, are diagnostic-only, and must not be passed to rewind_context when recovery_eligible=false.
 - The primer must preserve user constraints, current objective, completed work, changed files, important command results, remaining decisions, and the substance of any prior managed primer that would otherwise be overwritten.
 - Never synthesize anchor ids, never use anchors from failed examples, and never target managed-context maintenance calls unless explicitly auditing those internals."#;
 

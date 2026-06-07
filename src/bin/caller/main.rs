@@ -2571,7 +2571,7 @@ fn validate_context_rewind_anchor_restore_headroom(
                 return Ok(());
             }
             return Err(format!(
-                "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: a prior rewind to {} item was followed by {} tokens against the {} token rewind-only limit. Call list_rewind_anchors again and choose an anchor whose recovery_eligible field is true.",
+                "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: a prior rewind to {} item was followed by {} tokens against the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose recovery_eligible field is true.",
                 position.as_str(),
                 outcome.used_tokens,
                 outcome.rewind_only_limit
@@ -2581,7 +2581,7 @@ fn validate_context_rewind_anchor_restore_headroom(
     }
 
     Err(format!(
-        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: restoring {} item would keep an estimated {} prefix tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Call list_rewind_anchors again and choose an anchor whose recovery_eligible field is true.",
+        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: restoring {} item would keep an estimated {} prefix tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose recovery_eligible field is true.",
         position.as_str(),
         prefix_tokens,
         CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS,
@@ -2952,6 +2952,7 @@ struct ContextRewindAnchorCatalog {
     next_offset: Option<usize>,
     query: Option<String>,
     include_management_tools: bool,
+    include_non_recovery: bool,
     recovery_candidates_only: bool,
     anchors: Vec<ContextRewindAnchorCatalogEntry>,
     usage: &'static str,
@@ -3033,16 +3034,12 @@ fn list_context_rewind_anchors_from_rollout(
         .or_else(|| params.get("includeManagementTools"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
-    let recovery_candidates_only = params
-        .get("recovery_candidates_only")
-        .or_else(|| params.get("recoveryCandidatesOnly"))
-        .and_then(|value| value.as_bool())
-        .unwrap_or(true);
     let include_non_recovery = params
         .get("include_non_recovery")
         .or_else(|| params.get("includeNonRecovery"))
         .and_then(|value| value.as_bool())
         .unwrap_or(false);
+    let recovery_candidates_only = !include_non_recovery;
     let reverse = params
         .get("reverse")
         .and_then(|value| value.as_bool())
@@ -3064,7 +3061,7 @@ fn list_context_rewind_anchors_from_rollout(
     if !include_management_tools {
         anchors.retain(|anchor| !context_rewind_anchor_is_management_tool(anchor));
     }
-    if recovery_candidates_only && !include_non_recovery {
+    if recovery_candidates_only {
         anchors.retain(|anchor| anchor.recovery_eligible != Some(false));
     }
     if reverse {
@@ -3091,9 +3088,10 @@ fn list_context_rewind_anchors_from_rollout(
         next_offset,
         query,
         include_management_tools,
-        recovery_candidates_only: recovery_candidates_only && !include_non_recovery,
+        include_non_recovery,
+        recovery_candidates_only,
         anchors: page,
-        usage: "Use item_id exactly in rewind_context.anchor.item_id. Management calls are hidden by default; set include_management_tools=true only for internals. During recovery, anchors known at/above the rewind-only limit or without enough resume headroom are hidden unless include_non_recovery=true; absent recovery_eligible means no nearby backend usage sample. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too.",
+        usage: "Use item_id exactly in rewind_context.anchor.item_id. Normal model-facing catalogs hide anchors with recovery_eligible=false; recovery_candidates_only=false is ignored unless include_non_recovery=true. Set include_non_recovery=true only for diagnostics/audit, and never pass a recovery_eligible=false audit row to rewind_context. Management calls are hidden by default; set include_management_tools=true only for internals. Absent recovery_eligible means no nearby backend usage sample. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too.",
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
 }
@@ -4415,7 +4413,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -4434,7 +4432,7 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom unless include_non_recovery=true. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -10899,6 +10897,8 @@ mod tests {
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
         let anchors = catalog["anchors"].as_array().unwrap();
         assert_eq!(anchors.len(), 3);
+        assert_eq!(catalog["include_non_recovery"].as_bool(), Some(true));
+        assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(false));
         let below = anchors
             .iter()
             .find(|anchor| anchor["item_id"] == "call_below_soft")
@@ -10949,6 +10949,27 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["call_below_soft"]);
         assert_eq!(catalog["filtered_total"].as_u64(), Some(1));
+        assert_eq!(catalog["include_non_recovery"].as_bool(), Some(false));
+        assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(true));
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": false,
+            }),
+        )
+        .expect("normal catalog ignores false recovery bypass");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_below_soft"]);
+        assert_eq!(catalog["include_non_recovery"].as_bool(), Some(false));
         assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(true));
 
         let raw = list_context_rewind_anchors_from_rollout(
@@ -10963,6 +10984,7 @@ mod tests {
         .expect("audit catalog");
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
         assert_eq!(catalog["anchors"].as_array().unwrap().len(), 3);
+        assert_eq!(catalog["include_non_recovery"].as_bool(), Some(true));
         assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(false));
     }
 
@@ -11055,6 +11077,26 @@ mod tests {
             .filter_map(|anchor| anchor["item_id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["call_fit"]);
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "recovery_candidates_only": false,
+            }),
+        )
+        .expect("normal catalog ignores false recovery bypass");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_fit"]);
+        assert_eq!(catalog["include_non_recovery"].as_bool(), Some(false));
+        assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(true));
 
         let raw = list_context_rewind_anchors_from_rollout(
             &path,
