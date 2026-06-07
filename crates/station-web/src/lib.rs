@@ -1020,6 +1020,7 @@ impl StationInner {
         self.draw_toolbar(w);
         self.draw_tweaks_panel();
         self.draw_systems_panel();
+        self.draw_execution_deck(w, h);
         self.draw_command_lane(w, h);
         self.draw_attention_strip(w, h);
         self.draw_corners(w, h);
@@ -1728,6 +1729,262 @@ impl StationInner {
                 .push(HitZone::new(ax, ay, action.width, 21.0, action.hit));
             ax += action.width + 8.0;
         }
+    }
+
+    fn draw_execution_deck(&mut self, w: f32, h: f32) {
+        if w < 940.0 || h < 660.0 || self.selected_id.is_some() {
+            return;
+        }
+        let attention_clear = if !self.attention_items().is_empty() && w >= 900.0 && h >= 520.0 {
+            270.0
+        } else {
+            14.0
+        };
+        let x = 246.0;
+        let y = 52.0;
+        let deck_w = (w - x - attention_clear).min(760.0);
+        if deck_w < 380.0 {
+            return;
+        }
+        let deck_h = 146.0;
+        self.round_rect(
+            x,
+            y,
+            deck_w,
+            deck_h,
+            6.0,
+            "rgba(17,17,27,0.78)",
+            "rgba(148,226,213,0.58)",
+        );
+
+        let controls = self.snapshot.controls.clone();
+        let target_label = nonempty(
+            &controls.session_label,
+            &nonempty(&controls.session_selection, "no target"),
+        );
+        let session_state = if controls.session_detached {
+            "detached"
+        } else if controls.session_active {
+            "active"
+        } else if controls.session_id.is_empty() {
+            "none"
+        } else {
+            "idle"
+        };
+        let prompt_mode = if controls.prompt_mode == "steer" {
+            "steer"
+        } else {
+            "send"
+        };
+        let execution_mode = if controls.direct_mode {
+            "direct"
+        } else {
+            "presence"
+        };
+
+        self.text(
+            "EXECUTION DECK",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_TEAL_CSS,
+            "bold",
+        );
+        self.status_chip(
+            x + deck_w - 162.0,
+            y + 8.0,
+            148.0,
+            &format!("{prompt_mode} / {execution_mode}"),
+            C_TEAL_CSS,
+        );
+        self.text(
+            &truncate(&target_label, 74),
+            x + 12.0,
+            y + 40.0,
+            11.0,
+            C_TEXT_CSS,
+            "normal",
+        );
+        self.text(
+            &truncate(
+                &format!(
+                    "{} · {} · {}",
+                    nonempty(&controls.session_source, "agent"),
+                    session_state,
+                    nonempty(&controls.session_live_phase, "ready")
+                ),
+                82,
+            ),
+            x + 12.0,
+            y + 56.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let gap = 8.0;
+        let metric_w = ((deck_w - 24.0 - gap * 3.0) / 4.0).max(78.0);
+        let metric_y = y + 68.0;
+        let context_pct = percent(
+            self.snapshot.context.tokens,
+            self.snapshot.context.effective_window,
+        );
+        let managed_pct = percent(
+            self.snapshot.managed.used_tokens,
+            self.snapshot.managed.effective_window,
+        );
+        let metrics = [
+            (
+                "Draft",
+                format!("{} chars", controls.draft_chars),
+                format!(
+                    "{} / {}",
+                    prompt_mode,
+                    if controls.pending_attachments > 0 {
+                        "attachments"
+                    } else {
+                        "clean"
+                    }
+                ),
+                C_BLUE_CSS,
+            ),
+            (
+                "Session",
+                session_state.to_string(),
+                nonempty(&controls.session_goal_status, &controls.session_live_phase),
+                if controls.session_active {
+                    C_TEAL_CSS
+                } else {
+                    C_OVERLAY1_CSS
+                },
+            ),
+            (
+                "Context",
+                pct_label(context_pct),
+                format!("{} items", self.snapshot.context.item_count),
+                pressure_color(context_pct),
+            ),
+            (
+                "Managed",
+                nonempty(&self.snapshot.managed.status, "unknown"),
+                format!("{} anchors", self.snapshot.managed.anchors),
+                pressure_color(managed_pct),
+            ),
+        ];
+        for (idx, (title, value, detail, color)) in metrics.iter().enumerate() {
+            self.execution_metric_card(
+                x + 12.0 + idx as f32 * (metric_w + gap),
+                metric_y,
+                metric_w,
+                *title,
+                value,
+                detail,
+                color,
+            );
+        }
+
+        let mut actions = vec![
+            LaneAction::activity(
+                if controls.prompt_mode == "steer" {
+                    "steer"
+                } else {
+                    "send"
+                },
+                "send",
+                58.0,
+                C_BLUE_CSS,
+            ),
+            LaneAction::activity("new session", "new-session", 92.0, C_TEAL_CSS),
+        ];
+        if controls.session_can_attach && !controls.session_id.is_empty() {
+            actions.push(LaneAction::session(
+                "attach",
+                "attach",
+                &controls.session_id,
+                64.0,
+                C_PEACH_CSS,
+            ));
+        }
+        if controls.session_can_focus {
+            actions.push(LaneAction::activity("focus", "target", 58.0, C_PEACH_CSS));
+        }
+        if controls.session_can_interrupt {
+            actions.push(LaneAction::activity("stop", "stop", 50.0, C_RED_CSS));
+        }
+        if controls.shared_view_can_take_input {
+            actions.push(LaneAction::controls(
+                "take input",
+                "shared-view-take-input",
+                84.0,
+                C_GREEN_CSS,
+            ));
+        }
+        actions.push(LaneAction::select(
+            "sessions",
+            "system:sessions",
+            76.0,
+            C_TEAL_CSS,
+        ));
+        actions.push(LaneAction::select(
+            "controls",
+            "system:controls",
+            74.0,
+            C_MAUVE_CSS,
+        ));
+
+        let mut ax = x + 12.0;
+        let ay = y + deck_h - 29.0;
+        let max_x = x + deck_w - 12.0;
+        for action in actions {
+            if ax + action.width > max_x {
+                break;
+            }
+            self.pill_at(ax, ay, action.width, 21.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, ay, action.width, 21.0, action.hit));
+            ax += action.width + 8.0;
+        }
+    }
+
+    fn execution_metric_card(
+        &self,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        value: &str,
+        detail: &str,
+        color: &str,
+    ) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            38.0,
+            4.0,
+            "rgba(24,24,37,0.72)",
+            "rgba(49,50,68,0.76)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx.fill_rect(x as f64, y as f64, 3.0, 38.0);
+        let text_chars = ((w - 16.0) / 6.0).floor().max(8.0) as usize;
+        self.text(title, x + 10.0, y + 12.0, 8.5, C_OVERLAY1_CSS, "bold");
+        self.text(
+            &truncate(value, text_chars),
+            x + 10.0,
+            y + 25.0,
+            10.0,
+            color,
+            "bold",
+        );
+        self.text(
+            &truncate(detail, text_chars),
+            x + 10.0,
+            y + 35.0,
+            8.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
     }
 
     fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
@@ -6279,6 +6536,24 @@ impl LaneAction {
             color,
             hit: HitAction::ControlsAction {
                 action: action.to_string(),
+            },
+        }
+    }
+
+    fn session(
+        label: &'static str,
+        action: &'static str,
+        session_id: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::SessionAction {
+                action: action.to_string(),
+                session_id: session_id.to_string(),
             },
         }
     }
