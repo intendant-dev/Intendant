@@ -11456,6 +11456,12 @@ function stationCommandEntries() {
       run: () => stationDraftOperationsHandoff(),
     },
     {
+      label: 'Readiness board',
+      detail: 'Review Station control-center readiness across every surface',
+      tokens: 'readiness checklist health triage status activity context managed sessions peers displays execution',
+      run: () => stationRenderControlsDock('readiness'),
+    },
+    {
       label: 'New session',
       detail: 'Open the Station launch form',
       tokens: 'new session launch start task',
@@ -17987,6 +17993,168 @@ function stationDraftOperationsHandoff(payload = stationCurrentOperationsBriefPa
   showControlToast?.('success', 'Station handoff loaded into execution draft');
 }
 
+function stationReadinessState(level, summary, detail = '', actions = []) {
+  return { level, summary, detail, actions: actions.filter(Boolean) };
+}
+
+function stationReadinessStatusRank(level) {
+  return { blocked: 3, warn: 2, ready: 1, idle: 0 }[level] ?? 0;
+}
+
+function stationBuildReadinessBoard(context, managed, sessions, controls) {
+  const latestEvent = stationOperationsLatestActivityEvent();
+  const connected = !!document.getElementById('sb-conn')?.classList.contains('ok');
+  const contextPct = context.effectiveWindow ? Math.round((context.tokens / context.effectiveWindow) * 100) : 0;
+  const displayPayload = stationOperationsDisplayPayload(controls);
+  const managedReadiness = stationOperationsManagedReadiness(managed);
+  const rows = [
+    {
+      id: 'connection',
+      label: 'Connection',
+      ...stationReadinessState(
+        connected ? 'ready' : 'blocked',
+        connected ? 'dashboard websocket connected' : 'dashboard websocket disconnected',
+        `browser ${controls.activeBrowser ? 'active' : 'passive'} / voice ${controls.voiceState || 'idle'}`,
+        [
+          { label: 'Refresh', onClick: () => { stationRefreshSharedCaches(); stationRenderControlsDock('readiness'); } },
+          !controls.activeBrowser ? { label: 'Make active', onClick: () => document.getElementById('makeActiveBtn')?.click() } : null,
+        ],
+      ),
+    },
+    {
+      id: 'execution',
+      label: 'Execution',
+      ...stationReadinessState(
+        !app ? 'blocked' : (controls.draftChars ? 'ready' : 'idle'),
+        controls.draftChars ? `${controls.draftChars} chars ready for ${controls.promptMode || 'send'}` : 'no execution draft',
+        `${controls.sessionLabel || controls.sessionSelection || 'daemon'} / ${controls.directMode ? 'direct' : 'orchestrated'}`,
+        [
+          { label: 'Composer', primary: true, onClick: () => { stationRenderControlsDock('execution'); setTimeout(() => document.getElementById('station-execution-input')?.focus(), 0); } },
+          { label: 'Draft handoff', onClick: () => stationDraftOperationsHandoff() },
+        ],
+      ),
+    },
+    {
+      id: 'activity',
+      label: 'Activity',
+      ...stationReadinessState(
+        latestEvent ? 'ready' : 'idle',
+        latestEvent ? stationOperationsActivityLine(latestEvent) : 'no retained activity yet',
+        latestEvent ? compactSessionText(stationActivityEventCopyText(latestEvent), 120) : 'waiting for dashboard events',
+        [
+          { label: 'Activity', primary: true, onClick: () => stationRenderActivityDock(latestEvent ? stationActivityEventKey(latestEvent) : '') },
+          latestEvent ? { label: 'Copy latest', onClick: () => copyTextToClipboard(stationActivityEventCopyText(latestEvent)) } : null,
+        ],
+      ),
+    },
+    {
+      id: 'context',
+      label: 'Context',
+      ...stationReadinessState(
+        !context.available ? 'warn' : (contextPct >= 85 ? 'warn' : 'ready'),
+        context.available
+          ? `${stationCompactNumber(context.tokens)} / ${stationCompactNumber(context.effectiveWindow)} tokens (${contextPct}% effective)`
+          : 'no context snapshot',
+        context.topCategories?.[0]?.label ? `top lane ${context.topCategories[0].label}` : (context.source || 'no source'),
+        [
+          { label: 'Context', primary: true, onClick: () => stationRenderContextDock(stationSelectedContextPart) },
+          context.available ? { label: 'Seed rewind', onClick: stationSeedManagedFromOperationsBrief } : null,
+        ],
+      ),
+    },
+    {
+      id: 'managed',
+      label: 'Managed context',
+      ...stationReadinessState(
+        managed.error ? 'blocked' : (managed.rewindOnly ? 'warn' : (managed.mode === 'managed' ? 'ready' : 'idle')),
+        `${managed.mode || 'vanilla'} / ${managed.status || 'unknown'} / ${managedReadiness}`,
+        `${managed.anchors || 0} anchors / ${managed.records || 0} records${managed.error ? ` / ${managed.error}` : ''}`,
+        [
+          { label: 'Managed', primary: true, onClick: () => stationRenderManagedDock(managed.rewindOnly ? 'rewind' : '') },
+          managed.sessionId ? { label: 'Refresh', onClick: async () => { await stationApplyManagedAction('refresh', '', managed.sessionId); stationRenderControlsDock('readiness'); } } : null,
+        ],
+      ),
+    },
+    {
+      id: 'sessions',
+      label: 'Sessions',
+      ...stationReadinessState(
+        sessions.indexStatus === 'error' ? 'blocked' : (sessions.total ? 'ready' : 'idle'),
+        `${sessions.active || 0} active / ${sessions.total || 0} known / ${sessions.external || 0} external`,
+        `${sessions.indexStatus || 'cold'}${sessions.latestTask ? ` / latest ${compactSessionText(sessions.latestTask, 96)}` : ''}`,
+        [
+          { label: 'Sessions', primary: true, onClick: () => stationRenderSessionsDock(controls.sessionId || '') },
+          { label: 'Refresh', onClick: async () => { await loadSessions({ force: true }); stationRenderControlsDock('readiness'); } },
+        ],
+      ),
+    },
+    {
+      id: 'displays',
+      label: 'Peers and displays',
+      ...stationReadinessState(
+        displayPayload.shared_view.visible || displayPayload.local_streams || displayPayload.peer_streams || displayPayload.peers_connected
+          ? 'ready'
+          : 'idle',
+        `${displayPayload.local_streams || 0} local / ${displayPayload.peer_streams || 0} peer streams / ${displayPayload.peers_connected || 0}-${displayPayload.peers_total || 0} peers`,
+        `access ${displayPayload.local_access || 'off'} / shared ${displayPayload.shared_view.visible ? (displayPayload.shared_view.target || 'visible') : 'hidden'}`,
+        [
+          { label: 'Peers', primary: true, onClick: () => stationRenderPeersDock() },
+          { label: displayPayload.local_access?.startsWith?.('on') ? 'Revoke display' : 'Share display', onClick: () => window.toggleUserDisplay?.() },
+        ],
+      ),
+    },
+  ];
+  const worst = rows.reduce((acc, row) =>
+    stationReadinessStatusRank(row.level) > stationReadinessStatusRank(acc.level) ? row : acc,
+    { level: 'ready' },
+  );
+  return {
+    generated_at: new Date().toISOString(),
+    level: worst.level,
+    ready: rows.filter(row => row.level === 'ready').length,
+    warn: rows.filter(row => row.level === 'warn').length,
+    blocked: rows.filter(row => row.level === 'blocked').length,
+    idle: rows.filter(row => row.level === 'idle').length,
+    rows,
+  };
+}
+
+async function stationCopyReadinessBoard(board) {
+  await copyTextToClipboard(JSON.stringify({
+    ...board,
+    rows: board.rows.map(row => ({
+      id: row.id,
+      label: row.label,
+      level: row.level,
+      summary: row.summary,
+      detail: row.detail,
+    })),
+  }, null, 2));
+  showControlToast?.('success', 'Station readiness JSON copied');
+}
+
+function stationRenderReadinessBoardSection(parent, controls) {
+  const context = stationBuildContextSummary();
+  const managed = stationBuildManagedSummary(context);
+  const sessions = stationBuildSessionsSummary();
+  const board = stationBuildReadinessBoard(context, managed, sessions, controls);
+  const section = stationDockSection(parent, 'Readiness board');
+  stationDockRow(section, 'overall', `${board.level} / ${board.ready} ready / ${board.warn} warn / ${board.blocked} blocked / ${board.idle} idle`);
+  stationDockActions(section, [
+    { label: 'Refresh', primary: true, onClick: () => { stationRefreshSharedCaches(); stationRenderControlsDock('readiness'); } },
+    { label: 'Copy JSON', onClick: () => stationCopyReadinessBoard(board) },
+  ]);
+  for (const row of board.rows) {
+    stationDockCard(section, {
+      title: row.label,
+      meta: row.level,
+      detail: row.summary,
+      rows: row.detail ? [['detail', row.detail]] : [],
+      actions: row.actions,
+    });
+  }
+}
+
 function stationSeedManagedFromOperationsBrief() {
   stationRenderManagedDock('rewind');
   requestAnimationFrame(() => {
@@ -18169,6 +18337,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
     controls.sessionCanInterrupt ? { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) } : null,
   ]);
 
+  stationRenderReadinessBoardSection(body, controls);
   stationRenderOperationsBriefSection(body, controls);
   stationRenderLiveStatusSection(body, controls);
   stationRenderDashboardRoutesSection(body);
