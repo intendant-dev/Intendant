@@ -11448,6 +11448,7 @@ function stationSaveDockState() {
 let stationViewDraft = stationLoadViewDraft();
 let stationDockRestorePending = false;
 let stationDockState = stationLoadDockState();
+let stationDockFallbackDepth = 0;
 let stationLaunchDraft = {
   task: '',
   name: '',
@@ -11777,6 +11778,13 @@ function stationRenderCommandResults() {
 }
 
 function stationDockBegin(kind, title, subtitle = '') {
+  if (stationRenderedPrimaryActive() && stationDockFallbackDepth <= 0) {
+    const target = stationDockSystemTarget(kind);
+    if (target) {
+      stationRenderedSelectPanel(target, `${title || 'Station'} is rendered in Station`);
+    }
+    return null;
+  }
   const dock = document.getElementById('station-dock');
   const titleEl = document.getElementById('station-dock-title');
   const subtitleEl = document.getElementById('station-dock-subtitle');
@@ -11809,6 +11817,15 @@ function stationCloseDock() {
 }
 
 document.getElementById('station-dock-close')?.addEventListener('click', stationCloseDock);
+
+function stationWithDockFallback(fn) {
+  stationDockFallbackDepth += 1;
+  try {
+    return typeof fn === 'function' ? fn() : undefined;
+  } finally {
+    stationDockFallbackDepth = Math.max(0, stationDockFallbackDepth - 1);
+  }
+}
 
 function stationDockSystemTarget(kind) {
   const value = String(kind || '').trim();
@@ -11846,7 +11863,7 @@ document.getElementById('station-dock-nav')?.addEventListener('click', ev => {
   if (!button) return;
   ev.preventDefault();
   ev.stopPropagation();
-  stationHandleHotspot(button.dataset.stationDockNav);
+  stationWithDockFallback(() => stationHandleHotspot(button.dataset.stationDockNav));
 });
 
 document.getElementById('station-command-input')?.addEventListener('input', ev => {
@@ -13143,7 +13160,11 @@ function stationDispatchHotspot(target, ev) {
   stationLastHotspotDispatch = { target: name, at };
   ev?.preventDefault?.();
   ev?.stopPropagation?.();
-  stationHandleHotspot(name);
+  if (keyboardActivation) {
+    stationWithDockFallback(() => stationHandleHotspot(name));
+  } else {
+    stationHandleHotspot(name);
+  }
 }
 
 function stationHotspotLayerEvent(ev) {
