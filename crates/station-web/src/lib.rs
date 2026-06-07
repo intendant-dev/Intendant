@@ -3435,6 +3435,7 @@ impl StationInner {
             C_OVERLAY1_CSS,
             "normal",
         );
+        self.draw_selected_action_menu(id, x, y, panel_h);
 
         if id == "op" {
             self.text("operator", x + 12.0, y + 25.0, 10.0, C_BLUE_CSS, "bold");
@@ -3816,6 +3817,295 @@ impl StationInner {
                 );
             }
         }
+    }
+
+    fn draw_selected_action_menu(&mut self, id: &str, panel_x: f32, panel_y: f32, panel_h: f32) {
+        let Some((title, color, actions)) = self.selected_action_menu_actions(id) else {
+            return;
+        };
+        let menu_w = 188.0;
+        let x = panel_x - menu_w - 10.0;
+        if x < 246.0 || panel_h < 220.0 {
+            return;
+        }
+        let menu_h = (panel_h - 8.0).min(360.0);
+        self.round_rect(
+            x,
+            panel_y,
+            menu_w,
+            menu_h,
+            6.0,
+            "rgba(17,17,27,0.84)",
+            color,
+        );
+        self.hit_zones
+            .push(HitZone::new(x, panel_y, menu_w, menu_h, HitAction::Noop));
+        self.text("ACTION MENU", x + 12.0, panel_y + 19.0, 10.0, color, "bold");
+        self.text(
+            &truncate(&title, 24),
+            x + 12.0,
+            panel_y + 36.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut yy = panel_y + 52.0;
+        for action in actions {
+            if yy + 25.0 > panel_y + menu_h - 34.0 {
+                break;
+            }
+            self.action_menu_button(x + 10.0, yy, menu_w - 20.0, action);
+            yy += 29.0;
+        }
+
+        self.text(
+            "rendered primary",
+            x + 12.0,
+            panel_y + menu_h - 15.0,
+            8.0,
+            C_OVERLAY1_CSS,
+            "normal",
+        );
+        self.text(
+            "DOM dock fallback-only",
+            x + 92.0,
+            panel_y + menu_h - 15.0,
+            8.0,
+            C_MAUVE_CSS,
+            "normal",
+        );
+    }
+
+    fn selected_action_menu_actions(
+        &self,
+        id: &str,
+    ) -> Option<(String, &'static str, Vec<MenuAction>)> {
+        let controls = self.snapshot.controls.clone();
+        let managed = self.snapshot.managed.clone();
+        let display_source = self.display_sources.values().next();
+        match id {
+            "system:activity" => Some((
+                "Activity log".to_string(),
+                C_TEAL_CSS,
+                vec![
+                    MenuAction::activity("Latest event", "bottom", C_TEAL_CSS),
+                    MenuAction::activity("Copy visible log", "copy-visible", C_BLUE_CSS),
+                    MenuAction::activity("Clear triage", "clear-triage", C_YELLOW_CSS),
+                    MenuAction::activity("Clear log", "clear-log", C_RED_CSS),
+                    MenuAction::select("Open activity detail", "system:activity", C_OVERLAY1_CSS),
+                ],
+            )),
+            "system:context" => Some((
+                "Context window".to_string(),
+                C_BLUE_CSS,
+                vec![
+                    MenuAction::context("Live snapshot", "live", C_BLUE_CSS),
+                    MenuAction::context("Replay window", "replay", C_MAUVE_CSS),
+                    MenuAction::context("Focus item", "focus", C_TEAL_CSS),
+                    MenuAction::context("Raw view", "raw", C_PEACH_CSS),
+                    MenuAction::context("Copy snapshot", "copy-snapshot", C_TEAL_CSS),
+                    MenuAction::context("Load exact", "load-exact", C_YELLOW_CSS),
+                    MenuAction::context("Reset view", "reset", C_OVERLAY1_CSS),
+                ],
+            )),
+            "system:managed" => Some((
+                "Managed context".to_string(),
+                C_MAUVE_CSS,
+                vec![
+                    MenuAction::managed(
+                        "Use target",
+                        "use-target",
+                        "",
+                        &managed.session_id,
+                        C_TEAL_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Prepare rewind",
+                        "rewind",
+                        "",
+                        &managed.session_id,
+                        C_MAUVE_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Backout record",
+                        "backout",
+                        "",
+                        &managed.session_id,
+                        C_PEACH_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Refresh anchors",
+                        "refresh",
+                        "",
+                        &managed.session_id,
+                        C_BLUE_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Copy status",
+                        "copy-status",
+                        "",
+                        &managed.session_id,
+                        C_TEAL_CSS,
+                    ),
+                    MenuAction::select("Open managed detail", "system:managed", C_OVERLAY1_CSS),
+                ],
+            )),
+            "system:peers" => {
+                let mut actions = vec![
+                    MenuAction::controls(
+                        if controls.display_access.starts_with("on") {
+                            "Revoke local display"
+                        } else {
+                            "Share local display"
+                        },
+                        "display-toggle",
+                        C_PEACH_CSS,
+                    ),
+                    MenuAction::controls("List local displays", "display-list", C_BLUE_CSS),
+                    MenuAction::controls("Copy peer status", "peer-status-copy", C_TEAL_CSS),
+                ];
+                if let Some(source) = display_source {
+                    actions.insert(
+                        0,
+                        MenuAction::open_display(
+                            "Open first display",
+                            &source.host_id,
+                            &source.display_id,
+                            C_PEACH_CSS,
+                        ),
+                    );
+                }
+                if controls.shared_view_can_take_input {
+                    actions.push(MenuAction::controls(
+                        "Take shared input",
+                        "shared-view-take-input",
+                        C_GREEN_CSS,
+                    ));
+                }
+                if controls.shared_view_visible {
+                    actions.push(MenuAction::controls(
+                        "Focus shared view",
+                        "shared-view-focus",
+                        C_GREEN_CSS,
+                    ));
+                    actions.push(MenuAction::controls(
+                        "Hide shared view",
+                        "shared-view-hide",
+                        C_YELLOW_CSS,
+                    ));
+                }
+                Some(("Peers and displays".to_string(), C_PEACH_CSS, actions))
+            }
+            "system:sessions" => {
+                let mut actions = vec![
+                    MenuAction::activity("New session", "new-session", C_TEAL_CSS),
+                    MenuAction::select("Session detail", "system:sessions", C_OVERLAY1_CSS),
+                ];
+                if controls.session_can_focus {
+                    actions.insert(
+                        0,
+                        MenuAction::activity("Focus target", "target", C_BLUE_CSS),
+                    );
+                }
+                if controls.session_can_attach && !controls.session_id.is_empty() {
+                    actions.insert(
+                        0,
+                        MenuAction::session(
+                            "Attach target",
+                            "attach",
+                            &controls.session_id,
+                            C_PEACH_CSS,
+                        ),
+                    );
+                }
+                if controls.session_can_interrupt {
+                    actions.push(MenuAction::activity("Stop target", "stop", C_RED_CSS));
+                }
+                Some(("Sessions".to_string(), C_TEAL_CSS, actions))
+            }
+            "system:controls" => {
+                let mut actions = vec![
+                    MenuAction::activity(
+                        if controls.prompt_mode == "steer" {
+                            "Steer"
+                        } else {
+                            "Send"
+                        },
+                        "send",
+                        C_BLUE_CSS,
+                    ),
+                    MenuAction::activity("New session", "new-session", C_TEAL_CSS),
+                    MenuAction::controls("Share display", "display-toggle", C_PEACH_CSS),
+                    MenuAction::controls("Toggle mic", "voice-toggle", C_TEAL_CSS),
+                    MenuAction::controls("Toggle video", "video-toggle", C_TEAL_CSS),
+                ];
+                if controls.session_can_focus {
+                    actions.push(MenuAction::activity("Focus target", "target", C_PEACH_CSS));
+                }
+                if controls.session_can_interrupt {
+                    actions.push(MenuAction::activity("Stop target", "stop", C_RED_CSS));
+                }
+                if controls.shared_view_can_take_input {
+                    actions.push(MenuAction::controls(
+                        "Take shared input",
+                        "shared-view-take-input",
+                        C_GREEN_CSS,
+                    ));
+                }
+                Some(("Operator controls".to_string(), C_MAUVE_CSS, actions))
+            }
+            "system:changes" => Some((
+                "Working tree".to_string(),
+                C_YELLOW_CSS,
+                vec![
+                    MenuAction::changes("Refresh changes", "refresh", "", C_BLUE_CSS),
+                    MenuAction::changes("Copy paths", "copy-paths", "", C_TEAL_CSS),
+                    MenuAction::select("Changes detail", "system:changes", C_OVERLAY1_CSS),
+                ],
+            )),
+            "system:worktrees" => Some((
+                "Worktrees".to_string(),
+                C_BLUE_CSS,
+                vec![
+                    MenuAction::session("Refresh index", "worktree-refresh", "", C_BLUE_CSS),
+                    MenuAction::session("Search worktrees", "worktree-search", "", C_TEAL_CSS),
+                    MenuAction::select("Worktree detail", "system:worktrees", C_OVERLAY1_CSS),
+                ],
+            )),
+            "system:view" => Some((
+                "Station view".to_string(),
+                C_MAUVE_CSS,
+                vec![
+                    MenuAction::new(
+                        "Orbital layout",
+                        C_BLUE_CSS,
+                        HitAction::Layout(LayoutName::Orbital),
+                    ),
+                    MenuAction::new(
+                        "Constellation layout",
+                        C_MAUVE_CSS,
+                        HitAction::Layout(LayoutName::Constellation),
+                    ),
+                    MenuAction::new("Cockpit mood", C_TEAL_CSS, HitAction::Mood(Mood::Cockpit)),
+                    MenuAction::new("Calm mood", C_PEACH_CSS, HitAction::Mood(Mood::Calm)),
+                ],
+            )),
+            _ => None,
+        }
+    }
+
+    fn action_menu_button(&mut self, x: f32, y: f32, w: f32, action: MenuAction) {
+        self.round_rect(x, y, w, 24.0, 4.0, "rgba(49,50,68,0.42)", action.color);
+        self.text(
+            &truncate(&action.label, 24),
+            x + 9.0,
+            y + 15.5,
+            9.0,
+            action.color,
+            "bold",
+        );
+        self.hit_zones.push(HitZone::new(x, y, w, 24.0, action.hit));
     }
 
     fn draw_activity_info(&mut self, x: f32, y: f32, panel_w: f32) {
@@ -7722,6 +8012,103 @@ impl RunwayAction {
                 session_id: session_id.to_string(),
             },
         }
+    }
+}
+
+struct MenuAction {
+    label: String,
+    color: &'static str,
+    hit: HitAction,
+}
+
+impl MenuAction {
+    fn new(label: &str, color: &'static str, hit: HitAction) -> Self {
+        Self {
+            label: label.to_string(),
+            color,
+            hit,
+        }
+    }
+
+    fn select(label: &str, id: &str, color: &'static str) -> Self {
+        Self::new(label, color, HitAction::Select(id.to_string()))
+    }
+
+    fn activity(label: &str, action: &str, color: &'static str) -> Self {
+        Self::new(
+            label,
+            color,
+            HitAction::ActivityAction {
+                action: action.to_string(),
+                id: String::new(),
+            },
+        )
+    }
+
+    fn context(label: &str, action: &str, color: &'static str) -> Self {
+        Self::new(
+            label,
+            color,
+            HitAction::ContextAction {
+                action: action.to_string(),
+                id: String::new(),
+            },
+        )
+    }
+
+    fn controls(label: &str, action: &str, color: &'static str) -> Self {
+        Self::new(
+            label,
+            color,
+            HitAction::ControlsAction {
+                action: action.to_string(),
+            },
+        )
+    }
+
+    fn managed(label: &str, action: &str, id: &str, session_id: &str, color: &'static str) -> Self {
+        Self::new(
+            label,
+            color,
+            HitAction::ManagedAction {
+                action: action.to_string(),
+                id: id.to_string(),
+                session_id: session_id.to_string(),
+            },
+        )
+    }
+
+    fn changes(label: &str, action: &str, path: &str, color: &'static str) -> Self {
+        Self::new(
+            label,
+            color,
+            HitAction::ChangesAction {
+                action: action.to_string(),
+                path: path.to_string(),
+            },
+        )
+    }
+
+    fn session(label: &str, action: &str, session_id: &str, color: &'static str) -> Self {
+        Self::new(
+            label,
+            color,
+            HitAction::SessionAction {
+                action: action.to_string(),
+                session_id: session_id.to_string(),
+            },
+        )
+    }
+
+    fn open_display(label: &str, host_id: &str, display_id: &str, color: &'static str) -> Self {
+        Self::new(
+            label,
+            color,
+            HitAction::OpenDisplay {
+                host_id: host_id.to_string(),
+                display_id: display_id.to_string(),
+            },
+        )
     }
 }
 
