@@ -4226,9 +4226,10 @@ impl CodexCommandOutputHygiene {
 
         if self.suppressing_warning_diagnostic {
             if is_codex_warning_diagnostic_continuation(line) {
-                if line.trim().is_empty() {
-                    self.suppressing_warning_diagnostic = false;
-                }
+                // Codex can replay only the source excerpt after Rust's blank
+                // diagnostic separator. Keep suppression active until a real
+                // non-continuation line arrives so split tails like `59 ` are
+                // buffered and completed before classification.
                 return;
             }
             self.suppressing_warning_diagnostic = false;
@@ -7586,6 +7587,55 @@ warning: station warning {idx}
     }
 
     #[test]
+    fn codex_command_output_hygiene_suppresses_split_duplicated_warning_source_fragments() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let mut filtered = String::new();
+        for idx in 0..CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT {
+            let chunk = format!(
+                "\
+warning: inline warning {idx}
+ --> src/terminal.rs:{idx}:1
+  |
+
+"
+            );
+            if let Some(output) = hygiene.filter(&chunk, false) {
+                filtered.push_str(&output);
+            }
+        }
+
+        let chunk = "\
+warning: suppressed local constructor
+ --> src/terminal.rs:59:12
+  |
+59 |     pub fn local(terminal_id: impl Into<String>) -> Self {
+   |            ^^^^^
+
+59 ";
+        if let Some(output) = hygiene.filter(chunk, false) {
+            filtered.push_str(&output);
+        }
+
+        let chunk = "\
+|     pub fn local(terminal_id: impl Into<String>) -> Self {
+   |            ^^^^^
+
+error: could not compile `intendant`
+";
+        if let Some(output) = hygiene.filter(chunk, true) {
+            filtered.push_str(&output);
+        }
+
+        assert!(filtered.contains("warning: inline warning 0"));
+        assert!(filtered.contains("warning: inline warning 2"));
+        assert!(filtered.contains("suppressed additional repeated warning diagnostics"));
+        assert!(!filtered.contains("warning: suppressed local constructor"));
+        assert!(!filtered.contains("pub fn local(terminal_id"));
+        assert!(!filtered.contains("^^^^^"));
+        assert!(filtered.contains("error: could not compile `intendant`"));
+    }
+
+    #[test]
     fn codex_command_output_hygiene_truncates_long_lines() {
         let mut hygiene = CodexCommandOutputHygiene::default();
         let input = format!(
@@ -7842,6 +7892,73 @@ warning: station warning {idx}
         assert!(!joined.contains("warning: suppressed warning"));
         assert!(!joined.contains("split_station_warning_fragment"));
         assert!(!joined.contains("split continuation must stay hidden"));
+        assert!(joined.contains("error: build failed"));
+    }
+
+    #[test]
+    fn translate_output_delta_suppresses_duplicated_warning_source_excerpt_after_blank() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        for idx in 0..CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT {
+            let params = serde_json::json!({
+                "itemId": "item-1",
+                "delta": format!("warning: inline warning {idx}\n --> src/lib.rs:{idx}:1\n  |\n\n")
+            });
+            translate_notification_with_state(
+                "item/commandExecution/outputDelta",
+                &params,
+                &tx,
+                &mut state,
+            );
+        }
+
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "\
+warning: suppressed local constructor
+ --> src/terminal.rs:59:12
+  |
+59 |     pub fn local(terminal_id: impl Into<String>) -> Self {
+   |            ^^^^^
+
+59 "
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "\
+|     pub fn local(terminal_id: impl Into<String>) -> Self {
+   |            ^^^^^
+
+error: build failed
+"
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolOutputDelta { text, .. } => texts.push(text),
+                other => panic!("expected ToolOutputDelta, got {:?}", other),
+            }
+        }
+        let joined = texts.join("");
+        assert!(joined.contains("warning: inline warning 0"));
+        assert!(joined.contains("warning: inline warning 2"));
+        assert!(joined.contains("suppressed additional repeated warning diagnostics"));
+        assert!(!joined.contains("warning: suppressed local constructor"));
+        assert!(!joined.contains("pub fn local(terminal_id"));
+        assert!(!joined.contains("^^^^^"));
         assert!(joined.contains("error: build failed"));
     }
 
