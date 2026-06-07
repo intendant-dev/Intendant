@@ -4185,10 +4185,7 @@ impl CodexCommandOutputHygiene {
 
         if start < combined.len() {
             let tail = &combined[start..];
-            if flush
-                || (!self.suppressing_warning_diagnostic
-                    && !is_potential_codex_warning_prefix(tail))
-            {
+            if flush || !self.should_buffer_potential_warning_tail(tail) {
                 self.push_filtered_line(tail, &mut out);
             } else {
                 self.pending.push_str(tail);
@@ -4233,6 +4230,13 @@ impl CodexCommandOutputHygiene {
                 return;
             }
             self.suppressing_warning_diagnostic = false;
+        }
+
+        if self.warning_diagnostics_seen > CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT
+            && is_codex_detached_warning_diagnostic_tail_start(line)
+        {
+            self.suppressing_warning_diagnostic = true;
+            return;
         }
 
         if is_codex_build_progress_line(line) {
@@ -4370,6 +4374,13 @@ impl CodexCommandOutputHygiene {
         let trim_to = self.tail.len().saturating_sub(tail_limit);
         let split_at = codex_char_boundary_at_or_after(&self.tail, trim_to);
         self.tail.drain(..split_at);
+    }
+
+    fn should_buffer_potential_warning_tail(&self, tail: &str) -> bool {
+        self.suppressing_warning_diagnostic
+            || is_potential_codex_warning_prefix(tail)
+            || (self.warning_diagnostics_seen > CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT
+                && is_potential_codex_detached_warning_diagnostic_tail_prefix(tail))
     }
 }
 
@@ -4721,6 +4732,32 @@ fn is_codex_warning_diagnostic_continuation(line: &str) -> bool {
         || is_codex_warning_diagnostic_source_excerpt(trimmed)
         || trimmed.to_ascii_lowercase().starts_with("note:")
         || trimmed.to_ascii_lowercase().starts_with("help:")
+}
+
+fn is_codex_detached_warning_diagnostic_tail_start(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    trimmed.starts_with("-->") || is_codex_warning_diagnostic_source_excerpt(trimmed)
+}
+
+fn is_potential_codex_detached_warning_diagnostic_tail_prefix(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    if trimmed.starts_with("-->") || "-->".starts_with(trimmed) {
+        return true;
+    }
+
+    let digit_count = trimmed.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count == 0 {
+        return false;
+    }
+    if digit_count >= trimmed.len() {
+        return true;
+    }
+
+    let rest = trimmed[digit_count..].trim_start();
+    rest.is_empty() || rest.starts_with('|')
 }
 
 fn is_codex_warning_diagnostic_source_excerpt(trimmed: &str) -> bool {
@@ -7636,6 +7673,72 @@ error: could not compile `intendant`
     }
 
     #[test]
+    fn codex_command_output_hygiene_suppresses_post_limit_detached_warning_tail() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let mut filtered = String::new();
+        for idx in 0..CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT {
+            let chunk = format!(
+                "\
+warning: inline warning {idx}
+ --> src/lib.rs:{idx}:1
+  |
+
+"
+            );
+            if let Some(output) = hygiene.filter(&chunk, false) {
+                filtered.push_str(&output);
+            }
+        }
+
+        let chunk = "\
+warning: suppressed previous warning
+ --> src/terminal.rs:59:12
+  |
+
+status: continuing after suppressed warning
+";
+        if let Some(output) = hygiene.filter(chunk, false) {
+            filtered.push_str(&output);
+        }
+
+        if let Some(output) = hygiene.filter("59 ", false) {
+            filtered.push_str(&output);
+        }
+
+        let chunk = "\
+|     pub fn local(terminal_id: impl Into<String>) -> Self {
+   |            ^^^^^
+
+warning: variants `Help` and `Inspect` are never constructed
+  --> src/bin/caller/tui/app.rs:19:5
+   |
+16 | pub e";
+        if let Some(output) = hygiene.filter(chunk, false) {
+            filtered.push_str(&output);
+        }
+
+        let chunk = "\
+num AppMode {
+error: could not compile `intendant`
+";
+        if let Some(output) = hygiene.filter(chunk, true) {
+            filtered.push_str(&output);
+        }
+
+        assert!(filtered.contains("warning: inline warning 0"));
+        assert!(filtered.contains("warning: inline warning 2"));
+        assert!(filtered.contains("status: continuing after suppressed warning"));
+        assert!(filtered.contains("suppressed additional repeated warning diagnostics"));
+        assert!(!filtered.contains("warning: suppressed previous warning"));
+        assert!(!filtered.contains("pub fn local(terminal_id"));
+        assert!(!filtered.contains("^^^^^"));
+        assert!(!filtered.contains("variants `Help` and `Inspect`"));
+        assert!(!filtered.contains("src/bin/caller/tui/app.rs"));
+        assert!(!filtered.contains("16 | pub enum AppMode"));
+        assert!(filtered.contains("error: could not compile `intendant`"));
+    }
+
+    #[test]
     fn codex_command_output_hygiene_truncates_long_lines() {
         let mut hygiene = CodexCommandOutputHygiene::default();
         let input = format!(
@@ -7959,6 +8062,101 @@ error: build failed
         assert!(!joined.contains("warning: suppressed local constructor"));
         assert!(!joined.contains("pub fn local(terminal_id"));
         assert!(!joined.contains("^^^^^"));
+        assert!(joined.contains("error: build failed"));
+    }
+
+    #[test]
+    fn translate_output_delta_suppresses_post_limit_detached_warning_tail() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        for idx in 0..CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT {
+            let params = serde_json::json!({
+                "itemId": "item-1",
+                "delta": format!("warning: inline warning {idx}\n --> src/lib.rs:{idx}:1\n  |\n\n")
+            });
+            translate_notification_with_state(
+                "item/commandExecution/outputDelta",
+                &params,
+                &tx,
+                &mut state,
+            );
+        }
+
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "\
+warning: suppressed previous warning
+ --> src/terminal.rs:59:12
+  |
+
+status: continuing after suppressed warning
+"
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "59 "
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "\
+|     pub fn local(terminal_id: impl Into<String>) -> Self {
+   |            ^^^^^
+
+warning: variants `Help` and `Inspect` are never constructed
+  --> src/bin/caller/tui/app.rs:19:5
+   |
+16 | pub e"
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+        let params = serde_json::json!({
+            "itemId": "item-1",
+            "delta": "\
+num AppMode {
+error: build failed
+"
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolOutputDelta { text, .. } => texts.push(text),
+                other => panic!("expected ToolOutputDelta, got {:?}", other),
+            }
+        }
+        let joined = texts.join("");
+        assert!(joined.contains("warning: inline warning 0"));
+        assert!(joined.contains("warning: inline warning 2"));
+        assert!(joined.contains("status: continuing after suppressed warning"));
+        assert!(joined.contains("suppressed additional repeated warning diagnostics"));
+        assert!(!joined.contains("warning: suppressed previous warning"));
+        assert!(!joined.contains("pub fn local(terminal_id"));
+        assert!(!joined.contains("^^^^^"));
+        assert!(!joined.contains("variants `Help` and `Inspect`"));
+        assert!(!joined.contains("src/bin/caller/tui/app.rs"));
+        assert!(!joined.contains("16 | pub enum AppMode"));
         assert!(joined.contains("error: build failed"));
     }
 
