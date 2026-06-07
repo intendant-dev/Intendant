@@ -97,7 +97,7 @@ const EXTERNAL_TRANSCRIPT_CACHE_LIMIT: usize = 32;
 const EXTERNAL_TRANSCRIPT_DEDUPE_WINDOW_MILLIS: i64 = 2_000;
 const SESSION_LIST_ROW_CACHE_LIMIT: usize = 8_192;
 const SESSION_LIST_LIMIT: usize = 5_000;
-const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 2;
+const SESSION_LIST_RESPONSE_CACHE_TTL_SECS: u64 = 30;
 const SESSION_DETAIL_ENTRY_LIMIT_MAX: usize = 1_000;
 const SESSION_SOURCE_FLOOR: usize = 100;
 const SESSION_LOG_SEARCH_SNIPPETS_PER_SESSION: usize = 3;
@@ -7126,6 +7126,38 @@ fn filter_session_list_by_ids(body: &str, ids: &[String]) -> String {
         .filter(|row| session_row_matches_any_id(row, &wanted))
         .collect();
     serde_json::to_string(&filtered).unwrap_or_else(|_| "[]".to_string())
+}
+
+fn session_list_limit_from_request(request_line: &str) -> Option<usize> {
+    let raw = query_param(request_line, "limit")
+        .or_else(|| query_param(request_line, "max"))
+        .or_else(|| query_param(request_line, "count"))?;
+    let trimmed = raw.trim();
+    if trimmed.eq_ignore_ascii_case("all")
+        || trimmed.eq_ignore_ascii_case("full")
+        || trimmed.eq_ignore_ascii_case("unlimited")
+    {
+        return None;
+    }
+    trimmed
+        .parse::<usize>()
+        .ok()
+        .filter(|limit| *limit > 0)
+        .map(|limit| limit.min(SESSION_LIST_LIMIT))
+}
+
+fn limit_session_list_body(body: &str, limit: Option<usize>) -> String {
+    let Some(limit) = limit else {
+        return body.to_string();
+    };
+    let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(body) else {
+        return body.to_string();
+    };
+    if rows.len() <= limit {
+        return body.to_string();
+    }
+    rows.truncate(limit);
+    serde_json::to_string(&rows).unwrap_or_else(|_| body.to_string())
 }
 
 fn cached_list_sessions_for_ids(ids: &[String]) -> String {
@@ -17260,9 +17292,13 @@ pub fn spawn_web_gateway(
                         // daemons' session lists to populate its "All
                         // Sessions" and "Disk Usage" cards per host.
                         let ids_filter = session_ids_filter_from_request(request_line);
-                        let body = match tokio::task::spawn_blocking(move || match ids_filter {
-                            Some(ids) => cached_list_sessions_for_ids(&ids),
-                            None => cached_list_sessions(),
+                        let limit = session_list_limit_from_request(request_line);
+                        let body = match tokio::task::spawn_blocking(move || {
+                            let body = match ids_filter {
+                                Some(ids) => cached_list_sessions_for_ids(&ids),
+                                None => cached_list_sessions(),
+                            };
+                            limit_session_list_body(&body, limit)
                         })
                         .await
                         {
@@ -22406,6 +22442,50 @@ mod tests {
             session_ids_filter_from_request("GET /api/sessions?ids=..%2Fbad HTTP/1.1"),
             Some(Vec::new())
         );
+    }
+
+    #[test]
+    fn session_list_limit_from_request_parses_bounded_limits() {
+        assert_eq!(
+            session_list_limit_from_request("GET /api/sessions?limit=250 HTTP/1.1"),
+            Some(250)
+        );
+        assert_eq!(
+            session_list_limit_from_request("GET /api/sessions?max=7 HTTP/1.1"),
+            Some(7)
+        );
+        assert_eq!(
+            session_list_limit_from_request("GET /api/sessions?limit=all HTTP/1.1"),
+            None
+        );
+        assert_eq!(
+            session_list_limit_from_request("GET /api/sessions?limit=0 HTTP/1.1"),
+            None
+        );
+        assert_eq!(
+            session_list_limit_from_request("GET /api/sessions?limit=999999 HTTP/1.1"),
+            Some(SESSION_LIST_LIMIT)
+        );
+    }
+
+    #[test]
+    fn limit_session_list_body_keeps_recent_prefix() {
+        let body = serde_json::json!([
+            { "session_id": "newest" },
+            { "session_id": "middle" },
+            { "session_id": "oldest" }
+        ])
+        .to_string();
+
+        let limited = limit_session_list_body(&body, Some(2));
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&limited).unwrap();
+        let ids: Vec<_> = rows
+            .iter()
+            .filter_map(|row| row.get("session_id").and_then(|v| v.as_str()))
+            .collect();
+
+        assert_eq!(ids, vec!["newest", "middle"]);
+        assert_eq!(limit_session_list_body(&body, None), body);
     }
 
     #[test]

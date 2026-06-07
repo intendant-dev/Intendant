@@ -10653,6 +10653,25 @@ const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
 // the lower dashboard sections finish registering their helpers.
 const sessionsListCache = new Map();
 const sessionsListInflight = new Map();
+const SESSION_LIST_RECENT_LIMIT = 600;
+
+function sessionListRequestLimit(options = {}) {
+  if (options.limit === 'all' || options.limit === 'full' || options.full === true) return 'all';
+  const raw = options.limit ?? SESSION_LIST_RECENT_LIMIT;
+  const n = Number(raw);
+  return Number.isFinite(n) && n > 0 ? Math.min(Math.floor(n), 5000) : SESSION_LIST_RECENT_LIMIT;
+}
+
+function sessionListCacheKey(hostId, options = {}) {
+  return `${hostId || selfPeerId}\u001f${sessionListRequestLimit(options)}`;
+}
+
+function sessionListUrl(baseUrl, limit) {
+  const prefix = baseUrl ? baseUrl.replace(/\/$/, '') : '';
+  const value = limit === 'all' ? 'all' : String(limit);
+  return `${prefix}/api/sessions?limit=${encodeURIComponent(value)}`;
+}
+
 let worktreesLoaded = false;
 let _cachedWorktreeScan = null;
 let worktreesLoadInFlight = '';
@@ -10993,10 +11012,6 @@ function stationDomLogEvents(limit = 80) {
 }
 
 function stationSessionWindowHistoryEvent(item, win, index) {
-  const node = sessionWindowHistoryNode(item);
-  if (node) {
-    return stationLogEntryEvent(node, index, { includeSessionWindow: true });
-  }
   const record = sessionWindowHistoryRecord(item);
   if (!record) return null;
   const hostId = record.host_id || record.hostId || selfPeerId;
@@ -11065,9 +11080,8 @@ function stationActivityEvents() {
     seen.add(id);
     events.push(event.id ? event : { ...event, id });
   };
-  for (const event of stationDomLogEvents()) add(event);
-  for (const event of stationSessionWindowHistoryEvents()) add(event);
   for (const event of stationLogEvents) add(event);
+  for (const event of stationSessionWindowHistoryEvents()) add(event);
   return events.slice(-80);
 }
 
@@ -14466,7 +14480,7 @@ function stationRenderChangesDock(selectedPath = stationSelectedChangePath || ac
 function stationCollectSessionSet() {
   const indexedSessions = Array.isArray(_cachedSessions) && _cachedSessions.length
     ? _cachedSessions
-    : (sessionsListCache.get(selfPeerId) || []);
+    : (sessionsListCache.get(sessionListCacheKey(selfPeerId)) || []);
   const byId = new Map();
   const indexedIds = new Set();
   for (const session of indexedSessions) {
@@ -17995,7 +18009,7 @@ function stationFindSessionById(sessionId) {
   };
   for (const pool of [
     _cachedSessions || [],
-    sessionsListCache.get(selfPeerId) || [],
+    sessionsListCache.get(sessionListCacheKey(selfPeerId)) || [],
     stationSessionWindowSummaries(),
     [stationCurrentDaemonSessionSummary()].filter(Boolean),
   ]) {
@@ -19216,7 +19230,7 @@ function stationLatestConfigurableExternalSessionId(sourceFilter = '') {
   };
   const pools = [
     _cachedSessions || [],
-    sessionsListCache.get(selfPeerId) || [],
+    sessionsListCache.get(sessionListCacheKey(selfPeerId)) || [],
     stationSessionWindowSummaries(),
     stationSessionMetadataSummaries(),
   ];
@@ -20470,13 +20484,17 @@ async function main() {
         if (earlyUsage && !hostStatsCache.has(selfPeerId)) {
           hostStatsCache.set(selfPeerId, earlyUsage);
         }
-        const earlySessions = sessionsListCache.get(previousSelfPeerId);
-        if (earlySessions && !sessionsListCache.has(selfPeerId)) {
-          sessionsListCache.set(selfPeerId, earlySessions);
+        for (const [key, earlySessions] of Array.from(sessionsListCache.entries())) {
+          if (!key.startsWith(`${previousSelfPeerId}\u001f`)) continue;
+          const newKey = `${selfPeerId}${key.slice(previousSelfPeerId.length)}`;
+          if (!sessionsListCache.has(newKey)) sessionsListCache.set(newKey, earlySessions);
         }
-        const earlySessionsInflight = sessionsListInflight.get(previousSelfPeerId);
-        if (earlySessionsInflight && !sessionsListInflight.has(selfPeerId)) {
-          sessionsListInflight.set(selfPeerId, earlySessionsInflight);
+        for (const [key, earlySessionsInflight] of Array.from(sessionsListInflight.entries())) {
+          if (!key.startsWith(`${previousSelfPeerId}\u001f`)) continue;
+          const newKey = `${selfPeerId}${key.slice(previousSelfPeerId.length)}`;
+          if (!sessionsListInflight.has(newKey)) {
+            sessionsListInflight.set(newKey, earlySessionsInflight);
+          }
         }
       }
       selfHostLabel = card.label;
@@ -41141,11 +41159,12 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
-  const cached = sessionsListCache.get(hostId);
+  const cacheKey = sessionListCacheKey(hostId, options);
+  const cached = sessionsListCache.get(cacheKey);
   if (cached && !options.force) {
     return Promise.resolve(cached);
   }
-  const inflight = sessionsListInflight.get(hostId);
+  const inflight = sessionsListInflight.get(cacheKey);
   if (inflight) {
     return inflight;
   }
@@ -41157,9 +41176,11 @@ function fetchSessionsForHost(hostId, options = {}) {
     baseUrl = d.url.replace(/\/$/, '');
   }
 
+  const limit = sessionListRequestLimit(options);
+  const url = sessionListUrl(baseUrl, limit);
   const request = hostId === selfPeerId
-    ? authedFetch('/api/sessions')
-    : fetch(baseUrl + '/api/sessions');
+    ? authedFetch(url)
+    : fetch(url);
   const promise = request
     .then(r => {
       if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
@@ -41169,16 +41190,16 @@ function fetchSessionsForHost(hostId, options = {}) {
       if (!Array.isArray(sessions)) {
         throw new Error('/api/sessions returned a non-array payload');
       }
-      sessionsListCache.set(hostId, sessions);
+      sessionsListCache.set(cacheKey, sessions);
       if (hostId === selfPeerId) cacheSessionWindowMetadata(sessions);
       return sessions;
     })
     .finally(() => {
-      if (sessionsListInflight.get(hostId) === promise) {
-        sessionsListInflight.delete(hostId);
+      if (sessionsListInflight.get(cacheKey) === promise) {
+        sessionsListInflight.delete(cacheKey);
       }
     });
-  sessionsListInflight.set(hostId, promise);
+  sessionsListInflight.set(cacheKey, promise);
   return promise;
 }
 
@@ -41193,7 +41214,7 @@ function renderStatsSessionSections(sessions) {
 }
 
 function renderCachedStatsSessionSections(hostId) {
-  const sessions = sessionsListCache.get(hostId || selfPeerId);
+  const sessions = sessionsListCache.get(sessionListCacheKey(hostId || selfPeerId, { limit: 'all' }));
   if (Array.isArray(sessions)) renderStatsSessionSections(sessions);
 }
 
@@ -41718,7 +41739,7 @@ function renderSessionStatsFallback(sessions) {
 // mixed content. Same rules as fetching the remote's agent card on add.
 function loadAllSessionsUsage(hostId, options = {}) {
   hostId = hostId || selfPeerId;
-  fetchSessionsForHost(hostId, { force: !!options.force })
+  fetchSessionsForHost(hostId, { force: !!options.force, limit: 'all' })
     .then(sessions => {
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
@@ -43632,7 +43653,7 @@ function applyLoadedSessions(sessions, aggEl) {
 function loadSessions(options = {}) {
   const listEl = document.getElementById('sessions-list');
   const aggEl = document.getElementById('sessions-aggregate');
-  const cached = sessionsListCache.get(selfPeerId);
+  const cached = sessionsListCache.get(sessionListCacheKey(selfPeerId));
   if (cached) {
     applyLoadedSessions(cached, aggEl);
   } else if (listEl) {
@@ -43640,7 +43661,10 @@ function loadSessions(options = {}) {
   }
 
   const token = ++_sessionsLoadToken;
-  return fetchSessionsForHost(selfPeerId, { force: options.force !== false })
+  return fetchSessionsForHost(selfPeerId, {
+    force: options.force !== false,
+    limit: options.limit ?? SESSION_LIST_RECENT_LIMIT,
+  })
     .then(sessions => {
       if (token !== _sessionsLoadToken) return;
       applyLoadedSessions(sessions, aggEl);
@@ -45603,7 +45627,7 @@ async function confirmSessionDeleteModal() {
         s.total_bytes = Math.max(0, (s.total_bytes || 0) - freed);
       }
     }
-    sessionsListCache.set(selfPeerId, _cachedSessions);
+    sessionsListCache.set(sessionListCacheKey(selfPeerId), _cachedSessions);
     updateSessionProjectFilterOptions(_cachedSessions);
     renderSessionsAggregate(_cachedSessions, document.getElementById('sessions-aggregate'));
     _refilterSessions();
