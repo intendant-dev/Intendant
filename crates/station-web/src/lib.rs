@@ -2555,6 +2555,8 @@ impl StationInner {
             ("rewind", "prepare rewind", 116.0),
             ("backout", "backout", 72.0),
             ("refresh", "refresh", 68.0),
+            ("use-target", "use target", 86.0),
+            ("copy-status", "copy status", 94.0),
         ];
         let mut ax = x + 14.0;
         let mut ay = yy - 14.0;
