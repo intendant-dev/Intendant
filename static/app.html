@@ -11368,8 +11368,15 @@ function stationCommandEntries() {
       detail: 'Open the Station launch form',
       tokens: 'new session launch start task',
       run: () => {
-        stationHandleHotspot('system:sessions');
-        setTimeout(() => document.getElementById('station-launch-task')?.focus(), 0);
+        stationOpenSessionLaunchDock();
+      },
+    },
+    {
+      label: 'Start session',
+      detail: 'Launch with the Station draft and selected backend',
+      tokens: 'start launch execute run external agent codex claude gemini',
+      run: () => {
+        stationStartSessionFromDock();
       },
     },
     {
@@ -11473,8 +11480,7 @@ function stationRunQuickCommand(kind) {
       break;
     }
     case 'session':
-      stationHandleHotspot('system:sessions');
-      setTimeout(() => document.getElementById('station-launch-task')?.focus(), 0);
+      stationOpenSessionLaunchDock();
       break;
     case 'display':
       stationHandleHotspot('system:peers');
@@ -14195,6 +14201,37 @@ function stationLaunchDraftValue(key, fallback = '') {
   return value === undefined || value === null || value === '' ? fallback : value;
 }
 
+function stationFocusLaunchField(field = 'task') {
+  const id = field === 'agent'
+    ? 'station-launch-agent'
+    : field === 'command'
+      ? 'station-launch-command'
+      : field === 'project'
+        ? 'station-launch-project'
+        : 'station-launch-task';
+  const el = document.getElementById(id) || document.getElementById('station-launch-task');
+  if (!el) return;
+  el.focus();
+  if (typeof el.select === 'function') el.select();
+}
+
+function stationOpenSessionLaunchDock(opts = {}) {
+  stationRememberLaunchDraft();
+  const useActivityDraft = opts.useActivityDraft !== false;
+  if (useActivityDraft && !String(stationLaunchDraft.task || '').trim()) {
+    const activityDraft = document.getElementById('activity-task-input')?.value || '';
+    if (activityDraft.trim()) stationLaunchDraft.task = activityDraft;
+  }
+  const agent = normalizeAgentId(opts.agent || '');
+  if (agent) {
+    stationLaunchDraft.agent = agent;
+    stationLaunchDraft.command = stationLaunchCommandForAgent(agent);
+    if (agent === 'codex') stationApplyCodexLaunchDefaultsToDraft();
+  }
+  stationRenderSessionsDock(opts.focusId || '');
+  setTimeout(() => stationFocusLaunchField(opts.focus || 'task'), 0);
+}
+
 function stationAgentOptions() {
   return [
     ['', newSessionConfiguredAgent ? `Current (${prettyAgentName(newSessionConfiguredAgent)})` : 'Current setting'],
@@ -14335,7 +14372,17 @@ function stationRenderLaunchReadinessSection(parent, opts = {}) {
   }
   if (readiness.notice) stationDockEmpty(section, readiness.notice);
   const rerender = opts.rerender || (() => stationRenderSessionsDock());
-  stationDockActions(section, [
+  const actions = [];
+  if (opts.allowStart) {
+    actions.push({
+      label: newSessionSpawnPending ? 'Spawning...' : 'Start session',
+      primary: readiness.ready,
+      disabled: !readiness.ready,
+      title: readiness.ready ? 'Launch the Station draft' : `Blocked: ${readiness.missing.join(', ')}`,
+      onClick: stationStartSessionFromDock,
+    });
+  }
+  actions.push(
     {
       label: 'Use activity draft',
       onClick: () => {
@@ -14345,7 +14392,8 @@ function stationRenderLaunchReadinessSection(parent, opts = {}) {
     },
     { label: 'Refresh config', onClick: async () => { await refreshControlPane(); rerender(); } },
     { label: 'Clear draft', danger: true, onClick: () => { stationClearLaunchDraft(); rerender(); } },
-  ]);
+  );
+  stationDockActions(section, actions);
   return readiness;
 }
 
@@ -14404,10 +14452,14 @@ function stationRenderLaunchProfileSection(parent) {
 
 async function stationStartSessionFromDock() {
   stationRememberLaunchDraft();
+  if (!String(stationLaunchDraft.task || '').trim()) {
+    const activityDraft = document.getElementById('activity-task-input')?.value || '';
+    if (activityDraft.trim()) stationLaunchDraft.task = activityDraft;
+  }
   const task = String(stationLaunchDraft.task || '').trim();
   if (!task) {
     showControlToast?.('error', 'Enter a task before starting a Station session');
-    document.getElementById('station-launch-task')?.focus();
+    stationOpenSessionLaunchDock({ useActivityDraft: false });
     return;
   }
   if (newSessionSpawnPending) {
@@ -14473,6 +14525,7 @@ async function stationStartSessionFromDock() {
     renderAttachmentReceipt?.(task, pendingAttachments.slice(), 'Sent');
     clearPendingAttachments?.();
   }
+  stationRenderSessionsDock();
 }
 
 function stationRenderSessionLaunchSection(parent) {
@@ -14486,9 +14539,17 @@ function stationRenderSessionLaunchSection(parent) {
   const project = stationDockInput(section, 'Project', stationLaunchDraftValue('project', newSessionProjectInputValue?.() || dashboardProjectRoot || ''), { id: 'station-launch-project', placeholder: 'optional project path' });
   const agent = stationDockSelect(section, 'Agent', stationLaunchDraftValue('agent'), stationAgentOptions(), { id: 'station-launch-agent' });
   const onDraftInput = () => stationRememberLaunchDraft();
+  const onLaunchShortcut = ev => {
+    if (ev.key !== 'Enter' || (!ev.ctrlKey && !ev.metaKey)) return;
+    ev.preventDefault();
+    stationStartSessionFromDock();
+  };
   task.addEventListener('input', onDraftInput);
+  task.addEventListener('keydown', onLaunchShortcut);
   name.addEventListener('input', onDraftInput);
+  name.addEventListener('keydown', onLaunchShortcut);
   project.addEventListener('input', onDraftInput);
+  project.addEventListener('keydown', onLaunchShortcut);
   agent.addEventListener('change', () => {
     stationRememberLaunchDraft();
     stationRenderSessionsDock();
@@ -14497,6 +14558,7 @@ function stationRenderSessionLaunchSection(parent) {
   if (effectiveAgent && effectiveAgent !== 'internal') {
     const command = stationDockInput(section, 'Binary', stationLaunchDraftValue('command', commandDefaultForNewSessionAgent(effectiveAgent)), { id: 'station-launch-command', placeholder: commandDefaultForNewSessionAgent(effectiveAgent) || 'agent binary' });
     command.addEventListener('input', onDraftInput);
+    command.addEventListener('keydown', onLaunchShortcut);
   }
   if (effectiveAgent === 'codex') {
     const managed = stationDockSelect(section, 'Managed context', stationLaunchDraftValue('managed', newSessionCodexManagedContext || 'vanilla'), [
@@ -15799,7 +15861,7 @@ function stationRenderSessionsDock(focusId = '') {
   stationDockActions(overview, [
     { label: 'Refresh', primary: true, onClick: async () => { await loadSessions({ force: true }); stationRenderSessionsDock(focusId); } },
     { label: 'Clear filters', onClick: () => { stationSessionDockFilter = ''; stationSessionDockSourceFilter = ''; stationSessionDockStatusFilter = ''; stationSessionDockProjectFilter = ''; stationRenderSessionsDock(focusId); } },
-    { label: 'New session', onClick: () => { if (typeof openNewSessionFromPrompt === 'function') openNewSessionFromPrompt(); else stationForceRouteTo('sessions', 'new'); } },
+    { label: 'New session', onClick: () => stationOpenSessionLaunchDock() },
     { label: 'Worktrees', onClick: () => stationRenderWorktreesDock() },
     stationDockRouteAction('Route sessions tab', 'sessions', 'recent'),
     stationDockRouteAction('Route deep search', 'sessions', 'deep', () => document.getElementById('sessions-deep-result-search')?.focus()),
@@ -16966,6 +17028,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
   stationRenderGeminiSessionSection(body, controls);
   stationRenderLaunchReadinessSection(body, {
     title: 'Next launch',
+    allowStart: true,
     rerender: () => stationRenderControlsDock('launch'),
   });
 
@@ -17144,11 +17207,7 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'new-session') {
-    if (typeof openNewSessionFromPrompt === 'function') {
-      openNewSessionFromPrompt();
-    } else {
-      stationForceRouteTo('sessions', 'new');
-    }
+    stationOpenSessionLaunchDock();
     return;
   }
   if (op === 'worktree') {
@@ -17300,11 +17359,7 @@ function stationHandleActivityAction(action) {
     return;
   }
   if (op === 'new-session') {
-    if (typeof openNewSessionFromPrompt === 'function') {
-      openNewSessionFromPrompt();
-    } else {
-      stationForceRouteTo('sessions', 'new');
-    }
+    stationOpenSessionLaunchDock();
     return;
   }
   if (op === 'host:all') {
@@ -17350,6 +17405,14 @@ function stationHandleControlsAction(action) {
   }
   if (op === 'recordings') {
     stationRenderControlsDock('recordings');
+    return;
+  }
+  if (op === 'launch-dock') {
+    stationOpenSessionLaunchDock();
+    return;
+  }
+  if (op === 'start-session') {
+    stationStartSessionFromDock();
     return;
   }
   if (op === 'debug-screen') {

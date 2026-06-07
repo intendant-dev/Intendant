@@ -3326,6 +3326,21 @@ impl StationInner {
             &nonempty(&controls.new_session_agent, "--"),
         );
         yy += 30.0;
+        let launch_actions = vec![
+            (
+                "start-session".to_string(),
+                "start session".to_string(),
+                104.0,
+                C_GREEN_CSS.to_string(),
+            ),
+            (
+                "launch-dock".to_string(),
+                "launch dock".to_string(),
+                94.0,
+                C_MAUVE_CSS.to_string(),
+            ),
+        ];
+        yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &launch_actions);
 
         self.section_title_color(x, yy, "Live surfaces", C_BLUE_CSS);
         yy += 22.0;
