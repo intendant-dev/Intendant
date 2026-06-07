@@ -13292,6 +13292,112 @@ function stationRenderContextReplaySection(parent) {
   ]);
 }
 
+function stationContextContinuitySession(ctx, managed) {
+  const candidates = [
+    ctx?.sessionId,
+    managed?.sessionId,
+    resolvePromptTargetSessionId?.(),
+    currentSessionFullId,
+    foregroundSessionFullId,
+  ].map(id => String(id || '').trim()).filter(Boolean);
+  const sessionId = candidates.find(id => id && id !== CONTEXT_GLOBAL_SESSION) || '';
+  const session = sessionId ? stationFindSessionById(sessionId) : null;
+  const meta = sessionConfigMetadata(session || sessionId);
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || '';
+  return {
+    sessionId,
+    session,
+    label: stationSessionShortLabel(sessionId) || stationSessionTask(session) || shortSessionId(sessionId) || '',
+    source: source || session?.source || '',
+    canFocus: !!sessionId && sessionWindows.has(sessionId),
+  };
+}
+
+function stationContextContinuityPayload(ctx) {
+  const managed = stationBuildManagedSummary(ctx);
+  const session = stationContextContinuitySession(ctx, managed);
+  const topLanes = (ctx.topCategories || []).slice(0, 4).map(item => ({
+    label: item.label || item.category || '',
+    tokens: item.value || 0,
+    count: item.count || 0,
+    part_id: item.partId || '',
+  }));
+  const topItems = (ctx.topItems || []).slice(0, 4).map(item => ({
+    id: item.id || '',
+    label: item.label || '',
+    value: item.value || '',
+    detail: item.detail || '',
+  }));
+  return {
+    generated_at: new Date().toISOString(),
+    context: {
+      available: !!ctx.available,
+      source: ctx.source || '',
+      session_id: ctx.sessionId || '',
+      turn: ctx.turn || '',
+      format: ctx.format || '',
+      used_tokens: ctx.tokens || 0,
+      effective_window: ctx.effectiveWindow || 0,
+      hard_window: ctx.hardWindow || 0,
+      item_count: ctx.itemCount || 0,
+      category_count: ctx.categoryCount || 0,
+      top_lanes: topLanes,
+      top_items: topItems,
+    },
+    managed: {
+      session_id: managed.sessionId || '',
+      mode: managed.mode || '',
+      status: managed.status || '',
+      readiness: stationOperationsManagedReadiness(managed),
+      rewind_only: !!managed.rewindOnly,
+      anchors: managed.anchors || 0,
+      records: managed.records || 0,
+      remaining_to_rewind_only: managed.remainingToRewindOnly,
+    },
+    session: {
+      id: session.sessionId || '',
+      label: session.label || '',
+      source: session.source || '',
+      can_focus: !!session.canFocus,
+    },
+  };
+}
+
+async function stationCopyContextContinuityPayload(ctx) {
+  await copyTextToClipboard(JSON.stringify(stationContextContinuityPayload(ctx), null, 2));
+  showControlToast?.('success', 'Context continuity JSON copied');
+}
+
+function stationSeedManagedFromContextContinuity() {
+  stationRenderManagedDock('rewind');
+  requestAnimationFrame(() => {
+    stationSeedManagedDraftFromContext();
+    document.getElementById('station-managed-reason')?.focus();
+  });
+}
+
+function stationRenderContextContinuitySection(parent, ctx) {
+  const managed = stationBuildManagedSummary(ctx);
+  const session = stationContextContinuitySession(ctx, managed);
+  const pressure = ctx.effectiveWindow
+    ? `${Math.round((ctx.tokens / ctx.effectiveWindow) * 100)}% effective`
+    : '--';
+  const section = stationDockSection(parent, 'Continuity');
+  stationDockRow(section, 'session', session.label || ctx.sessionId || managed.sessionId || '--');
+  stationDockRow(section, 'source', [ctx.source || 'context', session.source || ''].filter(Boolean).join(' / '));
+  stationDockRow(section, 'pressure', ctx.available ? `${stationCompactNumber(ctx.tokens)} / ${stationCompactNumber(ctx.effectiveWindow)} (${pressure})` : 'no snapshot');
+  stationDockRow(section, 'managed', `${managed.mode || 'vanilla'} / ${stationOperationsManagedReadiness(managed)} / ${managed.anchors || 0} anchors`);
+  stationDockRow(section, 'top lane', ctx.topCategories?.[0]?.label ? `${ctx.topCategories[0].label} ${stationCompactNumber(ctx.topCategories[0].value)}` : '--');
+  stationDockActions(section, [
+    { label: 'Managed', onClick: () => { if (managed.sessionId) stationSetManagedSession(managed.sessionId); stationRenderManagedDock(managed.rewindOnly ? 'rewind' : ''); } },
+    { label: 'Seed rewind', primary: !!ctx.available || managed.rewindOnly, disabled: !ctx.available, onClick: stationSeedManagedFromContextContinuity },
+    session.sessionId ? { label: 'Session', onClick: () => stationRenderSessionsDock(session.sessionId) } : null,
+    session.canFocus ? { label: 'Focus target', onClick: () => focusSessionWindow(session.sessionId) } : null,
+    { label: 'Operations', onClick: () => stationRenderControlsDock('overview') },
+    { label: 'Copy JSON', onClick: () => stationCopyContextContinuityPayload(ctx) },
+  ]);
+}
+
 function stationRenderContextDock(focusId = stationSelectedContextPart) {
   const ctx = stationBuildContextSummary();
   const body = stationDockBegin(
@@ -13319,6 +13425,7 @@ function stationRenderContextDock(focusId = stationSelectedContextPart) {
     stationDockRouteAction('Route context tab', 'activity', 'context'),
   ]);
 
+  stationRenderContextContinuitySection(body, ctx);
   stationRenderContextReplaySection(body);
 
   const selectedPart = stationSelectedContextPartDetail(focusId);
