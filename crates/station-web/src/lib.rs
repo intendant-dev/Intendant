@@ -1016,6 +1016,7 @@ impl StationInner {
         self.draw_tweaks_panel();
         self.draw_systems_panel();
         self.draw_command_lane(w, h);
+        self.draw_attention_strip(w, h);
         self.draw_corners(w, h);
         self.draw_readout(h);
         self.draw_compass(w, h);
@@ -1727,6 +1728,199 @@ impl StationInner {
     fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
         self.round_rect(x, y, w, 22.0, 4.0, "rgba(30,30,46,0.58)", color);
         self.text(&truncate(label, 42), x + 8.0, y + 14.0, 9.0, color, "bold");
+    }
+
+    fn draw_attention_strip(&mut self, w: f32, h: f32) {
+        if w < 900.0 || h < 520.0 {
+            return;
+        }
+        let mut items = self.attention_items();
+        if items.is_empty() {
+            return;
+        }
+        items.truncate(6);
+
+        let strip_w = 242.0;
+        let item_h = 48.0;
+        let gap = 6.0;
+        let strip_h =
+            33.0 + items.len() as f32 * item_h + (items.len().saturating_sub(1)) as f32 * gap;
+        let x = w - strip_w - 14.0;
+        let y = 52.0;
+        self.round_rect(
+            x,
+            y,
+            strip_w,
+            strip_h,
+            6.0,
+            "rgba(17,17,27,0.80)",
+            "rgba(249,226,175,0.56)",
+        );
+        self.text("ATTENTION", x + 12.0, y + 20.0, 10.0, C_YELLOW_CSS, "bold");
+        self.text(
+            "rendered queue",
+            x + strip_w - 93.0,
+            y + 20.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut yy = y + 33.0;
+        for item in items {
+            self.attention_item(x + 10.0, yy, strip_w - 20.0, item_h, item);
+            yy += item_h + gap;
+        }
+    }
+
+    fn attention_items(&self) -> Vec<AttentionItem> {
+        let mut items = Vec::new();
+        let controls = &self.snapshot.controls;
+        if let Some(agent) = self
+            .snapshot
+            .agents
+            .iter()
+            .find(|agent| agent.needs_approval)
+        {
+            items.push(AttentionItem {
+                title: "approval".to_string(),
+                detail: truncate(
+                    &nonempty(
+                        &agent.approval_command,
+                        &nonempty(&agent.task, "agent waiting"),
+                    ),
+                    46,
+                ),
+                color: C_YELLOW_CSS,
+                hit: HitAction::Select(agent.id.clone()),
+            });
+        }
+        if controls.shared_view_can_take_input {
+            items.push(AttentionItem {
+                title: "shared input".to_string(),
+                detail: truncate(&nonempty(&controls.shared_view_target, "shared view"), 46),
+                color: C_GREEN_CSS,
+                hit: HitAction::ControlsAction {
+                    action: "shared-view-take-input".to_string(),
+                },
+            });
+        } else if controls.shared_view_visible {
+            items.push(AttentionItem {
+                title: "shared view".to_string(),
+                detail: truncate(&nonempty(&controls.shared_view_target, "visible"), 46),
+                color: C_PEACH_CSS,
+                hit: HitAction::Select("system:peers".to_string()),
+            });
+        }
+        if controls.session_can_interrupt {
+            items.push(AttentionItem {
+                title: "active run".to_string(),
+                detail: truncate(
+                    &nonempty(&controls.session_selection, "foreground session"),
+                    46,
+                ),
+                color: C_TEAL_CSS,
+                hit: HitAction::Select("system:controls".to_string()),
+            });
+        } else if controls.session_active {
+            items.push(AttentionItem {
+                title: "session live".to_string(),
+                detail: truncate(
+                    &nonempty(&controls.session_selection, "foreground session"),
+                    46,
+                ),
+                color: C_BLUE_CSS,
+                hit: HitAction::Select("system:sessions".to_string()),
+            });
+        }
+        if controls.pending_attachments > 0 {
+            items.push(AttentionItem {
+                title: "attachments".to_string(),
+                detail: format!("{} pending", controls.pending_attachments),
+                color: C_MAUVE_CSS,
+                hit: HitAction::Select("system:controls".to_string()),
+            });
+        }
+        if self.snapshot.managed.rewind_only {
+            items.push(AttentionItem {
+                title: "rewind only".to_string(),
+                detail: format_token_ratio(
+                    self.snapshot.managed.used_tokens,
+                    self.snapshot.managed.effective_window,
+                ),
+                color: C_RED_CSS,
+                hit: HitAction::Select("system:managed".to_string()),
+            });
+        } else if percent(
+            self.snapshot.managed.used_tokens,
+            self.snapshot.managed.effective_window,
+        ) >= 0.78
+        {
+            items.push(AttentionItem {
+                title: "context pressure".to_string(),
+                detail: format_token_ratio(
+                    self.snapshot.managed.used_tokens,
+                    self.snapshot.managed.effective_window,
+                ),
+                color: C_YELLOW_CSS,
+                hit: HitAction::Select("system:managed".to_string()),
+            });
+        }
+        if self.snapshot.changes.count > 0 {
+            items.push(AttentionItem {
+                title: "working tree".to_string(),
+                detail: format!(
+                    "{} files +{} -{}",
+                    self.snapshot.changes.count,
+                    compact_number(self.snapshot.changes.total_added as f64),
+                    compact_number(self.snapshot.changes.total_removed as f64)
+                ),
+                color: C_YELLOW_CSS,
+                hit: HitAction::Select("system:changes".to_string()),
+            });
+        }
+        let context_pct = percent(
+            self.snapshot.context.tokens,
+            self.snapshot.context.effective_window,
+        );
+        if self.snapshot.context.available && context_pct >= 0.78 {
+            items.push(AttentionItem {
+                title: "context window".to_string(),
+                detail: format!(
+                    "{} / {}",
+                    compact_number(self.snapshot.context.tokens as f64),
+                    compact_number(self.snapshot.context.effective_window as f64)
+                ),
+                color: pressure_color(context_pct),
+                hit: HitAction::Select("system:context".to_string()),
+            });
+        }
+        items
+    }
+
+    fn attention_item(&mut self, x: f32, y: f32, w: f32, h: f32, item: AttentionItem) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            h,
+            5.0,
+            "rgba(24,24,37,0.78)",
+            "rgba(69,71,90,0.78)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(item.color));
+        self.ctx
+            .fill_rect((x + 8.0) as f64, (y + 9.0) as f64, 3.0, (h - 18.0) as f64);
+        self.text(&item.title, x + 18.0, y + 18.0, 9.0, item.color, "bold");
+        self.text(
+            &truncate(&item.detail, 38),
+            x + 18.0,
+            y + 36.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        self.hit_zones.push(HitZone::new(x, y, w, h, item.hit));
     }
 
     fn summary_card(
@@ -6297,6 +6491,13 @@ impl LaneAction {
             },
         }
     }
+}
+
+struct AttentionItem {
+    title: String,
+    detail: String,
+    color: &'static str,
+    hit: HitAction,
 }
 
 struct PointerDrag {
