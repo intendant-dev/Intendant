@@ -27,6 +27,7 @@ const DIAGNOSTIC_BODY_LIMIT = 360;
 const DIAGNOSTIC_SELECTOR_LIMIT = 220;
 const DIAGNOSTIC_LIST_LIMIT = 8;
 const DIAGNOSTIC_SELECTOR_MATCH_LIMIT = 8;
+const DIAGNOSTIC_SOURCE_SELECTOR_LIMIT = 8;
 const FORMATTED_DIAGNOSTIC_LINE_LIMIT = 520;
 const PROTECTED_DASHBOARD_PORT = 8765;
 
@@ -365,7 +366,7 @@ async function main() {
     };
     printResult(opts, result);
   } catch (error) {
-    const diagnostics = opts.diagnostics && harness
+    const diagnostics = shouldCollectFailureDiagnostics(opts, error) && harness
       ? await harness.failureDiagnostics(opts).catch((diagError) => ({
           error: diagError.message || String(diagError),
         }))
@@ -379,6 +380,7 @@ async function main() {
       websocket: harness && harness.websocketKind,
       logs: collectFailureLogs(opts.logLines, dashboard, harness),
       diagnostics,
+      diagnosticsAuto: Boolean(diagnostics && !opts.diagnostics),
     };
     printResult(opts, result);
     process.exitCode = 1;
@@ -977,7 +979,7 @@ class BrowserHarness {
   }
 
   async failureDiagnostics(opts) {
-    return this.evaluate(`(${pageDiagnosticsSource()})(${JSON.stringify(opts.selectors || [])})`);
+    return this.evaluate(`(${pageDiagnosticsSource()})(${JSON.stringify(failureDiagnosticSelectors(opts))})`);
   }
 
   async close() {
@@ -1603,7 +1605,17 @@ function pageDiagnosticsSource() {
           '',
         80,
       );
-      return compact(`${tag}${id}${classes}${text ? ` "${text}"` : ''}`, 120);
+      const state = [];
+      if (el.hidden) state.push('hidden');
+      if (el.getAttribute('aria-hidden')) state.push(`aria-hidden=${el.getAttribute('aria-hidden')}`);
+      if (el.getAttribute('aria-expanded')) state.push(`aria-expanded=${el.getAttribute('aria-expanded')}`);
+      if (el.disabled) state.push('disabled');
+      const data = Object.entries(el.dataset || {})
+        .slice(0, 3)
+        .map(([key, value]) => `${key}=${compact(value, 40)}`);
+      const stateText = state.length ? ` [${state.join(' ')}]` : '';
+      const dataText = data.length ? ` {${data.join(' ')}}` : '';
+      return compact(`${tag}${id}${classes}${stateText}${dataText}${text ? ` "${text}"` : ''}`, 140);
     };
     const describeMany = (query, limit) => Array.from(document.querySelectorAll(query))
       .slice(0, limit)
@@ -1648,13 +1660,13 @@ function compactResultForOutput(opts, result) {
     compact.diagnostics = compactDiagnostics(compact.diagnostics);
   }
   if (compact.status === 'fail') {
-    compact.next = validationFailureNextStep(opts);
+    compact.next = validationFailureNextStep(compact);
   }
   return compact;
 }
 
-function validationFailureNextStep(opts) {
-  if (opts.diagnostics) {
+function validationFailureNextStep(result) {
+  if (result.diagnostics) {
     return 'fix from these targeted facts or report partial validation; avoid further broad selector/source dumps';
   }
   return 'retry at most once with --diagnostics --json and a targeted selector/function';
@@ -1772,6 +1784,135 @@ function formatDiagnostics(diagnostics) {
     lines.push(`diagnostics selectorMatchesOmitted=${diagnostics.selectorMatchesOmitted}`);
   }
   return lines.map((line) => truncateMiddle(line, FORMATTED_DIAGNOSTIC_LINE_LIMIT));
+}
+
+function shouldCollectFailureDiagnostics(opts, error) {
+  if (opts.diagnostics) {
+    return true;
+  }
+  const reason = error && (error.message || String(error));
+  return isWaitFailureReason(reason);
+}
+
+function isWaitFailureReason(reason) {
+  return /^selector not found: /.test(String(reason || ''))
+    || /^wait-for-function did not become truthy/.test(String(reason || ''));
+}
+
+function failureDiagnosticSelectors(opts) {
+  const selectors = [];
+  for (const selector of opts.selectors || []) {
+    addDiagnosticSelector(selectors, selector);
+  }
+  for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
+    addDiagnosticSelector(selectors, selector);
+  }
+  return selectors.slice(0, DIAGNOSTIC_SOURCE_SELECTOR_LIMIT);
+}
+
+function addDiagnosticSelector(selectors, selector) {
+  const compact = String(selector || '').trim();
+  if (compact && !selectors.includes(compact)) {
+    selectors.push(compact);
+  }
+}
+
+function diagnosticSelectorsFromWaitFunctions(functions) {
+  const selectors = [];
+  for (const source of functions) {
+    for (const call of extractDomLookupLiteralArgs(source)) {
+      if (call.name === 'getElementById') {
+        addDiagnosticSelector(selectors, idDiagnosticSelector(call.value));
+      } else if (call.name === 'querySelector' || call.name === 'querySelectorAll') {
+        addDiagnosticSelector(selectors, call.value);
+      }
+      if (selectors.length >= DIAGNOSTIC_SOURCE_SELECTOR_LIMIT) {
+        return selectors;
+      }
+    }
+  }
+  return selectors;
+}
+
+function extractDomLookupLiteralArgs(source) {
+  const text = String(source || '');
+  const names = ['getElementById', 'querySelector', 'querySelectorAll'];
+  const calls = [];
+  for (const name of names) {
+    let searchFrom = 0;
+    while (searchFrom < text.length) {
+      const index = text.indexOf(name, searchFrom);
+      if (index === -1) {
+        break;
+      }
+      searchFrom = index + name.length;
+      if (isIdentifierChar(text[index - 1]) || isIdentifierChar(text[index + name.length])) {
+        continue;
+      }
+      let pos = index + name.length;
+      while (/\s/.test(text[pos] || '')) pos += 1;
+      if (text[pos] !== '(') {
+        continue;
+      }
+      pos += 1;
+      while (/\s/.test(text[pos] || '')) pos += 1;
+      const quoteChar = text[pos];
+      if (quoteChar !== '\'' && quoteChar !== '"' && quoteChar !== '`') {
+        continue;
+      }
+      const parsed = readJsStringLiteral(text, pos);
+      if (!parsed) {
+        continue;
+      }
+      if (quoteChar === '`' && parsed.raw.includes('${')) {
+        continue;
+      }
+      calls.push({ name, value: parsed.value, pos: index });
+      searchFrom = parsed.end;
+    }
+  }
+  calls.sort((a, b) => a.pos - b.pos);
+  return calls;
+}
+
+function readJsStringLiteral(text, start) {
+  const quoteChar = text[start];
+  let value = '';
+  let raw = '';
+  for (let i = start + 1; i < text.length; i += 1) {
+    const ch = text[i];
+    if (ch === quoteChar) {
+      return { value, raw, end: i + 1 };
+    }
+    if (ch === '\\') {
+      const next = text[i + 1];
+      if (next === undefined) {
+        return undefined;
+      }
+      raw += ch + next;
+      value += next;
+      i += 1;
+    } else {
+      raw += ch;
+      value += ch;
+    }
+  }
+  return undefined;
+}
+
+function isIdentifierChar(ch) {
+  return Boolean(ch && /[A-Za-z0-9_$]/.test(ch));
+}
+
+function idDiagnosticSelector(id) {
+  const text = String(id || '');
+  return /^[A-Za-z_][A-Za-z0-9_-]*$/.test(text)
+    ? `#${text}`
+    : `[id=${quoteCssString(text)}]`;
+}
+
+function quoteCssString(value) {
+  return `"${String(value).replace(/\\/g, '\\\\').replace(/"/g, '\\"')}"`;
 }
 
 function quote(value) {
@@ -1916,6 +2057,32 @@ async function runSelfTest() {
   );
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
   assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
+  assert.ok(pageDiagnosticsSource().includes('dataset'));
+  assert.strictEqual(shouldCollectFailureDiagnostics({ diagnostics: true }, new Error('boom')), true);
+  assert.strictEqual(
+    shouldCollectFailureDiagnostics({ diagnostics: false }, new Error('wait-for-function did not become truthy')),
+    true,
+  );
+  assert.strictEqual(
+    shouldCollectFailureDiagnostics({ diagnostics: false }, new Error('navigation failed: nope')),
+    false,
+  );
+  assert.deepStrictEqual(
+    failureDiagnosticSelectors({
+      selectors: ['#station-status'],
+      functions: [
+        '() => document.getElementById("station-dock")?.textContent.includes("Controls") && document.querySelector("[data-station-dock-nav=\'system:controls\']")',
+      ],
+    }),
+    ['#station-status', '#station-dock', '[data-station-dock-nav=\'system:controls\']'],
+  );
+  assert.deepStrictEqual(
+    failureDiagnosticSelectors({
+      selectors: [],
+      functions: ['() => document.getElementById("has:colon")'],
+    }),
+    ['[id="has:colon"]'],
+  );
   assert.deepStrictEqual(formatDiagnostics(undefined), []);
   assert.deepStrictEqual(formatDiagnostics({ error: 'boom' }), ['diagnostics error="boom"']);
   assert.ok(
@@ -1956,6 +2123,22 @@ async function runSelfTest() {
   );
   assert.strictEqual(compactedFailure.diagnostics.selectorMatchesOmitted, 2);
   assert.ok(compactedFailure.diagnostics.selectorMatches[0].selector.includes('chars omitted'));
+  const compactedAutoDiagnosticFailure = compactResultForOutput(
+    {},
+    {
+      status: 'fail',
+      reason: 'wait-for-function did not become truthy',
+      diagnosticsAuto: true,
+      diagnostics: {
+        readyState: 'complete',
+        title: 'Dashboard',
+        location: 'http://127.0.0.1:1234/',
+        selectorMatches: [{ selector: '#station-dock', count: 1, first: 'aside#station-dock.hidden {kind=controls}' }],
+      },
+    },
+  );
+  assert.strictEqual(compactedAutoDiagnosticFailure.diagnosticsAuto, true);
+  assert.ok(compactedAutoDiagnosticFailure.next.includes('avoid further broad selector/source dumps'));
   const log = new BoundedLog(2);
   log.push('a', 'first');
   log.push('b', 'second');
