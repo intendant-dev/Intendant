@@ -2543,6 +2543,21 @@ fn context_rewind_anchor_restore_usage_for_headroom(
     Some(("estimated", prefix_tokens, rewind_only_limit))
 }
 
+fn context_rewind_anchor_position_recovery_eligible(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    position: external_agent::RollbackAnchorPosition,
+    latest_outcome: Option<ContextRewindBackendUsageAtLine>,
+) -> Option<bool> {
+    let (_, used_tokens, rewind_only_limit) =
+        context_rewind_anchor_restore_usage_for_headroom(anchor, position)?;
+    if !context_rewind_anchor_has_recovery_headroom(used_tokens, rewind_only_limit) {
+        return Some(false);
+    }
+    Some(latest_outcome.is_none_or(|outcome| {
+        context_rewind_anchor_has_recovery_headroom(outcome.used_tokens, outcome.rewind_only_limit)
+    }))
+}
+
 fn validate_context_rewind_anchor_restore_headroom(
     source_rollout_path: &Path,
     requested_item_id: &str,
@@ -2584,7 +2599,8 @@ fn validate_context_rewind_anchor_restore_headroom(
                 return Ok(());
             }
             return Err(format!(
-                "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: a prior rewind to {} item was followed by {} tokens against the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose recovery_eligible field is true.",
+                "rewind anchor item_id `{requested_item_id}` is not a valid recovery target for position `{}`: a prior rewind to {} item was followed by {} tokens against the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose positions includes the requested position; audit rows may expose recovery_eligible_positions.",
+                position.as_str(),
                 position.as_str(),
                 outcome.used_tokens,
                 outcome.rewind_only_limit
@@ -2594,7 +2610,8 @@ fn validate_context_rewind_anchor_restore_headroom(
     }
 
     Err(format!(
-        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target: restoring {} item would keep {} {} tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose recovery_eligible field is true.",
+        "rewind anchor item_id `{requested_item_id}` is not a valid recovery target for position `{}`: restoring {} item would keep {} {} tokens before the injected primer, leaving less than {} normal-tool headroom under the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose positions includes the requested position; audit rows may expose recovery_eligible_positions.",
+        position.as_str(),
         position.as_str(),
         usage_kind,
         used_tokens,
@@ -2958,6 +2975,8 @@ struct ContextRewindAnchorCatalogEntry {
     latest_rewind_limit_after_anchor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_eligible: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    recovery_eligible_positions: Option<Vec<&'static str>>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3088,6 +3107,19 @@ fn list_context_rewind_anchors_from_rollout(
     }
     if recovery_candidates_only {
         anchors.retain(|anchor| anchor.recovery_eligible != Some(false));
+        for anchor in &mut anchors {
+            if let Some(positions) = anchor
+                .recovery_eligible_positions
+                .as_ref()
+                .filter(|positions| !positions.is_empty())
+            {
+                anchor.positions = positions.clone();
+                if !anchor.positions.contains(&anchor.position_hint) {
+                    anchor.position_hint = anchor.positions[0];
+                }
+                anchor.recovery_eligible_positions = None;
+            }
+        }
     }
     if reverse {
         anchors.reverse();
@@ -3119,9 +3151,9 @@ fn list_context_rewind_anchors_from_rollout(
     }
     .to_string();
     let usage = if include_pruning_estimates {
-        "Use item_id exactly in rewind_context.anchor.item_id. Model-facing catalogs hide non-recovery and management anchors by default. Never pass recovery_eligible=false audit rows to rewind_context. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too. approx_pruned_tokens_after/before estimate how much recent rollout context that position discards."
+        "Use exact item_id in rewind_context.anchor.item_id. Default catalogs hide non-recovery/management anchors and narrow positions to valid values; use position_hint or positions. include_non_recovery=true is audit-only. Inspect ambiguous rows. after keeps the item/group; before drops it too. approx_pruned_tokens_after/before estimate discarded context."
     } else {
-        "Use item_id exactly in rewind_context.anchor.item_id. Model-facing catalogs hide non-recovery and management anchors by default. Never pass recovery_eligible=false audit rows to rewind_context. Inspect ambiguous candidates. position=\"after\" keeps the item/group; position=\"before\" drops it too."
+        "Use exact item_id in rewind_context.anchor.item_id. Default catalogs hide non-recovery/management anchors and narrow positions to valid values; use position_hint or positions. include_non_recovery=true is audit-only. Inspect ambiguous rows. after keeps the item/group; before drops it too."
     };
     let catalog = ContextRewindAnchorCatalog {
         rollout_path: source_rollout_path.display().to_string(),
@@ -3334,6 +3366,7 @@ fn scan_context_rewind_anchor_catalog(
                 latest_rewind_usage_after_anchor: None,
                 latest_rewind_limit_after_anchor: None,
                 recovery_eligible: None,
+                recovery_eligible_positions: None,
             });
         }
     }
@@ -3367,11 +3400,6 @@ fn scan_context_rewind_anchor_catalog(
             .is_some_and(|prefix_tokens| {
                 context_rewind_anchor_has_recovery_headroom(prefix_tokens, usage.rewind_only_limit)
             });
-        let restore_prefix_before_has_headroom = anchor
-            .prefix_estimated_tokens_before_anchor
-            .is_some_and(|prefix_tokens| {
-                context_rewind_anchor_has_recovery_headroom(prefix_tokens, usage.rewind_only_limit)
-            });
         if !backend_has_headroom && !restore_prefix_after_has_headroom {
             anchor.prefix_tokens_after = anchor.prefix_estimated_tokens_after_anchor;
         }
@@ -3393,22 +3421,26 @@ fn scan_context_rewind_anchor_catalog(
             anchor.latest_rewind_usage_after_anchor = Some(outcome.used_tokens);
             anchor.latest_rewind_limit_after_anchor = Some(outcome.rewind_only_limit);
         }
-        let latest_rewind_before_has_headroom = latest_rewind_outcomes
+        let latest_rewind_before_outcome = latest_rewind_outcomes
             .get(&context_rewind_anchor_outcome_key(
                 &anchor.item_id,
                 external_agent::RollbackAnchorPosition::Before,
             ))
-            .is_none_or(|outcome| {
-                context_rewind_anchor_has_recovery_headroom(
-                    outcome.used_tokens,
-                    outcome.rewind_only_limit,
-                )
-            });
-        let after_recovery_eligible = backend_has_headroom && latest_rewind_after_has_headroom;
-        let before_recovery_eligible = !after_recovery_eligible
-            && !restore_prefix_after_has_headroom
-            && restore_prefix_before_has_headroom
-            && latest_rewind_before_has_headroom;
+            .copied();
+        let after_recovery_eligible = context_rewind_anchor_position_recovery_eligible(
+            anchor,
+            external_agent::RollbackAnchorPosition::After,
+            latest_rewind_after_outcome,
+        )
+        .unwrap_or(false);
+        let before_recovery_eligible = context_rewind_anchor_position_recovery_eligible(
+            anchor,
+            external_agent::RollbackAnchorPosition::Before,
+            latest_rewind_before_outcome,
+        )
+        .unwrap_or(false)
+            && !after_recovery_eligible
+            && !restore_prefix_after_has_headroom;
         anchor.position_hint = if after_recovery_eligible {
             "after"
         } else if before_recovery_eligible {
@@ -3417,6 +3449,15 @@ fn scan_context_rewind_anchor_catalog(
             "after"
         };
         anchor.recovery_eligible = Some(after_recovery_eligible || before_recovery_eligible);
+        let mut recovery_eligible_positions = Vec::new();
+        if before_recovery_eligible {
+            recovery_eligible_positions.push("before");
+        }
+        if after_recovery_eligible {
+            recovery_eligible_positions.push("after");
+        }
+        anchor.recovery_eligible_positions =
+            (!recovery_eligible_positions.is_empty()).then_some(recovery_eligible_positions);
     }
 
     Ok(anchors)
@@ -4507,11 +4548,7 @@ async fn refresh_external_context_usage_snapshot(
 fn managed_context_rewind_only_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
-    let pressure = managed_context_recovery_pressure(snapshot)?;
-    if pressure.used_tokens < pressure.rewind_only_limit {
-        return None;
-    }
-    Some(pressure)
+    managed_context_recovery_pressure(snapshot)
 }
 
 fn managed_context_recovery_pressure(
@@ -4523,12 +4560,13 @@ fn managed_context_recovery_pressure(
         return None;
     }
     let hard_context_window = snapshot.hard_context_window;
+    if used_tokens < rewind_only_limit {
+        return None;
+    }
     let status = if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
         "critical"
-    } else if used_tokens >= rewind_only_limit {
-        "high"
     } else {
-        "recovery_required"
+        "high"
     };
     Some(ManagedContextRewindOnlyPressure {
         used_tokens,
@@ -4574,7 +4612,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -4593,7 +4631,7 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, anchor.position=\"after\" unless you intentionally want to discard the anchored item too, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -10220,7 +10258,7 @@ mod tests {
     }
 
     #[test]
-    fn managed_context_recovery_pressure_includes_below_soft_recovery_required() {
+    fn managed_context_recovery_pressure_excludes_below_soft_watch_state() {
         let snapshot = external_agent::AgentContextSnapshot {
             source: "codex".to_string(),
             label: "Codex resolved request payload".to_string(),
@@ -10228,7 +10266,7 @@ mod tests {
             request_index: Some(1),
             rollout_path: None,
             format: "openai.responses.resolved_request.v1".to_string(),
-            token_count: Some(253_741),
+            token_count: Some(220_385),
             token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
             context_window: Some(258_400),
             hard_context_window: Some(272_000),
@@ -10236,15 +10274,7 @@ mod tests {
             raw: serde_json::json!({}),
         };
 
-        assert_eq!(
-            managed_context_recovery_pressure(&snapshot),
-            Some(ManagedContextRewindOnlyPressure {
-                used_tokens: 253_741,
-                rewind_only_limit: 258_400,
-                hard_context_window: Some(272_000),
-                status: "recovery_required",
-            })
-        );
+        assert_eq!(managed_context_recovery_pressure(&snapshot), None);
         assert_eq!(managed_context_rewind_only_pressure(&snapshot), None);
     }
 
@@ -11601,6 +11631,19 @@ mod tests {
         assert_eq!(anchor["item_id"].as_str(), Some("call_noisy_build"));
         assert_eq!(anchor["position_hint"].as_str(), Some("before"));
         assert_eq!(anchor["recovery_eligible"].as_bool(), Some(true));
+        let positions = anchor["positions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|position| position.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(positions, vec!["before"]);
+        assert!(anchor["recovery_eligible_positions"].is_null());
+        for position in positions {
+            let position = external_agent::RollbackAnchorPosition::from_str(position).unwrap();
+            validate_context_rewind_anchor_restore_headroom(&path, "call_noisy_build", position)
+                .expect("listed recovery position should validate");
+        }
         assert!(
             anchor["prefix_tokens_after"]
                 .as_u64()

@@ -186,7 +186,10 @@ features they lack.
   current rollout before mutating the Codex thread.
   When backend-reported pressure is at or above the rewind-only threshold,
   `list_rewind_anchors` defaults to recovery candidates: anchors whose nearest
-  following backend token report is below that threshold. Passing
+  following backend token report is below that threshold with enough normal-tool
+  resume headroom. The default recovery catalog narrows `positions` to accepted
+  `rewind_context` values; audit/inspect rows may also expose per-position
+  eligibility as `recovery_eligible_positions`. Passing
   `include_non_recovery=true` is an audit escape hatch, not the normal recovery
   path. A successful `rewind_context` only proves the lineage mutation was
   applied; Intendant and Codex keep normal tools hidden until a later backend

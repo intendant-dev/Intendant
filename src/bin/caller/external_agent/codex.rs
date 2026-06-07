@@ -62,12 +62,12 @@ Keep the live transcript informationally dense:
 - While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors, such as "No output yet", "Still active", or "Polling". Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After noisy or unexpectedly large tool output, failed exploration, broad research, or finishing a coherent subtask, crystallize durable facts and use Intendant managed-context tools before continuing broad ordinary-tool work.
+- Backend context status `watch`, or usage above the recommended density threshold but below `rewind_only_limit`, is not recovery. Normal tools remain allowed; rewind only if it materially improves density.
 - Use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
-- Do not use recovery_candidates_only=false to look for newer rewind targets. Non-recovery rows require include_non_recovery=true, are diagnostic-only, and must not be passed to rewind_context when recovery_eligible=false.
+- Do not use recovery_candidates_only=false to look for newer rewind targets. Non-recovery rows require include_non_recovery=true, are diagnostic-only, and must not be passed to rewind_context when recovery_eligible=false or the requested position is not present in the default row's positions.
 - The primer must preserve user constraints, current objective, completed work, changed files, important command results, remaining decisions, and the substance of any prior managed primer that would otherwise be overwritten.
 - Never synthesize anchor ids, never use anchors from failed examples, and never target managed-context maintenance calls unless explicitly auditing those internals."#;
 
-const GENERATION_STARVATION_NEAR_LIMIT_PCT: f64 = 85.0;
 const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
 const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
 pub(crate) const CODEX_FAST_SERVICE_TIER: &str = "priority";
@@ -4941,15 +4941,6 @@ fn codex_error_near_context_limit(
     code: Option<&str>,
     latest_usage: Option<&AgentUsageSnapshot>,
 ) -> bool {
-    let near_limit = latest_usage.is_some_and(|usage| {
-        usage.context_window > 0
-            && (usage.tokens_used as f64 / usage.context_window as f64 * 100.0)
-                >= GENERATION_STARVATION_NEAR_LIMIT_PCT
-    });
-    if !near_limit {
-        return false;
-    }
-
     let mut text = message.to_ascii_lowercase();
     if let Some(details) = details {
         text.push('\n');
@@ -4962,12 +4953,22 @@ fn codex_error_near_context_limit(
         || text.contains("context length")
         || text.contains("maximum context")
         || matches!(code, Some("contextWindowExceeded"));
+    if context_limit {
+        return true;
+    }
+
+    let at_reported_limit = latest_usage
+        .is_some_and(|usage| usage.context_window > 0 && usage.tokens_used >= usage.context_window);
+    if !at_reported_limit {
+        return false;
+    }
+
     let terminal_stream_failure = matches!(
         code,
         Some("responseStreamDisconnected" | "responseTooManyFailedAttempts")
     );
 
-    incomplete || context_limit || terminal_stream_failure
+    incomplete || terminal_stream_failure
 }
 
 fn is_codex_noop_tool_wait_message(text: &str) -> bool {
@@ -8867,17 +8868,17 @@ error: build failed
     }
 
     #[test]
-    fn translate_incomplete_error_near_context_limit_marks_generation_starvation() {
+    fn translate_incomplete_error_at_rewind_only_limit_marks_generation_starvation() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = CodexNotificationState {
             latest_usage: Some(AgentUsageSnapshot {
                 provider: "openai".to_string(),
                 model: "gpt-5.2-codex".to_string(),
-                tokens_used: 91_000,
+                tokens_used: 100_000,
                 context_window: 100_000,
                 hard_context_window: Some(120_000),
-                usage_pct: 91.0,
-                prompt_tokens: 88_000,
+                usage_pct: 100.0,
+                prompt_tokens: 97_000,
                 completion_tokens: 3_000,
                 cached_tokens: 0,
             }),
@@ -8916,6 +8917,49 @@ error: build failed
                     !hint.contains("item-"),
                     "hint should not prescribe a stale anchor"
                 );
+            }
+            other => panic!("expected BackendError, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_incomplete_error_above_recommended_below_rewind_only_allows_normal_recovery() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState {
+            latest_usage: Some(AgentUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 86_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 86.0,
+                prompt_tokens: 83_000,
+                completion_tokens: 3_000,
+                cached_tokens: 0,
+            }),
+            ..Default::default()
+        };
+        let params = serde_json::json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "willRetry": false,
+            "error": {
+                "message": "stream disconnected before completion: Incomplete response returned, reason: max_output_tokens",
+                "codexErrorInfo": "other",
+                "additionalDetails": "response.incomplete had incomplete_details.reason=max_output_tokens"
+            }
+        });
+
+        translate_notification_with_state("error", &params, &tx, &mut state);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::BackendError {
+                likely_generation_starvation,
+                recovery_hint,
+                ..
+            } => {
+                assert!(!likely_generation_starvation);
+                assert!(recovery_hint.is_none());
             }
             other => panic!("expected BackendError, got {:?}", other),
         }
