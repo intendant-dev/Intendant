@@ -386,6 +386,8 @@ impl SessionSupervisor {
                 project_root,
                 agent,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
                 codex_service_tier,
@@ -419,6 +421,8 @@ impl SessionSupervisor {
                                 project_root,
                                 agent,
                                 agent_command,
+                                codex_sandbox,
+                                codex_approval_policy,
                                 codex_managed_context,
                                 codex_context_archive,
                                 orchestrate,
@@ -440,6 +444,8 @@ impl SessionSupervisor {
                         || display_target.is_some()
                         || agent.is_some()
                         || agent_command.is_some()
+                        || codex_sandbox.is_some()
+                        || codex_approval_policy.is_some()
                         || codex_managed_context.is_some()
                         || codex_context_archive.is_some()
                         || codex_service_tier.is_some()
@@ -459,6 +465,8 @@ impl SessionSupervisor {
                     project_root,
                     agent,
                     agent_command,
+                    codex_sandbox,
+                    codex_approval_policy,
                     codex_managed_context,
                     codex_context_archive,
                     orchestrate,
@@ -518,6 +526,8 @@ impl SessionSupervisor {
                                 None,
                                 None,
                                 None,
+                                None,
+                                None,
                                 orchestrate,
                                 direct,
                                 Vec::new(),
@@ -550,6 +560,8 @@ impl SessionSupervisor {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                     orchestrate,
                     direct,
                     reference_frame_ids,
@@ -568,6 +580,8 @@ impl SessionSupervisor {
                 direct,
                 attachments,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
             } => {
@@ -580,6 +594,8 @@ impl SessionSupervisor {
                     direct,
                     attachments,
                     agent_command,
+                    codex_sandbox,
+                    codex_approval_policy,
                     codex_managed_context,
                     codex_context_archive,
                     false,
@@ -599,6 +615,8 @@ impl SessionSupervisor {
                 direct,
                 attachments,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
             } => {
@@ -611,6 +629,8 @@ impl SessionSupervisor {
                     direct,
                     attachments,
                     agent_command,
+                    codex_sandbox,
+                    codex_approval_policy,
                     codex_managed_context,
                     codex_context_archive,
                 )
@@ -708,6 +728,8 @@ impl SessionSupervisor {
                 backend_session_id,
                 intendant_session_id,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
             } => {
@@ -717,6 +739,8 @@ impl SessionSupervisor {
                     backend_session_id,
                     intendant_session_id,
                     agent_command,
+                    codex_sandbox,
+                    codex_approval_policy,
                     codex_managed_context,
                     codex_context_archive,
                 )
@@ -752,6 +776,8 @@ impl SessionSupervisor {
         project_root: Option<String>,
         agent: Option<String>,
         agent_command: Option<String>,
+        codex_sandbox: Option<String>,
+        codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
         codex_context_archive: Option<String>,
         orchestrate: Option<bool>,
@@ -868,6 +894,30 @@ impl SessionSupervisor {
                 return;
             };
             apply_session_agent_command(&mut project, backend, command);
+        }
+        if let Some(mode) = normalize_session_codex_sandbox(codex_sandbox.as_deref()) {
+            let Some(ref backend) = backend else {
+                self.loop_error("Session create failed: codex_sandbox requires Codex".to_string());
+                return;
+            };
+            if let Err(e) = apply_session_codex_sandbox(&mut project, backend, mode) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
+        }
+        if let Some(policy) =
+            normalize_session_codex_approval_policy(codex_approval_policy.as_deref())
+        {
+            let Some(ref backend) = backend else {
+                self.loop_error(
+                    "Session create failed: codex_approval_policy requires Codex".to_string(),
+                );
+                return;
+            };
+            if let Err(e) = apply_session_codex_approval_policy(&mut project, backend, policy) {
+                self.loop_error(format!("Session create failed: {}", e));
+                return;
+            }
         }
         if let Some(mode) =
             normalize_session_codex_managed_context(codex_managed_context.as_deref())
@@ -991,6 +1041,8 @@ impl SessionSupervisor {
         direct: Option<bool>,
         attachments: Vec<String>,
         agent_command: Option<String>,
+        codex_sandbox: Option<String>,
+        codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
         codex_context_archive: Option<String>,
         force_new: bool,
@@ -1029,6 +1081,8 @@ impl SessionSupervisor {
             let mut config = crate::session_config::from_wire(
                 Some(backend.as_short_str()),
                 agent_command.as_deref(),
+                codex_sandbox.as_deref(),
+                codex_approval_policy.as_deref(),
                 codex_managed_context.as_deref(),
                 codex_context_archive.as_deref(),
                 None,
@@ -1786,6 +1840,8 @@ impl SessionSupervisor {
                     None,
                     None,
                     None,
+                    None,
+                    None,
                     false,
                 )
                 .await;
@@ -2073,6 +2129,8 @@ impl SessionSupervisor {
         direct: Option<bool>,
         attachments: Vec<String>,
         agent_command: Option<String>,
+        codex_sandbox: Option<String>,
+        codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
         codex_context_archive: Option<String>,
     ) {
@@ -2118,6 +2176,8 @@ impl SessionSupervisor {
             direct,
             attachments,
             agent_command,
+            codex_sandbox,
+            codex_approval_policy,
             codex_managed_context,
             codex_context_archive,
             true,
@@ -2431,6 +2491,8 @@ impl SessionSupervisor {
         backend_session_id: Option<String>,
         intendant_session_id: Option<String>,
         agent_command: Option<String>,
+        codex_sandbox: Option<String>,
+        codex_approval_policy: Option<String>,
         codex_managed_context: Option<String>,
         codex_context_archive: Option<String>,
     ) {
@@ -2471,6 +2533,8 @@ impl SessionSupervisor {
         let mut config = crate::session_config::from_wire(
             Some(backend.as_short_str()),
             agent_command.as_deref(),
+            codex_sandbox.as_deref(),
+            codex_approval_policy.as_deref(),
             codex_managed_context.as_deref(),
             codex_context_archive.as_deref(),
             None,
@@ -3109,6 +3173,14 @@ fn normalize_session_codex_managed_context(mode: Option<&str>) -> Option<String>
     mode.map(crate::project::normalize_codex_managed_context)
 }
 
+fn normalize_session_codex_sandbox(mode: Option<&str>) -> Option<String> {
+    mode.map(crate::project::normalize_sandbox_mode)
+}
+
+fn normalize_session_codex_approval_policy(policy: Option<&str>) -> Option<String> {
+    policy.map(crate::project::normalize_approval_policy)
+}
+
 fn normalize_session_codex_context_archive(mode: Option<&str>) -> Option<String> {
     mode.map(crate::project::normalize_codex_context_archive)
 }
@@ -3154,6 +3226,35 @@ fn apply_session_codex_managed_context(
             Ok(())
         }
         _ => Err("codex_managed_context requires Codex".to_string()),
+    }
+}
+
+fn apply_session_codex_sandbox(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    mode: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            project.config.agent.codex.sandbox = crate::project::normalize_sandbox_mode(&mode);
+            Ok(())
+        }
+        _ => Err("codex_sandbox requires Codex".to_string()),
+    }
+}
+
+fn apply_session_codex_approval_policy(
+    project: &mut Project,
+    backend: &external_agent::AgentBackend,
+    policy: String,
+) -> Result<(), String> {
+    match backend {
+        external_agent::AgentBackend::Codex => {
+            project.config.agent.codex.approval_policy =
+                crate::project::normalize_approval_policy(&policy);
+            Ok(())
+        }
+        _ => Err("codex_approval_policy requires Codex".to_string()),
     }
 }
 
@@ -3909,6 +4010,8 @@ mod tests {
                 None,
                 None,
                 None,
+                None,
+                None,
                 false,
             )
             .await;
@@ -3958,6 +4061,8 @@ mod tests {
                 None,
                 Some(true),
                 Vec::new(),
+                None,
+                None,
                 None,
                 None,
                 None,
@@ -4049,6 +4154,8 @@ mod tests {
                 Some("read attachment".to_string()),
                 Some(true),
                 vec![format!("upload:{}", upload.id)],
+                None,
+                None,
                 None,
                 None,
                 None,

@@ -9637,6 +9637,23 @@ body.display-fullscreen-open {
                       <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
                     </div>
                   </div>
+                  <label class="sessions-new-session-field" for="new-session-codex-sandbox">
+                    Sandbox
+                    <select id="new-session-codex-sandbox" disabled>
+                      <option value="workspace-write">workspace-write</option>
+                      <option value="danger-full-access">danger-full-access</option>
+                      <option value="read-only">read-only</option>
+                    </select>
+                  </label>
+                  <label class="sessions-new-session-field" for="new-session-codex-approval-policy">
+                    Approval
+                    <select id="new-session-codex-approval-policy" disabled>
+                      <option value="on-request">on-request</option>
+                      <option value="never">never</option>
+                      <option value="untrusted">untrusted</option>
+                      <option value="on-failure">on-failure</option>
+                    </select>
+                  </label>
                   <label class="sessions-new-session-field" for="new-session-codex-managed-context">
                     Managed context
                     <select id="new-session-codex-managed-context" class="sessions-agent-managed-context-select" disabled>
@@ -10152,6 +10169,23 @@ body.display-fullscreen-open {
       <select id="session-config-managed-context">
         <option value="vanilla">vanilla</option>
         <option value="managed">managed</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-sandbox-row">
+      <label for="session-config-sandbox">Sandbox</label>
+      <select id="session-config-sandbox">
+        <option value="workspace-write">workspace-write</option>
+        <option value="danger-full-access">danger-full-access</option>
+        <option value="read-only">read-only</option>
+      </select>
+    </div>
+    <div class="session-config-row" id="session-config-approval-row">
+      <label for="session-config-approval-policy">Approval</label>
+      <select id="session-config-approval-policy">
+        <option value="on-request">on-request</option>
+        <option value="never">never</option>
+        <option value="untrusted">untrusted</option>
+        <option value="on-failure">on-failure</option>
       </select>
     </div>
     <div class="session-config-row" id="session-config-archive-row">
@@ -14600,6 +14634,10 @@ function stationRememberLaunchDraft() {
   if (command) stationLaunchDraft.command = command.value || '';
   const managed = document.getElementById('station-launch-managed');
   if (managed) stationLaunchDraft.managed = managed.value || '';
+  const sandbox = document.getElementById('station-launch-sandbox');
+  if (sandbox) stationLaunchDraft.sandbox = sandbox.value || '';
+  const approval = document.getElementById('station-launch-approval');
+  if (approval) stationLaunchDraft.approval = approval.value || '';
   const archive = document.getElementById('station-launch-archive');
   if (archive) stationLaunchDraft.archive = archive.value || '';
   const fast = document.getElementById('station-launch-fast');
@@ -14679,6 +14717,8 @@ function stationBuildLaunchReadiness() {
     notice: stationLaunchNoticeText(),
     codex,
     managed: codex ? (stationLaunchDraftValue('managed', newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla')) : '',
+    sandbox: codex ? normalizeCodexSandbox(stationLaunchDraftValue('sandbox', newSessionCodexSandbox || controlCodexConfig.sandbox || 'workspace-write')) : '',
+    approval: codex ? normalizeCodexApprovalPolicy(stationLaunchDraftValue('approval', newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy || 'on-request')) : '',
     archive: codex ? normalizeContextArchiveMode(stationLaunchDraftValue('archive', newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary')) : '',
     serviceTier: codex
       ? (stationLaunchDraft.fast ? 'priority' : normalizeCodexServiceTier(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '') || 'default')
@@ -14694,6 +14734,8 @@ function stationClearLaunchDraft() {
     agent: '',
     command: '',
     managed: '',
+    sandbox: '',
+    approval: '',
     archive: '',
     fast: false,
     direct: false,
@@ -14712,6 +14754,8 @@ function stationRenderLaunchReadinessSection(parent, opts = {}) {
   if (readiness.attachments) stationDockRow(section, 'attachments', String(readiness.attachments));
   if (readiness.codex) {
     stationDockRow(section, 'managed', readiness.managed || '--');
+    stationDockRow(section, 'sandbox', readiness.sandbox || '--');
+    stationDockRow(section, 'approval', readiness.approval || '--');
     stationDockRow(section, 'archive', readiness.archive || '--');
     stationDockRow(section, 'tier', readiness.serviceTier || 'default');
   }
@@ -14744,6 +14788,8 @@ function stationRenderLaunchReadinessSection(parent, opts = {}) {
 
 function stationApplyCodexLaunchDefaultsToDraft() {
   stationLaunchDraft.managed = newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla';
+  stationLaunchDraft.sandbox = newSessionCodexSandbox || controlCodexConfig.sandbox || 'workspace-write';
+  stationLaunchDraft.approval = newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy || 'on-request';
   stationLaunchDraft.archive = newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary';
   stationLaunchDraft.fast = codexServiceTierIsFast(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '');
 }
@@ -14846,6 +14892,8 @@ async function stationStartSessionFromDock() {
     if (command) msg.agent_command = command;
   }
   if (stationEffectiveLaunchAgent() === 'codex') {
+    msg.codex_sandbox = normalizeCodexSandbox(stationLaunchDraft.sandbox || newSessionCodexSandbox || controlCodexConfig.sandbox);
+    msg.codex_approval_policy = normalizeCodexApprovalPolicy(stationLaunchDraft.approval || newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy);
     msg.codex_managed_context = stationLaunchDraft.managed === 'managed' ? 'managed' : 'vanilla';
     msg.codex_context_archive = normalizeContextArchiveMode(stationLaunchDraft.archive || newSessionCodexContextArchive);
     if (stationLaunchDraft.fast) {
@@ -14910,6 +14958,17 @@ function stationRenderSessionLaunchSection(parent) {
       ['vanilla', 'vanilla'],
       ['managed', 'managed'],
     ], { id: 'station-launch-managed' });
+    const sandbox = stationDockSelect(section, 'Sandbox', normalizeCodexSandbox(stationLaunchDraftValue('sandbox', newSessionCodexSandbox || 'workspace-write')), [
+      ['workspace-write', 'workspace-write'],
+      ['danger-full-access', 'danger-full-access'],
+      ['read-only', 'read-only'],
+    ], { id: 'station-launch-sandbox' });
+    const approval = stationDockSelect(section, 'Approval', normalizeCodexApprovalPolicy(stationLaunchDraftValue('approval', newSessionCodexApprovalPolicy || 'on-request')), [
+      ['on-request', 'on-request'],
+      ['never', 'never'],
+      ['untrusted', 'untrusted'],
+      ['on-failure', 'on-failure'],
+    ], { id: 'station-launch-approval' });
     const archive = stationDockSelect(section, 'Context replay', stationLaunchDraftValue('archive', newSessionCodexContextArchive || 'summary'), [
       ['summary', 'summary'],
       ['exact', 'exact'],
@@ -14917,6 +14976,8 @@ function stationRenderSessionLaunchSection(parent) {
     ], { id: 'station-launch-archive' });
     const fast = stationDockCheckbox(section, 'Fast service tier', !!stationLaunchDraft.fast || codexServiceTierIsFast(newSessionCodexDefaultServiceTier), { id: 'station-launch-fast' });
     managed.addEventListener('change', onDraftInput);
+    sandbox.addEventListener('change', onDraftInput);
+    approval.addEventListener('change', onDraftInput);
     archive.addEventListener('change', onDraftInput);
     fast.addEventListener('change', onDraftInput);
   }
@@ -15723,12 +15784,14 @@ function stationSessionConfigEditingFor(sessionOrId) {
 }
 
 function stationSessionConfigDraftFor(editing) {
-  if (!editing?.sessionId) return { command: '', managed: 'vanilla', archive: 'summary' };
+  if (!editing?.sessionId) return { command: '', managed: 'vanilla', sandbox: 'workspace-write', approval: 'on-request', archive: 'summary' };
   const existing = stationSessionConfigDrafts.get(editing.sessionId);
   if (existing) return existing;
   const draft = {
     command: sessionConfigCommand(editing.meta),
     managed: editing.source === 'codex' ? sessionConfigManagedMode(editing.meta) : 'vanilla',
+    sandbox: editing.source === 'codex' ? sessionConfigSandboxMode(editing.meta) : 'workspace-write',
+    approval: editing.source === 'codex' ? sessionConfigApprovalPolicy(editing.meta) : 'on-request',
     archive: editing.source === 'codex' ? sessionConfigArchiveMode(editing.meta) : 'summary',
   };
   stationSessionConfigDrafts.set(editing.sessionId, draft);
@@ -15743,6 +15806,8 @@ function stationRememberSessionConfigDraft(sessionId) {
     ...prior,
     command: document.getElementById('station-session-config-command')?.value || '',
     managed: document.getElementById('station-session-config-managed')?.value || prior.managed || 'vanilla',
+    sandbox: document.getElementById('station-session-config-sandbox')?.value || prior.sandbox || 'workspace-write',
+    approval: document.getElementById('station-session-config-approval')?.value || prior.approval || 'on-request',
     archive: document.getElementById('station-session-config-archive')?.value || prior.archive || 'summary',
   });
 }
@@ -15758,6 +15823,8 @@ function stationSetSessionConfigResult(sessionId, text, kind = '') {
 function stationSessionConfigPayload(editing, draft) {
   const command = String(draft.command || '').trim();
   const mode = draft.managed === 'managed' ? 'managed' : 'vanilla';
+  const sandboxMode = normalizeCodexSandbox(draft.sandbox || controlCodexConfig.sandbox);
+  const approvalPolicy = normalizeCodexApprovalPolicy(draft.approval || controlCodexConfig.approval_policy);
   const archiveMode = normalizeContextArchiveMode(draft.archive || controlCodexConfig.context_archive);
   return {
     payload: {
@@ -15768,11 +15835,15 @@ function stationSessionConfigPayload(editing, draft) {
       ...(editing.intendantSessionId ? { intendant_session_id: editing.intendantSessionId } : {}),
       agent_command: command,
       ...(editing.source === 'codex' ? {
+        codex_sandbox: sandboxMode,
+        codex_approval_policy: approvalPolicy,
         codex_managed_context: mode,
         codex_context_archive: archiveMode,
       } : {}),
     },
     command,
+    sandboxMode,
+    approvalPolicy,
     mode,
     archiveMode,
   };
@@ -15791,7 +15862,7 @@ function stationSaveSessionConfigFromDock(sessionOrId, options = {}) {
   }
   stationRememberSessionConfigDraft(editing.sessionId);
   const draft = stationSessionConfigDraftFor(editing);
-  const { payload, command, mode, archiveMode } = stationSessionConfigPayload(editing, draft);
+  const { payload, command, sandboxMode, approvalPolicy, mode, archiveMode } = stationSessionConfigPayload(editing, draft);
   try {
     if (sessionConfigSavePending?.timeoutHandle) {
       clearTimeout(sessionConfigSavePending.timeoutHandle);
@@ -15813,6 +15884,8 @@ function stationSaveSessionConfigFromDock(sessionOrId, options = {}) {
         intendantSessionId: editing.intendantSessionId,
       },
       command,
+      sandboxMode,
+      approvalPolicy,
       mode,
       archiveMode,
       restart: options.restart === true,
@@ -15862,6 +15935,19 @@ function stationRenderSessionConfigSection(parent, sessionOrId) {
       ['managed', 'managed'],
     ], { id: 'station-session-config-managed' });
     managed.addEventListener('change', () => stationRememberSessionConfigDraft(editing.sessionId));
+    const sandbox = stationDockSelect(section, 'Sandbox', normalizeCodexSandbox(draft.sandbox), [
+      ['workspace-write', 'workspace-write'],
+      ['danger-full-access', 'danger-full-access'],
+      ['read-only', 'read-only'],
+    ], { id: 'station-session-config-sandbox' });
+    sandbox.addEventListener('change', () => stationRememberSessionConfigDraft(editing.sessionId));
+    const approval = stationDockSelect(section, 'Approval', normalizeCodexApprovalPolicy(draft.approval), [
+      ['on-request', 'on-request'],
+      ['never', 'never'],
+      ['untrusted', 'untrusted'],
+      ['on-failure', 'on-failure'],
+    ], { id: 'station-session-config-approval' });
+    approval.addEventListener('change', () => stationRememberSessionConfigDraft(editing.sessionId));
     const archive = stationDockSelect(section, 'Context replay', draft.archive || 'summary', [
       ['summary', 'summary'],
       ['exact', 'exact'],
@@ -21585,6 +21671,8 @@ let newSessionAgentCommands = {
 };
 let newSessionCodexManagedContext = 'vanilla';
 let newSessionCodexContextArchive = 'summary';
+let newSessionCodexSandbox = 'workspace-write';
+let newSessionCodexApprovalPolicy = 'on-request';
 let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
@@ -21614,8 +21702,8 @@ async function refreshControlPane() {
     controlCurrentBackend = normalizeAgentId(d.external_agent);
     controlCodexConfig = {
       command: d.codex_command || 'codex',
-      sandbox: d.codex_sandbox || 'workspace-write',
-      approval_policy: d.codex_approval_policy || 'on-request',
+      sandbox: normalizeCodexSandbox(d.codex_sandbox || 'workspace-write'),
+      approval_policy: normalizeCodexApprovalPolicy(d.codex_approval_policy || 'on-request'),
       model: d.codex_model || '',
       reasoning_effort: d.codex_reasoning_effort || '',
       service_tier: normalizeCodexServiceTier(d.codex_service_tier || ''),
@@ -21625,6 +21713,8 @@ async function refreshControlPane() {
       managed_context: d.codex_managed_context || 'vanilla',
       context_archive: d.codex_context_archive || 'summary',
     };
+    newSessionCodexSandbox = controlCodexConfig.sandbox || 'workspace-write';
+    newSessionCodexApprovalPolicy = controlCodexConfig.approval_policy || 'on-request';
     newSessionCodexDefaultServiceTier = controlCodexConfig.service_tier || '';
     if (!newSessionCodexFastModeTouched) {
       newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
@@ -26387,6 +26477,28 @@ function sessionConfigManagedMode(meta = {}) {
   return mode === 'managed' ? 'managed' : 'vanilla';
 }
 
+function sessionConfigSandboxMode(meta = {}) {
+  return normalizeCodexSandbox(
+    meta.codexSandbox ||
+    meta.codex_sandbox ||
+    meta.capabilities?.codexSandbox ||
+    meta.capabilities?.codex_sandbox ||
+    controlCodexConfig.sandbox ||
+    'workspace-write'
+  );
+}
+
+function sessionConfigApprovalPolicy(meta = {}) {
+  return normalizeCodexApprovalPolicy(
+    meta.codexApprovalPolicy ||
+    meta.codex_approval_policy ||
+    meta.capabilities?.codexApprovalPolicy ||
+    meta.capabilities?.codex_approval_policy ||
+    controlCodexConfig.approval_policy ||
+    'on-request'
+  );
+}
+
 function sessionConfigArchiveMode(meta = {}) {
   return normalizeContextArchiveMode(String(
     meta.codexContextArchive ||
@@ -26427,6 +26539,8 @@ function sessionLaunchOverridesForSession(sessionOrId) {
   const command = sessionConfigCommand(meta);
   if (command) overrides.agent_command = command;
   if (source === 'codex') {
+    overrides.codex_sandbox = sessionConfigSandboxMode(meta);
+    overrides.codex_approval_policy = sessionConfigApprovalPolicy(meta);
     overrides.codex_managed_context = sessionConfigManagedMode(meta);
     overrides.codex_context_archive = sessionConfigArchiveMode(meta);
   }
@@ -26470,10 +26584,18 @@ function openSessionConfigModal(sessionOrId) {
   }
   const managedRow = document.getElementById('session-config-managed-row');
   const managedSel = document.getElementById('session-config-managed-context');
+  const sandboxRow = document.getElementById('session-config-sandbox-row');
+  const sandboxSel = document.getElementById('session-config-sandbox');
+  const approvalRow = document.getElementById('session-config-approval-row');
+  const approvalSel = document.getElementById('session-config-approval-policy');
   const archiveRow = document.getElementById('session-config-archive-row');
   const archiveSel = document.getElementById('session-config-context-archive');
   if (managedRow) managedRow.style.display = source === 'codex' ? '' : 'none';
   if (managedSel) managedSel.value = sessionConfigManagedMode(meta);
+  if (sandboxRow) sandboxRow.style.display = source === 'codex' ? '' : 'none';
+  if (sandboxSel) sandboxSel.value = sessionConfigSandboxMode(meta);
+  if (approvalRow) approvalRow.style.display = source === 'codex' ? '' : 'none';
+  if (approvalSel) approvalSel.value = sessionConfigApprovalPolicy(meta);
   if (archiveRow) archiveRow.style.display = source === 'codex' ? '' : 'none';
   if (archiveSel) archiveSel.value = sessionConfigArchiveMode(meta);
   const status = document.getElementById('session-config-status');
@@ -26562,7 +26684,14 @@ function handleSessionConfigResult(result) {
     return;
   }
 
-  applySessionConfigLocal(pending.meta, pending.command, pending.mode, pending.archiveMode);
+  applySessionConfigLocal(
+    pending.meta,
+    pending.command,
+    pending.sandboxMode,
+    pending.approvalPolicy,
+    pending.mode,
+    pending.archiveMode
+  );
   scheduleSessionsMetadataRefresh(200);
   showControlToast('success', pending.restart ? 'Launch config saved; restarting session' : 'Launch config saved');
   const restartSessionId = pending.meta.sessionId;
@@ -26578,7 +26707,7 @@ function handleSessionConfigResult(result) {
   if (pending.restart) restartSessionWindowAction(restartSessionId);
 }
 
-function applySessionConfigLocal(meta, command, mode, archiveMode) {
+function applySessionConfigLocal(meta, command, sandboxMode, approvalPolicy, mode, archiveMode) {
   const ids = Array.from(new Set([
     meta.sessionId,
     meta.backendSessionId,
@@ -26594,6 +26723,8 @@ function applySessionConfigLocal(meta, command, mode, archiveMode) {
       ...(meta.intendantSessionId ? { intendantSessionId: meta.intendantSessionId } : {}),
       ...(command ? { agentCommand: command } : {}),
       ...(meta.source === 'codex' ? {
+        codexSandbox: normalizeCodexSandbox(sandboxMode),
+        codexApprovalPolicy: normalizeCodexApprovalPolicy(approvalPolicy),
         codexManagedContext: mode,
         codexContextArchive: archiveMode,
       } : {}),
@@ -26618,6 +26749,8 @@ function applySessionConfigLocal(meta, command, mode, archiveMode) {
       delete session.codex_command;
     }
     if (meta.source === 'codex') {
+      session.codex_sandbox = normalizeCodexSandbox(sandboxMode);
+      session.codex_approval_policy = normalizeCodexApprovalPolicy(approvalPolicy);
       session.codex_managed_context = mode;
       session.codex_context_archive = archiveMode;
     }
@@ -26628,6 +26761,12 @@ function applySessionConfigLocal(meta, command, mode, archiveMode) {
 function saveSessionConfigModal(options = {}) {
   if (!sessionConfigEditing || !app) return;
   const command = document.getElementById('session-config-command')?.value.trim() || '';
+  const sandboxMode = normalizeCodexSandbox(
+    document.getElementById('session-config-sandbox')?.value || controlCodexConfig.sandbox
+  );
+  const approvalPolicy = normalizeCodexApprovalPolicy(
+    document.getElementById('session-config-approval-policy')?.value || controlCodexConfig.approval_policy
+  );
   const mode = document.getElementById('session-config-managed-context')?.value === 'managed'
     ? 'managed'
     : 'vanilla';
@@ -26642,6 +26781,8 @@ function saveSessionConfigModal(options = {}) {
     ...(sessionConfigEditing.intendantSessionId ? { intendant_session_id: sessionConfigEditing.intendantSessionId } : {}),
     agent_command: command,
     ...(sessionConfigEditing.source === 'codex' ? {
+      codex_sandbox: sandboxMode,
+      codex_approval_policy: approvalPolicy,
       codex_managed_context: mode,
       codex_context_archive: archiveMode,
     } : {}),
@@ -26662,6 +26803,8 @@ function saveSessionConfigModal(options = {}) {
       intendantSessionId: sessionConfigEditing.intendantSessionId,
       meta: { ...sessionConfigEditing },
       command,
+      sandboxMode,
+      approvalPolicy,
       mode,
       archiveMode,
       restart: options.restart === true,
@@ -27080,6 +27223,8 @@ function normalizeSessionCapabilities(raw = null) {
       ? actions.map(op => String(op || '').trim().toLowerCase().replace(/_/g, '-')).filter(Boolean)
       : null,
     codexManagedContext: raw.codex_managed_context ?? raw.codexManagedContext ?? null,
+    codexSandbox: raw.codex_sandbox ?? raw.codexSandbox ?? null,
+    codexApprovalPolicy: raw.codex_approval_policy ?? raw.codexApprovalPolicy ?? null,
     codexContextArchive: raw.codex_context_archive ?? raw.codexContextArchive ?? null,
     codexCommand: raw.codex_command ?? raw.codexCommand ?? null,
     codexFastMode,
@@ -27091,7 +27236,7 @@ function mergeSessionCapabilities(existing = null, incoming = null) {
   if (!existing) return incoming;
   if (!incoming) return existing;
   const merged = { ...existing, ...incoming };
-  for (const key of ['codexThreadActions', 'codexManagedContext', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
+  for (const key of ['codexThreadActions', 'codexManagedContext', 'codexSandbox', 'codexApprovalPolicy', 'codexContextArchive', 'codexCommand', 'codexFastMode', 'codexServiceTier']) {
     if (
       key === 'codexServiceTier' &&
       incoming.codexFastMode === false &&
@@ -43088,6 +43233,16 @@ function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
 }
 
+function normalizeCodexSandbox(mode) {
+  const v = String(mode || '').trim();
+  return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : 'workspace-write';
+}
+
+function normalizeCodexApprovalPolicy(policy) {
+  const v = String(policy || '').trim();
+  return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : 'on-request';
+}
+
 function normalizeCodexServiceTier(tier) {
   const v = String(tier || '').trim().toLowerCase();
   if (!v || v === 'inherit' || v === 'default' || v === 'auto' || v === 'codex') return '';
@@ -43115,6 +43270,8 @@ function setNewSessionAgentDefaults(settings) {
   newSessionCodexManagedContext =
     settings.codex_managed_context === 'managed' ? 'managed' : 'vanilla';
   newSessionCodexContextArchive = normalizeContextArchiveMode(settings.codex_context_archive || 'summary');
+  newSessionCodexSandbox = normalizeCodexSandbox(settings.codex_sandbox || 'workspace-write');
+  newSessionCodexApprovalPolicy = normalizeCodexApprovalPolicy(settings.codex_approval_policy || 'on-request');
   newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
@@ -43141,6 +43298,8 @@ function renderNewSessionAgentControls(options = {}) {
   const select = document.getElementById('new-session-agent');
   const commandInput = document.getElementById('new-session-agent-command');
   const browseBtn = document.getElementById('new-session-agent-command-browse');
+  const sandboxSel = document.getElementById('new-session-codex-sandbox');
+  const approvalSel = document.getElementById('new-session-codex-approval-policy');
   const managedContextSel = document.getElementById('new-session-codex-managed-context');
   const contextArchiveSel = document.getElementById('new-session-codex-context-archive');
   const fastToggle = document.getElementById('new-session-codex-fast');
@@ -43170,6 +43329,16 @@ function renderNewSessionAgentControls(options = {}) {
     const appliesToCodex = effectiveAgent === 'codex';
     managedContextSel.disabled = !appliesToCodex;
     managedContextSel.value = newSessionCodexManagedContext;
+  }
+  if (sandboxSel) {
+    const appliesToCodex = effectiveAgent === 'codex';
+    sandboxSel.disabled = !appliesToCodex;
+    sandboxSel.value = normalizeCodexSandbox(newSessionCodexSandbox);
+  }
+  if (approvalSel) {
+    const appliesToCodex = effectiveAgent === 'codex';
+    approvalSel.disabled = !appliesToCodex;
+    approvalSel.value = normalizeCodexApprovalPolicy(newSessionCodexApprovalPolicy);
   }
   if (contextArchiveSel) {
     const appliesToCodex = effectiveAgent === 'codex';
@@ -43433,6 +43602,12 @@ async function startNewSession() {
     if (agentCommand) msg.agent_command = agentCommand;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
+    msg.codex_sandbox = normalizeCodexSandbox(
+      document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
+    );
+    msg.codex_approval_policy = normalizeCodexApprovalPolicy(
+      document.getElementById('new-session-codex-approval-policy')?.value || newSessionCodexApprovalPolicy
+    );
     const mode = document.getElementById('new-session-codex-managed-context')?.value === 'managed'
       ? 'managed'
       : 'vanilla';
@@ -44049,6 +44224,14 @@ document.getElementById('new-session-agent')?.addEventListener('change', () => {
 });
 document.getElementById('new-session-codex-managed-context')?.addEventListener('change', (ev) => {
   newSessionCodexManagedContext = ev.currentTarget.value === 'managed' ? 'managed' : 'vanilla';
+  renderNewSessionAgentControls();
+});
+document.getElementById('new-session-codex-sandbox')?.addEventListener('change', (ev) => {
+  newSessionCodexSandbox = normalizeCodexSandbox(ev.currentTarget.value);
+  renderNewSessionAgentControls();
+});
+document.getElementById('new-session-codex-approval-policy')?.addEventListener('change', (ev) => {
+  newSessionCodexApprovalPolicy = normalizeCodexApprovalPolicy(ev.currentTarget.value);
   renderNewSessionAgentControls();
 });
 document.getElementById('new-session-codex-context-archive')?.addEventListener('change', (ev) => {

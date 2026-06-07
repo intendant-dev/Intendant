@@ -5002,6 +5002,10 @@ async fn fork_managed_context_edit_branch(
             direct: Some(true),
             attachments: unresolved_attachment_ids,
             agent_command: launch.as_ref().and_then(|cfg| cfg.agent_command.clone()),
+            codex_sandbox: launch.as_ref().and_then(|cfg| cfg.codex_sandbox.clone()),
+            codex_approval_policy: launch
+                .as_ref()
+                .and_then(|cfg| cfg.codex_approval_policy.clone()),
             codex_managed_context: launch
                 .as_ref()
                 .and_then(|cfg| cfg.codex_managed_context.clone()),
@@ -5238,6 +5242,10 @@ async fn apply_context_rewind_backout_action(
             attachments: Vec::new(),
             agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                 .and_then(|cfg| cfg.agent_command),
+            codex_sandbox: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.codex_sandbox),
+            codex_approval_policy: crate::session_config::read_log_dir_config(config.log_dir)
+                .and_then(|cfg| cfg.codex_approval_policy),
             codex_managed_context: crate::session_config::read_log_dir_config(config.log_dir)
                 .and_then(|cfg| cfg.codex_managed_context),
             codex_context_archive: crate::session_config::read_log_dir_config(config.log_dir)
@@ -5398,6 +5406,12 @@ async fn handle_external_thread_action(
                     attachments: Vec::new(),
                     agent_command: crate::session_config::read_log_dir_config(config.log_dir)
                         .and_then(|cfg| cfg.agent_command),
+                    codex_sandbox: crate::session_config::read_log_dir_config(config.log_dir)
+                        .and_then(|cfg| cfg.codex_sandbox),
+                    codex_approval_policy: crate::session_config::read_log_dir_config(
+                        config.log_dir,
+                    )
+                    .and_then(|cfg| cfg.codex_approval_policy),
                     codex_managed_context: crate::session_config::read_log_dir_config(
                         config.log_dir,
                     )
@@ -17221,6 +17235,12 @@ async fn run_with_presence(
                             direct: Some(true),
                             attachments: Vec::new(),
                             agent_command: Some(project.config.agent.codex.command.clone()),
+                            codex_sandbox: Some(crate::project::normalize_sandbox_mode(
+                                &project.config.agent.codex.sandbox,
+                            )),
+                            codex_approval_policy: Some(crate::project::normalize_approval_policy(
+                                &project.config.agent.codex.approval_policy,
+                            )),
                             codex_managed_context: Some(
                                 crate::project::normalize_codex_managed_context(
                                     &project.config.agent.codex.managed_context,

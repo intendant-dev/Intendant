@@ -16,6 +16,10 @@ pub struct SessionAgentConfig {
     pub source: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub agent_command: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_sandbox: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub codex_approval_policy: Option<String>,
     #[serde(
         default,
         alias = "codex_context_recovery",
@@ -34,6 +38,8 @@ impl SessionAgentConfig {
     pub fn is_empty(&self) -> bool {
         self.source.is_none()
             && self.agent_command.is_none()
+            && self.codex_sandbox.is_none()
+            && self.codex_approval_policy.is_none()
             && self.codex_managed_context.is_none()
             && self.codex_context_archive.is_none()
             && self.codex_service_tier.is_none()
@@ -46,6 +52,12 @@ impl SessionAgentConfig {
         }
         if self.agent_command.is_none() {
             self.agent_command = fallback.agent_command;
+        }
+        if self.codex_sandbox.is_none() {
+            self.codex_sandbox = fallback.codex_sandbox;
+        }
+        if self.codex_approval_policy.is_none() {
+            self.codex_approval_policy = fallback.codex_approval_policy;
         }
         if self.codex_managed_context.is_none() {
             self.codex_managed_context = fallback.codex_managed_context;
@@ -79,6 +91,14 @@ pub fn normalize_codex_home(home: Option<&str>) -> Option<String> {
         .map(ToString::to_string)
 }
 
+pub fn normalize_codex_sandbox(mode: Option<&str>) -> Option<String> {
+    mode.map(crate::project::normalize_sandbox_mode)
+}
+
+pub fn normalize_codex_approval_policy(policy: Option<&str>) -> Option<String> {
+    policy.map(crate::project::normalize_approval_policy)
+}
+
 pub fn effective_codex_home() -> Option<String> {
     let from_env = std::env::var_os("CODEX_HOME")
         .filter(|value| !value.is_empty())
@@ -90,6 +110,8 @@ pub fn effective_codex_home() -> Option<String> {
 pub fn from_wire(
     source: Option<&str>,
     agent_command: Option<&str>,
+    codex_sandbox: Option<&str>,
+    codex_approval_policy: Option<&str>,
     codex_managed_context: Option<&str>,
     codex_context_archive: Option<&str>,
     codex_service_tier: Option<&str>,
@@ -99,6 +121,14 @@ pub fn from_wire(
         .filter(|value| !value.is_empty());
     let codex_managed_context = match source.as_deref() {
         Some("codex") => codex_managed_context.map(crate::project::normalize_codex_managed_context),
+        _ => None,
+    };
+    let codex_sandbox = match source.as_deref() {
+        Some("codex") => normalize_codex_sandbox(codex_sandbox),
+        _ => None,
+    };
+    let codex_approval_policy = match source.as_deref() {
+        Some("codex") => normalize_codex_approval_policy(codex_approval_policy),
         _ => None,
     };
     let codex_context_archive = match source.as_deref() {
@@ -112,6 +142,8 @@ pub fn from_wire(
     SessionAgentConfig {
         source,
         agent_command: normalize_agent_command(agent_command),
+        codex_sandbox,
+        codex_approval_policy,
         codex_managed_context,
         codex_context_archive,
         codex_service_tier,
@@ -124,6 +156,12 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
         AgentBackend::Codex => SessionAgentConfig {
             source: Some("codex".to_string()),
             agent_command: Some(project.config.agent.codex.command.clone()),
+            codex_sandbox: Some(crate::project::normalize_sandbox_mode(
+                &project.config.agent.codex.sandbox,
+            )),
+            codex_approval_policy: Some(crate::project::normalize_approval_policy(
+                &project.config.agent.codex.approval_policy,
+            )),
             codex_managed_context: Some(crate::project::normalize_codex_managed_context(
                 &project.config.agent.codex.managed_context,
             )),
@@ -138,6 +176,8 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
         AgentBackend::ClaudeCode => SessionAgentConfig {
             source: Some("claude-code".to_string()),
             agent_command: Some(project.config.agent.claude_code.command.clone()),
+            codex_sandbox: None,
+            codex_approval_policy: None,
             codex_managed_context: None,
             codex_context_archive: None,
             codex_service_tier: None,
@@ -146,6 +186,8 @@ pub fn from_project(backend: &AgentBackend, project: &Project) -> SessionAgentCo
         AgentBackend::GeminiCli => SessionAgentConfig {
             source: Some("gemini".to_string()),
             agent_command: Some(project.config.agent.gemini_cli.command.clone()),
+            codex_sandbox: None,
+            codex_approval_policy: None,
             codex_managed_context: None,
             codex_context_archive: None,
             codex_service_tier: None,
@@ -163,6 +205,13 @@ pub fn apply_to_project(
         AgentBackend::Codex => {
             if let Some(command) = config.agent_command.clone() {
                 project.config.agent.codex.command = command;
+            }
+            if let Some(mode) = config.codex_sandbox.clone() {
+                project.config.agent.codex.sandbox = crate::project::normalize_sandbox_mode(&mode);
+            }
+            if let Some(policy) = config.codex_approval_policy.clone() {
+                project.config.agent.codex.approval_policy =
+                    crate::project::normalize_approval_policy(&policy);
             }
             if let Some(mode) = config.codex_managed_context.clone() {
                 project.config.agent.codex.managed_context =
@@ -205,6 +254,12 @@ pub fn read_log_dir_config(log_dir: &Path) -> Option<SessionAgentConfig> {
     }
     if let Some(command) = config.agent_command.take() {
         config.agent_command = normalize_agent_command(Some(&command));
+    }
+    if let Some(mode) = config.codex_sandbox.take() {
+        config.codex_sandbox = normalize_codex_sandbox(Some(&mode));
+    }
+    if let Some(policy) = config.codex_approval_policy.take() {
+        config.codex_approval_policy = normalize_codex_approval_policy(Some(&policy));
     }
     if let Some(mode) = config.codex_managed_context.take() {
         config.codex_managed_context = Some(crate::project::normalize_codex_managed_context(&mode));
@@ -414,6 +469,18 @@ pub fn apply_config_to_session_json(session: &mut Value, config: &SessionAgentCo
             Value::String(crate::project::normalize_codex_managed_context(mode)),
         );
     }
+    if let Some(mode) = config.codex_sandbox.as_deref() {
+        obj.insert(
+            "codex_sandbox".to_string(),
+            Value::String(crate::project::normalize_sandbox_mode(mode)),
+        );
+    }
+    if let Some(policy) = config.codex_approval_policy.as_deref() {
+        obj.insert(
+            "codex_approval_policy".to_string(),
+            Value::String(crate::project::normalize_approval_policy(policy)),
+        );
+    }
     if let Some(mode) = config.codex_context_archive.as_deref() {
         obj.insert(
             "codex_context_archive".to_string(),
@@ -512,6 +579,12 @@ fn read_overlay_map(home: &Path) -> HashMap<String, HashMap<String, SessionAgent
             if let Some(command) = config.agent_command.take() {
                 config.agent_command = normalize_agent_command(Some(&command));
             }
+            if let Some(mode) = config.codex_sandbox.take() {
+                config.codex_sandbox = normalize_codex_sandbox(Some(&mode));
+            }
+            if let Some(policy) = config.codex_approval_policy.take() {
+                config.codex_approval_policy = normalize_codex_approval_policy(Some(&policy));
+            }
             if let Some(mode) = config.codex_managed_context.take() {
                 config.codex_managed_context =
                     Some(crate::project::normalize_codex_managed_context(&mode));
@@ -593,17 +666,21 @@ mod tests {
         let cfg = from_wire(
             Some("Codex"),
             Some("  /tmp/codex  "),
+            Some("danger-full-access"),
+            Some("on-request"),
             Some("true"),
             Some("raw"),
             Some(" priority "),
         );
         assert_eq!(cfg.source.as_deref(), Some("codex"));
         assert_eq!(cfg.agent_command.as_deref(), Some("/tmp/codex"));
+        assert_eq!(cfg.codex_sandbox.as_deref(), Some("danger-full-access"));
+        assert_eq!(cfg.codex_approval_policy.as_deref(), Some("on-request"));
         assert_eq!(cfg.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(cfg.codex_context_archive.as_deref(), Some("exact"));
         assert_eq!(cfg.codex_service_tier.as_deref(), Some("priority"));
 
-        let normal_cfg = from_wire(Some("codex"), None, None, None, Some("normal"));
+        let normal_cfg = from_wire(Some("codex"), None, None, None, None, None, Some("normal"));
         assert_eq!(
             normal_cfg.codex_service_tier.as_deref(),
             Some(crate::project::CODEX_STANDARD_SERVICE_TIER)
@@ -616,6 +693,8 @@ mod tests {
         let mut cfg = from_wire(
             Some("codex"),
             Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
             Some("managed"),
             Some("summary"),
             Some("priority"),
@@ -632,6 +711,8 @@ mod tests {
         let mut cfg = from_wire(
             Some("codex"),
             Some("/tmp/codex"),
+            Some("danger-full-access"),
+            Some("never"),
             Some("managed"),
             Some("exact"),
             Some("priority"),
@@ -651,6 +732,16 @@ mod tests {
             session.get("codex_home").and_then(|v| v.as_str()),
             Some("/home/user/.codex-managed")
         );
+        assert_eq!(
+            session.get("codex_sandbox").and_then(|v| v.as_str()),
+            Some("danger-full-access")
+        );
+        assert_eq!(
+            session
+                .get("codex_approval_policy")
+                .and_then(|v| v.as_str()),
+            Some("never")
+        );
     }
 
     #[test]
@@ -659,6 +750,8 @@ mod tests {
         let mut stale_wrapper = from_wire(
             Some("codex"),
             Some("/tmp/stale-wrapper-codex"),
+            None,
+            None,
             Some("managed"),
             Some("summary"),
             None,
@@ -667,6 +760,8 @@ mod tests {
         let mut backend = from_wire(
             Some("codex"),
             Some("/tmp/backend-codex"),
+            None,
+            None,
             Some("managed"),
             Some("summary"),
             None,
@@ -690,6 +785,8 @@ mod tests {
         let mut wrapper = from_wire(
             Some("codex"),
             Some("/tmp/wrapper-codex"),
+            None,
+            None,
             Some("managed"),
             Some("summary"),
             None,
@@ -709,6 +806,8 @@ mod tests {
         let backend = from_wire(
             Some("codex"),
             Some("/tmp/backend-codex"),
+            None,
+            None,
             Some("managed"),
             Some("summary"),
             None,
@@ -736,6 +835,8 @@ mod tests {
         let cfg = from_wire(
             Some("codex"),
             Some("/tmp/codex"),
+            None,
+            None,
             Some("managed"),
             Some("off"),
             None,

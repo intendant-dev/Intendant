@@ -7967,6 +7967,14 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                             .as_ref()
                             .and_then(|caps| caps.get("codex_command"))
                             .and_then(|v| v.as_str());
+                        let sandbox = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_sandbox"))
+                            .and_then(|v| v.as_str());
+                        let approval_policy = capabilities
+                            .as_ref()
+                            .and_then(|caps| caps.get("codex_approval_policy"))
+                            .and_then(|v| v.as_str());
                         let mode = capabilities
                             .as_ref()
                             .and_then(|caps| caps.get("codex_managed_context"))
@@ -7982,6 +7990,8 @@ fn intendant_session_list_row_from_dir(dir: &Path, session_id: &str) -> Option<s
                         session_agent_config = Some(crate::session_config::from_wire(
                             source,
                             command,
+                            sandbox,
+                            approval_policy,
                             mode,
                             archive,
                             service_tier,
@@ -11535,10 +11545,10 @@ pub struct SettingsPayload {
     // the Activity → Control sub-tab can load in one fetch.
     #[serde(default)]
     pub codex_command: Option<String>,
-    #[serde(default = "default_settings_codex_sandbox")]
-    pub codex_sandbox: String,
-    #[serde(default = "default_settings_codex_approval_policy")]
-    pub codex_approval_policy: String,
+    #[serde(default)]
+    pub codex_sandbox: Option<String>,
+    #[serde(default)]
+    pub codex_approval_policy: Option<String>,
     #[serde(default)]
     pub codex_model: Option<String>,
     #[serde(default)]
@@ -11614,14 +11624,6 @@ fn default_settings_approval_ask() -> String {
     crate::autonomy::ApprovalRule::Ask.as_str().to_string()
 }
 
-fn default_settings_codex_sandbox() -> String {
-    crate::project::normalize_sandbox_mode("")
-}
-
-fn default_settings_codex_approval_policy() -> String {
-    crate::project::normalize_approval_policy("")
-}
-
 fn normalize_settings_codex_command(input: Option<&str>) -> String {
     normalize_settings_agent_command(input, "codex")
 }
@@ -11674,10 +11676,12 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         live_audio_timeout_secs: config.live_audio.default_timeout_secs,
         external_agent: config.agent.default_backend.clone(),
         codex_command: Some(config.agent.codex.command.clone()),
-        codex_sandbox: crate::project::normalize_sandbox_mode(&config.agent.codex.sandbox),
-        codex_approval_policy: crate::project::normalize_approval_policy(
+        codex_sandbox: Some(crate::project::normalize_sandbox_mode(
+            &config.agent.codex.sandbox,
+        )),
+        codex_approval_policy: Some(crate::project::normalize_approval_policy(
             &config.agent.codex.approval_policy,
-        ),
+        )),
         codex_model: config.agent.codex.model.clone(),
         codex_reasoning_effort: crate::project::normalize_reasoning_effort(
             config.agent.codex.reasoning_effort.as_deref(),
@@ -11765,6 +11769,12 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     if payload.codex_command.is_some() {
         config.agent.codex.command =
             normalize_settings_codex_command(payload.codex_command.as_deref());
+    }
+    if let Some(mode) = payload.codex_sandbox.as_deref() {
+        config.agent.codex.sandbox = crate::project::normalize_sandbox_mode(mode);
+    }
+    if let Some(policy) = payload.codex_approval_policy.as_deref() {
+        config.agent.codex.approval_policy = crate::project::normalize_approval_policy(policy);
     }
     if payload.codex_service_tier.is_some() {
         config.agent.codex.service_tier =
@@ -23770,14 +23780,15 @@ mod tests {
 
         let payload: SettingsPayload = serde_json::from_str(&body).unwrap();
         assert_eq!(payload.external_agent.as_deref(), Some("codex"));
-        assert_eq!(payload.codex_sandbox, "workspace-write");
-        assert_eq!(payload.codex_approval_policy, "on-request");
+        assert_eq!(payload.codex_sandbox, None);
+        assert_eq!(payload.codex_approval_policy, None);
         assert_eq!(payload.codex_managed_context, None);
         assert_eq!(payload.gemini_approval_mode, "default");
 
         let mut config = crate::project::ProjectConfig::default();
         config.agent.codex.command = "/opt/codex/bin/codex".to_string();
         config.agent.codex.sandbox = "danger-full-access".to_string();
+        config.agent.codex.approval_policy = "never".to_string();
         config.agent.codex.managed_context = "managed".to_string();
         config.agent.codex.service_tier = Some("priority".to_string());
         config.agent.gemini_cli.approval_mode = "yolo".to_string();
@@ -23786,6 +23797,7 @@ mod tests {
         assert_eq!(config.agent.default_backend.as_deref(), Some("codex"));
         assert_eq!(config.agent.codex.command, "/opt/codex/bin/codex");
         assert_eq!(config.agent.codex.sandbox, "danger-full-access");
+        assert_eq!(config.agent.codex.approval_policy, "never");
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.codex.service_tier.as_deref(), Some("priority"));
         assert_eq!(config.agent.gemini_cli.approval_mode, "yolo");
@@ -23805,6 +23817,8 @@ mod tests {
             payload.codex_command.as_deref(),
             Some("/usr/local/bin/codex")
         );
+        assert_eq!(payload.codex_sandbox.as_deref(), Some("workspace-write"));
+        assert_eq!(payload.codex_approval_policy.as_deref(), Some("on-request"));
         assert_eq!(payload.codex_managed_context.as_deref(), Some("managed"));
         assert_eq!(payload.codex_service_tier.as_deref(), Some("priority"));
         assert_eq!(
@@ -23837,6 +23851,8 @@ mod tests {
             "live_audio_timeout_secs": 300,
             "external_agent": "codex",
             "codex_command": "  /opt/homebrew/bin/codex  ",
+            "codex_sandbox": "danger-full-access",
+            "codex_approval_policy": "never",
             "codex_service_tier": "normal",
             "codex_managed_context": "true",
             "claude_command": "  /opt/claude/bin/claude  ",
@@ -23848,6 +23864,8 @@ mod tests {
         apply_settings_payload(&mut config, &payload);
 
         assert_eq!(config.agent.codex.command, "/opt/homebrew/bin/codex");
+        assert_eq!(config.agent.codex.sandbox, "danger-full-access");
+        assert_eq!(config.agent.codex.approval_policy, "never");
         assert_eq!(config.agent.codex.service_tier.as_deref(), Some("standard"));
         assert_eq!(config.agent.codex.managed_context, "managed");
         assert_eq!(config.agent.claude_code.command, "/opt/claude/bin/claude");

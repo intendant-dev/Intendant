@@ -1119,6 +1119,10 @@ pub enum ControlMsg {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_command: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_sandbox: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_approval_policy: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_managed_context: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_context_archive: Option<String>,
@@ -1146,6 +1150,10 @@ pub enum ControlMsg {
         attachments: Vec<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_command: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_sandbox: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_approval_policy: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         codex_managed_context: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1270,6 +1278,14 @@ pub enum ControlMsg {
         /// external agent. Empty/missing falls back to the configured command.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_command: Option<String>,
+        /// Optional one-shot Codex sandbox mode for this session. Only applies
+        /// when the resolved agent is Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_sandbox: Option<String>,
+        /// Optional one-shot Codex approval policy for this session. Only
+        /// applies when the resolved agent is Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_approval_policy: Option<String>,
         /// Optional one-shot Codex managed-context mode for this session.
         /// Accepted values normalize to "vanilla" or "managed". Only applies
         /// when the resolved agent is Codex.
@@ -1364,6 +1380,14 @@ pub enum ControlMsg {
         /// global Settings value.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         agent_command: Option<String>,
+        /// Per-session Codex sandbox override. Only applies when `source`
+        /// resolves to Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_sandbox: Option<String>,
+        /// Per-session Codex approval-policy override. Only applies when
+        /// `source` resolves to Codex.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        codex_approval_policy: Option<String>,
         /// Per-session Codex managed-context override. Only applies when
         /// `source` resolves to Codex.
         #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3263,6 +3287,8 @@ mod tests {
                 project_root: None,
                 agent: Some("codex".to_string()),
                 agent_command: Some("/opt/codex/bin/codex".to_string()),
+                codex_sandbox: Some("danger-full-access".to_string()),
+                codex_approval_policy: Some("never".to_string()),
                 codex_managed_context: Some("managed".to_string()),
                 codex_context_archive: Some("summary".to_string()),
                 codex_service_tier: Some("priority".to_string()),
@@ -3518,7 +3544,7 @@ mod tests {
 
     #[test]
     fn control_msg_create_session_deserialize() {
-        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_managed_context":"managed","codex_context_archive":"exact","codex_service_tier":"priority","direct":true,"attachments":["upload:u1"]}"#;
+        let json = r#"{"action":"create_session","task":"fix bug","name":"Bugfix work","project_root":"/repo","agent":"codex","agent_command":"/opt/codex/bin/codex","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"exact","codex_service_tier":"priority","direct":true,"attachments":["upload:u1"]}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::CreateSession {
@@ -3527,6 +3553,8 @@ mod tests {
                 project_root,
                 agent,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
                 codex_service_tier,
@@ -3541,6 +3569,8 @@ mod tests {
                 assert_eq!(project_root.as_deref(), Some("/repo"));
                 assert_eq!(agent.as_deref(), Some("codex"));
                 assert_eq!(agent_command.as_deref(), Some("/opt/codex/bin/codex"));
+                assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
+                assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("exact"));
                 assert_eq!(codex_service_tier.as_deref(), Some("priority"));
@@ -3576,7 +3606,7 @@ mod tests {
 
     #[test]
     fn control_msg_configure_session_agent_deserializes() {
-        let json = r#"{"action":"configure_session_agent","session_id":"abc123","source":"codex","backend_session_id":"thread-1","intendant_session_id":"wrap-1","agent_command":"/tmp/codex","codex_managed_context":"managed","codex_context_archive":"off"}"#;
+        let json = r#"{"action":"configure_session_agent","session_id":"abc123","source":"codex","backend_session_id":"thread-1","intendant_session_id":"wrap-1","agent_command":"/tmp/codex","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"off"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::ConfigureSessionAgent {
@@ -3585,6 +3615,8 @@ mod tests {
                 backend_session_id,
                 intendant_session_id,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
             } => {
@@ -3593,6 +3625,8 @@ mod tests {
                 assert_eq!(backend_session_id.as_deref(), Some("thread-1"));
                 assert_eq!(intendant_session_id.as_deref(), Some("wrap-1"));
                 assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
+                assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
+                assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("off"));
             }
@@ -3602,7 +3636,7 @@ mod tests {
 
     #[test]
     fn control_msg_resume_session_deserializes_launch_overrides() {
-        let json = r#"{"action":"resume_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","task":"continue","direct":true,"attachments":["upload:u1"],"agent_command":"/tmp/codex","codex_managed_context":"managed","codex_context_archive":"summary"}"#;
+        let json = r#"{"action":"resume_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","task":"continue","direct":true,"attachments":["upload:u1"],"agent_command":"/tmp/codex","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"summary"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::ResumeSession {
@@ -3614,6 +3648,8 @@ mod tests {
                 direct,
                 attachments,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
             } => {
@@ -3625,6 +3661,8 @@ mod tests {
                 assert_eq!(direct, Some(true));
                 assert_eq!(attachments, vec!["upload:u1"]);
                 assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
+                assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
+                assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("summary"));
             }
@@ -3646,7 +3684,7 @@ mod tests {
 
     #[test]
     fn control_msg_restart_session_deserializes_launch_overrides() {
-        let json = r#"{"action":"restart_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","direct":true,"agent_command":"/tmp/codex","codex_managed_context":"managed","codex_context_archive":"exact"}"#;
+        let json = r#"{"action":"restart_session","source":"codex","session_id":"thread-1","resume_id":"thread-1","project_root":"/repo","direct":true,"agent_command":"/tmp/codex","codex_sandbox":"danger-full-access","codex_approval_policy":"never","codex_managed_context":"managed","codex_context_archive":"exact"}"#;
         let msg: ControlMsg = serde_json::from_str(json).unwrap();
         match msg {
             ControlMsg::RestartSession {
@@ -3658,6 +3696,8 @@ mod tests {
                 direct,
                 attachments,
                 agent_command,
+                codex_sandbox,
+                codex_approval_policy,
                 codex_managed_context,
                 codex_context_archive,
             } => {
@@ -3669,6 +3709,8 @@ mod tests {
                 assert_eq!(direct, Some(true));
                 assert!(attachments.is_empty());
                 assert_eq!(agent_command.as_deref(), Some("/tmp/codex"));
+                assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
+                assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                 assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                 assert_eq!(codex_context_archive.as_deref(), Some("exact"));
             }

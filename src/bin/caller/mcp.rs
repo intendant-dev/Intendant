@@ -6330,6 +6330,8 @@ impl IntendantServer {
                                 direct: params.orchestrate.map(|orchestrate| !orchestrate),
                                 attachments: vec![],
                                 agent_command: target.agent_command,
+                                codex_sandbox: target.codex_sandbox,
+                                codex_approval_policy: target.codex_approval_policy,
                                 codex_managed_context: target.codex_managed_context,
                                 codex_context_archive: target.codex_context_archive,
                             }));
@@ -6418,6 +6420,8 @@ struct PersistedExternalStartTarget {
     resume_id: String,
     project_root: Option<String>,
     agent_command: Option<String>,
+    codex_sandbox: Option<String>,
+    codex_approval_policy: Option<String>,
     codex_managed_context: Option<String>,
     codex_context_archive: Option<String>,
 }
@@ -6509,6 +6513,12 @@ fn resolve_persisted_start_target(session_id: &str) -> PersistedStartTarget {
         agent_command: config
             .as_ref()
             .and_then(|config| config.agent_command.clone()),
+        codex_sandbox: config
+            .as_ref()
+            .and_then(|config| config.codex_sandbox.clone()),
+        codex_approval_policy: config
+            .as_ref()
+            .and_then(|config| config.codex_approval_policy.clone()),
         codex_managed_context: config
             .as_ref()
             .and_then(|config| config.codex_managed_context.clone()),
@@ -9410,6 +9420,8 @@ mod tests {
                 &crate::session_config::SessionAgentConfig {
                     source: Some("codex".to_string()),
                     agent_command: Some("/tmp/patched-codex".to_string()),
+                    codex_sandbox: Some("danger-full-access".to_string()),
+                    codex_approval_policy: Some("never".to_string()),
                     codex_managed_context: Some("managed".to_string()),
                     codex_context_archive: Some("summary".to_string()),
                     codex_service_tier: None,
@@ -9451,6 +9463,8 @@ mod tests {
                     direct,
                     attachments,
                     agent_command,
+                    codex_sandbox,
+                    codex_approval_policy,
                     codex_managed_context,
                     codex_context_archive,
                 }))) => {
@@ -9465,6 +9479,8 @@ mod tests {
                     assert_eq!(direct, Some(true));
                     assert!(attachments.is_empty());
                     assert_eq!(agent_command.as_deref(), Some("/tmp/patched-codex"));
+                    assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
+                    assert_eq!(codex_approval_policy.as_deref(), Some("never"));
                     assert_eq!(codex_managed_context.as_deref(), Some("managed"));
                     assert_eq!(codex_context_archive.as_deref(), Some("summary"));
                 }
