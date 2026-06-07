@@ -11052,6 +11052,18 @@ function stationLastSnapshotForFallback() {
   };
 }
 
+function stationRenderedPrimaryActive() {
+  return activeTab === 'station' && !!station && !stationDomFallback;
+}
+
+function stationRenderedSelectPanel(target, message = '') {
+  if (!stationRenderedPrimaryActive()) return false;
+  if (target) station.select_by_id?.(target);
+  stationStatus(message || (station.debug_state?.() || 'Station online'));
+  stationScheduleUpdate();
+  return true;
+}
+
 function stationLogEventId(c, fallbackIndex = '') {
   const hostId = String(c?.host_id || c?.hostId || selfPeerId || 'local');
   const sessionId = String(c?.session_id || c?.sessionId || '');
@@ -19962,6 +19974,7 @@ function stationHandleManagedAction(action) {
   if (sessionId) stationSetManagedSession(sessionId);
   if (op === 'use-target') {
     managedContextEl?.('managed-context-use-target')?.click();
+    if (stationRenderedSelectPanel('system:managed', 'Managed context target updated')) return;
     stationRenderManagedDock();
     return;
   }
@@ -19972,11 +19985,16 @@ function stationHandleManagedAction(action) {
     return;
   }
   if (op === 'rewind' || op === 'backout') {
+    if (stationRenderedSelectPanel('system:managed', `${op} controls remain in rendered managed panel`)) return;
     stationRenderManagedDock(op);
     return;
   }
   stationApplyManagedAction(op, id, sessionId)
-    .finally(() => stationRenderManagedDock(op === 'record' ? 'backout' : 'rewind'));
+    .finally(() => {
+      if (!stationRenderedSelectPanel('system:managed', `Managed action ${op || 'updated'}`)) {
+        stationRenderManagedDock(op === 'record' ? 'backout' : 'rewind');
+      }
+    });
 }
 
 function stationHandleContextAction(action) {
@@ -20001,6 +20019,7 @@ function stationHandleContextAction(action) {
   }
   if (op !== 'part' && !actionButtonByOp[op]) return;
   stationApplyContextAction(op, id);
+  if (stationRenderedSelectPanel('system:context', `Context ${op || 'updated'}`)) return;
   stationRenderContextDock(op === 'part' ? id : stationSelectedContextPart);
 }
 
@@ -20043,6 +20062,7 @@ function stationHandleActivityAction(action) {
     return;
   }
   if (op === 'bottom') {
+    if (stationRenderedSelectPanel('system:activity', 'Activity latest selected')) return;
     stationRenderActivityDock(stationActivityEvents().at(-1)?.id || '');
     return;
   }
@@ -20059,6 +20079,7 @@ function stationHandleActivityAction(action) {
     return;
   }
   if (op !== 'log' || !id) return;
+  if (stationRenderedSelectPanel('system:activity', 'Activity event selected')) return;
   stationRenderActivityDock(id);
 }
 
@@ -20094,16 +20115,19 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op === 'browser-open') {
+    if (stationRenderedSelectPanel('system:controls', 'Browser controls stay in Station')) return;
     stationRenderControlsDock('browser');
     setTimeout(() => document.getElementById('station-browser-url')?.focus(), 0);
     return;
   }
   if (op === 'browser-new') {
+    if (stationRenderedSelectPanel('system:controls', 'Browser controls stay in Station')) return;
     stationRenderControlsDock('browser');
     setTimeout(() => document.getElementById('station-browser-url')?.focus(), 0);
     return;
   }
   if (op === 'recordings') {
+    if (stationRenderedSelectPanel('system:controls', 'Recording controls stay in Station')) return;
     stationRenderControlsDock('recordings');
     return;
   }
@@ -20117,11 +20141,13 @@ function stationHandleControlsAction(action) {
   }
   if (op === 'debug-screen') {
     window.toggleDebugScreen?.();
+    if (stationRenderedSelectPanel('system:controls', 'Debug screen toggled')) return;
     stationRenderControlsDock('overview');
     return;
   }
   if (op === 'debug-record') {
     window.toggleDebugRecording?.();
+    if (stationRenderedSelectPanel('system:controls', 'Debug recording toggled')) return;
     stationRenderControlsDock('overview');
     return;
   }
@@ -20140,6 +20166,7 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op === 'cu-settings') {
+    if (stationRenderedSelectPanel('system:controls', 'Computer-use settings stay in Station')) return;
     stationRenderControlsDock('overview');
   }
 }
@@ -20174,7 +20201,11 @@ function stationHandleChangesAction(action) {
   if (op === 'refresh') {
     if (typeof refreshHistory === 'function') refreshHistory();
     refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true })
-      .finally(() => stationRenderChangesDock(activeChangesFile || path));
+      .finally(() => {
+        if (!stationRenderedSelectPanel('system:changes', 'Changes refreshed')) {
+          stationRenderChangesDock(activeChangesFile || path);
+        }
+      });
     return;
   }
   if (op === 'copy-paths') {
@@ -20200,10 +20231,15 @@ function stationHandleChangesAction(action) {
   }
   if (op !== 'file' || !path) {
     refreshChangesList({ selectFirst: true, refreshActive: true, quiet: true })
-      .finally(() => stationRenderChangesDock(activeChangesFile || path));
+      .finally(() => {
+        if (!stationRenderedSelectPanel('system:changes', 'Changes refreshed')) {
+          stationRenderChangesDock(activeChangesFile || path);
+        }
+      });
     return;
   }
   stationSelectChange(path);
+  stationRenderedSelectPanel('system:changes', 'Change selected');
 }
 
 function focusActivityLogEvent(id) {
