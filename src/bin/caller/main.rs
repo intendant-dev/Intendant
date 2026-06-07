@@ -2583,6 +2583,12 @@ fn validate_context_rewind_anchor_restore_headroom(
         return Ok(());
     };
 
+    if let Some(start_line) = anchor.managed_context_recovery_start_line {
+        return Err(format!(
+            "rewind anchor item_id `{requested_item_id}` is inside the active managed-context recovery span that starts at rollout line {start_line}; choosing it would preserve the recovery kickstart prompt or its list/inspect calls. Call list_rewind_anchors again without include_non_recovery and choose an anchor before that managed-context recovery span."
+        ));
+    }
+
     let Some((usage_kind, used_tokens, rewind_only_limit)) =
         context_rewind_anchor_restore_usage_for_headroom(&anchor, position)
     else {
@@ -2987,6 +2993,8 @@ struct ContextRewindAnchorCatalogEntry {
     recovery_eligible: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     recovery_eligible_positions: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    managed_context_recovery_start_line: Option<usize>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3266,6 +3274,7 @@ fn scan_context_rewind_anchor_catalog(
     let mut latest_rewind_outcomes = HashMap::<String, ContextRewindBackendUsageAtLine>::new();
     let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
     let mut prefix_estimated_tokens = 0_u64;
+    let mut managed_context_recovery_start_line = None::<usize>;
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -3301,6 +3310,11 @@ fn scan_context_rewind_anchor_catalog(
         let Some(payload) = entry.get("payload") else {
             continue;
         };
+        if managed_context_recovery_start_line.is_none()
+            && response_item_is_managed_context_recovery_kickstart(payload)
+        {
+            managed_context_recovery_start_line = Some(line_number);
+        }
         let prefix_before_item = prefix_estimated_tokens;
         prefix_estimated_tokens =
             prefix_estimated_tokens.saturating_add(context_rewind_estimated_tokens(payload));
@@ -3358,6 +3372,7 @@ fn scan_context_rewind_anchor_catalog(
                 latest_rewind_limit_after_anchor: None,
                 recovery_eligible: None,
                 recovery_eligible_positions: None,
+                managed_context_recovery_start_line: None,
             });
         }
     }
@@ -3375,6 +3390,13 @@ fn scan_context_rewind_anchor_catalog(
         anchor.approx_pruned_tokens_after = anchor
             .prefix_estimated_tokens_after_anchor
             .map(|prefix_tokens| total_prefix_estimated_tokens.saturating_sub(prefix_tokens));
+        let in_managed_recovery_span = managed_context_recovery_start_line
+            .filter(|start_line| anchor.last_line >= *start_line);
+        if let Some(start_line) = in_managed_recovery_span {
+            anchor.managed_context_recovery_start_line = Some(start_line);
+            anchor.recovery_eligible = Some(false);
+            anchor.recovery_eligible_positions = None;
+        }
         let Some(usage) = backend_usage
             .iter()
             .find(|usage| usage.line >= anchor.last_line)
@@ -3384,6 +3406,9 @@ fn scan_context_rewind_anchor_catalog(
         };
         anchor.backend_usage_at_or_after_anchor = Some(usage.used_tokens);
         anchor.rewind_only_limit_at_or_after_anchor = Some(usage.rewind_only_limit);
+        if in_managed_recovery_span.is_some() {
+            continue;
+        }
         let backend_has_headroom =
             context_rewind_anchor_has_recovery_headroom(usage.used_tokens, usage.rewind_only_limit);
         let restore_prefix_after_has_headroom = anchor
@@ -3647,6 +3672,16 @@ fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogE
                 | "context_rewind_backout"
         )
     })
+}
+
+fn response_item_is_managed_context_recovery_kickstart(item: &serde_json::Value) -> bool {
+    if item.get("type").and_then(|value| value.as_str()) != Some("message") {
+        return false;
+    }
+    if item.get("role").and_then(|value| value.as_str()) != Some("user") {
+        return false;
+    }
+    response_item_content_text(item).any(|text| text.contains("<managed_context_recovery>"))
 }
 
 fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
@@ -11707,6 +11742,276 @@ mod tests {
             .filter_map(|anchor| anchor["item_id"].as_str())
             .collect::<Vec<_>>();
         assert_eq!(ids, vec!["call_recovery_list", "call_launch_dashboard"]);
+    }
+
+    #[test]
+    fn context_rewind_anchor_catalog_excludes_active_recovery_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_before_recovery",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "id": "msg_recovery_kickstart",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<managed_context_recovery>Backend-reported Codex context pressure is high. First call list_rewind_anchors without a query.</managed_context_recovery>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "list_rewind_anchors",
+                        "call_id": "call_recovery_list",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_recovery_list",
+                        "output": "{\"anchors\":[{\"item_id\":\"call_before_recovery\"}]}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "get_status",
+                        "call_id": "call_recovery_status",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_after_recovery_prompt",
+                        "arguments": "{\"cmd\":\"echo healthy now\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 0, "limit": 10 }),
+        )
+        .expect("default recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_before_recovery"]);
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "include_non_recovery": true,
+                "include_management_tools": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchors = catalog["anchors"].as_array().unwrap();
+        let before = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_before_recovery")
+            .expect("pre-recovery anchor");
+        assert_eq!(before["recovery_eligible"].as_bool(), Some(true));
+        assert!(before["managed_context_recovery_start_line"].is_null());
+
+        for item_id in [
+            "msg_recovery_kickstart",
+            "call_recovery_list",
+            "call_recovery_status",
+            "call_after_recovery_prompt",
+        ] {
+            let anchor = anchors
+                .iter()
+                .find(|anchor| anchor["item_id"] == item_id)
+                .unwrap_or_else(|| panic!("missing audit anchor {item_id}: {catalog}"));
+            assert_eq!(
+                anchor["recovery_eligible"].as_bool(),
+                Some(false),
+                "got {anchor}"
+            );
+            assert_eq!(
+                anchor["managed_context_recovery_start_line"].as_u64(),
+                Some(3),
+                "got {anchor}"
+            );
+        }
+    }
+
+    #[test]
+    fn context_rewind_rejects_anchor_inside_active_recovery_span() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_before_recovery",
+                        "arguments": "{\"cmd\":\"true\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "user",
+                        "id": "msg_recovery_kickstart",
+                        "content": [{
+                            "type": "input_text",
+                            "text": "<managed_context_recovery>First call list_rewind_anchors without a query.</managed_context_recovery>"
+                        }]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "get_status",
+                        "call_id": "call_recovery_status",
+                        "arguments": "{}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "event_msg",
+                    "payload": {
+                        "type": "token_count",
+                        "info": {
+                            "last_token_usage": {
+                                "input_tokens": 1000,
+                                "cached_input_tokens": 0,
+                                "output_tokens": 0,
+                                "total_tokens": 1000
+                            },
+                            "model_context_window": 30000
+                        }
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_before_recovery",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect("pre-recovery anchor should remain valid");
+
+        let err = validate_context_rewind_anchor_restore_headroom(
+            &path,
+            "call_recovery_status",
+            external_agent::RollbackAnchorPosition::After,
+        )
+        .expect_err("active recovery span anchor must be rejected");
+        assert!(
+            err.contains("active managed-context recovery span"),
+            "got: {err}"
+        );
+        assert!(
+            err.contains("preserve the recovery kickstart prompt"),
+            "got: {err}"
+        );
     }
 
     #[test]
