@@ -4109,8 +4109,17 @@ struct CodexNotificationState {
 }
 
 const CODEX_WARNING_DIAGNOSTIC_INLINE_LIMIT: usize = 3;
+const CODEX_BUILD_PROGRESS_INLINE_LIMIT: usize = 4;
 const CODEX_COMMAND_PREVIEW_LIMIT: usize = 700;
 const CODEX_COMMAND_OUTPUT_LINE_LIMIT: usize = 1200;
+const CODEX_COMMAND_OUTPUT_INLINE_LIMIT: usize = 8 * 1024;
+const CODEX_COMMAND_OUTPUT_HEAD_LIMIT: usize = 4 * 1024;
+const CODEX_COMMAND_OUTPUT_TAIL_LIMIT: usize = 2 * 1024;
+const CODEX_COMMAND_SOURCE_OUTPUT_INLINE_LIMIT: usize = 4 * 1024;
+const CODEX_COMMAND_SOURCE_OUTPUT_HEAD_LIMIT: usize = 2 * 1024;
+const CODEX_COMMAND_SOURCE_OUTPUT_TAIL_LIMIT: usize = 2 * 1024;
+const CODEX_COMMAND_SOURCE_OUTPUT_DETECTION_MIN_BYTES: usize = 2 * 1024;
+const CODEX_COMMAND_SOURCE_OUTPUT_DETECTION_LINE_LIMIT: usize = 200;
 
 #[derive(Default)]
 struct CodexCommandOutputHygiene {
@@ -4118,11 +4127,33 @@ struct CodexCommandOutputHygiene {
     warning_diagnostics_seen: usize,
     suppressing_warning_diagnostic: bool,
     suppression_notice_emitted: bool,
+    build_progress_seen: usize,
+    build_progress_suppressed: usize,
+    build_progress_notice_emitted: bool,
+    last_suppressed_build_progress: String,
+    source_seen_bytes: usize,
+    filtered_seen_bytes: usize,
+    emitted_head_bytes: usize,
+    tail: String,
+    omitting_large_output: bool,
+    source_like: bool,
+    source_signals: CodexCommandSourceSignals,
+}
+
+#[derive(Default)]
+struct CodexCommandSourceSignals {
+    observed_lines: usize,
+    non_empty_lines: usize,
+    code_like_lines: usize,
+    markup_like_lines: usize,
+    style_like_lines: usize,
+    structural_lines: usize,
+    source_hint_lines: usize,
 }
 
 impl CodexCommandOutputHygiene {
     fn filter(&mut self, text: &str, flush: bool) -> Option<String> {
-        if text.is_empty() && !(flush && !self.pending.is_empty()) {
+        if text.is_empty() && !(flush && (!self.pending.is_empty() || self.omitting_large_output)) {
             return None;
         }
 
@@ -4132,6 +4163,14 @@ impl CodexCommandOutputHygiene {
             self.pending.clear();
         }
         combined.push_str(text);
+        self.source_seen_bytes = self.source_seen_bytes.saturating_add(combined.len());
+        self.source_signals.observe(&combined);
+        if self
+            .source_signals
+            .looks_like_large_source(self.source_seen_bytes)
+        {
+            self.source_like = true;
+        }
 
         let mut out = String::new();
         let mut start = 0;
@@ -4151,11 +4190,14 @@ impl CodexCommandOutputHygiene {
                 self.pending.push_str(tail);
             }
         }
+        if flush {
+            self.push_build_progress_summary(&mut out);
+        }
 
         if out.is_empty() {
-            None
+            self.filter_large_output(String::new(), flush)
         } else {
-            Some(out)
+            self.filter_large_output(out, flush)
         }
     }
 
@@ -4188,7 +4230,201 @@ impl CodexCommandOutputHygiene {
             self.suppressing_warning_diagnostic = false;
         }
 
+        if is_codex_build_progress_line(line) {
+            self.build_progress_seen += 1;
+            if self.build_progress_seen > CODEX_BUILD_PROGRESS_INLINE_LIMIT {
+                self.build_progress_suppressed += 1;
+                self.last_suppressed_build_progress = compact_codex_output_line(line);
+                if !self.build_progress_notice_emitted {
+                    if !out.ends_with('\n') && !out.is_empty() {
+                        out.push('\n');
+                    }
+                    out.push_str("[Intendant suppressed repetitive build progress from Codex command output]\n");
+                    self.build_progress_notice_emitted = true;
+                }
+                return;
+            }
+        }
+
         push_compact_codex_output_line(out, line);
+    }
+
+    fn push_build_progress_summary(&mut self, out: &mut String) {
+        if self.build_progress_suppressed == 0 {
+            return;
+        }
+        if !out.ends_with('\n') && !out.is_empty() {
+            out.push('\n');
+        }
+        let last = self.last_suppressed_build_progress.trim();
+        if last.is_empty() {
+            out.push_str(&format!(
+                "[Intendant suppressed {} repetitive build progress lines]\n",
+                self.build_progress_suppressed
+            ));
+        } else {
+            out.push_str(&format!(
+                "[Intendant suppressed {} repetitive build progress lines; last: {}]\n",
+                self.build_progress_suppressed, last
+            ));
+        }
+        self.build_progress_suppressed = 0;
+        self.last_suppressed_build_progress.clear();
+    }
+
+    fn filter_large_output(&mut self, text: String, flush: bool) -> Option<String> {
+        if text.is_empty() && !(flush && self.omitting_large_output) {
+            return None;
+        }
+
+        self.filtered_seen_bytes = self.filtered_seen_bytes.saturating_add(text.len());
+        let mut out = String::new();
+        if self.omitting_large_output {
+            self.push_tail(&text);
+        } else {
+            let inline_limit = self.inline_limit();
+            if self.filtered_seen_bytes <= inline_limit {
+                self.emitted_head_bytes = self.emitted_head_bytes.saturating_add(text.len());
+                out.push_str(&text);
+            } else {
+                let head_limit = self.head_limit();
+                let remaining_for_head = head_limit.saturating_sub(self.emitted_head_bytes);
+                let split_at = codex_char_boundary_at_or_before(&text, remaining_for_head);
+                out.push_str(&text[..split_at]);
+                self.emitted_head_bytes = self.emitted_head_bytes.saturating_add(split_at);
+                self.omitting_large_output = true;
+                self.push_tail(&text[split_at..]);
+                out.push_str(&codex_command_output_omission_start_notice(
+                    self.emitted_head_bytes,
+                ));
+            }
+        }
+
+        if flush && self.omitting_large_output {
+            out.push_str(&self.finish_large_output());
+        }
+
+        if out.is_empty() {
+            None
+        } else {
+            Some(out)
+        }
+    }
+
+    fn finish_large_output(&mut self) -> String {
+        let tail = std::mem::take(&mut self.tail);
+        let tail_bytes = tail.len();
+        let omitted_middle_bytes = self
+            .filtered_seen_bytes
+            .saturating_sub(self.emitted_head_bytes)
+            .saturating_sub(tail_bytes);
+        self.omitting_large_output = false;
+        let mut out = codex_command_output_omission_tail_notice(
+            self.filtered_seen_bytes,
+            self.emitted_head_bytes,
+            tail_bytes,
+            omitted_middle_bytes,
+        );
+        out.push_str(&tail);
+        out
+    }
+
+    fn inline_limit(&self) -> usize {
+        if self.source_like {
+            CODEX_COMMAND_SOURCE_OUTPUT_INLINE_LIMIT
+        } else {
+            CODEX_COMMAND_OUTPUT_INLINE_LIMIT
+        }
+    }
+
+    fn head_limit(&self) -> usize {
+        if self.source_like {
+            CODEX_COMMAND_SOURCE_OUTPUT_HEAD_LIMIT
+        } else {
+            CODEX_COMMAND_OUTPUT_HEAD_LIMIT
+        }
+    }
+
+    fn tail_limit(&self) -> usize {
+        if self.source_like {
+            CODEX_COMMAND_SOURCE_OUTPUT_TAIL_LIMIT
+        } else {
+            CODEX_COMMAND_OUTPUT_TAIL_LIMIT
+        }
+    }
+
+    fn push_tail(&mut self, text: &str) {
+        if text.is_empty() {
+            return;
+        }
+        self.tail.push_str(text);
+        let tail_limit = self.tail_limit();
+        if self.tail.len() <= tail_limit {
+            return;
+        }
+        let trim_to = self.tail.len().saturating_sub(tail_limit);
+        let split_at = codex_char_boundary_at_or_after(&self.tail, trim_to);
+        self.tail.drain(..split_at);
+    }
+}
+
+impl CodexCommandSourceSignals {
+    fn observe(&mut self, text: &str) {
+        if text.is_empty()
+            || self.observed_lines >= CODEX_COMMAND_SOURCE_OUTPUT_DETECTION_LINE_LIMIT
+        {
+            return;
+        }
+
+        for line in text.lines() {
+            if self.observed_lines >= CODEX_COMMAND_SOURCE_OUTPUT_DETECTION_LINE_LIMIT {
+                break;
+            }
+            self.observed_lines += 1;
+            let trimmed = codex_command_output_strip_source_line_prefix(line.trim());
+            if trimmed.is_empty() {
+                continue;
+            }
+
+            self.non_empty_lines += 1;
+            let code_like = codex_source_line_has_code_token(trimmed);
+            let markup_like = codex_source_line_has_markup_token(trimmed);
+            let style_like = codex_source_line_has_style_token(trimmed);
+            if code_like {
+                self.code_like_lines += 1;
+            }
+            if markup_like {
+                self.markup_like_lines += 1;
+            }
+            if style_like {
+                self.style_like_lines += 1;
+            }
+            if code_like || markup_like || style_like {
+                self.source_hint_lines += 1;
+            }
+            if codex_source_line_has_structural_token(trimmed) {
+                self.structural_lines += 1;
+            }
+        }
+    }
+
+    fn looks_like_large_source(&self, seen_bytes: usize) -> bool {
+        if seen_bytes <= CODEX_COMMAND_SOURCE_OUTPUT_DETECTION_MIN_BYTES
+            || self.non_empty_lines < 24
+        {
+            return false;
+        }
+
+        let code_density = self.code_like_lines * 100 / self.non_empty_lines;
+        let hint_density = self.source_hint_lines * 100 / self.non_empty_lines;
+        let structural_density = self.structural_lines * 100 / self.non_empty_lines;
+        (self.code_like_lines >= 8 && self.structural_lines >= 8 && code_density >= 20)
+            || (self.markup_like_lines >= 8 && self.structural_lines >= 8)
+            || (self.style_like_lines >= 8 && self.structural_lines >= 16)
+            || (self.source_hint_lines >= 16
+                && self.structural_lines >= 16
+                && hint_density >= 35
+                && structural_density >= 35)
     }
 }
 
@@ -4253,6 +4489,174 @@ fn truncate_middle_chars_with_notice(text: &str, max_chars: usize, label: &str) 
     let prefix: String = text.chars().take(head).collect();
     let suffix: String = text.chars().skip(total.saturating_sub(tail)).collect();
     format!("{prefix}{marker}{suffix}")
+}
+
+fn codex_command_output_omission_start_notice(shown_head_bytes: usize) -> String {
+    format!(
+        "\n\n[Intendant is omitting additional large command output; shown first {shown_head_bytes} bytes, final tail will be shown when the command completes]\n",
+    )
+}
+
+fn codex_command_output_omission_tail_notice(
+    total_bytes: usize,
+    head_bytes: usize,
+    tail_bytes: usize,
+    omitted_middle_bytes: usize,
+) -> String {
+    format!(
+        "\n\n[Intendant omitted {omitted_middle_bytes} bytes from the middle of {total_bytes} bytes of command output; shown head {head_bytes} bytes, final tail {tail_bytes} bytes]\n",
+    )
+}
+
+fn codex_command_output_strip_source_line_prefix(line: &str) -> &str {
+    let Some(rest) = codex_command_output_strip_numeric_line_prefix(line) else {
+        return codex_command_output_strip_path_line_prefix(line).unwrap_or(line);
+    };
+    rest
+}
+
+fn codex_command_output_strip_path_line_prefix(line: &str) -> Option<&str> {
+    let colon = line.find(':')?;
+    let prefix = &line[..colon];
+    if !(prefix.contains('/') || prefix.contains('.') || prefix.contains('\\')) {
+        return None;
+    }
+    let rest = &line[colon + 1..];
+    codex_command_output_strip_numeric_line_prefix(rest)
+}
+
+fn codex_command_output_strip_numeric_line_prefix(line: &str) -> Option<&str> {
+    let digit_count = line.bytes().take_while(u8::is_ascii_digit).count();
+    if digit_count == 0 || digit_count > 8 || digit_count >= line.len() {
+        return None;
+    }
+    let separator = line.as_bytes()[digit_count];
+    if !matches!(separator, b':' | b'\t' | b' ') {
+        return None;
+    }
+    Some(line[digit_count + 1..].trim_start())
+}
+
+fn is_codex_build_progress_line(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.is_empty() {
+        return false;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("warning:")
+        || lower.starts_with("warn:")
+        || lower.starts_with("error:")
+        || lower.starts_with("finished ")
+    {
+        return false;
+    }
+    if let Some(first) = trimmed.split_whitespace().next() {
+        if matches!(
+            first,
+            "Compiling" | "Checking" | "Building" | "Fresh" | "Downloading" | "Downloaded"
+        ) {
+            return true;
+        }
+    }
+    trimmed.starts_with("[INFO]:")
+        && (lower.contains("compiling")
+            || lower.contains("checking")
+            || lower.contains("installing wasm-bindgen"))
+}
+
+fn codex_source_line_has_code_token(line: &str) -> bool {
+    const TOKENS: &[&str] = &[
+        "fn ",
+        "impl ",
+        "pub ",
+        "struct ",
+        "enum ",
+        "use ",
+        "mod ",
+        "let ",
+        "const ",
+        "static ",
+        "async ",
+        "await",
+        "match ",
+        "if ",
+        "else",
+        "for ",
+        "while ",
+        "return ",
+        "function ",
+        "class ",
+        "import ",
+        "export ",
+        "type ",
+        "interface ",
+        "var ",
+        "=>",
+        "document.",
+        "window.",
+        "querySelector",
+        "addEventListener",
+    ];
+    TOKENS.iter().any(|token| line.contains(token))
+}
+
+fn codex_source_line_has_markup_token(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    if trimmed.starts_with('<') && trimmed.contains('>') {
+        return true;
+    }
+    trimmed.contains("</")
+        || trimmed.contains("<div")
+        || trimmed.contains("<span")
+        || trimmed.contains("<button")
+        || trimmed.contains("<script")
+        || trimmed.contains("<style")
+        || trimmed.contains("class=")
+        || trimmed.contains(" id=")
+}
+
+fn codex_source_line_has_style_token(line: &str) -> bool {
+    let trimmed = line.trim_start();
+    (trimmed.contains(':') && trimmed.ends_with(';'))
+        || (trimmed.ends_with('{')
+            && (trimmed.starts_with('.')
+                || trimmed.starts_with('#')
+                || trimmed.starts_with('@')
+                || trimmed.starts_with(":root")
+                || trimmed.contains(" .")
+                || trimmed.contains(" #")
+                || trimmed.contains(" {")))
+}
+
+fn codex_source_line_has_structural_token(line: &str) -> bool {
+    line.contains('{')
+        || line.contains('}')
+        || line.ends_with(';')
+        || line.ends_with(',')
+        || line.contains("=>")
+        || (line.contains('<') && line.contains('>'))
+}
+
+fn codex_char_boundary_at_or_before(text: &str, max_bytes: usize) -> usize {
+    if max_bytes >= text.len() {
+        return text.len();
+    }
+    let mut idx = max_bytes;
+    while idx > 0 && !text.is_char_boundary(idx) {
+        idx -= 1;
+    }
+    idx
+}
+
+fn codex_char_boundary_at_or_after(text: &str, min_bytes: usize) -> usize {
+    if min_bytes >= text.len() {
+        return text.len();
+    }
+    let mut idx = min_bytes;
+    while idx < text.len() && !text.is_char_boundary(idx) {
+        idx += 1;
+    }
+    idx
 }
 
 fn codex_command_output_hygiene_key(item_id: &str) -> String {
@@ -7146,6 +7550,154 @@ error: could not compile `demo`
     }
 
     #[test]
+    fn codex_command_output_hygiene_leaves_small_output_unchanged() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let input = "stdout line\nstderr: useful diagnostic\n";
+
+        let filtered = hygiene.filter(input, true).unwrap();
+
+        assert_eq!(filtered, input);
+    }
+
+    #[test]
+    fn codex_command_output_hygiene_collapses_repetitive_build_progress() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let mut input = String::from("[INFO]: Compiling to Wasm...\n");
+        for i in 0..40 {
+            input.push_str(&format!("   Compiling crate_{i} v0.1.0\n"));
+            input.push_str(&format!("    Checking helper_{i} v0.1.0\n"));
+        }
+        input.push_str(
+            "    Finished `test` profile [unoptimized + debuginfo] target(s) in 2m 17s\n",
+        );
+
+        let filtered = hygiene.filter(&input, true).unwrap();
+
+        assert!(filtered.contains("[INFO]: Compiling to Wasm"));
+        assert!(filtered.contains("Compiling crate_0"));
+        assert!(filtered.contains("Compiling crate_1"));
+        assert!(filtered.contains("suppressed repetitive build progress"));
+        assert!(filtered.contains("suppressed 77 repetitive build progress lines"));
+        assert!(filtered.contains("last: Checking helper_39 v0.1.0"));
+        assert!(filtered.contains("Finished `test` profile"));
+        assert!(!filtered.contains("Compiling crate_30"));
+        assert!(
+            filtered.len() < input.len() / 4,
+            "build progress should be compacted, got {} bytes from {}",
+            filtered.len(),
+            input.len()
+        );
+    }
+
+    #[test]
+    fn codex_command_output_hygiene_keeps_build_failure_after_progress() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let mut input = String::new();
+        for i in 0..30 {
+            input.push_str(&format!("   Compiling failing_crate_{i} v0.1.0\n"));
+        }
+        input.push_str("error: could not compile `failing_crate`\n");
+
+        let filtered = hygiene.filter(&input, true).unwrap();
+
+        assert!(filtered.contains("Compiling failing_crate_0"));
+        assert!(filtered.contains("suppressed repetitive build progress"));
+        assert!(filtered.contains("error: could not compile `failing_crate`"));
+        assert!(!filtered.contains("Compiling failing_crate_20"));
+    }
+
+    #[test]
+    fn codex_command_output_hygiene_compacts_large_static_app_html_source() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let input = large_static_app_html_js_output();
+
+        let filtered = hygiene.filter(&input, true).unwrap();
+
+        assert!(filtered.contains("<script>"));
+        assert!(filtered.contains("function renderStationRow0"));
+        assert!(filtered.contains("END_STATIC_APP_HTML_MARKER"));
+        assert!(filtered.contains("omitting additional large command output"));
+        assert!(filtered.contains("bytes from the middle"));
+        assert!(!filtered.contains("function renderStationRow80"));
+        assert!(
+            filtered.len()
+                <= CODEX_COMMAND_SOURCE_OUTPUT_HEAD_LIMIT
+                    + CODEX_COMMAND_SOURCE_OUTPUT_TAIL_LIMIT
+                    + 512,
+            "filtered output should stay bounded, got {} bytes",
+            filtered.len()
+        );
+    }
+
+    #[test]
+    fn translate_item_completed_compacts_large_command_output() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let output = large_static_app_html_js_output();
+        let params = serde_json::json!({
+            "item": {
+                "id": "item-static-app",
+                "type": "commandExecution",
+                "status": "completed",
+                "aggregatedOutput": output
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "item-static-app");
+                assert!(text.contains("function renderStationRow0"));
+                assert!(text.contains("END_STATIC_APP_HTML_MARKER"));
+                assert!(text.contains("bytes from the middle"));
+                assert!(
+                    text.len()
+                        <= CODEX_COMMAND_SOURCE_OUTPUT_HEAD_LIMIT
+                            + CODEX_COMMAND_SOURCE_OUTPUT_TAIL_LIMIT
+                            + 512,
+                    "translated output should stay bounded, got {} bytes",
+                    text.len()
+                );
+            }
+            other => panic!("expected ToolOutputDelta, got {:?}", other),
+        }
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "item-static-app");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn codex_command_output_hygiene_compacts_very_large_non_source_output() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let input = format!(
+            "BEGIN-LOG\n{}END-LOG\n",
+            (0..700)
+                .map(|i| format!("2026-06-06T12:00:{:02}Z INFO event number {i}\n", i % 60))
+                .collect::<String>()
+        );
+
+        let filtered = hygiene.filter(&input, true).unwrap();
+
+        assert!(filtered.contains("BEGIN-LOG"));
+        assert!(filtered.contains("END-LOG"));
+        assert!(filtered.contains("omitting additional large command output"));
+        assert!(filtered.contains("bytes from the middle"));
+        assert!(
+            filtered.len()
+                <= CODEX_COMMAND_OUTPUT_HEAD_LIMIT + CODEX_COMMAND_OUTPUT_TAIL_LIMIT + 512,
+            "generic large output should stay bounded, got {} bytes",
+            filtered.len()
+        );
+    }
+
+    #[test]
     fn translate_output_delta_suppresses_warning_flood_but_keeps_errors() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let mut state = CodexNotificationState::default();
@@ -7184,6 +7736,17 @@ error: could not compile `demo`
         assert!(!joined.contains("warning: noisy diagnostic 4"));
         assert!(joined.contains("suppressed additional repeated warning diagnostics"));
         assert!(joined.contains("error: build failed"));
+    }
+
+    fn large_static_app_html_js_output() -> String {
+        let mut output = String::from("<div id=\"app\"></div>\n<script>\n");
+        for i in 0..120 {
+            output.push_str(&format!(
+                "function renderStationRow{i}(station) {{\n  const label = station.name || 'station-{i}';\n  const node = document.querySelector('#station-{i}');\n  if (node) {{\n    node.addEventListener('click', () => window.dispatchEvent(new CustomEvent('station-select', {{ detail: label }})));\n  }}\n  return label;\n}}\n"
+            ));
+        }
+        output.push_str("</script>\nEND_STATIC_APP_HTML_MARKER\n");
+        output
     }
 
     #[test]
