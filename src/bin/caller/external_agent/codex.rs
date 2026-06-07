@@ -73,6 +73,7 @@ const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
 pub(crate) const CODEX_FAST_SERVICE_TIER: &str = "priority";
 const CODEX_DANGER_FULL_ACCESS_SANDBOX: &str = "danger-full-access";
 const CODEX_NEVER_APPROVAL_POLICY: &str = "never";
+const CODEX_INHERIT_MCP_SERVERS_ENV: &str = "INTENDANT_CODEX_INHERIT_MCP_SERVERS";
 
 /// Codex-specific thread-action helpers. Each wraps one of Codex's app-server
 /// JSON-RPC methods (`thread/compact/start`, `thread/fork`, `thread/inject_items`,
@@ -1083,6 +1084,78 @@ struct PendingApproval {
 /// enough once `/side` can start while the parent turn is still running.
 type ActiveTurns = Arc<Mutex<HashMap<String, String>>>;
 
+fn codex_mcp_server_names_from_home(home: &Path) -> Vec<String> {
+    let Ok(config) = std::fs::read_to_string(home.join("config.toml")) else {
+        return Vec::new();
+    };
+    codex_mcp_server_names_from_config_toml(&config)
+}
+
+fn codex_mcp_server_names_from_config_toml(config: &str) -> Vec<String> {
+    let Ok(value) = config.parse::<toml::Value>() else {
+        return Vec::new();
+    };
+    let Some(servers) = value.get("mcp_servers").and_then(|value| value.as_table()) else {
+        return Vec::new();
+    };
+
+    let mut names: Vec<String> = servers
+        .keys()
+        .filter_map(|name| {
+            let trimmed = name.trim();
+            if trimmed.eq_ignore_ascii_case("intendant") {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        })
+        .collect();
+    names.sort();
+    names
+}
+
+fn codex_mcp_server_disable_override(server_names: &[String]) -> Option<String> {
+    if server_names.is_empty() {
+        return None;
+    }
+    let servers = server_names
+        .iter()
+        .map(|name| format!("{}={{enabled=false}}", codex_toml_inline_key(name)))
+        .collect::<Vec<_>>()
+        .join(",");
+    Some(format!("mcp_servers={{{servers}}}"))
+}
+
+fn codex_toml_inline_key(name: &str) -> String {
+    if codex_mcp_server_name_can_be_toml_bare_key(name) {
+        name.to_string()
+    } else {
+        toml::Value::String(name.to_string()).to_string()
+    }
+}
+
+fn codex_mcp_server_name_can_be_toml_bare_key(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'-'))
+}
+
+fn inherit_configured_codex_mcp_servers() -> bool {
+    std::env::var(CODEX_INHERIT_MCP_SERVERS_ENV)
+        .ok()
+        .as_deref()
+        .map(codex_inherit_mcp_servers_env_value)
+        .unwrap_or(false)
+}
+
+fn codex_inherit_mcp_servers_env_value(value: &str) -> bool {
+    matches!(
+        value.trim().to_ascii_lowercase().as_str(),
+        "1" | "true" | "yes" | "on" | "inherit" | "all"
+    )
+}
+
 // ---------------------------------------------------------------------------
 // CodexAgent
 // ---------------------------------------------------------------------------
@@ -1500,14 +1573,30 @@ impl CodexAgent {
         }
     }
 
+    fn configured_codex_mcp_server_names(&self) -> Vec<String> {
+        if inherit_configured_codex_mcp_servers() {
+            return Vec::new();
+        }
+        self.codex_home
+            .as_deref()
+            .map(codex_mcp_server_names_from_home)
+            .unwrap_or_default()
+    }
+
     fn app_server_args(&self, effective_web_port: u16) -> Vec<String> {
         let mcp_url = self.intendant_mcp_url(effective_web_port);
         let mut args: Vec<String> = Vec::new();
         if self.sandbox.trim() == CODEX_DANGER_FULL_ACCESS_SANDBOX {
             args.push("--dangerously-bypass-approvals-and-sandbox".to_string());
         }
+        args.push("app-server".to_string());
+        if let Some(disable_override) =
+            codex_mcp_server_disable_override(&self.configured_codex_mcp_server_names())
+        {
+            args.push("-c".to_string());
+            args.push(disable_override);
+        }
         args.extend([
-            "app-server".to_string(),
             "-c".to_string(),
             "mcp_servers.intendant.type=\"http\"".to_string(),
             "-c".to_string(),
@@ -10042,6 +10131,102 @@ error: build failed
             .iter()
             .any(|arg| arg == "--dangerously-bypass-approvals-and-sandbox"));
         assert!(!args.iter().any(|arg| arg.starts_with("approval_policy=")));
+    }
+
+    #[test]
+    fn app_server_args_disable_unrelated_codex_mcp_servers_from_codex_home() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[mcp_servers.linear]
+command = "linear-mcp"
+
+[mcp_servers.notion]
+command = "notion-mcp"
+
+[mcp_servers."linear.com"]
+command = "linear-mcp"
+
+[mcp_servers.intendant]
+type = "http"
+url = "http://stale.example.invalid/mcp"
+"#,
+        )
+        .unwrap();
+        let mut agent = test_agent();
+        agent.codex_home = Some(tmp.path().to_path_buf());
+
+        let args = agent.app_server_args(8765);
+
+        assert_eq!(args.first().map(String::as_str), Some("app-server"));
+        assert!(args
+            .iter()
+            .any(|arg| arg
+                == "mcp_servers={linear={enabled=false},\"linear.com\"={enabled=false},notion={enabled=false}}"));
+        assert!(!args
+            .iter()
+            .any(|arg| arg == "mcp_servers.intendant.enabled=false"));
+        assert!(args
+            .iter()
+            .any(|arg| arg == "mcp_servers.intendant.type=\"http\""));
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.intendant.url=\"http://localhost:8765/mcp?managed_context=vanilla&tool_profile=core\""
+        }));
+    }
+
+    #[test]
+    fn codex_mcp_server_names_from_config_toml_filters_intendant_and_keeps_quoted_keys() {
+        let names = codex_mcp_server_names_from_config_toml(
+            r#"
+[mcp_servers.slack]
+command = "slack-mcp"
+
+[mcp_servers."linear.com"]
+command = "linear-mcp"
+
+[mcp_servers.intendant]
+type = "http"
+
+[mcp_servers.asana-prod]
+command = "asana-mcp"
+"#,
+        );
+
+        assert_eq!(
+            names,
+            vec![
+                "asana-prod".to_string(),
+                "linear.com".to_string(),
+                "slack".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn codex_mcp_server_disable_override_quotes_non_bare_keys() {
+        let names = vec![
+            "asana-prod".to_string(),
+            "linear.com".to_string(),
+            "gmail workspace".to_string(),
+        ];
+
+        assert_eq!(
+            codex_mcp_server_disable_override(&names).as_deref(),
+            Some(
+                "mcp_servers={asana-prod={enabled=false},\"linear.com\"={enabled=false},\"gmail workspace\"={enabled=false}}"
+            )
+        );
+    }
+
+    #[test]
+    fn codex_inherit_mcp_servers_env_value_requires_explicit_truthy_value() {
+        for value in ["1", "true", "yes", "on", "inherit", "all", " TRUE "] {
+            assert!(codex_inherit_mcp_servers_env_value(value), "{value}");
+        }
+        for value in ["", "0", "false", "no", "off", "intendant"] {
+            assert!(!codex_inherit_mcp_servers_env_value(value), "{value}");
+        }
     }
 
     #[test]
