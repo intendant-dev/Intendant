@@ -17428,6 +17428,18 @@ function stationHandleControlsAction(action) {
     window.toggleUserDisplay?.();
     return;
   }
+  if (op === 'display-list') {
+    stationLoadLocalDisplaysForDock(true);
+    return;
+  }
+  if (op === 'peer-status-copy') {
+    stationCopyPeerDisplayStatusFromDock();
+    return;
+  }
+  if (op === 'shared-view-focus') {
+    stationFocusSharedViewDisplayFromDock();
+    return;
+  }
   if (op === 'voice-active') {
     document.getElementById('makeActiveBtn')?.click();
     return;

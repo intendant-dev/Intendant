@@ -1952,7 +1952,12 @@ impl StationInner {
                 yy + 92.0,
                 122.0,
                 22.0,
-                HitAction::OpenDisplay(host.id.clone()),
+                HitAction::OpenDisplay {
+                    host_id: host.id.clone(),
+                    display_id: source
+                        .map(|source| source.display_id.clone())
+                        .unwrap_or_else(|| "0".to_string()),
+                },
             ));
             self.pill_at(
                 x + 188.0,
@@ -3084,10 +3089,7 @@ impl StationInner {
 
     fn draw_peers_info(&mut self, x: f32, y: f32, panel_w: f32) {
         let hosts = self.snapshot.hosts.clone();
-        let local_host_id = hosts
-            .first()
-            .map(|host| host.id.clone())
-            .unwrap_or_else(|| "local".to_string());
+        let controls = self.snapshot.controls.clone();
         let displays = self
             .display_sources
             .values()
@@ -3131,18 +3133,65 @@ impl StationInner {
         self.panel_row(x, yy, "peers", &hosts.len().saturating_sub(1).to_string());
         yy += 22.0;
         self.panel_row(x, yy, "streams", &displays.len().to_string());
+        yy += 22.0;
+        let shared_view_label = if controls.shared_view_visible {
+            nonempty(&controls.shared_view_target, "active")
+        } else {
+            "none".to_string()
+        };
+        self.panel_row(x, yy, "shared", &shared_view_label);
         yy += 30.0;
         self.section_title_color(x, yy, "Display controls", C_PEACH_CSS);
         yy += 22.0;
-        self.pill_at(x + 14.0, yy - 14.0, 96.0, 21.0, "share local", C_PEACH_CSS);
-        self.hit_zones.push(HitZone::new(
-            x + 14.0,
-            yy - 14.0,
-            96.0,
-            21.0,
-            HitAction::OpenDisplay(local_host_id),
-        ));
-        yy += 30.0;
+        let mut display_actions = vec![
+            (
+                "display-toggle".to_string(),
+                if controls.display_access.starts_with("on") {
+                    "revoke local".to_string()
+                } else {
+                    "share local".to_string()
+                },
+                100.0,
+                C_PEACH_CSS.to_string(),
+            ),
+            (
+                "display-list".to_string(),
+                "list displays".to_string(),
+                98.0,
+                C_BLUE_CSS.to_string(),
+            ),
+            (
+                "peer-status-copy".to_string(),
+                "copy status".to_string(),
+                94.0,
+                C_TEAL_CSS.to_string(),
+            ),
+        ];
+        if controls.shared_view_visible {
+            display_actions.push((
+                "shared-view-focus".to_string(),
+                "focus shared".to_string(),
+                104.0,
+                C_GREEN_CSS.to_string(),
+            ));
+        }
+        if controls.shared_view_can_take_input {
+            display_actions.push((
+                "shared-view-take-input".to_string(),
+                "take input".to_string(),
+                88.0,
+                C_GREEN_CSS.to_string(),
+            ));
+        }
+        if controls.shared_view_visible {
+            display_actions.push((
+                "shared-view-hide".to_string(),
+                "hide shared".to_string(),
+                94.0,
+                C_YELLOW_CSS.to_string(),
+            ));
+        }
+        yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &display_actions);
         self.section_title(x, yy, "Hosts");
         yy += 18.0;
         for host in hosts.iter().take(7) {
@@ -3193,7 +3242,10 @@ impl StationInner {
                     yy - 13.0,
                     panel_w - 24.0,
                     18.0,
-                    HitAction::OpenDisplay(host_id.clone()),
+                    HitAction::OpenDisplay {
+                        host_id: host_id.clone(),
+                        display_id: display_id.clone(),
+                    },
                 ));
                 yy += 20.0;
             }
@@ -4754,9 +4806,13 @@ impl StationInner {
                     "approval_id": approval_id,
                     "decision": decision,
             })),
-            HitAction::OpenDisplay(host_id) => Some(serde_json::json!({
+            HitAction::OpenDisplay {
+                host_id,
+                display_id,
+            } => Some(serde_json::json!({
                     "type": "open_display",
                     "host_id": host_id,
+                    "display_id": display_id,
             })),
             HitAction::Navigate { tab, subtab } => Some(serde_json::json!({
                     "type": "navigate",
@@ -5961,7 +6017,10 @@ enum HitAction {
         approval_id: String,
         decision: String,
     },
-    OpenDisplay(String),
+    OpenDisplay {
+        host_id: String,
+        display_id: String,
+    },
     Navigate {
         tab: String,
         subtab: Option<String>,
