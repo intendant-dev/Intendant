@@ -13099,6 +13099,106 @@ async function stationCopyActivityEventJson(ev) {
   showControlToast?.('success', 'Copied Station activity event JSON');
 }
 
+function stationActivityContinuityPayload(activityState) {
+  const allEvents = activityState?.allEvents || [];
+  const events = activityState?.events || [];
+  const latestVisible = events.at(-1) || null;
+  const latestRetained = allEvents.at(-1) || null;
+  const latest = latestVisible || latestRetained || null;
+  const context = stationBuildContextSummary();
+  const managed = stationBuildManagedSummary(context);
+  const controls = stationBuildControlsSummary();
+  const targetSessionId = String(
+    latest?.sessionId ||
+    latest?.session_id ||
+    controls.sessionId ||
+    context.sessionId ||
+    managed.sessionId ||
+    ''
+  ).trim();
+  return {
+    generated_at: new Date().toISOString(),
+    filters: {
+      host: activityState?.hostFilter || '',
+      level: activityState?.levelFilter || '',
+      source: activityState?.sourceFilter || '',
+      query: activityState?.query || '',
+      shown: events.length,
+      retained: allEvents.length,
+    },
+    latest: latest ? {
+      id: stationActivityEventKey(latest),
+      visible: latest === latestVisible,
+      time: latest.ts || '',
+      level: stationActivityLevelFor(latest),
+      source: stationActivitySourceFor(latest),
+      session_id: latest.sessionId || latest.session_id || '',
+      managed_signal: stationActivityEventIsManaged(latest),
+      text: stationActivityEventCopyText(latest),
+    } : null,
+    signals: {
+      visible_managed: events.filter(stationActivityEventIsManaged).length,
+      visible_sources: stationActivityTopSummary(events, stationActivitySourceFor),
+      visible_levels: stationActivityTopSummary(events, stationActivityLevelFor),
+    },
+    context: {
+      source: context.source || '',
+      session_id: context.sessionId || '',
+      used_tokens: context.tokens || 0,
+      effective_window: context.effectiveWindow || 0,
+      status: managed.status || '',
+    },
+    managed: {
+      session_id: managed.sessionId || '',
+      mode: managed.mode || '',
+      status: managed.status || '',
+      readiness: stationOperationsManagedReadiness(managed),
+      anchors: managed.anchors || 0,
+      records: managed.records || 0,
+      rewind_only: !!managed.rewindOnly,
+    },
+    target: {
+      session_id: targetSessionId,
+      label: stationSessionShortLabel(targetSessionId) || '',
+      source: controls.sessionSource || '',
+      active: !!controls.sessionActive,
+    },
+  };
+}
+
+async function stationCopyActivityContinuityPayload(activityState) {
+  await copyTextToClipboard(JSON.stringify(stationActivityContinuityPayload(activityState), null, 2));
+  showControlToast?.('success', 'Activity continuity JSON copied');
+}
+
+function stationOpenManagedFromActivityContinuity(payload) {
+  if (payload.latest?.managed_signal) {
+    stationOpenManagedFromActivity({ sessionId: payload.latest.session_id, msg: payload.latest.text, source: payload.latest.source });
+    return;
+  }
+  if (payload.managed.session_id) stationSetManagedSession(payload.managed.session_id);
+  stationRenderManagedDock(payload.managed.rewind_only ? 'rewind' : '');
+}
+
+function stationRenderActivityContinuitySection(parent, activityState) {
+  const payload = stationActivityContinuityPayload(activityState);
+  const section = stationDockSection(parent, 'Activity continuity');
+  stationDockRow(section, 'latest', payload.latest ? `${payload.latest.level} / ${payload.latest.source} / ${compactSessionText(payload.latest.text)}` : 'no retained event');
+  stationDockRow(section, 'filters', `${payload.filters.shown} shown / ${payload.filters.retained} retained${payload.filters.query ? ` / "${payload.filters.query}"` : ''}`);
+  stationDockRow(section, 'signals', `${payload.signals.visible_managed} managed / ${payload.signals.visible_levels}`);
+  stationDockRow(section, 'context', payload.context.effective_window ? `${stationCompactNumber(payload.context.used_tokens)} / ${stationCompactNumber(payload.context.effective_window)} tokens` : '--');
+  stationDockRow(section, 'target', payload.target.label || payload.target.session_id || '--');
+  stationDockActions(section, [
+    payload.latest ? { label: 'Pin latest', primary: true, onClick: () => stationRenderActivityDock(payload.latest.id) } : null,
+    payload.latest ? { label: 'Show latest', onClick: () => focusActivityLogEvent(payload.latest.id) } : null,
+    { label: 'Context', onClick: () => stationRenderContextDock(stationSelectedContextPart) },
+    { label: 'Managed', onClick: () => stationOpenManagedFromActivityContinuity(payload) },
+    payload.target.session_id ? { label: 'Session', onClick: () => stationRenderSessionsDock(payload.target.session_id) } : null,
+    { label: 'Operations', onClick: () => stationRenderControlsDock('overview') },
+    { label: 'Copy JSON', onClick: () => stationCopyActivityContinuityPayload(activityState) },
+  ]);
+}
+
 function stationRenderActivityDetailSection(parent, events, focusId = '') {
   const id = String(focusId || '').trim();
   if (!id) return;
@@ -13174,6 +13274,7 @@ function stationRenderActivityDock(focusId = '') {
   stationDockRow(triage, 'levels', stationActivityTopSummary(events, stationActivityLevelFor));
   stationDockRow(triage, 'sources', stationActivityTopSummary(events, stationActivitySourceFor));
   stationDockRow(triage, 'host', hostFilter || 'all');
+  stationRenderActivityContinuitySection(body, { allEvents, events, hostFilter, levelFilter, sourceFilter, query: stationActivityDockFilter.trim() });
   stationRenderActivityDetailSection(body, events, focusId);
   const list = stationDockSection(body, 'Recent events');
   if (!events.length) {
