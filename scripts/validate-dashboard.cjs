@@ -720,25 +720,54 @@ function checkClassicScriptSyntax(source, filename) {
 }
 
 function checkModuleSyntax(source, filename) {
-  const result = spawnSync(process.execPath, ['--check', '--input-type=module', '-'], {
-    input: source,
-    encoding: 'utf8',
-    maxBuffer: 1024 * 1024,
-  });
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), 'validate-dashboard-module-'));
+  const tempFile = path.join(tempDir, 'inline-script.mjs');
+  const tempFileAliases = [tempFile];
+  let result;
+  try {
+    fs.writeFileSync(tempFile, source, 'utf8');
+    tempFileAliases.push(fs.realpathSync(tempFile));
+    result = spawnSync(process.execPath, ['--check', tempFile], {
+      encoding: 'utf8',
+      maxBuffer: 4 * 1024 * 1024,
+    });
+  } finally {
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
   if (result.error) {
     throw new Error(`module inline script syntax check failed in ${filename}: ${result.error.message}`);
   }
   if (result.status !== 0) {
-    const details = firstMeaningfulLine(result.stderr || result.stdout || `node exited ${result.status}`);
+    const details = nodeSyntaxCheckDetails(result, tempFileAliases);
     throw new Error(`module inline script syntax check failed in ${filename}: ${details}`);
   }
 }
 
-function firstMeaningfulLine(text) {
-  return String(text)
+function nodeSyntaxCheckDetails(result, tempFileAliases) {
+  const fallback = result.signal
+    ? `node terminated by ${result.signal}`
+    : `node exited ${result.status}`;
+  const lines = String(result.stderr || result.stdout || fallback)
     .split(/\r?\n/)
     .map((line) => line.trim())
-    .find(Boolean) || 'syntax check failed';
+    .filter(Boolean);
+  const locationLine = lines
+    .map((line) => replaceFirstPathAlias(line, tempFileAliases, 'inline module'))
+    .find((line) => line !== undefined);
+  const parserLine = lines.find((line) => /^[A-Za-z]+Error:/.test(line));
+  if (locationLine && parserLine) {
+    return `${locationLine}: ${parserLine}`;
+  }
+  return lines[0] || fallback;
+}
+
+function replaceFirstPathAlias(line, aliases, replacement) {
+  for (const alias of aliases) {
+    if (alias && line.includes(alias)) {
+      return line.replace(alias, replacement);
+    }
+  }
+  return undefined;
 }
 
 function recordChildOutput(stream, logs, kind) {
@@ -2047,13 +2076,14 @@ async function runSelfTest() {
   assert.strictEqual(inlineScripts[1].goal, 'module');
   checkClassicScriptSyntax(inlineScripts[0].source, 'self-test-classic');
   checkModuleSyntax(inlineScripts[1].source, 'self-test-module');
+  checkModuleSyntax(`${'void 0;\n'.repeat(100000)}export const ok = true;`, 'self-test-large-module');
   assert.throws(
     () => checkClassicScriptSyntax(inlineScripts[1].source, 'self-test-classic-import'),
     /Cannot use import statement|Unexpected identifier|import declarations/i,
   );
   assert.throws(
     () => checkModuleSyntax('import x from "./missing.js"; const broken = ;', 'self-test-module-broken'),
-    /module inline script syntax check failed/,
+    /module inline script syntax check failed.*(SyntaxError|Unexpected token)/,
   );
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
   assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
