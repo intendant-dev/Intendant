@@ -1141,7 +1141,7 @@ impl SessionSupervisor {
                     }
                 }
                 let (ready_tx, ready_rx) = oneshot::channel();
-                let log_dir = session_log::SessionLog::resolve_path(None);
+                let log_dir = external_resume_log_dir(&session_id, force_new);
                 let session_log = match session_log::SessionLog::open(log_dir.clone()) {
                     Ok(log) => Arc::new(Mutex::new(log)),
                     Err(e) => {
@@ -1248,7 +1248,7 @@ impl SessionSupervisor {
                 }
             }
         } else {
-            session_log::SessionLog::resolve_path(None)
+            external_resume_log_dir(&session_id, force_new)
         };
         let session_log = match session_log::SessionLog::open(log_dir.clone()) {
             Ok(log) => Arc::new(Mutex::new(log)),
@@ -3597,6 +3597,15 @@ fn emit_follow_up_status(
     });
 }
 
+fn external_resume_log_dir(session_id: &str, force_new: bool) -> PathBuf {
+    if !force_new {
+        if let Some(dir) = session_log::SessionLog::find_session_by_id(session_id) {
+            return dir;
+        }
+    }
+    session_log::SessionLog::resolve_path(None)
+}
+
 fn spawn_text_steer_fallback(
     bus: EventBus,
     mut ack_rx: tokio::sync::broadcast::Receiver<AppEvent>,
@@ -3959,6 +3968,17 @@ mod tests {
         assert!(!state.mark_external_attach_requested(&duplicate_by_resume));
         state.clear_external_attach_requested(&first);
         assert!(state.mark_external_attach_requested(&duplicate_by_resume));
+    }
+
+    #[test]
+    fn external_resume_log_dir_reuses_requested_wrapper_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let wrapper_dir = dir.path().join("wrapper-session");
+        let log = session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+        log.write_meta(Some(dir.path()), Some("previous external task"));
+
+        let resolved = external_resume_log_dir(wrapper_dir.to_str().unwrap(), false);
+        assert_eq!(resolved, wrapper_dir);
     }
 
     #[tokio::test]
