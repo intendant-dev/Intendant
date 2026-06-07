@@ -6486,7 +6486,10 @@ impl IntendantServer {
             .map(str::to_string);
         if let Some(session_id) = session_id {
             let target_phase = self.target_session_phase(&session_id).await;
-            if target_phase.is_none()
+            let target_accepts_follow_up = target_phase
+                .as_ref()
+                .is_some_and(target_phase_accepts_follow_up);
+            if !target_accepts_follow_up
                 && params.reference_frame_ids.is_empty()
                 && params.display_target.is_none()
             {
@@ -6519,7 +6522,7 @@ impl IntendantServer {
                             session_id, source
                         );
                     }
-                    PersistedStartTarget::NonExternal if target_phase.is_none() => {
+                    PersistedStartTarget::NonExternal if !target_accepts_follow_up => {
                         return format!(
                             "Cannot start task: session {} is not active in this daemon and is not a persisted external-agent wrapper; use resume/restart from the dashboard or start a new session",
                             session_id
@@ -6528,7 +6531,8 @@ impl IntendantServer {
                     PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => {}
                 }
             }
-            if let Some(phase) = target_phase.filter(|phase| is_terminal_phase(phase)) {
+            if let Some(phase) = target_phase.filter(|phase| !target_phase_accepts_follow_up(phase))
+            {
                 return format!(
                     "Cannot start task: session {} is not active (phase {}); use restart/resume before sending a follow-up",
                     session_id,
@@ -6582,8 +6586,8 @@ impl IntendantServer {
     }
 }
 
-fn is_terminal_phase(phase: &Phase) -> bool {
-    matches!(phase, Phase::Done | Phase::Interrupted)
+fn target_phase_accepts_follow_up(phase: &Phase) -> bool {
+    !matches!(phase, Phase::Idle | Phase::Done | Phase::Interrupted)
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9721,6 +9725,131 @@ mod tests {
                         Some(project_root.to_string_lossy().as_ref())
                     );
                     assert_eq!(task.as_deref(), Some("continue managed station work"));
+                    assert_eq!(direct, Some(true));
+                    assert!(attachments.is_empty());
+                    assert_eq!(agent_command.as_deref(), Some("/tmp/patched-codex"));
+                    assert_eq!(codex_sandbox.as_deref(), Some("danger-full-access"));
+                    assert_eq!(codex_approval_policy.as_deref(), Some("never"));
+                    assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+                    assert_eq!(codex_context_archive.as_deref(), Some("summary"));
+                }
+                other => panic!("expected ResumeSession control event, got {other:?}"),
+            }
+
+            match prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prior_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        });
+    }
+
+    #[test]
+    fn start_task_resumes_known_idle_persisted_external_wrapper_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            let prior_home = std::env::var_os("HOME");
+            let prior_userprofile = std::env::var_os("USERPROFILE");
+            let home = tempdir().unwrap();
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+
+            let wrapper_session_id = "540b8411-4fd1-4210-9374-c9d58430f6e6";
+            let backend_session_id = "019ea0a9-92fc-7471-85d8-0a281fc54250";
+            let project_root = home.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let wrapper_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(wrapper_session_id);
+            {
+                let mut log = crate::session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+                log.write_meta(Some(&project_root), Some("previous external task"));
+                log.session_identity(wrapper_session_id, "codex", backend_session_id);
+            }
+            crate::session_config::write_log_dir_config(
+                &wrapper_dir,
+                &crate::session_config::SessionAgentConfig {
+                    source: Some("codex".to_string()),
+                    agent_command: Some("/tmp/patched-codex".to_string()),
+                    codex_sandbox: Some("danger-full-access".to_string()),
+                    codex_approval_policy: Some("never".to_string()),
+                    codex_managed_context: Some("managed".to_string()),
+                    codex_context_archive: Some("summary".to_string()),
+                    codex_service_tier: None,
+                    codex_home: Some(home.path().join(".codex").to_string_lossy().to_string()),
+                },
+            )
+            .unwrap();
+
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 0,
+                        phase: "idle".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: wrapper_session_id.to_string(),
+                        task: "previous external task".to_string(),
+                    },
+                );
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue idle wrapper",
+                        "orchestrate": false
+                    }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch resume for an idle persisted external wrapper");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains("ok (session resume dispatched"),
+                "got: {rendered}"
+            );
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::ResumeSession {
+                    source,
+                    session_id,
+                    resume_id,
+                    project_root: resumed_project_root,
+                    task,
+                    direct,
+                    attachments,
+                    agent_command,
+                    codex_sandbox,
+                    codex_approval_policy,
+                    codex_managed_context,
+                    codex_context_archive,
+                }))) => {
+                    assert_eq!(source, "codex");
+                    assert_eq!(session_id, wrapper_session_id);
+                    assert_eq!(resume_id.as_deref(), Some(backend_session_id));
+                    assert_eq!(
+                        resumed_project_root.as_deref(),
+                        Some(project_root.to_string_lossy().as_ref())
+                    );
+                    assert_eq!(task.as_deref(), Some("continue idle wrapper"));
                     assert_eq!(direct, Some(true));
                     assert!(attachments.is_empty());
                     assert_eq!(agent_command.as_deref(), Some("/tmp/patched-codex"));
