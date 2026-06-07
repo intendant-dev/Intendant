@@ -11535,6 +11535,12 @@ function stationCommandEntries() {
       },
     },
     {
+      label: 'Project runway',
+      detail: 'Reconcile current project root, launch draft, sessions, and worktrees',
+      tokens: 'project root cwd worktree launch draft sessions runway',
+      run: () => stationRenderWorktreesDock('project'),
+    },
+    {
       label: 'Session family',
       detail: 'Open parent, side, fork, and sub-agent relationships for the current target',
       tokens: 'session family relationships parent child side fork subagent topology',
@@ -17059,6 +17065,163 @@ function stationWorktreeDetailRowsForDock(wt) {
   return rows;
 }
 
+function stationProjectRunwayWorktreeForPath(worktrees, path) {
+  const target = String(path || '').trim();
+  if (!target) return null;
+  return (worktrees || []).find(wt => String(wt?.path || '').trim() === target)
+    || (worktrees || []).find(wt => {
+      const base = String(wt?.path || '').trim();
+      return base && target.startsWith(base + '/');
+    })
+    || null;
+}
+
+function stationProjectRunwayAddLane(lanes, seen, lane) {
+  const path = String(lane?.path || '').trim();
+  if (!path || seen.has(`${lane.type}:${path}`)) return;
+  seen.add(`${lane.type}:${path}`);
+  lanes.push({ ...lane, path });
+}
+
+function stationProjectRunwayPayload() {
+  const worktrees = stationWorktreeRowsForDock();
+  const summary = stationBuildWorktreesSummary();
+  const lanes = [];
+  const seen = new Set();
+  const addLane = lane => {
+    const wt = stationProjectRunwayWorktreeForPath(worktrees, lane.path);
+    stationProjectRunwayAddLane(lanes, seen, {
+      ...lane,
+      worktree: wt ? {
+        branch: wt.branch || wt.head_short || '',
+        repo: wt.repo_name || '',
+        safety: wt.safety || '',
+        dirty: !!wt.dirty,
+        active_sessions: stationNum(wt.active_sessions || 0),
+        cleanup: !!wt.safe_to_remove,
+        bytes: stationNum(wt.size_bytes || 0),
+      } : null,
+    });
+  };
+  addLane({
+    type: 'current',
+    label: 'Current project root',
+    source: 'daemon',
+    path: dashboardProjectRoot || '',
+  });
+  addLane({
+    type: 'launch',
+    label: 'Launch draft',
+    source: 'new session',
+    path: stationLaunchDraftProject(),
+  });
+  const { sessions } = stationCollectSessionSet();
+  const recentSessions = [...sessions]
+    .sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))
+    .slice(0, 12);
+  for (const session of recentSessions) {
+    const project = sessionProjectDirectory(session);
+    if (!project) continue;
+    addLane({
+      type: 'session',
+      label: stationSessionTask(session) || stationSessionShortLabel(stationSessionId(session)) || 'Recent session',
+      source: stationSessionSource(session) || 'session',
+      path: project,
+      session_id: stationSessionId(session),
+      updated: formatContextTimestamp(session?.updated_at || session?.updatedAt || session?.changed_at || session?.changedAt || session?.created_at || session?.createdAt),
+    });
+    if (lanes.filter(lane => lane.type === 'session').length >= 5) break;
+  }
+  for (const wt of [...worktrees]
+    .sort((a, b) => worktreeRiskRank(b) - worktreeRiskRank(a) || stationNum(b?.size_bytes) - stationNum(a?.size_bytes))
+    .slice(0, 5)) {
+    addLane({
+      type: wt.safe_to_remove ? 'cleanup' : 'worktree',
+      label: wt.branch || wt.head_short || '(unknown ref)',
+      source: wt.repo_name || 'worktree',
+      path: wt.path || '',
+    });
+  }
+  return {
+    generated_at: new Date().toISOString(),
+    current_project_root: dashboardProjectRoot || '',
+    launch_project: stationLaunchDraftProject(),
+    scan_status: summary.worktreeScanStatus || 'cold',
+    worktrees: summary.worktrees || 0,
+    dirty: summary.worktreeDirty || 0,
+    active: summary.worktreeActive || 0,
+    cleanup: summary.worktreeCleanup || 0,
+    lanes: lanes.slice(0, 12),
+  };
+}
+
+function stationUseProjectRunwayPath(path) {
+  const target = String(path || '').trim();
+  if (!target) return;
+  stationLaunchDraft.project = target;
+  const input = document.getElementById('new-session-project-root');
+  if (input) {
+    input.value = target;
+    scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
+  }
+  stationOpenSessionLaunchDock({ focus: 'project', useActivityDraft: false });
+}
+
+function stationFilterSessionsByProject(path) {
+  const target = String(path || '').trim();
+  stationSessionDockProjectFilter = target;
+  stationRenderSessionsDock();
+}
+
+async function stationCopyProjectRunwayPayload(payload = stationProjectRunwayPayload()) {
+  await copyTextToClipboard(JSON.stringify(payload, null, 2));
+  showControlToast?.('success', 'Project runway JSON copied');
+}
+
+function stationProjectRunwayActions(lane) {
+  const path = String(lane?.path || '').trim();
+  if (!path) return [];
+  return [
+    { label: 'Use for launch', primary: lane.type !== 'current', onClick: () => stationUseProjectRunwayPath(path) },
+    { label: 'Worktree', onClick: () => stationFocusWorktree(path) },
+    lane.session_id ? { label: 'Session', onClick: () => stationRenderSessionsDock(lane.session_id) } : null,
+    { label: 'Sessions here', onClick: () => stationFilterSessionsByProject(path) },
+    { label: 'Copy path', onClick: () => copyTextToClipboard(path) },
+  ];
+}
+
+function stationRenderProjectRunwaySection(parent) {
+  const payload = stationProjectRunwayPayload();
+  const section = stationDockSection(parent, 'Project runway');
+  stationDockRow(section, 'current', payload.current_project_root ? compactPathLabel(payload.current_project_root, true) : '--');
+  stationDockRow(section, 'launch', payload.launch_project ? compactPathLabel(payload.launch_project, true) : '--');
+  stationDockRow(section, 'worktrees', `${payload.worktrees} scanned / ${payload.dirty} dirty / ${payload.active} active / ${payload.cleanup} cleanup`);
+  stationDockActions(section, [
+    { label: 'Scan', primary: payload.scan_status === 'cold', onClick: () => stationLoadWorktreesForDock(true) },
+    { label: 'Cached', onClick: () => stationLoadWorktreesForDock(false) },
+    { label: 'Copy JSON', onClick: () => stationCopyProjectRunwayPayload(payload) },
+  ]);
+  if (!payload.lanes.length) {
+    stationDockEmpty(section, 'No project roots are known yet.');
+    return;
+  }
+  for (const lane of payload.lanes) {
+    const wt = lane.worktree || null;
+    stationDockCard(section, {
+      title: lane.label || compactPathLabel(lane.path, true),
+      meta: [lane.type, lane.source, wt?.branch].filter(Boolean).join(' / '),
+      detail: compactPathLabel(lane.path, true),
+      active: lane.path === payload.current_project_root,
+      rows: [
+        wt ? ['worktree', `${wt.repo || 'repo'}${wt.dirty ? ' / dirty' : ''}${wt.cleanup ? ' / cleanup' : ''}`] : null,
+        wt ? ['sessions', `${wt.active_sessions || 0} active`] : null,
+        lane.updated ? ['updated', lane.updated] : null,
+      ].filter(Boolean),
+      actions: stationProjectRunwayActions(lane),
+    });
+  }
+}
+
 function stationRenderWorktreesDock(focusPath = '') {
   const rows = stationWorktreeRowsForDock();
   const summary = stationBuildWorktreesSummary();
@@ -17081,6 +17244,8 @@ function stationRenderWorktreesDock(focusPath = '') {
     { label: 'Cached', onClick: () => stationLoadWorktreesForDock(false) },
     stationDockRouteAction('Route worktrees tab', 'sessions', 'worktrees'),
   ]);
+
+  stationRenderProjectRunwaySection(body);
 
   const list = stationDockSection(body, 'Watchlist');
   const query = stationWorktreeDockFilter.trim();
