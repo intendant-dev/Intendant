@@ -1021,6 +1021,7 @@ impl StationInner {
         self.draw_tweaks_panel();
         self.draw_systems_panel();
         self.draw_execution_deck(w, h);
+        self.draw_signal_runway(w, h);
         self.draw_command_lane(w, h);
         self.draw_attention_strip(w, h);
         self.draw_corners(w, h);
@@ -1985,6 +1986,213 @@ impl StationInner {
             C_SUBTEXT0_CSS,
             "normal",
         );
+    }
+
+    fn draw_signal_runway(&mut self, w: f32, h: f32) {
+        if w < 1040.0 || h < 700.0 || self.selected_id.is_some() {
+            return;
+        }
+        let attention_clear = if !self.attention_items().is_empty() && w >= 900.0 && h >= 520.0 {
+            270.0
+        } else {
+            14.0
+        };
+        let x = 246.0;
+        let y = 206.0;
+        let runway_w = (w - x - attention_clear).min(760.0);
+        if runway_w < 420.0 {
+            return;
+        }
+        let runway_h = 154.0;
+        self.round_rect(
+            x,
+            y,
+            runway_w,
+            runway_h,
+            6.0,
+            "rgba(17,17,27,0.72)",
+            "rgba(137,180,250,0.48)",
+        );
+        self.text(
+            "SIGNAL RUNWAY",
+            x + 12.0,
+            y + 20.0,
+            10.0,
+            C_OVERLAY1_CSS,
+            "bold",
+        );
+        self.text(
+            "activity / context / managed",
+            x + 116.0,
+            y + 20.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let latest_event = self.snapshot.events.last();
+        let activity_value = latest_event
+            .map(|ev| format!("{} {}", ev.level, nonempty(&ev.ts, "--")))
+            .unwrap_or_else(|| format!("{} events", self.snapshot.events.len()));
+        let activity_detail = latest_event
+            .map(|ev| truncate(&ev.msg, 68))
+            .unwrap_or_else(|| "Waiting for retained activity".to_string());
+        self.signal_runway_row(
+            x + 10.0,
+            y + 34.0,
+            runway_w - 20.0,
+            "Activity",
+            &activity_value,
+            &activity_detail,
+            latest_event
+                .map(|ev| level_color_css(&ev.level))
+                .unwrap_or(C_TEAL_CSS),
+            vec![
+                RunwayAction::activity("latest", "bottom", 62.0, C_TEAL_CSS),
+                RunwayAction::activity("copy", "copy-visible", 50.0, C_BLUE_CSS),
+                RunwayAction::select("panel", "system:activity", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
+
+        let ctx_pct = percent(
+            self.snapshot.context.tokens,
+            self.snapshot.context.effective_window,
+        );
+        let context_value = if self.snapshot.context.available {
+            format!(
+                "{} / {} items",
+                pct_label(ctx_pct),
+                self.snapshot.context.item_count
+            )
+        } else {
+            "waiting".to_string()
+        };
+        let context_detail = if self.snapshot.context.available {
+            truncate(
+                &format!(
+                    "{} {}",
+                    nonempty(&self.snapshot.context.source, "snapshot"),
+                    nonempty(&self.snapshot.context.turn, "--")
+                ),
+                68,
+            )
+        } else {
+            "No context snapshot available".to_string()
+        };
+        self.signal_runway_row(
+            x + 10.0,
+            y + 74.0,
+            runway_w - 20.0,
+            "Context",
+            &context_value,
+            &context_detail,
+            pressure_color(ctx_pct),
+            vec![
+                RunwayAction::context("live", "live", 46.0, C_BLUE_CSS),
+                RunwayAction::context("replay", "replay", 58.0, C_MAUVE_CSS),
+                RunwayAction::context("copy", "copy-snapshot", 50.0, C_TEAL_CSS),
+                RunwayAction::select("panel", "system:context", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
+
+        let managed_pct = percent(
+            self.snapshot.managed.used_tokens,
+            self.snapshot.managed.effective_window,
+        );
+        let managed_value = format!(
+            "{} / {}",
+            nonempty(&self.snapshot.managed.mode, "managed"),
+            nonempty(&self.snapshot.managed.status, "unknown")
+        );
+        let managed_detail = format!(
+            "{} records / {} anchors / {} branches",
+            self.snapshot.managed.records,
+            self.snapshot.managed.anchors,
+            self.snapshot.managed.branches
+        );
+        self.signal_runway_row(
+            x + 10.0,
+            y + 114.0,
+            runway_w - 20.0,
+            "Managed",
+            &managed_value,
+            &managed_detail,
+            pressure_color(managed_pct),
+            vec![
+                RunwayAction::managed(
+                    "target",
+                    "use-target",
+                    "",
+                    &self.snapshot.managed.session_id,
+                    58.0,
+                    C_TEAL_CSS,
+                ),
+                RunwayAction::managed(
+                    "rewind",
+                    "rewind",
+                    "",
+                    &self.snapshot.managed.session_id,
+                    64.0,
+                    C_MAUVE_CSS,
+                ),
+                RunwayAction::managed(
+                    "copy",
+                    "copy-status",
+                    "",
+                    &self.snapshot.managed.session_id,
+                    50.0,
+                    C_BLUE_CSS,
+                ),
+                RunwayAction::select("panel", "system:managed", 54.0, C_OVERLAY1_CSS),
+            ],
+        );
+    }
+
+    fn signal_runway_row(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        title: &str,
+        value: &str,
+        detail: &str,
+        color: &str,
+        actions: Vec<RunwayAction>,
+    ) {
+        self.round_rect(
+            x,
+            y,
+            w,
+            34.0,
+            4.0,
+            "rgba(24,24,37,0.70)",
+            "rgba(49,50,68,0.72)",
+        );
+        self.ctx.set_fill_style(&JsValue::from_str(color));
+        self.ctx
+            .fill_rect((x + 7.0) as f64, (y + 7.0) as f64, 3.0, 20.0);
+        self.text(title, x + 16.0, y + 14.0, 8.5, C_OVERLAY1_CSS, "bold");
+        self.text(&truncate(value, 28), x + 88.0, y + 14.0, 9.0, color, "bold");
+        self.text(
+            &truncate(detail, 64),
+            x + 16.0,
+            y + 28.0,
+            8.5,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut ax = x + w - 8.0;
+        for action in actions.into_iter().rev() {
+            ax -= action.width;
+            if ax < x + 245.0 {
+                break;
+            }
+            self.pill_at(ax, y + 7.0, action.width, 20.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, y + 7.0, action.width, 20.0, action.hit));
+            ax -= 6.0;
+        }
     }
 
     fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
@@ -6564,6 +6772,73 @@ impl LaneAction {
             color,
             hit: HitAction::SessionAction {
                 action: action.to_string(),
+                session_id: session_id.to_string(),
+            },
+        }
+    }
+}
+
+struct RunwayAction {
+    label: &'static str,
+    width: f32,
+    color: &'static str,
+    hit: HitAction,
+}
+
+impl RunwayAction {
+    fn select(label: &'static str, id: &'static str, width: f32, color: &'static str) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::Select(id.to_string()),
+        }
+    }
+
+    fn activity(
+        label: &'static str,
+        action: &'static str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ActivityAction {
+                action: action.to_string(),
+                id: String::new(),
+            },
+        }
+    }
+
+    fn context(label: &'static str, action: &'static str, width: f32, color: &'static str) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ContextAction {
+                action: action.to_string(),
+                id: String::new(),
+            },
+        }
+    }
+
+    fn managed(
+        label: &'static str,
+        action: &'static str,
+        id: &str,
+        session_id: &str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ManagedAction {
+                action: action.to_string(),
+                id: id.to_string(),
                 session_id: session_id.to_string(),
             },
         }
