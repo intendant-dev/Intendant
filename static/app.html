@@ -11563,6 +11563,12 @@ function stationCommandEntries() {
       run: () => stationHandleHotspot('system:controls'),
     },
     {
+      label: 'Live runway',
+      detail: 'Operate voice, video, recording, and live-audio settings from Station',
+      tokens: 'live runway voice mic video recording presence audio transcription active browser',
+      run: () => stationRenderControlsDock('live'),
+    },
+    {
       label: 'Activity threads',
       detail: 'Group retained Station activity by session, host, and source',
       tokens: 'activity log threads sessions hosts sources timeline triage',
@@ -18057,6 +18063,121 @@ function stationRenderLiveStatusSection(parent, controls) {
   ]);
 }
 
+function stationLiveRunwayPayload(controls) {
+  const presenceEnabled = !!document.getElementById('set-presence-enabled')?.checked;
+  const liveAudioEnabled = !!document.getElementById('set-live-audio-enabled')?.checked;
+  const transcriptionEnabled = !!document.getElementById('set-transcription-enabled')?.checked;
+  const lanes = [
+    {
+      type: 'browser',
+      id: 'browser-active',
+      title: controls.activeBrowser ? 'Active browser' : 'Passive browser',
+      meta: controls.activeBrowser ? 'controls live media' : 'observe only',
+      detail: `${controls.browserWorkspaces || 0} browser workspaces / shared view ${controls.sharedViewVisible ? 'visible' : 'hidden'}`,
+    },
+    {
+      type: 'voice',
+      id: 'voice-link',
+      title: 'Voice link',
+      meta: `${controls.voiceState || 'idle'}${controls.micActive ? ' / mic' : ''}${controls.videoActive ? ' / video' : ''}`,
+      detail: `${stationPresenceSettingValue('set-presence-provider', 'openai')} / ${stationPresenceSettingValue('set-presence-live-model', 'default live model')}`,
+    },
+    {
+      type: 'capture',
+      id: 'capture',
+      title: 'Display and capture',
+      meta: `${controls.displayAccess || 'off'} / ${controls.recordings || 0} recording streams`,
+      detail: `${controls.activeRecording ? `active ${controls.activeRecording}` : 'no active recording'} / ${controls.pendingAttachments || 0} pending attachments`,
+    },
+    {
+      type: 'settings',
+      id: 'live-settings',
+      title: 'Live defaults',
+      meta: `${presenceEnabled ? 'presence on' : 'presence off'} / ${liveAudioEnabled ? 'live audio on' : 'live audio off'} / ${transcriptionEnabled ? 'transcription on' : 'transcription off'}`,
+      detail: `${stationAudioSettingValue('set-transcription-provider', 'openai')} / ${stationAudioSettingValue('set-transcription-model', 'whisper-1')}`,
+    },
+  ];
+  return {
+    generated_at: new Date().toISOString(),
+    active_browser: !!controls.activeBrowser,
+    voice_state: controls.voiceState || '',
+    mic_active: !!controls.micActive,
+    video_active: !!controls.videoActive,
+    display_access: controls.displayAccess || '',
+    recordings: controls.recordings || 0,
+    active_recording: controls.activeRecording || '',
+    pending_attachments: controls.pendingAttachments || 0,
+    presence_enabled: presenceEnabled,
+    live_audio_enabled: liveAudioEnabled,
+    transcription_enabled: transcriptionEnabled,
+    lanes,
+  };
+}
+
+async function stationCopyLiveRunwayPayload(payload) {
+  await copyTextToClipboard(JSON.stringify(payload, null, 2));
+  showControlToast?.('success', 'Live runway JSON copied');
+}
+
+function stationLiveRunwayActions(lane, controls) {
+  if (!lane) return [];
+  if (lane.type === 'browser') {
+    return [
+      !controls.activeBrowser ? { label: 'Make active', primary: true, onClick: () => document.getElementById('makeActiveBtn')?.click() } : null,
+      { label: 'Browser workspaces', onClick: () => stationRenderControlsDock('browser') },
+      controls.sharedViewVisible ? { label: 'Hide shared', danger: true, onClick: () => document.querySelector('[data-shared-view-close]')?.click() } : null,
+    ];
+  }
+  if (lane.type === 'voice') {
+    return [
+      controls.voiceState === 'connected'
+        ? { label: 'Reconnect voice', onClick: () => { if (typeof connectVoice === 'function') connectVoice(); } }
+        : { label: 'Connect voice', primary: true, onClick: () => { if (typeof connectVoice === 'function') connectVoice(); } },
+      { label: controls.micActive ? 'Mic off' : 'Mic', onClick: () => document.getElementById('micBtn')?.click() },
+      { label: controls.videoActive ? 'Video off' : 'Video', disabled: !controls.activeBrowser || controls.voiceState !== 'connected', onClick: () => document.getElementById('videoBtn')?.click() },
+      { label: 'Presence settings', onClick: () => stationRenderControlsDock('presence') },
+    ];
+  }
+  if (lane.type === 'capture') {
+    return [
+      { label: controls.displayAccess.startsWith('on') ? 'Revoke display' : 'Share display', primary: !controls.displayAccess.startsWith('on'), onClick: () => window.toggleUserDisplay?.() },
+      { label: 'Recordings', onClick: () => stationRenderControlsDock('recordings') },
+      { label: 'Attach file', onClick: () => document.getElementById('upload-attach-btn')?.click() },
+      controls.pendingAttachments > 0 ? { label: 'Clear attach', danger: true, onClick: () => document.querySelector('[data-pending-attachments-clear]')?.click() } : null,
+    ];
+  }
+  if (lane.type === 'settings') {
+    return [
+      { label: 'Presence', primary: true, onClick: () => stationRenderControlsDock('presence') },
+      { label: 'Audio', onClick: () => stationRenderControlsDock('audio') },
+      { label: 'Recording defaults', onClick: () => stationRenderControlsDock('recordings') },
+    ];
+  }
+  return [];
+}
+
+function stationRenderLiveRunwaySection(parent, controls) {
+  const payload = stationLiveRunwayPayload(controls);
+  const section = stationDockSection(parent, 'Live runway');
+  stationDockRow(section, 'browser', payload.active_browser ? 'active' : 'passive');
+  stationDockRow(section, 'voice', `${payload.voice_state || 'idle'}${payload.mic_active ? ' / mic' : ''}${payload.video_active ? ' / video' : ''}`);
+  stationDockRow(section, 'capture', `${payload.display_access || 'off'} / ${payload.recordings} recordings / ${payload.pending_attachments} attachments`);
+  stationDockActions(section, [
+    { label: 'Copy JSON', onClick: () => stationCopyLiveRunwayPayload(payload) },
+    { label: 'Refresh', primary: true, onClick: () => { stationRefreshSharedCaches(); stationRenderControlsDock('live'); } },
+    stationDockRouteAction('Route agent settings', 'settings', 'agent'),
+  ]);
+  for (const lane of payload.lanes) {
+    stationDockCard(section, {
+      title: lane.title,
+      meta: lane.meta,
+      detail: lane.detail,
+      rows: [['kind', lane.type.replace(/_/g, ' ')]],
+      actions: stationLiveRunwayActions(lane, controls),
+    });
+  }
+}
+
 function stationRouteByLabel(label) {
   return STATION_DASHBOARD_ROUTES.find(route => route.label === label) || null;
 }
@@ -19500,6 +19621,7 @@ function stationRenderControlsDock(sectionName = 'overview') {
 
   stationRenderApprovalsSection(body);
   stationRenderHumanInputSection(body);
+  stationRenderLiveRunwaySection(body, controls);
 
   const live = stationDockSection(body, 'Live surfaces');
   stationDockRow(live, 'display', controls.displayAccess || '--');
