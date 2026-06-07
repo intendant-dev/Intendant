@@ -12388,6 +12388,69 @@ function stationRenderSharedViewSection(parent) {
   ]);
 }
 
+function stationDisplayContinuityPayload() {
+  const peerStatus = stationPeerDisplayStatusPayload();
+  const sharedView = stationSharedViewStatusPayload();
+  const controls = stationBuildControlsSummary();
+  const selectedPeer = stationSelectedPeer();
+  return {
+    generated_at: new Date().toISOString(),
+    local: {
+      host_id: peerStatus.self.host_id,
+      label: peerStatus.self.label,
+      display_access: peerStatus.self.display_access,
+      shared_display: peerStatus.self.shared_display,
+      local_streams: peerStatus.local_streams,
+    },
+    remote: {
+      selected_peer_id: stationPeerDraft.selectedHostId || stationSelectedPeerHost || '',
+      selected_peer_label: stationPeerDisplayName(selectedPeer),
+      selected_display_id: stationPeerDisplayId(),
+      remote_streams: peerStatus.remote_streams,
+      peer_count: peerStatus.peers.length,
+    },
+    shared_view: sharedView,
+    operator_target: {
+      session_id: controls.sessionId || '',
+      label: controls.sessionLabel || '',
+      source: controls.sessionSource || '',
+      active: !!controls.sessionActive,
+      detached: !!controls.sessionDetached,
+    },
+  };
+}
+
+async function stationCopyDisplayContinuityPayload() {
+  await copyTextToClipboard(JSON.stringify(stationDisplayContinuityPayload(), null, 2));
+  stationSetPeerStatus('Display continuity JSON copied', 'ok');
+  stationRenderPeersDock();
+}
+
+function stationRenderDisplayContinuitySection(parent) {
+  const payload = stationDisplayContinuityPayload();
+  const selectedPeer = stationSelectedPeer();
+  const canOpenPeerDisplay = !!selectedPeer && peerCanShareDisplay(selectedPeer);
+  const section = stationDockSection(parent, 'Display continuity');
+  stationDockRow(section, 'local', payload.local.shared_display === null
+    ? `${payload.local.display_access || 'off'} / no shared display`
+    : `${payload.local.display_access || 'on'} / display ${payload.local.shared_display}`);
+  stationDockRow(section, 'streams', `${payload.local.local_streams.length} local / ${payload.remote.remote_streams.length} remote`);
+  stationDockRow(section, 'selected peer', payload.remote.selected_peer_label || payload.remote.selected_peer_id || '--');
+  stationDockRow(section, 'shared view', payload.shared_view.visible ? `${payload.shared_view.target || 'visible'} / ${payload.shared_view.action || 'view'}` : 'hidden');
+  stationDockRow(section, 'operator target', payload.operator_target.label || payload.operator_target.session_id || '--');
+  stationDockActions(section, [
+    { label: userDisplayGranted ? 'Revoke local' : 'Share local', primary: !userDisplayGranted, onClick: () => window.toggleUserDisplay?.() },
+    { label: stationLocalDisplaysLoading ? 'Listing...' : 'List displays', disabled: stationLocalDisplaysLoading, onClick: () => stationLoadLocalDisplaysForDock(false) },
+    canOpenPeerDisplay ? { label: `Open :${stationPeerDisplayIdForHost(selectedPeer.host_id)}`, primary: true, onClick: () => stationOpenDisplay(selectedPeer.host_id, stationPeerDisplayIdForHost(selectedPeer.host_id)) } : null,
+    payload.shared_view.visible ? { label: 'Focus shared', disabled: sharedViewState.displayId === null || !displaySlots.has(sharedViewState.displayId), onClick: stationFocusSharedViewDisplayFromDock } : null,
+    payload.shared_view.can_take_input ? { label: 'Take input', primary: true, onClick: () => { document.querySelector('[data-shared-view-take-input]')?.click(); stationScheduleUpdate(); stationRenderPeersDock(); } } : null,
+    payload.operator_target.session_id ? { label: 'Session', onClick: () => stationRenderSessionsDock(payload.operator_target.session_id) } : null,
+    { label: 'Controls', onClick: () => stationRenderControlsDock('overview') },
+    { label: 'Activity', onClick: () => stationRenderActivityDock() },
+    { label: 'Copy JSON', onClick: stationCopyDisplayContinuityPayload },
+  ]);
+}
+
 function stationRenderPeerCoordinatorSection(parent) {
   const section = stationDockSection(parent, 'Coordinator');
   const caps = stationDockInput(section, 'Find caps', stationPeerDraftValue('capabilityFilter', 'display'), { id: 'station-peer-capabilities', placeholder: 'display, computer-use' });
@@ -12563,6 +12626,7 @@ function stationRenderPeersDock() {
     status.textContent = stationPeerStatus;
     overview.appendChild(status);
   }
+  stationRenderDisplayContinuitySection(body);
   stationRenderSharedViewSection(body);
   stationRenderLocalDisplayPickerSection(body);
   stationRenderPeerAddSection(body);
