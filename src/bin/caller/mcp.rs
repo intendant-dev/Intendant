@@ -6203,7 +6203,48 @@ impl IntendantServer {
             .filter(|id| !id.is_empty())
             .map(str::to_string);
         if let Some(session_id) = session_id {
-            if let Some(phase) = self.terminal_target_session_phase(&session_id).await {
+            let target_phase = self.target_session_phase(&session_id).await;
+            if target_phase.is_none()
+                && params.reference_frame_ids.is_empty()
+                && params.display_target.is_none()
+            {
+                match resolve_persisted_start_target(&session_id) {
+                    PersistedStartTarget::External(target) => {
+                        self.bus
+                            .send(AppEvent::ControlCommand(ControlMsg::ResumeSession {
+                                source: target.source.clone(),
+                                session_id: session_id.clone(),
+                                resume_id: Some(target.resume_id.clone()),
+                                project_root: target.project_root,
+                                task: Some(params.task),
+                                direct: params.orchestrate.map(|orchestrate| !orchestrate),
+                                attachments: vec![],
+                                agent_command: target.agent_command,
+                                codex_managed_context: target.codex_managed_context,
+                                codex_context_archive: target.codex_context_archive,
+                            }));
+                        return format!(
+                            "ok (session resume dispatched for {} {})",
+                            target.source, target.resume_id
+                        );
+                    }
+                    PersistedStartTarget::ExternalMissingResume { source } => {
+                        let source = source.unwrap_or_else(|| "external-agent".to_string());
+                        return format!(
+                            "Cannot start task: session {} is a persisted {} wrapper, but its backend resume id was not found; use dashboard Resume with an explicit source/resume_id or restart with saved config",
+                            session_id, source
+                        );
+                    }
+                    PersistedStartTarget::NonExternal if target_phase.is_none() => {
+                        return format!(
+                            "Cannot start task: session {} is not active in this daemon and is not a persisted external-agent wrapper; use resume/restart from the dashboard or start a new session",
+                            session_id
+                        );
+                    }
+                    PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => {}
+                }
+            }
+            if let Some(phase) = target_phase.filter(|phase| is_terminal_phase(phase)) {
                 return format!(
                     "Cannot start task: session {} is not active (phase {}); use restart/resume before sending a follow-up",
                     session_id,
@@ -6249,15 +6290,210 @@ impl IntendantServer {
         }
     }
 
-    async fn terminal_target_session_phase(&self, session_id: &str) -> Option<Phase> {
+    async fn target_session_phase(&self, session_id: &str) -> Option<Phase> {
         let s = self.state.read().await;
-        let phase = s
-            .session_status_for_id(session_id)
+        s.session_status_for_id(session_id)
             .map(|status| status.phase.clone())
-            .or_else(|| (s.session_id == session_id).then(|| s.phase.clone()))?;
-        matches!(phase, Phase::Done | Phase::Interrupted).then_some(phase)
+            .or_else(|| (s.session_id == session_id).then(|| s.phase.clone()))
+    }
+}
+
+fn is_terminal_phase(phase: &Phase) -> bool {
+    matches!(phase, Phase::Done | Phase::Interrupted)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PersistedExternalStartTarget {
+    source: String,
+    resume_id: String,
+    project_root: Option<String>,
+    agent_command: Option<String>,
+    codex_managed_context: Option<String>,
+    codex_context_archive: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PersistedStartTarget {
+    NotFound,
+    NonExternal,
+    External(PersistedExternalStartTarget),
+    ExternalMissingResume { source: Option<String> },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ExternalIdentity {
+    wrapper_id: Option<String>,
+    source: String,
+    resume_id: String,
+}
+
+fn resolve_persisted_start_target(session_id: &str) -> PersistedStartTarget {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return PersistedStartTarget::NotFound;
+    }
+    let Some(log_dir) = crate::session_log::SessionLog::find_session_by_id(session_id) else {
+        return PersistedStartTarget::NotFound;
+    };
+
+    let (canonical_session_id, project_root) = persisted_session_meta(&log_dir);
+    let config = crate::session_config::read_log_dir_config(&log_dir);
+    let mut source = config
+        .as_ref()
+        .and_then(|config| config.source.as_deref())
+        .and_then(normalized_external_source);
+    let mut resume_id = None;
+
+    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).unwrap_or_default();
+    let mut exact_identity = None;
+    let mut any_identity = None;
+    let mut identity_count = 0usize;
+    for line in contents.lines() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        let event = value.get("event").and_then(|v| v.as_str()).unwrap_or("");
+        let message = value.get("message").and_then(|v| v.as_str()).unwrap_or("");
+        if event == "session_identity" {
+            if let Some(identity) = persisted_external_identity_from_event(&value) {
+                identity_count += 1;
+                if identity_matches_requested_wrapper(
+                    identity.wrapper_id.as_deref(),
+                    session_id,
+                    canonical_session_id.as_deref(),
+                ) {
+                    exact_identity = Some(identity.clone());
+                }
+                if any_identity.is_none() {
+                    any_identity = Some(identity);
+                }
+            }
+        }
+        if source.is_none() {
+            source = external_agent_source_from_log_message(message);
+        }
+        if resume_id.is_none() {
+            resume_id = external_agent_resume_id_from_log_message(message);
+        }
     }
 
+    let identity = exact_identity.or_else(|| (identity_count == 1).then(|| any_identity).flatten());
+    if let Some(identity) = identity {
+        source = Some(identity.source);
+        resume_id = Some(identity.resume_id);
+    }
+
+    let Some(source) = source else {
+        return PersistedStartTarget::NonExternal;
+    };
+    let Some(resume_id) = resume_id else {
+        return PersistedStartTarget::ExternalMissingResume {
+            source: Some(source),
+        };
+    };
+
+    PersistedStartTarget::External(PersistedExternalStartTarget {
+        source,
+        resume_id,
+        project_root,
+        agent_command: config
+            .as_ref()
+            .and_then(|config| config.agent_command.clone()),
+        codex_managed_context: config
+            .as_ref()
+            .and_then(|config| config.codex_managed_context.clone()),
+        codex_context_archive: config
+            .as_ref()
+            .and_then(|config| config.codex_context_archive.clone()),
+    })
+}
+
+fn persisted_session_meta(log_dir: &std::path::Path) -> (Option<String>, Option<String>) {
+    let raw = std::fs::read_to_string(log_dir.join("session_meta.json")).ok();
+    let value = raw.and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok());
+    let session_id = value
+        .as_ref()
+        .and_then(|value| json_str_field(value, "session_id"));
+    let project_root = value
+        .as_ref()
+        .and_then(|value| json_str_field(value, "project_root"));
+    (session_id, project_root)
+}
+
+fn persisted_external_identity_from_event(value: &serde_json::Value) -> Option<ExternalIdentity> {
+    let data = value.get("data")?;
+    let source =
+        json_str_field(data, "source").and_then(|source| normalized_external_source(&source))?;
+    let resume_id =
+        json_str_field(data, "backend_session_id").and_then(|id| clean_external_resume_id(&id))?;
+    Some(ExternalIdentity {
+        wrapper_id: json_str_field(data, "session_id"),
+        source,
+        resume_id,
+    })
+}
+
+fn identity_matches_requested_wrapper(
+    identity_session_id: Option<&str>,
+    requested_id: &str,
+    canonical_session_id: Option<&str>,
+) -> bool {
+    let Some(identity_session_id) = identity_session_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+    else {
+        return false;
+    };
+    identity_session_id == requested_id
+        || identity_session_id.starts_with(requested_id)
+        || canonical_session_id
+            .map(|canonical| {
+                identity_session_id == canonical || canonical.starts_with(requested_id)
+            })
+            .unwrap_or(false)
+}
+
+fn normalized_external_source(source: &str) -> Option<String> {
+    let normalized = crate::session_names::normalize_source(source);
+    crate::external_agent::AgentBackend::from_str_loose(&normalized)
+        .map(|backend| backend.as_short_str().to_string())
+}
+
+fn json_str_field(value: &serde_json::Value, key: &str) -> Option<String> {
+    value
+        .get(key)
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn external_agent_source_from_log_message(message: &str) -> Option<String> {
+    let mode = message.strip_prefix("Mode: external agent (")?;
+    let (source, _) = mode.split_once(')')?;
+    normalized_external_source(source)
+}
+
+fn external_agent_resume_id_from_log_message(message: &str) -> Option<String> {
+    if let Some(thread_id) = message.strip_prefix("External agent thread: ") {
+        return clean_external_resume_id(thread_id);
+    }
+    if message.starts_with("Mode: external agent") {
+        if let Some((_, thread_id)) = message.rsplit_once("thread: ") {
+            return clean_external_resume_id(thread_id);
+        }
+    }
+    None
+}
+
+fn clean_external_resume_id(value: &str) -> Option<String> {
+    let value = value
+        .trim()
+        .trim_matches(|c: char| c.is_whitespace() || matches!(c, '`' | '"' | '\'' | ',' | ';'));
+    (!value.is_empty()).then(|| value.to_string())
+}
+
+impl IntendantServer {
     #[tool(
         description = "Schedule a Codex context rewind to an exact item/tool-call anchor. First call list_rewind_anchors and choose one returned item_id; call inspect_rewind_anchor when the compact row is ambiguous. Do not synthesize anchor ids from prior failed tool calls. The current turn will finish, Intendant will roll back Codex to the anchor, inject the primer as developer context, and resume the branch."
     )]
@@ -8925,6 +9161,256 @@ mod tests {
                     assert!(follow_up_id.is_none());
                 }
                 other => panic!("expected targeted StartTask control event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn start_task_resumes_persisted_external_wrapper_session() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            let prior_home = std::env::var_os("HOME");
+            let prior_userprofile = std::env::var_os("USERPROFILE");
+            let home = tempdir().unwrap();
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+
+            let wrapper_session_id = "724fafac-36d7-41e5-b822-e0a08c1f4701";
+            let backend_session_id = "019e9f80-bd44-7a00-bcef-f28ff529514e";
+            let project_root = home.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let wrapper_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(wrapper_session_id);
+            {
+                let mut log = crate::session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+                log.write_meta(Some(&project_root), Some("old task"));
+                log.session_identity(wrapper_session_id, "codex", backend_session_id);
+            }
+            crate::session_config::write_log_dir_config(
+                &wrapper_dir,
+                &crate::session_config::SessionAgentConfig {
+                    source: Some("codex".to_string()),
+                    agent_command: Some("/tmp/patched-codex".to_string()),
+                    codex_managed_context: Some("managed".to_string()),
+                    codex_context_archive: Some("summary".to_string()),
+                    codex_service_tier: None,
+                    codex_home: Some(home.path().join(".codex").to_string_lossy().to_string()),
+                },
+            )
+            .unwrap();
+
+            let state = test_state();
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue managed station work",
+                        "orchestrate": false
+                    }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch resume");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains("ok (session resume dispatched"),
+                "got: {rendered}"
+            );
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::ResumeSession {
+                    source,
+                    session_id,
+                    resume_id,
+                    project_root: resumed_project_root,
+                    task,
+                    direct,
+                    attachments,
+                    agent_command,
+                    codex_managed_context,
+                    codex_context_archive,
+                }))) => {
+                    assert_eq!(source, "codex");
+                    assert_eq!(session_id, wrapper_session_id);
+                    assert_eq!(resume_id.as_deref(), Some(backend_session_id));
+                    assert_eq!(
+                        resumed_project_root.as_deref(),
+                        Some(project_root.to_string_lossy().as_ref())
+                    );
+                    assert_eq!(task.as_deref(), Some("continue managed station work"));
+                    assert_eq!(direct, Some(true));
+                    assert!(attachments.is_empty());
+                    assert_eq!(agent_command.as_deref(), Some("/tmp/patched-codex"));
+                    assert_eq!(codex_managed_context.as_deref(), Some("managed"));
+                    assert_eq!(codex_context_archive.as_deref(), Some("summary"));
+                }
+                other => panic!("expected ResumeSession control event, got {other:?}"),
+            }
+
+            match prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prior_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        });
+    }
+
+    #[test]
+    fn start_task_targets_active_external_session_without_re_resuming() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            let prior_home = std::env::var_os("HOME");
+            let prior_userprofile = std::env::var_os("USERPROFILE");
+            let home = tempdir().unwrap();
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+
+            let wrapper_session_id = "62e6f9d9-06e9-420b-9245-9d0221e47c78";
+            let backend_session_id = "019e9f97-active-backend";
+            let project_root = home.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let wrapper_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(wrapper_session_id);
+            {
+                let mut log = crate::session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+                log.write_meta(Some(&project_root), Some("old task"));
+                log.session_identity(wrapper_session_id, "codex", backend_session_id);
+            }
+
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 7,
+                        phase: "waiting_follow_up".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: wrapper_session_id.to_string(),
+                        task: "active managed Codex session".to_string(),
+                    },
+                );
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue active managed station work"
+                    }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("tool should dispatch active follow-up");
+            assert!(!result.is_error.unwrap_or(false));
+            assert!(format!("{result:?}").contains("ok (task dispatched)"));
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id,
+                    task,
+                    ..
+                }))) => {
+                    assert_eq!(session_id.as_deref(), Some(wrapper_session_id));
+                    assert_eq!(task, "continue active managed station work");
+                }
+                other => panic!("expected active StartTask control event, got {other:?}"),
+            }
+
+            match prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prior_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+        });
+    }
+
+    #[test]
+    fn start_task_rejects_persisted_non_external_inactive_session_without_silent_ok() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            let prior_home = std::env::var_os("HOME");
+            let prior_userprofile = std::env::var_os("USERPROFILE");
+            let home = tempdir().unwrap();
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+
+            let session_id = "b74df098-9823-4f73-8ddf-e27bcb92f923";
+            let project_root = home.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let log_dir = home.path().join(".intendant").join("logs").join(session_id);
+            {
+                let log = crate::session_log::SessionLog::open(log_dir).unwrap();
+                log.write_meta(Some(&project_root), Some("old native task"));
+            }
+
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(test_state(), bus);
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue native session"
+                    }),
+                    Some(session_id),
+                    None,
+                )
+                .await
+                .expect("tool should return a clear rejection");
+            let rendered = format!("{result:?}");
+            assert!(rendered.contains("Cannot start task"), "got: {rendered}");
+            assert!(
+                rendered.contains("not a persisted external-agent wrapper"),
+                "got: {rendered}"
+            );
+            assert!(
+                timeout(Duration::from_millis(100), rx.recv())
+                    .await
+                    .is_err(),
+                "inactive persisted non-external session should not broadcast a misleading StartTask"
+            );
+
+            match prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prior_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
             }
         });
     }
