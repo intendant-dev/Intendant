@@ -328,6 +328,7 @@ html, body {
 .station-pane {
   position: relative;
   flex: 1;
+  min-height: 0;
   overflow: hidden;
   background:
     radial-gradient(ellipse at center, var(--base) 0%, var(--crust) 72%, #07070d 100%);
@@ -407,19 +408,30 @@ html, body {
 .station-status {
   position: absolute;
   left: 12px;
-  bottom: 10px;
+  top: 44px;
+  max-width: min(360px, calc(100% - 28px));
   z-index: 4;
   color: var(--overlay1);
   font-size: 10px;
+  line-height: 1.35;
+  padding: 4px 7px;
+  border: 1px solid rgba(69, 71, 90, 0.72);
+  border-radius: 5px;
+  background: rgba(17, 17, 27, 0.72);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
   pointer-events: none;
 }
 .station-dock {
   position: absolute;
-  top: 52px;
-  right: 14px;
-  bottom: 16px;
+  top: clamp(44px, 7vh, 56px);
+  right: clamp(8px, 2vw, 14px);
+  bottom: clamp(8px, 2vh, 16px);
   z-index: 6;
-  width: min(440px, calc(100vw - 28px));
+  width: min(460px, calc(100% - 28px));
+  max-height: calc(100dvh - 84px);
+  min-height: 0;
   display: flex;
   flex-direction: column;
   border: 1px solid rgba(127, 132, 156, 0.55);
@@ -583,6 +595,8 @@ html, body {
   flex: 1;
   min-height: 0;
   overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-gutter: stable;
   padding: 12px;
 }
 .station-dock-section {
@@ -820,7 +834,7 @@ html, body {
     top: auto;
     bottom: 10px;
     width: auto;
-    max-height: 58vh;
+    max-height: min(62vh, calc(100dvh - 84px));
   }
   .station-dock-nav {
     grid-template-columns: repeat(3, minmax(0, 1fr));
@@ -12888,7 +12902,10 @@ function stationDockSelect(parent, label, value, options, attrs = {}) {
   for (const [optValue, optLabel] of options) {
     const opt = document.createElement('option');
     opt.value = optValue;
-    opt.textContent = optLabel;
+    const labelText = optLabel && typeof optLabel === 'object'
+      ? (optLabel.label || optLabel.name || optLabel.title || optLabel.id || optValue)
+      : optLabel;
+    opt.textContent = String(labelText ?? optValue ?? '');
     select.appendChild(opt);
   }
   select.value = value || '';
@@ -14103,7 +14120,11 @@ function stationRenderManagedDock(mode = '') {
   if (actionStateValue) actionStateValue.id = 'station-managed-action-state';
   const sessionOptions = managedContextSessionOptions();
   if (sessionOptions.length) {
-    const selector = stationDockSelect(overview, 'Session', managed.sessionId || sessionOptions[0][0], sessionOptions, { id: 'station-managed-session' });
+    const stationSessionOptions = sessionOptions.map(([sid, meta]) => [
+      sid,
+      managedContextSessionLabel(sid, meta),
+    ]);
+    const selector = stationDockSelect(overview, 'Session', managed.sessionId || stationSessionOptions[0][0], stationSessionOptions, { id: 'station-managed-session' });
     selector.addEventListener('change', ev => {
       stationSetManagedSession(ev.target.value);
       stationRenderManagedDock(mode);
@@ -36593,6 +36614,19 @@ function updateSettingsSaveRow() {
   const row = document.querySelector('#tab-settings .settings-save-row');
   if (!row) return;
   row.style.display = (activeSettingsSubtab === 'agent') ? '' : 'none';
+}
+
+let initialRouteAppliedFromHash = false;
+function applyInitialRouteFromHash() {
+  if (initialRouteAppliedFromHash) return;
+  initialRouteAppliedFromHash = true;
+  applyCurrentRoute();
+}
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', applyInitialRouteFromHash, { once: true });
+} else {
+  applyInitialRouteFromHash();
 }
 
 // ── Daemons (multi-host) ──
