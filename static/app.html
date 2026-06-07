@@ -344,6 +344,10 @@ html, body {
 .station-pane.station-dom-fallback .station-canvas {
   display: none;
 }
+.station-pane.station-dom-fallback.station-canvas-fallback #station-hud-canvas {
+  display: block;
+  pointer-events: none;
+}
 #station-scene-canvas {
   z-index: 1;
 }
@@ -10755,6 +10759,9 @@ let stationSessionsIndexError = '';
 let stationWebgpuUnavailable = false;
 
 function stationStatus(text) {
+  if (String(text || '').includes('renderer=DOM fallback') && (stationWebgpuRequested() || stationWebgpuUnavailable)) {
+    stationDrawCanvasFallbackCommandLane(stationLastFallbackSnapshot || buildStationSnapshot());
+  }
   const el = document.getElementById('station-status');
   if (el) el.textContent = text;
 }
@@ -10804,6 +10811,68 @@ function stationViewDockSubtitle() {
 function stationSetFallbackClass(enabled) {
   const pane = document.querySelector('.station-pane');
   pane?.classList.toggle('station-dom-fallback', !!enabled);
+  pane?.classList.toggle('station-canvas-fallback', !!enabled && (stationWebgpuRequested() || stationWebgpuUnavailable));
+}
+
+function stationDrawCanvasFallbackCommandLane(snapshot) {
+  if (!stationWebgpuRequested() && !stationWebgpuUnavailable) return;
+  const canvas = document.getElementById('station-hud-canvas');
+  const pane = document.querySelector('.station-pane');
+  const ctx = canvas?.getContext?.('2d');
+  if (!canvas || !pane || !ctx) return;
+  pane.classList.add('station-canvas-fallback');
+  const rect = pane.getBoundingClientRect();
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  const width = Math.max(1, Math.round(rect.width * dpr));
+  const height = Math.max(1, Math.round(rect.height * dpr));
+  if (canvas.width !== width) canvas.width = width;
+  if (canvas.height !== height) canvas.height = height;
+  ctx.save();
+  ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+  ctx.clearRect(0, 0, rect.width, rect.height);
+  const laneW = Math.max(300, Math.min(rect.width - 28, 920));
+  const laneH = rect.width < 760 ? 104 : 78;
+  const x = Math.max(14, (rect.width - laneW) / 2);
+  const y = Math.max(52, rect.height - laneH - 14);
+  ctx.fillStyle = 'rgba(17,17,27,0.86)';
+  ctx.strokeStyle = 'rgba(137,180,250,0.62)';
+  ctx.lineWidth = 1;
+  ctx.beginPath();
+  ctx.roundRect(x, y, laneW, laneH, 6);
+  ctx.fill();
+  ctx.stroke();
+  ctx.font = 'bold 10px system-ui, sans-serif';
+  ctx.fillStyle = '#89b4fa';
+  ctx.fillText('COMMAND LANE', x + 12, y + 18);
+  const controls = snapshot.controls || {};
+  const context = snapshot.context || {};
+  const changes = snapshot.changes || {};
+  const statusA = `${controls.backend || 'agent'} / ${controls.sandbox || 'sandbox'} / ${controls.approvalPolicy || 'approval'}`;
+  const pct = context.effectiveWindow ? Math.round((Number(context.tokens || 0) / Number(context.effectiveWindow || 1)) * 100) : 0;
+  const statusB = `managed ${controls.managedContext || 'unknown'} / context ${pct}% / changes ${changes.status || 'clean'}`;
+  ctx.font = '10px system-ui, sans-serif';
+  ctx.fillStyle = '#cdd6f4';
+  ctx.fillText(statusA.slice(0, 78), x + 12, y + 38);
+  ctx.fillStyle = '#a6adc8';
+  ctx.fillText(statusB.slice(0, 78), x + 12, y + 53);
+  const labels = ['send', 'new session', 'context', 'managed', 'sessions', 'peers', 'changes', 'controls'];
+  let ax = x + 12;
+  let ay = y + (rect.width < 760 ? 67 : 47);
+  for (const label of labels) {
+    const w = label === 'new session' ? 92 : Math.max(58, label.length * 8 + 18);
+    if (ax + w > x + laneW - 12) break;
+    ctx.fillStyle = 'rgba(49,50,68,0.45)';
+    ctx.strokeStyle = label === 'send' ? '#89b4fa' : '#a6adc8';
+    ctx.beginPath();
+    ctx.roundRect(ax, ay, w, 21, 4);
+    ctx.fill();
+    ctx.stroke();
+    ctx.fillStyle = ctx.strokeStyle;
+    ctx.font = 'bold 10px system-ui, sans-serif';
+    ctx.fillText(label, ax + 8, ay + 14);
+    ax += w + 8;
+  }
+  ctx.restore();
 }
 
 function stationFallbackFromUnavailableWebgpu(instance) {
@@ -10811,19 +10880,16 @@ function stationFallbackFromUnavailableWebgpu(instance) {
   const state = instance.debug_state?.() || '';
   if (!state.includes('gpu=false')) return;
   stationWebgpuUnavailable = true;
-  try { instance.set_active(false); } catch (_) {}
-  station = null;
-  stationInitPromise = null;
-  stationDomFallback = true;
-  stationSetFallbackClass(true);
-  stationStatus('Station WebGPU unavailable; using DOM fallback');
+  stationDomFallback = false;
+  stationSetFallbackClass(false);
+  stationStatus('Station WebGPU unavailable; using Canvas controls');
   stationSyncHotspots();
   stationUpdateSnapshot();
   if (activeTab === 'station') stationRefreshSharedCaches();
 }
 
-async function ensureStation() {
-  if (!stationShouldUseWebgpu()) {
+async function ensureStation(forceRendered = false) {
+  if (!forceRendered && !stationWebgpuRequested()) {
     stationDomFallback = true;
     stationInitPromise = null;
     stationSetFallbackClass(true);
@@ -10885,7 +10951,7 @@ function stationSetActive(active) {
       stationRegisterExistingSources();
       stationMaybeRestoreDock();
     }
-  } else if (stationDomFallback && !stationShouldUseWebgpu()) {
+  } else if (stationDomFallback && !stationWebgpuRequested()) {
     stationSetFallbackClass(active);
     if (active) {
       stationSyncHotspots();
@@ -10943,7 +11009,20 @@ function stationUpdateSnapshot() {
   try {
     const snapshot = buildStationSnapshot();
     stationLastFallbackSnapshot = snapshot;
+    if (stationDomFallback && !station && (stationWebgpuRequested() || stationWebgpuUnavailable)) {
+      stationDomFallback = false;
+      stationSetFallbackClass(false);
+      stationStatus('Station renderer starting Canvas controls');
+      ensureStation(true).catch(err => {
+        console.error('Station Canvas fallback init failed:', err);
+        stationDomFallback = true;
+        stationSetFallbackClass(true);
+        stationStatus('Station failed: ' + (err && err.message ? err.message : err));
+      });
+      return;
+    }
     if (stationDomFallback && !station) {
+      stationDrawCanvasFallbackCommandLane(snapshot);
       stationStatus(`station hosts=${snapshot.hosts.length} agents=${snapshot.agents.length} events=${snapshot.events.length} displays=${displaySlots.size + peerDisplayConnections.size} renderer=${stationRendererLabel()} webgpu=${stationWebgpuStatusLabel()}`);
       stationSyncHotspots();
       return;

@@ -1015,6 +1015,7 @@ impl StationInner {
         self.draw_toolbar(w);
         self.draw_tweaks_panel();
         self.draw_systems_panel();
+        self.draw_command_lane(w, h);
         self.draw_corners(w, h);
         self.draw_readout(h);
         self.draw_compass(w, h);
@@ -1580,6 +1581,152 @@ impl StationInner {
             C_MAUVE_CSS,
             "system:view",
         );
+    }
+
+    fn draw_command_lane(&mut self, w: f32, h: f32) {
+        if w < 360.0 || h < 340.0 {
+            return;
+        }
+        let compact = w < 760.0;
+        let left_clear = if compact { 14.0 } else { 246.0 };
+        let max_w = if compact { w - 28.0 } else { 980.0 };
+        let lane_w = (w - left_clear - 14.0).min(max_w).max(300.0);
+        let dense = compact || lane_w < 760.0;
+        let lane_h = if dense { 104.0 } else { 78.0 };
+        let x = if compact {
+            14.0
+        } else {
+            ((w - lane_w) * 0.5).max(left_clear)
+        };
+        let y = (h - lane_h - 14.0).max(52.0);
+
+        self.round_rect(
+            x,
+            y,
+            lane_w,
+            lane_h,
+            6.0,
+            "rgba(17,17,27,0.86)",
+            "rgba(137,180,250,0.62)",
+        );
+        self.text("COMMAND LANE", x + 12.0, y + 18.0, 10.0, C_BLUE_CSS, "bold");
+
+        let controls = self.snapshot.controls.clone();
+        let status_a = format!(
+            "{} / {} / {}",
+            nonempty(&controls.backend, "agent"),
+            nonempty(&controls.sandbox, "sandbox"),
+            nonempty(&controls.approval_policy, "approval")
+        );
+        let status_b = format!(
+            "managed {} / context {} / changes {}",
+            nonempty(&controls.managed_context, "unknown"),
+            pct_label(percent(
+                self.snapshot.context.tokens,
+                self.snapshot.context.effective_window,
+            )),
+            nonempty(&self.snapshot.changes.status, "clean")
+        );
+        if dense {
+            self.text(
+                &truncate(&status_a, 48),
+                x + 12.0,
+                y + 36.0,
+                10.0,
+                C_TEXT_CSS,
+                "normal",
+            );
+            self.text(
+                &truncate(&status_b, 48),
+                x + 12.0,
+                y + 50.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+        } else {
+            self.status_chip(x + 112.0, y + 8.0, 230.0, &status_a, C_TEAL_CSS);
+            self.status_chip(x + 352.0, y + 8.0, 250.0, &status_b, C_MAUVE_CSS);
+            let session = if controls.session_active {
+                "active"
+            } else if controls.session_detached {
+                "detached"
+            } else {
+                "idle"
+            };
+            self.status_chip(
+                x + 612.0,
+                y + 8.0,
+                (lane_w - 624.0).max(130.0),
+                &format!(
+                    "target {} / {}",
+                    nonempty(&controls.session_selection, "none"),
+                    session
+                ),
+                C_PEACH_CSS,
+            );
+        }
+
+        let mut actions = vec![
+            LaneAction::activity(
+                if controls.prompt_mode == "steer" {
+                    "steer"
+                } else {
+                    "send"
+                },
+                "send",
+                62.0,
+                C_BLUE_CSS,
+            ),
+            LaneAction::activity("new session", "new-session", 92.0, C_TEAL_CSS),
+        ];
+        if controls.session_can_focus {
+            actions.push(LaneAction::activity("focus", "target", 58.0, C_PEACH_CSS));
+        }
+        if controls.session_can_interrupt {
+            actions.push(LaneAction::activity("stop", "stop", 50.0, C_RED_CSS));
+        }
+        if controls.shared_view_can_take_input {
+            actions.push(LaneAction::controls(
+                "take input",
+                "shared-view-take-input",
+                84.0,
+                C_YELLOW_CSS,
+            ));
+        }
+        actions.extend([
+            LaneAction::select("context", "system:context", 72.0, C_BLUE_CSS),
+            LaneAction::select("managed", "system:managed", 76.0, C_MAUVE_CSS),
+            LaneAction::select("sessions", "system:sessions", 76.0, C_TEAL_CSS),
+            LaneAction::select("peers", "system:peers", 58.0, C_PEACH_CSS),
+            LaneAction::select("changes", "system:changes", 72.0, C_YELLOW_CSS),
+            LaneAction::select("controls", "system:controls", 74.0, C_MAUVE_CSS),
+        ]);
+
+        let mut ax = x + 12.0;
+        let mut ay = y + if dense { 64.0 } else { 45.0 };
+        let max_x = x + lane_w - 12.0;
+        let max_rows = if dense { 2 } else { 1 };
+        let mut row = 0;
+        for action in actions {
+            if ax + action.width > max_x {
+                row += 1;
+                if row >= max_rows {
+                    break;
+                }
+                ax = x + 12.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, action.width, 21.0, action.label, action.color);
+            self.hit_zones
+                .push(HitZone::new(ax, ay, action.width, 21.0, action.hit));
+            ax += action.width + 8.0;
+        }
+    }
+
+    fn status_chip(&self, x: f32, y: f32, w: f32, label: &str, color: &str) {
+        self.round_rect(x, y, w, 22.0, 4.0, "rgba(30,30,46,0.58)", color);
+        self.text(&truncate(label, 42), x + 8.0, y + 14.0, 9.0, color, "bold");
     }
 
     fn summary_card(
@@ -6098,6 +6245,57 @@ struct HitZone {
 impl HitZone {
     fn new(x: f32, y: f32, w: f32, h: f32, action: HitAction) -> Self {
         Self { x, y, w, h, action }
+    }
+}
+
+struct LaneAction {
+    label: &'static str,
+    width: f32,
+    color: &'static str,
+    hit: HitAction,
+}
+
+impl LaneAction {
+    fn select(label: &'static str, id: &'static str, width: f32, color: &'static str) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::Select(id.to_string()),
+        }
+    }
+
+    fn activity(
+        label: &'static str,
+        action: &'static str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ActivityAction {
+                action: action.to_string(),
+                id: String::new(),
+            },
+        }
+    }
+
+    fn controls(
+        label: &'static str,
+        action: &'static str,
+        width: f32,
+        color: &'static str,
+    ) -> Self {
+        Self {
+            label,
+            width,
+            color,
+            hit: HitAction::ControlsAction {
+                action: action.to_string(),
+            },
+        }
     }
 }
 
