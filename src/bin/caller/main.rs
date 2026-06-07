@@ -3943,6 +3943,14 @@ async fn apply_external_context_rewind(
         success: true,
         message,
     });
+    if let Err(e) = refresh_external_context_usage_snapshot(agent, config).await {
+        slog(config.session_log, |l| {
+            l.debug(&format!(
+                "Could not refresh context usage after successful rewind: {}",
+                e
+            ))
+        });
+    }
 
     Ok(request.resume_followup())
 }
@@ -4343,6 +4351,39 @@ fn external_context_snapshot_backend_token_count(
         .flatten()
 }
 
+fn emit_external_context_usage_snapshot(
+    config: &DrainConfig<'_>,
+    snapshot: &external_agent::AgentContextSnapshot,
+) -> bool {
+    let Some(main) = external_context_snapshot_usage(snapshot) else {
+        return false;
+    };
+    emit_external_context_usage_snapshot_from_usage(config, main);
+    true
+}
+
+fn emit_external_context_usage_snapshot_from_usage(
+    config: &DrainConfig<'_>,
+    main: frontend::ModelUsageSnapshot,
+) {
+    config.bus.send(AppEvent::UsageSnapshot {
+        session_id: config.session_id.clone(),
+        main,
+        presence: None,
+    });
+}
+
+async fn refresh_external_context_usage_snapshot(
+    agent: &mut Box<dyn external_agent::ExternalAgent>,
+    config: &DrainConfig<'_>,
+) -> Result<Option<external_agent::AgentContextSnapshot>, CallerError> {
+    let snapshot = agent.context_snapshot().await?;
+    if let Some(snapshot) = snapshot.as_ref() {
+        emit_external_context_usage_snapshot(config, snapshot);
+    }
+    Ok(snapshot)
+}
+
 fn managed_context_rewind_only_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
@@ -4471,11 +4512,7 @@ async fn emit_external_context_snapshot_if_changed(
                     raw: snapshot.raw,
                 });
                 if let Some(main) = usage {
-                    config.bus.send(AppEvent::UsageSnapshot {
-                        session_id: config.session_id.clone(),
-                        main,
-                        presence: None,
-                    });
+                    emit_external_context_usage_snapshot_from_usage(config, main);
                 }
             }
             if !emitted {
@@ -9864,6 +9901,69 @@ mod tests {
             ..snapshot
         };
         assert!(external_context_snapshot_usage(&local_estimate).is_none());
+    }
+
+    #[test]
+    fn forced_context_usage_snapshot_emits_backend_pressure_usage() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("wrapper-session".to_string()),
+            alias_session_id: Some("codex-thread".to_string()),
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(70_046),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(51),
+            raw: serde_json::json!({ "model": "gpt-5.2-codex" }),
+        };
+
+        assert!(emit_external_context_usage_snapshot(&config, &snapshot));
+        match rx.try_recv().expect("usage event") {
+            AppEvent::UsageSnapshot {
+                session_id,
+                main,
+                presence,
+            } => {
+                assert_eq!(session_id.as_deref(), Some("wrapper-session"));
+                assert_eq!(main.provider, "openai");
+                assert_eq!(main.model, "gpt-5.2-codex");
+                assert_eq!(main.tokens_used, 70_046);
+                assert_eq!(main.context_window, 258_400);
+                assert_eq!(main.hard_context_window, Some(272_000));
+                assert!(presence.is_none());
+            }
+            other => panic!("expected UsageSnapshot, got {:?}", other),
+        }
     }
 
     #[test]
@@ -19181,7 +19281,7 @@ async fn run_external_agent_mode(
         }
 
         if codex_managed_context_enabled && !managed_context_recovery_kickstart {
-            match agent.context_snapshot().await {
+            match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                 Ok(Some(snapshot)) => {
                     if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
                         let drop_original = managed_context_drop_original_for_recovery(
@@ -19727,7 +19827,7 @@ async fn run_external_agent_mode(
             } => {
                 stats.rounds = round;
                 if codex_managed_context_enabled {
-                    match agent.context_snapshot().await {
+                    match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                         Ok(Some(snapshot)) => {
                             if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
                             {
@@ -19989,7 +20089,12 @@ async fn run_external_agent_mode(
                     if managed_context_recovery_kickstarts_without_rewind
                         < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
                     {
-                        let pressure = match agent.context_snapshot().await {
+                        let pressure = match refresh_external_context_usage_snapshot(
+                            &mut agent,
+                            &drain_config,
+                        )
+                        .await
+                        {
                             Ok(Some(snapshot)) => managed_context_recovery_pressure(&snapshot),
                             Ok(None) => None,
                             Err(e) => {
@@ -20120,7 +20225,7 @@ async fn run_external_agent_mode(
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
                 if codex_managed_context_enabled {
-                    match agent.context_snapshot().await {
+                    match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                         Ok(Some(snapshot)) => {
                             if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
                             {
