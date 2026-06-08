@@ -175,30 +175,42 @@ features they lack.
     --station-probe rendered --station-interaction-probe --json
   node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> \
     --dashboard-arg --no-tls --headed \
+    --require-station-state --require-managed-context-state \
+    --require-ai-provider-session --require-external-agent codex \
     --station-probe rendered --station-interaction-probe \
     --screenshot /tmp/intendant-station.png --json
   node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> \
     --selector '<css>'
+  node scripts/validate-dashboard.cjs --hold-dashboard --port <throwaway_port> --json
   ```
 
   The helper launches a fresh isolated headless Chromium, waits for CDP
   readiness, supports selector/function waits plus named Station probes and
   optional headed Station interaction/screenshot artifacts, falls back when Node
   has no WebSocket module, and prints compact PASS/FAIL output with bounded log
-  excerpts on failure. Use `--station-interaction-probe --screenshot <png>
+  excerpts on failure. Use `--require-station-state
+  --require-managed-context-state --require-ai-provider-session
+  --require-external-agent codex --station-interaction-probe --screenshot <png>
   --json` for meaningful headed Station QA instead of scraping the helper's
-  temporary DevTools profile. With `--launch-dashboard`, it starts the built
+  temporary DevTools profile, and review the returned screenshot path before
+  counting the run as a product pass. With `--launch-dashboard`, it starts the built
   intendant binary as `--web <port> --no-tui`, waits for HTTP readiness, and
   stops the temporary process afterward; use that instead of a separate
-  foreground/nohup dashboard launch. It does not default to port 8765; pass
+  foreground/nohup dashboard launch. For real headed CU/browser E2E that needs
+  a temporary dashboard to remain available while separate CU tools run, use
+  `--hold-dashboard` as a foreground long-running command, read the printed URL,
+  run the CU steps while the command stays active, and interrupt the command
+  afterward for helper-owned cleanup. It does not default to port 8765; pass
   `--port`/`--url` or let it derive the port from `INTENDANT_MCP_URL`. Managed
   Station product validation against an already-running controller should add
-  `--require-current-static --require-station-state --require-ai-provider-session --require-external-agent codex`:
+  `--require-current-static --require-station-state --require-managed-context-state --require-ai-provider-session --require-external-agent codex`:
   the first compares the served embedded app/WASM/JS assets with this worktree's
   `static/` files so a stale controller on the target port fails clearly, the
   second fails if Station sessions, events, managed context, and peers are all
-  empty, and the third fails if Station only exposes placeholder/no-provider
-  session state instead of a non-placeholder provider, model, and session id.
+  empty, the managed-context requirement fails if Station has no active
+  managed/context session state, and the provider requirement fails if Station
+  only exposes placeholder/no-provider session state instead of a non-placeholder
+  provider, model, and session id.
   The external-agent requirement then verifies that same real Station session is
   backed by Codex, so native/default-provider sessions cannot satisfy Codex QA.
   Omit `--require-current-static` only for generic connectivity checks against a

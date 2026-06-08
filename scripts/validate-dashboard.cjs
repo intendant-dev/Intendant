@@ -101,6 +101,7 @@ Options:
   --keep-artifacts           Preserve the Chromium profile/temp artifact directory
   --keep-browser             Leave Chromium running for manual follow-up; implies --keep-artifacts
   --launch-dashboard         Launch a temporary Intendant dashboard and stop it afterward
+  --hold-dashboard           With --launch-dashboard, keep the temporary dashboard alive until interrupted
   --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or a fresh target/{release,debug}/intendant)
   --dashboard-arg ARG        Extra arg appended to the launched dashboard command; repeatable
   --dashboard-timeout MS     Temporary dashboard readiness timeout (default: ${DEFAULT_DASHBOARD_TIMEOUT_MS})
@@ -110,6 +111,8 @@ Options:
                              Fail unless Station exposes a real session with non-placeholder provider/model
   --require-external-agent BACKEND
                              Fail unless that real Station session is backed by external BACKEND (e.g. codex)
+  --require-managed-context-state
+                             Fail unless Station exposes active managed/context session state
   --allow-empty-station-state
                              Explicitly allow empty Station state with --require-station-state
   --check-static-scripts     Parse inline classic/module scripts in static/app.html without executing them
@@ -125,7 +128,10 @@ On Linux, --headed browser runs launched from SSH import graphical session
 variables from systemd --user when DISPLAY/WAYLAND_DISPLAY are absent.
 
 With --launch-dashboard, HTTP targets add --no-tls and stale worktree target
-binaries are rejected before launch. Rebuild or use $INTENDANT/--dashboard-binary.`);
+binaries are rejected before launch. Rebuild or use $INTENDANT/--dashboard-binary.
+Use --hold-dashboard for separate headed CU/browser E2E: keep this command
+foregrounded, run the CU steps against the printed URL, then interrupt it for
+helper-owned cleanup.`);
 }
 
 function parseArgs(argv, env = process.env) {
@@ -144,6 +150,7 @@ function parseArgs(argv, env = process.env) {
     keepArtifacts: false,
     keepBrowser: false,
     launchDashboard: false,
+    holdDashboard: false,
     dashboardArgs: [],
     dashboardTimeoutMs: DEFAULT_DASHBOARD_TIMEOUT_MS,
     headless: true,
@@ -155,6 +162,7 @@ function parseArgs(argv, env = process.env) {
     requireCurrentStatic: false,
     requireStationState: false,
     requireAiProviderSession: false,
+    requireManagedContextState: false,
     allowEmptyStationState: false,
     checkStaticScripts: false,
     appHtmlPath: path.join('static', 'app.html'),
@@ -257,6 +265,9 @@ function parseArgs(argv, env = process.env) {
       opts.keepArtifacts = true;
     } else if (arg === '--launch-dashboard') {
       opts.launchDashboard = true;
+    } else if (arg === '--hold-dashboard') {
+      opts.launchDashboard = true;
+      opts.holdDashboard = true;
     } else if (arg === '--dashboard-binary') {
       opts.dashboardBinary = readValue();
     } else if (arg.startsWith('--dashboard-binary=')) {
@@ -279,6 +290,8 @@ function parseArgs(argv, env = process.env) {
       opts.requireExternalAgent = normalizeExternalAgentRequirement(readValue());
     } else if (arg.startsWith('--require-external-agent=')) {
       opts.requireExternalAgent = normalizeExternalAgentRequirement(arg.slice('--require-external-agent='.length));
+    } else if (arg === '--require-managed-context-state') {
+      opts.requireManagedContextState = true;
     } else if (arg === '--allow-empty-station-state') {
       opts.allowEmptyStationState = true;
     } else if (arg === '--check-static-scripts') {
@@ -487,6 +500,19 @@ async function main() {
     const staticIdentity = opts.requireCurrentStatic
       ? await validateCurrentStaticIdentity(opts.url, process.cwd())
       : undefined;
+    if (opts.holdDashboard) {
+      printDashboardHoldResult(opts, {
+        status: 'pass',
+        url: opts.url,
+        readyUrl: dashboard.readyUrl,
+        ms: Date.now() - started,
+        pid: dashboard.child && dashboard.child.pid,
+        command: [dashboard.executable, ...dashboard.args],
+        staticIdentity,
+      });
+      const status = await dashboard.waitForExit();
+      throw new Error(`temporary dashboard exited while holding (${status})`);
+    }
     harness = await BrowserHarness.launch(opts, launchEnv);
     const validation = await harness.validate(opts);
     const artifacts = {};
@@ -545,6 +571,7 @@ function staticScriptsOnly(opts) {
     opts.checkStaticScripts
       && !opts.explicitDashboardTarget
       && !opts.launchDashboard
+      && !opts.holdDashboard
       && opts.selectors.length === 0
       && opts.functions.length === 0
       && opts.stationProbes.length === 0
@@ -552,6 +579,7 @@ function staticScriptsOnly(opts) {
       && !opts.requireStationState
       && !opts.requireAiProviderSession
       && !opts.requireExternalAgent
+      && !opts.requireManagedContextState
       && !opts.screenshotPath
   );
 }
@@ -645,6 +673,11 @@ class TemporaryDashboard {
       await waitForExit(this.child, 800).catch(() => {});
     }
   }
+
+  async waitForExit() {
+    await waitForProcessExit(this.child);
+    return childExitStatus(this.child) || 'exited';
+  }
 }
 
 function printResult(opts, result) {
@@ -693,6 +726,26 @@ function printResult(opts, result) {
   }
 }
 
+function printDashboardHoldResult(opts, result) {
+  if (opts.json) {
+    console.log(JSON.stringify({
+      status: result.status,
+      mode: 'dashboard-hold',
+      url: result.url,
+      readyUrl: result.readyUrl,
+      ms: result.ms,
+      pid: result.pid,
+      command: result.command,
+      staticIdentity: result.staticIdentity,
+    }));
+    return;
+  }
+  console.log(
+    `PASS dashboard-hold url=${quote(result.url)} readyUrl=${quote(result.readyUrl)} pid=${result.pid || 'unknown'} ms=${result.ms}`,
+  );
+  console.log('Hold this command open while running CU/browser E2E; interrupt it to stop the temporary dashboard.');
+}
+
 function formatArtifactLines(artifacts) {
   if (!artifacts || typeof artifacts !== 'object') {
     return [];
@@ -731,7 +784,10 @@ function formatStationStatePass(result) {
   const external = result.externalAgentSession && result.externalAgentSession.ok
     ? ` externalAgent=${quote(result.externalAgentSession.agent || result.externalAgentSession.required || '')} externalEvidence=${quote(result.externalAgentSession.evidence || '')}`
     : '';
-  return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}${live}${external}`;
+  const managedContext = result.managedContextState && result.managedContextState.ok
+    ? ` managedContext=${quote(result.managedContextState.sessionId || result.managedSessionId || 'active')}`
+    : '';
+  return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}${live}${external}${managedContext}`;
 }
 
 function collectFailureLogs(lineCount, dashboard, harness) {
@@ -1389,7 +1445,7 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
-      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent) {
+      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
         await this.prepareStationSurface(opts.timeoutMs);
       }
       for (const probe of opts.stationProbes) {
@@ -1398,7 +1454,7 @@ class BrowserHarness {
       if (opts.stationInteractionProbe) {
         validation.stationInteraction = await this.runStationInteractionProbe(opts.timeoutMs);
       }
-      if (opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent) {
+      if (opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
         validation.stationState = await this.requireStationState(opts);
       }
       return validation;
@@ -1586,6 +1642,12 @@ class BrowserHarness {
         ? state.externalAgentSession.reason
         : `Station did not expose an external ${opts.requireExternalAgent} session`;
       throw new Error(`external agent session check failed: ${reason} (last value: ${summarizeWaitValue(state)})`);
+    }
+    if (opts.requireManagedContextState && !(state.managedContextState && state.managedContextState.ok)) {
+      const reason = state.managedContextState && state.managedContextState.reason
+        ? state.managedContextState.reason
+        : 'Station did not expose active managed/context session state';
+      throw new Error(`managed context state check failed: ${reason} (last value: ${summarizeWaitValue(state)})`);
     }
     return state;
   }
@@ -2850,6 +2912,20 @@ function stationStateSummarySource() {
       count += countArray(managed.recentBranches);
       return count;
     };
+    const managedCountDetails = (managed) => {
+      if (!managed || typeof managed !== 'object') {
+        return { records: 0, anchors: 0, lineageGroups: 0, fissionGroups: 0, recentRecords: 0, recentAnchors: 0, recentBranches: 0 };
+      }
+      return {
+        records: Number(managed.records) || 0,
+        anchors: Number(managed.anchors) || 0,
+        lineageGroups: Number(managed.lineageGroups) || 0,
+        fissionGroups: Number(managed.fissionGroups) || 0,
+        recentRecords: countArray(managed.recentRecords),
+        recentAnchors: countArray(managed.recentAnchors),
+        recentBranches: countArray(managed.recentBranches),
+      };
+    };
     const asText = (value) => String(value ?? '').trim();
     const compactUniqueText = (values) => {
       const out = [];
@@ -3054,6 +3130,29 @@ function stationStateSummarySource() {
         matches: sourceMatches.length,
       };
     };
+    const managedContextState = (snapshot, managedCount) => {
+      const managed = snapshot.managed && typeof snapshot.managed === 'object' ? snapshot.managed : {};
+      const context = snapshot.context && typeof snapshot.context === 'object' ? snapshot.context : {};
+      const sessionId = sessionIdText(
+        managed.sessionId || managed.session_id || context.sessionId || context.session_id ||
+        managed.intendantSessionId || managed.intendant_session_id || context.intendantSessionId || context.intendant_session_id
+      );
+      const status = asText(managed.status || managed.phase || managed.contextStatus || managed.context_status || context.status || context.phase || context.contextStatus || context.context_status);
+      const live = Boolean(managed.live || managed.active || context.live || context.active);
+      const counts = managedCountDetails(managed);
+      const stopped = /\b(stopped|inactive|ended|complete|completed|done|idle|unavailable|empty)\b/i.test(status);
+      const ok = live || Boolean(sessionId && !stopped);
+      return {
+        ok,
+        live,
+        sessionId,
+        status,
+        counts,
+        reason: ok
+          ? 'passed'
+          : `no active managed/context state (live=${live}, sessionId=${sessionId || 'none'}, status=${status || 'none'}, managedCount=${managedCount})`,
+      };
+    };
     try {
       const buildSnapshot = stationSnapshotBuilder();
       const snapshot = buildSnapshot ? buildSnapshot() : null;
@@ -3075,6 +3174,7 @@ function stationStateSummarySource() {
       const counts = { sessions, events, managed, peers };
       const candidates = collectSessionCandidates(snapshot);
       const requiredExternalAgent = normalizeExternalAgentId(requiredExternalAgentRaw);
+      const managedState = managedContextState(snapshot, managed);
       return {
         ok: true,
         nonEmpty: sessions > 0 || events > 0 || managed > 0 || peers > 0,
@@ -3083,6 +3183,7 @@ function stationStateSummarySource() {
         managedSessionId: snapshot.managed && snapshot.managed.sessionId || '',
         liveAgentSession: liveAgentSession(candidates),
         externalAgentSession: externalAgentSession(candidates, requiredExternalAgent),
+        managedContextState: managedState,
       };
     } catch (error) {
       return {
@@ -3149,6 +3250,30 @@ function compactStationState(state) {
     managedSessionId: truncateMiddle(state.managedSessionId || '', DIAGNOSTIC_TEXT_LIMIT),
     liveAgentSession: compactLiveAgentSession(state.liveAgentSession),
     externalAgentSession: compactExternalAgentSession(state.externalAgentSession),
+    managedContextState: compactManagedContextState(state.managedContextState),
+  };
+}
+
+function compactManagedContextState(state) {
+  if (!state || typeof state !== 'object') {
+    return state;
+  }
+  const counts = state.counts || {};
+  return {
+    ok: Boolean(state.ok),
+    live: Boolean(state.live),
+    sessionId: truncateMiddle(state.sessionId || '', DIAGNOSTIC_TEXT_LIMIT),
+    status: truncateMiddle(state.status || '', DIAGNOSTIC_TEXT_LIMIT),
+    counts: {
+      records: Number(counts.records) || 0,
+      anchors: Number(counts.anchors) || 0,
+      lineageGroups: Number(counts.lineageGroups) || 0,
+      fissionGroups: Number(counts.fissionGroups) || 0,
+      recentRecords: Number(counts.recentRecords) || 0,
+      recentAnchors: Number(counts.recentAnchors) || 0,
+      recentBranches: Number(counts.recentBranches) || 0,
+    },
+    reason: truncateMiddle(state.reason || '', DIAGNOSTIC_TEXT_LIMIT),
   };
 }
 
@@ -3255,6 +3380,9 @@ function validationFailureNextStep(result) {
   if (result.failureKind === 'external-agent-session') {
     return 'target a live Station session backed by the requested external agent; do not count native/default provider sessions as external-agent QA success';
   }
+  if (result.failureKind === 'managed-context-state') {
+    return 'target a Station session with active managed/context state; empty or stopped managed context does not satisfy product E2E';
+  }
   if (result.failureKind === 'stale-static') {
     return 'rebuild and restart the dashboard controller from this worktree, then rerun with --require-current-static';
   }
@@ -3280,6 +3408,9 @@ function validationFailureKind(reason) {
   }
   if (/^external agent session check failed/.test(text)) {
     return 'external-agent-session';
+  }
+  if (/^managed context state check failed/.test(text)) {
+    return 'managed-context-state';
   }
   if (/^stale dashboard static asset/.test(text)) {
     return 'stale-static';
@@ -3537,7 +3668,7 @@ function failureDiagnosticSelectors(opts) {
   for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
     addDiagnosticSelector(selectors, selector);
   }
-  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent) {
+  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent || opts.requireManagedContextState) {
     for (const selector of ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]']) {
       addDiagnosticSelector(selectors, selector);
     }
@@ -3554,6 +3685,7 @@ function isStationFocusedCheck(opts) {
     opts.requireStationState ? 'station:state' : '',
     opts.requireAiProviderSession ? 'station:ai-provider-session' : '',
     opts.requireExternalAgent ? `station:external-agent:${opts.requireExternalAgent}` : '',
+    opts.requireManagedContextState ? 'station:managed-context-state' : '',
   ].join('\n').toLowerCase();
   return haystack.includes('station-status')
     || haystack.includes('station-hud-canvas')
@@ -3717,6 +3849,15 @@ function waitForExit(child, timeoutMs) {
   });
 }
 
+function waitForProcessExit(child) {
+  if (!child || child.exitCode !== null || child.signalCode !== null) {
+    return Promise.resolve();
+  }
+  return new Promise((resolve) => {
+    child.once('exit', resolve);
+  });
+}
+
 async function runSelfTest() {
   const parsed = parseArgs(
     [
@@ -3748,6 +3889,7 @@ async function runSelfTest() {
       '--require-ai-provider-session',
       '--require-external-agent',
       'codex',
+      '--require-managed-context-state',
       '--allow-empty-station-state',
     ],
     {},
@@ -3768,6 +3910,7 @@ async function runSelfTest() {
   assert.strictEqual(parsed.requireStationState, true);
   assert.strictEqual(parsed.requireAiProviderSession, true);
   assert.strictEqual(parsed.requireExternalAgent, 'codex');
+  assert.strictEqual(parsed.requireManagedContextState, true);
   assert.strictEqual(parsed.allowEmptyStationState, true);
   assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11']);
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
@@ -3886,6 +4029,12 @@ async function runSelfTest() {
     '--no-tui',
     '--no-tls',
   ]);
+  const holdParsed = parseArgs(['--hold-dashboard', '--port', '8894', '--json'], {});
+  assert.strictEqual(holdParsed.launchDashboard, true);
+  assert.strictEqual(holdParsed.holdDashboard, true);
+  assert.strictEqual(dashboardLaunchPort(holdParsed), 8894);
+  assert.strictEqual(holdParsed.url, 'http://127.0.0.1:8894/');
+  assert.strictEqual(staticScriptsOnly(holdParsed), false);
   assert.throws(
     () => assertDashboardBinarySupportsLaunchArgs(process.execPath, dashboardLaunchArgs(8893)),
     /does not advertise .*--no-tls/,
@@ -4103,6 +4252,7 @@ async function runSelfTest() {
   assert.strictEqual(stationStateSummary.ok, true);
   assert.strictEqual(stationStateSummary.nonEmpty, false);
   assert.strictEqual(stationStateSummary.liveAgentSession.ok, false);
+  assert.strictEqual(stationStateSummary.managedContextState.ok, false);
   assert.deepStrictEqual(JSON.parse(JSON.stringify(stationStateSummary.counts)), {
     sessions: 0,
     events: 0,
@@ -4157,6 +4307,8 @@ async function runSelfTest() {
   })();
   assert.strictEqual(populatedStationStateSummary.nonEmpty, true);
   assert.strictEqual(populatedStationStateSummary.liveAgentSession.ok, false);
+  assert.strictEqual(populatedStationStateSummary.managedContextState.ok, true);
+  assert.strictEqual(populatedStationStateSummary.managedContextState.sessionId, 'abc');
   assert.deepStrictEqual(JSON.parse(JSON.stringify(populatedStationStateSummary.counts)), {
     sessions: 4,
     events: 1,
@@ -4189,7 +4341,27 @@ async function runSelfTest() {
   })();
   assert.strictEqual(placeholderProviderStationStateSummary.nonEmpty, true);
   assert.strictEqual(placeholderProviderStationStateSummary.liveAgentSession.ok, false);
+  assert.strictEqual(placeholderProviderStationStateSummary.managedContextState.ok, false);
   assert.ok(placeholderProviderStationStateSummary.liveAgentSession.reason.includes('no single non-placeholder'));
+  const stoppedManagedStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'stopped-managed', status: 'stopped', records: 2, anchors: 1 },
+      sessions: { total: 1, recent: [{ id: 'stopped-managed', status: 'stopped', source: 'codex' }] },
+    }),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(stoppedManagedStateSummary.nonEmpty, true);
+  assert.strictEqual(stoppedManagedStateSummary.managedContextState.ok, false);
   const nativeProviderStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
     buildStationSnapshot: () => ({
       hosts: [{ id: 'local' }],
@@ -4293,6 +4465,11 @@ async function runSelfTest() {
   assert.ok(validationFailureNextStep({ failureKind: 'station-state', reason: '' }).includes('--allow-empty-station-state'));
   assert.ok(validationFailureNextStep({ failureKind: 'ai-provider-session', reason: '' }).includes('provider/model'));
   assert.ok(validationFailureNextStep({ failureKind: 'external-agent-session', reason: '' }).includes('requested external agent'));
+  assert.strictEqual(
+    validationFailureKind('managed context state check failed: no active managed/context state'),
+    'managed-context-state',
+  );
+  assert.ok(validationFailureNextStep({ failureKind: 'managed-context-state', reason: '' }).includes('active managed/context'));
   assert.ok(validationFailureNextStep({ failureKind: 'stale-static', reason: '' }).includes('--require-current-static'));
   assert.strictEqual(
     normalizeAppHtmlForIdentity('<script src="/wasm-station/station_web.js?v=abc123"></script>'),
