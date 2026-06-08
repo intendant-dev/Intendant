@@ -6328,6 +6328,7 @@ impl StationInner {
             ));
         }
         yy = self.draw_controls_action_pills(x, panel_w, yy - 14.0, &surface_actions);
+        yy = self.draw_display_runway_lanes(x, panel_w, yy);
 
         self.section_title_color(x, yy, "Computer use", C_MAUVE_CSS);
         yy += 22.0;
