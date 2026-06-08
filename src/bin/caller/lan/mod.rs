@@ -1,41 +1,28 @@
-//! `intendant lan` subcommand: port of `scripts/setup-lan.sh` and
-//! `scripts/setup-lan-guest-macos.sh` to Rust.
+//! `intendant lan` subcommand.
 //!
-//! Sets up an mTLS nginx reverse proxy in front of `intendant --web` so
-//! LAN clients (phones, tablets, other boxes) can reach the dashboard
-//! over HTTPS authenticated by a client certificate.
+//! Generates a per-user LAN CA plus server/client certificates for the
+//! native `--tls` / `--mtls` dashboard gateway, then optionally runs a
+//! strict HTTPS enrollment server for importing the client identity on
+//! browsers and mobile devices.
 //!
 //! Shared across platforms: cert generation (pure-Rust rcgen +
-//! p12-keystore), nginx config rendering, client cert distribution, import
-//! instructions. Platform differences (apt vs brew, systemd vs launchd, cert
-//! dir location) are isolated behind the `LanBackend` trait.
+//! p12-keystore), client cert distribution, and import instructions.
+//! Platform differences are isolated behind the `LanBackend` trait.
 
 use std::fmt;
 
 pub mod backend;
 // `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
 // platform, so it stays ungated — `read_server_cert_fingerprint` backs the
-// `pin-self-cert` transport, which doesn't need the nginx flow.
-//
-// The nginx + distribution machinery (`cert_server`, `instructions`,
-// `nginx_config`, `wizard`) and the apt/brew/systemd setup flow are still
-// deferred on Windows (Tier-0): they depend on nginx + apt/brew +
-// systemd/launchd, none of which apply. `backend` and `state` stay available
-// everywhere because `resolve_host_label` / `routable_local_addrs` (called by
-// the web dashboard, not just `lan setup`) need them.
-//
-// On Windows only `certs::read_server_cert_fingerprint` is reachable; the
-// cert/p12 *generation* functions are exercised solely by the still-deferred
-// `lan setup` nginx flow, so they compile-but-are-unused there. Silence those
-// dead-code warnings on Windows; every item is live on macOS/Linux.
+// `pin-self-cert` transport. The interactive `lan` subcommand remains gated
+// off Windows for now because the enrollment UX and setup scripts were only
+// validated on Unix; the native cert store itself is cross-platform.
 #[cfg(not(target_os = "windows"))]
 pub mod cert_server;
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub mod certs;
 #[cfg(not(target_os = "windows"))]
 pub mod instructions;
-#[cfg(not(target_os = "windows"))]
-pub mod nginx_config;
 pub mod state;
 #[cfg(not(target_os = "windows"))]
 pub mod wizard;
@@ -230,12 +217,11 @@ pub struct LanArgs {
     pub cert_port: u16,
     pub lan_ip: Option<String>,
     pub name: Option<String>,
-    pub backend_addr: String,
     pub force: bool,
     /// Skip the interactive cert distribution server at the end of setup.
     /// Used by host orchestrators (e.g. the Windows batch script) that
     /// manage the distribution flow themselves and need setup to return
-    /// as soon as the certs are written and nginx is reloaded.
+    /// as soon as the certs are written.
     pub no_serve_certs: bool,
 }
 
@@ -255,11 +241,10 @@ impl Default for LanArgs {
     fn default() -> Self {
         Self {
             action: LanAction::Help,
-            https_port: 8443,
+            https_port: crate::web_gateway::DEFAULT_PORT,
             cert_port: 9999,
             lan_ip: None,
             name: None,
-            backend_addr: "127.0.0.1:8765".to_string(),
             force: false,
             no_serve_certs: false,
         }
@@ -340,7 +325,10 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
                 let v = iter
                     .next()
                     .ok_or_else(|| LanError("missing value for --backend".into()))?;
-                args.backend_addr = v.clone();
+                eprintln!(
+                    "warning: --backend {v:?} is ignored; native `intendant --tls` serves \
+                     the dashboard directly without an upstream proxy"
+                );
             }
             "--force" => {
                 args.force = true;
@@ -369,18 +357,18 @@ fn print_help() {
     println!("    intendant lan <action> [flags]");
     println!();
     println!("ACTIONS:");
-    println!("    setup         Install mTLS nginx reverse proxy and generate certs");
+    println!("    setup         Generate native TLS/mTLS LAN certs and start enrollment");
     println!("    recert        Regenerate server cert after LAN IP change");
-    println!("    remove        Tear down nginx config and remove certs");
+    println!("    remove        Remove the per-user LAN cert store");
     println!("    list          Show current setup state");
     println!("    serve-certs   Run strict HTTPS client cert enrollment");
     println!();
     println!("FLAGS:");
-    println!("    --port <N>         HTTPS port exposed to clients (default 8443)");
+    println!("    --port <N>         Native dashboard HTTPS port to advertise (default 8765)");
     println!("    --cert-port <N>    Port for the HTTPS enrollment server (default 9999)");
     println!("    --lan-ip <IP>      Override detected LAN IP");
     println!("    --name <LABEL>     Host label shown in cert CN and multi-host dashboard");
-    println!("    --backend <ADDR>   Upstream intendant address (default 127.0.0.1:8765)");
+    println!("    --backend <ADDR>   Ignored legacy flag from the old proxy setup path");
     println!("    --force            Skip idempotency checks (regenerate even if current)");
     println!("    --no-serve-certs   Skip the enrollment server at the end of setup");
     println!();
@@ -393,7 +381,6 @@ fn print_help() {
 #[cfg(not(target_os = "windows"))]
 async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
-    be.require_privileges()?;
 
     let lan_ip = match args.lan_ip.clone() {
         Some(ip) => {
@@ -405,24 +392,24 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
 
     let cert_dir = be.cert_dir();
     std::fs::create_dir_all(&cert_dir)?;
-    be.own_cert_dir(&cert_dir)?;
 
     let label = args.name.clone().unwrap_or_else(|| lan_ip.clone());
 
     let state = certs::ensure_certs(&cert_dir, &lan_ip, &label, args.force)?;
     state::write_host_label(&cert_dir, &label)?;
 
-    be.install_nginx()?;
-    let nginx_conf = nginx_config::render(&cert_dir, &args.backend_addr, args.https_port);
-    be.write_nginx_site(&nginx_conf)?;
-    be.reload_nginx()?;
-
     println!();
     println!("============================================================");
     println!("  Setup complete!");
     println!("============================================================");
     println!();
-    println!("  Phone connects to: https://{lan_ip}:{}", args.https_port);
+    println!("  Native LAN certs: {}", cert_dir.display());
+    println!("  Start or restart the dashboard with:");
+    println!("    intendant --tls");
+    println!("  Or require client certs with:");
+    println!("    intendant --mtls");
+    println!();
+    println!("  Dashboard URL: https://{lan_ip}:{}", args.https_port);
     println!();
 
     if args.no_serve_certs {
@@ -450,7 +437,6 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
 #[cfg(not(target_os = "windows"))]
 async fn cmd_recert(args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
-    be.require_privileges()?;
 
     let lan_ip = match args.lan_ip.clone() {
         Some(ip) => {
@@ -469,11 +455,10 @@ async fn cmd_recert(args: LanArgs) -> LanResult<()> {
     }
 
     certs::recert(&cert_dir, &lan_ip, args.force)?;
-    be.reload_nginx()?;
 
-    println!(":: done — nginx restarted with new cert");
-    println!(":: no changes needed on your phone (same CA)");
-    println!("!! if you get certificate errors, clear your browser's cache/history");
+    println!(":: done — native LAN server cert refreshed");
+    println!(":: restart any running `intendant --tls` / `--mtls` daemon to load it");
+    println!(":: enrolled clients can keep using the same CA and client identity");
 
     Ok(())
 }
@@ -481,8 +466,6 @@ async fn cmd_recert(args: LanArgs) -> LanResult<()> {
 #[cfg(not(target_os = "windows"))]
 async fn cmd_remove(_args: LanArgs) -> LanResult<()> {
     let be = backend::select_backend();
-    be.require_privileges()?;
-    be.remove_nginx_site()?;
     let cert_dir = be.cert_dir();
     if cert_dir.exists() {
         std::fs::remove_dir_all(&cert_dir)?;

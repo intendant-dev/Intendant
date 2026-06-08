@@ -25,8 +25,9 @@ INSTANCE_SLUG=""
 INSTANCE_NAME=""
 VM_IP=""
 VM_USER=""
-HTTPS_PORT=8443
+HTTPS_PORT=8765
 CERT_PORT=9999
+GUEST_DASHBOARD_PORT=8765
 NET_MODE=""
 LAN_IFACE=""
 LAN_IP=""
@@ -193,7 +194,7 @@ migrate_legacy() {
     INSTANCE_SLUG=""
     VM_IP=""
     VM_USER=""
-    HTTPS_PORT=8443
+    HTTPS_PORT=8765
     CERT_PORT=9999
     NET_MODE=""
     INSTANCE_NAME=""
@@ -306,10 +307,9 @@ resolve_intendant_path() {
     info "remote intendant: $REMOTE_INTENDANT"
 }
 
-# Run `intendant lan <action> [args]` on the VM. On Linux the command
-# is prefixed with `sudo` because the Linux backend writes to /etc and
-# requires root; on macOS the backend is user-level and refuses to run
-# as root, so no sudo.
+# Run `intendant lan <action> [args]` on the VM as the daemon user.
+# The native LAN cert store is per-user; using sudo would create certs
+# that the normal dashboard daemon cannot read.
 #
 # Setup blocks on the interactive cert distribution server, so we use
 # `run_on_guest_interactive` (PTY-allocating) for that action so that
@@ -331,11 +331,7 @@ run_intendant_lan() {
     done
 
     local cmd
-    if [[ "$GUEST_OS" == "linux" ]]; then
-        cmd="${prefix}sudo ${REMOTE_INTENDANT} lan ${action}${remote_args}"
-    else
-        cmd="${prefix}${REMOTE_INTENDANT} lan ${action}${remote_args}"
-    fi
+    cmd="${prefix}${REMOTE_INTENDANT} lan ${action}${remote_args}"
 
     if [[ "$action" == "setup" || "$action" == "serve-certs" ]]; then
         run_on_guest_interactive "$cmd"
@@ -397,7 +393,7 @@ setup_tunnel() {
         <string>-o</string>
         <string>ServerAliveCountMax=3</string>
         <string>-L</string>
-        <string>0.0.0.0:${HTTPS_PORT}:localhost:${HTTPS_PORT}</string>
+        <string>0.0.0.0:${HTTPS_PORT}:localhost:${GUEST_DASHBOARD_PORT}</string>
         <string>-L</string>
         <string>0.0.0.0:${CERT_PORT}:localhost:${CERT_PORT}</string>
         <string>${VM_USER}@${VM_IP}</string>
@@ -414,7 +410,7 @@ PLIST
     chown "$REAL_USER" "$plist" 2>/dev/null || true
 
     as_user launchctl load "$plist"
-    info "tunnel service started — forwarding 0.0.0.0:{$HTTPS_PORT,$CERT_PORT} → VM"
+    info "tunnel service started — forwarding 0.0.0.0:${HTTPS_PORT} → VM:${GUEST_DASHBOARD_PORT}, 0.0.0.0:${CERT_PORT} → VM:${CERT_PORT}"
 }
 
 remove_tunnel() {
@@ -541,7 +537,7 @@ run_wizard() {
         default_user=$(grep '^VM_USER=' "$(instance_config)" 2>/dev/null | cut -d'"' -f2)
         default_user="${default_user:-$REAL_USER}"
         HTTPS_PORT=$(grep '^HTTPS_PORT=' "$(instance_config)" 2>/dev/null | cut -d= -f2)
-        HTTPS_PORT="${HTTPS_PORT:-8443}"
+        HTTPS_PORT="${HTTPS_PORT:-8765}"
         CERT_PORT=$(grep '^CERT_PORT=' "$(instance_config)" 2>/dev/null | cut -d= -f2)
         CERT_PORT="${CERT_PORT:-9999}"
         INSTANCE_NAME=$(grep '^INSTANCE_NAME=' "$(instance_config)" 2>/dev/null | cut -d'"' -f2)
@@ -606,11 +602,11 @@ run_wizard() {
     echo ""
     if ! $is_reconfig; then
         local suggested_https
-        suggested_https=$(next_free_port 8443 HTTPS_PORT)
-        HTTPS_PORT=$(ask "HTTPS port for phone access" "$suggested_https")
+        suggested_https=$(next_free_port 8765 HTTPS_PORT)
+        HTTPS_PORT=$(ask "Native dashboard HTTPS port for phone access" "$suggested_https")
         CERT_PORT=$(next_free_port 9999 CERT_PORT)
     else
-        HTTPS_PORT=$(ask "HTTPS port for phone access" "$HTTPS_PORT")
+        HTTPS_PORT=$(ask "Native dashboard HTTPS port for phone access" "$HTTPS_PORT")
     fi
 
     # Step 6: Name
@@ -695,9 +691,7 @@ run_wizard() {
         echo ""
         echo "  The SSH tunnel and config are in place, but the"
         echo "  VM-side setup did not complete. SSH in and run:"
-        local manual_prefix=""
-        [[ "$GUEST_OS" == "linux" ]] && manual_prefix="sudo "
-        printf '    %s%s lan setup' "$manual_prefix" "${REMOTE_INTENDANT:-intendant}"
+        printf '    %s lan setup' "${REMOTE_INTENDANT:-intendant}"
         printf ' %q' "${guest_args[@]}"
         printf '\n'
         echo ""

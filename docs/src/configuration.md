@@ -325,7 +325,7 @@ deployments only ever touch `[server.tls]`.
 | `hostname` | string | — | Extra SAN hostname for the self-signed cert (in addition to bind IP + `localhost`) |
 
 When TLS is enabled and `cert`/`key` are omitted, Intendant first looks for the
-installed LAN server certificate in the platform cert directory
+installed LAN server certificate in the per-user platform cert directory
 (`server.crt` / `server.key`, normally created by `intendant lan setup`). If
 that pair is absent, it falls back to an ephemeral self-signed certificate.
 

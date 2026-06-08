@@ -335,34 +335,34 @@ clicking through a self-signed certificate warning is not a reliable way to
 unlock these browser APIs. See
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
-### mTLS reverse proxy — `intendant lan`
+### Native LAN certs — `intendant lan`
 
-`src/bin/caller/lan/` ports the old `setup-lan.sh` script to Rust. `intendant lan
-setup` stands up an **mTLS nginx reverse proxy** in front of `intendant --web` so
-LAN clients (phones, tablets, other boxes) reach the dashboard over HTTPS
-authenticated by a **client certificate**. Cert generation is pure-Rust (`rcgen` +
-RustCrypto `rsa` + `p12-keystore`); new cert material uses RSA-2048 with SHA-256
-signatures so Apple configuration-profile certificate payloads match Apple's
-documented compatibility path. The proxy/service plumbing (nginx config,
-apt/brew installs, systemd/launchd) is Unix-specific. Subcommands:
+`src/bin/caller/lan/` creates the certificate material used by native
+`--tls` / `--mtls`: a per-user LAN CA, server certificate, client identity, and
+strict HTTPS enrollment server. LAN clients (phones, tablets, other boxes) can
+then reach the dashboard over HTTPS authenticated by a **client certificate**.
+Cert generation is pure-Rust (`rcgen` + RustCrypto `rsa` + `p12-keystore`); new
+cert material uses RSA-2048 with SHA-256 signatures so Apple
+configuration-profile certificate payloads match Apple's documented
+compatibility path. Subcommands:
 
 | Command | Action |
 |---|---|
-| `intendant lan setup` | Generate CA + server/client certs, render nginx config, start the proxy + strict HTTPS enrollment server |
+| `intendant lan setup` | Generate CA + server/client certs and start the strict HTTPS enrollment server |
 | `intendant lan recert` | Re-issue certs |
-| `intendant lan remove` | Tear down the proxy and config |
+| `intendant lan remove` | Remove the per-user LAN cert store |
 | `intendant lan list` | List issued client certs |
 | `intendant lan serve-certs` | Run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
 
 ```bash
-intendant lan setup --name nicks-mac --https-port 8443
+intendant lan setup --name nicks-mac --port 8765
 ```
 
-`intendant lan` is **gated off Windows** — the nginx/systemd/apt machinery doesn't
-apply there. Cert *generation* is cross-platform, so a Windows daemon can still use
-`--tls` for native HTTPS and `read_server_cert_fingerprint` to publish a pinned
-fingerprint; to put it behind an mTLS proxy, front it with your own reverse proxy.
-See [Windows Support](./windows-support.md).
+The interactive `intendant lan` setup/enrollment flow is currently validated on
+Unix hosts. Cert *generation* and native HTTPS/WSS are cross-platform, so a
+Windows daemon can still use `--tls` for native HTTPS and
+`read_server_cert_fingerprint` to publish a pinned fingerprint. See
+[Windows Support](./windows-support.md).
 
 Enrollment is not a plain unauthenticated download. The temporary
 `serve-certs` endpoint runs HTTPS with the LAN server certificate. The CLI does
@@ -374,7 +374,7 @@ Apple configuration profile. The page detects the browser only to put the most
 likely install path first; all artifacts remain gated by the terminal-paired
 browser session.
 
-The mTLS proxy also solves browser secure-context requirements for LAN clients
+Native LAN TLS also solves browser secure-context requirements for LAN clients
 once the CA/client identity are installed. That matters for Station's WebGPU
 renderer, microphone/camera, browser screen capture, and stricter clipboard APIs;
 plain `http://<LAN-IP>:8765` does not expose those features.

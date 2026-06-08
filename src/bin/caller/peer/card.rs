@@ -48,10 +48,8 @@ impl AgentCard {
     ///
     /// Auth defaults to [`AuthRequirements::none`] (trust-the-network)
     /// unless the caller opts into a stricter combination; the LAN
-    /// mTLS case is handled at the nginx proxy layer above the
-    /// gateway and is selected by the operator passing
-    /// [`AuthRequirements::mutual_tls`] (or `mutual_tls_and_bearer`
-    /// for WAN exposure).
+    /// mTLS case is enforced by the native dashboard gateway when the
+    /// operator enables `--mtls` / `[server.mtls]`.
     pub fn local_intendant(
         label: String,
         version: String,
@@ -384,8 +382,7 @@ impl AuthRequirements {
 
     /// mTLS-only — TLS handshake authenticates the peer via a client
     /// cert. No application-layer requirement. Right for trusted-LAN
-    /// federation behind the existing `intendant lan setup` nginx
-    /// proxy. Inadequate alone for WAN exposure; pair with
+    /// federation behind native `--mtls`. Inadequate alone for WAN exposure; pair with
     /// [`AuthRequirements::mutual_tls_and_bearer`] for that.
     pub fn mutual_tls() -> Self {
         Self {

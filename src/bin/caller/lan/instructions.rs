@@ -1,6 +1,5 @@
 //! Per-platform client cert import walkthroughs.
 //!
-//! Straight port of the bash heredocs in `scripts/setup-lan.sh`.
 //! Printed at the end of `intendant lan setup` so the user can pick
 //! the right set of steps for whichever client device they're setting
 //! up.

@@ -283,10 +283,8 @@ fn build_local_advertised_auth(
         "mutual-tls" => peer::TransportAuth::MutualTls,
         "pin-self-cert" => {
             // `pin-self-cert` reads the local server cert produced by
-            // `intendant lan setup`. The `certs` module is now pure-Rust
-            // (rcgen + p12-keystore) and compiles everywhere, so this works
-            // on all platforms; only the nginx-based `lan setup` flow that
-            // writes the cert is still deferred on Windows.
+            // `intendant lan setup`. The cert store is per-user and is
+            // consumed directly by native `--tls` / `--mtls`.
             let fp = lan::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
                 CallerError::Config(format!(
                     "[server.auth] advertised_transport = \"pin-self-cert\" requires \
@@ -9867,27 +9865,19 @@ fn installed_lan_tls_unreadable_message(
     role: &str,
     err: &io::Error,
 ) -> String {
-    let linux_note = if cfg!(target_os = "linux") {
-        " On Linux, `intendant lan setup` stores nginx-facing certs under \
-         `/etc/intendant-lan`; private keys there are commonly root-readable \
-         only."
-    } else {
-        ""
-    };
     let permission_hint = if err.kind() == io::ErrorKind::PermissionDenied {
-        format!(
+        String::from(
             " To let this user run native `--tls` with the installed LAN cert, \
-             make the key readable by the Intendant runtime user, for example: \
-             `sudo chgrp $(id -gn) {path}` then `sudo chmod 0640 {path}`.",
-            path = path.display()
+             fix ownership of the per-user LAN cert store or rerun \
+             `intendant lan setup --force` as that user."
         )
     } else {
         String::new()
     };
     format!(
         "Installed LAN TLS {role} exists at {path}, but this process cannot read it: {err}. \
-         Native `--tls` reads the server certificate and key directly.{linux_note}{permission_hint} \
-         Alternatively, run Intendant as a user that can read the key, pass a readable pair with \
+         Native `--tls` reads the server certificate and key directly from the per-user \
+         LAN cert store at {cert_dir}.{permission_hint} Alternatively, pass a readable pair with \
          `--tls-cert <cert> --tls-key <key>`, or move the installed pair out of {cert_dir} to use \
          the self-signed fallback.",
         path = path.display(),
@@ -15417,7 +15407,8 @@ Also: {"source": "bare"}"#;
         let msg = err.to_string();
         assert!(msg.contains("cannot read it"), "msg: {msg}");
         assert!(msg.contains("server.key"), "msg: {msg}");
-        assert!(msg.contains("chmod 0640"), "msg: {msg}");
+        assert!(msg.contains("per-user LAN cert store"), "msg: {msg}");
+        assert!(msg.contains("intendant lan setup --force"), "msg: {msg}");
         assert!(msg.contains("--tls-cert <cert> --tls-key <key>"), "msg: {msg}");
     }
 
@@ -24444,10 +24435,8 @@ async fn main() -> Result<(), CallerError> {
     platform::ensure_tool_paths();
 
     // Intercept `intendant lan <action>` before the main runtime setup —
-    // the lan subcommand is a pure system-setup path with no project,
-    // no .env, no provider selection. The subcommand's cert machinery
-    // (OpenSSL + nginx) is deferred on Windows (Tier-0), so there it
-    // reports unsupported and exits rather than calling the gated path.
+    // the lan subcommand is a local certificate/enrollment path with no
+    // project, no .env, and no provider selection.
     if env::args().nth(1).as_deref() == Some("lan") {
         #[cfg(not(target_os = "windows"))]
         {

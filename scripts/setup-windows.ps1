@@ -785,7 +785,7 @@ function Show-CompletionSummary {
     } else {
         Warn "   - Voice optional: needs ffmpeg/ffplay plus manual VB-CABLE setup; Windows voice bridge is still pending end-to-end validation."
     }
-    Warn "   - LAN setup: native 'intendant lan' is unsupported on Windows; use scripts\setup-lan.bat with WSL/a Linux guest or your own reverse proxy."
+    Warn "   - LAN enrollment: native 'intendant lan' enrollment is Unix-validated; use scripts\setup-lan.bat with WSL/a Linux guest, explicit --tls-cert/--tls-key, or your own reverse proxy."
 
     Write-Host ""
     Write-Host "  Add an API key, then run intendant:" -ForegroundColor White

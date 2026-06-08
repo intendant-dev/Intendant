@@ -333,8 +333,8 @@ platform including Windows — no nginx, no OpenSSL. See the
 [Configuration → `[server]`](./configuration.md#server-daemon-and-federation).
 
 For mutual-TLS with client certificates (only enrolled devices can connect), use
-native `--mtls` / `[server.mtls]`, or use the `intendant lan setup` reverse
-proxy path — see
+native `--mtls` / `[server.mtls]`; use `intendant lan setup` to generate the
+per-user LAN CA/server/client certs and run strict enrollment. See
 [Getting Started → LAN access](./getting-started.md#lan-access) and
 [Peer Federation](./peer-federation.md). For the daemon posture and remote
 control surface, see [Control Plane & Daemon](./control-plane-and-daemon.md).
