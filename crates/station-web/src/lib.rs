@@ -5057,14 +5057,14 @@ impl StationInner {
                 .into_iter()
                 .rev()
             {
-                if ev.action == "log" && !ev.id.is_empty() {
+                if !ev.id.is_empty() {
                     self.hit_zones.push(HitZone::new(
                         x + 12.0,
                         ey - 11.0,
                         panel_w - 24.0,
                         17.0,
                         HitAction::ActivityAction {
-                            action: ev.action.clone(),
+                            action: "show-log".to_string(),
                             id: ev.id.clone(),
                         },
                     ));
@@ -5373,13 +5373,69 @@ impl StationInner {
             self.panel_row(x, yy, "lanes", "--");
         } else {
             for item in ctx.top_categories.iter().take(5) {
-                self.panel_row(
-                    x,
-                    yy,
-                    &truncate(&item.label, 13),
-                    &format!("{} tokens", compact_number(item.value as f64)),
+                self.round_rect(
+                    x + 12.0,
+                    yy - 11.0,
+                    panel_w - 24.0,
+                    39.0,
+                    4.0,
+                    "rgba(17,17,27,0.74)",
+                    "rgba(137,180,250,0.40)",
                 );
-                yy += 19.0;
+                self.text(
+                    &truncate(&item.label, 20),
+                    x + 20.0,
+                    yy + 1.0,
+                    9.0,
+                    C_BLUE_CSS,
+                    "bold",
+                );
+                self.text(
+                    &truncate(
+                        &format!(
+                            "{} tok · {} items{}{}",
+                            compact_number(item.value as f64),
+                            item.count,
+                            if item.detail.is_empty() { "" } else { " · " },
+                            item.detail
+                        ),
+                        30,
+                    ),
+                    x + 20.0,
+                    yy + 17.0,
+                    8.5,
+                    C_SUBTEXT0_CSS,
+                    "normal",
+                );
+                let mut bx = x + panel_w - 104.0;
+                if !item.part_id.is_empty() {
+                    self.pill_at(bx, yy + 10.0, 48.0, 18.0, "focus", C_BLUE_CSS);
+                    self.hit_zones.push(HitZone::new(
+                        bx,
+                        yy + 10.0,
+                        48.0,
+                        18.0,
+                        HitAction::ContextAction {
+                            action: "part".to_string(),
+                            id: item.part_id.clone(),
+                        },
+                    ));
+                    bx += 54.0;
+                }
+                if !item.category.is_empty() {
+                    self.pill_at(bx, yy + 10.0, 42.0, 18.0, "copy", C_TEAL_CSS);
+                    self.hit_zones.push(HitZone::new(
+                        bx,
+                        yy + 10.0,
+                        42.0,
+                        18.0,
+                        HitAction::ContextAction {
+                            action: "copy-lane".to_string(),
+                            id: item.category.clone(),
+                        },
+                    ));
+                }
+                yy += 43.0;
             }
         }
         yy += 12.0;
@@ -6499,7 +6555,8 @@ impl StationInner {
                 ),
             );
             yy += 22.0;
-            if !controls.session_sandbox.is_empty() || !controls.session_approval_policy.is_empty() {
+            if !controls.session_sandbox.is_empty() || !controls.session_approval_policy.is_empty()
+            {
                 self.panel_row(
                     x,
                     yy,
@@ -7708,12 +7765,7 @@ impl StationInner {
         );
         yy += 22.0;
         if !controls.browser_workspace_url.is_empty() {
-            self.panel_row(
-                x,
-                yy,
-                "url",
-                &truncate(&controls.browser_workspace_url, 42),
-            );
+            self.panel_row(x, yy, "url", &truncate(&controls.browser_workspace_url, 42));
             yy += 22.0;
         }
         if !controls.browser_workspace_latest.is_empty()
@@ -10204,7 +10256,9 @@ impl StationInner {
                     "action": action,
                     "id": id,
             })),
-            HitAction::ActivityAction { action, id } if action == "log" && !id.is_empty() => {
+            HitAction::ActivityAction { action, id }
+                if (action == "log" || action == "show-log") && !id.is_empty() =>
+            {
                 self.selected_id = Some(format!("activity:{id}"));
                 self.panel_scroll = 0.0;
                 self.last_render_ms = 0.0;
@@ -11611,15 +11665,23 @@ struct StationDisplayRunwayLane {
 #[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct StationBreakdown {
+    category: String,
     label: String,
     value: f32,
+    count: u32,
+    part_id: String,
+    detail: String,
 }
 
 impl Default for StationBreakdown {
     fn default() -> Self {
         Self {
+            category: String::new(),
             label: String::new(),
             value: 0.0,
+            count: 0,
+            part_id: String::new(),
+            detail: String::new(),
         }
     }
 }
@@ -12720,12 +12782,19 @@ fn external_turn_color_css(state: &str) -> &'static str {
 
 fn managed_row_buttons(row: &StationDetailRow) -> Vec<(&'static str, &'static str, f32)> {
     match row.action.as_str() {
-        "anchor" => vec![("use", "anchor", 40.0), ("inspect", "anchor-inspect", 58.0)],
-        "record" => vec![
-            ("inspect", "record-inspect", 58.0),
-            ("fork", "record-fork", 42.0),
+        "anchor" => vec![
+            ("use", "anchor", 40.0),
+            ("inspect", "anchor-inspect", 58.0),
+            ("copy", "anchor-copy", 42.0),
         ],
-        "branch" => vec![("claim", "branch", 50.0)],
+        "record" => vec![
+            ("select", "record", 50.0),
+            ("inspect", "record-inspect", 58.0),
+            ("restore", "record-restore", 58.0),
+            ("fork", "record-fork", 42.0),
+            ("copy", "record-copy", 42.0),
+        ],
+        "branch" => vec![("claim", "branch", 50.0), ("copy", "branch-copy", 42.0)],
         _ => Vec::new(),
     }
 }

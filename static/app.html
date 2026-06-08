@@ -20809,8 +20809,19 @@ function stationHandleManagedAction(action) {
       });
     return;
   }
-  if (op === 'record-inspect' || op === 'record-fork') {
-    const mode = op === 'record-fork' ? 'fork' : 'inspect';
+  if (op === 'anchor-copy' || op === 'record-copy' || op === 'branch-copy') {
+    copyTextToClipboard(id)
+      .then(() => showControlToast?.('success', 'Copied managed context ID'));
+    return;
+  }
+  if (op === 'record-inspect' || op === 'record-fork' || op === 'record-restore' || op === 'record-backout') {
+    const mode = op === 'record-fork'
+      ? 'fork'
+      : op === 'record-restore'
+        ? 'restore'
+        : op === 'record-backout'
+          ? 'backout'
+          : 'inspect';
     stationApplyManagedAction('record', id, sessionId)
       .then(() => {
         stationRememberManagedDraftValue('backoutMode', mode);
@@ -20891,6 +20902,11 @@ function stationHandleContextAction(action) {
     const part = stationSelectedContextPartDetail(id || stationSelectedContextPart);
     if (part) stationCopyContextPart(part);
     else showControlToast?.('error', 'No context item selected');
+    return;
+  }
+  if (op === 'copy-lane') {
+    if (id) stationCopyContextLane(id);
+    else showControlToast?.('error', 'No context lane selected');
     return;
   }
   if (op === 'copy-id') {
