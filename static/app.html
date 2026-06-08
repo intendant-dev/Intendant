@@ -12726,6 +12726,9 @@ function stationDisplayRunwayPayload() {
   const selectedDisplayId = selectedHostId
     ? stationPeerDisplayIdForHost(selectedHostId)
     : stationPeerDisplayId();
+  const peerCount = daemons.length;
+  const connectedPeers = daemons.filter(peer => !!peer.connected).length;
+  const displayPeers = daemons.filter(peer => peerCanShareDisplay(peer)).length;
   const lanes = [];
   if (controls.sessionId) {
     lanes.push({
@@ -12796,7 +12799,14 @@ function stationDisplayRunwayPayload() {
   return {
     generated_at: new Date().toISOString(),
     selected_peer_id: selectedHostId || '',
+    selected_peer_label: stationPeerDisplayName(selectedPeer),
     selected_display_id: Number(selectedDisplayId) || 0,
+    selected_peer_connected: !!selectedPeer?.connected,
+    selected_peer_can_display: !!selectedPeer && peerCanShareDisplay(selectedPeer),
+    peer_status: stationPeerStatus || '',
+    peer_count: peerCount,
+    connected_peers: connectedPeers,
+    display_peers: displayPeers,
     operator_session_id: controls.sessionId || '',
     local_streams: displaySlots.size,
     remote_streams: peerDisplayConnections.size,
@@ -20378,6 +20388,27 @@ function stationHandleControlsAction(action) {
   }
   if (op === 'peer-status-copy') {
     stationCopyPeerDisplayStatusFromDock();
+    return;
+  }
+  if (op === 'peer-refresh') {
+    refreshPeersFromApi()
+      .then(() => stationSetPeerStatus('Peer registry refreshed', 'ok'))
+      .catch(err => stationSetPeerStatus(`Peer refresh failed: ${err?.message || err}`, 'error'))
+      .finally(() => {
+        stationScheduleUpdate();
+        stationRenderPeersDock();
+      });
+    return;
+  }
+  if (op === 'peer-open-selected') {
+    const peer = stationSelectedPeer();
+    if (!peer || !peerCanShareDisplay(peer)) {
+      stationSetPeerStatus('Selected peer does not advertise display capability.', 'error');
+      stationScheduleUpdate();
+      return;
+    }
+    stationOpenDisplay(peer.host_id, stationPeerDisplayIdForHost(peer.host_id));
+    stationScheduleUpdate();
     return;
   }
   if (op === 'shared-view-focus') {

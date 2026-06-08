@@ -5981,6 +5981,74 @@ impl StationInner {
             ),
         );
         yy += 24.0;
+        self.panel_row(
+            x,
+            yy,
+            "peers",
+            &format!(
+                "{} connected / {} display / {} total",
+                runway.connected_peers, runway.display_peers, runway.peer_count
+            ),
+        );
+        yy += 20.0;
+        if !runway.selected_peer_label.is_empty() || !runway.selected_peer_id.is_empty() {
+            self.panel_row_color(
+                x,
+                yy,
+                "target",
+                &truncate(
+                    &format!(
+                        "{} :{} / {}",
+                        nonempty(&runway.selected_peer_label, &runway.selected_peer_id),
+                        runway.selected_display_id,
+                        if runway.selected_peer_connected {
+                            "connected"
+                        } else {
+                            "offline"
+                        }
+                    ),
+                    42,
+                ),
+                if runway.selected_peer_connected {
+                    C_GREEN_CSS
+                } else {
+                    C_YELLOW_CSS
+                },
+            );
+            yy += 20.0;
+        }
+        if !runway.peer_status.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "status",
+                &truncate(&runway.peer_status, 42),
+            );
+            yy += 22.0;
+        }
+        let mut peer_actions = vec![
+            (
+                "peer-refresh".to_string(),
+                "refresh peers".to_string(),
+                102.0,
+                C_BLUE_CSS.to_string(),
+            ),
+            (
+                "peer-status-copy".to_string(),
+                "copy status".to_string(),
+                94.0,
+                C_MAUVE_CSS.to_string(),
+            ),
+        ];
+        if runway.selected_peer_can_display {
+            peer_actions.push((
+                "peer-open-selected".to_string(),
+                "open peer".to_string(),
+                82.0,
+                C_PEACH_CSS.to_string(),
+            ));
+        }
+        yy = self.draw_controls_action_pills(x, panel_w, yy - 12.0, &peer_actions);
         if runway.lanes.is_empty() {
             self.panel_row(x, yy, "lanes", "no display/session lanes");
             return yy + 28.0;
@@ -9508,7 +9576,14 @@ struct StationAttentionItem {
 #[serde(default)]
 struct StationDisplayRunwaySummary {
     selected_peer_id: String,
+    selected_peer_label: String,
     selected_display_id: i32,
+    selected_peer_connected: bool,
+    selected_peer_can_display: bool,
+    peer_status: String,
+    peer_count: u32,
+    connected_peers: u32,
+    display_peers: u32,
     operator_session_id: String,
     local_streams: u32,
     remote_streams: u32,
