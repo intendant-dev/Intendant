@@ -27032,20 +27032,35 @@ function schedulePromptTargetLogSessionBadgeRefresh(target = resolvePromptTarget
 
 function updatePromptTargetLogSessionBadges(target = resolvePromptTargetSessionId()) {
   const normalizedTarget = String(target || '').trim();
+  const previousTarget = promptTargetLogBadgeRenderedTarget === null
+    ? ''
+    : String(promptTargetLogBadgeRenderedTarget || '').trim();
   if (promptTargetLogBadgeRefreshFrame) {
     cancelAnimationFrame(promptTargetLogBadgeRefreshFrame);
     promptTargetLogBadgeRefreshFrame = 0;
   }
   promptTargetLogBadgeScheduledTarget = normalizedTarget;
-  document.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
-    applyPromptTargetLogSessionBadgeState(entry, normalizedTarget);
-  });
-  if (concurrentLogDetachedFragment) {
-    concurrentLogDetachedFragment.querySelectorAll('.log-entry[data-session-id]').forEach(entry => {
-      applyPromptTargetLogSessionBadgeState(entry, normalizedTarget);
-    });
+  if (previousTarget && previousTarget !== normalizedTarget) {
+    updatePromptTargetLogSessionBadgesForSession(previousTarget, normalizedTarget);
   }
+  updatePromptTargetLogSessionBadgesForSession(normalizedTarget, normalizedTarget);
   promptTargetLogBadgeRenderedTarget = normalizedTarget;
+}
+
+function updatePromptTargetLogSessionBadgesForSession(sessionId, target) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const selector = window.CSS?.escape
+    ? `.log-entry[data-session-id="${CSS.escape(sid)}"]`
+    : '.log-entry[data-session-id]';
+  const apply = entry => {
+    if (entry.dataset.sessionId !== sid) return;
+    applyPromptTargetLogSessionBadgeState(entry, target);
+  };
+  document.querySelectorAll(selector).forEach(apply);
+  if (concurrentLogDetachedFragment) {
+    concurrentLogDetachedFragment.querySelectorAll(selector).forEach(apply);
+  }
 }
 
 function applyPromptTargetLogSessionBadgeState(entry, target = resolvePromptTargetSessionId()) {
@@ -29183,7 +29198,57 @@ function renderSessionWindowRange(win, start) {
 function renderSessionWindowTail(win) {
   if (!win) return;
   const history = ensureSessionWindowHistory(win);
-  renderSessionWindowRange(win, sessionWindowTailStart(history.length));
+  const start = sessionWindowTailStart(history.length);
+  if (
+    win.renderStart === start &&
+    win.renderEnd === history.length &&
+    !win.log?.firstElementChild?.classList?.contains('session-window-empty')
+  ) {
+    return;
+  }
+  renderSessionWindowRange(win, start);
+}
+
+function appendSessionWindowRenderedTailItem(win, item, index, historyLength) {
+  if (!win || !win.log || win.renderEnd !== index) return false;
+  const node = materializeSessionWindowHistoryItem(win, item, index);
+  if (!node) return false;
+  if (win.log.firstElementChild?.classList?.contains('session-window-empty')) {
+    win.log.replaceChildren();
+  }
+  win.log.appendChild(node);
+  win.renderEnd = index + 1;
+  const targetStart = sessionWindowTailStart(historyLength);
+  while (win.renderStart < targetStart && win.log.firstElementChild) {
+    win.log.firstElementChild.remove();
+    win.renderStart += 1;
+  }
+  scheduleSessionWindowGridFit();
+  return true;
+}
+
+function appendSessionWindowRenderedTailItems(win, items, startIndex, historyLength) {
+  if (!win || !win.log || !Array.isArray(items) || items.length === 0) return false;
+  if (win.renderEnd !== startIndex) return false;
+  if (win.log.firstElementChild?.classList?.contains('session-window-empty')) {
+    win.log.replaceChildren();
+  }
+  let appended = 0;
+  for (let offset = 0; offset < items.length; offset++) {
+    const node = materializeSessionWindowHistoryItem(win, items[offset], startIndex + offset);
+    if (!node) continue;
+    win.log.appendChild(node);
+    appended += 1;
+  }
+  if (appended === 0) return false;
+  win.renderEnd = startIndex + items.length;
+  const targetStart = sessionWindowTailStart(historyLength);
+  while (win.renderStart < targetStart && win.log.firstElementChild) {
+    win.log.firstElementChild.remove();
+    win.renderStart += 1;
+  }
+  scheduleSessionWindowGridFit();
+  return true;
 }
 
 function appendSessionWindowHistory(win, entry, shouldFollow) {
@@ -29193,7 +29258,9 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
   const item = prepareSessionWindowHistoryItem(entry);
   stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
   history.push(item);
-  if (shouldFollow || wasRenderingTail) {
+  const renderedIncrementally = wasRenderingTail
+    && appendSessionWindowRenderedTailItem(win, item, history.length - 1, history.length);
+  if ((shouldFollow || wasRenderingTail) && !renderedIncrementally) {
     renderSessionWindowTail(win);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
@@ -29202,14 +29269,20 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
 function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
   if (!win || !Array.isArray(entries) || entries.length === 0) return;
   const history = ensureSessionWindowHistory(win);
+  const startIndex = history.length;
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
+  const items = [];
   for (const entry of entries) {
     if (!entry) continue;
     const item = prepareSessionWindowHistoryItem(entry);
     stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
     history.push(item);
+    items.push(item);
   }
-  if (shouldFollow || wasRenderingTail) {
+  const renderedIncrementally = wasRenderingTail
+    && items.length <= SESSION_WINDOW_PREPEND_CHUNK
+    && appendSessionWindowRenderedTailItems(win, items, startIndex, history.length);
+  if ((shouldFollow || wasRenderingTail) && !renderedIncrementally) {
     renderSessionWindowTail(win);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
@@ -29260,7 +29333,10 @@ function updateSessionWindowJumpButton(win) {
 
 function scrollSessionWindowToBottom(win) {
   if (!win || !win.log) return;
-  renderSessionWindowTail(win);
+  const history = ensureSessionWindowHistory(win);
+  if (!sessionWindowIsRenderingTail(win, history.length) || win.renderEnd !== history.length) {
+    renderSessionWindowTail(win);
+  }
   win.log.scrollTop = win.log.scrollHeight;
   win.followOutput = true;
   win.pendingOutput = false;
