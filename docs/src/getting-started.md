@@ -126,8 +126,11 @@ with native `--mtls`. The in-app `intendant://` bridge then speaks HTTPS/WSS to
 the local backend, pins the generated server certificate, and presents the
 generated `client.p12` for its own local bridge. Remote browsers use
 `https://<mac-ip>:<port>` and must have an enrolled client identity. If only the
-server certificate/key are readable, the wrapper falls back to TLS-only. Explicit
-launch flags still win, so `open -a Intendant --args --tls` forces TLS-only.
+server certificate/key are readable, the wrapper falls back to TLS-only. If no
+complete access cert set is installed, the wrapper still starts the bundled
+daemon with native `--tls` and the daemon's self-signed fallback rather than
+serving plain HTTP. Explicit launch flags still win, so
+`open -a Intendant --args --tls` forces TLS-only.
 
 The same secure-context requirement applies to remote browsers using Station's
 WebGPU renderer, microphone/camera features, browser screen capture, and other
@@ -235,7 +238,8 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 # macOS app bundle (after scripts/bundle-macos.sh)
 open -a Intendant
 
-# With full access certs installed, the app auto-enables --mtls.
+# The bundle starts the backend with HTTPS by default. With full access certs
+# installed, the app auto-enables --mtls.
 # Forward --tls only when you intentionally want TLS without client cert auth.
 open -a Intendant --args --tls
 ```

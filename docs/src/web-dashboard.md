@@ -53,7 +53,10 @@ Practical rules:
   `http://localhost` there does not expose media devices.
 - `http://<host-ip>` is not a secure context. Use native `--tls` with a trusted
   certificate, `intendant access` cert enrollment plus native `--mtls`, the macOS
-  app wrapper, or another trusted HTTPS reverse proxy.
+  app wrapper, or another trusted HTTPS reverse proxy. The macOS app wrapper
+  starts its bundled backend with HTTPS by default; with full access certs it
+  upgrades to mTLS, otherwise it uses the daemon's self-signed TLS fallback
+  instead of serving plain HTTP.
 - Clicking through a self-signed certificate warning is not a reliable substitute
   for installing/trusting the certificate; browsers may still withhold secure
   APIs.

@@ -7,6 +7,7 @@ import WebKit
 struct BackendLaunchPlan {
     let extraArgs: [String]
     let autoTlsOnly: Bool
+    let autoTlsSelfSigned: Bool
     let autoMtls: Bool
     let usesTLS: Bool
     let usesMtls: Bool
@@ -56,11 +57,13 @@ func buildBackendLaunchPlan(extraArgs: [String]) -> BackendLaunchPlan {
     let autoMtls = !explicitTls && !disableAutoTls && installedAccessMtlsAvailable(certDir)
     let autoTlsOnly = !explicitTls && !disableAutoTls && !autoMtls &&
         installedAccessTlsAvailable(certDir)
+    let autoTlsSelfSigned = !explicitTls && !disableAutoTls && !autoMtls && !autoTlsOnly
     return BackendLaunchPlan(
         extraArgs: extraArgs,
         autoTlsOnly: autoTlsOnly,
+        autoTlsSelfSigned: autoTlsSelfSigned,
         autoMtls: autoMtls,
-        usesTLS: explicitTls || autoTlsOnly || autoMtls,
+        usesTLS: explicitTls || autoTlsOnly || autoMtls || autoTlsSelfSigned,
         usesMtls: cliHasFlag(extraArgs, "--mtls") || autoMtls,
         usesExplicitTlsCertPair: usesExplicitTlsCertPair,
         accessCertDir: certDir
@@ -306,6 +309,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                 NSLog(
                     "Access server certs found in \(launchPlan.accessCertDir.path), but mTLS client identity or CA is incomplete — launching bundled backend with --tls"
                 )
+            } else if launchPlan.autoTlsSelfSigned {
+                NSLog("No complete access cert set found in \(launchPlan.accessCertDir.path) — launching bundled backend with --tls and an ephemeral self-signed certificate")
             } else {
                 NSLog("Bundled backend TLS enabled by launch arguments")
             }
@@ -479,6 +484,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         if launchPlan.autoMtls {
             args.append("--mtls")
         } else if launchPlan.autoTlsOnly {
+            args.append("--tls")
+        } else if launchPlan.autoTlsSelfSigned {
             args.append("--tls")
         }
         args.append(contentsOf: launchPlan.extraArgs)
