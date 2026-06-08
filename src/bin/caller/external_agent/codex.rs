@@ -6118,6 +6118,8 @@ impl ExternalAgent for CodexAgent {
             .stderr(std::process::Stdio::inherit());
         self.add_intendant_ctl_env(&mut command, effective_web_port);
         Self::apply_codex_home_env(&mut command, self.codex_home.as_deref());
+        #[cfg(target_os = "linux")]
+        crate::linux_display_env::apply_to_tokio_command(&mut command);
         if let Some(root) = &self.request_trace_root {
             std::fs::create_dir_all(root)?;
             command.env("CODEX_ROLLOUT_TRACE_ROOT", root);

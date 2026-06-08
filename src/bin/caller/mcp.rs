@@ -8202,6 +8202,9 @@ impl IntendantServer {
     ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{execute_actions, CuAction, DisplayBackend};
 
+        #[cfg(target_os = "linux")]
+        crate::linux_display_env::ensure_gui_session_env("mcp take_screenshot");
+
         let target = resolve_display_target(params.display_target.as_deref());
         let backend = DisplayBackend::detect();
 
@@ -8254,6 +8257,9 @@ impl IntendantServer {
         Parameters(params): Parameters<ExecuteCuActionsParams>,
     ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{execute_actions, DisplayBackend};
+
+        #[cfg(target_os = "linux")]
+        crate::linux_display_env::ensure_gui_session_env("mcp execute_cu_actions");
 
         let mut actions = params.actions;
 

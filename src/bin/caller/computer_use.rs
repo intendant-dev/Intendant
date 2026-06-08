@@ -297,6 +297,9 @@ pub async fn execute_actions(
     session_registry: &Option<crate::display::SharedSessionRegistry>,
     denorm_ref: Option<(u32, u32)>,
 ) -> Vec<CuActionResult> {
+    #[cfg(target_os = "linux")]
+    crate::linux_display_env::ensure_gui_session_env("computer use actions");
+
     // Virtual displays are always Xvfb (X11), so use X11 tooling for them
     // regardless of the host's detected backend. This lets an agent running
     // on a Wayland host capture its own Xvfb virtual displays with `import`.
@@ -667,7 +670,9 @@ async fn run_xdotool(display: &str, args: &[&str]) -> CuActionResult {
         Ok(o) => CuActionResult {
             success: false,
             screenshot: None,
-            error: Some(String::from_utf8_lossy(&o.stderr).to_string()),
+            error: Some(with_linux_gui_env_diagnostic(
+                String::from_utf8_lossy(&o.stderr).to_string(),
+            )),
         },
         Err(e) => CuActionResult {
             success: false,
@@ -896,7 +901,7 @@ async fn take_screenshot(
         return Err(format!(
             "{} failed: {}",
             tool,
-            String::from_utf8_lossy(&output.stderr)
+            with_linux_gui_env_diagnostic(String::from_utf8_lossy(&output.stderr).to_string())
         ));
     }
 
@@ -960,21 +965,26 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
 /// agents to retry the same call indefinitely.
 fn no_wayland_session_message(target: &DisplayTarget) -> String {
     let granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
+    let diagnostic = linux_gui_env_diagnostic_suffix();
     match target {
         DisplayTarget::UserSession => {
             if granted {
-                "No active display capture session on Wayland. The screen-sharing \
+                format!(
+                    "No active display capture session on Wayland. The screen-sharing \
                  portal dialog is either pending approval on the physical display \
                  or was denied. Approve the dialog to enable capture, or target a \
-                 virtual Xvfb display (e.g. display_target=\":99\") instead."
-                    .to_string()
+                 virtual Xvfb display (e.g. display_target=\":99\") instead.{}",
+                    diagnostic
+                )
             } else {
-                "No active display capture session on Wayland. User display access \
+                format!(
+                    "No active display capture session on Wayland. User display access \
                  has not been granted — call grant_user_display first, then approve \
                  the screen-sharing portal dialog on the physical display. \
                  Alternatively, target a virtual Xvfb display (e.g. \
-                 display_target=\":99\")."
-                    .to_string()
+                 display_target=\":99\").{}",
+                    diagnostic
+                )
             }
         }
         DisplayTarget::Virtual { id } => format!(
@@ -982,6 +992,31 @@ fn no_wayland_session_message(target: &DisplayTarget) -> String {
              `Xvfb :{id} -screen 0 1920x1080x24 &` before taking a screenshot, \
              or target the user session with display_target=\"user_session\"."
         ),
+    }
+}
+
+fn with_linux_gui_env_diagnostic(message: String) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        format!(
+            "{message}\n{}",
+            crate::linux_display_env::diagnostic_summary()
+        )
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        message
+    }
+}
+
+fn linux_gui_env_diagnostic_suffix() -> String {
+    #[cfg(target_os = "linux")]
+    {
+        format!(" {}", crate::linux_display_env::diagnostic_summary())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        String::new()
     }
 }
 
