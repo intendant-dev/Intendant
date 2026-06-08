@@ -6054,7 +6054,14 @@ fn read_persisted_log_entries_for_session(
     params: &GetLogsParams,
 ) -> Option<Vec<LogEntrySnapshot>> {
     let session_id = session_id.map(str::trim).filter(|id| !id.is_empty())?;
-    let log_dir = crate::session_log::SessionLog::find_session_by_id(session_id)?;
+    let log_dir = persisted_log_dir_for_session(session_id)?;
+    read_persisted_log_entries_from_dir(&log_dir, params)
+}
+
+fn read_persisted_log_entries_from_dir(
+    log_dir: &std::path::Path,
+    params: &GetLogsParams,
+) -> Option<Vec<LogEntrySnapshot>> {
     let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).ok()?;
     let limit = params.limit.unwrap_or(100);
     let mut entries = Vec::new();
@@ -6092,6 +6099,77 @@ fn read_persisted_log_entries_for_session(
     }
 
     Some(entries)
+}
+
+fn persisted_log_dir_for_session(session_id: &str) -> Option<std::path::PathBuf> {
+    let home = crate::platform::home_dir();
+    persisted_log_dir_for_session_in_home(&home, session_id)
+}
+
+fn persisted_log_dir_for_session_in_home(
+    home: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    if let Some(log_dir) = find_session_log_dir_in_home(home, session_id) {
+        return Some(log_dir);
+    }
+    ["codex", "claude-code", "gemini"]
+        .into_iter()
+        .find_map(|source| {
+            crate::external_wrapper_index::wrappers_for(home, source, session_id)
+                .into_iter()
+                .next()
+                .map(|record| std::path::PathBuf::from(record.log_path))
+        })
+}
+
+fn find_session_log_dir_in_home(
+    home: &std::path::Path,
+    session_id: &str,
+) -> Option<std::path::PathBuf> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let logs_dir = home.join(".intendant").join("logs");
+    let direct = logs_dir.join(session_id);
+    if direct.is_dir() && direct.join("session_meta.json").exists() {
+        return Some(direct);
+    }
+
+    let path = std::path::Path::new(session_id);
+    let looks_like_path = path.is_absolute()
+        || session_id.contains('/')
+        || session_id.contains(std::path::MAIN_SEPARATOR);
+    if looks_like_path {
+        let dir = std::path::PathBuf::from(session_id);
+        return dir.is_dir().then_some(dir);
+    }
+
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(session_id) && entry.path().is_dir() {
+            return Some(entry.path());
+        }
+        let meta_path = entry.path().join("session_meta.json");
+        let meta_session_id = std::fs::read_to_string(meta_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| {
+                value
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        if meta_session_id
+            .as_deref()
+            .is_some_and(|id| id == session_id || id.starts_with(session_id))
+        {
+            return Some(entry.path());
+        }
+    }
+    None
 }
 
 fn persisted_log_entry_level(value: &serde_json::Value) -> String {
@@ -10303,6 +10381,57 @@ mod tests {
                 None => std::env::remove_var("USERPROFILE"),
             }
         });
+    }
+
+    #[test]
+    fn get_logs_resolves_backend_session_id_through_wrapper_index() {
+        let home = tempdir().unwrap();
+
+        let wrapper_session_id = "ec5865e5-a5af-4b8c-81a1-545a3a6f8ba9";
+        let backend_session_id = "019ea8b9-0000-7000-8000-000000000001";
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(wrapper_session_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        std::fs::write(
+            wrapper_dir.join("session.jsonl"),
+            serde_json::json!({
+                "ts": "2026-06-08T12:00:00",
+                "event": "info",
+                "level": "info",
+                "message": "live wrapper follow-up"
+            })
+            .to_string()
+                + "\n",
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            backend_session_id,
+            wrapper_session_id,
+            &wrapper_dir,
+            None,
+        )
+        .unwrap();
+
+        let resolved =
+            persisted_log_dir_for_session_in_home(home.path(), backend_session_id).unwrap();
+        assert_eq!(resolved, wrapper_dir);
+        let entries = read_persisted_log_entries_from_dir(
+            &resolved,
+            &GetLogsParams {
+                session_id: None,
+                since_id: None,
+                level_filter: None,
+                limit: Some(10),
+            },
+        )
+        .unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "live wrapper follow-up");
     }
 
     #[test]

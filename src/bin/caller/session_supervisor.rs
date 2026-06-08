@@ -1249,12 +1249,11 @@ impl SessionSupervisor {
         let resume_task = resume_task.expect("checked above");
 
         if external_backend.is_some() && !force_new {
-            if self
+            if let Some(existing_id) = self
                 .find_managed_session_id(&source_norm, &session_id, &resume_token)
                 .await
-                .is_some()
             {
-                self.route_follow_up(Some(session_id), resume_task, direct, attachments, None)
+                self.route_follow_up(Some(existing_id), resume_task, direct, attachments, None)
                     .await;
                 return;
             }
@@ -1674,6 +1673,31 @@ impl SessionSupervisor {
                     relation,
                 )
             });
+            (target_id, entry)
+        };
+        let (target_id, entry) = if entry.is_none() {
+            if let Some(live_id) = self.resolve_persisted_external_managed_id(&target_id).await {
+                let state = self.state.lock().await;
+                let target_id = state
+                    .resolve_session_id(&live_id)
+                    .unwrap_or_else(|| live_id.clone());
+                let entry = state.sessions.get(&target_id).map(|s| {
+                    let relation = state.related_sessions.get(&target_id).cloned();
+                    (
+                        s.session_id.clone(),
+                        s.source.clone(),
+                        s.project_root.clone(),
+                        s.session_dir.clone(),
+                        s.follow_up_tx.clone(),
+                        target_id.clone(),
+                        relation,
+                    )
+                });
+                (target_id, entry)
+            } else {
+                (target_id, entry)
+            }
+        } else {
             (target_id, entry)
         };
 
@@ -2931,6 +2955,17 @@ impl SessionSupervisor {
         state.session_is_managed(session_id)
     }
 
+    async fn resolve_persisted_external_managed_id(&self, session_id: &str) -> Option<String> {
+        let (source, backend_session_id) = persisted_external_identity_for_session(session_id)?;
+        let state = self.state.lock().await;
+        let resolved_id = state.resolve_session_id(&backend_session_id)?;
+        state
+            .sessions
+            .get(&resolved_id)
+            .filter(|session| session.source == source)
+            .map(|session| session.session_id.clone())
+    }
+
     async fn clear_external_attach_request(&self, keys: &[String]) {
         if keys.is_empty() {
             return;
@@ -3695,6 +3730,117 @@ fn external_resume_log_dir(session_id: &str, force_new: bool) -> PathBuf {
     session_log::SessionLog::resolve_path(None)
 }
 
+fn persisted_external_identity_for_session(session_id: &str) -> Option<(String, String)> {
+    let home = crate::platform::home_dir();
+    persisted_external_identity_for_session_in_home(&home, session_id)
+}
+
+fn persisted_external_identity_for_session_in_home(
+    home: &Path,
+    session_id: &str,
+) -> Option<(String, String)> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let log_dir = session_log_dir_for_id_in_home(home, session_id)?;
+    let canonical_session_id = std::fs::read_to_string(log_dir.join("session_meta.json"))
+        .ok()
+        .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+        .and_then(|value| {
+            value
+                .get("session_id")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_string)
+        });
+    let contents = std::fs::read_to_string(log_dir.join("session.jsonl")).ok()?;
+    for line in contents.lines().rev() {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(line) else {
+            continue;
+        };
+        if value.get("event").and_then(serde_json::Value::as_str) != Some("session_identity") {
+            continue;
+        }
+        let Some(data) = value.get("data") else {
+            continue;
+        };
+        let wrapper_id = data
+            .get("session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty());
+        let wrapper_matches = wrapper_id.is_some_and(|id| {
+            id == session_id
+                || id.starts_with(session_id)
+                || canonical_session_id
+                    .as_deref()
+                    .is_some_and(|canonical| id == canonical || canonical.starts_with(session_id))
+        });
+        if !wrapper_matches {
+            continue;
+        }
+        let source = data
+            .get("source")
+            .and_then(serde_json::Value::as_str)
+            .and_then(external_agent::AgentBackend::from_str_loose)
+            .map(|backend| backend.as_short_str().to_string())?;
+        let backend_session_id = data
+            .get("backend_session_id")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+            .filter(|id| external_agent::source_session_id_is_canonical(&source, id))?
+            .to_string();
+        return Some((source, backend_session_id));
+    }
+    None
+}
+
+fn session_log_dir_for_id_in_home(home: &Path, session_id: &str) -> Option<PathBuf> {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return None;
+    }
+    let logs_dir = home.join(".intendant").join("logs");
+    let direct = logs_dir.join(session_id);
+    if direct.is_dir() && direct.join("session_meta.json").exists() {
+        return Some(direct);
+    }
+
+    let path = Path::new(session_id);
+    let looks_like_path = path.is_absolute()
+        || session_id.contains('/')
+        || session_id.contains(std::path::MAIN_SEPARATOR);
+    if looks_like_path {
+        let dir = PathBuf::from(session_id);
+        return dir.is_dir().then_some(dir);
+    }
+
+    let entries = std::fs::read_dir(logs_dir).ok()?;
+    for entry in entries.flatten() {
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.starts_with(session_id) && entry.path().is_dir() {
+            return Some(entry.path());
+        }
+        let meta_session_id = std::fs::read_to_string(entry.path().join("session_meta.json"))
+            .ok()
+            .and_then(|raw| serde_json::from_str::<serde_json::Value>(&raw).ok())
+            .and_then(|value| {
+                value
+                    .get("session_id")
+                    .and_then(serde_json::Value::as_str)
+                    .map(str::to_string)
+            });
+        if meta_session_id
+            .as_deref()
+            .is_some_and(|id| id == session_id || id.starts_with(session_id))
+        {
+            return Some(entry.path());
+        }
+    }
+    None
+}
+
 fn spawn_text_steer_fallback(
     bus: EventBus,
     mut ack_rx: tokio::sync::broadcast::Receiver<AppEvent>,
@@ -4247,6 +4393,82 @@ mod tests {
 
         let state = supervisor.state.lock().await;
         assert!(state.session_is_managed("parent-thread"));
+    }
+
+    #[tokio::test]
+    async fn resume_managed_external_session_with_stale_wrapper_routes_live_backend() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
+        let (tx, mut rx) = mpsc::channel(1);
+        let stale_wrapper_id = "e9532107-8c7f-4c1f-b88d-410d6d365505";
+        let live_backend_id = "019ea8b9-0000-7000-8000-000000000001";
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                live_backend_id.to_string(),
+                ManagedSession {
+                    session_id: live_backend_id.to_string(),
+                    source: "codex".to_string(),
+                    name: None,
+                    phase: "idle".to_string(),
+                    project_root: PathBuf::from("/tmp/project"),
+                    session_dir: PathBuf::from("/tmp/session"),
+                    follow_up_tx: tx,
+                    approval_registry: event::ApprovalRegistry::default(),
+                    instance_id: 0,
+                    finished_rx: None,
+                },
+            );
+        }
+
+        supervisor
+            .resume_session(
+                "codex".to_string(),
+                stale_wrapper_id.to_string(),
+                Some(live_backend_id.to_string()),
+                Some("/tmp/project".to_string()),
+                Some("continue after restart".to_string()),
+                Some(true),
+                Vec::new(),
+                None,
+                None,
+                None,
+                None,
+                None,
+                false,
+            )
+            .await;
+
+        let msg = rx
+            .try_recv()
+            .expect("resume task should route to the live backend session");
+        assert_eq!(msg.text, "continue after restart");
+        assert_eq!(msg.target_session_id.as_deref(), Some(live_backend_id));
+    }
+
+    #[test]
+    fn persisted_external_identity_resolves_stale_wrapper_log() {
+        let home = tempfile::tempdir().unwrap();
+        let stale_wrapper_id = "e9532107-8c7f-4c1f-b88d-410d6d365505";
+        let live_backend_id = "019ea8b9-0000-7000-8000-000000000001";
+        let project_root = home.path().join("project");
+        let wrapper_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join(stale_wrapper_id);
+        std::fs::create_dir_all(&project_root).unwrap();
+        {
+            let mut log = session_log::SessionLog::open(wrapper_dir).unwrap();
+            log.write_meta(Some(&project_root), Some("old task"));
+            log.session_identity(stale_wrapper_id, "codex", live_backend_id);
+        }
+
+        let identity =
+            persisted_external_identity_for_session_in_home(home.path(), stale_wrapper_id)
+                .expect("wrapper identity should parse");
+        assert_eq!(identity.0, "codex");
+        assert_eq!(identity.1, live_backend_id);
     }
 
     #[tokio::test]

@@ -109,6 +109,14 @@ pub fn upsert(
         file_mtime_secs(&log_dir.join("session.jsonl")).max(file_mtime_secs(log_dir));
     let project_root = project_root.map(|path| path.to_string_lossy().to_string());
 
+    for record in index.wrappers.iter_mut().filter(|record| {
+        record.source == source
+            && record.backend_session_id == backend_session_id
+            && record.intendant_session_id != stored_intendant_session_id
+    }) {
+        record.updated_at_secs = 0;
+    }
+
     if let Some(existing) = index.wrappers.iter_mut().find(|record| {
         record.source == source
             && record.backend_session_id == backend_session_id
@@ -250,4 +258,67 @@ fn file_mtime_secs(path: &Path) -> u64 {
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
         .map(|duration| duration.as_secs())
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn upsert_demotes_stale_wrapper_for_same_backend_session() {
+        let home = tempfile::tempdir().unwrap();
+        let old_log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("e9532107-8c7f-4c1f-b88d-410d6d365505");
+        let new_log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("ec5865e5-a5af-4b8c-81a1-545a3a6f8ba9");
+        std::fs::create_dir_all(&old_log_dir).unwrap();
+        std::fs::create_dir_all(&new_log_dir).unwrap();
+        let backend_id = "019ea8b9-0000-7000-8000-000000000001";
+
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            "e9532107-8c7f-4c1f-b88d-410d6d365505",
+            &old_log_dir,
+            None,
+        )
+        .unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            "ec5865e5-a5af-4b8c-81a1-545a3a6f8ba9",
+            &new_log_dir,
+            None,
+        )
+        .unwrap();
+
+        let wrappers = wrappers_for(home.path(), "codex", backend_id);
+        assert_eq!(wrappers.len(), 2);
+        assert_eq!(
+            wrappers[0].intendant_session_id,
+            "ec5865e5-a5af-4b8c-81a1-545a3a6f8ba9"
+        );
+        assert_eq!(wrappers[0].log_path, new_log_dir.to_string_lossy());
+        assert_eq!(
+            wrappers[1].intendant_session_id,
+            "e9532107-8c7f-4c1f-b88d-410d6d365505"
+        );
+        assert_eq!(wrappers[1].updated_at_secs, 0);
+
+        let source_wrappers = wrappers_for_source(home.path(), "codex");
+        assert_eq!(
+            source_wrappers
+                .first()
+                .map(|record| record.intendant_session_id.as_str()),
+            Some("ec5865e5-a5af-4b8c-81a1-545a3a6f8ba9")
+        );
+    }
 }

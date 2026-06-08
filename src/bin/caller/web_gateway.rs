@@ -26983,6 +26983,7 @@ mod tests {
 
     #[test]
     fn external_activity_replay_uses_wrapper_index_for_multiple_codex_attaches() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
         let dir = tempfile::tempdir().unwrap();
         let home = dir.path();
         let session_id = "019e37b2-multiple-wrapper-index";
