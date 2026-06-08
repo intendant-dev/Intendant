@@ -5291,6 +5291,110 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
     }
 }
 
+fn session_log_dir_matches_requested_session(log_dir: &std::path::Path, session_id: &str) -> bool {
+    if log_dir
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name == session_id)
+    {
+        return true;
+    }
+
+    let Ok(contents) = std::fs::read_to_string(log_dir.join("session_meta.json")) else {
+        return false;
+    };
+    serde_json::from_str::<serde_json::Value>(&contents)
+        .ok()
+        .and_then(|meta| {
+            meta.get("session_id")
+                .and_then(|value| value.as_str())
+                .map(str::to_string)
+        })
+        .is_some_and(|id| id == session_id)
+}
+
+fn requested_session_log_dirs(
+    current_log_dir: &std::path::Path,
+    session_id: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs = Vec::new();
+    if current_log_dir.join("session.jsonl").is_file()
+        && session_log_dir_matches_requested_session(current_log_dir, session_id)
+    {
+        dirs.push(current_log_dir.to_path_buf());
+    }
+    if let Some(dir) = crate::session_log::SessionLog::find_session_by_id(session_id) {
+        if !dirs.iter().any(|existing| existing == &dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
+}
+
+fn hydrate_requested_session_status_from_logs(s: &mut McpAppState, session_id: &str) -> bool {
+    let session_id = session_id.trim();
+    if session_id.is_empty() {
+        return false;
+    }
+    let dirs = requested_session_log_dirs(&s.log_dir, session_id);
+    if dirs.is_empty() {
+        return false;
+    }
+
+    let provider_name = s.provider_name.clone();
+    let model_name = s.model_name.clone();
+    let turn = s.turn;
+    let budget_pct = s.budget_pct;
+    let phase = s.phase.clone();
+    let phase_entered_at = s.phase_entered_at;
+    let session_tokens = s.session_tokens;
+    let session_prompt_tokens = s.session_prompt_tokens;
+    let session_completion_tokens = s.session_completion_tokens;
+    let session_cached_tokens = s.session_cached_tokens;
+    let context_window = s.context_window;
+    let hard_context_window = s.hard_context_window;
+    let active_session_id = s.session_id.clone();
+    let task_description = s.task_description.clone();
+    let active_session_source = s.active_session_source.clone();
+    let codex_managed_context = s.codex_managed_context;
+
+    let mut changed = false;
+    for dir in dirs {
+        let Ok(contents) = std::fs::read_to_string(dir.join("session.jsonl")) else {
+            continue;
+        };
+        for line in contents.lines() {
+            let Ok(entry) = serde_json::from_str::<serde_json::Value>(line) else {
+                continue;
+            };
+            let Some(event) = crate::session_log::session_log_entry_to_app_event(&entry, &dir)
+            else {
+                continue;
+            };
+            changed |= apply_observed_event_to_mcp_state(s, &event);
+        }
+    }
+
+    s.provider_name = provider_name;
+    s.model_name = model_name;
+    s.turn = turn;
+    s.budget_pct = budget_pct;
+    s.phase = phase;
+    s.phase_entered_at = phase_entered_at;
+    s.session_tokens = session_tokens;
+    s.session_prompt_tokens = session_prompt_tokens;
+    s.session_completion_tokens = session_completion_tokens;
+    s.session_cached_tokens = session_cached_tokens;
+    s.context_window = context_window;
+    s.hard_context_window = hard_context_window;
+    s.session_id = active_session_id;
+    s.task_description = task_description;
+    s.active_session_source = active_session_source;
+    s.codex_managed_context = codex_managed_context;
+
+    changed
+}
+
 /// Lightweight event mirror for the stateless HTTP MCP endpoint used by
 /// external agents. It intentionally observes state only; it does not dispatch
 /// `ControlMsg`s, because the normal control plane remains the single writer.
@@ -6583,6 +6687,13 @@ impl IntendantServer {
         session_id_override: Option<&str>,
         managed_context_override: Option<bool>,
     ) -> String {
+        if let Some(requested_session_id) = session_id_override
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        {
+            let mut s = self.state.write().await;
+            hydrate_requested_session_status_from_logs(&mut s, requested_session_id);
+        }
         let s = self.state.read().await;
         let mut snap = s.status_snapshot();
         let log_dir = s.log_dir.clone();
@@ -11822,6 +11933,170 @@ mod tests {
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),
                 Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_for_wrapper_hydrates_backend_context_snapshot_from_session_log() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            let wrapper_dir = dir.path().join("wrapper-session");
+            let mut log = crate::session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+            log.write_meta(None, Some("managed Codex task"));
+            let capabilities = crate::types::SessionCapabilities {
+                follow_up: true,
+                steer: true,
+                interrupt: true,
+                codex_thread_actions: vec!["rewind_context".to_string()],
+                codex_managed_context: Some("managed".to_string()),
+                codex_sandbox: Some("danger-full-access".to_string()),
+                codex_approval_policy: Some("never".to_string()),
+                codex_context_archive: None,
+                codex_command: Some("/tmp/codex".to_string()),
+                codex_fast_mode: None,
+                codex_service_tier: None,
+            };
+            log.session_capabilities("wrapper-session", &capabilities);
+            {
+                use std::io::Write as _;
+                let mut file = std::fs::OpenOptions::new()
+                    .append(true)
+                    .open(wrapper_dir.join("session.jsonl"))
+                    .unwrap();
+                writeln!(
+                    file,
+                    "{}",
+                    serde_json::json!({
+                        "ts": "00:00:00.000",
+                        "event": "session_identity",
+                        "level": "info",
+                        "message": "Session identity: wrapper-session -> codex:codex-thread",
+                        "data": {
+                            "session_id": "wrapper-session",
+                            "source": "codex",
+                            "backend_session_id": "codex-thread",
+                        },
+                    })
+                )
+                .unwrap();
+            }
+            log.session_started("codex-thread", Some("managed Codex task"));
+            log.agent_started_with_session_id(
+                Some("codex-thread"),
+                5,
+                "edit src/bin/caller/mcp.rs",
+                None,
+                Some("Codex"),
+            );
+            log.context_snapshot_for_session(
+                Some("codex-thread"),
+                "codex",
+                "Codex resolved request payload",
+                Some("req-1"),
+                Some(1),
+                Some(5),
+                "openai.responses.resolved_request.v1",
+                Some(50_332),
+                Some("backend_reported"),
+                Some(258_400),
+                Some(272_000),
+                Some(64),
+                &serde_json::json!({ "model": "gpt-5.2-codex" }),
+            );
+
+            let state = test_state_with_log_dir(wrapper_dir);
+            {
+                let mut s = state.write().await;
+                s.provider_name = "none".to_string();
+                s.model_name = "none".to_string();
+                s.configured_codex_managed_context = true;
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("wrapper-session"), Some(true))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+
+            assert_eq!(
+                value.pointer("/session_id"),
+                Some(&"wrapper-session".into())
+            );
+            assert_eq!(value.pointer("/phase"), Some(&"running_agent".into()));
+            assert_eq!(value.pointer("/provider"), Some(&"openai".into()));
+            assert_eq!(value.pointer("/model"), Some(&"gpt-5.2-codex".into()));
+            assert_eq!(
+                value.pointer("/usage/main/tokens_used"),
+                Some(&50_332.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&50_332.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/context_window"),
+                Some(&258_400.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_log_hydration_does_not_leak_unrelated_backend_usage() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            let wrapper_dir = dir.path().join("wrapper-session");
+            let mut log = crate::session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+            log.write_meta(None, Some("managed Codex task"));
+            log.context_snapshot_for_session(
+                Some("other-codex-thread"),
+                "codex",
+                "Other Codex resolved request payload",
+                Some("req-other"),
+                Some(1),
+                Some(2),
+                "openai.responses.resolved_request.v1",
+                Some(200_000),
+                Some("backend_reported"),
+                Some(258_400),
+                Some(272_000),
+                Some(64),
+                &serde_json::json!({ "model": "gpt-5.2-codex" }),
+            );
+
+            let state = test_state_with_log_dir(wrapper_dir);
+            {
+                let mut s = state.write().await;
+                s.provider_name = "none".to_string();
+                s.model_name = "none".to_string();
+            }
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some("wrapper-session"), Some(true))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+
+            assert_eq!(value.pointer("/usage/main/provider"), Some(&"".into()));
+            assert_eq!(value.pointer("/usage/main/model"), Some(&"".into()));
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&0.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"unknown".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&0.into())
             );
         });
     }
