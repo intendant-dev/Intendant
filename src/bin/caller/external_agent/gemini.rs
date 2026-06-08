@@ -895,16 +895,18 @@ impl ExternalAgent for GeminiAgent {
         if self.debug {
             args.push("--debug".into());
         }
-        let mut child = crate::platform::spawn_command(&self.command)
+        let mut command = crate::platform::spawn_command(&self.command);
+        command
             .args(&args)
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .map_err(|e| {
-                CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
-            })?;
+            .stderr(std::process::Stdio::inherit());
+        #[cfg(target_os = "linux")]
+        crate::linux_display_env::apply_to_tokio_command(&mut command);
+        let mut child = command.spawn().map_err(|e| {
+            CallerError::ExternalAgent(format!("Failed to spawn '{}': {}", self.command, e))
+        })?;
         let child_pid = child.id();
 
         let stdin = child

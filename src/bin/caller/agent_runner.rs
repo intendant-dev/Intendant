@@ -105,6 +105,9 @@ async fn run_agent_inner(
         }
     }
 
+    #[cfg(target_os = "linux")]
+    crate::linux_display_env::apply_to_tokio_command(&mut cmd);
+
     let mut child = cmd.spawn().map_err(|e| {
         CallerError::Agent(format!("Failed to spawn agent at {:?}: {}", agent_path, e))
     })?;

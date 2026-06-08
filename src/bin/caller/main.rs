@@ -25,6 +25,7 @@ mod frames;
 mod frontend;
 mod knowledge;
 mod lineage_ledger;
+mod linux_display_env;
 mod live_audio;
 mod live_audio_types;
 mod mcp;
@@ -23553,6 +23554,9 @@ async fn capture_display_screenshot(
     }
 
     // Fallback: platform-native screenshot tools
+    #[cfg(target_os = "linux")]
+    crate::linux_display_env::ensure_gui_session_env("fresh display screenshot");
+
     let screenshot_path = log_dir.join("cu_reference.png");
     let ok = if cfg!(target_os = "macos") {
         tokio::process::Command::new("screencapture")
@@ -23798,6 +23802,9 @@ async fn activate_user_display(
 ) {
     let display_id: u32 = target_display_id;
 
+    #[cfg(target_os = "linux")]
+    crate::linux_display_env::ensure_gui_session_env("user display activation");
+
     // On Wayland: create a DisplaySession with WaylandBackend.
     // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
     // from a tty/ssh session while a graphical session is active).
@@ -23812,7 +23819,7 @@ async fn activate_user_display(
                 std::env::set_var("WAYLAND_DISPLAY", &socket);
             }
             if std::env::var("XDG_RUNTIME_DIR").is_err() {
-                let uid = unsafe { libc::getuid() };
+                let uid = crate::platform::current_uid();
                 let runtime_dir = format!("/run/user/{}", uid);
                 std::env::set_var("XDG_RUNTIME_DIR", &runtime_dir);
             }
@@ -24062,7 +24069,7 @@ async fn auto_activate_windows_user_display(
 /// Checks /run/user/<uid>/ for wayland-* sockets.
 #[cfg(target_os = "linux")]
 fn detect_wayland_socket() -> Option<String> {
-    let uid = unsafe { libc::getuid() };
+    let uid = crate::platform::current_uid();
     let runtime_dir = format!("/run/user/{}", uid);
     let entries = std::fs::read_dir(&runtime_dir).ok()?;
     for entry in entries.flatten() {
