@@ -381,8 +381,8 @@ Use this HTTPS/mTLS path, native `--tls` with a trusted certificate, or the macO
 app wrapper for dashboard features that require a secure browser context:
 Station WebGPU, microphone/camera, browser screen capture, and stricter
 clipboard APIs. Plain `http://<host-ip>:8765` is available only when launched
-with `--no-tls` and is intended for local/programmatic debugging
-but not for those browser-gated features.
+with `--no-tls`; it is intended for local/programmatic debugging and does not
+enable those browser-gated features.
 
 The client certificate is exported as `client.p12`, a password-protected
 PKCS#12 bundle for installation on iOS / Android / desktop browsers. The
