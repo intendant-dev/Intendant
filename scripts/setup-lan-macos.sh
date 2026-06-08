@@ -254,7 +254,7 @@ run_on_guest() {
 }
 
 # Like run_on_guest but forces a PTY with `-tt`. Needed for interactive
-# long-running commands (notably `intendant lan setup` which blocks on
+# long-running commands (notably `intendant access setup` which blocks on
 # its cert distribution server until Ctrl+C) so that local SIGINT
 # propagates via the PTY to the remote process tree. Without `-tt`,
 # Ctrl+C only closes the local ssh client and leaves the remote process
@@ -307,15 +307,15 @@ resolve_intendant_path() {
     info "remote intendant: $REMOTE_INTENDANT"
 }
 
-# Run `intendant lan <action> [args]` on the VM as the daemon user.
-# The native LAN cert store is per-user; using sudo would create certs
+# Run `intendant access <action> [args]` on the VM as the daemon user.
+# The native access cert store is per-user; using sudo would create certs
 # that the normal dashboard daemon cannot read.
 #
 # Setup blocks on the interactive cert distribution server, so we use
 # `run_on_guest_interactive` (PTY-allocating) for that action so that
 # local Ctrl+C propagates cleanly to the remote process tree. All other
 # actions are short-lived and use plain `run_on_guest`.
-run_intendant_lan() {
+run_intendant_access() {
     local action="$1"
     shift
 
@@ -331,7 +331,7 @@ run_intendant_lan() {
     done
 
     local cmd
-    cmd="${prefix}${REMOTE_INTENDANT} lan ${action}${remote_args}"
+    cmd="${prefix}${REMOTE_INTENDANT} access ${action}${remote_args}"
 
     if [[ "$action" == "setup" || "$action" == "serve-certs" ]]; then
         run_on_guest_interactive "$cmd"
@@ -664,11 +664,11 @@ run_wizard() {
     info "running setup on VM..."
     local guest_args=("--port" "$HTTPS_PORT")
     if [[ "$NET_MODE" == "shared" ]]; then
-        guest_args+=("--lan-ip" "$LAN_IP" "--cert-port" "$CERT_PORT")
+        guest_args+=("--ip" "$LAN_IP" "--cert-port" "$CERT_PORT")
     fi
     guest_args+=("--name" "${INSTANCE_NAME:-$VM_IP}")
     local guest_exit=0
-    run_intendant_lan setup "${guest_args[@]}" || guest_exit=$?
+    run_intendant_access setup "${guest_args[@]}" || guest_exit=$?
 
     echo ""
     # Exit 0 = clean exit; >128 = killed by signal (Ctrl+C on cert server = normal)
@@ -691,7 +691,7 @@ run_wizard() {
         echo ""
         echo "  The SSH tunnel and config are in place, but the"
         echo "  VM-side setup did not complete. SSH in and run:"
-        printf '    %s lan setup' "${REMOTE_INTENDANT:-intendant}"
+        printf '    %s access setup' "${REMOTE_INTENDANT:-intendant}"
         printf ' %q' "${guest_args[@]}"
         printf '\n'
         echo ""
@@ -741,10 +741,10 @@ run_recert() {
 
     local recert_args=()
     $FORCE && recert_args+=("--force")
-    [[ "$NET_MODE" == "shared" ]] && recert_args+=("--lan-ip" "$LAN_IP")
+    [[ "$NET_MODE" == "shared" ]] && recert_args+=("--ip" "$LAN_IP")
 
     info "regenerating server cert on VM..."
-    run_intendant_lan recert "${recert_args[@]}"
+    run_intendant_access recert "${recert_args[@]}"
 
     echo ""
     info "done — phone connects to: https://${LAN_IP}:${HTTPS_PORT}"
@@ -769,10 +769,10 @@ run_remove() {
     fi
 
     info "removing VM-side config..."
-    if ! run_intendant_lan remove 2>/dev/null; then
+    if ! run_intendant_access remove 2>/dev/null; then
         local manual_prefix=""
         [[ "$GUEST_OS" == "linux" ]] && manual_prefix="sudo "
-        warn "could not remove VM config — run '${manual_prefix}intendant lan remove' manually in the VM"
+        warn "could not remove VM config — run '${manual_prefix}intendant access remove' manually in the VM"
     fi
 
     rm -f "$(instance_config)"

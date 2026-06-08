@@ -1,3 +1,4 @@
+mod access;
 mod agent_runner;
 mod app_state_pricing;
 mod approval;
@@ -23,7 +24,6 @@ mod fission_ledger;
 mod frames;
 mod frontend;
 mod knowledge;
-mod lan;
 mod lineage_ledger;
 mod live_audio;
 mod live_audio_types;
@@ -252,7 +252,7 @@ fn external_steer_targets_idle_side_thread(
 
 /// Build the [`peer::AuthRequirements`] this daemon advertises in
 /// its own Agent Card from the project's `[server.auth]` config and
-/// the LAN cert dir.
+/// the access cert dir.
 ///
 /// Resolution rules:
 ///
@@ -260,9 +260,9 @@ fn external_steer_targets_idle_side_thread(
 ///   - `advertised_transport = "none"` (default) → [`peer::TransportAuth::None`]
 ///   - `"mutual-tls"` → [`peer::TransportAuth::MutualTls`]
 ///   - `"pin-self-cert"` → read this daemon's own `server.crt` from
-///     the LAN cert dir, compute its SHA-256 fingerprint, embed it
+///     the access cert dir, compute its SHA-256 fingerprint, embed it
 ///     in [`peer::TransportAuth::PinnedMutualTls`]. Errors if no
-///     cert is present (operator forgot to run `intendant lan
+///     cert is present (operator forgot to run `intendant access
 ///     setup`).
 ///   - any other value → config error
 /// - `application`:
@@ -283,12 +283,12 @@ fn build_local_advertised_auth(
         "mutual-tls" => peer::TransportAuth::MutualTls,
         "pin-self-cert" => {
             // `pin-self-cert` reads the local server cert produced by
-            // `intendant lan setup`. The cert store is per-user and is
+            // `intendant access setup`. The cert store is per-user and is
             // consumed directly by native `--tls` / `--mtls`.
-            let fp = lan::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
+            let fp = access::certs::read_server_cert_fingerprint(cert_dir).ok_or_else(|| {
                 CallerError::Config(format!(
                     "[server.auth] advertised_transport = \"pin-self-cert\" requires \
-                     a local server cert at {}/server.crt — run `intendant lan setup` \
+                     a local server cert at {}/server.crt — run `intendant access setup` \
                      first, or change advertised_transport to \"none\" / \"mutual-tls\"",
                     cert_dir.display()
                 ))
@@ -9487,7 +9487,7 @@ struct CliFlags {
     web_port: u16,
     /// --tls: Serve the `--web` dashboard over HTTPS/WSS. Off by default
     /// (plain HTTP). ORs with `[server.tls] enabled` in intendant.toml.
-    /// With no cert/key override, installed LAN certs are preferred when
+    /// With no cert/key override, installed access certs are preferred when
     /// present, otherwise a self-signed cert is minted at startup.
     tls: bool,
     /// --tls-cert <PATH>: PEM cert (chain) overriding default cert selection.
@@ -9499,7 +9499,7 @@ struct CliFlags {
     /// client CA. Implies `--tls`.
     mtls: bool,
     /// --mtls-ca <PATH>: PEM CA bundle used to verify client certs.
-    /// Defaults to the installed LAN CA when present.
+    /// Defaults to the installed access CA when present.
     mtls_ca: Option<String>,
     /// --transcription: Enable user speech transcription.
     transcription: bool,
@@ -9543,11 +9543,11 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
-    println!("    --tls                 Serve the web dashboard over HTTPS/WSS (uses installed LAN certs when present)");
+    println!("    --tls                 Serve the web dashboard over HTTPS/WSS (uses installed access certs when present)");
     println!("    --tls-cert <PATH>     PEM cert overriding default cert selection (with --tls-key; implies --tls)");
     println!("    --tls-key <PATH>      PEM private key matching --tls-cert");
     println!(
-        "    --mtls                Require client certificates signed by the Intendant LAN CA (implies --tls)"
+        "    --mtls                Require client certificates signed by the Intendant access CA (implies --tls)"
     );
     println!("    --mtls-ca <PATH>      PEM CA bundle for --mtls client certificate verification");
     println!("    --no-web              Disable web dashboard; use terminal TUI when interactive");
@@ -9567,7 +9567,7 @@ fn print_help() {
     println!();
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
-    println!("    lan                   Configure LAN mTLS access");
+    println!("    access                Configure dashboard TLS/mTLS access certificates");
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!();
     println!("SESSION LOGS:");
@@ -9702,8 +9702,8 @@ async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpList
 /// intendant.toml. When enabled, the cert source is resolved in priority order:
 ///   1. Explicit PEM files — CLI `--tls-cert`/`--tls-key` first, else
 ///      `[server.tls] cert`/`key`. Both halves of a pair must be present.
-///   2. Installed LAN certs (`server.crt` / `server.key`) from the platform's
-///      `intendant lan` cert directory.
+///   2. Installed access certs (`server.crt` / `server.key`) from the platform's
+///      `intendant access` cert directory.
 ///   3. Otherwise a self-signed cert minted by `rcgen`, with the listener
 ///      bind IP plus `localhost` (and optional `[server.tls] hostname`) in
 ///      the SAN list.
@@ -9741,7 +9741,7 @@ fn build_web_tls_acceptor(
                     .to_string(),
             ));
         }
-        (None, None) => match installed_lan_tls_cert_source()? {
+        (None, None) => match installed_access_tls_cert_source()? {
             Some(source) => source,
             None => web_tls::TlsCertSource::SelfSigned {
                 bind_ip: bind_addr.map(|a| a.ip()),
@@ -9756,11 +9756,11 @@ fn build_web_tls_acceptor(
             .clone()
             .or_else(|| mtls_cfg.ca.clone())
             .map(PathBuf::from)
-            .or_else(installed_lan_mtls_ca_path);
+            .or_else(installed_access_mtls_ca_path);
         let Some(ca_path) = ca_path else {
             return Err(CallerError::Config(
-                "mTLS requested, but no client CA was configured and no installed LAN CA \
-                 was found. Run `intendant lan setup` or pass --mtls-ca <ca.crt>."
+                "mTLS requested, but no client CA was configured and no installed access CA \
+                 was found. Run `intendant access setup` or pass --mtls-ca <ca.crt>."
                     .to_string(),
             ));
         };
@@ -9793,24 +9793,24 @@ fn build_web_tls_acceptor(
     Ok(Some(acceptor))
 }
 
-fn installed_lan_cert_dir() -> PathBuf {
-    lan::backend::select_backend().cert_dir()
+fn installed_access_cert_dir() -> PathBuf {
+    access::backend::select_backend().cert_dir()
 }
 
-fn installed_lan_tls_cert_source() -> Result<Option<web_tls::TlsCertSource>, CallerError> {
-    let cert_dir = installed_lan_cert_dir();
-    installed_lan_tls_cert_source_from_dir(&cert_dir)
+fn installed_access_tls_cert_source() -> Result<Option<web_tls::TlsCertSource>, CallerError> {
+    let cert_dir = installed_access_cert_dir();
+    installed_access_tls_cert_source_from_dir(&cert_dir)
 }
 
-fn installed_lan_tls_cert_source_from_dir(
+fn installed_access_tls_cert_source_from_dir(
     cert_dir: &Path,
 ) -> Result<Option<web_tls::TlsCertSource>, CallerError> {
-    installed_lan_tls_cert_source_from_dir_with_probe(cert_dir, |path| {
+    installed_access_tls_cert_source_from_dir_with_probe(cert_dir, |path| {
         std::fs::File::open(path).map(|_| ())
     })
 }
 
-fn installed_lan_tls_cert_source_from_dir_with_probe(
+fn installed_access_tls_cert_source_from_dir_with_probe(
     cert_dir: &Path,
     can_read: impl Fn(&Path) -> io::Result<()>,
 ) -> Result<Option<web_tls::TlsCertSource>, CallerError> {
@@ -9820,13 +9820,13 @@ fn installed_lan_tls_cert_source_from_dir_with_probe(
     let key_exists = key_path.exists();
     match (cert_exists, key_exists) {
         (true, true) => {
-            ensure_installed_lan_tls_file_readable(
+            ensure_installed_access_tls_file_readable(
                 cert_dir,
                 &cert_path,
                 "certificate",
                 &can_read,
             )?;
-            ensure_installed_lan_tls_file_readable(
+            ensure_installed_access_tls_file_readable(
                 cert_dir,
                 &key_path,
                 "private key",
@@ -9839,27 +9839,27 @@ fn installed_lan_tls_cert_source_from_dir_with_probe(
         }
         (false, false) => Ok(None),
         _ => Err(CallerError::Config(format!(
-            "Installed LAN TLS certs are incomplete in {} (expected both server.crt and \
-             server.key). Run `intendant lan setup --force` or pass --tls-cert/--tls-key.",
+            "Installed access TLS certs are incomplete in {} (expected both server.crt and \
+             server.key). Run `intendant access setup --force` or pass --tls-cert/--tls-key.",
             cert_dir.display()
         ))),
     }
 }
 
-fn ensure_installed_lan_tls_file_readable(
+fn ensure_installed_access_tls_file_readable(
     cert_dir: &Path,
     path: &Path,
     role: &str,
     can_read: &impl Fn(&Path) -> io::Result<()>,
 ) -> Result<(), CallerError> {
     can_read(path).map_err(|err| {
-        CallerError::Config(installed_lan_tls_unreadable_message(
+        CallerError::Config(installed_access_tls_unreadable_message(
             cert_dir, path, role, &err,
         ))
     })
 }
 
-fn installed_lan_tls_unreadable_message(
+fn installed_access_tls_unreadable_message(
     cert_dir: &Path,
     path: &Path,
     role: &str,
@@ -9867,17 +9867,17 @@ fn installed_lan_tls_unreadable_message(
 ) -> String {
     let permission_hint = if err.kind() == io::ErrorKind::PermissionDenied {
         String::from(
-            " To let this user run native `--tls` with the installed LAN cert, \
-             fix ownership of the per-user LAN cert store or rerun \
-             `intendant lan setup --force` as that user."
+            " To let this user run native `--tls` with the installed access cert, \
+             fix ownership of the per-user access cert store or rerun \
+             `intendant access setup --force` as that user.",
         )
     } else {
         String::new()
     };
     format!(
-        "Installed LAN TLS {role} exists at {path}, but this process cannot read it: {err}. \
+        "Installed access TLS {role} exists at {path}, but this process cannot read it: {err}. \
          Native `--tls` reads the server certificate and key directly from the per-user \
-         LAN cert store at {cert_dir}.{permission_hint} Alternatively, pass a readable pair with \
+         access cert store at {cert_dir}.{permission_hint} Alternatively, pass a readable pair with \
          `--tls-cert <cert> --tls-key <key>`, or move the installed pair out of {cert_dir} to use \
          the self-signed fallback.",
         path = path.display(),
@@ -9885,11 +9885,11 @@ fn installed_lan_tls_unreadable_message(
     )
 }
 
-fn installed_lan_mtls_ca_path() -> Option<PathBuf> {
-    installed_lan_mtls_ca_path_from_dir(&installed_lan_cert_dir())
+fn installed_access_mtls_ca_path() -> Option<PathBuf> {
+    installed_access_mtls_ca_path_from_dir(&installed_access_cert_dir())
 }
 
-fn installed_lan_mtls_ca_path_from_dir(cert_dir: &Path) -> Option<PathBuf> {
+fn installed_access_mtls_ca_path_from_dir(cert_dir: &Path) -> Option<PathBuf> {
     let ca_path = cert_dir.join("ca.crt");
     ca_path.exists().then_some(ca_path)
 }
@@ -10059,7 +10059,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                 }
             }
             "--tls" => {
-                // Serve the dashboard over HTTPS/WSS. Installed LAN certs
+                // Serve the dashboard over HTTPS/WSS. Installed access certs
                 // are preferred unless --tls-cert/--tls-key override them.
                 flags.tls = true;
                 i += 1;
@@ -10805,11 +10805,19 @@ fn normalize_command_batch(json_str: &str) -> String {
 mod tests {
     use super::*;
 
+    fn access_names(ip: &str) -> access::certs::ServerNames {
+        access::certs::ServerNames::new(
+            ip.parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap()
+    }
+
     /// `build_local_advertised_auth` with the default config (all
     /// `[server.auth]` fields unset) produces `AuthRequirements::none()`
     /// — the conservative default that doesn't advertise any auth.
-    /// Doesn't touch the cert dir at all; safe to run with no LAN
-    /// setup.
+    /// Doesn't touch the cert dir at all; safe to run with no access setup.
     #[test]
     fn build_local_advertised_auth_defaults_to_none() {
         let server_auth = project::ServerAuthConfig::default();
@@ -14361,16 +14369,16 @@ mod tests {
         assert!(auth.application.is_none());
     }
 
-    /// `advertised_transport = "pin-self-cert"` reads the LAN cert
+    /// `advertised_transport = "pin-self-cert"` reads the access cert
     /// dir, computes the fingerprint, embeds it in PinnedMutualTls.
-    /// Uses `lan::certs::ensure_certs` to populate a tempdir.
-    /// `lan::certs` is now pure-Rust and compiles everywhere, so this
+    /// Uses `access::certs::ensure_certs` to populate a tempdir.
+    /// `access::certs` is now pure-Rust and compiles everywhere, so this
     /// applies on all platforms.
     #[test]
     fn build_local_advertised_auth_pin_self_cert_reads_cert_dir() {
         let tmp = tempfile::TempDir::new().unwrap();
-        lan::certs::ensure_certs(tmp.path(), "10.0.0.1", "test", false).unwrap();
-        let expected_fp = lan::certs::read_server_cert_fingerprint(tmp.path()).unwrap();
+        access::certs::ensure_certs(tmp.path(), &access_names("10.0.0.1"), "test", false).unwrap();
+        let expected_fp = access::certs::read_server_cert_fingerprint(tmp.path()).unwrap();
 
         let server_auth = project::ServerAuthConfig {
             bearer_token: None,
@@ -14389,7 +14397,7 @@ mod tests {
 
     /// `advertised_transport = "pin-self-cert"` with no cert in
     /// the dir errors with a clear message that points the
-    /// operator at `intendant lan setup`.
+    /// operator at `intendant access setup`.
     #[test]
     fn build_local_advertised_auth_pin_self_cert_errors_without_cert() {
         let tmp = tempfile::TempDir::new().unwrap();
@@ -14400,7 +14408,7 @@ mod tests {
         let err = build_local_advertised_auth(&server_auth, tmp.path()).unwrap_err();
         let msg = err.to_string();
         assert!(msg.contains("server.crt"), "msg: {msg}");
-        assert!(msg.contains("intendant lan setup"), "msg: {msg}");
+        assert!(msg.contains("intendant access setup"), "msg: {msg}");
     }
 
     /// Unrecognized `advertised_transport` value errors loudly at
@@ -14450,12 +14458,13 @@ mod tests {
     /// full defense-in-depth advertise (PinnedMutualTls transport +
     /// Bearer application). The expected configuration for WAN-
     /// exposed daemons that want both wire-layer and app-layer auth.
-    /// `lan::certs` is now pure-Rust and compiles everywhere, so this
+    /// `access::certs` is now pure-Rust and compiles everywhere, so this
     /// applies on all platforms.
     #[test]
     fn build_local_advertised_auth_full_defense_in_depth() {
         let tmp = tempfile::TempDir::new().unwrap();
-        lan::certs::ensure_certs(tmp.path(), "10.0.0.99", "wan-test", false).unwrap();
+        access::certs::ensure_certs(tmp.path(), &access_names("10.0.0.99"), "wan-test", false)
+            .unwrap();
 
         let server_auth = project::ServerAuthConfig {
             bearer_token: Some("wan-secret".to_string()),
@@ -15346,16 +15355,16 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn installed_lan_tls_source_uses_complete_server_pair() {
+    fn installed_access_tls_source_uses_complete_server_pair() {
         let dir = tempfile::tempdir().unwrap();
         let cert_path = dir.path().join("server.crt");
         let key_path = dir.path().join("server.key");
         std::fs::write(&cert_path, b"cert").unwrap();
         std::fs::write(&key_path, b"key").unwrap();
 
-        let source = installed_lan_tls_cert_source_from_dir(dir.path())
+        let source = installed_access_tls_cert_source_from_dir(dir.path())
             .unwrap()
-            .expect("LAN cert pair should be discovered");
+            .expect("access cert pair should be discovered");
         match source {
             web_tls::TlsCertSource::Files {
                 cert_path: c,
@@ -15369,18 +15378,18 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn installed_lan_tls_source_ignores_absent_pair() {
+    fn installed_access_tls_source_ignores_absent_pair() {
         let dir = tempfile::tempdir().unwrap();
-        assert!(installed_lan_tls_cert_source_from_dir(dir.path())
+        assert!(installed_access_tls_cert_source_from_dir(dir.path())
             .unwrap()
             .is_none());
     }
 
     #[test]
-    fn installed_lan_tls_source_errors_on_partial_pair() {
+    fn installed_access_tls_source_errors_on_partial_pair() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("server.crt"), b"cert").unwrap();
-        let err = installed_lan_tls_cert_source_from_dir(dir.path()).unwrap_err();
+        let err = installed_access_tls_cert_source_from_dir(dir.path()).unwrap_err();
         assert!(
             err.to_string().contains("incomplete"),
             "unexpected error: {err}"
@@ -15388,12 +15397,12 @@ Also: {"source": "bare"}"#;
     }
 
     #[test]
-    fn installed_lan_tls_source_explains_unreadable_key() {
+    fn installed_access_tls_source_explains_unreadable_key() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("server.crt"), b"cert").unwrap();
         std::fs::write(dir.path().join("server.key"), b"key").unwrap();
 
-        let err = installed_lan_tls_cert_source_from_dir_with_probe(dir.path(), |path| {
+        let err = installed_access_tls_cert_source_from_dir_with_probe(dir.path(), |path| {
             if path.ends_with("server.key") {
                 Err(io::Error::new(
                     io::ErrorKind::PermissionDenied,
@@ -15407,18 +15416,21 @@ Also: {"source": "bare"}"#;
         let msg = err.to_string();
         assert!(msg.contains("cannot read it"), "msg: {msg}");
         assert!(msg.contains("server.key"), "msg: {msg}");
-        assert!(msg.contains("per-user LAN cert store"), "msg: {msg}");
-        assert!(msg.contains("intendant lan setup --force"), "msg: {msg}");
-        assert!(msg.contains("--tls-cert <cert> --tls-key <key>"), "msg: {msg}");
+        assert!(msg.contains("per-user access cert store"), "msg: {msg}");
+        assert!(msg.contains("intendant access setup --force"), "msg: {msg}");
+        assert!(
+            msg.contains("--tls-cert <cert> --tls-key <key>"),
+            "msg: {msg}"
+        );
     }
 
     #[test]
-    fn installed_lan_mtls_ca_uses_ca_crt_when_present() {
+    fn installed_access_mtls_ca_uses_ca_crt_when_present() {
         let dir = tempfile::tempdir().unwrap();
         let ca_path = dir.path().join("ca.crt");
         std::fs::write(&ca_path, b"ca").unwrap();
         assert_eq!(
-            installed_lan_mtls_ca_path_from_dir(dir.path()).as_deref(),
+            installed_access_mtls_ca_path_from_dir(dir.path()).as_deref(),
             Some(ca_path.as_path())
         );
     }
@@ -24434,14 +24446,22 @@ async fn main() -> Result<(), CallerError> {
     // Ensure platform tool directories (Homebrew etc.) are in PATH.
     platform::ensure_tool_paths();
 
-    // Intercept `intendant lan <action>` before the main runtime setup —
-    // the lan subcommand is a local certificate/enrollment path with no
-    // project, no .env, and no provider selection.
+    // `intendant lan` was removed when the native dashboard certificate flow
+    // became `intendant access`. Fail explicitly so the old command cannot be
+    // misread as an ordinary task prompt.
     if env::args().nth(1).as_deref() == Some("lan") {
+        eprintln!("error: `intendant lan` was removed; use `intendant access`");
+        std::process::exit(1);
+    }
+
+    // Intercept `intendant access <action>` before the main runtime setup.
+    // This is a local certificate/enrollment path with no project, no .env,
+    // and no provider selection.
+    if env::args().nth(1).as_deref() == Some("access") {
         #[cfg(not(target_os = "windows"))]
         {
             let argv: Vec<String> = env::args().skip(2).collect();
-            return match lan::run(argv).await {
+            return match access::run(argv).await {
                 Ok(()) => Ok(()),
                 Err(e) => {
                     eprintln!("error: {e}");
@@ -24451,7 +24471,7 @@ async fn main() -> Result<(), CallerError> {
         }
         #[cfg(target_os = "windows")]
         {
-            eprintln!("error: `intendant lan` is not supported on Windows yet");
+            eprintln!("error: `intendant access` is not supported on Windows yet");
             std::process::exit(1);
         }
     }
@@ -24948,7 +24968,7 @@ async fn main() -> Result<(), CallerError> {
             project.config.server.auth.bearer_token.clone(),
             build_local_advertised_auth(
                 &project.config.server.auth,
-                &lan::backend::select_backend().cert_dir(),
+                &access::backend::select_backend().cert_dir(),
             )?,
             web_tls_acceptor.clone(),
         );
@@ -25181,7 +25201,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.server.auth.bearer_token.clone(),
                 build_local_advertised_auth(
                     &project.config.server.auth,
-                    &lan::backend::select_backend().cert_dir(),
+                    &access::backend::select_backend().cert_dir(),
                 )?,
                 web_tls_acceptor.clone(),
             );
@@ -25789,7 +25809,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.server.auth.bearer_token.clone(),
                 build_local_advertised_auth(
                     &project.config.server.auth,
-                    &lan::backend::select_backend().cert_dir(),
+                    &access::backend::select_backend().cert_dir(),
                 )?,
                 web_tls_acceptor.clone(),
             );
@@ -26306,7 +26326,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.server.auth.bearer_token.clone(),
                 build_local_advertised_auth(
                     &project.config.server.auth,
-                    &lan::backend::select_backend().cert_dir(),
+                    &access::backend::select_backend().cert_dir(),
                 )?,
                 web_tls_acceptor.clone(),
             );

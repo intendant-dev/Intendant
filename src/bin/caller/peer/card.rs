@@ -33,7 +33,7 @@ impl AgentCard {
     /// so `web_gateway::spawn_web_gateway` doesn't reinvent the
     /// shape of the card at its only call site.
     ///
-    /// `label` should come from [`crate::lan::resolve_host_label`],
+    /// `label` should come from [`crate::access::resolve_host_label`],
     /// `version` from `env!("CARGO_PKG_VERSION")`, and `git_sha` from
     /// `env!("INTENDANT_GIT_SHA")` (wrapped in `Some` — it's a
     /// build-time constant in Intendant). `transports` is the list of
@@ -428,7 +428,7 @@ pub enum TransportAuth {
     None,
     /// mTLS — TLS handshake authenticates the peer via a client
     /// cert signed by a CA both sides trust. Reuses the
-    /// `intendant lan` CA infrastructure when both peers are
+    /// `intendant access` CA infrastructure when both peers are
     /// Intendants on the same LAN.
     MutualTls,
     /// Cert pinning — the connecting peer requires the server cert

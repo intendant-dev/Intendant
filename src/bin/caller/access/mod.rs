@@ -1,22 +1,22 @@
-//! `intendant lan` subcommand.
+//! `intendant access` subcommand.
 //!
-//! Generates a per-user LAN CA plus server/client certificates for the
+//! Generates a per-user access CA plus server/client certificates for the
 //! native `--tls` / `--mtls` dashboard gateway, then optionally runs a
 //! strict HTTPS enrollment server for importing the client identity on
 //! browsers and mobile devices.
 //!
 //! Shared across platforms: cert generation (pure-Rust rcgen +
 //! p12-keystore), client cert distribution, and import instructions.
-//! Platform differences are isolated behind the `LanBackend` trait.
+//! Platform differences are isolated behind the `AccessBackend` trait.
 
 use std::fmt;
 
 pub mod backend;
 // `certs` is pure-Rust (rcgen + p12-keystore) and compiles on every
 // platform, so it stays ungated — `read_server_cert_fingerprint` backs the
-// `pin-self-cert` transport. The interactive `lan` subcommand remains gated
-// off Windows for now because the enrollment UX and setup scripts were only
-// validated on Unix; the native cert store itself is cross-platform.
+// `pin-self-cert` transport. The interactive `access` subcommand remains
+// gated off Windows for now because the enrollment UX and setup scripts were
+// only validated on Unix; the native cert store itself is cross-platform.
 #[cfg(not(target_os = "windows"))]
 pub mod cert_server;
 #[cfg_attr(target_os = "windows", allow(dead_code))]
@@ -28,11 +28,11 @@ pub mod wizard;
 /// Resolve the multi-host `HostId` for this machine.
 ///
 /// Checks the platform cert dir's `host_label` file first (written by
-/// `intendant lan setup --name …`), then falls back to the system
+/// `intendant access setup --name …`), then falls back to the system
 /// hostname. Returns `"local"` only if both fail, so the dashboard
 /// always has *some* label to display.
 ///
-/// Callable from `intendant --web` without running any `lan` action,
+/// Callable from `intendant --web` without running any `access` action,
 /// because the backend's `cert_dir()` is a pure path accessor with no
 /// privileged I/O.
 pub fn resolve_host_label() -> String {
@@ -172,47 +172,48 @@ pub mod backend_linux;
 #[cfg(target_os = "macos")]
 pub mod backend_macos;
 
-/// Errors from the lan subcommand — string-based on purpose: this is a
+/// Errors from the access subcommand — string-based on purpose: this is a
 /// user-facing setup tool and most errors are meant to be printed and
 /// exited on, not matched programmatically.
 #[derive(Debug)]
-pub struct LanError(pub String);
+pub struct AccessError(pub String);
 
-impl fmt::Display for LanError {
+impl fmt::Display for AccessError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.0)
     }
 }
 
-impl std::error::Error for LanError {}
+impl std::error::Error for AccessError {}
 
-impl From<std::io::Error> for LanError {
+impl From<std::io::Error> for AccessError {
     fn from(e: std::io::Error) -> Self {
-        LanError(format!("io: {e}"))
+        AccessError(format!("io: {e}"))
     }
 }
 
 // `certs` (rcgen-based, pure-Rust) uses `?` on `rcgen::Error`; surface it as
-// a LanError. Available on all platforms, like the `certs` module itself.
-impl From<rcgen::Error> for LanError {
+// a AccessError. Available on all platforms, like the `certs` module itself.
+impl From<rcgen::Error> for AccessError {
     fn from(e: rcgen::Error) -> Self {
-        LanError(format!("rcgen: {e}"))
+        AccessError(format!("rcgen: {e}"))
     }
 }
 
-pub type LanResult<T> = Result<T, LanError>;
+pub type AccessResult<T> = Result<T, AccessError>;
 
-/// Parsed `intendant lan <action> [flags]` invocation.
+/// Parsed `intendant access <action> [flags]` invocation.
 // The interactive setup/enrollment command surface is still gated off
 // Windows. Only the lookup helpers above (`resolve_host_label`,
 // `routable_local_addrs`) remain on Windows.
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug)]
-pub struct LanArgs {
-    pub action: LanAction,
+pub struct AccessArgs {
+    pub action: AccessAction,
     pub https_port: u16,
     pub cert_port: u16,
-    pub lan_ip: Option<String>,
+    pub ips: Vec<String>,
+    pub hosts: Vec<String>,
     pub name: Option<String>,
     pub force: bool,
     /// Skip the interactive cert distribution server at the end of setup.
@@ -224,7 +225,7 @@ pub struct LanArgs {
 
 #[cfg(not(target_os = "windows"))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum LanAction {
+pub enum AccessAction {
     Setup,
     Recert,
     Remove,
@@ -234,13 +235,14 @@ pub enum LanAction {
 }
 
 #[cfg(not(target_os = "windows"))]
-impl Default for LanArgs {
+impl Default for AccessArgs {
     fn default() -> Self {
         Self {
-            action: LanAction::Help,
+            action: AccessAction::Help,
             https_port: crate::web_gateway::DEFAULT_PORT,
             cert_port: 9999,
-            lan_ip: None,
+            ips: Vec::new(),
+            hosts: Vec::new(),
             name: None,
             force: false,
             no_serve_certs: false,
@@ -248,26 +250,26 @@ impl Default for LanArgs {
     }
 }
 
-/// Top-level entry invoked from `main()` when argv[1] == "lan".
+/// Top-level entry invoked from `main()` when argv[1] == "access".
 #[cfg(not(target_os = "windows"))]
-pub async fn run(argv: Vec<String>) -> LanResult<()> {
+pub async fn run(argv: Vec<String>) -> AccessResult<()> {
     let args = parse_args(&argv)?;
     match args.action {
-        LanAction::Help => {
+        AccessAction::Help => {
             print_help();
             Ok(())
         }
-        LanAction::Setup => cmd_setup(args).await,
-        LanAction::Recert => cmd_recert(args).await,
-        LanAction::Remove => cmd_remove(args).await,
-        LanAction::List => cmd_list(args),
-        LanAction::ServeCerts => cmd_serve_certs(args).await,
+        AccessAction::Setup => cmd_setup(args).await,
+        AccessAction::Recert => cmd_recert(args).await,
+        AccessAction::Remove => cmd_remove(args).await,
+        AccessAction::List => cmd_list(args),
+        AccessAction::ServeCerts => cmd_serve_certs(args).await,
     }
 }
 
 #[cfg(not(target_os = "windows"))]
-fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
-    let mut args = LanArgs::default();
+fn parse_args(argv: &[String]) -> AccessResult<AccessArgs> {
+    let mut args = AccessArgs::default();
 
     let mut iter = argv.iter();
     let Some(first) = iter.next() else {
@@ -275,15 +277,15 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
     };
 
     args.action = match first.as_str() {
-        "setup" => LanAction::Setup,
-        "recert" => LanAction::Recert,
-        "remove" => LanAction::Remove,
-        "list" => LanAction::List,
-        "serve-certs" => LanAction::ServeCerts,
+        "setup" => AccessAction::Setup,
+        "recert" => AccessAction::Recert,
+        "remove" => AccessAction::Remove,
+        "list" => AccessAction::List,
+        "serve-certs" => AccessAction::ServeCerts,
         "help" | "-h" | "--help" => return Ok(args),
         other => {
-            return Err(LanError(format!(
-                "unknown lan subcommand '{other}' (expected setup/recert/remove/list/serve-certs)"
+            return Err(AccessError(format!(
+                "unknown access subcommand '{other}' (expected setup/recert/remove/list/serve-certs)"
             )));
         }
     };
@@ -293,39 +295,36 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
             "--port" => {
                 let v = iter
                     .next()
-                    .ok_or_else(|| LanError("missing value for --port".into()))?;
+                    .ok_or_else(|| AccessError("missing value for --port".into()))?;
                 args.https_port = v
                     .parse()
-                    .map_err(|_| LanError(format!("invalid --port value '{v}'")))?;
+                    .map_err(|_| AccessError(format!("invalid --port value '{v}'")))?;
             }
             "--cert-port" => {
                 let v = iter
                     .next()
-                    .ok_or_else(|| LanError("missing value for --cert-port".into()))?;
+                    .ok_or_else(|| AccessError("missing value for --cert-port".into()))?;
                 args.cert_port = v
                     .parse()
-                    .map_err(|_| LanError(format!("invalid --cert-port value '{v}'")))?;
+                    .map_err(|_| AccessError(format!("invalid --cert-port value '{v}'")))?;
             }
-            "--lan-ip" => {
+            "--ip" => {
                 let v = iter
                     .next()
-                    .ok_or_else(|| LanError("missing value for --lan-ip".into()))?;
-                args.lan_ip = Some(v.clone());
+                    .ok_or_else(|| AccessError("missing value for --ip".into()))?;
+                args.ips.push(v.clone());
+            }
+            "--host" => {
+                let v = iter
+                    .next()
+                    .ok_or_else(|| AccessError("missing value for --host".into()))?;
+                args.hosts.push(v.clone());
             }
             "--name" => {
                 let v = iter
                     .next()
-                    .ok_or_else(|| LanError("missing value for --name".into()))?;
+                    .ok_or_else(|| AccessError("missing value for --name".into()))?;
                 args.name = Some(v.clone());
-            }
-            "--backend" => {
-                let v = iter
-                    .next()
-                    .ok_or_else(|| LanError("missing value for --backend".into()))?;
-                eprintln!(
-                    "warning: --backend {v:?} is ignored; native `intendant --tls` serves \
-                     the dashboard directly without an upstream proxy"
-                );
             }
             "--force" => {
                 args.force = true;
@@ -334,11 +333,11 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
                 args.no_serve_certs = true;
             }
             "-h" | "--help" => {
-                args.action = LanAction::Help;
+                args.action = AccessAction::Help;
                 return Ok(args);
             }
             other => {
-                return Err(LanError(format!("unknown flag '{other}'")));
+                return Err(AccessError(format!("unknown flag '{other}'")));
             }
         }
     }
@@ -348,65 +347,67 @@ fn parse_args(argv: &[String]) -> LanResult<LanArgs> {
 
 #[cfg(not(target_os = "windows"))]
 fn print_help() {
-    println!("Intendant LAN access setup");
+    println!("Intendant dashboard access setup");
     println!();
     println!("USAGE:");
-    println!("    intendant lan <action> [flags]");
+    println!("    intendant access <action> [flags]");
     println!();
     println!("ACTIONS:");
-    println!("    setup         Generate native TLS/mTLS LAN certs and start enrollment");
-    println!("    recert        Regenerate server cert after LAN IP change");
-    println!("    remove        Remove the per-user LAN cert store");
+    println!("    setup         Generate native TLS/mTLS access certs and start enrollment");
+    println!("    recert        Regenerate the server cert after access addresses change");
+    println!("    remove        Remove the per-user access cert store");
     println!("    list          Show current setup state");
     println!("    serve-certs   Run strict HTTPS client cert enrollment");
     println!();
     println!("FLAGS:");
     println!("    --port <N>         Native dashboard HTTPS port to advertise (default 8765)");
     println!("    --cert-port <N>    Port for the HTTPS enrollment server (default 9999)");
-    println!("    --lan-ip <IP>      Override detected LAN IP");
+    println!("    --ip <IP>          Add an IP SAN; first --ip becomes the dashboard URL host");
+    println!("    --host <DNS>       Add a DNS SAN");
     println!("    --name <LABEL>     Host label shown in cert CN and multi-host dashboard");
-    println!("    --backend <ADDR>   Ignored legacy flag from the old proxy setup path");
     println!("    --force            Skip idempotency checks (regenerate even if current)");
     println!("    --no-serve-certs   Skip the enrollment server at the end of setup");
     println!();
-    println!("SECURITY TIERS:");
-    println!("    Trusted LAN    — mTLS (this command)");
-    println!("    Public WiFi    — WireGuard + mTLS");
-    println!("    NAT traversal  — Tailscale");
+    println!("NOTES:");
+    println!("    Loopback SANs are always included: localhost, 127.0.0.1, ::1.");
+    println!("    Detected local interface IPs are included. Public interface IPs are");
+    println!("    allowed, but WAN exposure should use `intendant --mtls`, not only --tls.");
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn cmd_setup(args: LanArgs) -> LanResult<()> {
+async fn cmd_setup(args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
-
-    let lan_ip = match args.lan_ip.clone() {
-        Some(ip) => {
-            println!(":: LAN IP: {ip} (override)");
-            ip
-        }
-        None => be.detect_lan_ip()?,
-    };
+    let server_names = resolve_server_names(&args, be.as_ref())?;
+    let dashboard_host = url_host_for_ip(server_names.primary_ip);
 
     let cert_dir = be.cert_dir();
     std::fs::create_dir_all(&cert_dir)?;
 
-    let label = args.name.clone().unwrap_or_else(|| lan_ip.clone());
+    let label = args
+        .name
+        .clone()
+        .unwrap_or_else(|| server_names.primary_ip.to_string());
 
-    let state = certs::ensure_certs(&cert_dir, &lan_ip, &label, args.force)?;
+    print_public_ip_warnings(&server_names);
+
+    let state = certs::ensure_certs(&cert_dir, &server_names, &label, args.force)?;
     state::write_host_label(&cert_dir, &label)?;
 
     println!();
     println!("============================================================");
-    println!("  LAN certs ready");
+    println!("  Access certs ready");
     println!("============================================================");
     println!();
-    println!("  Native LAN certs: {}", cert_dir.display());
+    println!("  Native access certs: {}", cert_dir.display());
     println!("  Start or restart the dashboard with:");
     println!("    intendant --tls");
     println!("  Or require client certs with:");
     println!("    intendant --mtls");
     println!();
-    println!("  Dashboard URL: https://{lan_ip}:{}", args.https_port);
+    println!(
+        "  Dashboard URL: https://{dashboard_host}:{}",
+        args.https_port
+    );
     println!();
 
     if args.no_serve_certs {
@@ -414,7 +415,7 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
         // they have an interactive operator channel for fingerprint
         // verification.
         println!("  Enrollment server was not started (--no-serve-certs).");
-        println!("  Run `intendant lan serve-certs` later to enroll devices.");
+        println!("  Run `intendant access serve-certs` later to enroll devices.");
         println!();
         return Ok(());
     }
@@ -427,34 +428,28 @@ async fn cmd_setup(args: LanArgs) -> LanResult<()> {
     println!("  The enrollment page contains the device-specific install steps.");
     println!("  Press Ctrl+C here when all devices are enrolled.");
     println!();
-    cert_server::serve(&state, args.cert_port, &lan_ip, args.https_port).await?;
+    cert_server::serve(&state, args.cert_port, &dashboard_host, args.https_port).await?;
 
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn cmd_recert(args: LanArgs) -> LanResult<()> {
+async fn cmd_recert(args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
-
-    let lan_ip = match args.lan_ip.clone() {
-        Some(ip) => {
-            println!(":: LAN IP: {ip} (override)");
-            ip
-        }
-        None => be.detect_lan_ip()?,
-    };
+    let server_names = resolve_server_names(&args, be.as_ref())?;
 
     let cert_dir = be.cert_dir();
     if !cert_dir.join("ca.key").exists() {
-        return Err(LanError(format!(
-            "no CA found in {} — run `intendant lan setup` first",
+        return Err(AccessError(format!(
+            "no CA found in {} — run `intendant access setup` first",
             cert_dir.display()
         )));
     }
 
-    certs::recert(&cert_dir, &lan_ip, args.force)?;
+    print_public_ip_warnings(&server_names);
+    certs::recert(&cert_dir, &server_names, args.force)?;
 
-    println!(":: done — native LAN server cert refreshed");
+    println!(":: done — native access server cert refreshed");
     println!(":: restart any running `intendant --tls` / `--mtls` daemon to load it");
     println!(":: enrolled clients can keep using the same CA and client identity");
 
@@ -462,7 +457,7 @@ async fn cmd_recert(args: LanArgs) -> LanResult<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn cmd_remove(_args: LanArgs) -> LanResult<()> {
+async fn cmd_remove(_args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
     if cert_dir.exists() {
@@ -474,7 +469,7 @@ async fn cmd_remove(_args: LanArgs) -> LanResult<()> {
 }
 
 #[cfg(not(target_os = "windows"))]
-fn cmd_list(_args: LanArgs) -> LanResult<()> {
+fn cmd_list(_args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
     if !cert_dir.join("ca.crt").exists() {
@@ -485,18 +480,18 @@ fn cmd_list(_args: LanArgs) -> LanResult<()> {
     println!("  Cert dir:   {}", cert_dir.display());
     println!("  Host label: {label}");
     if let Ok(ip) = certs::current_cert_ip(&cert_dir) {
-        println!("  Cert IP:    {ip}");
+        println!("  Primary IP: {ip}");
     }
     Ok(())
 }
 
 #[cfg(not(target_os = "windows"))]
-async fn cmd_serve_certs(args: LanArgs) -> LanResult<()> {
+async fn cmd_serve_certs(args: AccessArgs) -> AccessResult<()> {
     let be = backend::select_backend();
     let cert_dir = be.cert_dir();
     if !cert_dir.join("client.p12").exists() {
-        return Err(LanError(format!(
-            "no client.p12 found in {} — run `intendant lan setup` first",
+        return Err(AccessError(format!(
+            "no client.p12 found in {} — run `intendant access setup` first",
             cert_dir.display()
         )));
     }
@@ -505,12 +500,81 @@ async fn cmd_serve_certs(args: LanArgs) -> LanResult<()> {
         p12_password: state::read_p12_password(&cert_dir)?,
         label: state::read_host_label(&cert_dir).unwrap_or_default(),
     };
-    let lan_ip = match args.lan_ip.clone() {
-        Some(ip) => ip,
-        None => be.detect_lan_ip()?,
-    };
-    cert_server::serve(&state, args.cert_port, &lan_ip, args.https_port).await?;
+    let server_names = resolve_server_names(&args, be.as_ref())?;
+    let dashboard_host = url_host_for_ip(server_names.primary_ip);
+    cert_server::serve(&state, args.cert_port, &dashboard_host, args.https_port).await?;
     Ok(())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn resolve_server_names(
+    args: &AccessArgs,
+    be: &dyn backend::AccessBackend,
+) -> AccessResult<certs::ServerNames> {
+    let primary_ip_text = match args.ips.first() {
+        Some(ip) => {
+            println!(":: primary IP: {ip} (override)");
+            ip.clone()
+        }
+        None => be.detect_primary_ip()?,
+    };
+    let primary_ip = primary_ip_text
+        .parse()
+        .map_err(|_| AccessError(format!("invalid --ip value '{primary_ip_text}'")))?;
+    let mut ips = routable_local_addrs(false);
+    for ip in &args.ips {
+        ips.push(
+            ip.parse()
+                .map_err(|_| AccessError(format!("invalid --ip value '{ip}'")))?,
+        );
+    }
+    certs::ServerNames::new(primary_ip, ips, args.hosts.clone())
+}
+
+#[cfg(not(target_os = "windows"))]
+fn url_host_for_ip(ip: std::net::IpAddr) -> String {
+    match ip {
+        std::net::IpAddr::V4(ip) => ip.to_string(),
+        std::net::IpAddr::V6(ip) => format!("[{ip}]"),
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn print_public_ip_warnings(server_names: &certs::ServerNames) {
+    for ip in &server_names.ips {
+        if is_public_ip(ip) {
+            println!("!! public interface address included in server cert: {ip}");
+            println!("!! WAN exposure should use `intendant --mtls`, not only `--tls`.");
+        }
+    }
+}
+
+#[cfg(not(target_os = "windows"))]
+fn is_public_ip(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(ip) => {
+            let o = ip.octets();
+            !(ip.is_private()
+                || ip.is_loopback()
+                || ip.is_link_local()
+                || ip.is_broadcast()
+                || ip.is_documentation()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || o[0] == 0
+                || (o[0] == 100 && (64..=127).contains(&o[1]))
+                || (o[0] == 198 && (18..=19).contains(&o[1])))
+        }
+        std::net::IpAddr::V6(ip) => {
+            let s = ip.segments();
+            !(ip.is_loopback()
+                || ip.is_unspecified()
+                || ip.is_multicast()
+                || is_link_local_v6(ip)
+                || (s[0] & 0xfe00) == 0xfc00
+                || (s[0] == 0x2001 && s[1] == 0x0db8))
+        }
+    }
 }
 
 #[cfg(test)]

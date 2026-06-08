@@ -2602,7 +2602,7 @@ impl WebRtcPeer {
         // read it back via `local_addr()` when gathering the srflx
         // candidate off the critical path (audit F8), so we don't need to
         // carry the bases separately here.
-        let local_addrs = crate::lan::routable_local_addrs(true);
+        let local_addrs = crate::access::routable_local_addrs(true);
         for iface_addr in &local_addrs {
             let bind_addr = SocketAddr::new(*iface_addr, 0);
             let socket = match UdpSocket::bind(bind_addr).await {
@@ -5111,7 +5111,7 @@ fn serialize_clipboard(content: &ClipboardContent) -> String {
     }
 }
 
-// `routable_local_addrs` and `is_link_local_v6` moved to `crate::lan`
+// `routable_local_addrs` and `is_link_local_v6` moved to `crate::access`
 // so the federation advertise side can share them — same set of
 // "addresses we can be reached at" applies to both WebRTC host
 // candidates and Agent Card transport URLs.

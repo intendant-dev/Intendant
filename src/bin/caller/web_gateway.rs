@@ -2280,9 +2280,7 @@ fn prepare_websocket_bootstrap_replay_entries(
     mut entries: Vec<serde_json::Value>,
     limit: usize,
 ) -> Vec<serde_json::Value> {
-    entries.retain(|entry| {
-        entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot")
-    });
+    entries.retain(|entry| entry.get("event").and_then(|v| v.as_str()) != Some("context_snapshot"));
     entries = limited_session_detail_entries(entries, Some(limit));
     for entry in &mut entries {
         compact_replay_entry_text_fields_for_websocket(entry);
@@ -6950,10 +6948,7 @@ fn external_session_activity_replay_from_home_with_attach(
         let content = if compact_for_websocket
             && content.len() > WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES
         {
-            truncate_string_to_utf8_byte_limit(
-                content,
-                WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES,
-            )
+            truncate_string_to_utf8_byte_limit(content, WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES)
         } else {
             content.to_string()
         };
@@ -12703,7 +12698,7 @@ pub fn spawn_web_gateway(
     // `[server.auth] advertised_transport` (`"none"` /
     // `"mutual-tls"` / `"pin-self-cert"`) and
     // `[server.auth] bearer_token`. The `pin-self-cert` path reads
-    // the daemon's own `server.crt` from the LAN cert dir and
+    // the daemon's own `server.crt` from the access cert dir and
     // pre-fills the fingerprint so operators don't have to compute
     // it manually.
     //
@@ -19609,7 +19604,7 @@ pub(crate) fn verify_bearer_token(
 ///
 /// **Additive auto-detection.** Mirrors WebRTC's host-candidate
 /// gathering pattern: the daemon enumerates its own routable
-/// interfaces via [`crate::lan::routable_local_addrs`] and emits one
+/// interfaces via [`crate::access::routable_local_addrs`] and emits one
 /// URL per address by default, so the operator doesn't need to type
 /// their own LAN IP into `--advertise-url`. The operator's overrides
 /// (CLI `--advertise-url` or `[server.advertise]` in intendant.toml)
@@ -19632,7 +19627,7 @@ pub(crate) fn verify_bearer_token(
 ///
 /// ## Fallbacks (in order, when auto-detection finds nothing)
 ///
-/// 1. Resolved host label ([`crate::lan::resolve_host_label`]) —
+/// 1. Resolved host label ([`crate::access::resolve_host_label`]) —
 ///    works on a trusted LAN with mDNS, fragile elsewhere. Last-
 ///    ditch best-effort.
 /// 2. `ws://localhost:0/ws` if there's no listener at all
@@ -19715,7 +19710,7 @@ fn auto_detect_advertise_urls(
     // dial. Within each address family we preserve `getifaddrs` order
     // (`stable_sort_by`), so a multi-NIC host that already had a
     // preferred primary interface keeps it.
-    let mut ips = crate::lan::routable_local_addrs(false);
+    let mut ips = crate::access::routable_local_addrs(false);
     ips.sort_by(|a, b| match (a, b) {
         (IpAddr::V4(_), IpAddr::V6(_)) => std::cmp::Ordering::Less,
         (IpAddr::V6(_), IpAddr::V4(_)) => std::cmp::Ordering::Greater,
@@ -19734,7 +19729,7 @@ fn auto_detect_advertise_urls(
     // dialable on a trusted LAN with mDNS.
     if urls.is_empty() {
         urls.push(format_ws_url(
-            &crate::lan::resolve_host_label(),
+            &crate::access::resolve_host_label(),
             port,
             tls_enabled,
         ));
@@ -19782,7 +19777,7 @@ fn format_ws_url(host: &str, port: u16, tls_enabled: bool) -> String {
 /// what connecting peers should send. Built by
 /// `crate::main::build_local_advertised_auth` from
 /// `[server.auth]` (advertised_transport + bearer_token) and the
-/// LAN cert dir (for `pin-self-cert` fingerprint). Phase 1 of slice
+/// access cert dir (for `pin-self-cert` fingerprint). Phase 1 of slice
 /// 2c always passed `AuthRequirements::none()`; this signature
 /// change lets the operator advertise mTLS / pinned-mTLS / bearer
 /// in the card so connecting peers know what to send.
@@ -19796,7 +19791,7 @@ pub fn build_local_agent_card(
         .map(|url| TransportSpec::IntendantWs { url })
         .collect();
     crate::peer::AgentCard::local_intendant(
-        crate::lan::resolve_host_label(),
+        crate::access::resolve_host_label(),
         env!("CARGO_PKG_VERSION").to_string(),
         Some(env!("INTENDANT_GIT_SHA").to_string()),
         transports,
@@ -26547,7 +26542,10 @@ mod tests {
         }));
         assert!(limited.len() <= 12);
         assert!(limited.iter().any(|entry| {
-            entry.pointer("/data/goal/objective").and_then(|v| v.as_str()) == Some("latest goal")
+            entry
+                .pointer("/data/goal/objective")
+                .and_then(|v| v.as_str())
+                == Some("latest goal")
         }));
         let oversized_summary = limited
             .last()
@@ -28998,7 +28996,7 @@ mod tests {
         );
         assert!(
             !card.label.is_empty(),
-            "label must be resolved from lan::resolve_host_label"
+            "label must be resolved from access::resolve_host_label"
         );
         assert_eq!(
             card.version,

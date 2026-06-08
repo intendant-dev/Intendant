@@ -199,7 +199,7 @@ encrypted WebRTC transport with real clients. The libvpx-backed VP8 encoder is
 gated **off** Windows in `Cargo.toml` (`cfg(not(target_os = "windows"))`), so the
 MSVC build never tries to compile the `env-libvpx-sys` C-FFI crate (which needs a
 C toolchain plus the vpx headers); the VP8 code paths are themselves `cfg`'d off
-Windows. (The former OpenSSL C-FFI dependency is gone entirely — the LAN cert
+Windows. (The former OpenSSL C-FFI dependency is gone entirely — the access cert
 subsystem is now pure-Rust via `rcgen` + `p12-keystore` — so nothing OpenSSL
 needs gating on any platform.)
 
@@ -234,7 +234,7 @@ process and network helpers:
   `QueryFullProcessImageNameW` (executable path only) when the full command line
   is unavailable.
 - **Routable local addresses** — the **`if-addrs`** crate (wrapping
-  `GetAdaptersAddresses`) backs `lan::routable_local_addrs`, which feeds the
+  `GetAdaptersAddresses`) backs `access::routable_local_addrs`, which feeds the
   web-gateway advertise URLs and WebRTC ICE host-candidate gathering. The Unix
   path keeps its direct `getifaddrs(3)` walk.
 
@@ -254,14 +254,14 @@ than a panic or silent no-op.
   bridge is wired up but has not yet been validated end-to-end on a Windows
   host. It also requires the manual VB-CABLE install (see
   [Audio](#audio-ffmpeg--vb-cable-wasapi-bridge)).
-- **`intendant lan` enrollment is still Unix-validated.** Native HTTPS/WSS via
-  `--tls` and `--mtls` is pure Rust and cross-platform, but the interactive LAN
+- **`intendant access` enrollment is still Unix-validated.** Native HTTPS/WSS via
+  `--tls` and `--mtls` is pure Rust and cross-platform, but the interactive access
   enrollment command has only been validated on Unix hosts so far. To expose the
   dashboard to other devices from a Windows host, use native HTTPS/WSS with
   explicit `--tls-cert` / `--tls-key`, run enrollment from a Unix peer, or front
   the dashboard with your own reverse proxy. See
-  [Peer Federation](./peer-federation.md#lan-access-and-tls) for the full
-  LAN/TLS and federation auth story.
+  [Peer Federation](./peer-federation.md#dashboard-access-and-tls) for the full
+  dashboard TLS/mTLS and federation auth story.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so
   the lazily-launched virtual displays the Linux pipeline uses do not exist on
   Windows. Capture targets the real interactive desktop only.
@@ -272,5 +272,5 @@ than a panic or silent no-op.
 
 - [Getting Started](./getting-started.md) — building, the `.env` file, and run modes
 - [Display Pipeline](./display-pipeline.md) — capture/encode/WebRTC architecture and the encoder pool
-- [Peer Federation](./peer-federation.md) — LAN/TLS, `--tls`, and cross-machine display
+- [Peer Federation](./peer-federation.md) — dashboard TLS/mTLS, `--tls`, and cross-machine display
 - [Computer Use & Live Audio](./computer-use-and-audio.md) — input and voice

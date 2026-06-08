@@ -1,30 +1,30 @@
-//! Small persistent bits of state the `lan` subcommand reads and writes:
+//! Small persistent bits of state the `access` subcommand reads and writes:
 //! the host label (used as the future multi-host `HostId`) and the .p12
 //! password (so `serve-certs` can show it on the unlocked enrollment
 //! page and embed it in the gated Apple profile after strict pairing).
 
 use std::path::Path;
 
-use super::{LanError, LanResult};
+use super::{AccessError, AccessResult};
 
 const HOST_LABEL_FILE: &str = "host_label";
 const P12_PASSWORD_FILE: &str = "p12_password";
 
-pub fn write_host_label(cert_dir: &Path, label: &str) -> LanResult<()> {
+pub fn write_host_label(cert_dir: &Path, label: &str) -> AccessResult<()> {
     let path = cert_dir.join(HOST_LABEL_FILE);
     std::fs::write(&path, label.as_bytes())?;
     set_readable_perms(&path)?;
     Ok(())
 }
 
-pub fn read_host_label(cert_dir: &Path) -> LanResult<String> {
+pub fn read_host_label(cert_dir: &Path) -> AccessResult<String> {
     let path = cert_dir.join(HOST_LABEL_FILE);
     let contents = std::fs::read_to_string(&path)
-        .map_err(|e| LanError(format!("read {}: {e}", path.display())))?;
+        .map_err(|e| AccessError(format!("read {}: {e}", path.display())))?;
     Ok(contents.trim().to_string())
 }
 
-pub fn write_p12_password(cert_dir: &Path, password: &str) -> LanResult<()> {
+pub fn write_p12_password(cert_dir: &Path, password: &str) -> AccessResult<()> {
     let path = cert_dir.join(P12_PASSWORD_FILE);
     std::fs::write(&path, password.as_bytes())?;
     // .p12 password is mildly sensitive — 0600.
@@ -38,14 +38,14 @@ pub fn write_p12_password(cert_dir: &Path, password: &str) -> LanResult<()> {
     Ok(())
 }
 
-pub fn read_p12_password(cert_dir: &Path) -> LanResult<String> {
+pub fn read_p12_password(cert_dir: &Path) -> AccessResult<String> {
     let path = cert_dir.join(P12_PASSWORD_FILE);
     let contents = std::fs::read_to_string(&path)
-        .map_err(|e| LanError(format!("read {}: {e}", path.display())))?;
+        .map_err(|e| AccessError(format!("read {}: {e}", path.display())))?;
     Ok(contents.trim().to_string())
 }
 
-fn set_readable_perms(path: &Path) -> LanResult<()> {
+fn set_readable_perms(path: &Path) -> AccessResult<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;

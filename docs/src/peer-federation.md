@@ -9,7 +9,7 @@ displays across machines.
 This chapter covers what federation is and how it differs from external agents,
 the Agent Card and discovery model, the peer actor/registry/coordinator layer,
 the transport stack (native WebSocket, multi-URL probing, cert pinning), the
-cross-machine display path, and the LAN/TLS setup. For the local display pipeline
+cross-machine display path, and dashboard TLS/mTLS setup. For the local display pipeline
 those federated displays plug into, see [Display Pipeline](./display-pipeline.md).
 
 ## Federation vs. External Agents
@@ -304,7 +304,7 @@ is dropped silently at the peer regardless of what the browser believes; the
 browser-side check is UX only. The full protocol is in
 [`docs/design-federated-input-authority.md`](https://github.com/lovon-spec/intendant/blob/main/docs/design-federated-input-authority.md).
 
-## LAN Access and TLS
+## Dashboard Access and TLS
 
 Two independent mechanisms expose the dashboard securely; they can be used
 together or separately.
@@ -319,14 +319,14 @@ ClientHello, wraps the socket in a `TlsAcceptor` before handing the decrypted
 stream to the existing HTTP/WebSocket handling.
 
 ```bash
-intendant --tls                                # installed LAN certs when present; else self-signed
+intendant --tls                                # installed access certs when present; else self-signed
 intendant --mtls                               # same, plus required client certs
 intendant --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies --tls)
 ```
 
 `--tls-cert` / `--tls-key` must be supplied together; supplying either implies
 `--tls`. `--mtls` implies `--tls` and verifies clients against the installed
-Intendant LAN CA unless `--mtls-ca` or `[server.mtls] ca` overrides it.
+Intendant access CA unless `--mtls-ca` or `[server.mtls] ca` overrides it.
 
 Native HTTPS/WSS is also the direct way to make a remote dashboard origin a
 browser secure context when you need Station WebGPU, microphone/camera, browser
@@ -335,11 +335,11 @@ clicking through a self-signed certificate warning is not a reliable way to
 unlock these browser APIs. See
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
-### Native LAN certs — `intendant lan`
+### Native access certs — `intendant access`
 
-`src/bin/caller/lan/` creates the certificate material used by native
-`--tls` / `--mtls`: a per-user LAN CA, server certificate, client identity, and
-strict HTTPS enrollment server. LAN clients (phones, tablets, other boxes) can
+`src/bin/caller/access/` creates the certificate material used by native
+`--tls` / `--mtls`: a per-user access CA, server certificate, client identity, and
+strict HTTPS enrollment server. Access clients (phones, tablets, other boxes) can
 then reach the dashboard over HTTPS authenticated by a **client certificate**.
 Cert generation is pure-Rust (`rcgen` + RustCrypto `rsa` + `p12-keystore`); new
 cert material uses RSA-2048 with SHA-256 signatures so Apple
@@ -348,24 +348,24 @@ compatibility path. Subcommands:
 
 | Command | Action |
 |---|---|
-| `intendant lan setup` | Generate CA + server/client certs and start the strict HTTPS enrollment server |
-| `intendant lan recert` | Re-issue certs |
-| `intendant lan remove` | Remove the per-user LAN cert store |
-| `intendant lan list` | List issued client certs |
-| `intendant lan serve-certs` | Run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
+| `intendant access setup` | Generate CA + server/client certs and start the strict HTTPS enrollment server |
+| `intendant access recert` | Re-issue certs |
+| `intendant access remove` | Remove the per-user access cert store |
+| `intendant access list` | List issued client certs |
+| `intendant access serve-certs` | Run strict HTTPS enrollment for importing `ca.crt`, client `.p12`/`.pfx`, or Apple `.mobileconfig` onto devices |
 
 ```bash
-intendant lan setup --name nicks-mac --port 8765
+intendant access setup --name nicks-mac --port 8765
 ```
 
-The interactive `intendant lan` setup/enrollment flow is currently validated on
+The interactive `intendant access` setup/enrollment flow is currently validated on
 Unix hosts. Cert *generation* and native HTTPS/WSS are cross-platform, so a
 Windows daemon can still use `--tls` for native HTTPS and
 `read_server_cert_fingerprint` to publish a pinned fingerprint. See
 [Windows Support](./windows-support.md).
 
 Enrollment is not a plain unauthenticated download. The temporary
-`serve-certs` endpoint runs HTTPS with the LAN server certificate. The CLI does
+`serve-certs` endpoint runs HTTPS with the access server certificate. The CLI does
 not print the expected server fingerprint or the enrollment secret at startup;
 the operator first copies the SHA-256 fingerprint observed in the browser's
 certificate UI into the CLI. Only a match reveals a one-time secret, and only a
@@ -374,10 +374,10 @@ Apple configuration profile. The page detects the browser only to put the most
 likely install path first; all artifacts remain gated by the terminal-paired
 browser session.
 
-Native LAN TLS also solves browser secure-context requirements for LAN clients
+Native access TLS also solves browser secure-context requirements for access clients
 once the CA/client identity are installed. That matters for Station's WebGPU
 renderer, microphone/camera, browser screen capture, and stricter clipboard APIs;
-plain `http://<LAN-IP>:8765` does not expose those features.
+plain `http://<host-ip>:8765` does not expose those features.
 
 ### How auth maps to the Agent Card
 
@@ -387,7 +387,7 @@ The card's `auth` field tells connecting peers what to send. Construct it via th
 | Helper | `transport` | `application` | Use when |
 |---|---|---|---|
 | `none()` | `None` | — | Trusted network: loopback, tailnet, LAN behind a firewall (the phase-1 default) |
-| `mutual_tls()` | `MutualTls` | — | Trusted-LAN federation behind `intendant lan setup` |
+| `mutual_tls()` | `MutualTls` | — | Trusted-LAN federation behind `intendant access setup` |
 | `bearer(hint)` | `None` | `Bearer` | Over an already-secured transport (e.g. a WireGuard tailnet) |
 | `mutual_tls_and_bearer(hint)` | `MutualTls` | `Bearer` | WAN exposure — even a TLS-verification CVE still needs a valid bearer |
 
@@ -402,7 +402,7 @@ secret without leaking it onto the wire.
 
 - [Display Pipeline](./display-pipeline.md) — the local capture/encode/WebRTC
   pipeline that federated displays plug into, and the `[webrtc]` config
-- [Windows Support](./windows-support.md) — why `intendant lan` is gated off
+- [Windows Support](./windows-support.md) — why `intendant access` is gated off
   Windows and what to use instead
 - [`docs/design-federated-input-authority.md`](https://github.com/lovon-spec/intendant/blob/main/docs/design-federated-input-authority.md)
   — the full federated input-authority protocol

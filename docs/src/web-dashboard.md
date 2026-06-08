@@ -51,8 +51,8 @@ Practical rules:
   desktop browsers, but not by every embedding. In particular, the macOS
   `WKWebView` wrapper uses the custom `intendant://` scheme because
   `http://localhost` there does not expose media devices.
-- `http://<LAN-IP>` is not a secure context. Use native `--tls` with a trusted
-  certificate, `intendant lan` cert enrollment plus native `--mtls`, the macOS
+- `http://<host-ip>` is not a secure context. Use native `--tls` with a trusted
+  certificate, `intendant access` cert enrollment plus native `--mtls`, the macOS
   app wrapper, or another trusted HTTPS reverse proxy.
 - Clicking through a self-signed certificate warning is not a reliable substitute
   for installing/trusting the certificate; browsers may still withhold secure
@@ -302,9 +302,9 @@ transcription endpoint. Transcripts are broadcast as `user_transcript` events
 and written to the session log. See
 [Configuration](./configuration.md#transcription).
 
-## Secure context and LAN access
+## Secure Browser Contexts
 
-- **Microphone/camera require a secure context.** Plain `http://<lan-ip>` is not
+- **Microphone/camera require a secure context.** Plain `http://<host-ip>` is not
   a secure context in the browser, so `getUserMedia` is blocked there. Reach the
   dashboard over one of:
   - `http://localhost` (e.g. an SSH tunnel: `ssh -L 8765:localhost:8765 host`),
@@ -317,13 +317,13 @@ and written to the session log. See
 ### HTTPS / TLS
 
 ```bash
-./target/release/intendant --tls                 # installed LAN certs when present; else self-signed
+./target/release/intendant --tls                 # installed access certs when present; else self-signed
 ./target/release/intendant --mtls                # require client certificates
 ./target/release/intendant --tls-cert c.pem --tls-key k.pem   # bring your own
 ```
 
 `--tls` (or `[server.tls] enabled = true`) makes the gateway serve HTTPS/WSS
-directly. With no explicit cert/key override, Intendant uses installed LAN
+directly. With no explicit cert/key override, Intendant uses installed access
 server certs when present and falls back to an auto self-signed certificate.
 The gateway demuxes per connection: a first byte of `0x16` (a TLS ClientHello)
 is wrapped in the rustls acceptor, while raw WebRTC ICE-TCP/UDP media is left
@@ -333,9 +333,9 @@ platform including Windows — no nginx, no OpenSSL. See the
 [Configuration → `[server]`](./configuration.md#server-daemon-and-federation).
 
 For mutual-TLS with client certificates (only enrolled devices can connect), use
-native `--mtls` / `[server.mtls]`; use `intendant lan setup` to generate the
-per-user LAN CA/server/client certs and run strict enrollment. See
-[Getting Started → LAN access](./getting-started.md#lan-access) and
+native `--mtls` / `[server.mtls]`; use `intendant access setup` to generate the
+per-user access CA/server/client certs and run strict enrollment. See
+[Getting Started → Dashboard access over TLS](./getting-started.md#dashboard-access-over-tls) and
 [Peer Federation](./peer-federation.md). For the daemon posture and remote
 control surface, see [Control Plane & Daemon](./control-plane-and-daemon.md).
 

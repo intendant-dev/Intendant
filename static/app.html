@@ -8366,7 +8366,7 @@ body.display-fullscreen-open {
 
   <!-- Status Bar -->
   <div class="status-bar" id="status-bar">
-    <span class="host-label" id="sb-host-label" title="This daemon's identity. Set it with `intendant lan setup --name <label>` or it falls back to the system hostname.">local</span>
+    <span class="host-label" id="sb-host-label" title="This daemon's identity. Set it with `intendant access setup --name <label>` or it falls back to the system hostname.">local</span>
     <span class="sep">|</span>
     <span class="provider" id="sb-provider">--</span>
     <span class="sep">/</span>
@@ -44350,7 +44350,7 @@ async function addDaemon() {
   // the browser's cryptic CORS/mixed-content error.
   if (location.protocol === 'https:' && baseUrl.startsWith('http://')) {
     setDaemonsStatus(
-      'This dashboard is served over HTTPS, so secondaries must also be HTTPS (browser mixed-content rule). Either set up mTLS on the remote daemon via `intendant lan setup`, or open this dashboard over plain HTTP.',
+      'This dashboard is served over HTTPS, so secondaries must also be HTTPS (browser mixed-content rule). Either set up mTLS on the remote daemon via `intendant access setup`, or open this dashboard over plain HTTP.',
       'error'
     );
     return;
