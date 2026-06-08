@@ -1130,9 +1130,10 @@ fn codex_mcp_server_disable_override(server_names: &[String]) -> Option<String> 
 
 fn codex_inherited_config_suppression_overrides(
     codex_home: Option<&Path>,
+    managed_context: bool,
     inherit_configured_mcp_servers: bool,
 ) -> Vec<String> {
-    if inherit_configured_mcp_servers {
+    if !managed_context || inherit_configured_mcp_servers {
         return Vec::new();
     }
 
@@ -1615,6 +1616,7 @@ impl CodexAgent {
         args.push("app-server".to_string());
         for override_value in codex_inherited_config_suppression_overrides(
             self.codex_home.as_deref(),
+            self.managed_context,
             inherit_configured_mcp_servers,
         ) {
             args.push("-c".to_string());
@@ -10572,9 +10574,10 @@ url = "http://stale.example.invalid/mcp"
         )
         .unwrap();
         let mut agent = test_agent();
+        agent.managed_context = true;
         agent.codex_home = Some(tmp.path().to_path_buf());
 
-        let args = agent.app_server_args_with_mcp_inheritance(8765, false);
+        let args = agent.app_server_args(8765);
 
         assert_eq!(args.first().map(String::as_str), Some("app-server"));
         assert!(args_have_config_override(&args, "features.plugins=false"));
@@ -10589,15 +10592,16 @@ url = "http://stale.example.invalid/mcp"
             .iter()
             .any(|arg| arg == "mcp_servers.intendant.type=\"http\""));
         assert!(args.iter().any(|arg| {
-            arg == "mcp_servers.intendant.url=\"http://localhost:8765/mcp?managed_context=vanilla&tool_profile=core\""
+            arg == "mcp_servers.intendant.url=\"http://localhost:8765/mcp?managed_context=managed&tool_profile=core\""
         }));
     }
 
     #[test]
     fn app_server_args_disable_inherited_codex_plugins_without_codex_home() {
-        let agent = test_agent();
+        let mut agent = test_agent();
+        agent.managed_context = true;
 
-        let args = agent.app_server_args_with_mcp_inheritance(8765, false);
+        let args = agent.app_server_args(8765);
 
         assert_eq!(args.first().map(String::as_str), Some("app-server"));
         assert!(args_have_config_override(&args, "features.plugins=false"));
@@ -10606,6 +10610,34 @@ url = "http://stale.example.invalid/mcp"
             &args,
             "mcp_servers.intendant.type=\"http\""
         ));
+    }
+
+    #[test]
+    fn app_server_args_vanilla_preserves_inherited_codex_config_by_default() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(
+            tmp.path().join("config.toml"),
+            r#"
+[mcp_servers.linear]
+command = "linear-mcp"
+
+[plugins."browser@openai-bundled"]
+enabled = true
+"#,
+        )
+        .unwrap();
+        let mut agent = test_agent();
+        agent.managed_context = false;
+        agent.codex_home = Some(tmp.path().to_path_buf());
+
+        let args = agent.app_server_args(8765);
+
+        assert_eq!(args.first().map(String::as_str), Some("app-server"));
+        assert!(!args_have_config_override(&args, "features.plugins=false"));
+        assert!(!args.iter().any(|arg| arg.starts_with("mcp_servers={")));
+        assert!(args.iter().any(|arg| {
+            arg == "mcp_servers.intendant.url=\"http://localhost:8765/mcp?managed_context=vanilla&tool_profile=core\""
+        }));
     }
 
     #[test]
@@ -10623,6 +10655,7 @@ enabled = true
         )
         .unwrap();
         let mut agent = test_agent();
+        agent.managed_context = true;
         agent.codex_home = Some(tmp.path().to_path_buf());
 
         let args = agent.app_server_args_with_mcp_inheritance(8765, true);
