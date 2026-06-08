@@ -6445,6 +6445,82 @@ impl StationInner {
             &nonempty(&controls.session_service_tier, "--"),
         );
         yy += 22.0;
+        let ctx = self.snapshot.context.clone();
+        if ctx.available || controls.session_is_codex || controls.session_source == "codex" {
+            self.section_title_color(x, yy + 8.0, "Context runway", C_BLUE_CSS);
+            yy += 30.0;
+            self.panel_row_color(
+                x,
+                yy,
+                "window",
+                &format!(
+                    "{} / {} items",
+                    if ctx.available { "live" } else { "waiting" },
+                    ctx.item_count
+                ),
+                if ctx.available {
+                    C_GREEN_CSS
+                } else {
+                    C_YELLOW_CSS
+                },
+            );
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "tokens",
+                &format!(
+                    "{} / {}",
+                    compact_number(ctx.tokens as f64),
+                    compact_number(ctx.effective_window as f64)
+                ),
+            );
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "replay",
+                &truncate(
+                    &format!(
+                        "{} / {}/{} / raw {}",
+                        nonempty(&ctx.replay_mode, "live"),
+                        ctx.replay_index,
+                        ctx.replay_count,
+                        nonempty(&ctx.exact_status, "compact")
+                    ),
+                    42,
+                ),
+            );
+            yy += 28.0;
+            let context_actions = [
+                ("live".to_string(), "live".to_string(), 50.0, C_GREEN_CSS.to_string()),
+                (
+                    "replay".to_string(),
+                    "replay".to_string(),
+                    64.0,
+                    C_BLUE_CSS.to_string(),
+                ),
+                (
+                    "replay-latest".to_string(),
+                    "latest".to_string(),
+                    62.0,
+                    C_TEAL_CSS.to_string(),
+                ),
+                (
+                    "copy-snapshot".to_string(),
+                    "copy".to_string(),
+                    54.0,
+                    C_MAUVE_CSS.to_string(),
+                ),
+                (
+                    "load-exact".to_string(),
+                    "exact".to_string(),
+                    54.0,
+                    C_PEACH_CSS.to_string(),
+                ),
+            ];
+            yy = self.draw_context_action_pills(x, panel_w, yy - 14.0, &context_actions);
+        }
         if controls.session_is_codex
             || controls.session_source == "codex"
             || controls.session_managed_context == "managed"
@@ -6994,6 +7070,36 @@ impl StationInner {
                     action: action.clone(),
                     id: String::new(),
                     session_id: session_id.to_string(),
+                },
+            ));
+            ax += *width + 8.0;
+        }
+        ay + 35.0
+    }
+
+    fn draw_context_action_pills(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        actions: &[(String, String, f32, String)],
+    ) -> f32 {
+        let mut ax = x + 14.0;
+        let mut ay = y;
+        for (action, label, width, color) in actions {
+            if ax + *width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, *width, 21.0, label, color);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                *width,
+                21.0,
+                HitAction::ContextAction {
+                    action: action.clone(),
+                    id: String::new(),
                 },
             ));
             ax += *width + 8.0;
