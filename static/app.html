@@ -12719,6 +12719,9 @@ function stationBrowserWorkspaceStatusPayload() {
     latest_url: latest?.url || '',
     latest_updated: latest?.updated_at || '',
     lease: latest?.lease ? (latest.lease.holder_id || 'leased') : '',
+    can_create: !!app,
+    can_acquire: !!latest?.id,
+    can_close: !!latest?.id,
     validation_state: latest ? (latest.status || 'unknown') : 'idle',
     validation_detail: latest
       ? [latest.provider || 'browser', latest.lease ? 'leased' : 'unleased', latest.browser_executable_source || '']
@@ -12726,6 +12729,58 @@ function stationBrowserWorkspaceStatusPayload() {
         .join(' / ')
       : 'no workspace',
   };
+}
+
+function stationBrowserWorkspaceDraftPayload() {
+  return {
+    url: (document.getElementById('station-browser-url')?.value
+      || document.getElementById('browser-workspace-url')?.value
+      || '').trim(),
+    label: (document.getElementById('station-browser-label')?.value
+      || document.getElementById('browser-workspace-label')?.value
+      || '').trim(),
+    provider: (document.getElementById('station-browser-provider')?.value
+      || document.getElementById('browser-workspace-provider')?.value
+      || 'auto').trim() || 'auto',
+  };
+}
+
+function stationOperateBrowserWorkspace(op) {
+  const status = stationBrowserWorkspaceStatusPayload();
+  if (op === 'copy') {
+    copyTextToClipboard(JSON.stringify(status, null, 2))
+      .then(() => stationSetPeerStatus('Browser workspace status copied', 'ok'))
+      .catch(err => stationSetPeerStatus(`Browser workspace copy failed: ${err?.message || err}`, 'error'))
+      .finally(stationScheduleUpdate);
+    return;
+  }
+  if (op === 'create') {
+    const draft = stationBrowserWorkspaceDraftPayload();
+    app?.send_server_action({
+      action: 'create_browser_workspace',
+      url: draft.url || undefined,
+      provider: draft.provider || 'auto',
+      label: draft.label || undefined,
+      owner_session_id: currentSessionId || undefined,
+    });
+    stationSetPeerStatus('Browser workspace create requested', 'ok');
+    stationScheduleUpdate();
+    return;
+  }
+  if (!status.latest_id) {
+    stationSetPeerStatus('No active browser workspace selected.', 'error');
+    stationScheduleUpdate();
+    return;
+  }
+  if (op === 'acquire') {
+    acquireBrowserWorkspace(status.latest_id, true);
+    stationScheduleUpdate();
+    return;
+  }
+  if (op === 'close') {
+    closeBrowserWorkspace(status.latest_id);
+    stationScheduleUpdate();
+  }
 }
 
 function stationLatestOperationalActivityPayload() {
@@ -21081,6 +21136,22 @@ function stationHandleControlsAction(action) {
     setTimeout(() => document.getElementById('station-browser-url')?.focus(), 0);
     return;
   }
+  if (op === 'browser-create') {
+    stationOperateBrowserWorkspace('create');
+    return;
+  }
+  if (op === 'browser-acquire') {
+    stationOperateBrowserWorkspace('acquire');
+    return;
+  }
+  if (op === 'browser-close') {
+    stationOperateBrowserWorkspace('close');
+    return;
+  }
+  if (op === 'browser-copy') {
+    stationOperateBrowserWorkspace('copy');
+    return;
+  }
   if (op === 'recordings') {
     if (stationRenderedSelectPanel('system:controls', 'Recording controls stay in Station')) return;
     stationRenderControlsDock('recordings');
@@ -22237,6 +22308,13 @@ function stationBuildControlsSummary() {
     browserWorkspaceDetail: browserWorkspaceStatus.validation_detail,
     browserWorkspaceLatest: browserWorkspaceStatus.latest_label || browserWorkspaceStatus.latest_id || '',
     browserWorkspaceLease: browserWorkspaceStatus.lease || '',
+    browserWorkspaceId: browserWorkspaceStatus.latest_id || '',
+    browserWorkspaceProvider: browserWorkspaceStatus.latest_provider || '',
+    browserWorkspaceUrl: browserWorkspaceStatus.latest_url || '',
+    browserWorkspaceUpdated: browserWorkspaceStatus.latest_updated || '',
+    browserWorkspaceCanCreate: !!browserWorkspaceStatus.can_create,
+    browserWorkspaceCanAcquire: !!browserWorkspaceStatus.can_acquire,
+    browserWorkspaceCanClose: !!browserWorkspaceStatus.can_close,
     recordings: recordingStreams.size,
     activeRecording: activeRecordingStream || '',
     cuProvider: stationComputerUseValue('set-cu-provider', '') || 'auto',

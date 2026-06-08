@@ -7707,6 +7707,15 @@ impl StationInner {
             ),
         );
         yy += 22.0;
+        if !controls.browser_workspace_url.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "url",
+                &truncate(&controls.browser_workspace_url, 42),
+            );
+            yy += 22.0;
+        }
         if !controls.browser_workspace_latest.is_empty()
             || !controls.browser_workspace_detail.is_empty()
         {
@@ -7724,6 +7733,36 @@ impl StationInner {
                             " / "
                         },
                         controls.browser_workspace_lease
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
+        if !controls.browser_workspace_id.is_empty()
+            || !controls.browser_workspace_provider.is_empty()
+            || !controls.browser_workspace_updated.is_empty()
+        {
+            self.panel_row(
+                x,
+                yy,
+                "browser id",
+                &truncate(
+                    &format!(
+                        "{}{}{}{}{}",
+                        nonempty(&controls.browser_workspace_id, "--"),
+                        if controls.browser_workspace_provider.is_empty() {
+                            ""
+                        } else {
+                            " / "
+                        },
+                        controls.browser_workspace_provider,
+                        if controls.browser_workspace_updated.is_empty() {
+                            ""
+                        } else {
+                            " / "
+                        },
+                        controls.browser_workspace_updated
                     ),
                     42,
                 ),
@@ -7875,6 +7914,30 @@ impl StationInner {
                 C_RED_CSS.to_string(),
             ));
         }
+        if controls.browser_workspace_can_create {
+            surface_actions.push((
+                "browser-create".to_string(),
+                "new browser".to_string(),
+                92.0,
+                C_BLUE_CSS.to_string(),
+            ));
+        }
+        if controls.browser_workspace_can_acquire {
+            surface_actions.push((
+                "browser-acquire".to_string(),
+                "take browser".to_string(),
+                96.0,
+                C_GREEN_CSS.to_string(),
+            ));
+        }
+        if controls.browser_workspace_can_close {
+            surface_actions.push((
+                "browser-close".to_string(),
+                "close browser".to_string(),
+                98.0,
+                C_RED_CSS.to_string(),
+            ));
+        }
         if controls.shared_view_can_take_input {
             surface_actions.push((
                 "shared-view-take-input".to_string(),
@@ -7934,6 +7997,12 @@ impl StationInner {
                 "browser ops".to_string(),
                 94.0,
                 C_BLUE_CSS.to_string(),
+            ),
+            (
+                "browser-copy".to_string(),
+                "copy browser".to_string(),
+                98.0,
+                C_TEAL_CSS.to_string(),
             ),
             (
                 "cu-settings".to_string(),
@@ -11290,6 +11359,13 @@ struct StationControlsSummary {
     browser_workspace_detail: String,
     browser_workspace_latest: String,
     browser_workspace_lease: String,
+    browser_workspace_id: String,
+    browser_workspace_provider: String,
+    browser_workspace_url: String,
+    browser_workspace_updated: String,
+    browser_workspace_can_create: bool,
+    browser_workspace_can_acquire: bool,
+    browser_workspace_can_close: bool,
     recordings: u32,
     active_recording: String,
     cu_provider: String,
@@ -11408,6 +11484,13 @@ impl Default for StationControlsSummary {
             browser_workspace_detail: String::new(),
             browser_workspace_latest: String::new(),
             browser_workspace_lease: String::new(),
+            browser_workspace_id: String::new(),
+            browser_workspace_provider: String::new(),
+            browser_workspace_url: String::new(),
+            browser_workspace_updated: String::new(),
+            browser_workspace_can_create: false,
+            browser_workspace_can_acquire: false,
+            browser_workspace_can_close: false,
             recordings: 0,
             active_recording: String::new(),
             cu_provider: String::new(),
