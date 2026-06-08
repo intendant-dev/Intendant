@@ -10771,7 +10771,13 @@ function stationStatus(text) {
 }
 
 function stationWebgpuRequested() {
-  return window.location.href.includes('station_gpu=webgpu');
+  return !window.location.href.includes('station_gpu=canvas')
+    && !window.location.href.includes('station_gpu=off')
+    && !stationDomFallbackRequested();
+}
+
+function stationDomFallbackRequested() {
+  return window.location.href.includes('station_dom_fallback=1');
 }
 
 function stationShouldUseWebgpu() {
@@ -10893,7 +10899,7 @@ function stationFallbackFromUnavailableWebgpu(instance) {
 }
 
 async function ensureStation(forceRendered = false) {
-  if (!forceRendered && !stationWebgpuRequested()) {
+  if (!forceRendered && stationDomFallbackRequested()) {
     stationDomFallback = true;
     stationInitPromise = null;
     stationSetFallbackClass(true);

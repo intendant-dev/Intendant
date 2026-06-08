@@ -978,6 +978,9 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
+      if (opts.stationProbes.length > 0) {
+        await this.prepareStationSurface(opts.timeoutMs);
+      }
       for (const probe of opts.stationProbes) {
         await this.waitForStationProbe(probe, opts.timeoutMs);
       }
@@ -1040,6 +1043,26 @@ class BrowserHarness {
       },
       timeoutMs,
       () => `station probe ${probe} did not pass${waitFailureSuffix(lastError, lastValue)}`,
+    );
+  }
+
+  async prepareStationSurface(timeoutMs) {
+    const expression = `Promise.resolve((() => {
+      const button = document.querySelector('[data-tab="station"]');
+      if (typeof switchTab === 'function') {
+        switchTab('station');
+      } else if (button) {
+        button.click();
+      }
+      const pane = document.getElementById('tab-station');
+      const canvas = document.getElementById('station-hud-canvas');
+      const rect = canvas ? canvas.getBoundingClientRect() : { width: 0, height: 0 };
+      return Boolean(pane && pane.classList.contains('active') && canvas && rect.width > 0 && rect.height > 0);
+    })())`;
+    await waitUntil(
+      async () => Boolean(await this.evaluate(expression)),
+      timeoutMs,
+      'Station tab did not expose a measurable rendered surface',
     );
   }
 
@@ -1227,6 +1250,9 @@ function browserArgs(userDataDir, opts) {
   }
   if (opts.noSandbox) {
     args.push('--no-sandbox');
+  }
+  if (opts.enableGpu && (opts.stationProbes || []).includes('webgpu')) {
+    args.push('--enable-unsafe-webgpu');
   }
   args.push(...opts.browserArgs);
   return args;

@@ -9948,7 +9948,11 @@ fn station_enable_webgpu() -> bool {
     web_sys::window()
         .and_then(|w| w.document())
         .and_then(|document| document.url().ok())
-        .is_some_and(|url| url.contains("station_gpu=webgpu"))
+        .map_or(true, |url| {
+            !url.contains("station_gpu=canvas")
+                && !url.contains("station_gpu=off")
+                && !url.contains("station_dom_fallback=1")
+        })
 }
 
 fn now_ms() -> f64 {
