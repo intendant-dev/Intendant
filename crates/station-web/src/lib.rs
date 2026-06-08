@@ -6445,6 +6445,108 @@ impl StationInner {
             &nonempty(&controls.session_service_tier, "--"),
         );
         yy += 22.0;
+        if controls.session_is_codex
+            || controls.session_source == "codex"
+            || controls.session_managed_context == "managed"
+        {
+            let managed = self.snapshot.managed.clone();
+            self.section_title_color(x, yy + 8.0, "Managed Codex", C_MAUVE_CSS);
+            yy += 30.0;
+            self.panel_row_color(
+                x,
+                yy,
+                "mode",
+                &format!(
+                    "{} / {}",
+                    nonempty(&controls.session_managed_context, "vanilla"),
+                    nonempty(&managed.mode, "unknown")
+                ),
+                if controls.session_managed_context == "managed" {
+                    C_GREEN_CSS
+                } else {
+                    C_YELLOW_CSS
+                },
+            );
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "runway",
+                &truncate(
+                    &format!(
+                        "{} / {} anchors / {} records",
+                        nonempty(&managed.status, "unknown"),
+                        managed.anchors,
+                        managed.records
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+            let pressure_label = if managed.rewind_only {
+                "rewind-only".to_string()
+            } else if managed.effective_window > 0.0 {
+                format!(
+                    "{:.0}% context",
+                    (managed.used_tokens / managed.effective_window * 100.0).clamp(0.0, 999.0)
+                )
+            } else {
+                "context --".to_string()
+            };
+            self.panel_row_color(
+                x,
+                yy,
+                "pressure",
+                &pressure_label,
+                if managed.rewind_only {
+                    C_RED_CSS
+                } else {
+                    C_TEXT_CSS
+                },
+            );
+            yy += 28.0;
+            let managed_session_id = nonempty(&controls.session_id, &managed.session_id);
+            let mut managed_actions = Vec::new();
+            if !managed_session_id.is_empty() {
+                managed_actions.push((
+                    "use-target".to_string(),
+                    "use target".to_string(),
+                    86.0,
+                    C_TEAL_CSS.to_string(),
+                ));
+            }
+            managed_actions.push((
+                "seed-context".to_string(),
+                "seed rewind".to_string(),
+                102.0,
+                C_MAUVE_CSS.to_string(),
+            ));
+            managed_actions.push((
+                "copy-status".to_string(),
+                "copy status".to_string(),
+                94.0,
+                C_BLUE_CSS.to_string(),
+            ));
+            managed_actions.push((
+                "rewind".to_string(),
+                "rewind".to_string(),
+                68.0,
+                C_PEACH_CSS.to_string(),
+            ));
+            managed_actions.push((
+                "backout".to_string(),
+                "backout".to_string(),
+                72.0,
+                C_RED_CSS.to_string(),
+            ));
+            yy = self.draw_managed_action_pills(
+                x,
+                panel_w,
+                yy - 14.0,
+                &managed_actions,
+                &managed_session_id,
+            );
+        }
         self.panel_row(
             x,
             yy,
@@ -6859,6 +6961,38 @@ impl StationInner {
                 21.0,
                 HitAction::SessionAction {
                     action: action.clone(),
+                    session_id: session_id.to_string(),
+                },
+            ));
+            ax += *width + 8.0;
+        }
+        ay + 35.0
+    }
+
+    fn draw_managed_action_pills(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        actions: &[(String, String, f32, String)],
+        session_id: &str,
+    ) -> f32 {
+        let mut ax = x + 14.0;
+        let mut ay = y;
+        for (action, label, width, color) in actions {
+            if ax + *width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, *width, 21.0, label, color);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                *width,
+                21.0,
+                HitAction::ManagedAction {
+                    action: action.clone(),
+                    id: String::new(),
                     session_id: session_id.to_string(),
                 },
             ));
