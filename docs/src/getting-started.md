@@ -119,6 +119,15 @@ The wrapper hosts a `WKWebView` that loads the dashboard over a custom
 `http://localhost` as a secure context, so `navigator.mediaDevices` (microphone
 and camera) would be unavailable. Serving from a registered custom scheme
 restores the secure context the live-voice and camera features need.
+
+When `~/.intendant/access-certs/server.crt` and `server.key` exist and are
+readable, the wrapper automatically starts the bundled daemon with native
+`--tls`. The in-app `intendant://` bridge then speaks HTTPS/WSS to the local
+backend and pins the generated server certificate, while remote browsers can use
+`https://<mac-ip>:<port>` with the same enrolled access CA. Launching the bundle
+with `--mtls` still requires enrolled client certificates; the wrapper presents
+the generated `client.p12` for its own local bridge when that identity is present.
+
 The same secure-context requirement applies to remote browsers using Station's
 WebGPU renderer, microphone/camera features, browser screen capture, and other
 privileged browser APIs; see
@@ -224,6 +233,11 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 
 # macOS app bundle (after scripts/bundle-macos.sh)
 open -a Intendant
+
+# Forward daemon flags through the bundle. With access certs installed,
+# the app already enables --tls; add --mtls when the dashboard should
+# require enrolled client certificates.
+open -a Intendant --args --mtls
 ```
 
 ## CLI flag reference

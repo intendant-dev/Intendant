@@ -10451,7 +10451,8 @@ async function authedFetch(url, opts) {
 function buildWsUrl(path) {
   let url;
   if (window.__intendantPort) {
-    url = 'ws://127.0.0.1:' + window.__intendantPort + (path || '');
+    const scheme = window.__intendantBackendTls ? 'wss://' : 'ws://';
+    url = scheme + '127.0.0.1:' + window.__intendantPort + (path || '');
   } else {
     const p = location.protocol === 'https:' ? 'wss:' : 'ws:';
     url = p + '//' + location.host + (path || '');

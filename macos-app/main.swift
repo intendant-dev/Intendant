@@ -1,22 +1,188 @@
 import Cocoa
+import Security
 import WebKit
+
+// MARK: - Backend TLS
+
+struct BackendLaunchPlan {
+    let extraArgs: [String]
+    let autoTls: Bool
+    let usesTLS: Bool
+    let usesMtls: Bool
+    let usesExplicitTlsCertPair: Bool
+    let accessCertDir: URL
+
+    var scheme: String {
+        usesTLS ? "https" : "http"
+    }
+}
+
+func defaultAccessCertDir() -> URL {
+    FileManager.default.homeDirectoryForCurrentUser
+        .appendingPathComponent(".intendant")
+        .appendingPathComponent("access-certs")
+}
+
+func cliHasFlag(_ args: [String], _ flag: String) -> Bool {
+    args.contains(flag) || args.contains { $0.hasPrefix(flag + "=") }
+}
+
+func readableFileExists(_ url: URL) -> Bool {
+    FileManager.default.isReadableFile(atPath: url.path)
+}
+
+func installedAccessTlsAvailable(_ certDir: URL) -> Bool {
+    readableFileExists(certDir.appendingPathComponent("server.crt")) &&
+        readableFileExists(certDir.appendingPathComponent("server.key"))
+}
+
+func buildBackendLaunchPlan(extraArgs: [String]) -> BackendLaunchPlan {
+    let certDir = defaultAccessCertDir()
+    let explicitTls = cliHasFlag(extraArgs, "--tls") ||
+        cliHasFlag(extraArgs, "--mtls") ||
+        cliHasFlag(extraArgs, "--tls-cert") ||
+        cliHasFlag(extraArgs, "--tls-key")
+    let usesExplicitTlsCertPair = cliHasFlag(extraArgs, "--tls-cert") ||
+        cliHasFlag(extraArgs, "--tls-key")
+    let disableAutoTls = ProcessInfo.processInfo.environment["INTENDANT_BUNDLE_DISABLE_TLS"] == "1"
+    let autoTls = !explicitTls && !disableAutoTls && installedAccessTlsAvailable(certDir)
+    return BackendLaunchPlan(
+        extraArgs: extraArgs,
+        autoTls: autoTls,
+        usesTLS: explicitTls || autoTls,
+        usesMtls: cliHasFlag(extraArgs, "--mtls"),
+        usesExplicitTlsCertPair: usesExplicitTlsCertPair,
+        accessCertDir: certDir
+    )
+}
+
+func readPemCertificateDER(_ url: URL) -> Data? {
+    guard let pem = try? String(contentsOf: url, encoding: .utf8) else {
+        return nil
+    }
+    let begin = "-----BEGIN CERTIFICATE-----"
+    let end = "-----END CERTIFICATE-----"
+    guard let beginRange = pem.range(of: begin),
+          let endRange = pem.range(of: end, range: beginRange.upperBound..<pem.endIndex) else {
+        return nil
+    }
+    let base64 = pem[beginRange.upperBound..<endRange.lowerBound]
+        .components(separatedBy: .whitespacesAndNewlines)
+        .joined()
+    return Data(base64Encoded: base64)
+}
+
+func loadClientIdentity(certDir: URL) -> (SecIdentity, [SecCertificate])? {
+    let p12URL = certDir.appendingPathComponent("client.p12")
+    let passwordURL = certDir.appendingPathComponent("p12_password")
+    guard let p12 = try? Data(contentsOf: p12URL),
+          let password = try? String(contentsOf: passwordURL, encoding: .utf8)
+            .trimmingCharacters(in: .whitespacesAndNewlines) else {
+        NSLog("mTLS requested, but client.p12 or p12_password is missing in \(certDir.path)")
+        return nil
+    }
+
+    let options = [kSecImportExportPassphrase as String: password] as CFDictionary
+    var items: CFArray?
+    let status = SecPKCS12Import(p12 as CFData, options, &items)
+    guard status == errSecSuccess,
+          let imported = items as? [[String: Any]],
+          let first = imported.first,
+          let rawIdentity = first[kSecImportItemIdentity as String] else {
+        NSLog("mTLS requested, but SecPKCS12Import failed for \(p12URL.path) with status \(status)")
+        return nil
+    }
+    let identity = rawIdentity as! SecIdentity
+    let chain = first[kSecImportItemCertChain as String] as? [SecCertificate] ?? []
+    return (identity, chain)
+}
+
+class BackendTrustDelegate: NSObject, URLSessionDelegate {
+    let pinnedServerCertDER: Data?
+    let clientIdentity: SecIdentity?
+    let clientCertificates: [SecCertificate]
+
+    init(certDir: URL, pinInstalledServerCert: Bool, usesMtls: Bool) {
+        self.pinnedServerCertDER = pinInstalledServerCert
+            ? readPemCertificateDER(certDir.appendingPathComponent("server.crt"))
+            : nil
+        if usesMtls, let identity = loadClientIdentity(certDir: certDir) {
+            self.clientIdentity = identity.0
+            self.clientCertificates = identity.1
+        } else {
+            self.clientIdentity = nil
+            self.clientCertificates = []
+        }
+    }
+
+    func urlSession(_ session: URLSession,
+                    didReceive challenge: URLAuthenticationChallenge,
+                    completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void) {
+        switch challenge.protectionSpace.authenticationMethod {
+        case NSURLAuthenticationMethodServerTrust:
+            guard let trust = challenge.protectionSpace.serverTrust else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
+            if let pinnedServerCertDER = pinnedServerCertDER {
+                if let chain = SecTrustCopyCertificateChain(trust) as? [SecCertificate],
+                   let leaf = chain.first {
+                    let leafDER = SecCertificateCopyData(leaf) as Data
+                    if leafDER == pinnedServerCertDER {
+                        completionHandler(.useCredential, URLCredential(trust: trust))
+                        return
+                    }
+                }
+                NSLog("Backend TLS certificate did not match the installed access server.crt")
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
+
+            // Local wrapper fallback for explicitly-requested TLS without an
+            // installed access cert. The connection is loopback to the child
+            // process this app just spawned; remote browser trust is still
+            // controlled by the daemon's TLS certificate.
+            let host = challenge.protectionSpace.host
+            if host == "127.0.0.1" || host == "localhost" {
+                completionHandler(.useCredential, URLCredential(trust: trust))
+            } else {
+                completionHandler(.performDefaultHandling, nil)
+            }
+        case NSURLAuthenticationMethodClientCertificate:
+            guard let identity = clientIdentity else {
+                completionHandler(.performDefaultHandling, nil)
+                return
+            }
+            let credential = URLCredential(
+                identity: identity,
+                certificates: clientCertificates,
+                persistence: .forSession
+            )
+            completionHandler(.useCredential, credential)
+        default:
+            completionHandler(.performDefaultHandling, nil)
+        }
+    }
+}
 
 // MARK: - Scheme Handler
 
-/// Proxies requests from the custom `intendant://` scheme to the local HTTP
-/// backend. WKWebView does not treat `http://localhost` as a secure context,
-/// so navigator.mediaDevices (mic/camera) is unavailable. Loading the page
-/// from a custom scheme registered via setURLSchemeHandler restores secure
-/// context status.
+/// Proxies requests from the custom `intendant://` scheme to the local backend.
+/// WKWebView does not treat `http://localhost` as a secure context, so
+/// navigator.mediaDevices (mic/camera) is unavailable. Loading the page from a
+/// custom scheme registered via setURLSchemeHandler restores secure-context
+/// status while the proxy can still speak HTTP or HTTPS to the spawned daemon.
 class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
+    let launchPlan: BackendLaunchPlan
     let port: Int
     private var stopped = Set<Int>()
     private let lock = NSLock()
-    /// Ephemeral session — no disk or memory cache, so WASM/JS always loads fresh.
-    private let session = URLSession(configuration: .ephemeral)
+    private let session: URLSession
 
-    init(port: Int) {
+    init(port: Int, launchPlan: BackendLaunchPlan, session: URLSession) {
         self.port = port
+        self.launchPlan = launchPlan
+        self.session = session
     }
 
     func webView(_ webView: WKWebView, start urlSchemeTask: any WKURLSchemeTask) {
@@ -25,7 +191,7 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
             urlSchemeTask.didFailWithError(URLError(.badURL))
             return
         }
-        components.scheme = "http"
+        components.scheme = launchPlan.scheme
         components.host = "127.0.0.1"
         components.port = port
 
@@ -83,6 +249,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     var healthTimer: Timer?
     var port: Int = 8765
     let portSearchLimit = 20
+    var launchPlan: BackendLaunchPlan!
+    var backendSession: URLSession!
+    var backendTrustDelegate: BackendTrustDelegate?
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         let preferredPort = port
@@ -98,10 +267,44 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         // Check permissions BEFORE creating the window so system prompts
         // aren't hidden behind it. AXIsProcessTrustedWithOptions is the
         // official way to trigger the Accessibility prompt.
+        launchPlan = buildBackendLaunchPlan(
+            extraArgs: Array(ProcessInfo.processInfo.arguments.dropFirst())
+        )
+        configureBackendSession()
         checkPermissions()
         startBackend()
         createWindow()
         pollUntilReady()
+    }
+
+    func configureBackendSession() {
+        if launchPlan.usesTLS {
+            backendTrustDelegate = BackendTrustDelegate(
+                certDir: launchPlan.accessCertDir,
+                pinInstalledServerCert: !launchPlan.usesExplicitTlsCertPair,
+                usesMtls: launchPlan.usesMtls
+            )
+            backendSession = URLSession(
+                configuration: .ephemeral,
+                delegate: backendTrustDelegate,
+                delegateQueue: nil
+            )
+            if launchPlan.autoTls {
+                NSLog("Access certs found in \(launchPlan.accessCertDir.path) — launching bundled backend with --tls")
+            } else {
+                NSLog("Bundled backend TLS enabled by launch arguments")
+            }
+        } else {
+            backendSession = URLSession(configuration: .ephemeral)
+            let cert = launchPlan.accessCertDir.appendingPathComponent("server.crt")
+            let key = launchPlan.accessCertDir.appendingPathComponent("server.key")
+            if FileManager.default.fileExists(atPath: cert.path) ||
+                FileManager.default.fileExists(atPath: key.path) {
+                NSLog(
+                    "Access cert store exists but server.crt/server.key are not both readable in \(launchPlan.accessCertDir.path); bundled backend will stay on HTTP"
+                )
+            }
+        }
     }
 
     func checkPermissions() {
@@ -258,8 +461,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         process.executableURL = URL(fileURLWithPath: binPath)
         // Forward any extra CLI arguments (e.g. --agent codex) to the backend
         var args = ["--web", String(port)]
-        let extra = Array(ProcessInfo.processInfo.arguments.dropFirst())
-        args.append(contentsOf: extra)
+        if launchPlan.autoTls {
+            args.append("--tls")
+        }
+        args.append(contentsOf: launchPlan.extraArgs)
         process.arguments = args
 
         // Inherit environment + ensure Homebrew PATH
@@ -362,12 +567,16 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
 
         // Serve pages from a custom scheme so WKWebView grants a secure
         // context (required for navigator.mediaDevices / getUserMedia).
-        config.setURLSchemeHandler(BackendSchemeHandler(port: port), forURLScheme: "intendant")
+        config.setURLSchemeHandler(
+            BackendSchemeHandler(port: port, launchPlan: launchPlan, session: backendSession),
+            forURLScheme: "intendant"
+        )
 
         // Inject backend port so JS can build WebSocket URLs (WebSocket
         // connections bypass the scheme handler and need the real address).
+        let tlsLiteral = launchPlan.usesTLS ? "true" : "false"
         let script = WKUserScript(
-            source: "window.__intendantPort = \(port);",
+            source: "window.__intendantPort = \(port); window.__intendantBackendTls = \(tlsLiteral);",
             injectionTime: .atDocumentStart,
             forMainFrameOnly: true
         )
@@ -442,11 +651,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
             return
         }
 
-        // Poll the HTTP backend directly
-        let healthURL = URL(string: "http://127.0.0.1:\(port)/")!
+        // Poll the backend directly; under bundled auto-TLS this is HTTPS
+        // and uses the same local trust delegate as the intendant:// proxy.
+        let healthURL = backendURL("/")
         var request = URLRequest(url: healthURL, timeoutInterval: 1)
         request.httpMethod = "HEAD"
-        URLSession.shared.dataTask(with: request) { _, response, error in
+        backendSession.dataTask(with: request) { _, response, error in
             if let http = response as? HTTPURLResponse, http.statusCode == 200 {
                 DispatchQueue.main.async {
                     // Load via custom scheme for secure context
@@ -473,10 +683,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                 return
             }
             // Also ping the HTTP endpoint
-            let url = URL(string: "http://127.0.0.1:\(self.port)/")!
+            let url = self.backendURL("/")
             var req = URLRequest(url: url, timeoutInterval: 2)
             req.httpMethod = "HEAD"
-            URLSession.shared.dataTask(with: req) { _, response, _ in
+            self.backendSession.dataTask(with: req) { _, response, _ in
                 let ok = (response as? HTTPURLResponse)?.statusCode == 200
                 if !ok {
                     DispatchQueue.main.async {
@@ -486,6 +696,10 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                 }
             }.resume()
         }
+    }
+
+    func backendURL(_ path: String) -> URL {
+        URL(string: "\(launchPlan.scheme)://127.0.0.1:\(port)\(path)")!
     }
 
     func showBackendCrash() {

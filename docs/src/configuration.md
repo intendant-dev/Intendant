@@ -344,7 +344,8 @@ client identity. Plain `[server.tls]` is enough for browser secure-context APIs;
 Use `[server.tls]`, `--tls`, `intendant access`, the macOS app wrapper, or another
 trusted HTTPS reverse proxy when a remote browser needs secure-context-gated
 features: Station WebGPU, microphone/camera, browser screen capture, or stricter
-clipboard APIs. Plain `http://<host-ip>` is not enough for those APIs; see
+clipboard APIs. Plain `http://<host-ip>` is not enough for those APIs. The macOS
+app wrapper auto-enables native TLS when installed access certs are readable; see
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
 `[server.auth]` — inbound auth this daemon enforces on federation peers:
