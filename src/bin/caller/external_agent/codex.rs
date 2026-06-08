@@ -4495,6 +4495,12 @@ struct CodexCommandSourceSignals {
 }
 
 impl CodexCommandOutputHygiene {
+    fn observe_command(&mut self, command: &str) {
+        if codex_command_likely_source_output(command) {
+            self.source_like = true;
+        }
+    }
+
     fn filter(&mut self, text: &str, flush: bool) -> Option<String> {
         if text.is_empty() && !(flush && (!self.pending.is_empty() || self.omitting_large_output)) {
             return None;
@@ -4796,6 +4802,82 @@ fn compact_codex_command_preview(command: &str) -> String {
     )
 }
 
+fn codex_command_likely_source_output(command: &str) -> bool {
+    if command.trim().is_empty() {
+        return false;
+    }
+
+    codex_command_mentions_source_reader(command) && codex_command_mentions_code_path(command)
+}
+
+fn codex_command_mentions_source_reader(command: &str) -> bool {
+    command
+        .split(|ch: char| !ch.is_ascii_alphanumeric() && ch != '_' && ch != '-')
+        .any(|token| {
+            matches!(
+                token.to_ascii_lowercase().as_str(),
+                "awk" | "cat" | "grep" | "head" | "nl" | "rg" | "ripgrep" | "sed" | "tail"
+            )
+        })
+}
+
+fn codex_command_mentions_code_path(command: &str) -> bool {
+    const CODE_PATH_HINTS: &[&str] = &[
+        ".c",
+        ".cc",
+        ".cjs",
+        ".cpp",
+        ".cs",
+        ".css",
+        ".go",
+        ".h",
+        ".hpp",
+        ".html",
+        ".java",
+        ".js",
+        ".json",
+        ".jsx",
+        ".kt",
+        ".mjs",
+        ".php",
+        ".py",
+        ".rb",
+        ".rs",
+        ".sass",
+        ".scss",
+        ".sh",
+        ".sql",
+        ".svelte",
+        ".swift",
+        ".toml",
+        ".ts",
+        ".tsx",
+        ".vue",
+        ".xml",
+        ".yaml",
+        ".yml",
+        ".zsh",
+        "app/",
+        "crates/",
+        "lib/",
+        "packages/",
+        "src/",
+    ];
+
+    command.split_whitespace().any(|token| {
+        let token = token
+            .trim_matches(|ch: char| {
+                matches!(
+                    ch,
+                    '\'' | '"' | '`' | ',' | ';' | '(' | ')' | '[' | ']' | '{' | '}'
+                )
+            })
+            .trim_end_matches(|ch: char| matches!(ch, ':' | '|'));
+        let lower = token.to_ascii_lowercase();
+        CODE_PATH_HINTS.iter().any(|hint| lower.contains(hint))
+    })
+}
+
 fn normalize_codex_command_output_record_separators(text: &str) -> Cow<'_, str> {
     if !text.contains('\r') {
         return Cow::Borrowed(text);
@@ -5089,6 +5171,19 @@ fn filter_codex_command_output(
         .entry(key)
         .or_default()
         .filter(text, flush)
+}
+
+fn observe_codex_command_output_command(
+    state: &mut CodexNotificationState,
+    item_id: &str,
+    command: &str,
+) {
+    let key = codex_command_output_hygiene_key(item_id);
+    state
+        .command_output_hygiene
+        .entry(key)
+        .or_default()
+        .observe_command(command);
 }
 
 fn finish_codex_command_output(
@@ -5459,6 +5554,7 @@ fn translate_notification_with_scope(
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    observe_codex_command_output_command(state, &item_id, &command);
                     send_scoped_agent_event(
                         event_tx,
                         thread_id,
@@ -5677,6 +5773,9 @@ fn translate_notification_with_scope(
 
             // Extract command output from commandExecution items
             if item_type == "commandExecution" {
+                if let Some(command) = item.get("command").and_then(|v| v.as_str()) {
+                    observe_codex_command_output_command(state, &item_id, command);
+                }
                 if let Some(output) = item.get("aggregatedOutput").and_then(|v| v.as_str()) {
                     if let Some(text) = filter_codex_command_output(state, &item_id, output, true) {
                         send_scoped_agent_event(
@@ -7735,6 +7834,28 @@ mod tests {
     }
 
     #[test]
+    fn source_output_command_hint_detects_common_code_reads() {
+        assert!(codex_command_likely_source_output(
+            "sed -n '1670,2465p' crates/example-web/src/lib.rs"
+        ));
+        assert!(codex_command_likely_source_output(
+            "cat ./src/components/panel.tsx"
+        ));
+        assert!(codex_command_likely_source_output(
+            "rg -n \"render\" crates/example-web/src/lib.rs"
+        ));
+        assert!(codex_command_likely_source_output(
+            "bash -lc \"nl -ba src/main.py | sed -n '1,220p'\""
+        ));
+
+        assert!(!codex_command_likely_source_output("cargo test src/lib.rs"));
+        assert!(!codex_command_likely_source_output(
+            "sed -n '1,80p' /tmp/runtime.log"
+        ));
+        assert!(!codex_command_likely_source_output("rg timeout"));
+    }
+
+    #[test]
     fn translate_item_started_collab_spawn_agent() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let params = serde_json::json!({
@@ -8391,6 +8512,104 @@ error: could not compile `intendant`
     }
 
     #[test]
+    fn translate_output_delta_compacts_command_hinted_source_read() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        let start = serde_json::json!({
+            "item": {
+                "id": "item-source-read",
+                "type": "commandExecution",
+                "command": "sed -n '1670,2465p' crates/example-web/src/lib.rs"
+            }
+        });
+        translate_notification_with_state("item/started", &start, &tx, &mut state);
+        let _ = rx.try_recv().unwrap();
+
+        let output = large_comment_heavy_source_output();
+        assert!(
+            output.len() < CODEX_COMMAND_OUTPUT_INLINE_LIMIT,
+            "fixture should characterize the generic inline hole"
+        );
+        let delta = serde_json::json!({
+            "itemId": "item-source-read",
+            "delta": output
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &delta,
+            &tx,
+            &mut state,
+        );
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "item-source-read");
+                assert!(text.contains("comment heavy source line 000"));
+                assert!(text.contains("omitting additional large command output"));
+                assert!(text.contains("final tail will be shown when the command completes"));
+                assert!(!text.contains("comment heavy source line 060"));
+                assert!(!text.contains("comment heavy source line 119"));
+                assert!(
+                    text.len() <= CODEX_COMMAND_SOURCE_OUTPUT_HEAD_LIMIT + 512,
+                    "command-hinted source output should stay bounded, got {} bytes",
+                    text.len()
+                );
+            }
+            other => panic!("expected ToolOutputDelta, got {:?}", other),
+        }
+
+        let completed = serde_json::json!({
+            "item": {
+                "id": "item-source-read",
+                "type": "commandExecution",
+                "status": "completed"
+            }
+        });
+        translate_notification_with_state("item/completed", &completed, &tx, &mut state);
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "item-source-read");
+                assert!(text.contains("bytes from the middle"));
+                assert!(text.contains("comment heavy source line 119"));
+                assert!(!text.contains("comment heavy source line 060"));
+            }
+            other => panic!("expected ToolOutputDelta tail, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_item_completed_uses_command_hint_without_started_event() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let output = large_comment_heavy_source_output();
+        let params = serde_json::json!({
+            "item": {
+                "id": "item-cat-source",
+                "type": "commandExecution",
+                "status": "completed",
+                "command": "cat src/generated_fixture.ts",
+                "aggregatedOutput": output
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        let event = rx.try_recv().unwrap();
+        match event {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "item-cat-source");
+                assert!(text.contains("comment heavy source line 000"));
+                assert!(text.contains("comment heavy source line 119"));
+                assert!(text.contains("bytes from the middle"));
+                assert!(!text.contains("comment heavy source line 060"));
+            }
+            other => panic!("expected ToolOutputDelta, got {:?}", other),
+        }
+    }
+
+    #[test]
     fn translate_item_completed_compacts_large_command_output() {
         let (tx, mut rx) = mpsc::unbounded_channel();
         let output = large_static_app_html_js_output();
@@ -8772,6 +8991,14 @@ error: build failed
             ));
         }
         output.push_str("</script>\nEND_STATIC_APP_HTML_MARKER\n");
+        output
+    }
+
+    fn large_comment_heavy_source_output() -> String {
+        let mut output = String::new();
+        for i in 0..120 {
+            output.push_str(&format!("// comment heavy source line {i:03}: fixture\n"));
+        }
         output
     }
 
