@@ -5808,11 +5808,7 @@ fn translate_notification_with_scope(
             if item_type == "mcpToolCall" {
                 // MCP results may contain structured data; surface as output
                 if let Some(result) = item.get("result") {
-                    let text = if let Some(s) = result.as_str() {
-                        s.to_string()
-                    } else {
-                        serde_json::to_string_pretty(result).unwrap_or_default()
-                    };
+                    let text = codex_mcp_tool_result_text(result);
                     if !text.is_empty() {
                         send_scoped_agent_event(
                             event_tx,
@@ -6040,6 +6036,82 @@ fn translate_notification_with_scope(
             );
         }
     }
+}
+
+fn codex_mcp_tool_result_text(result: &serde_json::Value) -> String {
+    let sanitized = sanitize_codex_mcp_tool_result_for_text(result);
+    if let Some(s) = sanitized.as_str() {
+        s.to_string()
+    } else {
+        serde_json::to_string_pretty(&sanitized).unwrap_or_default()
+    }
+}
+
+fn sanitize_codex_mcp_tool_result_for_text(value: &serde_json::Value) -> serde_json::Value {
+    match value {
+        serde_json::Value::Array(items) => serde_json::Value::Array(
+            items
+                .iter()
+                .map(sanitize_codex_mcp_tool_result_for_text)
+                .collect(),
+        ),
+        serde_json::Value::Object(map) => {
+            if codex_mcp_result_object_is_image(map) {
+                let mut out = serde_json::Map::new();
+                if let Some(value) = map.get("type") {
+                    out.insert("type".to_string(), value.clone());
+                } else {
+                    out.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("image".to_string()),
+                    );
+                }
+                if let Some(value) = map.get("mimeType").or_else(|| map.get("mime_type")) {
+                    out.insert("mimeType".to_string(), value.clone());
+                }
+                if let Some(value) = map.get("screenshot_path").or_else(|| map.get("path")) {
+                    out.insert("artifact_path".to_string(), value.clone());
+                }
+                for key in ["data", "image_url", "imageUrl"] {
+                    if let Some(bytes) = map
+                        .get(key)
+                        .and_then(|value| value.as_str())
+                        .map(|value| value.len())
+                    {
+                        out.insert(format!("{key}_omitted_bytes"), serde_json::json!(bytes));
+                    }
+                }
+                out.insert(
+                    "image_content".to_string(),
+                    serde_json::Value::String("omitted_for_intendant_text_history".to_string()),
+                );
+                return serde_json::Value::Object(out);
+            }
+
+            let sanitized = map
+                .iter()
+                .map(|(key, value)| (key.clone(), sanitize_codex_mcp_tool_result_for_text(value)))
+                .collect();
+            serde_json::Value::Object(sanitized)
+        }
+        _ => value.clone(),
+    }
+}
+
+fn codex_mcp_result_object_is_image(map: &serde_json::Map<String, serde_json::Value>) -> bool {
+    let type_text = map
+        .get("type")
+        .or_else(|| map.get("mimeType"))
+        .or_else(|| map.get("mime_type"))
+        .and_then(|value| value.as_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    type_text.contains("image")
+        || map
+            .get("image_url")
+            .or_else(|| map.get("imageUrl"))
+            .and_then(|value| value.as_str())
+            .is_some_and(|value| value.starts_with("data:image/"))
 }
 
 /// Build a failure message for a Codex `item/completed` item with
@@ -7046,6 +7118,31 @@ mod tests {
             exact.get("instructions").and_then(|v| v.as_str()),
             Some("keep me exact")
         );
+    }
+
+    #[test]
+    fn codex_mcp_tool_result_text_omits_image_payload_blocks() {
+        let base64 = "a".repeat(4096);
+        let result = serde_json::json!({
+            "content": [
+                {
+                    "type": "text",
+                    "text": "{\"status\":\"screenshot captured\",\"screenshot_path\":\"/tmp/shot.png\",\"width\":1200,\"height\":800}"
+                },
+                {
+                    "type": "image",
+                    "mimeType": "image/png",
+                    "data": base64
+                }
+            ],
+            "isError": false
+        });
+
+        let text = codex_mcp_tool_result_text(&result);
+        assert!(text.contains("/tmp/shot.png"));
+        assert!(text.contains("omitted_for_intendant_text_history"));
+        assert!(text.contains("data_omitted_bytes"));
+        assert!(!text.contains(&"a".repeat(1024)));
     }
 
     #[test]

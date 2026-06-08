@@ -6567,19 +6567,23 @@ impl IntendantServer {
             }
             "capture_shared_view_frame" => {
                 let Parameters(params) = parse_params::<CaptureSharedViewFrameParams>(args)?;
-                self.capture_shared_view_frame_for_session(params, session_id)
-                    .await
-                    .map_err(|e| e.to_string())
+                self.capture_shared_view_frame_for_session(
+                    params,
+                    session_id,
+                    managed_context_override == Some(true),
+                )
+                .await
+                .map_err(|e| e.to_string())
             }
             "take_screenshot" => {
                 let params = parse_params::<TakeScreenshotParams>(args)?;
-                self.take_screenshot(params)
+                self.take_screenshot_with_output(params, managed_context_override == Some(true))
                     .await
                     .map_err(|e| e.to_string())
             }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
-                self.execute_cu_actions(params)
+                self.execute_cu_actions_with_output(params, managed_context_override == Some(true))
                     .await
                     .map_err(|e| e.to_string())
             }
@@ -6739,6 +6743,20 @@ fn image_tool_result(text: impl Into<String>, base64_png: impl Into<String>) -> 
         Content::text(text.into()),
         Content::image(base64_png.into(), "image/png"),
     ])
+}
+
+fn compact_image_tool_result(mut metadata: serde_json::Value, mime_type: &str) -> CallToolResult {
+    if let serde_json::Value::Object(map) = &mut metadata {
+        map.entry("mime_type".to_string())
+            .or_insert_with(|| serde_json::Value::String(mime_type.to_string()));
+        map.entry("image_content".to_string()).or_insert_with(|| {
+            serde_json::Value::String("omitted_for_managed_codex_text_history".to_string())
+        });
+        if let Some(path) = map.get("screenshot_path").cloned() {
+            map.entry("artifact_path".to_string()).or_insert(path);
+        }
+    }
+    text_tool_result(metadata.to_string())
 }
 
 fn clamp_shared_view_unit(value: f64) -> f64 {
@@ -8416,6 +8434,7 @@ impl IntendantServer {
         &self,
         params: CaptureSharedViewFrameParams,
         session_id: Option<&str>,
+        compact_output: bool,
     ) -> Result<CallToolResult, McpError> {
         let display_target = shared_view_display_target(params.display_target, params.display_id);
         let display_id = shared_view_display_id(display_target.as_deref(), params.display_id);
@@ -8431,8 +8450,11 @@ impl IntendantServer {
             None,
         )
         .await;
-        self.take_screenshot(Parameters(TakeScreenshotParams { display_target }))
-            .await
+        self.take_screenshot_with_output(
+            Parameters(TakeScreenshotParams { display_target }),
+            compact_output,
+        )
+        .await
     }
 
     #[tool(
@@ -8442,7 +8464,7 @@ impl IntendantServer {
         &self,
         Parameters(params): Parameters<CaptureSharedViewFrameParams>,
     ) -> Result<CallToolResult, McpError> {
-        self.capture_shared_view_frame_for_session(params, None)
+        self.capture_shared_view_frame_for_session(params, None, false)
             .await
     }
 
@@ -8450,6 +8472,15 @@ impl IntendantServer {
     async fn take_screenshot(
         &self,
         Parameters(params): Parameters<TakeScreenshotParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.take_screenshot_with_output(Parameters(params), false)
+            .await
+    }
+
+    async fn take_screenshot_with_output(
+        &self,
+        Parameters(params): Parameters<TakeScreenshotParams>,
+        compact_output: bool,
     ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{execute_actions, CuAction, DisplayBackend};
 
@@ -8487,14 +8518,19 @@ impl IntendantServer {
 
         if let Some(result) = results.first() {
             if let Some(ref screenshot) = result.screenshot {
-                let text = serde_json::json!({
+                let metadata = serde_json::json!({
                     "status": "screenshot captured",
                     "screenshot_path": screenshot.path,
                     "width": screenshot.width,
                     "height": screenshot.height,
-                })
-                .to_string();
-                return Ok(image_tool_result(text, screenshot.base64_png.clone()));
+                });
+                if compact_output {
+                    return Ok(compact_image_tool_result(metadata, "image/png"));
+                }
+                return Ok(image_tool_result(
+                    metadata.to_string(),
+                    screenshot.base64_png.clone(),
+                ));
             }
             if let Some(ref err) = result.error {
                 return Ok(text_tool_error(format!("Screenshot error: {}", err)));
@@ -8510,6 +8546,15 @@ impl IntendantServer {
     async fn execute_cu_actions(
         &self,
         Parameters(params): Parameters<ExecuteCuActionsParams>,
+    ) -> Result<CallToolResult, McpError> {
+        self.execute_cu_actions_with_output(Parameters(params), false)
+            .await
+    }
+
+    async fn execute_cu_actions_with_output(
+        &self,
+        Parameters(params): Parameters<ExecuteCuActionsParams>,
+        compact_output: bool,
     ) -> Result<CallToolResult, McpError> {
         use crate::computer_use::{execute_actions, DisplayBackend};
 
@@ -8603,6 +8648,18 @@ impl IntendantServer {
                 let _ = std::fs::write(&ss.path, &bytes);
             }
             summaries.push("post-action screenshot captured".to_string());
+            if compact_output {
+                return Ok(compact_image_tool_result(
+                    serde_json::json!({
+                        "status": "actions executed",
+                        "actions": summaries,
+                        "screenshot_path": ss.path,
+                        "width": ss.width,
+                        "height": ss.height,
+                    }),
+                    "image/png",
+                ));
+            }
             return Ok(image_tool_result(summaries.join("\n"), annotated));
         }
 
@@ -10280,6 +10337,40 @@ mod tests {
             let rendered = format!("{result:?}");
             assert!(rendered.contains("managed context is disabled"));
         });
+    }
+
+    #[test]
+    fn compact_image_tool_result_serializes_metadata_without_image_payload() {
+        let payload = "a".repeat(4096);
+        let result = compact_image_tool_result(
+            serde_json::json!({
+                "status": "screenshot captured",
+                "screenshot_path": "/tmp/intendant-shot.png",
+                "width": 1200,
+                "height": 800,
+            }),
+            "image/png",
+        );
+
+        let rendered = serde_json::to_value(&result).expect("serialize CallToolResult");
+        let content = rendered
+            .get("content")
+            .and_then(|value| value.as_array())
+            .expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(
+            content[0].get("type").and_then(|value| value.as_str()),
+            Some("text")
+        );
+        let text = content[0]
+            .get("text")
+            .and_then(|value| value.as_str())
+            .expect("text content");
+        assert!(text.contains("/tmp/intendant-shot.png"));
+        assert!(text.contains("omitted_for_managed_codex_text_history"));
+        assert!(!text.contains(&payload));
+        assert!(!rendered.to_string().contains("\"data\""));
+        assert!(!rendered.to_string().contains("\"image\""));
     }
 
     #[test]
