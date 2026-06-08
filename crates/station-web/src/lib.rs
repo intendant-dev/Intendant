@@ -3076,12 +3076,9 @@ impl StationInner {
     }
 
     fn attention_items(&self) -> Vec<AttentionItem> {
-        let rendered_queue = self.rendered_attention_items();
-        if !rendered_queue.is_empty() {
-            return rendered_queue;
-        }
-
         let mut items = Vec::new();
+        let rendered_keys = self.rendered_attention_keys();
+        items.extend(self.rendered_attention_items());
         let controls = &self.snapshot.controls;
         if let Some(agent) = self
             .snapshot
@@ -3089,64 +3086,94 @@ impl StationInner {
             .iter()
             .find(|agent| agent.needs_approval)
         {
-            items.push(AttentionItem {
-                title: "approval".to_string(),
-                detail: truncate(
-                    &nonempty(
-                        &agent.approval_command,
-                        &nonempty(&agent.task, "agent waiting"),
+            push_synth_attention(
+                &mut items,
+                &rendered_keys,
+                "approval",
+                AttentionItem {
+                    title: "approval".to_string(),
+                    detail: truncate(
+                        &nonempty(
+                            &agent.approval_command,
+                            &nonempty(&agent.task, "agent waiting"),
+                        ),
+                        46,
                     ),
-                    46,
-                ),
-                color: C_YELLOW_CSS,
-                hit: HitAction::Select(agent.id.clone()),
-            });
+                    color: C_YELLOW_CSS,
+                    hit: HitAction::Select(agent.id.clone()),
+                },
+            );
         }
         if controls.shared_view_can_take_input {
-            items.push(AttentionItem {
-                title: "shared input".to_string(),
-                detail: truncate(&nonempty(&controls.shared_view_target, "shared view"), 46),
-                color: C_GREEN_CSS,
-                hit: HitAction::ControlsAction {
-                    action: "shared-view-take-input".to_string(),
+            push_synth_attention(
+                &mut items,
+                &rendered_keys,
+                "shared",
+                AttentionItem {
+                    title: "shared input".to_string(),
+                    detail: truncate(&nonempty(&controls.shared_view_target, "shared view"), 46),
+                    color: C_GREEN_CSS,
+                    hit: HitAction::ControlsAction {
+                        action: "shared-view-take-input".to_string(),
+                    },
                 },
-            });
+            );
         } else if controls.shared_view_visible {
-            items.push(AttentionItem {
-                title: "shared view".to_string(),
-                detail: truncate(&nonempty(&controls.shared_view_target, "visible"), 46),
-                color: C_PEACH_CSS,
-                hit: HitAction::Select("system:peers".to_string()),
-            });
+            push_synth_attention(
+                &mut items,
+                &rendered_keys,
+                "shared",
+                AttentionItem {
+                    title: "shared view".to_string(),
+                    detail: truncate(&nonempty(&controls.shared_view_target, "visible"), 46),
+                    color: C_PEACH_CSS,
+                    hit: HitAction::Select("system:peers".to_string()),
+                },
+            );
         }
         if controls.session_can_interrupt {
-            items.push(AttentionItem {
-                title: "active run".to_string(),
-                detail: truncate(
-                    &nonempty(&controls.session_selection, "foreground session"),
-                    46,
-                ),
-                color: C_TEAL_CSS,
-                hit: HitAction::Select("system:controls".to_string()),
-            });
+            push_synth_attention(
+                &mut items,
+                &rendered_keys,
+                "active",
+                AttentionItem {
+                    title: "active run".to_string(),
+                    detail: truncate(
+                        &nonempty(&controls.session_selection, "foreground session"),
+                        46,
+                    ),
+                    color: C_TEAL_CSS,
+                    hit: HitAction::Select("system:controls".to_string()),
+                },
+            );
         } else if controls.session_active {
-            items.push(AttentionItem {
-                title: "session live".to_string(),
-                detail: truncate(
-                    &nonempty(&controls.session_selection, "foreground session"),
-                    46,
-                ),
-                color: C_BLUE_CSS,
-                hit: HitAction::Select("system:sessions".to_string()),
-            });
+            push_synth_attention(
+                &mut items,
+                &rendered_keys,
+                "active",
+                AttentionItem {
+                    title: "session live".to_string(),
+                    detail: truncate(
+                        &nonempty(&controls.session_selection, "foreground session"),
+                        46,
+                    ),
+                    color: C_BLUE_CSS,
+                    hit: HitAction::Select("system:sessions".to_string()),
+                },
+            );
         }
         if controls.pending_attachments > 0 {
-            items.push(AttentionItem {
-                title: "attachments".to_string(),
-                detail: format!("{} pending", controls.pending_attachments),
-                color: C_MAUVE_CSS,
-                hit: HitAction::Select("system:controls".to_string()),
-            });
+            push_synth_attention(
+                &mut items,
+                &rendered_keys,
+                "attachments",
+                AttentionItem {
+                    title: "attachments".to_string(),
+                    detail: format!("{} pending", controls.pending_attachments),
+                    color: C_MAUVE_CSS,
+                    hit: HitAction::Select("system:controls".to_string()),
+                },
+            );
         }
         if self.snapshot.managed.rewind_only {
             items.push(AttentionItem {
@@ -3202,6 +3229,7 @@ impl StationInner {
                 hit: HitAction::Select("system:context".to_string()),
             });
         }
+        items.truncate(6);
         items
     }
 
@@ -3230,6 +3258,21 @@ impl StationInner {
                     color: attention_level_color_css(&item.level, &item.kind),
                     hit: self.rendered_attention_hit(item),
                 }
+            })
+            .collect()
+    }
+
+    fn rendered_attention_keys(&self) -> HashSet<&'static str> {
+        self.snapshot
+            .attention_queue
+            .items
+            .iter()
+            .filter_map(|item| match item.kind.as_str() {
+                "approval" => Some("approval"),
+                "shared_view_input" => Some("shared"),
+                "attachments" => Some("attachments"),
+                "active_turn" | "steer" | "follow_up" => Some("active"),
+                _ => None,
             })
             .collect()
     }
@@ -9442,6 +9485,17 @@ fn attention_level_color_css(level: &str, kind: &str) -> &'static str {
         "warn" | "warning" => C_YELLOW_CSS,
         "ready" | "ok" => C_GREEN_CSS,
         _ => tone_color_css(kind),
+    }
+}
+
+fn push_synth_attention(
+    items: &mut Vec<AttentionItem>,
+    rendered_keys: &HashSet<&'static str>,
+    key: &'static str,
+    item: AttentionItem,
+) {
+    if !rendered_keys.contains(key) {
+        items.push(item);
     }
 }
 
