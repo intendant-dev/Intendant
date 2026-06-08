@@ -276,20 +276,20 @@ function Quote-GuestArg($s) {
     return "'" + ($s -replace "'", "'\''") + "'"
 }
 
-# Run `intendant lan <action> [args]` on the guest as the daemon user.
-# The native LAN cert store is per-user; using sudo would create certs
+# Run `intendant access <action> [args]` on the guest as the daemon user.
+# The native access cert store is per-user; using sudo would create certs
 # that the normal dashboard daemon cannot read.
-function Invoke-IntendantLan {
+function Invoke-IntendantAccess {
     param(
         [string]$Action,
-        [string[]]$LanArgs = @()
+        [string[]]$AccessArgs = @()
     )
 
     $ErrorActionPreference = "Continue"
 
     $intendant = Resolve-GuestIntendantPath
-    $quoted = ($LanArgs | ForEach-Object { Quote-GuestArg $_ }) -join " "
-    $cmd = "$intendant lan $Action $quoted"
+    $quoted = ($AccessArgs | ForEach-Object { Quote-GuestArg $_ }) -join " "
+    $cmd = "$intendant access $Action $quoted"
 
     Invoke-GuestCommand $cmd
 }
@@ -470,14 +470,14 @@ function Run-Wizard {
     Add-FirewallRule
 
     Info "running setup on guest..."
-    # --no-serve-certs: the guest-side `intendant lan setup` returns
-    # once the native LAN certs are in place. We run the cert
+    # --no-serve-certs: the guest-side `intendant access setup` returns
+    # once the native access certs are in place. We run the cert
     # distribution server ourselves below so we can display the p12
     # password in the Windows console (the guest's SSH stdout isn't
     # always visible, especially for WSL flows).
-    Invoke-IntendantLan "setup" @(
+    Invoke-IntendantAccess "setup" @(
         "--port", "$($script:Port)"
-        "--lan-ip", "$hostIp"
+        "--ip", "$hostIp"
         "--cert-port", "$($script:CertPort)"
         "--no-serve-certs"
     )
@@ -500,8 +500,8 @@ function Run-Wizard {
     Write-Host "  Press Ctrl+C after the client has downloaded and installed ca.crt"
     Write-Host "  and client.p12."
     Write-Host ""
-    Invoke-IntendantLan "serve-certs" @(
-        "--lan-ip", "$hostIp"
+    Invoke-IntendantAccess "serve-certs" @(
+        "--ip", "$hostIp"
         "--cert-port", "$($script:CertPort)"
         "--port", "$($script:Port)"
     )
@@ -552,9 +552,9 @@ function Run-Remove {
         if ($script:Mode -eq "wsl") {
             Resolve-GuestIp
         }
-        Invoke-IntendantLan "remove"
+        Invoke-IntendantAccess "remove"
     } catch {
-        Warn "could not remove guest config (run 'intendant lan remove' manually in the guest as the daemon user)"
+        Warn "could not remove guest config (run 'intendant access remove' manually in the guest as the daemon user)"
     }
 
     Remove-Item $script:ConfigPath -ErrorAction SilentlyContinue
@@ -578,7 +578,7 @@ function Run-Recert {
     if ($Force) { $recertArgs += "--force" }
 
     Info "regenerating server cert on guest..."
-    Invoke-IntendantLan "recert" $recertArgs
+    Invoke-IntendantAccess "recert" $recertArgs
 
     $hostIp = Get-HostLanIp
     Write-Host ""

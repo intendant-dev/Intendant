@@ -210,7 +210,7 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 ./target/release/intendant --web
 ./target/release/intendant --web 9000
 
-# Serve the dashboard over HTTPS/WSS (installed LAN certs when present)
+# Serve the dashboard over HTTPS/WSS (installed access certs when present)
 ./target/release/intendant --tls
 
 # Classic terminal TUI (dashboard off)
@@ -250,10 +250,10 @@ value is missing.
 | `--no-presence` | — | Disable the presence layer (talk to the worker agent directly) |
 | `--web` | `[port]` | Start the web dashboard. **On by default**; optional numeric port (default 8765) |
 | `--no-web` | — | Disable the web dashboard; use the terminal TUI when interactive |
-| `--tls` | — | Serve the dashboard over HTTPS/WSS; uses installed LAN certs when present, otherwise falls back to an auto self-signed cert |
+| `--tls` | — | Serve the dashboard over HTTPS/WSS; uses installed access certs when present, otherwise falls back to an auto self-signed cert |
 | `--tls-cert` | `<path>` | PEM cert (chain) overriding the default cert selection; implies `--tls` (pair with `--tls-key`) |
 | `--tls-key` | `<path>` | PEM private key matching `--tls-cert`; implies `--tls` |
-| `--mtls` | — | Require browser/client certificates signed by the Intendant LAN CA; implies `--tls` |
+| `--mtls` | — | Require browser/client certificates signed by the Intendant access CA; implies `--tls` |
 | `--mtls-ca` | `<path>` | PEM CA bundle for `--mtls` client certificate verification |
 | `--transcription` | — | Enable server-side speech transcription (overrides `[transcription] enabled`) |
 | `--record-display` | `<id>` | Record an existing X11 display, e.g. `50` for `:50` (repeatable) |
@@ -269,7 +269,7 @@ value is missing.
 A non-flag token (one that does not start with `-`) is collected into the task
 string; an unknown flag is an error.
 
-## LAN access
+## Dashboard access over TLS
 
 Two independent ways to reach the dashboard from other devices on your network:
 
@@ -281,7 +281,7 @@ Two independent ways to reach the dashboard from other devices on your network:
 
 With `--tls` (or `[server.tls] enabled = true` in `intendant.toml`) the gateway
 serves HTTPS/WSS directly. With no explicit cert override it first uses the
-installed Intendant LAN server certificate (`server.crt` / `server.key`) when
+installed Intendant access server certificate (`server.crt` / `server.key`) when
 present, then falls back to minting a self-signed certificate at startup (SAN =
 bind IP + `localhost`, plus an optional configured hostname). The TLS stack is
 pure Rust (`rustls` + `rcgen`) — no OpenSSL, no nginx — and works on Windows
@@ -289,50 +289,50 @@ too. See
 [Configuration](./configuration.md) for `[server.tls]` and `--tls-cert` /
 `--tls-key`.
 
-`intendant lan setup` stores the LAN CA, server cert, and client identity in
-the current user's native cert store (`~/.intendant/lan-certs` on Unix-like
+`intendant access setup` stores the access CA, server cert, and client identity in
+the current user's native cert store (`~/.intendant/access-certs` on Unix-like
 hosts). Run setup as the same user that launches the daemon; the native gateway
 reads `server.crt` / `server.key` directly from that store.
 
-For stricter LAN access control, require client certificates:
+For stricter remote dashboard access control, require client certificates:
 
 ```bash
 ./target/release/intendant --mtls
 ```
 
 `--mtls` implies `--tls` and verifies browser/client certificates against the
-installed Intendant LAN CA (`ca.crt`) unless `--mtls-ca` or `[server.mtls] ca`
+installed Intendant access CA (`ca.crt`) unless `--mtls-ca` or `[server.mtls] ca`
 overrides it. This is native mTLS on the dashboard port; unlike plain `--tls`,
 clients without the installed client identity cannot complete the TLS
 handshake.
 
-### 2. Native LAN cert enrollment (`intendant lan setup`)
+### 2. Native access cert enrollment (`intendant access setup`)
 
 For mutual-TLS with client certificates (so only enrolled devices can connect),
-the `intendant lan` subcommand creates a per-user LAN certificate authority,
+the `intendant access` subcommand creates a per-user access certificate authority,
 server cert, client identity, and strict enrollment page for installing those
 certs on browsers and mobile devices:
 
 ```bash
-intendant lan setup            # generate CA/server/client certs + start enrollment
-intendant lan recert           # regenerate the server cert after a LAN IP change
-intendant lan list             # show current setup state
-intendant lan serve-certs      # run strict HTTPS client-cert enrollment
-intendant lan remove           # remove the per-user LAN cert store
+intendant access setup            # generate CA/server/client certs + start enrollment
+intendant access recert           # regenerate the server cert after access addresses change
+intendant access list             # show current setup state
+intendant access serve-certs      # run strict HTTPS client-cert enrollment
+intendant access remove           # remove the per-user access cert store
 ```
 
 Useful flags: `--port <N>` (native dashboard HTTPS port to advertise, default
 8765),
-`--cert-port <N>` (HTTPS enrollment server, default 9999), `--lan-ip <IP>`,
-`--name <label>`, `--force`, `--no-serve-certs`. The old `--backend` flag is
-accepted as an ignored compatibility no-op; Intendant no longer installs or
-configures an upstream proxy.
+`--cert-port <N>` (HTTPS enrollment server, default 9999), repeatable
+`--ip <IP>`, repeatable `--host <DNS>`, `--name <label>`, `--force`, and
+`--no-serve-certs`. Removed LAN/proxy flags are rejected; certificate setup no
+longer configures an upstream proxy.
 
 Client certificate enrollment is deliberately strict. The temporary enrollment
-server is HTTPS, using the same LAN server certificate as the dashboard. Before
+server is HTTPS, using the same access server certificate as the dashboard. Before
 the CLI reveals the one-time enrollment secret, the operator must copy the
 server certificate SHA-256 fingerprint observed in the browser certificate UI
-and paste it into the `intendant lan` terminal. Treat any enrollment web content
+and paste it into the `intendant access` terminal. Treat any enrollment web content
 as untrusted until that terminal check succeeds: stop at the browser certificate
 warning/details UI, do not continue to page content, enter secrets, click
 downloads, or install anything first. If the browser cannot expose certificate
@@ -351,13 +351,13 @@ always the strict terminal-paired session cookie.
 Use this HTTPS/mTLS path, native `--tls` with a trusted certificate, or the
 macOS app wrapper for dashboard features that require a secure browser context:
 Station WebGPU, microphone/camera, browser screen capture, and stricter
-clipboard APIs. Plain `http://<LAN-IP>:8765` is enough for basic monitoring but
-not for those browser-gated features.
+clipboard APIs. Plain `http://<host-ip>:8765` is enough for basic monitoring
+but not for those browser-gated features.
 
 The client certificate is exported as `client.p12`, a password-protected
 PKCS#12 bundle for installation on iOS / Android / desktop browsers. The
 password is shown only on the unlocked enrollment page. The Apple
-`intendant.mobileconfig` profile embeds that same client identity, the LAN CA,
+`intendant.mobileconfig` profile embeds that same client identity, the access CA,
 and the PKCS#12 password, so it is served only after strict pairing succeeds.
 On macOS, install downloaded profiles from **System Settings → General → Device
 Management**; if that pane is hidden, search System Settings for "Profiles".
@@ -366,7 +366,7 @@ Intendant CA to **Always Trust**; installing the profile is not enough unless
 the CA is trusted for websites.
 If macOS reports that the profile certificate could not be verified, install
 `ca.crt` and `client.p12` manually from the same unlocked page, or regenerate
-LAN cert material with `intendant lan setup --force` so the Apple profile
+access cert material with `intendant access setup --force` so the Apple profile
 uses an Apple-compatible client identity bundle and certificate payloads.
 
 #### Apple device requirement for `client.p12`
@@ -375,7 +375,7 @@ uses an Apple-compatible client identity bundle and certificate payloads.
 3DES-CBC with a SHA-1 MAC. This is intentionally less modern than PBES2/AES
 because macOS profile installation and `security import` can reject PBES2/AES
 bundles as a password/MAC authentication error unless the caller explicitly
-forces PKCS#12 format. New LAN cert material still uses RSA-2048 certificates
+forces PKCS#12 format. New access cert material still uses RSA-2048 certificates
 with SHA-256 signatures, matching Apple's documented certificate
 configuration-profile payload compatibility.
 

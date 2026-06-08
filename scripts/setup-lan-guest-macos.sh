@@ -3,7 +3,7 @@
 # Intendant LAN Access Setup (macOS daemon side)
 #
 # This script is now a thin shim. The real implementation lives in the
-# intendant binary as `intendant lan <action>`. The shim forwards the
+# intendant binary as `intendant access <action>`. The shim forwards the
 # same flags and positional args so existing invocations — including
 # from the host orchestrator (scripts/setup-lan-macos.sh) — keep
 # working unchanged.
@@ -15,9 +15,9 @@
 #   ./setup-lan-guest-macos.sh --name mac-work      # Label this host
 #
 # Or use the native subcommand directly:
-#   intendant lan setup [flags]
-#   intendant lan recert
-#   intendant lan remove
+#   intendant access setup [flags]
+#   intendant access recert
+#   intendant access remove
 #
 set -euo pipefail
 
@@ -48,9 +48,12 @@ while [[ $# -gt 0 ]]; do
         --recert)           action="recert"; shift ;;
         --remove)           action="remove"; shift ;;
         --stop-cert-server) action="remove"; shift ;;
-        --tunnel|--backend) args+=("--backend" "$2"); shift 2 ;;
+        --tunnel|--backend)
+            echo "error: $1 was removed; configure VM/LAN routing in the wrapper, not in intendant access" >&2
+            exit 2
+            ;;
         -h|--help)
-            "$INTENDANT" lan --help
+            "$INTENDANT" access --help
             exit 0
             ;;
         *)
@@ -59,4 +62,4 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
-exec "$INTENDANT" lan "$action" "${args[@]}"
+exec "$INTENDANT" access "$action" "${args[@]}"

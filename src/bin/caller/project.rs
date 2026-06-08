@@ -557,7 +557,7 @@ pub struct ServerConfig {
 /// ```toml
 /// [server.tls]
 /// enabled = true
-/// # optional explicit cert/key (PEM); omit for installed LAN certs or self-signed fallback
+/// # optional explicit cert/key (PEM); omit for installed access certs or self-signed fallback
 /// # cert = "/etc/intendant/server.crt"
 /// # key  = "/etc/intendant/server.key"
 /// # extra SAN hostname beyond the bind IP + localhost
@@ -593,15 +593,15 @@ pub struct ServerTlsConfig {
 /// This is intentionally separate from [`ServerTlsConfig`]: TLS controls
 /// encryption and browser secure-context behavior, while mTLS controls client
 /// authentication. Enabling this section implies native TLS. When `ca` is not
-/// configured, Intendant uses the installed LAN CA from the platform-specific
-/// `intendant lan` cert directory.
+/// configured, Intendant uses the installed access CA from the platform-specific
+/// `intendant access` cert directory.
 ///
 /// Example:
 /// ```toml
 /// [server.mtls]
 /// enabled = true
-/// # optional CA override; omit to use the installed Intendant LAN CA
-/// # ca = "~/.intendant/lan-certs/ca.crt"
+/// # optional CA override; omit to use the installed Intendant access CA
+/// # ca = "~/.intendant/access-certs/ca.crt"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerMutualTlsConfig {
@@ -612,7 +612,7 @@ pub struct ServerMutualTlsConfig {
     pub enabled: bool,
 
     /// Optional PEM CA bundle for verifying client certificates. When absent,
-    /// native mTLS uses the installed Intendant LAN CA (`ca.crt`) if present.
+    /// native mTLS uses the installed Intendant access CA (`ca.crt`) if present.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub ca: Option<String>,
 }
@@ -665,12 +665,12 @@ pub struct ServerAuthConfig {
     ///   the requirement.
     /// - `"pin-self-cert"` — advertise mTLS PLUS pin this daemon's
     ///   server cert by SHA-256 fingerprint. Daemon reads its own
-    ///   `server.crt` from the LAN cert dir at startup, computes
+    ///   `server.crt` from the access cert dir at startup, computes
     ///   the fingerprint, and embeds it in the local card's
     ///   `auth.transport = PinnedMutualTls` so connecting peers can
     ///   verify against it without the operator having to compute
     ///   and paste the fingerprint by hand. Fails startup if no
-    ///   `server.crt` exists (run `intendant lan setup` first).
+    ///   `server.crt` exists (run `intendant access setup` first).
     ///
     /// Example:
     /// ```toml

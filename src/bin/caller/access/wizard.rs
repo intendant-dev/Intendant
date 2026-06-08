@@ -1,4 +1,4 @@
-//! Interactive prompts for optional inputs during `intendant lan setup`.
+//! Interactive prompts for optional inputs during `intendant access setup`.
 //!
 //! Intentionally minimal — most flags are passed on the command line.
 //! This module only provides helpers for reading lines from stdin with
@@ -6,21 +6,24 @@
 
 use std::io::{self, BufRead, Write};
 
-use super::{LanError, LanResult};
+use super::{AccessError, AccessResult};
 
 #[allow(dead_code)]
-pub fn prompt(msg: &str, default: Option<&str>) -> LanResult<String> {
+pub fn prompt(msg: &str, default: Option<&str>) -> AccessResult<String> {
     let suffix = default.map(|d| format!(" [{d}]")).unwrap_or_default();
     print!("  {msg}{suffix}: ");
-    io::stdout().flush().map_err(LanError::from)?;
+    io::stdout().flush().map_err(AccessError::from)?;
     let stdin = io::stdin();
     let mut line = String::new();
-    stdin.lock().read_line(&mut line).map_err(LanError::from)?;
+    stdin
+        .lock()
+        .read_line(&mut line)
+        .map_err(AccessError::from)?;
     let trimmed = line.trim();
     if trimmed.is_empty() {
         match default {
             Some(d) => Ok(d.to_string()),
-            None => Err(LanError("input required".into())),
+            None => Err(AccessError("input required".into())),
         }
     } else {
         Ok(trimmed.to_string())

@@ -1,7 +1,7 @@
-//! Strict HTTPS enrollment server for LAN client certificates.
+//! Strict HTTPS enrollment server for access client certificates.
 //!
 //! This is intentionally a pairing ceremony, not a trust-on-first-use
-//! download page. The server starts HTTPS using the same LAN server cert
+//! download page. The server starts HTTPS using the same access server cert
 //! as the native TLS dashboard. The operator must copy the certificate fingerprint
 //! observed by the browser into this CLI process. Only after it matches
 //! the local `server.crt` does the CLI reveal a one-time enrollment secret.
@@ -27,9 +27,9 @@ use uuid::Uuid;
 use crate::peer::transport::pinning::{format_fingerprint, parse_fingerprint};
 use crate::web_tls::{build_acceptor, TlsCertSource};
 
-use super::{certs::CertState, LanError, LanResult};
+use super::{certs::CertState, AccessError, AccessResult};
 
-const ENROLL_COOKIE: &str = "intendant_lan_enroll";
+const ENROLL_COOKIE: &str = "intendant_access_enroll";
 const MAX_REQUEST_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -83,13 +83,18 @@ impl EnrollmentGate {
 /// Serve `ca.crt`, `client.p12`, `client.pfx`, and Apple `.mobileconfig`
 /// behind a strict fingerprint-pairing flow. Blocks until interrupted
 /// with Ctrl+C.
-pub async fn serve(state: &CertState, port: u16, lan_ip: &str, https_port: u16) -> LanResult<()> {
+pub async fn serve(
+    state: &CertState,
+    port: u16,
+    access_host: &str,
+    https_port: u16,
+) -> AccessResult<()> {
     let cert_path = state.cert_dir.join("server.crt");
     let key_path = state.cert_dir.join("server.key");
     let expected_fingerprint = super::certs::read_server_cert_fingerprint(&state.cert_dir)
         .ok_or_else(|| {
-            LanError(format!(
-                "no server.crt fingerprint found in {} — run `intendant lan setup` first",
+            AccessError(format!(
+                "no server.crt fingerprint found in {} — run `intendant access setup` first",
                 state.cert_dir.display()
             ))
         })?;
@@ -97,15 +102,15 @@ pub async fn serve(state: &CertState, port: u16, lan_ip: &str, https_port: u16) 
         cert_path: cert_path.clone(),
         key_path: key_path.clone(),
     })
-    .map_err(|e| LanError(format!("build enrollment TLS acceptor: {e}")))?;
+    .map_err(|e| AccessError(format!("build enrollment TLS acceptor: {e}")))?;
 
     let bind_addr = format!("0.0.0.0:{port}");
     let listener = TcpListener::bind(&bind_addr)
         .await
-        .map_err(|e| LanError(format!("bind {bind_addr}: {e}")))?;
+        .map_err(|e| AccessError(format!("bind {bind_addr}: {e}")))?;
 
     let gate = Arc::new(EnrollmentGate::default());
-    print_client_setup_banner(lan_ip, port, https_port);
+    print_client_setup_banner(access_host, port, https_port);
 
     let prompt_gate = Arc::clone(&gate);
     tokio::spawn(async move {
@@ -115,11 +120,11 @@ pub async fn serve(state: &CertState, port: u16, lan_ip: &str, https_port: u16) 
     let cert_dir = state.cert_dir.clone();
     let p12_password = state.p12_password.clone();
     let host_label = if state.label.trim().is_empty() {
-        lan_ip.to_string()
+        access_host.to_string()
     } else {
         state.label.clone()
     };
-    let lan_ip = lan_ip.to_string();
+    let access_host = access_host.to_string();
 
     let shutdown = async {
         let _ = tokio::signal::ctrl_c().await;
@@ -129,7 +134,7 @@ pub async fn serve(state: &CertState, port: u16, lan_ip: &str, https_port: u16) 
 
     tokio::select! {
         _ = shutdown => {}
-        _ = accept_loop(listener, acceptor, cert_dir, p12_password, host_label, lan_ip, https_port, gate) => {}
+        _ = accept_loop(listener, acceptor, cert_dir, p12_password, host_label, access_host, https_port, gate) => {}
     }
 
     Ok(())
@@ -194,7 +199,7 @@ async fn accept_loop(
     cert_dir: PathBuf,
     p12_password: String,
     host_label: String,
-    lan_ip: String,
+    access_host: String,
     https_port: u16,
     gate: Arc<EnrollmentGate>,
 ) {
@@ -207,7 +212,7 @@ async fn accept_loop(
         let cert_dir = cert_dir.clone();
         let p12_password = p12_password.clone();
         let host_label = host_label.clone();
-        let lan_ip = lan_ip.clone();
+        let access_host = access_host.clone();
         let gate = Arc::clone(&gate);
         tokio::spawn(async move {
             let stream = match acceptor.accept(stream).await {
@@ -219,7 +224,7 @@ async fn accept_loop(
                 &cert_dir,
                 &p12_password,
                 &host_label,
-                &lan_ip,
+                &access_host,
                 https_port,
                 gate,
             )
@@ -233,7 +238,7 @@ async fn handle_conn<S>(
     cert_dir: &Path,
     p12_password: &str,
     host_label: &str,
-    lan_ip: &str,
+    access_host: &str,
     https_port: u16,
     gate: Arc<EnrollmentGate>,
 ) -> std::io::Result<()>
@@ -252,7 +257,7 @@ where
                 write_html_response(
                     &mut stream,
                     "200 OK",
-                    &unlocked_html(lan_ip, https_port, p12_password, platform, None),
+                    &unlocked_html(access_host, https_port, p12_password, platform, None),
                     &[],
                 )
                 .await
@@ -260,7 +265,7 @@ where
                 write_html_response(
                     &mut stream,
                     "200 OK",
-                    &locked_html(lan_ip, platform, None),
+                    &locked_html(access_host, platform, None),
                     &[],
                 )
                 .await
@@ -272,7 +277,7 @@ where
                     &mut stream,
                     "400 Bad Request",
                     &locked_html(
-                        lan_ip,
+                        access_host,
                         platform,
                         Some("Enter the enrollment secret from the terminal."),
                     ),
@@ -285,7 +290,7 @@ where
                     &mut stream,
                     "403 Forbidden",
                     &locked_html(
-                        lan_ip,
+                        access_host,
                         platform,
                         Some("Enrollment secret was invalid or already redeemed."),
                     ),
@@ -299,7 +304,7 @@ where
                 &mut stream,
                 "200 OK",
                 &unlocked_html(
-                    lan_ip,
+                    access_host,
                     https_port,
                     p12_password,
                     platform,
@@ -315,7 +320,7 @@ where
                     &mut stream,
                     "403 Forbidden",
                     &locked_html(
-                        lan_ip,
+                        access_host,
                         platform,
                         Some("Pair in the terminal before downloading the Apple profile."),
                     ),
@@ -351,7 +356,7 @@ where
                     &mut stream,
                     "403 Forbidden",
                     &locked_html(
-                        lan_ip,
+                        access_host,
                         platform,
                         Some("Pair in the terminal before downloading certs."),
                     ),
@@ -394,7 +399,7 @@ where
                     &mut stream,
                     "403 Forbidden",
                     &locked_html(
-                        lan_ip,
+                        access_host,
                         platform,
                         Some("Pair in the terminal before downloading certs."),
                     ),
@@ -786,11 +791,11 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
 
 fn unlocked_platform_steps(
     platform: ClientPlatform,
-    lan_ip: &str,
+    access_host: &str,
     https_port: u16,
     password: &str,
 ) -> String {
-    let dashboard = escape_html(&format!("https://{lan_ip}:{https_port}"));
+    let dashboard = escape_html(&format!("https://{access_host}:{https_port}"));
     let password = escape_html(password);
 
     match platform {
@@ -816,7 +821,7 @@ fn unlocked_platform_steps(
 <li>If Safari still shows Not Secure, open Keychain Access and set the Intendant CA to Always Trust. Station WebGPU, microphone/camera, and browser capture require Safari to treat this page as secure.</li>
 <li>Open <code>{dashboard}</code>.</li>
 </ol>
-<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below or regenerate LAN certs with <code>intendant lan setup --force</code>.</p>
+<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below or regenerate access certs with <code>intendant access setup --force</code>.</p>
 </div>"#
         ),
         ClientPlatform::Android => format!(
@@ -881,11 +886,11 @@ fn alternate_downloads_html(password: &str) -> String {
 <p><a class="btn" href="/ca.crt">Download ca.crt</a><a class="btn" href="/client.p12">Download client.p12</a><a class="btn" href="/client.pfx">Download client.pfx</a><a class="btn" href="/intendant.mobileconfig">Apple profile</a></p>
 <p>Client certificate password: <span class="pw">{}</span></p>
 <ul>
-<li><code>ca.crt</code> is the Intendant LAN root CA. Trust it for websites.</li>
+<li><code>ca.crt</code> is the Intendant access root CA. Trust it for websites.</li>
 <li><code>client.p12</code> is the password-protected client identity.</li>
 <li><code>client.pfx</code> is the same client identity with an Android/Windows-friendly extension.</li>
 <li>Secure browser features such as Station WebGPU, microphone/camera, and browser capture work only after the browser stops showing Not Secure for the dashboard.</li>
-<li><code>intendant.mobileconfig</code> bundles the CA and client identity for Apple platforms. If it fails on macOS, install <code>ca.crt</code> and <code>client.p12</code> manually or regenerate LAN certs with <code>intendant lan setup --force</code>.</li>
+<li><code>intendant.mobileconfig</code> bundles the CA and client identity for Apple platforms. If it fails on macOS, install <code>ca.crt</code> and <code>client.p12</code> manually or regenerate access certs with <code>intendant access setup --force</code>.</li>
 </ul>
 </div>
 </details>"#,
@@ -1013,7 +1018,7 @@ fn ensure_apple_profile_cert_compatible(
 
 fn apple_profile_regen_message(label: &str, reason: &str) -> String {
     format!(
-        "{label} {reason}. macOS may reject this Apple configuration profile; install ca.crt and client.p12 manually or regenerate LAN certs with `intendant lan setup --force` so the profile uses an Apple-compatible client identity bundle."
+        "{label} {reason}. macOS may reject this Apple configuration profile; install ca.crt and client.p12 manually or regenerate access certs with `intendant access setup --force` so the profile uses an Apple-compatible client identity bundle."
     )
 }
 
@@ -1024,12 +1029,12 @@ fn mobileconfig_profile_from_bytes(
     p12: &[u8],
 ) -> String {
     let id_fragment = profile_identifier_fragment(host_label);
-    let profile_identifier = format!("dev.intendant.lan.{id_fragment}");
+    let profile_identifier = format!("dev.intendant.access.{id_fragment}");
     let profile_uuid = Uuid::new_v4();
     let ca_uuid = Uuid::new_v4();
     let identity_uuid = Uuid::new_v4();
     let display_label = if host_label.trim().is_empty() {
-        "Intendant LAN"
+        "Intendant Access"
     } else {
         host_label.trim()
     };
@@ -1051,7 +1056,7 @@ fn mobileconfig_profile_from_bytes(
 {ca_data}
       </data>
       <key>PayloadDescription</key>
-      <string>Trust the Intendant LAN root CA for {label}.</string>
+      <string>Trust the Intendant access root CA for {label}.</string>
       <key>PayloadDisplayName</key>
       <string>Intendant CA ({label})</string>
       <key>PayloadIdentifier</key>
@@ -1073,7 +1078,7 @@ fn mobileconfig_profile_from_bytes(
 {p12_data}
       </data>
       <key>PayloadDescription</key>
-      <string>Install the Intendant LAN client identity for {label}.</string>
+      <string>Install the Intendant access client identity for {label}.</string>
       <key>PayloadDisplayName</key>
       <string>Intendant Client Identity ({label})</string>
       <key>PayloadIdentifier</key>
@@ -1087,9 +1092,9 @@ fn mobileconfig_profile_from_bytes(
     </dict>
   </array>
   <key>PayloadDescription</key>
-  <string>Installs the Intendant LAN root CA and client identity for {label}.</string>
+  <string>Installs the Intendant access root CA and client identity for {label}.</string>
   <key>PayloadDisplayName</key>
-  <string>Intendant LAN ({label})</string>
+  <string>Intendant Access ({label})</string>
   <key>PayloadIdentifier</key>
   <string>{identifier}</string>
   <key>PayloadOrganization</key>
@@ -1151,7 +1156,7 @@ fn xml_escape(input: &str) -> String {
     escape_html(input)
 }
 
-fn locked_html(lan_ip: &str, platform: ClientPlatform, message: Option<&str>) -> String {
+fn locked_html(access_host: &str, platform: ClientPlatform, message: Option<&str>) -> String {
     let message = message
         .map(|m| format!(r#"<p class="warn">{}</p>"#, escape_html(m)))
         .unwrap_or_default();
@@ -1201,12 +1206,12 @@ summary {{ cursor: pointer; color: #89b4fa; font-weight: 700; }}
 "#,
         escape_html(platform_label(platform)),
         locked_platform_steps(platform),
-        escape_html(lan_ip),
+        escape_html(access_host),
     )
 }
 
 fn unlocked_html(
-    lan_ip: &str,
+    access_host: &str,
     https_port: u16,
     password: &str,
     platform: ClientPlatform,
@@ -1215,7 +1220,7 @@ fn unlocked_html(
     let message = message
         .map(|m| format!(r#"<p class="ok">{}</p>"#, escape_html(m)))
         .unwrap_or_default();
-    let primary_steps = unlocked_platform_steps(platform, lan_ip, https_port, password);
+    let primary_steps = unlocked_platform_steps(platform, access_host, https_port, password);
     let alternate_downloads = alternate_downloads_html(password);
     format!(
         r#"<!DOCTYPE html>
@@ -1223,7 +1228,7 @@ fn unlocked_html(
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width,initial-scale=1">
-<title>Intendant LAN Setup</title>
+<title>Intendant Access Setup</title>
 <style>
 body {{ background: #1e1e2e; color: #cdd6f4; font-family: system-ui, sans-serif; max-width: 860px; margin: 2em auto; padding: 0 1em; line-height: 1.5; }}
 h1 {{ color: #89b4fa; }}
@@ -1240,7 +1245,7 @@ summary {{ cursor: pointer; color: #89b4fa; font-weight: 700; margin-top: 1.5em;
 </style>
 </head>
 <body>
-<h1>Intendant LAN Setup</h1>
+<h1>Intendant Access Setup</h1>
 {message}
 <p class="muted">Detected setup path: <strong>{}</strong>.</p>
 {primary_steps}
@@ -1264,14 +1269,14 @@ fn escape_html(input: &str) -> String {
         .replace('"', "&quot;")
 }
 
-fn print_client_setup_banner(lan_ip: &str, cert_port: u16, https_port: u16) {
+fn print_client_setup_banner(access_host: &str, cert_port: u16, https_port: u16) {
     println!();
     println!("============================================================");
     println!("  Strict client enrollment");
     println!("============================================================");
     println!();
     println!("  Open this URL on the client browser/device:");
-    println!("    https://{lan_ip}:{cert_port}/");
+    println!("    https://{access_host}:{cert_port}/");
     println!();
     println!("  The browser may warn because the Intendant CA is not installed yet.");
     println!("  Stop at that warning page. Do not continue to page content, enter");
@@ -1289,7 +1294,7 @@ fn print_client_setup_banner(lan_ip: &str, cert_port: u16, https_port: u16) {
     println!();
     println!("  After pairing, follow the browser page's device-specific install steps.");
     println!("  Dashboard URL after enrollment:");
-    println!("    https://{lan_ip}:{https_port}");
+    println!("    https://{access_host}:{https_port}");
     println!();
 }
 
@@ -1353,7 +1358,7 @@ mod tests {
         assert!(profile.contains("client.p12"));
         assert!(profile.contains("Lab &amp; Phone &lt;1&gt;"));
         assert!(profile.contains("p&amp;&lt;&quot;&gt;"));
-        assert!(profile.contains("dev.intendant.lan.lab-phone-1"));
+        assert!(profile.contains("dev.intendant.access.lab-phone-1"));
     }
 
     #[cfg(target_os = "macos")]
@@ -1404,7 +1409,7 @@ mod tests {
 
         let err = mobileconfig_profile(tmp.path(), "legacy", "pw").unwrap_err();
         assert!(err.contains("non-RSA certificate material"));
-        assert!(err.contains("intendant lan setup --force"));
+        assert!(err.contains("intendant access setup --force"));
     }
 
     #[test]
@@ -1439,7 +1444,7 @@ mod tests {
 
         let err = mobileconfig_profile(tmp.path(), "legacy", "pw").unwrap_err();
         assert!(err.contains("client.crt is missing key usage"), "{err}");
-        assert!(err.contains("intendant lan setup --force"));
+        assert!(err.contains("intendant access setup --force"));
     }
 
     fn rsa_test_key_pair() -> rcgen::KeyPair {
@@ -1488,22 +1493,33 @@ mod tests {
     }
 
     #[test]
-    fn enrollment_tls_acceptor_builds_from_lan_server_cert() {
+    fn enrollment_tls_acceptor_builds_from_access_server_cert() {
         let tmp = TempDir::new().unwrap();
-        super::super::certs::ensure_certs(tmp.path(), "127.0.0.1", "enroll-test", false).unwrap();
+        let names = super::super::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        super::super::certs::ensure_certs(tmp.path(), &names, "enroll-test", false).unwrap();
         build_acceptor(&TlsCertSource::Files {
             cert_path: tmp.path().join("server.crt"),
             key_path: tmp.path().join("server.key"),
         })
-        .expect("lan server cert/key should build an enrollment TLS acceptor");
+        .expect("access server cert/key should build an enrollment TLS acceptor");
     }
 
     #[tokio::test]
     async fn enrollment_handler_gates_downloads_behind_one_time_secret() {
         let tmp = TempDir::new().unwrap();
+        let names = super::super::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
         let state =
-            super::super::certs::ensure_certs(tmp.path(), "127.0.0.1", "enroll-test", false)
-                .unwrap();
+            super::super::certs::ensure_certs(tmp.path(), &names, "enroll-test", false).unwrap();
         let gate = Arc::new(EnrollmentGate::default());
 
         let blocked = exchange(

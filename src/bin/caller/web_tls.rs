@@ -422,10 +422,15 @@ mod tests {
     }
 
     #[test]
-    fn acceptor_builds_with_required_lan_client_ca() {
+    fn acceptor_builds_with_required_access_client_ca() {
         let dir = tempfile::tempdir().unwrap();
-        crate::lan::certs::ensure_certs(dir.path(), "127.0.0.1", "native-mtls-test", false)
-            .unwrap();
+        let names = crate::access::certs::ServerNames::new(
+            "127.0.0.1".parse().unwrap(),
+            Vec::<std::net::IpAddr>::new(),
+            Vec::<String>::new(),
+        )
+        .unwrap();
+        crate::access::certs::ensure_certs(dir.path(), &names, "native-mtls-test", false).unwrap();
 
         let src = TlsCertSource::Files {
             cert_path: dir.path().join("server.crt"),
