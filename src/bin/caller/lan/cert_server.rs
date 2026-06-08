@@ -336,7 +336,7 @@ where
                 }
                 Err(e) => {
                     let body = format!("failed to build mobileconfig: {e}");
-                    let status = if e.contains("non-RSA certificate material") {
+                    let status = if e.contains("legacy LAN cert directory") {
                         "409 Conflict"
                     } else {
                         "500 Internal Server Error"
@@ -809,7 +809,7 @@ fn unlocked_platform_steps(
 <li>If macOS does not fully trust the root automatically, open Keychain Access and set the Intendant CA to Always Trust.</li>
 <li>Open <code>{dashboard}</code>.</li>
 </ol>
-<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses RSA certificate payloads.</p>
+<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses profile-compatible RSA certificate payloads.</p>
 </div>"#
         ),
         ClientPlatform::Android => format!(
@@ -892,10 +892,14 @@ fn mobileconfig_profile(
 ) -> Result<String, String> {
     let ca_der = super::certs::read_cert_der(&cert_dir.join("ca.crt"))
         .map_err(|e| format!("read ca.crt: {e}"))?;
-    ensure_apple_profile_rsa_cert(&ca_der, "ca.crt")?;
+    ensure_apple_profile_cert_compatible(&ca_der, "ca.crt", AppleProfileCertRole::RootCa)?;
     let client_der = super::certs::read_cert_der(&cert_dir.join("client.crt"))
         .map_err(|e| format!("read client.crt: {e}"))?;
-    ensure_apple_profile_rsa_cert(&client_der, "client.crt")?;
+    ensure_apple_profile_cert_compatible(
+        &client_der,
+        "client.crt",
+        AppleProfileCertRole::ClientIdentity,
+    )?;
     let p12 =
         std::fs::read(cert_dir.join("client.p12")).map_err(|e| format!("read client.p12: {e}"))?;
     Ok(mobileconfig_profile_from_bytes(
@@ -906,19 +910,103 @@ fn mobileconfig_profile(
     ))
 }
 
-fn ensure_apple_profile_rsa_cert(der: &[u8], label: &str) -> Result<(), String> {
+#[derive(Clone, Copy)]
+enum AppleProfileCertRole {
+    RootCa,
+    ClientIdentity,
+}
+
+fn ensure_apple_profile_cert_compatible(
+    der: &[u8],
+    label: &str,
+    role: AppleProfileCertRole,
+) -> Result<(), String> {
     use x509_parser::oid_registry::OID_PKCS1_RSAENCRYPTION;
     use x509_parser::prelude::*;
 
     let (_, cert) =
         X509Certificate::from_der(der).map_err(|e| format!("parse {label} for profile: {e}"))?;
-    if cert.public_key().algorithm.algorithm == OID_PKCS1_RSAENCRYPTION {
-        Ok(())
-    } else {
-        Err(format!(
-            "{label} uses non-RSA certificate material. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force`."
-        ))
+    if cert.public_key().algorithm.algorithm != OID_PKCS1_RSAENCRYPTION {
+        return Err(apple_profile_regen_message(
+            label,
+            "uses non-RSA certificate material",
+        ));
     }
+
+    let key_usage = cert
+        .key_usage()
+        .map_err(|e| apple_profile_regen_message(label, &format!("has invalid key usage: {e}")))?
+        .ok_or_else(|| apple_profile_regen_message(label, "is missing key usage"))?;
+
+    match role {
+        AppleProfileCertRole::RootCa => {
+            let basic_constraints = cert
+                .basic_constraints()
+                .map_err(|e| {
+                    apple_profile_regen_message(
+                        label,
+                        &format!("has invalid basic constraints: {e}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    apple_profile_regen_message(label, "is missing basic constraints")
+                })?;
+            if !basic_constraints.value.ca {
+                return Err(apple_profile_regen_message(label, "is not marked as a CA"));
+            }
+            if !key_usage.value.key_cert_sign() {
+                return Err(apple_profile_regen_message(
+                    label,
+                    "is missing keyCertSign usage",
+                ));
+            }
+        }
+        AppleProfileCertRole::ClientIdentity => {
+            let basic_constraints = cert.basic_constraints().map_err(|e| {
+                apple_profile_regen_message(label, &format!("has invalid basic constraints: {e}"))
+            })?;
+            if basic_constraints
+                .as_ref()
+                .is_some_and(|extension| extension.value.ca)
+            {
+                return Err(apple_profile_regen_message(
+                    label,
+                    "is marked as a CA, not a client identity",
+                ));
+            }
+            if !key_usage.value.digital_signature() || !key_usage.value.key_encipherment() {
+                return Err(apple_profile_regen_message(
+                    label,
+                    "is missing client key usages",
+                ));
+            }
+            let extended_key_usage = cert
+                .extended_key_usage()
+                .map_err(|e| {
+                    apple_profile_regen_message(
+                        label,
+                        &format!("has invalid extended key usage: {e}"),
+                    )
+                })?
+                .ok_or_else(|| {
+                    apple_profile_regen_message(label, "is missing extended key usage")
+                })?;
+            if !extended_key_usage.value.client_auth {
+                return Err(apple_profile_regen_message(
+                    label,
+                    "is missing TLS clientAuth extended key usage",
+                ));
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn apple_profile_regen_message(label: &str, reason: &str) -> String {
+    format!(
+        "{label} {reason}. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force`."
+    )
 }
 
 fn mobileconfig_profile_from_bytes(
@@ -1302,6 +1390,50 @@ mod tests {
         let err = mobileconfig_profile(tmp.path(), "legacy", "pw").unwrap_err();
         assert!(err.contains("non-RSA certificate material"));
         assert!(err.contains("intendant lan setup --force"));
+    }
+
+    #[test]
+    fn mobileconfig_rejects_legacy_rsa_client_without_client_auth_extensions() {
+        let tmp = TempDir::new().unwrap();
+
+        let mut ca_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        ca_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Legacy RSA CA");
+        ca_params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
+        ca_params.key_usages = vec![
+            rcgen::KeyUsagePurpose::KeyCertSign,
+            rcgen::KeyUsagePurpose::CrlSign,
+        ];
+        let ca_key = rsa_test_key_pair();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_issuer = rcgen::Issuer::from_ca_cert_pem(&ca_cert.pem(), ca_key).unwrap();
+
+        let mut client_params = rcgen::CertificateParams::new(vec![]).unwrap();
+        client_params
+            .distinguished_name
+            .push(rcgen::DnType::CommonName, "Legacy RSA Client");
+        let client_key = rsa_test_key_pair();
+        let client_cert = client_params
+            .signed_by(&client_key, &ca_issuer)
+            .expect("legacy client cert");
+
+        std::fs::write(tmp.path().join("ca.crt"), ca_cert.pem()).unwrap();
+        std::fs::write(tmp.path().join("client.crt"), client_cert.pem()).unwrap();
+        std::fs::write(tmp.path().join("client.p12"), b"dummy").unwrap();
+
+        let err = mobileconfig_profile(tmp.path(), "legacy", "pw").unwrap_err();
+        assert!(err.contains("client.crt is missing key usage"), "{err}");
+        assert!(err.contains("intendant lan setup --force"));
+    }
+
+    fn rsa_test_key_pair() -> rcgen::KeyPair {
+        use rsa::pkcs8::{EncodePrivateKey, LineEnding};
+
+        let mut rng = rand::rngs::OsRng;
+        let rsa_key = rsa::RsaPrivateKey::new(&mut rng, 2048).unwrap();
+        let pkcs8_pem = rsa_key.to_pkcs8_pem(LineEnding::LF).unwrap();
+        rcgen::KeyPair::from_pem_and_sign_algo(pkcs8_pem.as_str(), &rcgen::PKCS_RSA_SHA256).unwrap()
     }
 
     #[test]
