@@ -5999,7 +5999,9 @@ impl StationInner {
         lane: &StationDisplayRunwayLane,
     ) -> f32 {
         let color = display_lane_color_css(&lane.kind);
-        let card_h = 54.0;
+        let actions = self.display_runway_lane_actions(lane);
+        let multi_row_actions = actions.len() > 3;
+        let card_h = if multi_row_actions { 76.0 } else { 54.0 };
         self.round_rect(
             x + 12.0,
             y - 9.0,
@@ -6053,20 +6055,22 @@ impl StationInner {
             ));
         }
 
-        let actions = self.display_runway_lane_actions(lane);
-        let visible = actions.into_iter().take(3).collect::<Vec<_>>();
-        let total_w = visible
-            .iter()
-            .map(|action| (action.label.len() as f32 * 6.0).clamp(44.0, 70.0))
-            .sum::<f32>()
-            + visible.len().saturating_sub(1) as f32 * 6.0;
-        let mut bx = x + panel_w - 20.0 - total_w;
-        for action in visible {
-            let button_w = (action.label.len() as f32 * 6.0).clamp(44.0, 70.0);
-            self.pill_at(bx, y + 25.0, button_w, 18.0, &action.label, action.color);
-            self.hit_zones
-                .push(HitZone::new(bx, y + 25.0, button_w, 18.0, action.hit));
-            bx += button_w + 6.0;
+        let visible = actions.into_iter().take(5).collect::<Vec<_>>();
+        for (row_idx, row_actions) in visible.chunks(3).enumerate() {
+            let total_w = row_actions
+                .iter()
+                .map(|action| display_lane_button_width(&action.label))
+                .sum::<f32>()
+                + row_actions.len().saturating_sub(1) as f32 * 6.0;
+            let mut bx = x + panel_w - 20.0 - total_w;
+            let by = y + if row_idx == 0 { 25.0 } else { 47.0 };
+            for action in row_actions {
+                let button_w = display_lane_button_width(&action.label);
+                self.pill_at(bx, by, button_w, 18.0, &action.label, action.color);
+                self.hit_zones
+                    .push(HitZone::new(bx, by, button_w, 18.0, action.hit.clone()));
+                bx += button_w + 6.0;
+            }
         }
 
         y + card_h + 2.0
@@ -10633,6 +10637,10 @@ fn short_id(s: &str) -> String {
     } else {
         truncate(s, 8)
     }
+}
+
+fn display_lane_button_width(label: &str) -> f32 {
+    (label.len() as f32 * 6.0).clamp(44.0, 76.0)
 }
 
 fn stable_angle(s: &str) -> f32 {
