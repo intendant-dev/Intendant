@@ -76,6 +76,23 @@ ssh user@192.168.1.206 '
 '
 ```
 
+For the full managed Station headed/GPU acceptance check, use the same
+environment setup with the renderer probes:
+
+```sh
+node scripts/validate-dashboard.cjs \
+  --launch-dashboard \
+  --port 8897 \
+  --dashboard-binary target/release/intendant \
+  --headed \
+  --enable-gpu \
+  --station-probe rendered \
+  --station-probe webgpu \
+  --station-probe dock-hidden \
+  --timeout 30000 \
+  --dashboard-timeout 30000
+```
+
 For older helper versions, or when manually launching Chromium, import the
 graphical session variables before running the validation:
 
@@ -99,11 +116,12 @@ pgrep -af intendant || true
 ```
 
 If Chromium fails before CDP with `Missing X server or $DISPLAY`, the run is
-still missing the graphical session environment. If CDP starts and the helper
-returns a Station renderer failure such as `Station initializing` with a
-`0x0` canvas, the remote headed/GPU browser path is working and the remaining
-failure is a Station renderer/readiness condition, not an SSH/X11/ozone setup
-problem.
+still missing the graphical session environment; the helper reports this as a
+harness setup failure and points back to `systemctl --user show-environment`.
+If CDP starts and the helper returns a Station renderer failure such as
+`Station initializing` with a `0x0` canvas, the remote headed/GPU browser path
+is working and the remaining failure is a Station renderer/readiness condition,
+not an SSH/X11/ozone setup problem.
 
 ## Preferred Flow
 

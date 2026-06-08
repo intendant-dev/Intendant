@@ -1370,7 +1370,7 @@ async function waitForDevToolsPort(userDataDir, child, stderr, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
-      throw new Error(`Chromium exited before CDP was ready${formatStderrSuffix(stderr)}`);
+      throw new Error(chromiumCdpReadinessFailure(stderr, 'Chromium exited before CDP was ready'));
     }
     if (fs.existsSync(activePortPath)) {
       const lines = fs.readFileSync(activePortPath, 'utf8').trim().split(/\r?\n/);
@@ -1382,6 +1382,22 @@ async function waitForDevToolsPort(userDataDir, child, stderr, timeoutMs) {
     await delay(80);
   }
   throw new Error(`CDP was not ready within ${timeoutMs}ms${formatStderrSuffix(stderr)}`);
+}
+
+function chromiumCdpReadinessFailure(stderr, prefix) {
+  const displayHint = chromiumDisplayStartupHint(stderr);
+  if (displayHint) {
+    return `${prefix}; ${displayHint}${formatStderrSuffix(stderr)}`;
+  }
+  return `${prefix}${formatStderrSuffix(stderr)}`;
+}
+
+function chromiumDisplayStartupHint(stderr) {
+  const text = stderr.excerpt(LOG_BUFFER_LIMIT).join('\n');
+  if (!/Missing X server or \$DISPLAY|platform failed to initialize|ozone_platform_x11/i.test(text)) {
+    return '';
+  }
+  return 'headed Linux Chromium could not reach the graphical display. For SSH validation, run with a live GNOME/RDP session or export DISPLAY/WAYLAND_DISPLAY plus XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and XAUTHORITY from `systemctl --user show-environment`';
 }
 
 function formatStderrSuffix(stderr) {
@@ -2126,6 +2142,9 @@ function compactResultForOutput(opts, result) {
 }
 
 function validationFailureNextStep(result) {
+  if (/headed Linux Chromium could not reach the graphical display|Missing X server or \$DISPLAY|ozone_platform_x11/i.test(result.reason || '')) {
+    return 'fix the remote graphical session environment first: on SSH hosts, prepend ~/.cargo/bin to PATH and run from a live GNOME/RDP session or import DISPLAY/WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and XAUTHORITY from systemctl --user show-environment';
+  }
   if (result.failureKind === 'renderer') {
     return 'treat as renderer validation failure; use the Station diagnostics here instead of repeating broad DOM/source dumps';
   }
@@ -2602,6 +2621,16 @@ async function runSelfTest() {
   assert.ok(!gpuBrowserArgs.includes('--disable-gpu'));
   assert.ok(gpuBrowserArgs.includes('--ozone-platform=x11'));
   assert.ok(gpuBrowserArgs.includes('--enable-unsafe-webgpu'));
+  const displayStartupLog = new BoundedLog(4);
+  displayStartupLog.push('browser.stderr', '[123:123:0607/230000.000000:ERROR:ui/ozone/platform/x11/ozone_platform_x11.cc:257] Missing X server or $DISPLAY');
+  displayStartupLog.push('browser.stderr', '[123:123:0607/230000.000001:ERROR:ui/aura/env.cc:246] The platform failed to initialize.  Exiting.');
+  assert.ok(chromiumCdpReadinessFailure(displayStartupLog, 'Chromium exited before CDP was ready').includes('headed Linux Chromium could not reach the graphical display'));
+  assert.ok(
+    validationFailureNextStep({
+      failureKind: 'harness',
+      reason: chromiumCdpReadinessFailure(displayStartupLog, 'Chromium exited before CDP was ready'),
+    }).includes('systemctl --user show-environment'),
+  );
   const parsedSystemdEnv = parseSystemdUserEnvironment([
     'DISPLAY=:0',
     'WAYLAND_DISPLAY=wayland-0',
