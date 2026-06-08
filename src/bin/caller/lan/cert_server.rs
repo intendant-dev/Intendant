@@ -794,7 +794,7 @@ fn unlocked_platform_steps(
 <ol>
 <li>Open the downloaded profile in Settings.</li>
 <li>Install the profile from Settings → General → VPN & Device Management.</li>
-<li>Enable full trust for the Intendant CA in Settings → General → About → Certificate Trust Settings.</li>
+<li>Enable full trust for the Intendant CA in Settings → General → About → Certificate Trust Settings. Safari must stop showing Not Secure before Station WebGPU, microphone/camera, and browser capture can work.</li>
 <li>Open <code>{dashboard}</code>.</li>
 </ol>
 <p class="warn">The profile bundles the CA, client identity, and PKCS#12 password. It is safe to download only because this browser was already paired through the terminal fingerprint check.</p>
@@ -806,10 +806,10 @@ fn unlocked_platform_steps(
 <p><a class="btn" href="/intendant.mobileconfig">Download Apple profile</a></p>
 <ol>
 <li>Open the profile and install it in System Settings → General → Device Management. If the pane is hidden, search System Settings for Profiles.</li>
-<li>If macOS does not fully trust the root automatically, open Keychain Access and set the Intendant CA to Always Trust.</li>
+<li>If Safari still shows Not Secure, open Keychain Access and set the Intendant CA to Always Trust. Station WebGPU, microphone/camera, and browser capture require Safari to treat this page as secure.</li>
 <li>Open <code>{dashboard}</code>.</li>
 </ol>
-<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses profile-compatible RSA certificate payloads.</p>
+<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses an Apple-compatible client identity bundle.</p>
 </div>"#
         ),
         ClientPlatform::Android => format!(
@@ -877,6 +877,7 @@ fn alternate_downloads_html(password: &str) -> String {
 <li><code>ca.crt</code> is the Intendant LAN root CA. Trust it for websites.</li>
 <li><code>client.p12</code> is the password-protected client identity.</li>
 <li><code>client.pfx</code> is the same client identity with an Android/Windows-friendly extension.</li>
+<li>Secure browser features such as Station WebGPU, microphone/camera, and browser capture work only after the browser stops showing Not Secure for the dashboard.</li>
 <li><code>intendant.mobileconfig</code> bundles the CA and client identity for Apple platforms. If it fails on macOS, install <code>ca.crt</code> and <code>client.p12</code> manually or regenerate old LAN certs with <code>intendant lan setup --force</code>.</li>
 </ul>
 </div>
@@ -1005,7 +1006,7 @@ fn ensure_apple_profile_cert_compatible(
 
 fn apple_profile_regen_message(label: &str, reason: &str) -> String {
     format!(
-        "{label} {reason}. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force`."
+        "{label} {reason}. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force` so the Apple profile uses an Apple-compatible client identity bundle."
     )
 }
 
@@ -1369,6 +1370,9 @@ mod tests {
     fn macos_enrollment_copy_points_to_device_management() {
         let html = unlocked_platform_steps(ClientPlatform::AppleDesktop, "192.0.2.10", 8443, "pw");
         assert!(html.contains("System Settings → General → Device Management"));
+        assert!(html.contains("Always Trust"));
+        assert!(html.contains("Station WebGPU"));
+        assert!(html.contains("Not Secure"));
         assert!(html.contains("certificate could not be verified"));
         assert!(!html.contains("Privacy & Security → Profiles"));
     }

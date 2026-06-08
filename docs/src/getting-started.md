@@ -333,10 +333,13 @@ password is shown only on the unlocked enrollment page. The Apple
 and the PKCS#12 password, so it is served only after strict pairing succeeds.
 On macOS, install downloaded profiles from **System Settings → General → Device
 Management**; if that pane is hidden, search System Settings for "Profiles".
+If Safari still shows **Not Secure**, open Keychain Access and set the
+Intendant CA to **Always Trust**; installing the profile is not enough unless
+the CA is trusted for websites.
 If macOS reports that the profile certificate could not be verified, install
 `ca.crt` and `client.p12` manually from the same unlocked page, or regenerate
 older LAN cert material with `intendant lan setup --force` so the Apple profile
-uses profile-compatible RSA certificate payloads with client-auth extensions.
+uses an Apple-compatible client identity bundle and certificate payloads.
 
 #### Apple device requirement for `client.p12`
 
