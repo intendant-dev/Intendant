@@ -1994,24 +1994,27 @@ fn collect_controller_loop_status_inner(
             }
         }
     }
-    let process_tree_codex = live_codex_app_server_processes(std::process::id(), &known_codex_pids);
-    let process_tree_codex_pids: Vec<u32> = process_tree_codex
-        .iter()
-        .filter_map(|entry| entry.get("pid").and_then(|pid| pid.as_u64()))
-        .filter_map(|pid| u32::try_from(pid).ok())
-        .collect();
-    active_codex.extend(process_tree_codex);
-    active_wrappers.extend(active_external_wrappers_from_index(
+    let process_tree_codex =
+        live_codex_app_server_process_infos(std::process::id(), &known_codex_pids);
+    active_codex.extend(live_codex_app_server_processes_from_infos(
+        &process_tree_codex,
+    ));
+    active_wrappers.extend(active_external_wrappers_from_index_for_processes(
         loop_dir,
-        &process_tree_codex_pids,
+        &process_tree_codex,
     ));
     if let Some((state, now_secs)) = live_state {
         enrich_controller_loop_wrappers_with_mcp_state(&mut active_wrappers, state, now_secs);
+        enrich_controller_loop_codex_with_mcp_state(&mut active_codex, state, now_secs);
     }
 
     let latest_run_id = read_trimmed(&loop_dir.join("latest.run_id"));
     let latest_status_file = read_json_file(&loop_dir.join("latest.status.json"));
-    let latest_status = controller_loop_latest_status(latest_status_file, &active_wrappers);
+    let latest_status = controller_loop_latest_status_with_codex(
+        latest_status_file,
+        &active_wrappers,
+        &active_codex,
+    );
     let latest_target_path = std::fs::read_link(loop_dir.join("latest")).ok().map(|p| {
         if p.is_absolute() {
             p
@@ -2116,8 +2119,25 @@ fn active_external_wrappers_from_index(
     loop_dir: &std::path::Path,
     live_codex_pids: &[u32],
 ) -> Vec<serde_json::Value> {
+    let live_codex_processes = live_codex_processes_from_pids(live_codex_pids);
+    active_external_wrappers_from_index_for_processes(loop_dir, &live_codex_processes)
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LiveCodexAppServerProcess {
+    pid: u32,
+    mcp_session_id: Option<String>,
+}
+
+fn active_external_wrappers_from_index_for_processes(
+    loop_dir: &std::path::Path,
+    live_codex_processes: &[LiveCodexAppServerProcess],
+) -> Vec<serde_json::Value> {
     let candidate_homes = controller_loop_wrapper_index_homes(loop_dir);
-    active_external_wrappers_from_index_homes(candidate_homes.iter(), live_codex_pids)
+    active_external_wrappers_from_index_homes_for_processes(
+        candidate_homes.iter(),
+        live_codex_processes,
+    )
 }
 
 fn active_external_wrappers_from_index_homes<'a, I>(
@@ -2127,11 +2147,8 @@ fn active_external_wrappers_from_index_homes<'a, I>(
 where
     I: IntoIterator<Item = &'a std::path::PathBuf>,
 {
-    active_external_wrappers_from_index_homes_with_probe(
-        candidate_homes,
-        live_codex_pids,
-        codex_app_server_process_tree_active,
-    )
+    let live_codex_processes = live_codex_processes_from_pids(live_codex_pids);
+    active_external_wrappers_from_index_homes_for_processes(candidate_homes, &live_codex_processes)
 }
 
 fn active_external_wrappers_from_index_homes_with_probe<'a, I, F>(
@@ -2143,9 +2160,40 @@ where
     I: IntoIterator<Item = &'a std::path::PathBuf>,
     F: FnMut(u32) -> bool,
 {
-    active_external_wrappers_from_index_homes_with_probe_and_cwd(
+    let live_codex_processes = live_codex_processes_from_pids(live_codex_pids);
+    active_external_wrappers_from_index_homes_for_processes_with_probe(
         candidate_homes,
-        live_codex_pids,
+        &live_codex_processes,
+        process_tree_active,
+    )
+}
+
+fn active_external_wrappers_from_index_homes_for_processes<'a, I>(
+    candidate_homes: I,
+    live_codex_processes: &[LiveCodexAppServerProcess],
+) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = &'a std::path::PathBuf>,
+{
+    active_external_wrappers_from_index_homes_for_processes_with_probe(
+        candidate_homes,
+        live_codex_processes,
+        codex_app_server_process_tree_active,
+    )
+}
+
+fn active_external_wrappers_from_index_homes_for_processes_with_probe<'a, I, F>(
+    candidate_homes: I,
+    live_codex_processes: &[LiveCodexAppServerProcess],
+    process_tree_active: F,
+) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = &'a std::path::PathBuf>,
+    F: FnMut(u32) -> bool,
+{
+    active_external_wrappers_from_index_homes_for_processes_with_probe_and_cwd(
+        candidate_homes,
+        live_codex_processes,
         process_tree_active,
         live_process_cwd,
     )
@@ -2154,6 +2202,26 @@ where
 fn active_external_wrappers_from_index_homes_with_probe_and_cwd<'a, I, F, G>(
     candidate_homes: I,
     live_codex_pids: &[u32],
+    process_tree_active: F,
+    process_cwd: G,
+) -> Vec<serde_json::Value>
+where
+    I: IntoIterator<Item = &'a std::path::PathBuf>,
+    F: FnMut(u32) -> bool,
+    G: FnMut(u32) -> Option<std::path::PathBuf>,
+{
+    let live_codex_processes = live_codex_processes_from_pids(live_codex_pids);
+    active_external_wrappers_from_index_homes_for_processes_with_probe_and_cwd(
+        candidate_homes,
+        &live_codex_processes,
+        process_tree_active,
+        process_cwd,
+    )
+}
+
+fn active_external_wrappers_from_index_homes_for_processes_with_probe_and_cwd<'a, I, F, G>(
+    candidate_homes: I,
+    live_codex_processes: &[LiveCodexAppServerProcess],
     mut process_tree_active: F,
     mut process_cwd: G,
 ) -> Vec<serde_json::Value>
@@ -2162,30 +2230,43 @@ where
     F: FnMut(u32) -> bool,
     G: FnMut(u32) -> Option<std::path::PathBuf>,
 {
-    if live_codex_pids.is_empty() {
+    if live_codex_processes.is_empty() {
         return Vec::new();
     }
     let mut seen_backend_ids = HashSet::new();
+    let mut used_processes = vec![false; live_codex_processes.len()];
     let mut wrappers = Vec::new();
     for home in candidate_homes {
         for record in crate::external_wrapper_index::wrappers_for_source(home, "codex") {
-            if wrappers.len() >= live_codex_pids.len() {
+            if wrappers.len() >= live_codex_processes.len() {
                 break;
             }
-            if !seen_backend_ids.insert(record.backend_session_id.clone()) {
+            if seen_backend_ids.contains(&record.backend_session_id) {
                 continue;
             }
             let status = session_meta_status(std::path::Path::new(&record.log_path));
             if external_wrapper_status_is_terminal(status.as_deref()) {
                 continue;
             }
-            let codex_pid = live_codex_pids.get(wrappers.len()).copied();
-            let process_tree_active = codex_pid
-                .map(|pid| process_tree_active(pid))
-                .unwrap_or(false);
+            let Some((process_index, process)) =
+                live_codex_processes
+                    .iter()
+                    .enumerate()
+                    .find(|(index, process)| {
+                        !used_processes[*index]
+                            && live_codex_process_matches_wrapper_record(process, &record)
+                    })
+            else {
+                continue;
+            };
+            used_processes[process_index] = true;
+            seen_backend_ids.insert(record.backend_session_id.clone());
+
+            let codex_pid = Some(process.pid);
+            let process_tree_active = process_tree_active(process.pid);
             let effective_status =
                 effective_external_wrapper_status(status.as_deref(), process_tree_active);
-            let cwd = codex_pid.and_then(|pid| process_cwd(pid));
+            let cwd = process_cwd(process.pid);
             let cwd_string = cwd.as_ref().map(|path| path.to_string_lossy().to_string());
             let project_root = cwd
                 .as_deref()
@@ -2205,6 +2286,7 @@ where
                 "backend_source": record.source,
                 "backend_session_id": record.backend_session_id,
                 "intendant_session_id": record.intendant_session_id,
+                "mcp_session_id": process.mcp_session_id.clone(),
                 "log_path": record.log_path,
                 "cwd": cwd_string,
                 "project_root": project_root,
@@ -2214,11 +2296,37 @@ where
                 "updated_at_secs": updated_at_secs,
             }));
         }
-        if wrappers.len() >= live_codex_pids.len() {
+        if wrappers.len() >= live_codex_processes.len() {
             break;
         }
     }
     wrappers
+}
+
+fn live_codex_process_matches_wrapper_record(
+    process: &LiveCodexAppServerProcess,
+    record: &crate::external_wrapper_index::ExternalWrapperRecord,
+) -> bool {
+    let Some(session_id) = process
+        .mcp_session_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+    else {
+        return true;
+    };
+    session_id == record.intendant_session_id || session_id == record.backend_session_id
+}
+
+fn live_codex_processes_from_pids(live_codex_pids: &[u32]) -> Vec<LiveCodexAppServerProcess> {
+    live_codex_pids
+        .iter()
+        .copied()
+        .map(|pid| LiveCodexAppServerProcess {
+            pid,
+            mcp_session_id: None,
+        })
+        .collect()
 }
 
 fn project_root_from_process_cwd(cwd: &std::path::Path) -> Option<std::path::PathBuf> {
@@ -2248,6 +2356,14 @@ fn controller_loop_latest_status(
     latest_status_file: serde_json::Value,
     wrappers: &[serde_json::Value],
 ) -> serde_json::Value {
+    controller_loop_latest_status_with_codex(latest_status_file, wrappers, &[])
+}
+
+fn controller_loop_latest_status_with_codex(
+    latest_status_file: serde_json::Value,
+    wrappers: &[serde_json::Value],
+    active_codex: &[serde_json::Value],
+) -> serde_json::Value {
     let active_wrapper_status = latest_status_from_active_wrappers(wrappers);
     if let Some(status) = active_wrapper_status.as_ref().filter(|status| {
         status
@@ -2257,11 +2373,27 @@ fn controller_loop_latest_status(
     }) {
         return status.clone();
     }
+    let active_codex_status = latest_status_from_active_codex(active_codex);
+    if let Some(status) = active_codex_status.as_ref().filter(|status| {
+        status
+            .get("live_status_source")
+            .and_then(|source| source.as_str())
+            == Some("mcp_state")
+    }) {
+        return status.clone();
+    }
     if latest_status_file.is_null() {
-        return active_wrapper_status.unwrap_or(serde_json::Value::Null);
+        return active_wrapper_status
+            .or(active_codex_status)
+            .unwrap_or(serde_json::Value::Null);
     }
     if controller_loop_status_state_is_idle(&latest_status_file) {
         if let Some(status) = active_wrapper_status {
+            if !controller_loop_status_state_is_idle(&status) {
+                return status;
+            }
+        }
+        if let Some(status) = active_codex_status {
             if !controller_loop_status_state_is_idle(&status) {
                 return status;
             }
@@ -2288,6 +2420,7 @@ fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<
         "backend_source": wrapper.get("backend_source").cloned().unwrap_or(serde_json::Value::Null),
         "backend_session_id": wrapper.get("backend_session_id").cloned().unwrap_or(serde_json::Value::Null),
         "intendant_session_id": wrapper.get("intendant_session_id").cloned().unwrap_or(serde_json::Value::Null),
+        "mcp_session_id": wrapper.get("mcp_session_id").cloned().unwrap_or(serde_json::Value::Null),
         "log_path": wrapper.get("log_path").cloned().unwrap_or(serde_json::Value::Null),
         "session_meta_status": wrapper.get("session_meta_status").cloned().unwrap_or(serde_json::Value::Null),
         "process_tree_active": wrapper.get("process_tree_active").cloned().unwrap_or(serde_json::Value::Null),
@@ -2299,6 +2432,55 @@ fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<
         "task": wrapper.get("task").cloned().unwrap_or(serde_json::Value::Null),
         "updated_at_secs": wrapper.get("updated_at_secs").cloned().unwrap_or(serde_json::Value::Null),
         "live_status_source": wrapper.get("live_status_source").cloned().unwrap_or(serde_json::Value::Null),
+    }))
+}
+
+fn latest_status_from_active_codex(
+    active_codex: &[serde_json::Value],
+) -> Option<serde_json::Value> {
+    let codex = active_codex
+        .iter()
+        .find(|codex| {
+            codex
+                .get("live_status_source")
+                .and_then(|source| source.as_str())
+                == Some("mcp_state")
+        })
+        .or_else(|| {
+            active_codex.iter().find(|codex| {
+                codex
+                    .get("app_server_active")
+                    .and_then(serde_json::Value::as_bool)
+                    == Some(true)
+                    && codex
+                        .get("mcp_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|session_id| !session_id.trim().is_empty())
+            })
+        })?;
+    let state = codex
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .or_else(|| codex.get("status").and_then(|v| v.as_str()))
+        .unwrap_or("unknown_running");
+    let pid = codex.get("pid").cloned().unwrap_or(serde_json::Value::Null);
+    Some(serde_json::json!({
+        "run_id": codex.get("run_id").cloned().unwrap_or(serde_json::Value::Null),
+        "state": state,
+        "pid": pid,
+        "codex_pid": codex.get("codex_pid").cloned().unwrap_or_else(|| codex.get("pid").cloned().unwrap_or(serde_json::Value::Null)),
+        "source": codex.get("source").cloned().unwrap_or(serde_json::Value::Null),
+        "mcp_session_id": codex.get("mcp_session_id").cloned().unwrap_or(serde_json::Value::Null),
+        "intendant_session_id": codex.get("intendant_session_id").cloned().unwrap_or_else(|| codex.get("mcp_session_id").cloned().unwrap_or(serde_json::Value::Null)),
+        "backend_session_id": codex.get("backend_session_id").cloned().unwrap_or(serde_json::Value::Null),
+        "app_server_pid": codex.get("app_server_pid").cloned().unwrap_or_else(|| codex.get("pid").cloned().unwrap_or(serde_json::Value::Null)),
+        "app_server_active": codex.get("app_server_active").cloned().unwrap_or(serde_json::Value::Null),
+        "phase": codex.get("phase").cloned().unwrap_or(serde_json::Value::Null),
+        "turn": codex.get("turn").cloned().unwrap_or(serde_json::Value::Null),
+        "round": codex.get("round").cloned().unwrap_or(serde_json::Value::Null),
+        "task": codex.get("task").cloned().unwrap_or(serde_json::Value::Null),
+        "updated_at_secs": codex.get("updated_at_secs").cloned().unwrap_or(serde_json::Value::Null),
+        "live_status_source": codex.get("live_status_source").cloned().unwrap_or(serde_json::Value::Null),
     }))
 }
 
@@ -2347,6 +2529,71 @@ fn enrich_controller_loop_wrappers_with_mcp_state(
     for wrapper in wrappers {
         enrich_controller_loop_wrapper_with_mcp_state(wrapper, state, now_secs);
     }
+}
+
+fn enrich_controller_loop_codex_with_mcp_state(
+    active_codex: &mut [serde_json::Value],
+    state: &McpAppState,
+    now_secs: u64,
+) {
+    for codex in active_codex {
+        enrich_controller_loop_codex_process_with_mcp_state(codex, state, now_secs);
+    }
+}
+
+fn enrich_controller_loop_codex_process_with_mcp_state(
+    codex: &mut serde_json::Value,
+    state: &McpAppState,
+    now_secs: u64,
+) {
+    let Some(session_id) = codex
+        .get("mcp_session_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|session_id| !session_id.is_empty())
+        .map(str::to_string)
+    else {
+        return;
+    };
+    let Some(live_status) = state.session_status_for_id(&session_id).cloned() else {
+        return;
+    };
+    let phase = phase_to_str(&live_status.phase);
+    let Some(obj) = codex.as_object_mut() else {
+        return;
+    };
+    obj.entry("intendant_session_id".to_string())
+        .or_insert_with(|| serde_json::Value::String(session_id));
+    obj.insert(
+        "phase".to_string(),
+        serde_json::Value::String(phase.to_string()),
+    );
+    obj.insert(
+        "status".to_string(),
+        serde_json::Value::String(phase.to_string()),
+    );
+    obj.insert(
+        "turn".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(live_status.turn as u64)),
+    );
+    obj.insert(
+        "round".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(live_status.round as u64)),
+    );
+    if !live_status.task.is_empty() {
+        obj.insert(
+            "task".to_string(),
+            serde_json::Value::String(live_status.task),
+        );
+    }
+    obj.insert(
+        "updated_at_secs".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(now_secs)),
+    );
+    obj.insert(
+        "live_status_source".to_string(),
+        serde_json::Value::String("mcp_state".to_string()),
+    );
 }
 
 fn enrich_controller_loop_wrapper_with_mcp_state(
@@ -2572,29 +2819,58 @@ where
     })
 }
 
-fn live_codex_app_server_processes(
-    root_pid: u32,
-    known_codex_pids: &HashSet<u32>,
+fn live_codex_app_server_processes_from_infos(
+    processes: &[LiveCodexAppServerProcess],
 ) -> Vec<serde_json::Value> {
-    live_codex_app_server_pids(root_pid, known_codex_pids)
-        .into_iter()
-        .map(|pid| {
-            serde_json::json!({
+    processes
+        .iter()
+        .map(|process| {
+            let mut entry = serde_json::json!({
                 "run_id": serde_json::Value::Null,
-                "pid": pid,
+                "pid": process.pid,
+                "codex_pid": process.pid,
+                "app_server_pid": process.pid,
                 "source": "process_tree",
                 "app_server_active": true,
-            })
+            });
+            if let Some(session_id) = process
+                .mcp_session_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|session_id| !session_id.is_empty())
+            {
+                if let Some(obj) = entry.as_object_mut() {
+                    obj.insert(
+                        "mcp_session_id".to_string(),
+                        serde_json::Value::String(session_id.to_string()),
+                    );
+                    obj.insert(
+                        "intendant_session_id".to_string(),
+                        serde_json::Value::String(session_id.to_string()),
+                    );
+                }
+            }
+            entry
         })
         .collect()
 }
 
-fn live_codex_app_server_pids(root_pid: u32, known_codex_pids: &HashSet<u32>) -> Vec<u32> {
-    live_codex_app_server_pids_from_descendants(
+fn live_codex_app_server_process_infos(
+    root_pid: u32,
+    known_codex_pids: &HashSet<u32>,
+) -> Vec<LiveCodexAppServerProcess> {
+    live_codex_app_server_process_infos_from_descendants(
         super::platform::process_descendants(root_pid),
         known_codex_pids,
         super::platform::process_cmdline,
     )
+}
+
+fn live_codex_app_server_pids(root_pid: u32, known_codex_pids: &HashSet<u32>) -> Vec<u32> {
+    live_codex_app_server_process_infos(root_pid, known_codex_pids)
+        .into_iter()
+        .map(|process| process.pid)
+        .collect()
 }
 
 fn live_codex_app_server_pids_from_descendants<I, F>(
@@ -2606,7 +2882,26 @@ where
     I: IntoIterator<Item = u32>,
     F: FnMut(u32) -> Option<String>,
 {
-    let mut pids = Vec::new();
+    live_codex_app_server_process_infos_from_descendants(
+        descendant_pids,
+        known_codex_pids,
+        &mut cmdline_for_pid,
+    )
+    .into_iter()
+    .map(|process| process.pid)
+    .collect()
+}
+
+fn live_codex_app_server_process_infos_from_descendants<I, F>(
+    descendant_pids: I,
+    known_codex_pids: &HashSet<u32>,
+    mut cmdline_for_pid: F,
+) -> Vec<LiveCodexAppServerProcess>
+where
+    I: IntoIterator<Item = u32>,
+    F: FnMut(u32) -> Option<String>,
+{
+    let mut processes = Vec::new();
     for pid in descendant_pids {
         if known_codex_pids.contains(&pid) {
             continue;
@@ -2615,17 +2910,77 @@ where
             continue;
         };
         if is_codex_app_server_cmdline(&cmdline) {
-            pids.push(pid);
+            processes.push(LiveCodexAppServerProcess {
+                pid,
+                mcp_session_id: codex_app_server_mcp_session_id_from_cmdline(&cmdline),
+            });
         }
     }
-    pids.sort_unstable();
-    pids.dedup();
-    pids
+    processes.sort_by_key(|process| process.pid);
+    processes.dedup_by_key(|process| process.pid);
+    processes
 }
 
 fn is_codex_app_server_cmdline(cmdline: &str) -> bool {
     let mut args = cmdline.split_whitespace();
     args.any(|arg| arg.ends_with("codex")) && args.any(|arg| arg == "app-server")
+}
+
+fn codex_app_server_mcp_session_id_from_cmdline(cmdline: &str) -> Option<String> {
+    const URL_KEY: &str = "mcp_servers.intendant.url=";
+    cmdline.split_whitespace().find_map(|arg| {
+        let raw_url = arg
+            .strip_prefix(URL_KEY)
+            .or_else(|| arg.find(URL_KEY).map(|index| &arg[index + URL_KEY.len()..]))?;
+        mcp_session_id_from_url_value(raw_url)
+    })
+}
+
+fn mcp_session_id_from_url_value(raw_url: &str) -> Option<String> {
+    let url = raw_url
+        .trim()
+        .trim_matches(|ch| ch == '"' || ch == '\'' || ch == '\\');
+    let (_, query) = url.split_once('?')?;
+    for pair in query.split('&') {
+        let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+        if matches!(key, "session_id" | "session" | "intendant_session") {
+            let decoded = percent_decode_mcp_query_value(value);
+            if !decoded.trim().is_empty() {
+                return Some(decoded);
+            }
+        }
+    }
+    None
+}
+
+fn percent_decode_mcp_query_value(value: &str) -> String {
+    let bytes = value.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            if let (Some(hi), Some(lo)) = (
+                hex_mcp_query_value(bytes[i + 1]),
+                hex_mcp_query_value(bytes[i + 2]),
+            ) {
+                out.push((hi << 4) | lo);
+                i += 3;
+                continue;
+            }
+        }
+        out.push(if bytes[i] == b'+' { b' ' } else { bytes[i] });
+        i += 1;
+    }
+    String::from_utf8_lossy(&out).to_string()
+}
+
+fn hex_mcp_query_value(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _ => None,
+    }
 }
 
 fn request_loop_halt_marker(loop_dir: &std::path::Path, persistent: bool) -> Result<(), String> {
@@ -14507,6 +14862,118 @@ mod tests {
     }
 
     #[test]
+    fn controller_loop_status_filters_stale_wrapper_index_by_live_mcp_session() {
+        let dir = tempdir().unwrap();
+        let home = dir.path();
+        let stale_intendant_session_id = "4470a234-c76e-4dd7-81fe-27b703dab1c4";
+        let stale_backend_session_id = "019ea864-3e83-7f73-aff2-4710faaf2b3f";
+        let current_session_id = "e9532107-8c7f-4c1f-b88d-410d6d365505";
+        let stale_log_dir = home
+            .join(".intendant/logs")
+            .join(stale_intendant_session_id);
+        let current_log_dir = home.join(".intendant/logs").join(current_session_id);
+        std::fs::create_dir_all(&stale_log_dir).unwrap();
+        std::fs::create_dir_all(&current_log_dir).unwrap();
+        std::fs::write(
+            stale_log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": stale_intendant_session_id,
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "idle"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(
+            current_log_dir.join("session_meta.json"),
+            serde_json::json!({
+                "session_id": current_session_id,
+                "created_at": "2026-01-01T00:00:00Z",
+                "status": "running"
+            })
+            .to_string(),
+        )
+        .unwrap();
+        crate::external_wrapper_index::upsert(
+            home,
+            "codex",
+            stale_backend_session_id,
+            stale_intendant_session_id,
+            &stale_log_dir,
+            None,
+        )
+        .unwrap();
+
+        let live_process = LiveCodexAppServerProcess {
+            pid: 8955,
+            mcp_session_id: Some(current_session_id.to_string()),
+        };
+        let wrappers = active_external_wrappers_from_index_homes_for_processes_with_probe(
+            [home.to_path_buf()].iter(),
+            std::slice::from_ref(&live_process),
+            |pid| pid == 8955,
+        );
+        assert!(
+            wrappers.is_empty(),
+            "stale wrapper index row must not be paired with a live current-session app-server"
+        );
+
+        let mut active_codex =
+            live_codex_app_server_processes_from_infos(std::slice::from_ref(&live_process));
+        let mut app_state = McpAppState::new(
+            "openai".to_string(),
+            "gpt-5.2-codex".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            current_log_dir,
+        );
+        app_state.session_id = current_session_id.to_string();
+        app_state.note_session_phase(
+            Some(current_session_id),
+            Some(21),
+            Phase::RunningAgent,
+            Some("current Codex turn"),
+        );
+        app_state.note_session_round(Some(current_session_id), 21);
+        enrich_controller_loop_codex_with_mcp_state(&mut active_codex, &app_state, 12345);
+
+        let latest = controller_loop_latest_status_with_codex(
+            serde_json::json!({
+                "run_id": "stale-run",
+                "state": "idle",
+                "source": "external_wrapper_index",
+                "backend_session_id": stale_backend_session_id,
+                "intendant_session_id": stale_intendant_session_id
+            }),
+            &wrappers,
+            &active_codex,
+        );
+        assert_eq!(
+            latest.get("source").and_then(|value| value.as_str()),
+            Some("process_tree")
+        );
+        assert_eq!(
+            latest
+                .get("intendant_session_id")
+                .and_then(|value| value.as_str()),
+            Some(current_session_id)
+        );
+        assert_ne!(
+            latest
+                .get("intendant_session_id")
+                .and_then(|value| value.as_str()),
+            Some(stale_intendant_session_id)
+        );
+        assert_eq!(
+            latest.get("state").and_then(|value| value.as_str()),
+            Some("running_agent")
+        );
+        assert_eq!(
+            latest.get("turn").and_then(|value| value.as_u64()),
+            Some(21)
+        );
+    }
+
+    #[test]
     fn codex_app_server_process_tree_active_includes_root_pid_liveness() {
         assert!(codex_app_server_process_tree_active_with_root(
             1298123,
@@ -14770,6 +15237,33 @@ mod tests {
         assert!(!is_codex_app_server_cmdline(
             "/usr/bin/codex completion bash"
         ));
+    }
+
+    #[test]
+    fn controller_loop_status_extracts_mcp_session_id_from_codex_app_server_cmdline() {
+        assert_eq!(
+            codex_app_server_mcp_session_id_from_cmdline(
+                "/home/user/projects/codex-minimal-lineage-aae40ce1f/codex-rs/target/debug/codex \
+                 --dangerously-bypass-approvals-and-sandbox app-server -c \
+                 mcp_servers.intendant.url=\"http://localhost:8955/mcp?session_id=e9532107-8c7f-4c1f-b88d-410d6d365505&managed_context=managed&tool_profile=core\""
+            )
+            .as_deref(),
+            Some("e9532107-8c7f-4c1f-b88d-410d6d365505")
+        );
+        assert_eq!(
+            codex_app_server_mcp_session_id_from_cmdline(
+                "/opt/homebrew/bin/codex app-server -c \
+                 mcp_servers.intendant.url=\"http://localhost:8765/mcp?session_id=session%20with%20spaces&managed_context=managed\""
+            )
+            .as_deref(),
+            Some("session with spaces")
+        );
+        assert_eq!(
+            codex_app_server_mcp_session_id_from_cmdline(
+                "/opt/homebrew/bin/codex app-server -c mcp_servers.intendant.url=http://localhost:8765/mcp?managed_context=managed"
+            ),
+            None
+        );
     }
 
     #[test]
