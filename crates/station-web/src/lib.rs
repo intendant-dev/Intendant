@@ -1305,7 +1305,7 @@ impl StationInner {
             44.0
         } else {
             let available_h = (self.css_height() - y - 14.0).max(0.0);
-            ((available_h - 45.0 - (card_gap * (card_count - 1.0))) / card_count).clamp(38.0, 47.0)
+            ((available_h - 45.0 - (card_gap * (card_count - 1.0))) / card_count).clamp(32.0, 47.0)
         };
         let panel_h = 45.0 + (card_h * rows) + (card_gap * (rows - 1.0));
         self.round_rect(
@@ -3655,23 +3655,35 @@ impl StationInner {
         self.ctx.set_fill_style(&JsValue::from_str(color));
         self.ctx
             .fill_rect((x + 7.0) as f64, (y + 7.0) as f64, 3.0, (h - 14.0) as f64);
-        self.text(title, x + 15.0, y + 14.0, 9.0, C_OVERLAY1_CSS, "bold");
-        self.text(
-            &truncate(value, 30),
-            x + 15.0,
-            y + 28.0,
-            10.0,
-            C_TEXT_CSS,
-            "normal",
-        );
-        self.text(
-            &truncate(detail, 38),
-            x + 15.0,
-            y + h - 8.0,
-            8.5,
-            C_SUBTEXT0_CSS,
-            "normal",
-        );
+        if h < 38.0 {
+            self.text(title, x + 15.0, y + 13.0, 8.5, C_OVERLAY1_CSS, "bold");
+            self.text(
+                &truncate(value, 28),
+                x + 15.0,
+                y + h - 8.0,
+                9.0,
+                C_TEXT_CSS,
+                "normal",
+            );
+        } else {
+            self.text(title, x + 15.0, y + 14.0, 9.0, C_OVERLAY1_CSS, "bold");
+            self.text(
+                &truncate(value, 30),
+                x + 15.0,
+                y + 28.0,
+                10.0,
+                C_TEXT_CSS,
+                "normal",
+            );
+            self.text(
+                &truncate(detail, 38),
+                x + 15.0,
+                y + h - 8.0,
+                8.5,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+        }
         self.hit_zones.push(HitZone::new(
             x,
             y,
