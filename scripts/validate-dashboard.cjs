@@ -68,7 +68,7 @@ Options:
   --cdp-timeout MS           Chromium CDP readiness timeout (default: ${DEFAULT_CDP_TIMEOUT_MS})
   --browser PATH             Chromium/Chrome executable
   --headed                   Run without --headless=new
-  --enable-gpu               Omit the default --disable-gpu Chromium flag
+  --enable-gpu               Omit the default --disable-gpu Chromium flag (implied by --station-probe webgpu)
   --browser-arg ARG          Extra Chromium arg; repeatable
   --sandbox                  Omit default --no-sandbox
   --log-lines N              Bounded browser/page log lines on failure (default: ${DEFAULT_LOG_LINES})
@@ -1231,6 +1231,7 @@ function parseSystemdUserEnvironment(output) {
 }
 
 function browserArgs(userDataDir, opts) {
+  const needsGpu = browserValidationNeedsGpu(opts);
   const args = [
     '--remote-debugging-port=0',
     `--user-data-dir=${userDataDir}`,
@@ -1242,7 +1243,7 @@ function browserArgs(userDataDir, opts) {
     '--disable-popup-blocking',
     '--window-size=1440,1000',
   ];
-  if (!opts.enableGpu) {
+  if (!needsGpu) {
     args.push('--disable-gpu');
   }
   if (opts.headless) {
@@ -1251,11 +1252,15 @@ function browserArgs(userDataDir, opts) {
   if (opts.noSandbox) {
     args.push('--no-sandbox');
   }
-  if (opts.enableGpu && (opts.stationProbes || []).includes('webgpu')) {
+  if (needsGpu && (opts.stationProbes || []).includes('webgpu')) {
     args.push('--enable-unsafe-webgpu');
   }
   args.push(...opts.browserArgs);
   return args;
+}
+
+function browserValidationNeedsGpu(opts) {
+  return Boolean(opts.enableGpu || (opts.stationProbes || []).includes('webgpu'));
 }
 
 function resolveBrowserExecutable(explicit) {
@@ -2647,6 +2652,17 @@ async function runSelfTest() {
   assert.ok(!gpuBrowserArgs.includes('--disable-gpu'));
   assert.ok(gpuBrowserArgs.includes('--ozone-platform=x11'));
   assert.ok(gpuBrowserArgs.includes('--enable-unsafe-webgpu'));
+  const impliedGpuParsed = parseArgs([
+    '--headed',
+    '--station-probe',
+    'rendered',
+    '--station-probe',
+    'webgpu',
+  ], {});
+  assert.strictEqual(impliedGpuParsed.enableGpu, false);
+  const impliedGpuBrowserArgs = browserArgs('/tmp/profile', impliedGpuParsed);
+  assert.ok(!impliedGpuBrowserArgs.includes('--disable-gpu'));
+  assert.ok(impliedGpuBrowserArgs.includes('--enable-unsafe-webgpu'));
   const displayStartupLog = new BoundedLog(4);
   displayStartupLog.push('browser.stderr', '[123:123:0607/230000.000000:ERROR:ui/ozone/platform/x11/ozone_platform_x11.cc:257] Missing X server or $DISPLAY');
   displayStartupLog.push('browser.stderr', '[123:123:0607/230000.000001:ERROR:ui/aura/env.cc:246] The platform failed to initialize.  Exiting.');
