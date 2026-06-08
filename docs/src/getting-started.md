@@ -289,6 +289,17 @@ too. See
 [Configuration](./configuration.md) for `[server.tls]` and `--tls-cert` /
 `--tls-key`.
 
+On Linux, `intendant lan setup` stores the nginx-facing LAN certs under
+`/etc/intendant-lan`; private keys there are often root-readable only. If
+native `--tls` reports that it cannot read `server.key`, either run Intendant
+as a user that can read the key, pass a readable pair with `--tls-cert` /
+`--tls-key`, or make the key readable by the runtime user's group:
+
+```bash
+sudo chgrp "$(id -gn)" /etc/intendant-lan/server.key
+sudo chmod 0640 /etc/intendant-lan/server.key
+```
+
 For stricter LAN access control, require client certificates:
 
 ```bash

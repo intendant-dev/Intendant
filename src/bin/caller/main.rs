@@ -9634,15 +9634,38 @@ fn installed_lan_tls_cert_source() -> Result<Option<web_tls::TlsCertSource>, Cal
 fn installed_lan_tls_cert_source_from_dir(
     cert_dir: &Path,
 ) -> Result<Option<web_tls::TlsCertSource>, CallerError> {
+    installed_lan_tls_cert_source_from_dir_with_probe(cert_dir, |path| {
+        std::fs::File::open(path).map(|_| ())
+    })
+}
+
+fn installed_lan_tls_cert_source_from_dir_with_probe(
+    cert_dir: &Path,
+    can_read: impl Fn(&Path) -> io::Result<()>,
+) -> Result<Option<web_tls::TlsCertSource>, CallerError> {
     let cert_path = cert_dir.join("server.crt");
     let key_path = cert_dir.join("server.key");
     let cert_exists = cert_path.exists();
     let key_exists = key_path.exists();
     match (cert_exists, key_exists) {
-        (true, true) => Ok(Some(web_tls::TlsCertSource::Files {
-            cert_path,
-            key_path,
-        })),
+        (true, true) => {
+            ensure_installed_lan_tls_file_readable(
+                cert_dir,
+                &cert_path,
+                "certificate",
+                &can_read,
+            )?;
+            ensure_installed_lan_tls_file_readable(
+                cert_dir,
+                &key_path,
+                "private key",
+                &can_read,
+            )?;
+            Ok(Some(web_tls::TlsCertSource::Files {
+                cert_path,
+                key_path,
+            }))
+        }
         (false, false) => Ok(None),
         _ => Err(CallerError::Config(format!(
             "Installed LAN TLS certs are incomplete in {} (expected both server.crt and \
@@ -9650,6 +9673,53 @@ fn installed_lan_tls_cert_source_from_dir(
             cert_dir.display()
         ))),
     }
+}
+
+fn ensure_installed_lan_tls_file_readable(
+    cert_dir: &Path,
+    path: &Path,
+    role: &str,
+    can_read: &impl Fn(&Path) -> io::Result<()>,
+) -> Result<(), CallerError> {
+    can_read(path).map_err(|err| {
+        CallerError::Config(installed_lan_tls_unreadable_message(
+            cert_dir, path, role, &err,
+        ))
+    })
+}
+
+fn installed_lan_tls_unreadable_message(
+    cert_dir: &Path,
+    path: &Path,
+    role: &str,
+    err: &io::Error,
+) -> String {
+    let linux_note = if cfg!(target_os = "linux") {
+        " On Linux, `intendant lan setup` stores nginx-facing certs under \
+         `/etc/intendant-lan`; private keys there are commonly root-readable \
+         only."
+    } else {
+        ""
+    };
+    let permission_hint = if err.kind() == io::ErrorKind::PermissionDenied {
+        format!(
+            " To let this user run native `--tls` with the installed LAN cert, \
+             make the key readable by the Intendant runtime user, for example: \
+             `sudo chgrp $(id -gn) {path}` then `sudo chmod 0640 {path}`.",
+            path = path.display()
+        )
+    } else {
+        String::new()
+    };
+    format!(
+        "Installed LAN TLS {role} exists at {path}, but this process cannot read it: {err}. \
+         Native `--tls` reads the server certificate and key directly.{linux_note}{permission_hint} \
+         Alternatively, run Intendant as a user that can read the key, pass a readable pair with \
+         `--tls-cert <cert> --tls-key <key>`, or move the installed pair out of {cert_dir} to use \
+         the self-signed fallback.",
+        path = path.display(),
+        cert_dir = cert_dir.display(),
+    )
 }
 
 fn installed_lan_mtls_ca_path() -> Option<PathBuf> {
@@ -15076,6 +15146,30 @@ Also: {"source": "bare"}"#;
             err.to_string().contains("incomplete"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn installed_lan_tls_source_explains_unreadable_key() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("server.crt"), b"cert").unwrap();
+        std::fs::write(dir.path().join("server.key"), b"key").unwrap();
+
+        let err = installed_lan_tls_cert_source_from_dir_with_probe(dir.path(), |path| {
+            if path.ends_with("server.key") {
+                Err(io::Error::new(
+                    io::ErrorKind::PermissionDenied,
+                    "permission denied",
+                ))
+            } else {
+                Ok(())
+            }
+        })
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("cannot read it"), "msg: {msg}");
+        assert!(msg.contains("server.key"), "msg: {msg}");
+        assert!(msg.contains("chmod 0640"), "msg: {msg}");
+        assert!(msg.contains("--tls-cert <cert> --tls-key <key>"), "msg: {msg}");
     }
 
     #[test]
