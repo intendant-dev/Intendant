@@ -5005,6 +5005,37 @@ fn managed_context_rewind_only_pressure_from_usage(
     })
 }
 
+fn managed_context_preflight_pressure_gate_enabled(
+    codex_managed_context_enabled: bool,
+    managed_context_recovery_kickstart: bool,
+    managed_context_density_handoff: bool,
+    managed_context_density_handoff_completed: bool,
+) -> bool {
+    codex_managed_context_enabled
+        && !managed_context_recovery_kickstart
+        && !managed_context_density_handoff
+        && !managed_context_density_handoff_completed
+}
+
+fn managed_context_density_pressure_from_usage(
+    usage: &external_agent::AgentUsageSnapshot,
+) -> Option<ManagedContextDensityPressure> {
+    let rewind_only_limit = usage.context_window;
+    if rewind_only_limit == 0 || usage.tokens_used >= rewind_only_limit {
+        return None;
+    }
+    let recommended_rewind_limit = managed_context_density_recommended_limit(rewind_only_limit);
+    if usage.tokens_used < recommended_rewind_limit {
+        return None;
+    }
+    Some(ManagedContextDensityPressure {
+        used_tokens: usage.tokens_used,
+        recommended_rewind_limit,
+        rewind_only_limit,
+        hard_context_window: usage.hard_context_window,
+    })
+}
+
 fn managed_context_rewind_only_tool_allowed(tool_name: &str, preview: &str) -> bool {
     fn allowed_name(name: &str) -> bool {
         matches!(
@@ -5116,6 +5147,29 @@ fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure)
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
         hard = hard,
+    )
+}
+
+fn managed_context_density_active_steer_text(
+    pressure: ManagedContextDensityPressure,
+    in_flight_tool_count: usize,
+) -> String {
+    let hard = pressure
+        .hard_context_window
+        .map(|hard| format!(" hard_limit={hard}"))
+        .unwrap_or_default();
+    let in_flight = if in_flight_tool_count == 0 {
+        "No command/tool was active when Intendant sent this steer; do not start a broad build, QA, exploration, or implementation loop before density maintenance."
+    } else {
+        "Allow the currently in-flight narrow validation/build/tool to finish and preserve its durable result, but do not start another broad build, QA, exploration, or implementation loop before density maintenance."
+    };
+    format!(
+        "<managed_context_density_steer>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). {in_flight} Normal tools are still allowed below rewind_only, but before broad follow-up work do exact-anchor density maintenance if a current catalog anchor can materially reduce pressure below the recommended density threshold, or give a concise no-rewind density handoff that crystallizes durable facts, changed files, validation results, constraints, and remaining decisions. Use list_rewind_anchors and inspect_rewind_anchor only as needed; if rewinding, call rewind_context with one exact returned item_id, a valid returned position, and a dense carry-forward primer. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_steer>",
+        used = pressure.used_tokens,
+        limit = pressure.rewind_only_limit,
+        recommended = pressure.recommended_rewind_limit,
+        hard = hard,
+        in_flight = in_flight,
     )
 }
 
@@ -7333,6 +7387,8 @@ async fn drain_external_agent_events(
     let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
     let mut managed_context_rewind_only_pressure: Option<ManagedContextRewindOnlyPressure> = None;
     let mut managed_context_pressure_interrupt_sent = false;
+    let mut managed_context_density_steer_sent =
+        managed_context_recovery_kickstart || managed_context_density_handoff;
     let mut managed_context_blocked_tool_items: HashSet<String> = HashSet::new();
 
     // Background watcher: if an interrupt arrives while an approval handler
@@ -8154,6 +8210,45 @@ async fn drain_external_agent_events(
                                 config.bus.send(AppEvent::LogEntry {
                                     session_id: config.session_id.clone(),
                                     level: "warn".to_string(),
+                                    source: "Intendant".to_string(),
+                                    content,
+                                    turn: None,
+                                });
+                            }
+                        }
+                    } else if let Some(pressure) =
+                        managed_context_density_pressure_from_usage(&usage)
+                    {
+                        if !managed_context_density_steer_sent && pending_backend_recovery.is_none()
+                        {
+                            managed_context_density_steer_sent = true;
+                            let steer_text = managed_context_density_active_steer_text(
+                                pressure,
+                                active_tool_ids.len(),
+                            );
+                            let content = format!(
+                                "Managed Codex context pressure is watch ({}/{} tokens, threshold {}); steering active turn toward density maintenance before more broad work.",
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit,
+                                pressure.recommended_rewind_limit
+                            );
+                            slog(config.session_log, |l| l.info(&content));
+                            config.bus.send(AppEvent::LogEntry {
+                                session_id: config.session_id.clone(),
+                                level: "info".to_string(),
+                                source: "Intendant".to_string(),
+                                content,
+                                turn: None,
+                            });
+                            if let Err(e) = agent.steer_turn(&steer_text).await {
+                                let content = format!(
+                                    "Managed-context density steer could not be delivered: {}",
+                                    e
+                                );
+                                slog(config.session_log, |l| l.debug(&content));
+                                config.bus.send(AppEvent::LogEntry {
+                                    session_id: config.session_id.clone(),
+                                    level: "debug".to_string(),
                                     source: "Intendant".to_string(),
                                     content,
                                     turn: None,
@@ -9227,6 +9322,7 @@ struct FollowUpMessage {
     target_session_id: Option<String>,
     managed_context_recovery_kickstart: bool,
     managed_context_density_handoff: bool,
+    managed_context_density_handoff_completed: bool,
 }
 
 impl FollowUpMessage {
@@ -9243,6 +9339,7 @@ impl FollowUpMessage {
             target_session_id: None,
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
+            managed_context_density_handoff_completed: false,
         }
     }
 
@@ -9259,6 +9356,7 @@ impl FollowUpMessage {
             target_session_id: None,
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
+            managed_context_density_handoff_completed: false,
         }
     }
 
@@ -9275,6 +9373,7 @@ impl FollowUpMessage {
             target_session_id: None,
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
+            managed_context_density_handoff_completed: false,
         }
     }
 
@@ -9298,6 +9397,7 @@ impl FollowUpMessage {
             target_session_id: None,
             managed_context_recovery_kickstart: false,
             managed_context_density_handoff: false,
+            managed_context_density_handoff_completed: false,
         }
     }
 
@@ -9318,6 +9418,11 @@ impl FollowUpMessage {
 
     fn managed_context_density_handoff(mut self) -> Self {
         self.managed_context_density_handoff = true;
+        self
+    }
+
+    fn after_managed_context_density_handoff(mut self) -> Self {
+        self.managed_context_density_handoff_completed = true;
         self
     }
 }
@@ -9494,6 +9599,8 @@ type FollowUpReceiver = tokio::sync::mpsc::Receiver<FollowUpMessage>;
 /// CLI flags parsed from command-line arguments.
 struct CliFlags {
     task: Option<String>,
+    /// --task-file <PATH>: Read the initial task from a file instead of argv.
+    task_file: Option<String>,
     provider: Option<String>,
     model: Option<String>,
     verbose: bool,
@@ -9567,6 +9674,7 @@ fn print_help() {
     println!("OPTIONS:");
     println!("    --provider <NAME>     API provider (openai, anthropic, or gemini)");
     println!("    --model <NAME>        Model name to use");
+    println!("    --task-file <PATH>    Read initial task from file instead of argv");
     println!("    --autonomy <LEVEL>    Autonomy level: low, medium, high, full");
     println!("    --log-file <DIR>      Override session log directory (default: ~/.intendant/logs/<uuid>/)");
     println!("    --continue, -c        Resume the most recent session for this project");
@@ -9993,6 +10101,7 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     let args: Vec<String> = env::args().skip(1).collect();
     let mut flags = CliFlags {
         task: None,
+        task_file: None,
         provider: None,
         model: None,
         verbose: false,
@@ -10049,6 +10158,16 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     i += 2;
                 } else {
                     return Err(CallerError::Config("Missing value for --model".to_string()));
+                }
+            }
+            "--task-file" => {
+                if i + 1 < args.len() {
+                    flags.task_file = Some(args[i + 1].clone());
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config(
+                        "Missing value for --task-file".to_string(),
+                    ));
                 }
             }
             "--verbose" | "-v" => {
@@ -10248,6 +10367,11 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
     if !task_parts.is_empty() {
         flags.task = Some(task_parts.join(" "));
     }
+    if flags.task.is_some() && flags.task_file.is_some() {
+        return Err(CallerError::Config(
+            "`--task-file` cannot be combined with a positional task".to_string(),
+        ));
+    }
     validate_tls_cli_flags(&flags)?;
 
     Ok(flags)
@@ -10273,6 +10397,7 @@ fn validate_tls_cli_flags(flags: &CliFlags) -> Result<(), CallerError> {
 fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
     use_web
         && !flags.mcp
+        && flags.task_file.is_none()
         && flags
             .task
             .as_ref()
@@ -11373,6 +11498,7 @@ mod tests {
 
     struct ManagedDrainTestAgent {
         interrupts: Arc<std::sync::atomic::AtomicUsize>,
+        steers: Arc<Mutex<Vec<String>>>,
     }
 
     #[async_trait::async_trait]
@@ -11415,6 +11541,11 @@ mod tests {
         async fn interrupt_turn(&mut self) -> Result<(), CallerError> {
             self.interrupts
                 .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+
+        async fn steer_turn(&mut self, text: &str) -> Result<(), CallerError> {
+            self.steers.lock().unwrap().push(text.to_string());
             Ok(())
         }
 
@@ -11498,8 +11629,10 @@ mod tests {
         drop(event_tx);
 
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
         let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
             interrupts: interrupts.clone(),
+            steers: steers.clone(),
         });
         let mut stats = LoopStats::default();
         let mut diff_tracker = ExternalDiffDeltaTracker::default();
@@ -11530,6 +11663,7 @@ mod tests {
             _ => panic!("expected RecoveryRequired"),
         }
         assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(steers.lock().unwrap().is_empty());
 
         let mut saw_block_log = false;
         loop {
@@ -11558,6 +11692,152 @@ mod tests {
             }
         }
         assert!(saw_block_log);
+    }
+
+    #[tokio::test]
+    async fn managed_context_watch_drain_steers_without_blocking_active_tool() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let mut observed = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("thread-1".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::Usage {
+                usage: external_agent::AgentUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 226_956,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 87.8,
+                    prompt_tokens: 226_000,
+                    completion_tokens: 956,
+                    cached_tokens: 0,
+                },
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "cmd-1".to_string(),
+                tool_name: "command".to_string(),
+                preview: "cargo test --bins".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolOutputDelta {
+                item_id: "cmd-1".to_string(),
+                text: "test result output".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "cmd-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+            steers: steers.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut dedupe,
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        match outcome {
+            DrainOutcome::TurnCompleted { .. } => {}
+            _ => panic!("expected TurnCompleted"),
+        }
+        assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        let steers = steers.lock().unwrap();
+        assert_eq!(steers.len(), 1);
+        assert!(steers[0].contains("context pressure is watch"));
+        assert!(steers[0].contains("recommended_density_threshold=219640"));
+        assert!(steers[0].contains("do not start a broad build"));
+        assert!(steers[0].contains("exact returned item_id"));
+
+        let mut saw_tool_start = false;
+        let mut saw_tool_output = false;
+        loop {
+            match observed.try_recv() {
+                Ok(AppEvent::AgentStarted {
+                    commands_preview, ..
+                }) if commands_preview.contains("cargo test --bins") => {
+                    saw_tool_start = true;
+                }
+                Ok(AppEvent::AgentOutput { stdout, .. })
+                    if stdout.contains("test result output") =>
+                {
+                    saw_tool_output = true;
+                }
+                Ok(AppEvent::LogEntry { content, .. }) => {
+                    assert!(
+                        !content.contains("Blocked Codex tool"),
+                        "watch pressure must not hard-block ordinary tools"
+                    );
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        assert!(
+            saw_tool_start,
+            "watch pressure should allow active tool start"
+        );
+        assert!(
+            saw_tool_output,
+            "watch pressure should allow active tool output"
+        );
     }
 
     #[tokio::test]
@@ -11591,8 +11871,10 @@ mod tests {
         };
         let (_event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
         let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
         let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
             interrupts: interrupts.clone(),
+            steers: steers.clone(),
         });
         let mut stats = LoopStats::default();
         let mut diff_tracker = ExternalDiffDeltaTracker::default();
@@ -11629,6 +11911,7 @@ mod tests {
             _ => panic!("expected Terminated stop outcome"),
         }
         assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(steers.lock().unwrap().is_empty());
     }
 
     #[test]
@@ -11752,6 +12035,27 @@ mod tests {
 
         let normal = FollowUpMessage::text("ordinary follow-up".into());
         assert!(managed_context_density_retry_after_rewind(&normal, Some(&below)).is_none());
+    }
+
+    #[test]
+    fn managed_context_density_handoff_completed_allows_one_queued_replay() {
+        assert!(managed_context_preflight_pressure_gate_enabled(
+            true, false, false, false
+        ));
+        assert!(!managed_context_preflight_pressure_gate_enabled(
+            true, true, false, false
+        ));
+        assert!(!managed_context_preflight_pressure_gate_enabled(
+            true, false, true, false
+        ));
+        assert!(!managed_context_preflight_pressure_gate_enabled(
+            true, false, false, true
+        ));
+
+        let replay =
+            FollowUpMessage::text("held follow-up".into()).after_managed_context_density_handoff();
+        assert!(replay.managed_context_density_handoff_completed);
+        assert!(!replay.managed_context_density_handoff);
     }
 
     #[test]
@@ -15325,6 +15629,7 @@ Also: {"source": "bare"}"#;
     fn cli_flags_for_tests() -> CliFlags {
         CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -15368,6 +15673,55 @@ Also: {"source": "bare"}"#;
 
         flags.task = Some("do the thing".to_string());
         assert!(!should_start_idle_web_daemon(true, &flags));
+
+        flags.task = None;
+        flags.task_file = Some("/tmp/intendant-task.txt".to_string());
+        assert!(!should_start_idle_web_daemon(true, &flags));
+    }
+
+    #[test]
+    fn task_file_is_trimmed_for_initial_task() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_path = dir.path().join("task.txt");
+        std::fs::write(&task_path, "long managed prompt\n").unwrap();
+
+        let mut flags = cli_flags_for_tests();
+        flags.task_file = Some(task_path.to_string_lossy().into_owned());
+
+        let task = get_task_from_flags_or_env(&flags).unwrap();
+        assert_eq!(task, "long managed prompt");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn black_frame_detector_rejects_all_zero_rgb() {
+        let frame = display::Frame {
+            data: vec![0; 4 * 4 * 4],
+            format: display::FrameFormat::Bgra,
+            width: 4,
+            height: 4,
+            stride: 16,
+            timestamp: std::time::Instant::now(),
+        };
+
+        assert!(!frame_has_visible_rgb(&frame));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn black_frame_detector_accepts_visible_rgb() {
+        let mut data = vec![0; 4 * 4 * 4];
+        data[10] = 64;
+        let frame = display::Frame {
+            data,
+            format: display::FrameFormat::Bgra,
+            width: 4,
+            height: 4,
+            stride: 16,
+            timestamp: std::time::Instant::now(),
+        };
+
+        assert!(frame_has_visible_rgb(&frame));
     }
 
     #[test]
@@ -15376,6 +15730,7 @@ Also: {"source": "bare"}"#;
         // but we can test the struct defaults
         let flags = CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -15427,6 +15782,7 @@ Also: {"source": "bare"}"#;
     fn cli_web_flag() {
         let flags = CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -15466,6 +15822,7 @@ Also: {"source": "bare"}"#;
     fn cli_web_with_port() {
         let flags = CliFlags {
             task: None,
+            task_file: None,
             provider: None,
             model: None,
             verbose: false,
@@ -18696,6 +19053,11 @@ fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
     if let Some(ref task) = flags.task {
         return Ok(task.clone());
     }
+    if let Some(ref path) = flags.task_file {
+        return std::fs::read_to_string(path)
+            .map(|s| s.trim_end_matches(|c| c == '\r' || c == '\n').to_string())
+            .map_err(|e| CallerError::Config(format!("Failed to read --task-file {path}: {e}")));
+    }
     if let Ok(task) = env::var("INTENDANT_TASK") {
         return Ok(task);
     }
@@ -21877,6 +22239,8 @@ async fn run_external_agent_mode(
         let target_session_id = followup.target_session_id.clone();
         let managed_context_recovery_kickstart = followup.managed_context_recovery_kickstart;
         let managed_context_density_handoff = followup.managed_context_density_handoff;
+        let managed_context_density_handoff_completed =
+            followup.managed_context_density_handoff_completed;
 
         if let Some(side_thread_id) = target_session_id
             .as_deref()
@@ -22142,7 +22506,12 @@ async fn run_external_agent_mode(
             continue;
         }
 
-        if codex_managed_context_enabled && !managed_context_recovery_kickstart {
+        if managed_context_preflight_pressure_gate_enabled(
+            codex_managed_context_enabled,
+            managed_context_recovery_kickstart,
+            managed_context_density_handoff,
+            managed_context_density_handoff_completed,
+        ) {
             match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                 Ok(Some(snapshot)) => {
                     if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
@@ -22166,6 +22535,7 @@ async fn run_external_agent_mode(
                                 target_session_id: target_session_id.clone(),
                                 managed_context_recovery_kickstart: false,
                                 managed_context_density_handoff: false,
+                                managed_context_density_handoff_completed: false,
                             });
                             emit_follow_up_status(
                                 &bus,
@@ -22223,6 +22593,56 @@ async fn run_external_agent_mode(
                                 recovery_followup.with_follow_up_id(follow_up_id.clone());
                         }
                         next_turn = Some(recovery_followup);
+                        continue 'outer;
+                    } else if let Some(pressure) = managed_context_density_pressure(&snapshot) {
+                        pending_managed_context_replays.push_back(FollowUpMessage {
+                            text: turn_text.clone(),
+                            attachments: attachments.clone(),
+                            steer_id: steer_id.clone(),
+                            follow_up_id: follow_up_id.clone(),
+                            edit_user_turn_index,
+                            edit_user_turn_revision,
+                            edit_original_text: edit_original_text.clone(),
+                            unresolved_attachment_ids: unresolved_attachment_ids.clone(),
+                            target_session_id: target_session_id.clone(),
+                            managed_context_recovery_kickstart: false,
+                            managed_context_density_handoff: false,
+                            managed_context_density_handoff_completed: false,
+                        });
+                        emit_follow_up_status(
+                            &bus,
+                            live_session_id.as_deref(),
+                            &follow_up_id,
+                            None,
+                            "queued",
+                            Some(
+                                "managed context is above the recommended density threshold; sending density handoff before broad follow-up",
+                            ),
+                        );
+                        let handoff_text = managed_context_density_handoff_text(pressure);
+                        slog(&session_log, |l| {
+                            l.info(&format!(
+                                "Holding Codex follow-up during managed-context density watch ({}/{} tokens, threshold {}); sending density handoff",
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit,
+                                pressure.recommended_rewind_limit
+                            ))
+                        });
+                        bus.send(AppEvent::LogEntry {
+                            session_id: live_session_id.clone(),
+                            level: "info".to_string(),
+                            source: "Intendant".to_string(),
+                            content: format!(
+                                "Managed context is above the recommended density threshold ({}/{} tokens, threshold {}); sending a density handoff before broad follow-up work. Normal tools remain allowed below rewind-only pressure.",
+                                pressure.used_tokens,
+                                pressure.rewind_only_limit,
+                                pressure.recommended_rewind_limit
+                            ),
+                            turn: None,
+                        });
+                        next_turn = Some(
+                            FollowUpMessage::text(handoff_text).managed_context_density_handoff(),
+                        );
                         continue 'outer;
                     }
                 }
@@ -22779,12 +23199,23 @@ async fn run_external_agent_mode(
                                 }
                             } else {
                                 managed_context_recovery_kickstarts_without_rewind = 0;
-                                if let Some(replay) = pending_managed_context_replays.pop_front() {
-                                    slog(&session_log, |l| {
-                                        l.warn(
-                                            "Managed-context pressure cleared without a context rewind; replaying held follow-up",
-                                        )
-                                    });
+                                if let Some(mut replay) =
+                                    pending_managed_context_replays.pop_front()
+                                {
+                                    if managed_context_density_handoff {
+                                        slog(&session_log, |l| {
+                                            l.info(
+                                                "Managed-context density handoff completed without a context rewind; replaying held follow-up",
+                                            )
+                                        });
+                                        replay = replay.after_managed_context_density_handoff();
+                                    } else {
+                                        slog(&session_log, |l| {
+                                            l.warn(
+                                                "Managed-context pressure cleared without a context rewind; replaying held follow-up",
+                                            )
+                                        });
+                                    }
                                     record_external_round_inline(
                                         &session_log,
                                         persist_model_responses_inline,
@@ -23809,7 +24240,11 @@ async fn activate_user_display(
     // Detect Wayland even when WAYLAND_DISPLAY isn't in our env (e.g. started
     // from a tty/ssh session while a graphical session is active).
     #[cfg(target_os = "linux")]
-    if std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some() {
+    let wayland_session_detected =
+        std::env::var("WAYLAND_DISPLAY").is_ok() || detect_wayland_socket().is_some();
+
+    #[cfg(target_os = "linux")]
+    if wayland_session_detected {
         if let Some(socket) = detect_wayland_socket() {
             if std::env::var("WAYLAND_DISPLAY").is_err() {
                 eprintln!(
@@ -23922,6 +24357,20 @@ async fn activate_user_display(
                 {
                     eprintln!("[user_display] X11 display session failed: {}", e);
                 } else {
+                    if wayland_session_detected && x11_fallback_session_is_all_black(&session).await
+                    {
+                        session.stop().await;
+                        reject_user_display_activation(
+                            bus,
+                            display_id,
+                            "Wayland portal was not approved and X11 fallback captured an \
+                             all-black rootless Xwayland frame. Approve the screen-sharing \
+                             portal for the user session, or target a virtual Xvfb display \
+                             for headed harness work."
+                                .to_string(),
+                        );
+                        return;
+                    }
                     let (width, height) = session.resolution();
                     let session = Arc::new(session);
                     session.spawn_metrics_logger(Some(bus.clone()));
@@ -24024,6 +24473,49 @@ async fn activate_user_display(
     {
         reject_user_display_activation(bus, display_id, "no supported display backend detected");
     }
+}
+
+#[cfg(target_os = "linux")]
+async fn x11_fallback_session_is_all_black(session: &display::DisplaySession) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+    loop {
+        if let Some(frame) = session.latest_frame().await {
+            return !frame_has_visible_rgb(&frame);
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn frame_has_visible_rgb(frame: &display::Frame) -> bool {
+    if frame.width == 0 || frame.height == 0 || frame.stride == 0 {
+        return false;
+    }
+    let row_bytes = frame.width as usize * 4;
+    let stride = frame.stride as usize;
+    if stride < row_bytes || frame.data.len() < stride.saturating_mul(frame.height as usize) {
+        return false;
+    }
+
+    let total_pixels = frame.width as usize * frame.height as usize;
+    let step = (total_pixels / 4096).max(1);
+    let mut pixel_index = 0usize;
+    for y in 0..frame.height as usize {
+        let row = y * stride;
+        for x in 0..frame.width as usize {
+            if pixel_index % step == 0 {
+                let px = row + x * 4;
+                if frame.data[px] > 3 || frame.data[px + 1] > 3 || frame.data[px + 2] > 3 {
+                    return true;
+                }
+            }
+            pixel_index += 1;
+        }
+    }
+    false
 }
 
 /// Auto-register the Windows desktop as an active display at web-daemon

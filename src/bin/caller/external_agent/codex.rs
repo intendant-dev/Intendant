@@ -58,12 +58,13 @@ Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
 - For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
 - For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. For Station smoke checks, prefer named probes such as `--station-probe rendered --station-probe dock-hidden` over giant inline `--wait-for-function` expressions. For headed Station QA, use the helper's first-class artifacts and rendered controls probe, for example `--headed --station-interaction-probe --screenshot /tmp/intendant-station.png --json`; read the returned artifact path, interaction names/count, warm-up latency, and subsequent latency instead of scraping the helper's temporary Chromium profile or `DevToolsActivePort`. For a temporary local dashboard smoke, prefer one owned-lifecycle command such as `node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> --selector <css>`; the helper launches the built intendant binary as `--web <port> --no-tui`, waits for HTTP readiness, and stops it afterward. Do not start a separate foreground/nohup dashboard just so the helper can connect. The helper launches isolated Chromium, waits for CDP and selectors/functions/probes, handles WebSocket fallbacks, captures requested artifacts, and prints compact PASS/FAIL output with bounded failure excerpts.
+- Do not use broad argv-pattern process cleanup such as `pkill -f validate-dashboard`, `pkill -f intendant`, or similar. Managed controller argv can contain the task prompt, and prompts often include command examples, so `pkill -f` can match and kill the controller supervising you. Prefer helper-owned cleanup, tracked child PIDs, process groups created by the command you launched, temporary workspace/profile directories, or exact PIDs you verified with `ps`.
 - Browser validation retry discipline: run one primary helper smoke. If it fails or times out, run at most one compact diagnostic retry with `--diagnostics --json` and a targeted selector/function. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the helper reason/logs/diagnostics. Do not cycle through raw CDP, Node, Python, Browser, Chrome, and plugin automation stacks unless the user explicitly asks for deeper manual investigation or the helper itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
 - While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors, such as "No output yet", "Still active", or "Polling". Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
 - A rewind can cancel the active long-running command. If the chosen anchor is before a server launch, assume the server may be gone; verify it with a small health check and relaunch tersely instead of preserving the old PID as if it survived.
 - After genuinely noisy or unexpectedly large tool output, failed exploration that added substantial low-value context, backend context status `watch`/`rewind_only`, or finishing a coherent subtask while near the density threshold, crystallize durable facts and consider exact-anchor managed-context maintenance before continuing broad ordinary-tool work.
-- Backend context status `watch`, or usage above the recommended density threshold but below `rewind_only_limit`, is not recovery. Normal tools remain allowed; at handoff or before more broad tool work, use exact-anchor density maintenance only if it materially improves density. At `ok` pressure, do not discover anchors solely for context hygiene.
+- Backend context status `watch`, or usage above the recommended density threshold but below `rewind_only_limit`, is not recovery. Normal tools remain allowed, including one already-running narrow validation/build/check. Do not begin another broad build, QA, exploration, or implementation loop while watch pressure persists; first perform exact-anchor density maintenance if it materially improves density, or give a concise no-rewind density handoff. At `ok` pressure, do not discover anchors solely for context hygiene.
 - Do not call list_rewind_anchors merely because managed_context=managed is enabled, during ordinary startup/status checks, or after bounded searches with compact output at low context pressure. Continue normal work in those cases.
 - Once one of those conditions makes a rewind necessary, use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
 - Do not use recovery_candidates_only=false to look for newer rewind targets. Non-recovery rows require include_non_recovery=true, are diagnostic-only, and must not be passed to rewind_context when recovery_eligible=false or the requested position is not present in the default row's positions.
@@ -5395,6 +5396,24 @@ fn translate_notification_with_state(
     translate_notification_with_scope(method, params, event_tx, state, None, None);
 }
 
+fn codex_item_event_id<'a>(
+    params: &'a serde_json::Value,
+    item: &'a serde_json::Value,
+) -> Option<&'a str> {
+    [
+        item.get("id"),
+        item.get("call_id"),
+        item.get("callId"),
+        params.get("itemId"),
+        params.get("call_id"),
+        params.get("callId"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str().map(str::trim))
+    .find(|value| !value.is_empty())
+}
+
 fn translate_notification_with_scope(
     method: &str,
     params: &serde_json::Value,
@@ -5427,15 +5446,10 @@ fn translate_notification_with_scope(
         }
 
         "item/started" => {
-            let item_type = params
-                .pointer("/item/type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let item_id = params
-                .pointer("/item/id")
-                .or_else(|| params.get("itemId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            let item = params.get("item").unwrap_or(params);
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let item_id = codex_item_event_id(params, item)
+                .unwrap_or_default()
                 .to_string();
 
             match item_type {
@@ -5569,10 +5583,8 @@ fn translate_notification_with_scope(
 
         "item/completed" => {
             let item = params.get("item").unwrap_or(params);
-            let item_id = item
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            let item_id = codex_item_event_id(params, item)
+                .unwrap_or_default()
                 .to_string();
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -8801,6 +8813,50 @@ error: build failed
         match event {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "item-1");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_function_call_output_completion_uses_call_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_CP7ok6SOm9fbU9zYp8Ok1IL3",
+                "output": "Chunk ID: d1ff8c\nWall time: 30.0011 seconds\nProcess running with session ID 1404\n"
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_function_call_output_completion_uses_top_level_call_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "callId": "call_IXwDrmqUWzOZ8mBwjyG3rJqd",
+            "item": {
+                "type": "function_call_output",
+                "output": "Chunk ID: c36672\nWall time: 17.4574 seconds\nProcess exited with code 0\n"
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
             other => panic!("expected ToolCompleted, got {:?}", other),

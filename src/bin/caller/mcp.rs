@@ -429,6 +429,15 @@ impl McpAppState {
         None
     }
 
+    fn session_source_for_id(&self, session_id: &str) -> Option<&str> {
+        for related in self.session_related_ids(session_id) {
+            if let Some(source) = self.session_sources.get(&related) {
+                return Some(source.as_str());
+            }
+        }
+        None
+    }
+
     fn note_session_phase(
         &mut self,
         session_id: Option<&str>,
@@ -785,7 +794,10 @@ impl McpAppState {
                 "hard_limit": null,
                 "rewind_only": false,
                 "density_pressure": false,
+                "density_maintenance_recommended": false,
                 "normal_tools_allowed": true,
+                "broad_followup_allowed": true,
+                "narrow_inflight_validation_allowed": true,
                 "required_action": "continue",
                 "message": "Backend-reported context pressure is unavailable. Normal tools are allowed unless a later status reports rewind_only=true; continue ordinary work while pressure is unknown.",
                 "managed_context": Self::managed_context_mode(managed_context),
@@ -811,9 +823,14 @@ impl McpAppState {
         };
         let rewind_only = managed_context && (status == "high" || status == "critical");
         let density_pressure = used_tokens >= recommended_rewind_limit;
+        let density_maintenance_recommended = managed_context && density_pressure && !rewind_only;
         let normal_tools_allowed = !rewind_only;
+        let broad_followup_allowed = normal_tools_allowed && !density_maintenance_recommended;
+        let narrow_inflight_validation_allowed = normal_tools_allowed;
         let required_action = if rewind_only {
             "rewind_context"
+        } else if density_maintenance_recommended {
+            "density_handoff_before_broad_work"
         } else if density_pressure {
             "continue_or_rewind_optional"
         } else {
@@ -822,7 +839,11 @@ impl McpAppState {
         let message = if rewind_only {
             "Managed context is in rewind-only mode. Use rewind_context before ordinary model-facing tools."
         } else if density_pressure {
-            "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; at handoff or before broad follow-up work, exact-anchor density maintenance is optional only if it materially improves density."
+            if managed_context {
+                "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff."
+            } else {
+                "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; at handoff or before broad follow-up work, exact-anchor density maintenance is optional only if it materially improves density."
+            }
         } else {
             "Context is below the recommended density threshold. Normal tools are allowed; no rewind preparation is needed unless a recent tool result was genuinely noisy or unexpectedly large."
         };
@@ -841,7 +862,10 @@ impl McpAppState {
             "hard_limit": hard_context_window,
             "rewind_only": rewind_only,
             "density_pressure": density_pressure,
+            "density_maintenance_recommended": density_maintenance_recommended,
             "normal_tools_allowed": normal_tools_allowed,
+            "broad_followup_allowed": broad_followup_allowed,
+            "narrow_inflight_validation_allowed": narrow_inflight_validation_allowed,
             "required_action": required_action,
             "message": message,
             "managed_context": Self::managed_context_mode(managed_context),
@@ -7031,7 +7055,9 @@ impl IntendantServer {
                     PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => {}
                 }
             }
-            if let Some(phase) = target_phase.filter(|phase| !target_phase_accepts_follow_up(phase))
+            if let Some(phase) = target_phase
+                .as_ref()
+                .filter(|phase| !target_phase_accepts_follow_up(phase))
             {
                 return format!(
                     "Cannot start task: session {} is not active (phase {}); use restart/resume before sending a follow-up",
@@ -7041,7 +7067,7 @@ impl IntendantServer {
             }
             self.bus
                 .send(AppEvent::ControlCommand(ControlMsg::StartTask {
-                    session_id: Some(session_id),
+                    session_id: Some(session_id.clone()),
                     task: params.task,
                     orchestrate: params.orchestrate,
                     direct: None,
@@ -7050,6 +7076,21 @@ impl IntendantServer {
                     attachments: vec![],
                     follow_up_id: None,
                 }));
+            if target_phase
+                .as_ref()
+                .is_some_and(target_phase_is_active_turn)
+            {
+                let source = self.target_session_source(&session_id).await;
+                if source
+                    .as_deref()
+                    .is_some_and(|source| source.eq_ignore_ascii_case("codex"))
+                {
+                    return "ok (follow-up queued for next turn; active Codex turn is still running)"
+                        .to_string();
+                }
+                return "ok (follow-up queued for next turn; active turn is still running)"
+                    .to_string();
+            }
             return "ok (task dispatched)".to_string();
         }
 
@@ -7084,10 +7125,33 @@ impl IntendantServer {
             .map(|status| status.phase.clone())
             .or_else(|| (s.session_id == session_id).then(|| s.phase.clone()))
     }
+
+    async fn target_session_source(&self, session_id: &str) -> Option<String> {
+        let s = self.state.read().await;
+        s.session_source_for_id(session_id)
+            .map(str::to_string)
+            .or_else(|| {
+                (s.session_id == session_id)
+                    .then(|| s.active_session_source.clone())
+                    .flatten()
+            })
+    }
 }
 
 fn target_phase_accepts_follow_up(phase: &Phase) -> bool {
     !matches!(phase, Phase::Idle | Phase::Done | Phase::Interrupted)
+}
+
+fn target_phase_is_active_turn(phase: &Phase) -> bool {
+    matches!(
+        phase,
+        Phase::Thinking
+            | Phase::RunningAgent
+            | Phase::Orchestrating
+            | Phase::WaitingApproval
+            | Phase::WaitingHuman
+            | Phase::Interrupting
+    )
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -9288,7 +9352,10 @@ mod tests {
             assert_eq!(pressure["rewind_only_limit"], 100_000);
             assert_eq!(pressure["rewind_only"], false);
             assert_eq!(pressure["density_pressure"], true);
+            assert_eq!(pressure["density_maintenance_recommended"], false);
             assert_eq!(pressure["normal_tools_allowed"], true);
+            assert_eq!(pressure["broad_followup_allowed"], true);
+            assert_eq!(pressure["narrow_inflight_validation_allowed"], true);
             assert_eq!(pressure["required_action"], "continue_or_rewind_optional");
             assert_eq!(pressure["managed_context"], "vanilla");
         });
@@ -9346,14 +9413,22 @@ mod tests {
         let pressure = s.context_pressure_snapshot();
         assert_eq!(pressure["status"], "watch");
         assert_eq!(pressure["rewind_only"], false);
+        assert_eq!(pressure["density_maintenance_recommended"], true);
         assert_eq!(pressure["normal_tools_allowed"], true);
-        assert_eq!(pressure["required_action"], "continue_or_rewind_optional");
+        assert_eq!(pressure["broad_followup_allowed"], false);
+        assert_eq!(pressure["narrow_inflight_validation_allowed"], true);
+        assert_eq!(
+            pressure["required_action"],
+            "density_handoff_before_broad_work"
+        );
         assert_eq!(
             pressure["last_rewind_insufficient"],
             serde_json::Value::Null
         );
         let message = pressure["message"].as_str().unwrap_or_default();
-        assert!(message.contains("Normal tools are allowed"));
+        assert!(message.contains("Normal tools remain allowed"));
+        assert!(message.contains("one narrow in-flight validation or build"));
+        assert!(message.contains("concise no-rewind density handoff"));
         assert!(!message.contains("recovery"));
         assert!(!message.contains("Use rewind_context before ordinary"));
         assert!(s.rewind_only_gate_message("execute_cu_actions").is_none());
@@ -10544,6 +10619,79 @@ mod tests {
     }
 
     #[test]
+    fn start_task_targeting_running_codex_reports_follow_up_queued() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let wrapper_session_id = "17ea6240-138a-4db6-8954-22f11437aa0d";
+            let backend_session_id = "019e9fa2-active-turn";
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: wrapper_session_id.to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: backend_session_id.to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 9,
+                        phase: "thinking".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: wrapper_session_id.to_string(),
+                        task: "active managed Codex turn".to_string(),
+                    },
+                );
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "please prioritize the harness status fix"
+                    }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("tool should queue active-turn follow-up");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains(
+                    "ok (follow-up queued for next turn; active Codex turn is still running)"
+                ),
+                "got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("ok (task dispatched)"),
+                "active-turn follow-up must not look actively dispatched: {rendered}"
+            );
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id,
+                    task,
+                    ..
+                }))) => {
+                    assert_eq!(session_id.as_deref(), Some(wrapper_session_id));
+                    assert_eq!(task, "please prioritize the harness status fix");
+                }
+                other => panic!("expected queued StartTask control event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
     fn start_task_rejects_persisted_non_external_inactive_session_without_silent_ok() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11649,7 +11797,11 @@ mod tests {
             );
             assert_eq!(
                 value.pointer("/context_pressure/required_action"),
-                Some(&"continue_or_rewind_optional".into())
+                Some(&"density_handoff_before_broad_work".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/broad_followup_allowed"),
+                Some(&false.into())
             );
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),
