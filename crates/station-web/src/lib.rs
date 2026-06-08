@@ -6134,6 +6134,14 @@ impl StationInner {
                 yy += 22.0;
             }
             let mut target_actions = Vec::new();
+            if controls.session_can_focus {
+                target_actions.push((
+                    "focus".to_string(),
+                    "focus".to_string(),
+                    54.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+            }
             if controls.session_can_attach {
                 target_actions.push((
                     "attach".to_string(),
@@ -6156,7 +6164,27 @@ impl StationInner {
                     C_BLUE_CSS.to_string(),
                 ));
             }
+            target_actions.push((
+                "copy".to_string(),
+                "copy id".to_string(),
+                68.0,
+                C_BLUE_CSS.to_string(),
+            ));
+            if !controls.session_backend_id.is_empty() || !controls.session_action_id.is_empty() {
+                target_actions.push((
+                    "copy-backend".to_string(),
+                    "copy backend".to_string(),
+                    108.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+            }
             if controls.session_can_config {
+                target_actions.push((
+                    "config".to_string(),
+                    "launch config".to_string(),
+                    112.0,
+                    C_MAUVE_CSS.to_string(),
+                ));
                 target_actions.push((
                     "restart".to_string(),
                     "restart saved".to_string(),
@@ -6164,7 +6192,34 @@ impl StationInner {
                     C_PEACH_CSS.to_string(),
                 ));
             }
+            if controls.session_can_interrupt {
+                target_actions.push((
+                    "interrupt".to_string(),
+                    "interrupt".to_string(),
+                    82.0,
+                    C_RED_CSS.to_string(),
+                ));
+            } else if controls.session_can_stop {
+                target_actions.push((
+                    "stop".to_string(),
+                    "stop".to_string(),
+                    48.0,
+                    C_RED_CSS.to_string(),
+                ));
+            }
             if controls.session_is_codex {
+                target_actions.push((
+                    "context-jump".to_string(),
+                    "context".to_string(),
+                    70.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+                target_actions.push((
+                    "managed-jump".to_string(),
+                    "managed".to_string(),
+                    78.0,
+                    C_MAUVE_CSS.to_string(),
+                ));
                 target_actions.push((
                     "fork".to_string(),
                     "fork".to_string(),
@@ -6667,7 +6722,7 @@ impl StationInner {
             ));
         }
 
-        let visible = actions.into_iter().take(5).collect::<Vec<_>>();
+        let visible = actions.into_iter().take(6).collect::<Vec<_>>();
         for (row_idx, row_actions) in visible.chunks(3).enumerate() {
             let total_w = row_actions
                 .iter()
@@ -6723,25 +6778,44 @@ impl StationInner {
             }
             "local_stream" => vec![
                 action("video", "open", C_BLUE_CSS),
-                action("input", "input", C_TEAL_CSS),
+                action(
+                    if lane.input_authority == "you" {
+                        "release"
+                    } else {
+                        "take"
+                    },
+                    "input",
+                    C_TEAL_CSS,
+                ),
                 action("attach", "attach", C_PEACH_CSS),
                 action("record", "record", C_RED_CSS),
                 action("full", "fullscreen", C_MAUVE_CSS),
+                action("copy", "copy", C_BLUE_CSS),
             ],
             "remote_stream" => {
                 let mut actions = vec![
                     action("focus", "focus", C_PEACH_CSS),
-                    action("input", "input", C_TEAL_CSS),
+                    action(
+                        if lane.input_authority == "you" {
+                            "release"
+                        } else {
+                            "take"
+                        },
+                        "input",
+                        C_TEAL_CSS,
+                    ),
                 ];
                 if !lane.session_id.is_empty() {
                     actions.push(action("session", "session", C_BLUE_CSS));
                 }
+                actions.push(action("copy", "copy", C_BLUE_CSS));
                 actions.push(action("close", "close", C_RED_CSS));
                 actions
             }
             "peer_target" => vec![
                 action("open", "open", C_PEACH_CSS),
                 action("select", "select", C_BLUE_CSS),
+                action("copy", "copy", C_BLUE_CSS),
             ],
             _ => vec![action("open", "open", C_OVERLAY1_CSS)],
         }
@@ -7143,6 +7217,89 @@ impl StationInner {
                 &nonempty(&controls.session_live_phase, "--"),
             );
             yy += 22.0;
+        }
+        if !controls.session_id.is_empty() {
+            let mut target_actions = Vec::new();
+            if controls.session_can_focus {
+                target_actions.push((
+                    "focus".to_string(),
+                    "focus".to_string(),
+                    54.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+            }
+            if controls.session_can_attach {
+                target_actions.push((
+                    "attach".to_string(),
+                    "attach".to_string(),
+                    58.0,
+                    C_TEAL_CSS.to_string(),
+                ));
+            }
+            target_actions.push((
+                "copy".to_string(),
+                "copy id".to_string(),
+                68.0,
+                C_BLUE_CSS.to_string(),
+            ));
+            if !controls.session_backend_id.is_empty() || !controls.session_action_id.is_empty() {
+                target_actions.push((
+                    "copy-backend".to_string(),
+                    "copy backend".to_string(),
+                    108.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+            }
+            if controls.session_can_config {
+                target_actions.push((
+                    "config".to_string(),
+                    "launch config".to_string(),
+                    112.0,
+                    C_MAUVE_CSS.to_string(),
+                ));
+                target_actions.push((
+                    "restart".to_string(),
+                    "restart saved".to_string(),
+                    112.0,
+                    C_PEACH_CSS.to_string(),
+                ));
+            }
+            if controls.session_can_interrupt {
+                target_actions.push((
+                    "interrupt".to_string(),
+                    "interrupt".to_string(),
+                    82.0,
+                    C_RED_CSS.to_string(),
+                ));
+            } else if controls.session_can_stop {
+                target_actions.push((
+                    "stop".to_string(),
+                    "stop".to_string(),
+                    48.0,
+                    C_RED_CSS.to_string(),
+                ));
+            }
+            if controls.session_is_codex {
+                target_actions.push((
+                    "context-jump".to_string(),
+                    "context".to_string(),
+                    70.0,
+                    C_BLUE_CSS.to_string(),
+                ));
+                target_actions.push((
+                    "managed-jump".to_string(),
+                    "managed".to_string(),
+                    78.0,
+                    C_MAUVE_CSS.to_string(),
+                ));
+            }
+            yy = self.draw_session_action_pills(
+                x,
+                panel_w,
+                yy - 14.0,
+                &target_actions,
+                &controls.session_id,
+            );
         }
         yy = self.draw_external_turn_monitor(x, panel_w, yy, &controls);
         self.panel_row(
@@ -8489,8 +8646,17 @@ impl StationInner {
                 );
             }
             let mut buttons = Vec::new();
+            if row.can_focus && !row.id.is_empty() {
+                buttons.push(("focus", "focus", 48.0, C_BLUE_CSS));
+            }
             if row.can_attach && !row.id.is_empty() {
                 buttons.push(("attach", "attach", 58.0, C_TEAL_CSS));
+            }
+            if !row.id.is_empty() {
+                buttons.push(("copy", "copy", 44.0, C_BLUE_CSS));
+            }
+            if !row.backend_id.is_empty() && !row.id.is_empty() {
+                buttons.push(("copy-backend", "backend", 70.0, C_BLUE_CSS));
             }
             if row.can_resume && !row.id.is_empty() {
                 buttons.push(("resume", "resume", 58.0, C_TEAL_CSS));
@@ -8504,8 +8670,15 @@ impl StationInner {
             if row.can_fork && !row.id.is_empty() {
                 buttons.push(("fork", "fork", 42.0, C_MAUVE_CSS));
             }
+            if row.is_codex && !row.id.is_empty() {
+                buttons.push(("context-jump", "ctx", 38.0, C_BLUE_CSS));
+                buttons.push(("managed-jump", "mgd", 40.0, C_MAUVE_CSS));
+            }
             if row.can_open_log && !row.id.is_empty() {
                 buttons.push(("open-log", "log", 38.0, C_BLUE_CSS));
+            }
+            if row.can_interrupt && !row.id.is_empty() {
+                buttons.push(("interrupt", "interrupt", 74.0, C_RED_CSS));
             }
             if row.can_stop && !row.id.is_empty() {
                 buttons.push(("stop", "stop", 46.0, C_RED_CSS));
@@ -10445,6 +10618,7 @@ struct StationDisplayRunwayLane {
     display_id: i32,
     session_id: String,
     live_id: String,
+    input_authority: String,
     selected: bool,
     can_focus: bool,
     can_interrupt: bool,
@@ -10499,8 +10673,10 @@ struct StationDetailRow {
     can_resume: bool,
     can_config: bool,
     can_rename: bool,
+    can_focus: bool,
     can_attach: bool,
     can_stop: bool,
+    can_interrupt: bool,
     can_restart: bool,
     can_open_log: bool,
     can_fork: bool,
@@ -10538,8 +10714,10 @@ impl Default for StationDetailRow {
             can_resume: false,
             can_config: false,
             can_rename: false,
+            can_focus: false,
             can_attach: false,
             can_stop: false,
+            can_interrupt: false,
             can_restart: false,
             can_open_log: false,
             can_fork: false,

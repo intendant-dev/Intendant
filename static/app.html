@@ -12809,6 +12809,7 @@ function stationDisplayRunwayPayload() {
       meta: `${slot.connected ? 'connected' : 'connecting'} / input ${slot.authorityState || 'unknown'}`,
       detail: `${slot.width || 0}x${slot.height || 0} / ${slot.interactive ? 'interactive' : 'view only'}${slot.recording ? ' / recording' : ''}`,
       display_id: slot.displayId,
+      input_authority: slot.authorityState || '',
       selected: userDisplayGranted && Number(grantedDisplayId) === Number(slot.displayId),
     });
   }
@@ -12822,6 +12823,7 @@ function stationDisplayRunwayPayload() {
       host_id: conn.hostId || '',
       display_id: conn.displayId,
       session_id: conn.sessionId || '',
+      input_authority: conn.peerAuthorityState || '',
       selected: String(conn.hostId || '') === String(selectedHostId || '') && Number(conn.displayId) === Number(selectedDisplayId),
     });
   }
@@ -12959,6 +12961,21 @@ function stationHandleDisplayRunwayAction(action) {
   if (op === 'session' && lane.session_id) {
     if (stationRenderedSelectPanel('system:sessions', 'Display runway session selected')) return;
     stationRenderSessionsDock(lane.session_id);
+    return;
+  }
+  if (op === 'copy') {
+    const id = [
+      lane.id || '',
+      lane.host_id ? `host ${lane.host_id}` : '',
+      lane.display_id !== undefined && lane.display_id !== null ? `display ${lane.display_id}` : '',
+      lane.session_id ? `session ${lane.session_id}` : '',
+    ].filter(Boolean).join(' / ');
+    if (id) {
+      copyTextToClipboard(id)
+        .then(() => stationSetPeerStatus('Display lane ID copied', 'ok'))
+        .catch(err => stationSetPeerStatus(`Display lane copy failed: ${err?.message || err}`, 'error'))
+        .finally(() => stationScheduleUpdate());
+    }
     return;
   }
   if (op === 'stop' && lane.type === 'operator_target') {
@@ -15549,8 +15566,10 @@ function stationSessionRowForDock(session, indexedIds = new Set()) {
     canResume: !!rowId && session?.can_resume !== false,
     canConfig: !!rowId && !!configSource && configSource !== 'intendant',
     canRename: !!rowId,
+    canFocus: !!rowId && (!!live?.liveId || sessionWindows.has(rowId)),
     canAttach: !!rowId && canAttachSessionWindow(rowId),
     canStop: !!rowId && sessionWindowStopAvailability(rowId).ok,
+    canInterrupt: false,
     canRestart: !!rowId && !!configSource && configSource !== 'intendant',
     canOpenLog: !!rowId,
     canFork: !!rowId && (source === 'codex' || stationSessionLooksCodex(threadActionSessionId || rowId)),
@@ -20185,10 +20204,57 @@ function stationHandleSessionAction(action) {
     focusSessionWindow(live?.liveId || sessionId);
     return;
   }
+  if (op === 'interrupt') {
+    stationHandleActivityAction({ action: 'stop' });
+    return;
+  }
   if (op === 'copy') {
     copyTextToClipboard(sessionId)
       .then(() => showControlToast('success', `Copied session ID ${shortSessionId(sessionId)}`))
       .catch(err => showControlToast('error', `Copy session ID failed: ${err?.message || err}`));
+    return;
+  }
+  if (op === 'copy-backend') {
+    const meta = sessionConfigMetadata(session || sessionId);
+    const backendId = String(
+      meta.backendSessionId ||
+      meta.backend_session_id ||
+      session?.backend_session_id ||
+      session?.backendSessionId ||
+      live?.actionId ||
+      ''
+    ).trim();
+    if (backendId) {
+      copyTextToClipboard(backendId)
+        .then(() => showControlToast('success', `Copied backend ID ${shortSessionId(backendId)}`))
+        .catch(err => showControlToast('error', `Copy backend ID failed: ${err?.message || err}`));
+    } else {
+      showControlToast('error', 'No backend ID is available for this session');
+    }
+    return;
+  }
+  if (op === 'copy-intendant') {
+    const meta = sessionConfigMetadata(session || sessionId);
+    const intendantId = String(
+      meta.intendantSessionId ||
+      meta.intendant_session_id ||
+      session?.intendant_session_id ||
+      session?.intendantSessionId ||
+      ''
+    ).trim() || sessionId;
+    copyTextToClipboard(intendantId)
+      .then(() => showControlToast('success', `Copied wrapper ID ${shortSessionId(intendantId)}`))
+      .catch(err => showControlToast('error', `Copy wrapper ID failed: ${err?.message || err}`));
+    return;
+  }
+  if (op === 'context-jump') {
+    stationHandleContextAction({ action: 'live' });
+    stationRenderedSelectPanel('system:context', 'Session context selected');
+    return;
+  }
+  if (op === 'managed-jump') {
+    stationSetManagedSession(sessionId);
+    stationRenderedSelectPanel('system:managed', 'Session managed context selected');
     return;
   }
   if (op === 'resume') {
@@ -21489,10 +21555,13 @@ function stationBuildSessionsSummary() {
       managedContext: row.source === 'codex' ? sessionConfigManagedMode(sessionConfigMetadata(row.id)) : '',
       contextArchive: row.source === 'codex' ? sessionConfigArchiveMode(sessionConfigMetadata(row.id)) : '',
       launchPersistent: true,
+      canFocus: !!row.liveId,
       canResume: !!row.canResume,
       canConfig: !!row.canConfig,
+      canRename: !!row.id,
       canAttach: !!row.attachId,
       canStop: !!row.stopId,
+      canInterrupt: !!row.target && !!controls.sessionCanInterrupt,
       canRestart: !!row.canConfig,
       canOpenLog: true,
       canFork: !!row.isCodex,
