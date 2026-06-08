@@ -1255,6 +1255,83 @@ fn apply_session_capabilities_to_mcp_state(
     true
 }
 
+fn usage_snapshot_from_context_snapshot_event(
+    source: &str,
+    format: &str,
+    token_count: Option<u64>,
+    token_count_kind: Option<&str>,
+    context_window: Option<u64>,
+    hard_context_window: Option<u64>,
+    raw: &serde_json::Value,
+) -> Option<frontend::ModelUsageSnapshot> {
+    if token_count_kind != Some("backend_reported") {
+        return None;
+    }
+    let tokens_used = token_count?;
+    let context_window = context_window?;
+    if context_window == 0 {
+        return None;
+    }
+
+    let provider = if format.starts_with("openai.") {
+        "openai"
+    } else if format.starts_with("anthropic.") {
+        "anthropic"
+    } else if format.starts_with("gemini.") {
+        "gemini"
+    } else {
+        source
+    };
+    let model = raw
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|model| !model.trim().is_empty())
+        .unwrap_or(source);
+
+    Some(frontend::ModelUsageSnapshot {
+        provider: provider.to_string(),
+        model: model.to_string(),
+        tokens_used,
+        context_window,
+        hard_context_window,
+        usage_pct: tokens_used as f64 / context_window as f64 * 100.0,
+        prompt_tokens: tokens_used,
+        completion_tokens: 0,
+        cached_tokens: 0,
+    })
+}
+
+fn apply_context_snapshot_usage_to_mcp_state(
+    s: &mut McpAppState,
+    session_id: Option<&str>,
+    source: &str,
+    format: &str,
+    token_count: Option<u64>,
+    token_count_kind: Option<&str>,
+    context_window: Option<u64>,
+    hard_context_window: Option<u64>,
+    raw: &serde_json::Value,
+) -> bool {
+    let Some(main) = usage_snapshot_from_context_snapshot_event(
+        source,
+        format,
+        token_count,
+        token_count_kind,
+        context_window,
+        hard_context_window,
+        raw,
+    ) else {
+        return false;
+    };
+    let main = s.normalize_main_usage_snapshot(session_id, main);
+    s.record_session_usage_snapshot(session_id, main.clone());
+    if s.session_id_applies_to_current_session(session_id) {
+        s.apply_main_usage_snapshot(main);
+    }
+    s.complete_pending_rewind_pressure_check_for(session_id);
+    true
+}
+
 fn context_rewind_record_id_from_message(message: &str) -> Option<String> {
     message
         .split(|ch: char| ch.is_whitespace() || matches!(ch, ',' | ';' | ')' | '('))
@@ -4080,8 +4157,7 @@ pub fn spawn_event_listener(
                 match event {
                     AppEvent::Key(_) => {} // MCP doesn't handle key events
                     AppEvent::Resize(_, _) => {}
-                    AppEvent::ContextSnapshot { .. }
-                    | AppEvent::LogEntry { .. }
+                    AppEvent::LogEntry { .. }
                     | AppEvent::UserMessageRewind { .. }
                     | AppEvent::UserMessageLog { .. }
                     | AppEvent::ExternalAgentChanged { .. }
@@ -4116,6 +4192,31 @@ pub fn spawn_event_listener(
                     } => {
                         if apply_session_capabilities_to_mcp_state(&mut s, session_id, capabilities)
                         {
+                            resource_changed = Some("intendant://status");
+                        }
+                    }
+                    AppEvent::ContextSnapshot {
+                        ref session_id,
+                        ref source,
+                        ref format,
+                        token_count,
+                        ref token_count_kind,
+                        context_window,
+                        hard_context_window,
+                        ref raw,
+                        ..
+                    } => {
+                        if apply_context_snapshot_usage_to_mcp_state(
+                            &mut s,
+                            session_id.as_deref(),
+                            source,
+                            format,
+                            token_count,
+                            token_count_kind.as_deref(),
+                            context_window,
+                            hard_context_window,
+                            raw,
+                        ) {
                             resource_changed = Some("intendant://status");
                         }
                     }
@@ -4997,6 +5098,27 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             session_id,
             capabilities,
         } => apply_session_capabilities_to_mcp_state(s, session_id, capabilities),
+        AppEvent::ContextSnapshot {
+            session_id,
+            source,
+            format,
+            token_count,
+            token_count_kind,
+            context_window,
+            hard_context_window,
+            raw,
+            ..
+        } => apply_context_snapshot_usage_to_mcp_state(
+            s,
+            session_id.as_deref(),
+            source,
+            format,
+            *token_count,
+            token_count_kind.as_deref(),
+            *context_window,
+            *hard_context_window,
+            raw,
+        ),
         AppEvent::SessionStarted { session_id, task } => {
             s.session_id = session_id.clone();
             s.task_description = task.clone().unwrap_or_default();
@@ -11592,6 +11714,110 @@ mod tests {
             assert_eq!(
                 value.pointer("/context_pressure/context_window"),
                 Some(&serde_json::Value::Null)
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/managed_context"),
+                Some(&"managed".into())
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_uses_backend_context_snapshot_before_usage_snapshot() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.provider_name = "none".to_string();
+                s.model_name = "none".to_string();
+                s.configured_codex_managed_context = true;
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionCapabilities {
+                        session_id: "wrapper-session".to_string(),
+                        capabilities: crate::types::SessionCapabilities {
+                            follow_up: true,
+                            steer: true,
+                            interrupt: true,
+                            codex_thread_actions: vec!["rewind_context".to_string()],
+                            codex_managed_context: Some("managed".to_string()),
+                            codex_sandbox: Some("danger-full-access".to_string()),
+                            codex_approval_policy: Some("never".to_string()),
+                            codex_context_archive: None,
+                            codex_command: Some("/tmp/codex".to_string()),
+                            codex_fast_mode: None,
+                            codex_service_tier: None,
+                        },
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: "wrapper-session".to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: "codex-thread".to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionStarted {
+                        session_id: "codex-thread".to_string(),
+                        task: Some("managed Codex task".to_string()),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::AgentStarted {
+                        session_id: Some("codex-thread".to_string()),
+                        turn: 3,
+                        commands_preview: "edit static/app.html".to_string(),
+                        item_id: None,
+                        source: Some("Codex".to_string()),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::ContextSnapshot {
+                        session_id: Some("codex-thread".to_string()),
+                        source: "codex".to_string(),
+                        label: "Codex resolved request payload".to_string(),
+                        request_id: Some("req-1".to_string()),
+                        request_index: Some(1),
+                        turn: Some(3),
+                        format: "openai.responses.resolved_request.v1".to_string(),
+                        token_count: Some(990),
+                        token_count_kind: Some("backend_reported".to_string()),
+                        context_window: Some(1_000),
+                        hard_context_window: Some(1_200),
+                        item_count: Some(12),
+                        raw: serde_json::json!({ "model": "gpt-5.2-codex" }),
+                    },
+                );
+            }
+
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server.get_status().await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+            assert_eq!(value.pointer("/phase"), Some(&"running_agent".into()));
+            assert_eq!(value.pointer("/provider"), Some(&"openai".into()));
+            assert_eq!(value.pointer("/model"), Some(&"gpt-5.2-codex".into()));
+            assert_eq!(value.pointer("/session_tokens"), Some(&990.into()));
+            assert_eq!(value.pointer("/usage/main/tokens_used"), Some(&990.into()));
+            assert_eq!(
+                value.pointer("/context_pressure/used_tokens"),
+                Some(&990.into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/status"),
+                Some(&"watch".into())
+            );
+            assert_eq!(
+                value.pointer("/context_pressure/context_window"),
+                Some(&1000.into())
             );
             assert_eq!(
                 value.pointer("/context_pressure/managed_context"),
