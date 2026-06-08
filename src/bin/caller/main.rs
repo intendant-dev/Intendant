@@ -7293,11 +7293,6 @@ async fn drain_external_agent_events(
                             &alias_session_id,
                         ) =>
                     {
-                        if let Err(e) = agent.interrupt_turn().await {
-                            slog(config.session_log, |l| {
-                                l.warn(&format!("Stop interrupt failed for {}: {}", agent.name(), e))
-                            });
-                        }
                         return DrainOutcome::Terminated {
                             reason,
                             exit_code: None,
@@ -9003,6 +8998,7 @@ enum LoopExitReason {
 struct LoopStats {
     turns: usize,
     rounds: usize,
+    terminal_outcome: Option<String>,
     usage: provider::TokenUsage,
     codex_subagent_sessions: std::collections::HashSet<String>,
     codex_subagent_parent_threads: std::collections::HashMap<String, String>,
@@ -11222,6 +11218,77 @@ mod tests {
             }
         }
         assert!(saw_block_log);
+    }
+
+    #[tokio::test]
+    async fn stop_requested_drain_returns_without_backend_interrupt() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("thread-1".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let (_event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        bus.send(AppEvent::SessionStopRequested {
+            session_id: Some("thread-1".to_string()),
+            reason: "stopped by user".to_string(),
+        });
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut dedupe,
+            None,
+            false,
+            false,
+        )
+        .await;
+
+        match outcome {
+            DrainOutcome::Terminated { reason, exit_code } => {
+                assert_eq!(reason, "stopped by user");
+                assert_eq!(exit_code, None);
+            }
+            _ => panic!("expected Terminated stop outcome"),
+        }
+        assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]
@@ -20894,6 +20961,8 @@ async fn run_external_agent_mode(
                                 slog(&session_log, |l| {
                                     l.info("Follow-up channel closed, exiting")
                                 });
+                                stats.terminal_outcome =
+                                    Some("follow-up channel closed".to_string());
                                 break 'outer;
                             }
                         }
@@ -20937,6 +21006,7 @@ async fn run_external_agent_mode(
                                         );
                                         slog(&session_log, |l| l.warn(&message));
                                         bus.send(AppEvent::LoopError(message));
+                                        stats.terminal_outcome = Some(reason);
                                         break 'outer;
                                     }
                                     _ => {}
@@ -20947,6 +21017,8 @@ async fn run_external_agent_mode(
                                 slog(&session_log, |l| {
                                     l.info("External agent event channel closed, exiting")
                                 });
+                                stats.terminal_outcome =
+                                    Some("external agent event channel closed".to_string());
                                 break 'outer;
                             }
                         }
@@ -20964,6 +21036,7 @@ async fn run_external_agent_mode(
                                 slog(&session_log, |l| {
                                     l.info(&format!("Stop requested while idle: {}", reason))
                                 });
+                                stats.terminal_outcome = Some(reason);
                                 break 'outer;
                             }
                             Ok(AppEvent::SteerCancelRequested {
@@ -21240,6 +21313,7 @@ async fn run_external_agent_mode(
                             Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,
                             Err(tokio::sync::broadcast::error::RecvError::Closed) => {
                                 slog(&session_log, |l| l.info("Event bus closed, exiting"));
+                                stats.terminal_outcome = Some("event bus closed".to_string());
                                 break 'outer;
                             }
                         }
@@ -22031,6 +22105,7 @@ async fn run_external_agent_mode(
                 "Failed to send follow-up: {}",
                 e
             )));
+            stats.terminal_outcome = Some(format!("failed to send follow-up: {}", e));
             break;
         }
         emit_follow_up_status(
@@ -22152,6 +22227,9 @@ async fn run_external_agent_mode(
                                         native_message_count: None,
                                     });
                                     bus.send(AppEvent::LoopError(message));
+                                    stats.terminal_outcome = Some(
+                                        "managed Codex context pressure unresolved".to_string(),
+                                    );
                                     break;
                                 }
                             } else {
@@ -22244,6 +22322,8 @@ async fn run_external_agent_mode(
                                     native_message_count: None,
                                 });
                                 bus.send(AppEvent::LoopError(message));
+                                stats.terminal_outcome =
+                                    Some("managed Codex context pressure unreadable".to_string());
                                 break;
                             }
                         }
@@ -22269,6 +22349,8 @@ async fn run_external_agent_mode(
                                     native_message_count: None,
                                 });
                                 bus.send(AppEvent::LoopError(message));
+                                stats.terminal_outcome =
+                                    Some("managed Codex context pressure unreadable".to_string());
                                 break;
                             } else {
                                 slog(&session_log, |l| {
@@ -22497,6 +22579,8 @@ async fn run_external_agent_mode(
                             turn: None,
                         });
                         bus.send(AppEvent::LoopError(failure));
+                        stats.terminal_outcome =
+                            Some("managed Codex recovery required".to_string());
                         break;
                     }
                 }
@@ -22523,6 +22607,7 @@ async fn run_external_agent_mode(
                     reason: "recovery required".to_string(),
                     summary: recovery_hint.or(Some(message)),
                 });
+                stats.terminal_outcome = Some("recovery required".to_string());
                 break;
             }
             DrainOutcome::Interrupted { reason } => {
@@ -22549,7 +22634,9 @@ async fn run_external_agent_mode(
             }
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
-                if codex_managed_context_enabled {
+                let user_requested_stop =
+                    matches!(reason.as_str(), "stopped by user" | "restarting session");
+                if codex_managed_context_enabled && !user_requested_stop {
                     match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                         Ok(Some(snapshot)) => {
                             if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
@@ -22573,6 +22660,9 @@ async fn run_external_agent_mode(
                                     native_message_count: None,
                                 });
                                 bus.send(AppEvent::LoopError(message));
+                                stats.terminal_outcome = Some(
+                                    "managed Codex terminated under context pressure".to_string(),
+                                );
                                 break;
                             }
                         }
@@ -22598,12 +22688,14 @@ async fn run_external_agent_mode(
                     reason: reason.clone(),
                     summary: stats.last_response.clone(),
                 });
+                stats.terminal_outcome = Some(reason);
                 break;
             }
             DrainOutcome::ChannelClosed => {
                 slog(&session_log, |l| {
                     l.info("External agent event channel closed")
                 });
+                stats.terminal_outcome = Some("external agent event channel closed".to_string());
                 break;
             }
         }
@@ -26113,10 +26205,11 @@ async fn main() -> Result<(), CallerError> {
 
         let reason = match &result {
             Ok(stats) => {
+                let outcome = stats.terminal_outcome.as_deref().unwrap_or("completed");
                 slog(&session_log, |l| {
-                    l.write_summary_with_rounds(&task, "completed", stats.turns, Some(stats.rounds))
+                    l.write_summary_with_rounds(&task, outcome, stats.turns, Some(stats.rounds))
                 });
-                "completed".to_string()
+                outcome.to_string()
             }
             Err(e) => {
                 slog(&session_log, |l| {
