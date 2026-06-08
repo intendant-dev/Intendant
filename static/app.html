@@ -4105,6 +4105,42 @@ body.context-focus-active {
   color: var(--overlay1);
   margin-bottom: 8px;
 }
+.stats-loading {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 420px;
+  margin: 0 0 24px;
+  padding: 12px 14px;
+  background: var(--mantle);
+  border: 1px solid var(--surface0);
+  border-radius: 8px;
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.stats-loading-spinner {
+  width: 14px;
+  height: 14px;
+  flex: 0 0 auto;
+  border: 2px solid var(--surface2);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: stats-loading-spin 850ms linear infinite;
+}
+.stats-loading-title {
+  display: block;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.stats-loading-detail {
+  display: block;
+  margin-top: 2px;
+  color: var(--overlay1);
+}
+@keyframes stats-loading-spin {
+  to { transform: rotate(360deg); }
+}
 .history-chart {
   display: flex;
   align-items: flex-end;
@@ -9159,6 +9195,13 @@ body.display-fullscreen-open {
         <div class="token-history" id="token-history" style="display:none">
           <div class="history-title">Tokens per Turn</div>
           <div class="history-chart" id="history-chart"></div>
+        </div>
+        <div class="stats-loading" id="stats-session-loading" style="display:none" role="status" aria-live="polite">
+          <span class="stats-loading-spinner" aria-hidden="true"></span>
+          <span>
+            <span class="stats-loading-title">Loading session stats...</span>
+            <span class="stats-loading-detail">More usage sections will appear here.</span>
+          </span>
         </div>
         <div class="cost-section token-activity-section" id="token-activity-section" style="display:none">
           <div class="token-activity-head">
@@ -45149,14 +45192,62 @@ function currentStatsHostKey() {
 }
 
 function renderStatsSessionSections(sessions) {
+  setStatsSessionLoading(currentStatsHostKey(), false);
   renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
   renderDiskUsage(sessions);
 }
 
+function clearStatsSessionSections() {
+  for (const id of [
+    'token-activity-section',
+    'all-sessions-usage',
+    'agent-usage-section',
+    'disk-usage-section',
+  ]) {
+    const el = document.getElementById(id);
+    if (el) el.style.display = 'none';
+  }
+  for (const id of [
+    'token-activity-stats',
+    'token-activity-skyline',
+    'token-activity-months',
+    'token-activity-heatmap',
+    'all-sessions-grid',
+    'agent-usage-grid',
+    'disk-usage-grid',
+  ]) {
+    const el = document.getElementById(id);
+    if (el) el.innerHTML = '';
+  }
+}
+
+function cachedStatsSessions(hostId) {
+  return sessionsListCache.get(sessionListCacheKey(hostId || selfPeerId, { limit: 'all' }));
+}
+
+function setStatsSessionLoading(hostId, loading) {
+  const el = document.getElementById('stats-session-loading');
+  if (!el) return;
+  const normalizedHost = hostId || selfPeerId;
+  const currentHost = currentStatsHostKey();
+  if (normalizedHost !== currentHost) return;
+  el.style.display = loading ? 'flex' : 'none';
+  const container = document.getElementById('usage-container');
+  if (container) {
+    if (loading) container.setAttribute('aria-busy', 'true');
+    else container.removeAttribute('aria-busy');
+  }
+}
+
 function renderCachedStatsSessionSections(hostId) {
-  const sessions = sessionsListCache.get(sessionListCacheKey(hostId || selfPeerId, { limit: 'all' }));
-  if (Array.isArray(sessions)) renderStatsSessionSections(sessions);
+  const sessions = cachedStatsSessions(hostId);
+  if (Array.isArray(sessions)) {
+    renderStatsSessionSections(sessions);
+    return true;
+  }
+  clearStatsSessionSections();
+  return false;
 }
 
 function statsHostHasLiveUsage(hostId) {
@@ -45680,6 +45771,10 @@ function renderSessionStatsFallback(sessions) {
 // mixed content. Same rules as fetching the remote's agent card on add.
 function loadAllSessionsUsage(hostId, options = {}) {
   hostId = hostId || selfPeerId;
+  if (!Array.isArray(cachedStatsSessions(hostId))) {
+    clearStatsSessionSections();
+    setStatsSessionLoading(hostId, true);
+  }
   fetchSessionsForHost(hostId, { force: !!options.force, limit: 'all' })
     .then(sessions => {
       // Only render if the user is still viewing this host. A slow
@@ -45687,12 +45782,14 @@ function loadAllSessionsUsage(hostId, options = {}) {
       // otherwise stomp the current view.
       const currentHost = activeStatsHost || selfPeerId;
       if (currentHost === hostId) {
+        setStatsSessionLoading(hostId, false);
         renderStatsSessionSections(sessions);
       }
     })
     .catch(err => {
       const currentHost = activeStatsHost || selfPeerId;
       if (currentHost === hostId) {
+        setStatsSessionLoading(hostId, false);
         renderAllSessionsUsageError(err.message || 'Failed to load session usage');
       }
     });
