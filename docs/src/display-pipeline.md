@@ -235,8 +235,8 @@ VBoxManage modifyvm <vm> --natpf1 "intendant,tcp,0.0.0.0,8765,,8765"
 ```
 
 Then access the dashboard at `https://<host-LAN-IP>:8765` after enrolling the
-browser/client certificate with `intendant access setup`. Use `--no-tls` only
-for explicit local/debug plaintext.
+browser/client certificate with `intendant access setup`. Use `--no-tls --bind
+127.0.0.1` only for explicit local/debug plaintext.
 
 Plain HTTP is sufficient for the display transport itself, but not for browser
 APIs that require a secure context. Use default HTTPS/mTLS, native `--tls` with

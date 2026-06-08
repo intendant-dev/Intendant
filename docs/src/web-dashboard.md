@@ -22,7 +22,9 @@ There is no opt-in: the gateway starts automatically unless you pass `--no-web`,
 The server binds port **8765** by default, auto-incrementing through 8785 if it
 is busy; the chosen port is printed at startup. With the default mTLS transport,
 open `https://<host>:<port>/` in a browser after running
-`intendant access setup` and enrolling that browser/device.
+`intendant access setup` and enrolling that browser/device. Use
+`--bind 127.0.0.1` when starting plaintext local/debug dashboards with
+`--no-tls`.
 
 > **Correction vs. older docs:** `--web` is the default and no longer "implies
 > `--mcp`". Earlier docs described `--web` as opt-in and tied to MCP mode —
@@ -325,7 +327,7 @@ and written to the session log. See
 ```bash
 ./target/release/intendant                       # default: mTLS, requires access certs
 ./target/release/intendant --tls                 # TLS-only; installed access certs when present, else self-signed
-./target/release/intendant --no-tls              # explicit plaintext/debug escape
+./target/release/intendant --no-tls --bind 127.0.0.1 # explicit local plaintext/debug escape
 ./target/release/intendant --tls-cert c.pem --tls-key k.pem   # bring your own
 ```
 
@@ -333,7 +335,9 @@ By default, the gateway serves HTTPS/WSS with browser client certificates
 required. `--tls` (or `[server.tls] enabled = true`) makes the gateway serve
 HTTPS/WSS without requiring client certificates. With no explicit cert/key
 override, TLS-only uses installed access server certs when present and falls back
-to an auto self-signed certificate.
+to an auto self-signed certificate. Plain HTTP via `--no-tls` is intended for
+local/programmatic debugging; wildcard plaintext refuses startup when the host
+has a public interface unless `--allow-public-plaintext` is passed.
 The gateway demuxes per connection: a first byte of `0x16` (a TLS ClientHello)
 is wrapped in the rustls acceptor, while raw WebRTC ICE-TCP/UDP media is left
 untouched. The TLS stack is pure Rust (`rustls` + `rcgen`) and works on every

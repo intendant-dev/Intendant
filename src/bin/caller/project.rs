@@ -497,6 +497,21 @@ pub struct ProjectConfig {
 /// behind them.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerConfig {
+    /// IP address the web dashboard listens on. Empty/default means the
+    /// current wildcard behavior: bind dual-stack `[::]` when available
+    /// (accepting IPv4 too), then fall back to `0.0.0.0`.
+    ///
+    /// Operators should set this to `127.0.0.1` or another specific
+    /// interface when using plaintext `--no-tls` for local automation.
+    ///
+    /// Example:
+    /// ```toml
+    /// [server]
+    /// bind = "127.0.0.1"
+    /// ```
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bind: Option<std::net::IpAddr>,
+
     /// WebSocket URLs to advertise in this daemon's Agent Card,
     /// in preference order (most-preferred first). Each becomes
     /// an `IntendantWs` transport entry. Empty (the default) means
@@ -512,7 +527,7 @@ pub struct ServerConfig {
     /// ```toml
     /// [server]
     /// advertise = [
-    ///   "ws://192.168.1.42:8765/ws",            # LAN
+    ///   "wss://192.168.1.42:8765/ws",           # LAN with access certs
     ///   "wss://laptop.tail-abcd.ts.net:8443/ws" # Tailscale fallback
     /// ]
     /// ```
@@ -620,7 +635,7 @@ pub struct ServerMutualTlsConfig {
     pub ca: Option<String>,
 }
 
-/// Auth requirements this daemon enforces on inbound peer connections.
+/// Advanced compatibility auth this daemon enforces on inbound peer connections.
 /// Lives under `[server.auth]` in intendant.toml.
 ///
 /// What this configures: what *peers* must present when connecting
@@ -629,26 +644,28 @@ pub struct ServerMutualTlsConfig {
 /// to send. The two are normally kept consistent by the operator — if
 /// `[server.auth] bearer_token` is set, the daemon's Agent Card should
 /// advertise `application: Some(Bearer)` so peers know to send it.
+/// Prefer dashboard/server mTLS for normal operator-facing access; bearer
+/// tokens remain here for legacy deployments and non-browser clients that
+/// cannot present a client certificate yet.
 ///
-/// What it does NOT configure: outbound auth credentials this daemon
+/// What it does NOT configure: outbound legacy credentials this daemon
 /// sends to other peers. Those live on each `[[peer]]` block as
-/// `bearer_token = "..."` and are sent when this daemon connects out.
+/// `bearer_token = "..."`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServerAuthConfig {
     /// When set, inbound HTTP and WebSocket requests must carry
     /// `Authorization: Bearer <token>` matching this exact value.
     /// Missing or wrong token returns 401.
     ///
-    /// `None` (the default) means no application-layer requirement —
-    /// either trust the transport (LAN, mTLS proxy, tailnet) or rely
-    /// on the network firewall. For WAN exposure, operators should
-    /// set this in addition to whatever transport-layer auth they
-    /// have (mTLS proxy in front, etc.) for defense in depth.
+    /// `None` (the default) means no application-layer requirement.
+    /// Prefer mTLS/keycard access for the dashboard and federation. This
+    /// field is intentionally kept as an advanced compatibility escape
+    /// hatch rather than a first-class UX path.
     ///
     /// Example:
     /// ```toml
     /// [server.auth]
-    /// bearer_token = "long-random-secret-from-`openssl rand -hex 32`"
+    /// bearer_token = "legacy-advanced-only"
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
@@ -711,9 +728,9 @@ impl Default for ServerAuthConfig {
 /// peer's Agent Card from that URL at startup, picks a supported
 /// transport, and spawns the actor. `label` is an optional display
 /// override; when absent the card's own `label` field is used.
-/// `bearer_token` is the credential this daemon sends when connecting
-/// out to the peer — must match what the peer's `[server.auth]`
-/// expects.
+/// `bearer_token` is an advanced compatibility credential this daemon
+/// sends when connecting out to legacy peers that still require
+/// `[server.auth] bearer_token`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PeerConfig {
     /// URL of the peer's Agent Card. Typically
@@ -731,15 +748,15 @@ pub struct PeerConfig {
     /// WebSocket request. The peer enforces it via its own
     /// `[server.auth] bearer_token`.
     ///
-    /// Should be set when the peer's Agent Card advertises
-    /// `auth.application = Some(Bearer)`. If the peer requires it
-    /// and this is `None`, the connect attempt will fail with 401.
+    /// Only set this when the peer's Agent Card advertises
+    /// `auth.application = Some(Bearer)`. Normal dashboard and
+    /// federation access should use TLS/mTLS client certificates.
     ///
     /// Example:
     /// ```toml
     /// [[peer]]
     /// card_url = "https://wan-peer.example.com/.well-known/agent-card.json"
-    /// bearer_token = "matching-secret-from-the-peer-side"
+    /// bearer_token = "legacy-token-from-the-peer-side"
     /// ```
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bearer_token: Option<String>,
@@ -981,7 +998,18 @@ mod tests {
         assert!(config.model.max_output_tokens.is_none());
         assert!(config.orchestrator.max_parallel_agents.is_none());
         assert!(config.orchestrator.sub_agent_dir.is_none());
+        assert!(config.server.bind.is_none());
         assert!(config.peers.is_empty());
+    }
+
+    #[test]
+    fn parse_server_bind_ip() {
+        let toml_str = r#"
+[server]
+bind = "127.0.0.1"
+"#;
+        let config: ProjectConfig = toml::from_str(toml_str).unwrap();
+        assert_eq!(config.server.bind, Some("127.0.0.1".parse().unwrap()));
     }
 
     /// `[[peer]]` sections parse into `ProjectConfig.peers` via the
