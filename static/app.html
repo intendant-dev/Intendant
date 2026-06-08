@@ -15698,11 +15698,21 @@ function stationRenderLaunchReadinessSection(parent, opts = {}) {
 }
 
 function stationApplyCodexLaunchDefaultsToDraft() {
-  stationLaunchDraft.managed = newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla';
-  stationLaunchDraft.sandbox = newSessionCodexSandbox || controlCodexConfig.sandbox || 'workspace-write';
-  stationLaunchDraft.approval = newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy || 'on-request';
-  stationLaunchDraft.archive = newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary';
-  stationLaunchDraft.fast = codexServiceTierIsFast(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '');
+  stationLaunchDraft.managed = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexManagedContext || controlCodexConfig.managed_context || 'vanilla')
+    : '';
+  stationLaunchDraft.sandbox = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexSandbox || controlCodexConfig.sandbox || 'workspace-write')
+    : '';
+  stationLaunchDraft.approval = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy || 'on-request')
+    : '';
+  stationLaunchDraft.archive = newSessionCodexLaunchDefaultsLoaded
+    ? (newSessionCodexContextArchive || controlCodexConfig.context_archive || 'summary')
+    : '';
+  stationLaunchDraft.fast = newSessionCodexLaunchDefaultsLoaded
+    ? codexServiceTierIsFast(newSessionCodexDefaultServiceTier || controlCodexConfig.service_tier || '')
+    : false;
 }
 
 function stationSetLaunchDraftAgent(agent, opts = {}) {
@@ -15803,14 +15813,38 @@ async function stationStartSessionFromDock() {
     if (command) msg.agent_command = command;
   }
   if (stationEffectiveLaunchAgent() === 'codex') {
-    msg.codex_sandbox = normalizeCodexSandbox(stationLaunchDraft.sandbox || newSessionCodexSandbox || controlCodexConfig.sandbox);
-    msg.codex_approval_policy = normalizeCodexApprovalPolicy(stationLaunchDraft.approval || newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy);
-    msg.codex_managed_context = stationLaunchDraft.managed === 'managed' ? 'managed' : 'vanilla';
-    msg.codex_context_archive = normalizeContextArchiveMode(stationLaunchDraft.archive || newSessionCodexContextArchive);
-    if (stationLaunchDraft.fast) {
-      msg.codex_service_tier = 'priority';
-    } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
-      msg.codex_service_tier = 'standard';
+    const hasCodexLaunchConfig = newSessionCodexLaunchDefaultsLoaded ||
+      !!stationLaunchDraft.sandbox ||
+      !!stationLaunchDraft.approval ||
+      !!stationLaunchDraft.managed ||
+      !!stationLaunchDraft.archive ||
+      !!stationLaunchDraft.fast;
+    if (hasCodexLaunchConfig) {
+      const sandbox = normalizeCodexSandboxOptional(
+        stationLaunchDraft.sandbox ||
+          (newSessionCodexLaunchDefaultsLoaded ? (newSessionCodexSandbox || controlCodexConfig.sandbox) : '')
+      );
+      const approval = normalizeCodexApprovalPolicyOptional(
+        stationLaunchDraft.approval ||
+          (newSessionCodexLaunchDefaultsLoaded ? (newSessionCodexApprovalPolicy || controlCodexConfig.approval_policy) : '')
+      );
+      const managed = stationLaunchDraft.managed === 'managed' || stationLaunchDraft.managed === 'vanilla'
+        ? stationLaunchDraft.managed
+        : (newSessionCodexLaunchDefaultsLoaded
+          ? (newSessionCodexManagedContext === 'managed' ? 'managed' : 'vanilla')
+          : '');
+      const archive = normalizeContextArchiveModeOptional(
+        stationLaunchDraft.archive || (newSessionCodexLaunchDefaultsLoaded ? newSessionCodexContextArchive : '')
+      );
+      if (sandbox) msg.codex_sandbox = sandbox;
+      if (approval) msg.codex_approval_policy = approval;
+      if (managed) msg.codex_managed_context = managed;
+      if (archive) msg.codex_context_archive = archive;
+      if (stationLaunchDraft.fast) {
+        msg.codex_service_tier = 'priority';
+      } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
+        msg.codex_service_tier = 'standard';
+      }
     }
   }
   if (stationLaunchDraft.direct) msg.direct = true;
@@ -23954,11 +23988,12 @@ let newSessionAgentCommands = {
 };
 let newSessionCodexManagedContext = 'vanilla';
 let newSessionCodexContextArchive = 'summary';
-let newSessionCodexSandbox = 'workspace-write';
-let newSessionCodexApprovalPolicy = 'on-request';
+let newSessionCodexSandbox = '';
+let newSessionCodexApprovalPolicy = '';
 let newSessionCodexDefaultServiceTier = '';
 let newSessionCodexFastMode = false;
 let newSessionCodexFastModeTouched = false;
+let newSessionCodexLaunchDefaultsLoaded = false;
 let newSessionSpawnPending = false;
 let newSessionSpawnTask = '';
 let newSessionSpawnName = '';
@@ -23999,6 +24034,7 @@ async function refreshControlPane() {
     newSessionCodexSandbox = controlCodexConfig.sandbox || 'workspace-write';
     newSessionCodexApprovalPolicy = controlCodexConfig.approval_policy || 'on-request';
     newSessionCodexDefaultServiceTier = controlCodexConfig.service_tier || '';
+    newSessionCodexLaunchDefaultsLoaded = true;
     if (!newSessionCodexFastModeTouched) {
       newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
     }
@@ -28831,6 +28867,47 @@ function sessionConfigArchiveMode(meta = {}) {
   ).trim() || controlCodexConfig.context_archive || 'summary');
 }
 
+function sessionLaunchManagedMode(meta = {}) {
+  const mode = String(
+    meta.codexManagedContext ||
+    meta.codex_managed_context ||
+    meta.capabilities?.codexManagedContext ||
+    meta.capabilities?.codex_managed_context ||
+    ''
+  ).trim();
+  return mode === 'managed' || mode === 'vanilla' ? mode : '';
+}
+
+function sessionLaunchSandboxMode(meta = {}) {
+  return normalizeCodexSandboxOptional(
+    meta.codexSandbox ||
+    meta.codex_sandbox ||
+    meta.capabilities?.codexSandbox ||
+    meta.capabilities?.codex_sandbox ||
+    ''
+  );
+}
+
+function sessionLaunchApprovalPolicy(meta = {}) {
+  return normalizeCodexApprovalPolicyOptional(
+    meta.codexApprovalPolicy ||
+    meta.codex_approval_policy ||
+    meta.capabilities?.codexApprovalPolicy ||
+    meta.capabilities?.codex_approval_policy ||
+    ''
+  );
+}
+
+function sessionLaunchArchiveMode(meta = {}) {
+  return normalizeContextArchiveModeOptional(
+    meta.codexContextArchive ||
+    meta.codex_context_archive ||
+    meta.capabilities?.codexContextArchive ||
+    meta.capabilities?.codex_context_archive ||
+    ''
+  );
+}
+
 function sessionConfigMetadata(sessionOrId) {
   const raw = typeof sessionOrId === 'object'
     ? sessionOrId
@@ -28861,10 +28938,14 @@ function sessionLaunchOverridesForSession(sessionOrId) {
   const command = sessionConfigCommand(meta);
   if (command) overrides.agent_command = command;
   if (source === 'codex') {
-    overrides.codex_sandbox = sessionConfigSandboxMode(meta);
-    overrides.codex_approval_policy = sessionConfigApprovalPolicy(meta);
-    overrides.codex_managed_context = sessionConfigManagedMode(meta);
-    overrides.codex_context_archive = sessionConfigArchiveMode(meta);
+    const sandbox = sessionLaunchSandboxMode(meta);
+    const approvalPolicy = sessionLaunchApprovalPolicy(meta);
+    const managedMode = sessionLaunchManagedMode(meta);
+    const archiveMode = sessionLaunchArchiveMode(meta);
+    if (sandbox) overrides.codex_sandbox = sandbox;
+    if (approvalPolicy) overrides.codex_approval_policy = approvalPolicy;
+    if (managedMode) overrides.codex_managed_context = managedMode;
+    if (archiveMode) overrides.codex_context_archive = archiveMode;
   }
   return overrides;
 }
@@ -45790,14 +45871,29 @@ function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';
 }
 
+function normalizeContextArchiveModeOptional(mode) {
+  const v = String(mode || '').trim();
+  return ['summary', 'exact', 'off'].includes(v) ? v : '';
+}
+
 function normalizeCodexSandbox(mode) {
   const v = String(mode || '').trim();
   return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : 'workspace-write';
 }
 
+function normalizeCodexSandboxOptional(mode) {
+  const v = String(mode || '').trim();
+  return ['workspace-write', 'danger-full-access', 'read-only'].includes(v) ? v : '';
+}
+
 function normalizeCodexApprovalPolicy(policy) {
   const v = String(policy || '').trim();
   return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : 'on-request';
+}
+
+function normalizeCodexApprovalPolicyOptional(policy) {
+  const v = String(policy || '').trim();
+  return ['on-request', 'never', 'untrusted', 'on-failure'].includes(v) ? v : '';
 }
 
 function normalizeCodexServiceTier(tier) {
@@ -45830,6 +45926,7 @@ function setNewSessionAgentDefaults(settings) {
   newSessionCodexSandbox = normalizeCodexSandbox(settings.codex_sandbox || 'workspace-write');
   newSessionCodexApprovalPolicy = normalizeCodexApprovalPolicy(settings.codex_approval_policy || 'on-request');
   newSessionCodexDefaultServiceTier = normalizeCodexServiceTier(settings.codex_service_tier || '');
+  newSessionCodexLaunchDefaultsLoaded = true;
   if (!newSessionCodexFastModeTouched) {
     newSessionCodexFastMode = codexServiceTierIsFast(newSessionCodexDefaultServiceTier);
   }
@@ -46159,25 +46256,27 @@ async function startNewSession() {
     if (agentCommand) msg.agent_command = agentCommand;
   }
   if (effectiveNewSessionAgentId() === 'codex') {
-    msg.codex_sandbox = normalizeCodexSandbox(
-      document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
-    );
-    msg.codex_approval_policy = normalizeCodexApprovalPolicy(
-      document.getElementById('new-session-codex-approval-policy')?.value || newSessionCodexApprovalPolicy
-    );
-    const mode = document.getElementById('new-session-codex-managed-context')?.value === 'managed'
-      ? 'managed'
-      : 'vanilla';
-    msg.codex_managed_context = mode;
-    const archiveMode = normalizeContextArchiveMode(
-      document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
-    );
-    msg.codex_context_archive = archiveMode;
-    const fastChecked = !!document.getElementById('new-session-codex-fast')?.checked;
-    if (fastChecked) {
-      msg.codex_service_tier = 'priority';
-    } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
-      msg.codex_service_tier = 'standard';
+    if (newSessionCodexLaunchDefaultsLoaded) {
+      msg.codex_sandbox = normalizeCodexSandbox(
+        document.getElementById('new-session-codex-sandbox')?.value || newSessionCodexSandbox
+      );
+      msg.codex_approval_policy = normalizeCodexApprovalPolicy(
+        document.getElementById('new-session-codex-approval-policy')?.value || newSessionCodexApprovalPolicy
+      );
+      const mode = document.getElementById('new-session-codex-managed-context')?.value === 'managed'
+        ? 'managed'
+        : 'vanilla';
+      msg.codex_managed_context = mode;
+      const archiveMode = normalizeContextArchiveMode(
+        document.getElementById('new-session-codex-context-archive')?.value || newSessionCodexContextArchive
+      );
+      msg.codex_context_archive = archiveMode;
+      const fastChecked = !!document.getElementById('new-session-codex-fast')?.checked;
+      if (fastChecked) {
+        msg.codex_service_tier = 'priority';
+      } else if (codexServiceTierIsFast(newSessionCodexDefaultServiceTier)) {
+        msg.codex_service_tier = 'standard';
+      }
     }
   }
   if (direct) msg.direct = true;
