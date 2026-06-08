@@ -120,13 +120,14 @@ The wrapper hosts a `WKWebView` that loads the dashboard over a custom
 and camera) would be unavailable. Serving from a registered custom scheme
 restores the secure context the live-voice and camera features need.
 
-When `~/.intendant/access-certs/server.crt` and `server.key` exist and are
-readable, the wrapper automatically starts the bundled daemon with native
-`--tls`. The in-app `intendant://` bridge then speaks HTTPS/WSS to the local
-backend and pins the generated server certificate, while remote browsers can use
-`https://<mac-ip>:<port>` with the same enrolled access CA. Launching the bundle
-with `--mtls` still requires enrolled client certificates; the wrapper presents
-the generated `client.p12` for its own local bridge when that identity is present.
+When the generated access cert set is readable in
+`~/.intendant/access-certs`, the wrapper automatically starts the bundled daemon
+with native `--mtls`. The in-app `intendant://` bridge then speaks HTTPS/WSS to
+the local backend, pins the generated server certificate, and presents the
+generated `client.p12` for its own local bridge. Remote browsers use
+`https://<mac-ip>:<port>` and must have an enrolled client identity. If only the
+server certificate/key are readable, the wrapper falls back to TLS-only. Explicit
+launch flags still win, so `open -a Intendant --args --tls` forces TLS-only.
 
 The same secure-context requirement applies to remote browsers using Station's
 WebGPU renderer, microphone/camera features, browser screen capture, and other
@@ -234,10 +235,9 @@ want the classic in-terminal TUI, run `intendant --no-web "task"`.
 # macOS app bundle (after scripts/bundle-macos.sh)
 open -a Intendant
 
-# Forward daemon flags through the bundle. With access certs installed,
-# the app already enables --tls; add --mtls when the dashboard should
-# require enrolled client certificates.
-open -a Intendant --args --mtls
+# With full access certs installed, the app auto-enables --mtls.
+# Forward --tls only when you intentionally want TLS without client cert auth.
+open -a Intendant --args --tls
 ```
 
 ## CLI flag reference

@@ -311,9 +311,10 @@ and written to the session log. See
   - HTTPS via `--tls` / `[server.tls]` (see below), or
   - the macOS app bundle, which serves the page over a custom `intendant://`
     scheme specifically to restore the secure context (see
-    [Getting Started](./getting-started.md#macos-app-bundle)). When access
-    certs are installed, the bundle also starts its daemon with native TLS so
-    remote browsers can use the same safe context over `https://`.
+    [Getting Started](./getting-started.md#macos-app-bundle)). When full access
+    certs are installed, the bundle also starts its daemon with native mTLS so
+    remote browsers get a safe context over `https://` and must present an
+    enrolled client identity.
 - **API key for voice:** Gemini or OpenAI, stored browser-side only.
 
 ### HTTPS / TLS

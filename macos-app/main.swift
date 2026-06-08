@@ -6,7 +6,8 @@ import WebKit
 
 struct BackendLaunchPlan {
     let extraArgs: [String]
-    let autoTls: Bool
+    let autoTlsOnly: Bool
+    let autoMtls: Bool
     let usesTLS: Bool
     let usesMtls: Bool
     let usesExplicitTlsCertPair: Bool
@@ -36,6 +37,13 @@ func installedAccessTlsAvailable(_ certDir: URL) -> Bool {
         readableFileExists(certDir.appendingPathComponent("server.key"))
 }
 
+func installedAccessMtlsAvailable(_ certDir: URL) -> Bool {
+    installedAccessTlsAvailable(certDir) &&
+        readableFileExists(certDir.appendingPathComponent("ca.crt")) &&
+        readableFileExists(certDir.appendingPathComponent("client.p12")) &&
+        readableFileExists(certDir.appendingPathComponent("p12_password"))
+}
+
 func buildBackendLaunchPlan(extraArgs: [String]) -> BackendLaunchPlan {
     let certDir = defaultAccessCertDir()
     let explicitTls = cliHasFlag(extraArgs, "--tls") ||
@@ -45,12 +53,15 @@ func buildBackendLaunchPlan(extraArgs: [String]) -> BackendLaunchPlan {
     let usesExplicitTlsCertPair = cliHasFlag(extraArgs, "--tls-cert") ||
         cliHasFlag(extraArgs, "--tls-key")
     let disableAutoTls = ProcessInfo.processInfo.environment["INTENDANT_BUNDLE_DISABLE_TLS"] == "1"
-    let autoTls = !explicitTls && !disableAutoTls && installedAccessTlsAvailable(certDir)
+    let autoMtls = !explicitTls && !disableAutoTls && installedAccessMtlsAvailable(certDir)
+    let autoTlsOnly = !explicitTls && !disableAutoTls && !autoMtls &&
+        installedAccessTlsAvailable(certDir)
     return BackendLaunchPlan(
         extraArgs: extraArgs,
-        autoTls: autoTls,
-        usesTLS: explicitTls || autoTls,
-        usesMtls: cliHasFlag(extraArgs, "--mtls"),
+        autoTlsOnly: autoTlsOnly,
+        autoMtls: autoMtls,
+        usesTLS: explicitTls || autoTlsOnly || autoMtls,
+        usesMtls: cliHasFlag(extraArgs, "--mtls") || autoMtls,
         usesExplicitTlsCertPair: usesExplicitTlsCertPair,
         accessCertDir: certDir
     )
@@ -289,8 +300,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                 delegate: backendTrustDelegate,
                 delegateQueue: nil
             )
-            if launchPlan.autoTls {
-                NSLog("Access certs found in \(launchPlan.accessCertDir.path) — launching bundled backend with --tls")
+            if launchPlan.autoMtls {
+                NSLog("Access certs found in \(launchPlan.accessCertDir.path) — launching bundled backend with --mtls")
+            } else if launchPlan.autoTlsOnly {
+                NSLog(
+                    "Access server certs found in \(launchPlan.accessCertDir.path), but mTLS client identity or CA is incomplete — launching bundled backend with --tls"
+                )
             } else {
                 NSLog("Bundled backend TLS enabled by launch arguments")
             }
@@ -461,7 +476,9 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         process.executableURL = URL(fileURLWithPath: binPath)
         // Forward any extra CLI arguments (e.g. --agent codex) to the backend
         var args = ["--web", String(port)]
-        if launchPlan.autoTls {
+        if launchPlan.autoMtls {
+            args.append("--mtls")
+        } else if launchPlan.autoTlsOnly {
             args.append("--tls")
         }
         args.append(contentsOf: launchPlan.extraArgs)
@@ -651,8 +668,8 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
             return
         }
 
-        // Poll the backend directly; under bundled auto-TLS this is HTTPS
-        // and uses the same local trust delegate as the intendant:// proxy.
+        // Poll the backend directly; under bundled auto-TLS/mTLS this is
+        // HTTPS and uses the same local trust delegate as the intendant:// proxy.
         let healthURL = backendURL("/")
         var request = URLRequest(url: healthURL, timeoutInterval: 1)
         request.httpMethod = "HEAD"
