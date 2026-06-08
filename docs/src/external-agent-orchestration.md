@@ -182,20 +182,23 @@ features they lack.
   dense. Rewinds are not just emergency context-limit recovery: they should also
   happen after noisy tool output, failed exploration, or a long research branch
   whose useful result can be crystallized into a compact primer. Model-driven
-  rewinds must first call `list_rewind_anchors`; when the compact row is
-  ambiguous, `inspect_rewind_anchor` returns a small before/after window for the
-  candidate. `rewind_context` still validates the exact `item_id` against the
-  current rollout before mutating the Codex thread.
+  rewinds must first call `list_rewind_anchors`; by default it returns one
+  compact whole-catalog result with exact `item_id` values and short semantic
+  rows for all matching valid anchors instead of a paged crawl. When a compact
+  row is ambiguous, `inspect_rewind_anchor` returns a small before/after window
+  for the candidate. `rewind_context` still validates the exact `item_id`
+  against the current rollout before mutating the Codex thread.
   When backend-reported pressure is at or above the rewind-only threshold,
   `list_rewind_anchors` defaults to recovery candidates: anchors whose nearest
   following backend token report is below that threshold with enough normal-tool
   resume headroom. The default recovery catalog narrows `positions` to accepted
-  `rewind_context` values; audit/inspect rows may also expose per-position
-  eligibility as `recovery_eligible_positions`. Passing
-  `include_non_recovery=true` is an audit escape hatch, not the normal recovery
-  path. Anchors inside the active managed-context recovery span, starting at the
-  recovery kickstart prompt, are not valid recovery targets because they would
-  preserve recovery instructions and anchor-discovery calls. A successful
+  `rewind_context` values. `include_pruning_estimates=true` adds approximate
+  discard sizes to compact rows, while `detail=true` or explicit `offset`/`limit`
+  requests diagnostic detailed pages. Passing `include_non_recovery=true` is an
+  audit escape hatch, not the normal recovery path. Anchors inside the active
+  managed-context recovery span, starting at the recovery kickstart prompt, are
+  not valid recovery targets because they would preserve recovery instructions
+  and anchor-discovery calls. A successful
   `rewind_context` only proves the lineage mutation was
   applied; Intendant and Codex keep normal tools hidden until a later backend
   token report confirms the active thread is below the rewind-only limit.
