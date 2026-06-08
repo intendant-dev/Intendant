@@ -10805,13 +10805,18 @@ const STATION_LOG_ANCHOR_LIMIT = 10000;
 const stationRegisteredSources = new Set();
 let stationLastSnapshotJson = '';
 let stationLastFallbackSnapshot = null;
+let stationSnapshotDirty = false;
 let stationSessionsIndexLoading = false;
 let stationSessionsIndexError = '';
 let stationWebgpuUnavailable = false;
 
 function stationStatus(text) {
   if (String(text || '').includes('renderer=DOM fallback') && (stationWebgpuRequested() || stationWebgpuUnavailable)) {
-    stationDrawCanvasFallbackCommandLane(stationLastFallbackSnapshot || buildStationSnapshot());
+    if (stationSnapshotVisible()) {
+      stationDrawCanvasFallbackCommandLane(stationLastFallbackSnapshot || buildStationSnapshot());
+    } else {
+      stationSnapshotDirty = true;
+    }
   }
   const el = document.getElementById('station-status');
   if (el) el.textContent = text;
@@ -10945,6 +10950,10 @@ function stationFallbackFromUnavailableWebgpu(instance) {
   if (activeTab === 'station') stationRefreshSharedCaches();
 }
 
+function stationSnapshotVisible() {
+  return activeTab === 'station';
+}
+
 async function ensureStation(forceRendered = false) {
   if (!forceRendered && stationDomFallbackRequested()) {
     stationDomFallback = true;
@@ -11053,6 +11062,10 @@ function stationRefreshSharedCaches() {
 
 function stationScheduleUpdate() {
   if (!station && !stationDomFallback) return;
+  if (!stationSnapshotVisible()) {
+    stationSnapshotDirty = true;
+    return;
+  }
   if (stationScheduleUpdate._pending) return;
   stationScheduleUpdate._pending = true;
   requestAnimationFrame(() => {
@@ -11063,6 +11076,11 @@ function stationScheduleUpdate() {
 
 function stationUpdateSnapshot() {
   if (!station && !stationDomFallback) return;
+  if (!stationSnapshotVisible()) {
+    stationSnapshotDirty = true;
+    return;
+  }
+  stationSnapshotDirty = false;
   try {
     const snapshot = buildStationSnapshot();
     stationLastFallbackSnapshot = snapshot;
@@ -22059,27 +22077,34 @@ function stationBuildSessionsSummary() {
     if (hasPendingActiveSessionWindow(sid) || isAgentActivePhase(win.phase)) active += 1;
   }
   if (!active && isAgentActivePhase(currentPhase)) active = 1;
-  const latest = [...sessions].sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))[0] || null;
-  const sessionRows = [...sessions]
-    .sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))
-    .map(session => stationSessionRowForDock(session, indexedIds));
   const sessionQuery = stationSessionDockFilter.trim();
-  const filteredRows = sessionRows.filter(row =>
-    stationSessionDockRowMatchesFilters(
-      row,
-      sessionQuery,
-      stationSessionDockSourceFilter,
-      stationSessionDockStatusFilter,
-      stationSessionDockProjectFilter
-    )
-  );
   const hasSessionFilters = !!(
     sessionQuery ||
     stationSessionDockSourceFilter ||
     stationSessionDockStatusFilter ||
     stationSessionDockProjectFilter
   );
-  const recent = sessionRows.slice(0, 6);
+  const sortedSessions = [...sessions].sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a));
+  const latest = sortedSessions[0] || null;
+  let recent = [];
+  let filteredRows = [];
+  if (hasSessionFilters) {
+    const sessionRows = sortedSessions.map(session => stationSessionRowForDock(session, indexedIds));
+    filteredRows = sessionRows.filter(row =>
+      stationSessionDockRowMatchesFilters(
+        row,
+        sessionQuery,
+        stationSessionDockSourceFilter,
+        stationSessionDockStatusFilter,
+        stationSessionDockProjectFilter
+      )
+    );
+    recent = sessionRows.slice(0, 6);
+  } else {
+    recent = sortedSessions
+      .slice(0, 6)
+      .map(session => stationSessionRowForDock(session, indexedIds));
+  }
   let externalTargets = [];
   try {
     externalTargets = stationExternalTargetRowsForDock(5).map(row => ({
@@ -22137,7 +22162,7 @@ function stationBuildSessionsSummary() {
     sourceFilter: stationSessionDockSourceFilter || '',
     statusFilter: stationSessionDockStatusFilter || '',
     projectFilter: stationSessionDockProjectFilter || '',
-    filtered: filteredRows.length,
+    filtered: hasSessionFilters ? filteredRows.length : sessions.length,
     filteredSessions: hasSessionFilters ? filteredRows.slice(0, 8) : [],
     externalTargets,
     recent,
