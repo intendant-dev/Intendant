@@ -6295,11 +6295,14 @@ impl StationInner {
             return yy + 20.0;
         }
         for row in rows.iter().take(max_rows) {
+            let has_goal = !row.goal_status.is_empty() || !row.goal_objective.is_empty();
+            let show_thread_controls = row.is_codex || has_goal;
+            let card_h = if show_thread_controls { 68.0 } else { 43.0 };
             self.round_rect(
                 x + 12.0,
                 yy - 11.0,
                 panel_w - 24.0,
-                43.0,
+                card_h,
                 4.0,
                 "rgba(17,17,27,0.76)",
                 "rgba(49,50,68,0.72)",
@@ -6317,7 +6320,7 @@ impl StationInner {
                     x + 12.0,
                     yy - 11.0,
                     panel_w - 24.0,
-                    43.0,
+                    card_h,
                     action,
                 ));
             }
@@ -6345,6 +6348,72 @@ impl StationInner {
                 C_SUBTEXT0_CSS,
                 "normal",
             );
+            if show_thread_controls {
+                let goal_status = nonempty(&row.goal_status, "goal");
+                let goal_detail = if row.goal_objective.is_empty() {
+                    if row.is_codex {
+                        "goal controls available".to_string()
+                    } else {
+                        "goal --".to_string()
+                    }
+                } else {
+                    format!("{} · {}", goal_status, row.goal_objective)
+                };
+                let goal_tokens = if row.goal_tokens.is_empty() {
+                    String::new()
+                } else if row.goal_token_budget.is_empty() {
+                    format!(" · {} tok", row.goal_tokens)
+                } else {
+                    format!(" · {}/{} tok", row.goal_tokens, row.goal_token_budget)
+                };
+                self.text(
+                    &truncate(&format!("{goal_detail}{goal_tokens}"), 28),
+                    x + 20.0,
+                    yy + 35.0,
+                    8.5,
+                    if row.goal_status == "active" {
+                        C_GREEN_CSS
+                    } else if row.goal_status == "paused" {
+                        C_YELLOW_CSS
+                    } else {
+                        C_MAUVE_CSS
+                    },
+                    "normal",
+                );
+                let session_id = nonempty(&row.thread_action_session_id, &row.id);
+                if !session_id.is_empty() {
+                    let middle = if row.goal_status == "paused" {
+                        ("goal-resume", "resume", 58.0, C_GREEN_CSS)
+                    } else {
+                        ("goal-pause", "pause", 50.0, C_YELLOW_CSS)
+                    };
+                    let goal_buttons = [
+                        ("goal-get", "status", 54.0, C_MAUVE_CSS),
+                        middle,
+                        ("goal-clear", "clear", 48.0, C_RED_CSS),
+                    ];
+                    let total_w = goal_buttons
+                        .iter()
+                        .map(|(_, _, width, _)| *width)
+                        .sum::<f32>()
+                        + (goal_buttons.len().saturating_sub(1) as f32 * 6.0);
+                    let mut bx = x + panel_w - total_w - 28.0;
+                    for (op, label, width, color) in goal_buttons {
+                        self.pill_at(bx, yy + 39.0, width, 18.0, label, color);
+                        self.hit_zones.push(HitZone::new(
+                            bx,
+                            yy + 39.0,
+                            width,
+                            18.0,
+                            HitAction::ThreadAction {
+                                op: op.to_string(),
+                                session_id: session_id.clone(),
+                            },
+                        ));
+                        bx += width + 6.0;
+                    }
+                }
+            }
             let mut buttons = Vec::new();
             if row.can_attach && !row.id.is_empty() {
                 buttons.push(("attach", "attach", 58.0, C_TEAL_CSS));
@@ -6384,7 +6453,7 @@ impl StationInner {
                     bx += width + 6.0;
                 }
             }
-            yy += 47.0;
+            yy += card_h + 4.0;
         }
         yy
     }
@@ -8132,6 +8201,12 @@ struct StationDetailRow {
     value: String,
     detail: String,
     tone: String,
+    is_codex: bool,
+    thread_action_session_id: String,
+    goal_status: String,
+    goal_objective: String,
+    goal_tokens: String,
+    goal_token_budget: String,
     can_resume: bool,
     can_config: bool,
     can_rename: bool,
@@ -8149,6 +8224,12 @@ impl Default for StationDetailRow {
             value: String::new(),
             detail: String::new(),
             tone: String::new(),
+            is_codex: false,
+            thread_action_session_id: String::new(),
+            goal_status: String::new(),
+            goal_objective: String::new(),
+            goal_tokens: String::new(),
+            goal_token_budget: String::new(),
             can_resume: false,
             can_config: false,
             can_rename: false,

@@ -15412,6 +15412,8 @@ function stationSessionRowForDock(session, indexedIds = new Set()) {
   const source = normalizeAgentId(configSource || stationSessionSource(session) || session?.source || '') || 'intendant';
   const project = sessionProjectDirectory(session);
   const rowId = String(id || '').trim();
+  const goal = normalizeSessionGoal(configMeta.goal || configMeta.session_goal || configMeta.sessionGoal || null);
+  const threadActionSessionId = stationCodexThreadActionSessionId(session) || rowId;
   return {
     id: rowId,
     action: indexedIds.has(String(id)) ? 'detail' : '',
@@ -15426,6 +15428,16 @@ function stationSessionRowForDock(session, indexedIds = new Set()) {
     source,
     status,
     project,
+    isCodex: source === 'codex' || stationSessionLooksCodex(rowId),
+    threadActionSessionId,
+    goalStatus: goal?.status || '',
+    goalObjective: goal?.objective || '',
+    goalTokens: goal?.tokensUsed !== null && goal?.tokensUsed !== undefined
+      ? String(goal.tokensUsed)
+      : '',
+    goalTokenBudget: goal?.tokenBudget !== null && goal?.tokenBudget !== undefined
+      ? String(goal.tokenBudget)
+      : '',
     canResume: !!rowId && session?.can_resume !== false,
     canConfig: !!rowId && !!configSource && configSource !== 'intendant',
     canRename: !!rowId,
