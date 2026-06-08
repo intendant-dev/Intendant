@@ -20080,6 +20080,14 @@ function stationHandleSessionAction(action) {
     setTimeout(() => document.getElementById('station-session-config-command')?.focus(), 0);
     return;
   }
+  if (op === 'config-save') {
+    stationSaveSessionConfigFromDock(stationSessionId(session) || sessionId);
+    return;
+  }
+  if (op === 'config-save-restart') {
+    stationSaveSessionConfigFromDock(stationSessionId(session) || sessionId, { restart: true });
+    return;
+  }
   if (op === 'restart') {
     restartSessionWindowAction(sessionId);
     return;
@@ -21234,11 +21242,18 @@ function stationBuildControlsSummary() {
   const sessionCommand = !sessionId
     ? ''
     : (sessionSource === 'intendant' ? 'internal' : (rawSessionCommand || 'global default'));
+  const sessionBackendId = String(sessionMeta.backendSessionId || sessionMeta.backend_session_id || '').trim();
+  const sessionIntendantId = String(sessionMeta.intendantSessionId || sessionMeta.intendant_session_id || '').trim();
   const sessionManagedContext = sessionSource === 'codex' ? sessionConfigManagedMode(sessionMeta) : '';
   const sessionContextArchive = sessionSource === 'codex' ? sessionConfigArchiveMode(sessionMeta) : '';
   let sessionCanConfig = !!sessionId && !!rawSessionSource && rawSessionSource !== 'intendant';
   const externalLive = sessionId ? stationExternalLiveThreadDescriptor(sessionId) : null;
   if (externalLive?.source && externalLive.source !== 'intendant') sessionCanConfig = true;
+  const sessionConfigEditing = sessionCanConfig ? stationSessionConfigEditingFor(sessionId) : null;
+  const sessionConfigHadDraft = !!(sessionConfigEditing?.sessionId && stationSessionConfigDrafts.has(sessionConfigEditing.sessionId));
+  const sessionConfigDraft = sessionConfigEditing ? stationSessionConfigDraftFor(sessionConfigEditing) : null;
+  const sessionConfigPending = !!(sessionConfigSavePending?.station && sessionConfigEditing?.sessionId && sessionConfigSavePending.sessionId === sessionConfigEditing.sessionId);
+  const sessionConfigResultActive = !!(sessionConfigEditing?.sessionId && stationSessionConfigResult.sessionId === sessionConfigEditing.sessionId);
   const sessionLiveId = externalLive?.liveId || '';
   const sessionActionId = externalLive?.actionId || '';
   const sessionAttachId = externalLive?.attachId || '';
@@ -21347,6 +21362,8 @@ function stationBuildControlsSummary() {
     sessionSelection,
     sessionSource,
     sessionCommand,
+    sessionBackendId,
+    sessionIntendantId,
     sessionLiveId,
     sessionLivePhase,
     sessionActionId,
@@ -21354,6 +21371,14 @@ function stationBuildControlsSummary() {
     sessionStopId,
     sessionManagedContext,
     sessionContextArchive,
+    sessionSandbox: sessionSource === 'codex' ? sessionConfigSandboxMode(sessionMeta) : '',
+    sessionApprovalPolicy: sessionSource === 'codex' ? sessionConfigApprovalPolicy(sessionMeta) : '',
+    sessionConfigManaged: sessionConfigDraft?.managed || sessionManagedContext || '',
+    sessionConfigArchive: sessionConfigDraft?.archive || sessionContextArchive || '',
+    sessionConfigResult: sessionConfigResultActive ? (stationSessionConfigResult.text || '') : '',
+    sessionConfigResultKind: sessionConfigResultActive ? (stationSessionConfigResult.kind || '') : '',
+    sessionConfigHasDraft: sessionConfigHadDraft,
+    sessionConfigPending,
     sessionCanConfig,
     sessionCanFocus,
     sessionCanAttach,

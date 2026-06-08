@@ -6449,6 +6449,120 @@ impl StationInner {
             &nonempty(&controls.session_service_tier, "--"),
         );
         yy += 22.0;
+        if controls.session_can_config {
+            self.section_title_color(x, yy + 8.0, "Launch config", C_PEACH_CSS);
+            yy += 30.0;
+            if !controls.session_backend_id.is_empty() || !controls.session_intendant_id.is_empty() {
+                self.panel_row(
+                    x,
+                    yy,
+                    "ids",
+                    &truncate(
+                        &format!(
+                            "backend {} · wrapper {}",
+                            short_id(&controls.session_backend_id),
+                            short_id(&controls.session_intendant_id)
+                        ),
+                        42,
+                    ),
+                );
+                yy += 22.0;
+            }
+            self.panel_row(
+                x,
+                yy,
+                "runtime",
+                &truncate(
+                    &format!(
+                        "{} / {}",
+                        nonempty(&controls.session_sandbox, "sandbox --"),
+                        nonempty(&controls.session_approval_policy, "approval --")
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+            self.panel_row(
+                x,
+                yy,
+                "draft",
+                &truncate(
+                    &format!(
+                        "{}{} / {}",
+                        if controls.session_config_pending {
+                            "saving "
+                        } else if controls.session_config_has_draft {
+                            "draft "
+                        } else {
+                            "saved "
+                        },
+                        nonempty(&controls.session_config_managed, "vanilla"),
+                        nonempty(&controls.session_config_archive, "summary")
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+            if !controls.session_config_result.is_empty() {
+                self.panel_row_color(
+                    x,
+                    yy,
+                    "result",
+                    &truncate(&controls.session_config_result, 42),
+                    if controls.session_config_result_kind == "error" {
+                        C_RED_CSS
+                    } else if controls.session_config_result_kind == "ok" {
+                        C_GREEN_CSS
+                    } else {
+                        C_TEXT_CSS
+                    },
+                );
+                yy += 22.0;
+            }
+            let mut config_actions = vec![
+                (
+                    "config".to_string(),
+                    "edit config".to_string(),
+                    92.0,
+                    C_MAUVE_CSS.to_string(),
+                ),
+                (
+                    "config-save".to_string(),
+                    if controls.session_config_pending {
+                        "saving".to_string()
+                    } else {
+                        "save".to_string()
+                    },
+                    58.0,
+                    C_GREEN_CSS.to_string(),
+                ),
+                (
+                    "config-save-restart".to_string(),
+                    if controls.session_config_pending {
+                        "saving".to_string()
+                    } else {
+                        "save+restart".to_string()
+                    },
+                    112.0,
+                    C_PEACH_CSS.to_string(),
+                ),
+            ];
+            if !controls.session_detached || controls.session_can_attach {
+                config_actions.push((
+                    "restart".to_string(),
+                    "restart saved".to_string(),
+                    112.0,
+                    C_RED_CSS.to_string(),
+                ));
+            }
+            yy = self.draw_session_action_pills(
+                x,
+                panel_w,
+                yy - 14.0,
+                &config_actions,
+                &controls.session_id,
+            );
+        }
         let ctx = self.snapshot.context.clone();
         if ctx.available || controls.session_is_codex || controls.session_source == "codex" {
             self.section_title_color(x, yy + 8.0, "Context runway", C_BLUE_CSS);
@@ -9112,6 +9226,8 @@ struct StationControlsSummary {
     session_selection: String,
     session_source: String,
     session_command: String,
+    session_backend_id: String,
+    session_intendant_id: String,
     session_live_id: String,
     session_live_phase: String,
     session_action_id: String,
@@ -9119,6 +9235,14 @@ struct StationControlsSummary {
     session_stop_id: String,
     session_managed_context: String,
     session_context_archive: String,
+    session_sandbox: String,
+    session_approval_policy: String,
+    session_config_managed: String,
+    session_config_archive: String,
+    session_config_result: String,
+    session_config_result_kind: String,
+    session_config_has_draft: bool,
+    session_config_pending: bool,
     session_can_config: bool,
     session_can_focus: bool,
     session_can_attach: bool,
@@ -9183,6 +9307,8 @@ impl Default for StationControlsSummary {
             session_selection: String::new(),
             session_source: String::new(),
             session_command: String::new(),
+            session_backend_id: String::new(),
+            session_intendant_id: String::new(),
             session_live_id: String::new(),
             session_live_phase: String::new(),
             session_action_id: String::new(),
@@ -9190,6 +9316,14 @@ impl Default for StationControlsSummary {
             session_stop_id: String::new(),
             session_managed_context: String::new(),
             session_context_archive: String::new(),
+            session_sandbox: String::new(),
+            session_approval_policy: String::new(),
+            session_config_managed: String::new(),
+            session_config_archive: String::new(),
+            session_config_result: String::new(),
+            session_config_result_kind: String::new(),
+            session_config_has_draft: false,
+            session_config_pending: false,
             session_can_config: false,
             session_can_focus: false,
             session_can_attach: false,
@@ -10383,6 +10517,14 @@ fn truncate(s: &str, max: usize) -> String {
         out.push(ch);
     }
     out
+}
+
+fn short_id(s: &str) -> String {
+    if s.is_empty() {
+        "--".to_string()
+    } else {
+        truncate(s, 8)
+    }
 }
 
 fn stable_angle(s: &str) -> f32 {
