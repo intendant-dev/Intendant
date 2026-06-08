@@ -108,6 +108,8 @@ Options:
   --require-station-state    Fail if Station sessions/events/managed/peers are all empty
   --require-ai-provider-session
                              Fail unless Station exposes a real session with non-placeholder provider/model
+  --require-external-agent BACKEND
+                             Fail unless that real Station session is backed by external BACKEND (e.g. codex)
   --allow-empty-station-state
                              Explicitly allow empty Station state with --require-station-state
   --check-static-scripts     Parse inline classic/module scripts in static/app.html without executing them
@@ -273,6 +275,10 @@ function parseArgs(argv, env = process.env) {
       opts.requireStationState = true;
     } else if (arg === '--require-ai-provider-session') {
       opts.requireAiProviderSession = true;
+    } else if (arg === '--require-external-agent') {
+      opts.requireExternalAgent = normalizeExternalAgentRequirement(readValue());
+    } else if (arg.startsWith('--require-external-agent=')) {
+      opts.requireExternalAgent = normalizeExternalAgentRequirement(arg.slice('--require-external-agent='.length));
     } else if (arg === '--allow-empty-station-state') {
       opts.allowEmptyStationState = true;
     } else if (arg === '--check-static-scripts') {
@@ -324,6 +330,14 @@ function normalizeStationProbeName(raw) {
     throw new Error(`unknown Station probe '${raw}'; expected one of ${Array.from(allowed).join(', ')}`);
   }
   return normalized;
+}
+
+function normalizeExternalAgentRequirement(raw) {
+  const value = String(raw || '').trim().toLowerCase().replace(/[_\s]+/g, '-');
+  if (!value) {
+    throw new Error('--require-external-agent requires a backend name');
+  }
+  return value;
 }
 
 function resolveDashboardUrl(opts, env) {
@@ -535,6 +549,9 @@ function staticScriptsOnly(opts) {
       && opts.functions.length === 0
       && opts.stationProbes.length === 0
       && !opts.stationInteractionProbe
+      && !opts.requireStationState
+      && !opts.requireAiProviderSession
+      && !opts.requireExternalAgent
       && !opts.screenshotPath
   );
 }
@@ -711,7 +728,10 @@ function formatStationStatePass(result) {
   const live = result.liveAgentSession && result.liveAgentSession.ok
     ? ` liveSession=${quote(result.liveAgentSession.sessionId || '')} provider=${quote(result.liveAgentSession.provider || '')} model=${quote(result.liveAgentSession.model || '')}`
     : '';
-  return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}${live}`;
+  const external = result.externalAgentSession && result.externalAgentSession.ok
+    ? ` externalAgent=${quote(result.externalAgentSession.agent || result.externalAgentSession.required || '')} externalEvidence=${quote(result.externalAgentSession.evidence || '')}`
+    : '';
+  return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}${live}${external}`;
 }
 
 function collectFailureLogs(lineCount, dashboard, harness) {
@@ -1369,7 +1389,7 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
-      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession) {
+      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent) {
         await this.prepareStationSurface(opts.timeoutMs);
       }
       for (const probe of opts.stationProbes) {
@@ -1378,7 +1398,7 @@ class BrowserHarness {
       if (opts.stationInteractionProbe) {
         validation.stationInteraction = await this.runStationInteractionProbe(opts.timeoutMs);
       }
-      if (opts.requireStationState || opts.requireAiProviderSession) {
+      if (opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent) {
         validation.stationState = await this.requireStationState(opts);
       }
       return validation;
@@ -1548,7 +1568,7 @@ class BrowserHarness {
   }
 
   async requireStationState(opts) {
-    const state = await this.evaluate(`(${stationStateSummarySource()})()`);
+    const state = await this.evaluate(`(${stationStateSummarySource()})(${JSON.stringify(opts.requireExternalAgent || '')})`);
     if (!state || !state.ok) {
       throw new Error(`station state check failed: ${state && state.reason ? state.reason : 'could not inspect Station state'} (last value: ${summarizeWaitValue(state)})`);
     }
@@ -1560,6 +1580,12 @@ class BrowserHarness {
         ? state.liveAgentSession.reason
         : 'Station did not expose a real provider/model/session';
       throw new Error(`ai provider session check failed: ${reason} (last value: ${summarizeWaitValue(state)})`);
+    }
+    if (opts.requireExternalAgent && !(state.externalAgentSession && state.externalAgentSession.ok)) {
+      const reason = state.externalAgentSession && state.externalAgentSession.reason
+        ? state.externalAgentSession.reason
+        : `Station did not expose an external ${opts.requireExternalAgent} session`;
+      throw new Error(`external agent session check failed: ${reason} (last value: ${summarizeWaitValue(state)})`);
     }
     return state;
   }
@@ -2801,7 +2827,7 @@ function stationHotspotActivateSource() {
 }
 
 function stationStateSummarySource() {
-  return function collectStationStateSummary() {
+  return function collectStationStateSummary(requiredExternalAgentRaw) {
     const countArray = (value) => Array.isArray(value) ? value.length : 0;
     const countMap = (value) => {
       if (!value) return 0;
@@ -2825,6 +2851,15 @@ function stationStateSummarySource() {
       return count;
     };
     const asText = (value) => String(value ?? '').trim();
+    const compactUniqueText = (values) => {
+      const out = [];
+      for (const value of values || []) {
+        const text = asText(value);
+        if (text && !out.includes(text)) out.push(text);
+      }
+      return out;
+    };
+    const normalizeExternalAgentId = (value) => asText(value).toLowerCase().replace(/[_\s]+/g, '-');
     const placeholderPattern = /^(?:-|--|n\/a|na|null|undefined|unknown|none|no[-_\s]?provider|no[-_\s]?model|placeholder|dummy|default|auto|browser|current|global|managed-context|done-placeholder|claude-code-session)$/i;
     const usableText = (value) => {
       const text = asText(value);
@@ -2835,19 +2870,41 @@ function stationStateSummarySource() {
       if (!text || /^(?:primary-agent|local|session|current-daemon-session)$/i.test(text)) return '';
       return text;
     };
+    const sourceValuesFor = (item, fallback = {}) => compactUniqueText([
+      item.backend_source,
+      item.backendSource,
+      item.source,
+      item.source_label,
+      item.sourceLabel,
+      item.backend_source_label,
+      item.backendSourceLabel,
+      item.agent,
+      item.agent_name,
+      item.agentName,
+      item.isCodex ? 'codex' : '',
+      fallback.backendSource,
+      fallback.source,
+      fallback.sourceLabel,
+    ]);
     const candidateFrom = (raw, fallback = {}) => {
       const item = raw && typeof raw === 'object' ? raw : {};
+      const backendSessionId = sessionIdText(item.backend_session_id || item.backendSessionId || item.backendId || fallback.backendSessionId);
+      const intendantSessionId = sessionIdText(item.intendant_session_id || item.intendantSessionId || item.intendantId || fallback.intendantSessionId);
       const sessionId = sessionIdText(
         item.session_id || item.sessionId || item.resume_id || item.resumeId ||
-        item.backend_session_id || item.backendSessionId || item.id || fallback.sessionId
+        backendSessionId || item.id || fallback.sessionId
       );
       const provider = usableText(item.provider || item.provider_name || item.providerName || fallback.provider);
       const model = usableText(item.model || item.model_name || item.modelName || fallback.model);
+      const sourceCandidates = sourceValuesFor(item, fallback);
       return {
         sessionId,
+        backendSessionId,
+        intendantSessionId,
         provider,
         model,
-        source: usableText(item.source || item.backend_source || item.backendSource || item.source_label || item.sourceLabel || fallback.source),
+        source: usableText(sourceCandidates[0] || ''),
+        sourceCandidates,
         status: asText(item.status || item.phase || fallback.status),
         evidence: fallback.evidence || '',
       };
@@ -2874,7 +2931,7 @@ function stationStateSummarySource() {
       }
       return null;
     };
-    const liveAgentSession = (snapshot) => {
+    const collectSessionCandidates = (snapshot) => {
       const candidates = [];
       try { collectMapCandidates(candidates, typeof sessionMetadataById !== 'undefined' ? sessionMetadataById : null, 'sessionMetadataById'); } catch (_) {}
       try { collectMapCandidates(candidates, typeof sessionWindows !== 'undefined' ? sessionWindows : null, 'sessionWindows'); } catch (_) {}
@@ -2888,6 +2945,14 @@ function stationStateSummarySource() {
       collectArrayCandidates(candidates, snapshot.sessions && snapshot.sessions.recent, 'snapshot.sessions.recent');
       collectArrayCandidates(candidates, snapshot.sessions && snapshot.sessions.filteredSessions, 'snapshot.sessions.filteredSessions');
       collectArrayCandidates(candidates, snapshot.sessions && snapshot.sessions.externalTargets, 'snapshot.sessions.externalTargets');
+      if (snapshot.context) candidates.push(candidateFrom(snapshot.context, { evidence: 'snapshot.context' }));
+      if (snapshot.managed) candidates.push(candidateFrom(snapshot.managed, { evidence: 'snapshot.managed' }));
+      if (snapshot.controls) {
+        candidates.push(candidateFrom(snapshot.controls, {
+          source: snapshot.controls.backend || snapshot.controls.agent || '',
+          evidence: 'snapshot.controls',
+        }));
+      }
 
       const agents = Array.isArray(snapshot.agents) ? snapshot.agents : [];
       const agentWithModel = agents.find(agent => usableText(agent && agent.provider) && usableText(agent && agent.model));
@@ -2901,7 +2966,7 @@ function stationStateSummarySource() {
           sessionId: snapshot.managed && snapshot.managed.sessionId || snapshotSession.id || snapshotSession.sessionId || snapshot.sessions && snapshot.sessions.latestSessionId || '',
           provider: agentWithModel.provider,
           model: agentWithModel.model,
-          source: snapshot.sessions && snapshot.sessions.latestSource || agentWithModel.role || '',
+          source: snapshot.sessions && snapshot.sessions.latestSource || snapshot.managed && (snapshot.managed.backendSource || snapshot.managed.backend_source) || snapshot.context && (snapshot.context.backendSource || snapshot.context.backend_source) || agentWithModel.role || '',
           status: agentWithModel.status || agentWithModel.phase || '',
           evidence: 'snapshot.agents+sessions',
         }));
@@ -2922,7 +2987,10 @@ function stationStateSummarySource() {
           evidence: 'status-bar',
         }));
       } catch (_) {}
+      return candidates;
+    };
 
+    const liveAgentSession = (candidates) => {
       const winner = candidates.find(candidate => candidate.sessionId && candidate.provider && candidate.model);
       if (winner) {
         return {
@@ -2945,6 +3013,47 @@ function stationStateSummarySource() {
         candidates: candidates.length,
       };
     };
+    const candidateExternalSource = (candidate, requiredAgent) => {
+      for (const source of candidate.sourceCandidates || [candidate.source]) {
+        if (normalizeExternalAgentId(source) === requiredAgent) return source;
+      }
+      return '';
+    };
+    const externalAgentSession = (candidates, requiredAgent) => {
+      if (!requiredAgent) return undefined;
+      const sourceMatches = candidates
+        .map(candidate => ({ candidate, source: candidateExternalSource(candidate, requiredAgent) }))
+        .filter(match => match.source);
+      const winner = sourceMatches
+        .map(match => ({ ...match.candidate, matchedSource: match.source }))
+        .find(candidate => candidate.sessionId && candidate.provider && candidate.model);
+      if (winner) {
+        return {
+          ok: true,
+          required: requiredAgent,
+          agent: normalizeExternalAgentId(winner.matchedSource),
+          sessionId: winner.sessionId,
+          backendSessionId: winner.backendSessionId,
+          intendantSessionId: winner.intendantSessionId,
+          provider: winner.provider,
+          model: winner.model,
+          source: winner.matchedSource,
+          status: winner.status,
+          evidence: winner.evidence,
+          candidates: candidates.length,
+          matches: sourceMatches.length,
+        };
+      }
+      const realSessions = candidates.filter(candidate => candidate.sessionId && candidate.provider && candidate.model).length;
+      const sourceSummary = compactUniqueText(candidates.flatMap(candidate => candidate.sourceCandidates || [candidate.source])).slice(0, 8).join(', ');
+      return {
+        ok: false,
+        required: requiredAgent,
+        reason: `required external agent ${requiredAgent}, found ${sourceMatches.length} matching source candidate(s) and ${realSessions} real provider/model/session candidate(s), but no single real session tied to that external backend${sourceSummary ? ` (sources: ${sourceSummary})` : ''}`,
+        candidates: candidates.length,
+        matches: sourceMatches.length,
+      };
+    };
     try {
       const buildSnapshot = stationSnapshotBuilder();
       const snapshot = buildSnapshot ? buildSnapshot() : null;
@@ -2964,13 +3073,16 @@ function stationStateSummarySource() {
         countMap(typeof daemons !== 'undefined' ? daemons : null),
       );
       const counts = { sessions, events, managed, peers };
+      const candidates = collectSessionCandidates(snapshot);
+      const requiredExternalAgent = normalizeExternalAgentId(requiredExternalAgentRaw);
       return {
         ok: true,
         nonEmpty: sessions > 0 || events > 0 || managed > 0 || peers > 0,
         counts,
         latestSession: snapshot.sessions && snapshot.sessions.latestTask || '',
         managedSessionId: snapshot.managed && snapshot.managed.sessionId || '',
-        liveAgentSession: liveAgentSession(snapshot),
+        liveAgentSession: liveAgentSession(candidates),
+        externalAgentSession: externalAgentSession(candidates, requiredExternalAgent),
       };
     } catch (error) {
       return {
@@ -3036,6 +3148,7 @@ function compactStationState(state) {
     latestSession: truncateMiddle(state.latestSession || '', DIAGNOSTIC_TEXT_LIMIT),
     managedSessionId: truncateMiddle(state.managedSessionId || '', DIAGNOSTIC_TEXT_LIMIT),
     liveAgentSession: compactLiveAgentSession(state.liveAgentSession),
+    externalAgentSession: compactExternalAgentSession(state.externalAgentSession),
   };
 }
 
@@ -3053,6 +3166,28 @@ function compactLiveAgentSession(session) {
     evidence: truncateMiddle(session.evidence || '', DIAGNOSTIC_TEXT_LIMIT),
     reason: truncateMiddle(session.reason || '', DIAGNOSTIC_TEXT_LIMIT),
     candidates: Number(session.candidates) || 0,
+  };
+}
+
+function compactExternalAgentSession(session) {
+  if (!session || typeof session !== 'object') {
+    return session;
+  }
+  return {
+    ok: Boolean(session.ok),
+    required: truncateMiddle(session.required || '', DIAGNOSTIC_TEXT_LIMIT),
+    agent: truncateMiddle(session.agent || '', DIAGNOSTIC_TEXT_LIMIT),
+    sessionId: truncateMiddle(session.sessionId || '', DIAGNOSTIC_TEXT_LIMIT),
+    backendSessionId: truncateMiddle(session.backendSessionId || '', DIAGNOSTIC_TEXT_LIMIT),
+    intendantSessionId: truncateMiddle(session.intendantSessionId || '', DIAGNOSTIC_TEXT_LIMIT),
+    provider: truncateMiddle(session.provider || '', DIAGNOSTIC_TEXT_LIMIT),
+    model: truncateMiddle(session.model || '', DIAGNOSTIC_TEXT_LIMIT),
+    source: truncateMiddle(session.source || '', DIAGNOSTIC_TEXT_LIMIT),
+    status: truncateMiddle(session.status || '', DIAGNOSTIC_TEXT_LIMIT),
+    evidence: truncateMiddle(session.evidence || '', DIAGNOSTIC_TEXT_LIMIT),
+    reason: truncateMiddle(session.reason || '', DIAGNOSTIC_TEXT_LIMIT),
+    candidates: Number(session.candidates) || 0,
+    matches: Number(session.matches) || 0,
   };
 }
 
@@ -3117,6 +3252,9 @@ function validationFailureNextStep(result) {
   if (result.failureKind === 'ai-provider-session') {
     return 'target a real managed Station session with populated provider/model metadata; do not count no-provider or placeholder sessions as product E2E success';
   }
+  if (result.failureKind === 'external-agent-session') {
+    return 'target a live Station session backed by the requested external agent; do not count native/default provider sessions as external-agent QA success';
+  }
   if (result.failureKind === 'stale-static') {
     return 'rebuild and restart the dashboard controller from this worktree, then rerun with --require-current-static';
   }
@@ -3139,6 +3277,9 @@ function validationFailureKind(reason) {
   }
   if (/^ai provider session check failed/.test(text)) {
     return 'ai-provider-session';
+  }
+  if (/^external agent session check failed/.test(text)) {
+    return 'external-agent-session';
   }
   if (/^stale dashboard static asset/.test(text)) {
     return 'stale-static';
@@ -3384,6 +3525,7 @@ function isWaitFailureReason(reason) {
     || /^wait-for-function did not become truthy/.test(String(reason || ''))
     || /^station probe .* did not pass/.test(String(reason || ''))
     || /^station state check failed/.test(String(reason || ''))
+    || /^external agent session check failed/.test(String(reason || ''))
     || /^station interaction probe/.test(String(reason || ''));
 }
 
@@ -3395,7 +3537,7 @@ function failureDiagnosticSelectors(opts) {
   for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
     addDiagnosticSelector(selectors, selector);
   }
-  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession) {
+  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState || opts.requireAiProviderSession || opts.requireExternalAgent) {
     for (const selector of ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]']) {
       addDiagnosticSelector(selectors, selector);
     }
@@ -3411,6 +3553,7 @@ function isStationFocusedCheck(opts) {
     opts.stationInteractionProbe ? 'station:interaction' : '',
     opts.requireStationState ? 'station:state' : '',
     opts.requireAiProviderSession ? 'station:ai-provider-session' : '',
+    opts.requireExternalAgent ? `station:external-agent:${opts.requireExternalAgent}` : '',
   ].join('\n').toLowerCase();
   return haystack.includes('station-status')
     || haystack.includes('station-hud-canvas')
@@ -3603,6 +3746,8 @@ async function runSelfTest() {
       '--require-current-static',
       '--require-station-state',
       '--require-ai-provider-session',
+      '--require-external-agent',
+      'codex',
       '--allow-empty-station-state',
     ],
     {},
@@ -3622,6 +3767,7 @@ async function runSelfTest() {
   assert.strictEqual(parsed.requireCurrentStatic, true);
   assert.strictEqual(parsed.requireStationState, true);
   assert.strictEqual(parsed.requireAiProviderSession, true);
+  assert.strictEqual(parsed.requireExternalAgent, 'codex');
   assert.strictEqual(parsed.allowEmptyStationState, true);
   assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11']);
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
@@ -4044,6 +4190,34 @@ async function runSelfTest() {
   assert.strictEqual(placeholderProviderStationStateSummary.nonEmpty, true);
   assert.strictEqual(placeholderProviderStationStateSummary.liveAgentSession.ok, false);
   assert.ok(placeholderProviderStationStateSummary.liveAgentSession.reason.includes('no single non-placeholder'));
+  const nativeProviderStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent', provider: 'google', model: 'gemini-2.5-pro', status: 'running' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'sess-native', records: 1, anchors: 0 },
+      sessions: {
+        total: 1,
+        latestTask: 'native provider session',
+        latestSource: 'intendant',
+        recent: [{ id: 'sess-native', status: 'running', source: 'intendant' }],
+      },
+    }),
+    sessionMetadataById: new Map([
+      ['sess-native', { provider: 'google', model: 'gemini-2.5-pro', status: 'running', source: 'intendant' }],
+    ]),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })('codex');
+  assert.strictEqual(nativeProviderStationStateSummary.liveAgentSession.ok, true);
+  assert.strictEqual(nativeProviderStationStateSummary.externalAgentSession.ok, false);
+  assert.ok(nativeProviderStationStateSummary.externalAgentSession.reason.includes('required external agent codex'));
   const liveProviderStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
     buildStationSnapshot: () => ({
       hosts: [{ id: 'local' }],
@@ -4068,11 +4242,38 @@ async function runSelfTest() {
     Object,
     Number,
     String,
-  })();
+  })('codex');
   assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.ok, true);
   assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.sessionId, 'sess-live');
   assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.provider, 'openai');
   assert.strictEqual(liveProviderStationStateSummary.liveAgentSession.model, 'gpt-5.2-codex');
+  assert.strictEqual(liveProviderStationStateSummary.externalAgentSession.ok, true);
+  assert.strictEqual(liveProviderStationStateSummary.externalAgentSession.sessionId, 'sess-live');
+  assert.strictEqual(liveProviderStationStateSummary.externalAgentSession.agent, 'codex');
+  const codexTargetStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent', provider: 'openai', model: 'gpt-5.2-codex', status: 'running' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'wrapper-live', records: 1, anchors: 0 },
+      sessions: {
+        total: 1,
+        latestTask: 'codex target session',
+        externalTargets: [{ id: 'codex-thread', sessionId: 'codex-thread', isCodex: true, status: 'running' }],
+      },
+    }),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })('codex');
+  assert.strictEqual(codexTargetStationStateSummary.externalAgentSession.ok, true);
+  assert.strictEqual(codexTargetStationStateSummary.externalAgentSession.sessionId, 'codex-thread');
+  assert.strictEqual(codexTargetStationStateSummary.externalAgentSession.agent, 'codex');
   assert.strictEqual(
     validationFailureKind('station state check failed: Station sessions/events/managed/peers are all empty'),
     'station-state',
@@ -4082,11 +4283,16 @@ async function runSelfTest() {
     'ai-provider-session',
   );
   assert.strictEqual(
+    validationFailureKind('external agent session check failed: required external agent codex'),
+    'external-agent-session',
+  );
+  assert.strictEqual(
     validationFailureKind('stale dashboard static asset /app; served hash abc does not match static/app.html hash def'),
     'stale-static',
   );
   assert.ok(validationFailureNextStep({ failureKind: 'station-state', reason: '' }).includes('--allow-empty-station-state'));
   assert.ok(validationFailureNextStep({ failureKind: 'ai-provider-session', reason: '' }).includes('provider/model'));
+  assert.ok(validationFailureNextStep({ failureKind: 'external-agent-session', reason: '' }).includes('requested external agent'));
   assert.ok(validationFailureNextStep({ failureKind: 'stale-static', reason: '' }).includes('--require-current-static'));
   assert.strictEqual(
     normalizeAppHtmlForIdentity('<script src="/wasm-station/station_web.js?v=abc123"></script>'),
