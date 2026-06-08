@@ -7447,6 +7447,7 @@ impl StationInner {
             );
         }
         yy += 88.0;
+        yy = self.draw_activity_log_lanes(x, yy, panel_w, events);
 
         let latest_id = latest.map(|event| event.id.clone()).unwrap_or_default();
         let latest_managed_id = events
@@ -7514,6 +7515,143 @@ impl StationInner {
             ax += width + 8.0;
         }
         ay + 35.0
+    }
+
+    fn draw_activity_log_lanes(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        events: &[StationEvent],
+    ) -> f32 {
+        if events.is_empty() {
+            return y;
+        }
+        let mut yy = y + 6.0;
+        self.section_title_color(x, yy, "Log lanes", C_TEAL_CSS);
+        yy += 20.0;
+        let managed_count = events
+            .iter()
+            .filter(|event| activity_event_is_managed(event))
+            .count();
+        let level_summary = activity_count_summary(events, |event| nonempty(&event.level, "info"));
+        let source_summary =
+            activity_count_summary(events, |event| nonempty(&event.source, "activity"));
+        self.panel_row(
+            x,
+            yy,
+            "filters",
+            &truncate(
+                &format!(
+                    "{} retained / {} managed / {}",
+                    events.len(),
+                    managed_count,
+                    nonempty(&level_summary, "levels --")
+                ),
+                42,
+            ),
+        );
+        yy += 20.0;
+        self.panel_row(
+            x,
+            yy,
+            "sources",
+            &truncate(&nonempty(&source_summary, "--"), 42),
+        );
+        yy += 24.0;
+        for event in events.iter().rev().take(3) {
+            let color = level_color_css(&event.level);
+            self.round_rect(
+                x + 12.0,
+                yy - 10.0,
+                panel_w - 24.0,
+                43.0,
+                4.0,
+                if activity_event_is_managed(event) {
+                    "rgba(49,50,68,0.74)"
+                } else {
+                    "rgba(17,17,27,0.76)"
+                },
+                color,
+            );
+            self.ctx.set_fill_style(&JsValue::from_str(color));
+            self.ctx
+                .fill_rect((x + 20.0) as f64, (yy - 2.0) as f64, 3.0, 26.0);
+            if !event.id.is_empty() {
+                self.hit_zones.push(HitZone::new(
+                    x + 12.0,
+                    yy - 10.0,
+                    panel_w - 24.0,
+                    43.0,
+                    HitAction::ActivityAction {
+                        action: "show-log".to_string(),
+                        id: event.id.clone(),
+                    },
+                ));
+            }
+            self.text(
+                &truncate(&nonempty(&event.source, "activity"), 18),
+                x + 30.0,
+                yy + 1.0,
+                9.0,
+                C_TEAL_CSS,
+                "bold",
+            );
+            self.text(
+                &truncate(&nonempty(&event.level, "info"), 9),
+                x + panel_w - 92.0,
+                yy + 1.0,
+                8.5,
+                color,
+                "bold",
+            );
+            self.text(
+                &truncate(
+                    &format!(
+                        "{}{}",
+                        if event.session_id.is_empty() {
+                            String::new()
+                        } else {
+                            format!("{} / ", truncate(&event.session_id, 8))
+                        },
+                        event.msg
+                    ),
+                    48,
+                ),
+                x + 30.0,
+                yy + 18.0,
+                8.5,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            let mut buttons = Vec::new();
+            buttons.push(("show-log", "open", 45.0, C_TEAL_CSS));
+            if !event.session_id.is_empty() {
+                buttons.push(("activity-session", "sess", 42.0, C_BLUE_CSS));
+            }
+            if activity_event_is_managed(event) {
+                buttons.push(("activity-managed", "mgd", 38.0, C_MAUVE_CSS));
+            }
+            let total_w: f32 = buttons.iter().map(|(_, _, width, _)| *width).sum::<f32>()
+                + buttons.len().saturating_sub(1) as f32 * 5.0;
+            let mut bx = x + panel_w - total_w - 24.0;
+            for (action, label, width, button_color) in buttons {
+                self.pill_at(bx, yy + 19.0, width, 17.0, label, button_color);
+                self.hit_zones.push(HitZone::new(
+                    bx,
+                    yy + 19.0,
+                    width,
+                    17.0,
+                    HitAction::ActivityAction {
+                        action: action.to_string(),
+                        id: event.id.clone(),
+                    },
+                ));
+                bx += width + 5.0;
+            }
+            yy += 48.0;
+        }
+        yy + 4.0
     }
 
     fn draw_controls_action_pills(
@@ -10548,6 +10686,27 @@ fn activity_event_is_managed(event: &StationEvent) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn activity_count_summary<F>(events: &[StationEvent], mut label_for: F) -> String
+where
+    F: FnMut(&StationEvent) -> String,
+{
+    let mut counts: HashMap<String, usize> = HashMap::new();
+    for event in events {
+        let label = label_for(event);
+        if label.is_empty() {
+            continue;
+        }
+        *counts.entry(label).or_insert(0) += 1;
+    }
+    let mut rows = counts.into_iter().collect::<Vec<_>>();
+    rows.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    rows.into_iter()
+        .take(3)
+        .map(|(label, count)| format!("{label} {count}"))
+        .collect::<Vec<_>>()
+        .join(" / ")
 }
 
 fn activity_level_rank(level: &str) -> u8 {
