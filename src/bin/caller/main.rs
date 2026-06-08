@@ -2187,6 +2187,7 @@ enum DrainOutcome {
         request: ExternalContextRewindRequest,
         message: Option<String>,
         turns_in_round: usize,
+        turn_stop_status: ManagedContextRewindTurnStopStatus,
     },
 }
 
@@ -2209,6 +2210,107 @@ struct ExternalContextRewindRequest {
     next_steps: Vec<String>,
     auto_resume: bool,
     require_density_improvement: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ManagedContextRewindTurnStopStatus {
+    NotRequested,
+    StopRequestedNoToolObserved,
+    StopRequestedCompleted {
+        success: usize,
+        failed: usize,
+        cancelled: usize,
+    },
+    StopRequestedUnfinished {
+        pending: usize,
+        success: usize,
+        failed: usize,
+        cancelled: usize,
+    },
+    StopRequestFailed {
+        message: String,
+    },
+}
+
+impl Default for ManagedContextRewindTurnStopStatus {
+    fn default() -> Self {
+        Self::NotRequested
+    }
+}
+
+#[derive(Debug, Default)]
+struct ManagedContextRewindTurnStopTracker {
+    stop_requested: bool,
+    stop_error: Option<String>,
+    pending_tools: HashSet<String>,
+    success: usize,
+    failed: usize,
+    cancelled: usize,
+}
+
+impl ManagedContextRewindTurnStopTracker {
+    fn request_stop(&mut self, active_tools: &HashSet<String>) {
+        self.stop_requested = true;
+        self.stop_error = None;
+        self.pending_tools.extend(active_tools.iter().cloned());
+    }
+
+    fn fail_stop(&mut self, active_tools: &HashSet<String>, message: String) {
+        self.stop_requested = true;
+        self.stop_error = Some(message);
+        self.pending_tools.extend(active_tools.iter().cloned());
+    }
+
+    fn record_tool_started(&mut self, item_id: &str) {
+        if self.stop_requested && !item_id.trim().is_empty() {
+            self.pending_tools.insert(item_id.to_string());
+        }
+    }
+
+    fn record_tool_completed(
+        &mut self,
+        item_id: &str,
+        status: &external_agent::ToolCompletionStatus,
+    ) {
+        if !self.stop_requested || !self.pending_tools.remove(item_id) {
+            return;
+        }
+        match status {
+            external_agent::ToolCompletionStatus::Success => self.success += 1,
+            external_agent::ToolCompletionStatus::Failed { .. } => self.failed += 1,
+            external_agent::ToolCompletionStatus::Cancelled => self.cancelled += 1,
+        }
+    }
+
+    fn status(&self) -> ManagedContextRewindTurnStopStatus {
+        if let Some(message) = self.stop_error.as_deref() {
+            return ManagedContextRewindTurnStopStatus::StopRequestFailed {
+                message: message.to_string(),
+            };
+        }
+        if !self.stop_requested {
+            return ManagedContextRewindTurnStopStatus::NotRequested;
+        }
+        let completed = self.success + self.failed + self.cancelled;
+        if self.pending_tools.is_empty() {
+            if completed == 0 {
+                ManagedContextRewindTurnStopStatus::StopRequestedNoToolObserved
+            } else {
+                ManagedContextRewindTurnStopStatus::StopRequestedCompleted {
+                    success: self.success,
+                    failed: self.failed,
+                    cancelled: self.cancelled,
+                }
+            }
+        } else {
+            ManagedContextRewindTurnStopStatus::StopRequestedUnfinished {
+                pending: self.pending_tools.len(),
+                success: self.success,
+                failed: self.failed,
+                cancelled: self.cancelled,
+            }
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -2465,6 +2567,7 @@ fn external_context_rewind_request_from_action(
 
 fn backend_recovery_outcome_or_context_rewind(
     request: Option<ExternalContextRewindRequest>,
+    turn_stop_status: ManagedContextRewindTurnStopStatus,
     recovery: Option<ExternalBackendRecovery>,
     message: Option<String>,
     turns_in_round: usize,
@@ -2474,6 +2577,7 @@ fn backend_recovery_outcome_or_context_rewind(
             request,
             message,
             turns_in_round,
+            turn_stop_status,
         };
     }
     if let Some(recovery) = recovery {
@@ -4472,6 +4576,7 @@ async fn apply_chained_context_rewind_resume_turns(
                 request: next_request,
                 message,
                 turns_in_round,
+                ..
             } => {
                 emit_context_rewind_resume_round_complete(resume, message, turns_in_round);
                 request = next_request;
@@ -7199,6 +7304,7 @@ async fn drain_external_agent_events(
     let mut tool_failure_limiter = ExternalToolFailureLogLimiter::default();
     let mut tool_previews: std::collections::HashMap<String, String> =
         std::collections::HashMap::new();
+    let mut active_tool_ids: HashSet<String> = HashSet::new();
     let mut context_snapshot_tick = tokio::time::interval_at(
         tokio::time::Instant::now() + EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
         EXTERNAL_CONTEXT_SNAPSHOT_INTERVAL,
@@ -7210,6 +7316,7 @@ async fn drain_external_agent_events(
     let mut pending_turn_completion: Option<(Option<String>, usize)> = None;
     let mut active_side_turns: HashSet<String> = HashSet::new();
     let mut pending_context_rewind: Option<ExternalContextRewindRequest> = None;
+    let mut pending_context_rewind_turn_stop = ManagedContextRewindTurnStopTracker::default();
     let mut pending_backend_recovery: Option<ExternalBackendRecovery> = None;
     let mut managed_context_rewind_only_pressure: Option<ManagedContextRewindOnlyPressure> = None;
     let mut managed_context_pressure_interrupt_sent = false;
@@ -7715,13 +7822,18 @@ async fn drain_external_agent_events(
                                         if should_stop_turn {
                                             match agent.interrupt_turn().await {
                                                 Ok(()) => {
+                                                    pending_context_rewind_turn_stop
+                                                        .request_stop(&active_tool_ids);
                                                     message.push_str(
                                                         "; active turn stop requested",
                                                     );
                                                 }
                                                 Err(e) => {
+                                                    let stop_error = e.to_string();
+                                                    pending_context_rewind_turn_stop
+                                                        .fail_stop(&active_tool_ids, stop_error.clone());
                                                     message.push_str(&format!(
-                                                        "; active turn stop failed: {e}"
+                                                        "; active turn stop failed: {stop_error}"
                                                     ));
                                                 }
                                             }
@@ -7806,6 +7918,7 @@ async fn drain_external_agent_events(
                             .expect("checked pending turn completion");
                         return backend_recovery_outcome_or_context_rewind(
                             pending_context_rewind.take(),
+                            pending_context_rewind_turn_stop.status(),
                             pending_backend_recovery.take(),
                             message,
                             turns_in_round,
@@ -7820,6 +7933,7 @@ async fn drain_external_agent_events(
                     .expect("post-turn sleep active only while completion is pending");
                 return backend_recovery_outcome_or_context_rewind(
                     pending_context_rewind.take(),
+                    pending_context_rewind_turn_stop.status(),
                     pending_backend_recovery.take(),
                     message,
                     turns_in_round,
@@ -8285,6 +8399,10 @@ async fn drain_external_agent_events(
                     continue;
                 }
                 turns_in_round += 1;
+                if !item_id.is_empty() {
+                    active_tool_ids.insert(item_id.clone());
+                    pending_context_rewind_turn_stop.record_tool_started(&item_id);
+                }
                 let preview_text = external_tool_preview_text(&tool_name, &preview);
                 if let Some(preview_text) = preview_text.as_deref() {
                     if !item_id.is_empty() {
@@ -8332,6 +8450,8 @@ async fn drain_external_agent_events(
                 if managed_context_blocked_tool_items.remove(&item_id) {
                     continue;
                 }
+                active_tool_ids.remove(&item_id);
+                pending_context_rewind_turn_stop.record_tool_completed(&item_id, &status);
                 if let Some(stdout) = tool_output_limiter.complete(&item_id) {
                     emit_external_tool_output(config, config.session_id.as_deref(), stdout);
                 }
@@ -9178,7 +9298,7 @@ const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER: &str = "\n\nUser follo
 const MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_INSTRUCTIONS: &str =
     "A managed-context rewind requested during this queued follow-up has already succeeded. Continue the user's follow-up below from the rewound context. Do not call rewind_context again merely to satisfy any instruction to rewind first; only rewind again if new context pressure or an invalid anchor genuinely requires it.";
 const MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS: &str =
-    "A managed-context rewind requested during the active follow-up has already succeeded. The active follow-up is already in the preserved thread history; the model_context_rewind_primer is the authoritative carry-forward summary for the pruned span. Continue with the next unfinished step. Do not repeat already-completed verification, setup, or research steps from the preserved request, and do not call rewind_context again merely to satisfy any prior instruction to rewind first.";
+    "A managed-context rewind requested during the active follow-up has already succeeded. The active follow-up is already in the preserved thread history; the model_context_rewind_primer is the authoritative carry-forward summary for the pruned span. Continue with the next unfinished step. Use only completed validation, setup, or research facts that are preserved in the current history or primer, and do not call rewind_context again merely to satisfy any prior instruction to rewind first.";
 
 fn managed_context_canonical_followup_replay_text(text: &str) -> String {
     let mut current = text.trim();
@@ -9214,21 +9334,73 @@ fn managed_context_followup_replay_text(user_followup: &str) -> String {
     )
 }
 
-fn managed_context_active_followup_resume_text() -> String {
+fn managed_context_rewind_turn_stop_status_text(
+    status: &ManagedContextRewindTurnStopStatus,
+) -> Option<String> {
+    match status {
+        ManagedContextRewindTurnStopStatus::NotRequested => None,
+        ManagedContextRewindTurnStopStatus::StopRequestedNoToolObserved => Some(
+            "Tool/command status: Intendant requested a stop for the active turn before applying the rewind. No active tool or command completion was observed in the stop window."
+                .to_string(),
+        ),
+        ManagedContextRewindTurnStopStatus::StopRequestedCompleted {
+            success,
+            failed,
+            cancelled,
+        } => {
+            let total = success + failed + cancelled;
+            if *failed == 0 && *cancelled == 0 {
+                Some(format!(
+                    "Tool/command status: Intendant requested a stop for the active turn before applying the rewind. All {total} tool(s)/command(s) active in the stop window emitted successful completion before the rewind."
+                ))
+            } else {
+                Some(format!(
+                    "Tool/command status: Intendant requested a stop for the active turn before applying the rewind. Tool(s)/command(s) active in the stop window emitted completion before the rewind with statuses: {success} success, {failed} failed, {cancelled} cancelled. A cancelled validation or setup command has no successful result preserved; rerun any required check whose success is not preserved in the current history or primer."
+                ))
+            }
+        }
+        ManagedContextRewindTurnStopStatus::StopRequestedUnfinished {
+            pending,
+            success,
+            failed,
+            cancelled,
+        } => Some(format!(
+            "Tool/command status: Intendant requested a stop for the active turn before applying the rewind. {pending} tool(s)/command(s) active in the stop window did not emit completion before the rewind; their outcome is unknown. Completed statuses observed before the rewind: {success} success, {failed} failed, {cancelled} cancelled. Rerun any required validation or setup whose result is not preserved in the current history or primer."
+        )),
+        ManagedContextRewindTurnStopStatus::StopRequestFailed { message } => Some(format!(
+            "Tool/command status: Intendant attempted to stop the active turn before applying the rewind, but the stop request failed: {message}. Treat tool outcomes according to the current preserved history and primer."
+        )),
+    }
+}
+
+fn managed_context_active_followup_resume_text(
+    turn_stop_status: &ManagedContextRewindTurnStopStatus,
+) -> String {
+    let status_text = managed_context_rewind_turn_stop_status_text(turn_stop_status)
+        .map(|text| format!("\n\n{text}"))
+        .unwrap_or_default();
     format!(
-        "{open}\n{instructions}\n{close}",
+        "{open}\n{instructions}{status_text}\n{close}",
         open = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN,
         instructions = MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS,
+        status_text = status_text,
         close = MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE,
     )
 }
 
 fn managed_context_is_active_followup_resume(text: &str) -> bool {
-    text.trim() == managed_context_active_followup_resume_text()
+    let text = text.trim();
+    text.strip_prefix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_OPEN)
+        .and_then(|inner| inner.strip_suffix(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_CLOSE))
+        .is_some_and(|inner| {
+            inner.contains(MANAGED_CONTEXT_REWIND_ACTIVE_RESUME_INSTRUCTIONS)
+                && !inner.contains(MANAGED_CONTEXT_REWIND_FOLLOWUP_REPLAY_USER_MARKER)
+        })
 }
 
 fn managed_context_followup_replay_after_rewind(
     active_followup: &FollowUpMessage,
+    turn_stop_status: &ManagedContextRewindTurnStopStatus,
 ) -> Option<FollowUpMessage> {
     if active_followup.managed_context_recovery_kickstart || active_followup.text.trim().is_empty()
     {
@@ -9238,7 +9410,7 @@ fn managed_context_followup_replay_after_rewind(
     let text = if managed_context_is_active_followup_resume(&active_followup.text) {
         active_followup.text.trim().to_string()
     } else {
-        managed_context_active_followup_resume_text()
+        managed_context_active_followup_resume_text(turn_stop_status)
     };
 
     let mut followup = FollowUpMessage::with_attachments(text, active_followup.attachments.clone());
@@ -9262,11 +9434,12 @@ fn managed_context_rewind_continuation(
     pending_replays: &mut std::collections::VecDeque<FollowUpMessage>,
     active_followup: &FollowUpMessage,
     automatic_resume: Option<FollowUpMessage>,
+    turn_stop_status: &ManagedContextRewindTurnStopStatus,
 ) -> Option<FollowUpMessage> {
     pending_replays
         .pop_front()
         .map(managed_context_sanitize_queued_followup_replay)
-        .or_else(|| managed_context_followup_replay_after_rewind(active_followup))
+        .or_else(|| managed_context_followup_replay_after_rewind(active_followup, turn_stop_status))
         .or(automatic_resume)
 }
 
@@ -11570,9 +11743,13 @@ mod tests {
         let automatic = FollowUpMessage::text("<context_rewind_resumed/>".into());
         let mut pending = std::collections::VecDeque::new();
 
-        let continuation =
-            managed_context_rewind_continuation(&mut pending, &active, Some(automatic))
-                .expect("continuation");
+        let continuation = managed_context_rewind_continuation(
+            &mut pending,
+            &active,
+            Some(automatic),
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("continuation");
 
         assert!(continuation
             .text
@@ -11580,7 +11757,7 @@ mod tests {
         assert!(continuation.text.contains("has already succeeded"));
         assert!(continuation
             .text
-            .contains("Do not repeat already-completed verification"));
+            .contains("Use only completed validation, setup, or research facts"));
         assert!(!continuation
             .text
             .contains("then implement the next Station slice"));
@@ -11592,8 +11769,16 @@ mod tests {
     fn managed_context_rewind_replay_is_idempotent_for_active_followup() {
         let original = "First inspect the failing harness log.\nThen patch the replay builder.";
         let active = FollowUpMessage::text(original.into());
-        let first = managed_context_followup_replay_after_rewind(&active).expect("first replay");
-        let second = managed_context_followup_replay_after_rewind(&first).expect("second replay");
+        let first = managed_context_followup_replay_after_rewind(
+            &active,
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("first replay");
+        let second = managed_context_followup_replay_after_rewind(
+            &first,
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("second replay");
 
         assert_eq!(second.text, first.text);
         assert!(!first.text.contains(original));
@@ -11621,7 +11806,51 @@ mod tests {
                 .count(),
             0
         );
-        assert!(second.text.contains("Do not repeat already-completed"));
+        assert!(second.text.contains("Use only completed validation"));
+    }
+
+    #[test]
+    fn managed_context_rewind_active_replay_reports_unknown_stopped_tool() {
+        let active = FollowUpMessage::text("Run release validation.".into());
+        let status = ManagedContextRewindTurnStopStatus::StopRequestedUnfinished {
+            pending: 1,
+            success: 0,
+            failed: 0,
+            cancelled: 0,
+        };
+
+        let replay =
+            managed_context_followup_replay_after_rewind(&active, &status).expect("replay");
+
+        assert!(replay
+            .text
+            .contains("active turn before applying the rewind"));
+        assert!(replay
+            .text
+            .contains("did not emit completion before the rewind"));
+        assert!(replay.text.contains("their outcome is unknown"));
+        assert!(replay
+            .text
+            .contains("Rerun any required validation or setup"));
+    }
+
+    #[test]
+    fn managed_context_rewind_active_replay_reports_completed_stopped_tool_status() {
+        let active = FollowUpMessage::text("Run release validation.".into());
+        let status = ManagedContextRewindTurnStopStatus::StopRequestedCompleted {
+            success: 0,
+            failed: 0,
+            cancelled: 1,
+        };
+
+        let replay =
+            managed_context_followup_replay_after_rewind(&active, &status).expect("replay");
+
+        assert!(replay.text.contains("emitted completion before the rewind"));
+        assert!(replay.text.contains("0 success, 0 failed, 1 cancelled"));
+        assert!(replay
+            .text
+            .contains("cancelled validation or setup command has no successful result"));
     }
 
     #[test]
@@ -11632,12 +11861,19 @@ mod tests {
         let active = FollowUpMessage::text(nested);
         let mut pending = std::collections::VecDeque::new();
 
-        let continuation =
-            managed_context_rewind_continuation(&mut pending, &active, None).expect("continuation");
+        let continuation = managed_context_rewind_continuation(
+            &mut pending,
+            &active,
+            None,
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("continuation");
 
         assert_eq!(
             continuation.text,
-            managed_context_active_followup_resume_text()
+            managed_context_active_followup_resume_text(
+                &ManagedContextRewindTurnStopStatus::NotRequested
+            )
         );
         assert_eq!(
             continuation
@@ -11658,8 +11894,13 @@ mod tests {
             FollowUpMessage::text("recovery kickstart".into()).managed_context_recovery_kickstart();
         let mut pending = std::collections::VecDeque::from([FollowUpMessage::text(nested)]);
 
-        let continuation =
-            managed_context_rewind_continuation(&mut pending, &active, None).expect("continuation");
+        let continuation = managed_context_rewind_continuation(
+            &mut pending,
+            &active,
+            None,
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("continuation");
 
         assert_eq!(
             continuation.text,
@@ -11676,9 +11917,13 @@ mod tests {
         let automatic = FollowUpMessage::text("<context_rewind_resumed/>".into());
         let mut pending = std::collections::VecDeque::from([held]);
 
-        let continuation =
-            managed_context_rewind_continuation(&mut pending, &active, Some(automatic))
-                .expect("continuation");
+        let continuation = managed_context_rewind_continuation(
+            &mut pending,
+            &active,
+            Some(automatic),
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("continuation");
 
         assert_eq!(continuation.text, "original queued user request");
         assert!(pending.is_empty());
@@ -11691,9 +11936,13 @@ mod tests {
         let automatic = FollowUpMessage::text("<context_rewind_resumed/>".into());
         let mut pending = std::collections::VecDeque::new();
 
-        let continuation =
-            managed_context_rewind_continuation(&mut pending, &active, Some(automatic))
-                .expect("continuation");
+        let continuation = managed_context_rewind_continuation(
+            &mut pending,
+            &active,
+            Some(automatic),
+            &ManagedContextRewindTurnStopStatus::NotRequested,
+        )
+        .expect("continuation");
 
         assert_eq!(continuation.text, "<context_rewind_resumed/>");
     }
@@ -19920,6 +20169,7 @@ async fn run_with_presence(
                     request,
                     message,
                     turns_in_round,
+                    ..
                 } => {
                     cumulative_stats.turns += 1;
                     cumulative_stats.rounds += 1;
@@ -22001,6 +22251,7 @@ async fn run_external_agent_mode(
                             request,
                             message,
                             turns_in_round,
+                            ..
                         } => {
                             stats.rounds = round;
                             record_external_done_and_round_inline(
@@ -22481,6 +22732,7 @@ async fn run_external_agent_mode(
                 request,
                 message,
                 turns_in_round,
+                turn_stop_status,
             } => {
                 managed_context_recovery_kickstarts_without_rewind = 0;
                 stats.rounds = round;
@@ -22527,6 +22779,7 @@ async fn run_external_agent_mode(
                             &mut pending_managed_context_replays,
                             &active_followup_for_rewind_replay,
                             automatic_resume,
+                            &turn_stop_status,
                         ) {
                             slog(&session_log, |l| {
                                 l.info(
