@@ -3051,8 +3051,16 @@ impl StationInner {
             "rgba(249,226,175,0.56)",
         );
         self.text("ATTENTION", x + 12.0, y + 20.0, 10.0, C_YELLOW_CSS, "bold");
+        let queue_label = if self.snapshot.attention_queue.count > 0 {
+            format!(
+                "{} queued / {} blocked",
+                self.snapshot.attention_queue.count, self.snapshot.attention_queue.blocked
+            )
+        } else {
+            "rendered queue".to_string()
+        };
         self.text(
-            "rendered queue",
+            &truncate(&queue_label, 24),
             x + strip_w - 93.0,
             y + 20.0,
             9.0,
@@ -3068,6 +3076,11 @@ impl StationInner {
     }
 
     fn attention_items(&self) -> Vec<AttentionItem> {
+        let rendered_queue = self.rendered_attention_items();
+        if !rendered_queue.is_empty() {
+            return rendered_queue;
+        }
+
         let mut items = Vec::new();
         let controls = &self.snapshot.controls;
         if let Some(agent) = self
@@ -3190,6 +3203,58 @@ impl StationInner {
             });
         }
         items
+    }
+
+    fn rendered_attention_items(&self) -> Vec<AttentionItem> {
+        self.snapshot
+            .attention_queue
+            .items
+            .iter()
+            .take(6)
+            .map(|item| {
+                let mut detail = [item.meta.as_str(), item.detail.as_str()]
+                    .into_iter()
+                    .filter(|part| !part.trim().is_empty())
+                    .collect::<Vec<_>>()
+                    .join(" / ");
+                if item.can_cancel && !item.id.is_empty() {
+                    detail = if detail.is_empty() {
+                        "tap to cancel".to_string()
+                    } else {
+                        format!("{detail} / tap to cancel")
+                    };
+                }
+                AttentionItem {
+                    title: truncate(&nonempty(&item.title, &item.kind.replace('_', " ")), 28),
+                    detail: truncate(&detail, 58),
+                    color: attention_level_color_css(&item.level, &item.kind),
+                    hit: self.rendered_attention_hit(item),
+                }
+            })
+            .collect()
+    }
+
+    fn rendered_attention_hit(&self, item: &StationAttentionItem) -> HitAction {
+        if item.can_cancel && !item.id.is_empty() {
+            return HitAction::ControlsAction {
+                action: format!("queue-cancel:{}", item.id),
+            };
+        }
+        match item.kind.as_str() {
+            "shared_view_input" => HitAction::ControlsAction {
+                action: "shared-view-take-input".to_string(),
+            },
+            "attachments" => HitAction::ControlsAction {
+                action: "attachments-clear".to_string(),
+            },
+            "active_turn" | "steer" | "follow_up" if !item.session_id.is_empty() => {
+                HitAction::SessionAction {
+                    action: "focus".to_string(),
+                    session_id: item.session_id.clone(),
+                }
+            }
+            _ => HitAction::Select("system:controls".to_string()),
+        }
     }
 
     fn attention_item(&mut self, x: f32, y: f32, w: f32, h: f32, item: AttentionItem) {
@@ -8054,6 +8119,7 @@ struct StationSnapshot {
     changes: StationChangesSummary,
     sessions: StationSessionsSummary,
     controls: StationControlsSummary,
+    attention_queue: StationAttentionQueueSummary,
     display_runway: StationDisplayRunwaySummary,
 }
 
@@ -8508,6 +8574,29 @@ impl Default for StationControlsSummary {
             shared_view_can_take_input: false,
         }
     }
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct StationAttentionQueueSummary {
+    count: u32,
+    blocked: u32,
+    warn: u32,
+    ready: u32,
+    items: Vec<StationAttentionItem>,
+}
+
+#[derive(Clone, Deserialize, Default)]
+#[serde(default, rename_all = "camelCase")]
+struct StationAttentionItem {
+    id: String,
+    kind: String,
+    level: String,
+    title: String,
+    meta: String,
+    detail: String,
+    session_id: String,
+    can_cancel: bool,
 }
 
 #[derive(Clone, Deserialize, Default)]
@@ -9344,6 +9433,15 @@ fn level_color_css(level: &str) -> &'static str {
         "subagent" => C_MAUVE_CSS,
         "presence" => C_GREEN_CSS,
         _ => C_OVERLAY1_CSS,
+    }
+}
+
+fn attention_level_color_css(level: &str, kind: &str) -> &'static str {
+    match level {
+        "blocked" | "error" => C_RED_CSS,
+        "warn" | "warning" => C_YELLOW_CSS,
+        "ready" | "ok" => C_GREEN_CSS,
+        _ => tone_color_css(kind),
     }
 }
 

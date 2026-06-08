@@ -19482,6 +19482,7 @@ function stationBuildAttentionQueue(controls) {
   for (const row of approvals) {
     items.push({
       id: `approval:${row.hostId}:${row.approvalId}`,
+      kind: 'approval',
       level: 'blocked',
       title: row.command || 'Approval required',
       meta: ['approval', row.local ? 'local' : stationHostLabel(row.hostId), row.category].filter(Boolean).join(' / '),
@@ -19499,6 +19500,7 @@ function stationBuildAttentionQueue(controls) {
   if (question) {
     items.push({
       id: 'human-input',
+      kind: 'human_input',
       level: 'blocked',
       title: 'Human input requested',
       meta: 'agent is waiting',
@@ -19513,6 +19515,7 @@ function stationBuildAttentionQueue(controls) {
   if (controls.sharedViewCanTakeInput) {
     items.push({
       id: 'shared-view-input',
+      kind: 'shared_view_input',
       level: 'blocked',
       title: 'Shared view input request',
       meta: controls.sharedViewTarget || 'shared display',
@@ -19535,6 +19538,7 @@ function stationBuildAttentionQueue(controls) {
   if (newSessionSpawnPending) {
     items.push({
       id: 'session-spawn',
+      kind: 'session_spawn',
       level: 'warn',
       title: 'New session spawning',
       meta: newSessionSpawnName || 'pending start confirmation',
@@ -19550,6 +19554,7 @@ function stationBuildAttentionQueue(controls) {
     const names = stationAttentionAttachmentNames();
     items.push({
       id: 'attachments',
+      kind: 'attachments',
       level: 'warn',
       title: `${controls.pendingAttachments} pending attachment${controls.pendingAttachments === 1 ? '' : 's'}`,
       meta: names.join(' / ') || 'staged for next send',
@@ -19565,10 +19570,13 @@ function stationBuildAttentionQueue(controls) {
     const cancellable = row.id.startsWith('steer-') && !['delivered', 'cancelled', 'failed'].includes(row.status);
     items.push({
       id: row.id,
+      kind: row.id.startsWith('follow-') ? 'follow_up' : 'steer',
       level: row.status === 'failed' ? 'blocked' : 'warn',
       title: `Steer ${row.status}`,
       meta: row.sessionId ? stationSessionShortLabel(row.sessionId) : row.id,
       detail: [compactSessionText(row.text, 160), row.reason].filter(Boolean).join(' / '),
+      sessionId: row.sessionId || '',
+      canCancel: cancellable,
       actions: [
         row.sessionId ? { label: 'Session', primary: true, onClick: () => stationRenderSessionsDock(row.sessionId) } : null,
         cancellable ? { label: 'Cancel', danger: true, onClick: () => { cancelSteerRow(row.id); stationRenderControlsDock('attention'); } } : null,
@@ -19579,6 +19587,7 @@ function stationBuildAttentionQueue(controls) {
   if (!controls.activeBrowser) {
     items.push({
       id: 'passive-browser',
+      kind: 'passive_browser',
       level: 'warn',
       title: 'Browser is passive',
       meta: 'voice/video control is elsewhere',
@@ -19592,10 +19601,13 @@ function stationBuildAttentionQueue(controls) {
   if (controls.sessionCanInterrupt) {
     items.push({
       id: 'active-turn',
+      kind: 'active_turn',
       level: 'ready',
       title: 'Agent turn active',
       meta: controls.sessionLabel || controls.sessionSelection || 'current target',
       detail: controls.sessionCanSteer ? 'Steer is available from the execution composer.' : 'Follow-up may be queued until the turn ends.',
+      sessionId: controls.sessionLiveId || controls.sessionId || '',
+      canCancel: false,
       actions: [
         { label: 'Composer', primary: true, onClick: () => { stationRenderControlsDock('execution'); setTimeout(() => document.getElementById('station-execution-input')?.focus(), 0); } },
         { label: 'Stop', danger: true, onClick: () => stationHandleActivityAction({ action: 'stop' }) },
@@ -20400,6 +20412,11 @@ function stationHandleControlsAction(action) {
   }
   if (op === 'attachments-clear') {
     document.querySelector('[data-pending-attachments-clear]')?.click();
+    return;
+  }
+  if (op.startsWith('queue-cancel:')) {
+    cancelSteerRow(op.slice('queue-cancel:'.length));
+    stationScheduleUpdate();
     return;
   }
   if (op === 'shared-view-take-input') {
@@ -21514,6 +21531,7 @@ function buildStationSnapshot() {
   }
 
   const context = stationBuildContextSummary();
+  const controls = stationBuildControlsSummary();
   return {
     hosts,
     agents,
@@ -21522,7 +21540,8 @@ function buildStationSnapshot() {
     managed: stationBuildManagedSummary(context),
     changes: stationBuildChangesSummary(),
     sessions: stationBuildSessionsSummary(),
-    controls: stationBuildControlsSummary(),
+    controls,
+    attentionQueue: stationBuildAttentionQueue(controls),
     displayRunway: stationDisplayRunwayPayload(),
   };
 }
@@ -44865,6 +44884,7 @@ function removeSteerRowSoon(id, delayMs = 1400) {
       steerRows.delete(key);
       const strip = document.getElementById('steer-strip');
       if (strip && strip.childElementCount === 0) strip.classList.add('empty');
+      stationScheduleUpdate();
     }, 220);
   }, delayMs);
 }
@@ -45157,6 +45177,7 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
   reasonNode.title = reason || '';
   el.title = [entry.text || text, reason].filter(Boolean).join('\n\n');
   strip.classList.remove('empty');
+  stationScheduleUpdate();
 
   // Clear any in-flight fade timer — a fresh status update preempts it.
   if (entry.timeout) { clearTimeout(entry.timeout); entry.timeout = null; }
@@ -45169,6 +45190,7 @@ function onSteerStatusUpdate(id, text, status, reason, options = {}) {
         el.remove();
         steerRows.delete(key);
         if (strip.childElementCount === 0) strip.classList.add('empty');
+        stationScheduleUpdate();
       }, 220);
     }, 1200);
   }
