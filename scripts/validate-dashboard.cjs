@@ -35,6 +35,16 @@ const PROTECTED_DASHBOARD_PORT = 8765;
 const STALE_BINARY_MTIME_SLOP_MS = 1000;
 const DASHBOARD_BINARY_INPUT_FILES = ['Cargo.toml', 'Cargo.lock'];
 const DASHBOARD_BINARY_INPUT_DIRS = ['src', 'crates', 'static'];
+const STATIC_IDENTITY_ASSETS = [
+  { urlPath: '/app', file: path.join('static', 'app.html'), kind: 'text', normalize: normalizeAppHtmlForIdentity },
+  { urlPath: '/wasm-web/presence_web.js', file: path.join('static', 'wasm-web', 'presence_web.js'), kind: 'text' },
+  { urlPath: '/wasm-web/presence_web_bg.wasm', file: path.join('static', 'wasm-web', 'presence_web_bg.wasm'), kind: 'binary' },
+  { urlPath: '/wasm-station/station_web.js', file: path.join('static', 'wasm-station', 'station_web.js'), kind: 'text' },
+  { urlPath: '/wasm-station/station_web_bg.wasm', file: path.join('static', 'wasm-station', 'station_web_bg.wasm'), kind: 'binary' },
+  { urlPath: '/three.module.min.js', file: path.join('static', 'three.module.min.js'), kind: 'text' },
+  { urlPath: '/audio-processor.js', file: path.join('static', 'audio-processor.js'), kind: 'text' },
+  { urlPath: '/icon-128.png', file: path.join('static', 'icon-128.png'), kind: 'binary' },
+];
 
 const BROWSER_EXECUTABLE_ENVS = [
   'INTENDANT_BROWSER_WORKSPACE_EXECUTABLE',
@@ -86,6 +96,10 @@ Options:
   --dashboard-binary PATH    Intendant binary for --launch-dashboard (default: $INTENDANT or a fresh target/{release,debug}/intendant)
   --dashboard-arg ARG        Extra arg appended to the launched dashboard command; repeatable
   --dashboard-timeout MS     Temporary dashboard readiness timeout (default: ${DEFAULT_DASHBOARD_TIMEOUT_MS})
+  --require-current-static   Fail unless served embedded dashboard static assets match this worktree
+  --require-station-state    Fail if Station sessions/events/managed/peers are all empty
+  --allow-empty-station-state
+                             Explicitly allow empty Station state with --require-station-state
   --check-static-scripts     Parse inline classic/module scripts in static/app.html without executing them
   --app-html PATH            HTML file for --check-static-scripts (default: static/app.html)
   --json                     Print one compact JSON result
@@ -126,6 +140,9 @@ function parseArgs(argv, env = process.env) {
     noSandbox: true,
     json: false,
     selfTest: false,
+    requireCurrentStatic: false,
+    requireStationState: false,
+    allowEmptyStationState: false,
     checkStaticScripts: false,
     appHtmlPath: path.join('static', 'app.html'),
     explicitDashboardTarget: false,
@@ -239,6 +256,12 @@ function parseArgs(argv, env = process.env) {
       opts.dashboardTimeoutMs = readNumber('--dashboard-timeout');
     } else if (arg.startsWith('--dashboard-timeout=')) {
       opts.dashboardTimeoutMs = parsePositiveInt(arg.slice('--dashboard-timeout='.length), '--dashboard-timeout');
+    } else if (arg === '--require-current-static') {
+      opts.requireCurrentStatic = true;
+    } else if (arg === '--require-station-state') {
+      opts.requireStationState = true;
+    } else if (arg === '--allow-empty-station-state') {
+      opts.allowEmptyStationState = true;
     } else if (arg === '--check-static-scripts') {
       opts.checkStaticScripts = true;
     } else if (arg === '--app-html') {
@@ -434,6 +457,9 @@ async function main() {
     if (opts.launchDashboard) {
       dashboard = await TemporaryDashboard.launch(opts, launchEnv);
     }
+    const staticIdentity = opts.requireCurrentStatic
+      ? await validateCurrentStaticIdentity(opts.url, process.cwd())
+      : undefined;
     harness = await BrowserHarness.launch(opts, launchEnv);
     const validation = await harness.validate(opts);
     const artifacts = {};
@@ -455,6 +481,8 @@ async function main() {
       stationProbes: opts.stationProbes.length,
       stationInteraction: validation.stationInteraction,
       stationInteractions: validation.stationInteraction ? validation.stationInteraction.count : 0,
+      stationState: validation.stationState,
+      staticIdentity,
       staticScripts: staticScriptResult,
     };
     printResult(opts, result);
@@ -607,6 +635,12 @@ function printResult(opts, result) {
         `  station interaction count=${displayResult.stationInteraction.count || 0} warmupLatencyMs=${displayResult.stationInteraction.warmupLatencyMs || 0} subsequentLatencyMs=${displayResult.stationInteraction.subsequentLatencyMs || 0} names=${quote((displayResult.stationInteraction.names || []).join(','))}`,
       );
     }
+    if (displayResult.stationState) {
+      console.log(formatStationStatePass(displayResult.stationState));
+    }
+    if (displayResult.staticIdentity) {
+      console.log(formatStaticIdentityPass(displayResult.staticIdentity));
+    }
     if (displayResult.staticScripts) {
       console.log(formatStaticScriptPass(displayResult.staticScripts));
     }
@@ -653,6 +687,15 @@ function printStaticScriptResult(opts, result) {
 
 function formatStaticScriptPass(result) {
   return `PASS dashboard-static-scripts file=${quote(result.file)} scripts=${result.scripts} classic=${result.classic} modules=${result.modules}`;
+}
+
+function formatStaticIdentityPass(result) {
+  return `  static identity assets=${result.assets} hash=${quote(result.hash)}`;
+}
+
+function formatStationStatePass(result) {
+  const counts = result.counts || {};
+  return `  station state sessions=${counts.sessions || 0} events=${counts.events || 0} managed=${counts.managed || 0} peers=${counts.peers || 0}`;
 }
 
 function collectFailureLogs(lineCount, dashboard, harness) {
@@ -908,6 +951,96 @@ function httpReady(url) {
     req.setTimeout(1000, () => {
       req.destroy();
       resolve(false);
+    });
+  });
+}
+
+async function validateCurrentStaticIdentity(targetUrl, cwd = process.cwd()) {
+  const assets = [];
+  for (const asset of STATIC_IDENTITY_ASSETS) {
+    const localPath = path.join(cwd, asset.file);
+    const local = fs.readFileSync(localPath);
+    const expected = normalizeStaticIdentityBytes(local, asset);
+    const servedUrl = dashboardAssetUrl(targetUrl, asset.urlPath);
+    const served = await httpBuffer(servedUrl);
+    const actual = normalizeStaticIdentityBytes(served, asset);
+    const expectedHash = sha256Hex(expected);
+    const actualHash = sha256Hex(actual);
+    if (expectedHash !== actualHash) {
+      throw new Error(
+        [
+          `stale dashboard static asset ${asset.urlPath}`,
+          `served hash ${actualHash} does not match ${path.relative(cwd, localPath) || localPath} hash ${expectedHash}`,
+          'the target is likely an already-running stale controller; rebuild/restart the controller for this worktree or omit --require-current-static only for non-build validation',
+        ].join('; '),
+      );
+    }
+    assets.push({ path: asset.urlPath, hash: actualHash });
+  }
+  return {
+    status: 'pass',
+    assets: assets.length,
+    hash: sha256Hex(Buffer.from(assets.map((item) => `${item.path}:${item.hash}`).join('\n'))),
+    items: assets,
+  };
+}
+
+function normalizeStaticIdentityBytes(bytes, asset) {
+  if (asset.kind === 'text') {
+    const text = Buffer.isBuffer(bytes) ? bytes.toString('utf8') : String(bytes || '');
+    const normalized = asset.normalize ? asset.normalize(text) : text;
+    return Buffer.from(normalized, 'utf8');
+  }
+  return Buffer.isBuffer(bytes) ? bytes : Buffer.from(bytes);
+}
+
+function normalizeAppHtmlForIdentity(text) {
+  return String(text || '')
+    .replace(/(\/wasm-web\/presence_web(?:_bg\.wasm|\.js))\?v=[A-Za-z0-9._:-]+/g, '$1')
+    .replace(/(\/wasm-station\/station_web(?:_bg\.wasm|\.js))\?v=[A-Za-z0-9._:-]+/g, '$1')
+    .replace(/(\/three\.module\.min\.js)\?v=[A-Za-z0-9._:-]+/g, '$1')
+    .replace(/(\/icon-128\.png)\?v=[A-Za-z0-9._:-]+/g, '$1');
+}
+
+function dashboardAssetUrl(targetUrl, urlPath) {
+  const url = new URL(targetUrl);
+  url.pathname = urlPath;
+  url.search = '';
+  url.hash = '';
+  return url.toString();
+}
+
+function sha256Hex(bytes) {
+  return crypto.createHash('sha256').update(bytes).digest('hex');
+}
+
+function httpBuffer(url) {
+  return new Promise((resolve, reject) => {
+    const parsed = new URL(url);
+    const client = parsed.protocol === 'https:' ? https : http;
+    const req = client.get(
+      {
+        hostname: parsed.hostname.replace(/^\[|\]$/g, ''),
+        port: parsed.port,
+        path: `${parsed.pathname || '/'}${parsed.search || ''}`,
+        protocol: parsed.protocol,
+        rejectUnauthorized: false,
+      },
+      (res) => {
+        const chunks = [];
+        res.on('data', (chunk) => chunks.push(Buffer.from(chunk)));
+        res.on('end', () => {
+          if (Number(res.statusCode) < 200 || Number(res.statusCode) >= 300) {
+            reject(new Error(`GET ${url} returned ${res.statusCode}`));
+            return;
+          }
+          resolve(Buffer.concat(chunks));
+        });
+      },
+    );
+    req.on('error', reject);
+    req.setTimeout(5000, () => {
+      req.destroy(new Error(`GET ${url} timed out`));
     });
   });
 }
@@ -1215,7 +1348,7 @@ class BrowserHarness {
       for (const source of opts.functions) {
         await this.waitForFunction(source, opts.timeoutMs);
       }
-      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe) {
+      if (opts.stationProbes.length > 0 || opts.stationInteractionProbe || opts.requireStationState) {
         await this.prepareStationSurface(opts.timeoutMs);
       }
       for (const probe of opts.stationProbes) {
@@ -1223,6 +1356,9 @@ class BrowserHarness {
       }
       if (opts.stationInteractionProbe) {
         validation.stationInteraction = await this.runStationInteractionProbe(opts.timeoutMs);
+      }
+      if (opts.requireStationState) {
+        validation.stationState = await this.requireStationState(opts);
       }
       return validation;
     } finally {
@@ -1388,6 +1524,17 @@ class BrowserHarness {
 
   async activateStationHotspot(target) {
     return this.evaluate(`(${stationHotspotActivateSource()})(${JSON.stringify(target)})`);
+  }
+
+  async requireStationState(opts) {
+    const state = await this.evaluate(`(${stationStateSummarySource()})()`);
+    if (!state || !state.ok) {
+      throw new Error(`station state check failed: ${state && state.reason ? state.reason : 'could not inspect Station state'} (last value: ${summarizeWaitValue(state)})`);
+    }
+    if (!state.nonEmpty && !opts.allowEmptyStationState) {
+      throw new Error(`station state check failed: Station sessions/events/managed/peers are all empty (last value: ${summarizeWaitValue(state)})`);
+    }
+    return state;
   }
 
   recordPageEvent(message) {
@@ -2626,6 +2773,64 @@ function stationHotspotActivateSource() {
   }.toString();
 }
 
+function stationStateSummarySource() {
+  return function collectStationStateSummary() {
+    const countArray = (value) => Array.isArray(value) ? value.length : 0;
+    const countMap = (value) => {
+      if (!value) return 0;
+      if (value instanceof Map || value instanceof Set) return value.size;
+      if (Array.isArray(value)) return value.length;
+      if (typeof value === 'object') return Object.keys(value).length;
+      return 0;
+    };
+    const countManaged = (managed) => {
+      if (!managed || typeof managed !== 'object') return 0;
+      let count = 0;
+      if (managed.live) count += 1;
+      if (managed.sessionId) count += 1;
+      count += Number(managed.records) || 0;
+      count += Number(managed.anchors) || 0;
+      count += Number(managed.lineageGroups) || 0;
+      count += Number(managed.fissionGroups) || 0;
+      count += countArray(managed.recentRecords);
+      count += countArray(managed.recentAnchors);
+      count += countArray(managed.recentBranches);
+      return count;
+    };
+    try {
+      const snapshot = typeof buildStationSnapshot === 'function' ? buildStationSnapshot() : null;
+      if (!snapshot || typeof snapshot !== 'object') {
+        return { ok: false, reason: 'buildStationSnapshot is unavailable' };
+      }
+      const sessions = Number(snapshot.sessions && snapshot.sessions.total) || 0;
+      const events = Math.max(
+        countArray(snapshot.events),
+        Number(snapshot.activity && snapshot.activity.retainedCount) || 0,
+        Number(snapshot.activity && snapshot.activity.shownCount) || 0,
+      );
+      const managed = countManaged(snapshot.managed);
+      const peers = Math.max(
+        countArray(snapshot.hosts) > 0 ? countArray(snapshot.hosts) - 1 : 0,
+        countArray(snapshot.agents) > 0 ? snapshot.agents.filter(agent => !/^primary-agent$/.test(String(agent && agent.id || ''))).length : 0,
+        countMap(typeof daemons !== 'undefined' ? daemons : null),
+      );
+      const counts = { sessions, events, managed, peers };
+      return {
+        ok: true,
+        nonEmpty: sessions > 0 || events > 0 || managed > 0 || peers > 0,
+        counts,
+        latestSession: snapshot.sessions && snapshot.sessions.latestTask || '',
+        managedSessionId: snapshot.managed && snapshot.managed.sessionId || '',
+      };
+    } catch (error) {
+      return {
+        ok: false,
+        reason: error && error.message ? error.message : String(error),
+      };
+    }
+  }.toString();
+}
+
 function stationConsoleWarnings(lines) {
   if (!Array.isArray(lines)) {
     return [];
@@ -2650,6 +2855,9 @@ function compactResultForOutput(opts, result) {
   if (compact.stationInteraction) {
     compact.stationInteraction = compactStationInteraction(compact.stationInteraction);
   }
+  if (compact.stationState) {
+    compact.stationState = compactStationState(compact.stationState);
+  }
   if (compact.diagnostics) {
     compact.diagnostics = compactDiagnostics(compact.diagnostics, {
       suppressControls: isStationFocusedCheck(opts) && !opts.diagnostics,
@@ -2659,6 +2867,25 @@ function compactResultForOutput(opts, result) {
     compact.next = validationFailureNextStep(compact);
   }
   return compact;
+}
+
+function compactStationState(state) {
+  if (!state || typeof state !== 'object') {
+    return state;
+  }
+  const counts = state.counts || {};
+  return {
+    ok: Boolean(state.ok),
+    nonEmpty: Boolean(state.nonEmpty),
+    counts: {
+      sessions: Number(counts.sessions) || 0,
+      events: Number(counts.events) || 0,
+      managed: Number(counts.managed) || 0,
+      peers: Number(counts.peers) || 0,
+    },
+    latestSession: truncateMiddle(state.latestSession || '', DIAGNOSTIC_TEXT_LIMIT),
+    managedSessionId: truncateMiddle(state.managedSessionId || '', DIAGNOSTIC_TEXT_LIMIT),
+  };
 }
 
 function compactStationInteraction(interaction) {
@@ -2716,6 +2943,12 @@ function validationFailureNextStep(result) {
   if (result.failureKind === 'interaction') {
     return 'treat as headed interaction validation failure; use the reported hotspot state/latency facts instead of scraping DevToolsActivePort or switching to desktop portal screenshots';
   }
+  if (result.failureKind === 'station-state') {
+    return 'target a populated managed Station controller, or rerun with --allow-empty-station-state only for renderer smoke tests';
+  }
+  if (result.failureKind === 'stale-static') {
+    return 'rebuild and restart the dashboard controller from this worktree, then rerun with --require-current-static';
+  }
   if (result.failureKind === 'probe' || result.failureKind === 'assertion') {
     return 'treat as probe/assertion failure; adjust the targeted condition or report partial validation; avoid further broad selector/source dumps and do not retry the same brittle wait';
   }
@@ -2729,6 +2962,12 @@ function validationFailureKind(reason) {
   const text = String(reason || '');
   if (/^station interaction probe/.test(text) || /station interaction probe impossible/.test(text)) {
     return 'interaction';
+  }
+  if (/^station state check failed/.test(text)) {
+    return 'station-state';
+  }
+  if (/^stale dashboard static asset/.test(text)) {
+    return 'stale-static';
   }
   if (/^screenshot capture/.test(text)) {
     return 'artifact';
@@ -2970,6 +3209,7 @@ function isWaitFailureReason(reason) {
   return /^selector not found: /.test(String(reason || ''))
     || /^wait-for-function did not become truthy/.test(String(reason || ''))
     || /^station probe .* did not pass/.test(String(reason || ''))
+    || /^station state check failed/.test(String(reason || ''))
     || /^station interaction probe/.test(String(reason || ''));
 }
 
@@ -2981,7 +3221,7 @@ function failureDiagnosticSelectors(opts) {
   for (const selector of diagnosticSelectorsFromWaitFunctions(opts.functions || [])) {
     addDiagnosticSelector(selectors, selector);
   }
-  if ((opts.stationProbes || []).length || opts.stationInteractionProbe) {
+  if ((opts.stationProbes || []).length || opts.stationInteractionProbe || opts.requireStationState) {
     for (const selector of ['#station-status', '#station-hud-canvas', '#station-dock', '#station-dock-nav [data-station-dock-nav="system:controls"]']) {
       addDiagnosticSelector(selectors, selector);
     }
@@ -2995,6 +3235,7 @@ function isStationFocusedCheck(opts) {
     ...(opts.functions || []),
     ...(opts.stationProbes || []).map((probe) => `station:${probe}`),
     opts.stationInteractionProbe ? 'station:interaction' : '',
+    opts.requireStationState ? 'station:state' : '',
   ].join('\n').toLowerCase();
   return haystack.includes('station-status')
     || haystack.includes('station-hud-canvas')
@@ -3184,6 +3425,9 @@ async function runSelfTest() {
       '--keep-browser',
       '--enable-gpu',
       '--browser-arg=--ozone-platform=x11',
+      '--require-current-static',
+      '--require-station-state',
+      '--allow-empty-station-state',
     ],
     {},
   );
@@ -3199,6 +3443,9 @@ async function runSelfTest() {
   assert.strictEqual(parsed.keepArtifacts, true);
   assert.strictEqual(parsed.keepBrowser, true);
   assert.strictEqual(parsed.enableGpu, true);
+  assert.strictEqual(parsed.requireCurrentStatic, true);
+  assert.strictEqual(parsed.requireStationState, true);
+  assert.strictEqual(parsed.allowEmptyStationState, true);
   assert.deepStrictEqual(parsed.browserArgs, ['--ozone-platform=x11']);
   assert.ok(browserArgs('/tmp/profile', parseArgs([], {})).includes('--disable-gpu'));
   const gpuBrowserArgs = browserArgs('/tmp/profile', parsed);
@@ -3397,6 +3644,7 @@ async function runSelfTest() {
   assert.ok(pageDiagnosticsSource().includes('selectorMatches'));
   assert.ok(pageDiagnosticsSource().includes('dataset'));
   assert.ok(stationDiagnosticsSource().includes('station-hud-canvas'));
+  assert.ok(stationStateSummarySource().includes('buildStationSnapshot'));
   assert.ok(stationHotspotPointSource().includes('stationHotspotBoxes'));
   assert.ok(stationHotspotActivateSource().includes('MouseEvent'));
   const fakeDock = {
@@ -3512,6 +3760,74 @@ async function runSelfTest() {
   })('system:view');
   assert.strictEqual(hotspotActivation.ok, true);
   assert.strictEqual(dispatchedActivationDetail, 0);
+  const stationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }],
+      agents: [{ id: 'primary-agent' }],
+      events: [],
+      activity: { retainedCount: 0, shownCount: 0 },
+      managed: { records: 0, anchors: 0 },
+      sessions: { total: 0 },
+    }),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(stationStateSummary.ok, true);
+  assert.strictEqual(stationStateSummary.nonEmpty, false);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(stationStateSummary.counts)), {
+    sessions: 0,
+    events: 0,
+    managed: 0,
+    peers: 0,
+  });
+  const populatedStationStateSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    buildStationSnapshot: () => ({
+      hosts: [{ id: 'local' }, { id: 'peer-1' }],
+      agents: [{ id: 'primary-agent' }, { id: 'peer-peer-1' }],
+      events: [{ id: 'event-1' }],
+      activity: { retainedCount: 1, shownCount: 1 },
+      managed: { sessionId: 'abc', records: 2, anchors: 3 },
+      sessions: { total: 4, latestTask: 'managed Station session' },
+    }),
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(populatedStationStateSummary.nonEmpty, true);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(populatedStationStateSummary.counts)), {
+    sessions: 4,
+    events: 1,
+    managed: 6,
+    peers: 1,
+  });
+  assert.strictEqual(
+    validationFailureKind('station state check failed: Station sessions/events/managed/peers are all empty'),
+    'station-state',
+  );
+  assert.strictEqual(
+    validationFailureKind('stale dashboard static asset /app; served hash abc does not match static/app.html hash def'),
+    'stale-static',
+  );
+  assert.ok(validationFailureNextStep({ failureKind: 'station-state', reason: '' }).includes('--allow-empty-station-state'));
+  assert.ok(validationFailureNextStep({ failureKind: 'stale-static', reason: '' }).includes('--require-current-static'));
+  assert.strictEqual(
+    normalizeAppHtmlForIdentity('<script src="/wasm-station/station_web.js?v=abc123"></script>'),
+    '<script src="/wasm-station/station_web.js"></script>',
+  );
+  assert.strictEqual(
+    dashboardAssetUrl('http://127.0.0.1:8912/app?passive=1#station', '/wasm-station/station_web.js'),
+    'http://127.0.0.1:8912/wasm-station/station_web.js',
+  );
+  assert.strictEqual(sha256Hex(Buffer.from('same')), sha256Hex(Buffer.from('same')));
   assert.deepStrictEqual(
     stationConsoleWarnings([
       '[console.log] Station ordinary log',
