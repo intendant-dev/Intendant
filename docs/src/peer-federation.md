@@ -41,7 +41,7 @@ authenticate*:
   "version": "0.x.y",
   "git_sha": "abc1234",
   "transports": [
-    { "type": "intendant-ws", "url": "ws://192.168.1.42:8765/ws" },
+    { "type": "intendant-ws", "url": "wss://192.168.1.42:8765/ws" },
     { "type": "intendant-ws", "url": "wss://node.tail-abcd.ts.net:8443/ws" }
   ],
   "capabilities": [
@@ -82,7 +82,7 @@ auto-detects its listener URL, but a NAT'd / tunneled / multi-homed daemon must
 advertise what's actually reachable:
 
 ```bash
-intendant --web --advertise-url ws://192.168.1.42:8765/ws \
+intendant --web --advertise-url wss://192.168.1.42:8765/ws \
                 --advertise-url wss://node.tail-abcd.ts.net:8443/ws
 ```
 
@@ -321,7 +321,7 @@ stream to the existing HTTP/WebSocket handling.
 ```bash
 intendant                                      # default: mTLS with access certs
 intendant --tls                                # TLS-only; installed access certs when present, else self-signed
-intendant --no-tls                            # explicit plaintext/debug escape
+intendant --no-tls --bind 127.0.0.1           # explicit local plaintext/debug escape
 intendant --tls-cert chain.pem --tls-key key.pem   # explicit PEM (implies --tls)
 ```
 
@@ -380,26 +380,28 @@ browser session.
 Native access TLS also solves browser secure-context requirements for access clients
 once the CA/client identity are installed. That matters for Station's WebGPU
 renderer, microphone/camera, browser screen capture, and stricter clipboard APIs;
-plain `http://<host-ip>:8765` does not expose those features.
+plain `http://<host-ip>:8765` does not expose those features. Plaintext mode is
+intended for explicit local/debug use; `--no-tls` on a wildcard listener refuses
+startup when a public interface exists unless `--allow-public-plaintext` is
+passed.
 
 ### How auth maps to the Agent Card
 
-The card's `auth` field tells connecting peers what to send. Construct it via the
-`AuthRequirements` helpers:
+The human model is certificate-first: the server certificate proves the daemon
+you reached, a client certificate is the peer's keycard, and role/capability
+metadata decides which doors that keycard opens. The card's `auth` field tells
+connecting peers what proof to send. Construct it via the `AuthRequirements`
+helpers:
 
 | Helper | `transport` | `application` | Use when |
 |---|---|---|---|
 | `none()` | `None` | — | Trusted network: loopback, tailnet, LAN behind a firewall (the phase-1 default) |
-| `mutual_tls()` | `MutualTls` | — | Trusted-LAN federation behind `intendant access setup` |
-| `bearer(hint)` | `None` | `Bearer` | Over an already-secured transport (e.g. a WireGuard tailnet) |
-| `mutual_tls_and_bearer(hint)` | `MutualTls` | `Bearer` | WAN exposure — even a TLS-verification CVE still needs a valid bearer |
+| `mutual_tls()` | `MutualTls` | — | Normal federation behind `intendant access setup` |
 
-Auth is layered: a wire-layer `TransportAuth` (`None` / `MutualTls` /
-`PinnedMutualTls`) satisfied during the TLS handshake, plus an optional per-request
-`ApplicationAuth` (a bearer token, with the actual secret referenced by `hint`
-rather than embedded in the card). A `bearer` `hint` is a human-readable reference
-like `"intendant.toml [peer.foo] bearer_token"` so the registry can locate the
-secret without leaking it onto the wire.
+`PinnedMutualTls` is the stricter transport form when an operator pins a server
+certificate fingerprint out of band. Bearer `ApplicationAuth` still exists in the
+wire format and code for legacy deployments and non-browser clients that cannot
+present a client certificate yet, but it should not be the normal dashboard UX.
 
 ## See Also
 

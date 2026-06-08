@@ -312,6 +312,7 @@ deployments only ever touch `[server.tls]`.
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
+| `bind` | string/IP | wildcard dual-stack, then `0.0.0.0` fallback | IP address the dashboard listens on. Use `127.0.0.1` or a specific interface for local/plaintext automation |
 | `advertise` | array | `[]` (auto-detect) | WebSocket URLs to advertise in this daemon's Agent Card, preference order. The CLI `--advertise-url` is additive over this |
 
 `[server.tls]` — native TLS-only HTTPS/WSS for the dashboard (pure-Rust
@@ -347,17 +348,19 @@ client identity.
 Use default mTLS, `[server.tls]`, `--tls`, the macOS app wrapper, or another
 trusted HTTPS reverse proxy when a remote browser needs secure-context-gated
 features: Station WebGPU, microphone/camera, browser screen capture, or stricter
-clipboard APIs. Plain `http://<host-ip>` is not enough for those APIs. The macOS
+clipboard APIs. Plain `http://<host-ip>` is not enough for those APIs, and
+`--no-tls` on a wildcard listener refuses startup when the host has a public
+interface unless `--allow-public-plaintext` is passed. The macOS
 app wrapper starts its bundled backend with native mTLS by default and fails
 closed with setup guidance when access certs are missing; see
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
-`[server.auth]` — inbound auth this daemon enforces on federation peers:
+`[server.auth]` — advanced compatibility auth for federation peers:
 
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
-| `bearer_token` | string | none | Require `Authorization: Bearer <token>` on inbound HTTP/WS; wrong/missing → 401 |
 | `advertised_transport` | string | `none` | What the Agent Card advertises: `none`, `mutual-tls`, or `pin-self-cert` |
+| `bearer_token` | string | none | Legacy/advanced: require `Authorization: Bearer <token>` on inbound HTTP/WS; prefer mTLS/client certificates for normal access |
 
 ### `[[peer]]` — federated peers
 
@@ -368,7 +371,7 @@ is required.
 |-----|------|---------|-------------|
 | `card_url` | string | (required) | URL of the peer's Agent Card (`.../.well-known/agent-card.json`) |
 | `label` | string | from card | Display label override in the dashboard's Daemons panel |
-| `bearer_token` | string | none | Outbound token this daemon sends to the peer (must match the peer's `[server.auth] bearer_token`) |
+| `bearer_token` | string | none | Legacy/advanced outbound token for peers that still require `[server.auth] bearer_token` |
 | `pinned_fingerprints` | array | `[]` | Operator-pinned SHA-256 cert fingerprints; when set, replaces the card's `auth.transport` claim |
 | `browser_tcp_via_url` | string | from primary | Explicit URL the browser uses to reach this peer's HTTP port for WebRTC ICE-TCP |
 
@@ -494,7 +497,8 @@ urls = ["stun:stun.l.google.com:19302"]
 # credential = "pass"
 
 [server]
-advertise = ["ws://192.168.1.42:8765/ws"]
+# bind = "127.0.0.1" # optional; use for local/plaintext automation
+advertise = ["wss://192.168.1.42:8765/ws"]
 
 [server.tls]
 enabled = false
@@ -503,11 +507,11 @@ enabled = false
 
 [server.auth]
 advertised_transport = "none"
-# bearer_token = "long-random-secret"
+# bearer_token = "legacy-advanced-only"
 
 # [[peer]]
 # card_url = "https://peer.example.com/.well-known/agent-card.json"
-# bearer_token = "matching-secret-from-the-peer-side"
+# bearer_token = "legacy-token-if-the-peer-requires-one"
 
 [[mcp_servers]]
 name = "filesystem"

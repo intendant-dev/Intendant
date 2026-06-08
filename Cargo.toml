@@ -74,7 +74,7 @@ image = { version = "0.25", default-features = false, features = ["jpeg", "png",
 tokio-util = { version = "0.7", features = ["rt"] }
 presence-core = { path = "crates/presence-core" }
 libc = "0.2"
-# Used by `find_available_port` / `bind_dual_stack_or_v4` to flip
+# Used by `find_available_port` / web listener binding to flip
 # IPV6_V6ONLY off before bind — tokio's `TcpSocket` doesn't expose
 # that knob, and macOS defaults it to true so an IPv6 bind without
 # this refuses IPv4 connections. Kept pinned to tokio 1.x's transitive

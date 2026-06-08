@@ -10033,11 +10033,11 @@ body.display-fullscreen-open {
             <fieldset class="settings-group">
               <legend>Daemons</legend>
               <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
-                Connect to additional intendant daemons on other machines to observe their activity alongside this one. Use <code style="color:var(--blue)">https://</code> (mTLS, required on iOS) or <code style="color:var(--blue)">http://</code> (trusted LAN / same hypervisor). Browser mixed-content rules apply — HTTPS pages can only reach HTTPS secondaries.
+                Connect to additional intendant daemons on other machines to observe their activity alongside this one. Use <code style="color:var(--blue)">https://</code> with enrolled access certificates for normal use; plain <code style="color:var(--blue)">http://</code> is only for explicit local/debug daemons started with <code style="color:var(--blue)">--no-tls</code>. Browser mixed-content rules apply — HTTPS pages can only reach HTTPS secondaries.
               </p>
               <div id="daemons-list" class="daemons-list"></div>
               <div class="daemon-add-row">
-                <input id="daemon-add-url" type="text" placeholder="http://macos-guest:8765 or https://mac-work:8443" autocomplete="off">
+                <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
                 <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
                 <button id="daemon-add-btn" type="button">Add</button>
               </div>
@@ -10077,19 +10077,6 @@ body.display-fullscreen-open {
                 </div>
                 <div id="coord-route-result" class="coord-result"></div>
               </div>
-            </fieldset>
-
-            <fieldset class="settings-group">
-              <legend>Federation auth</legend>
-              <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
-                When this dashboard's primary daemon enforces application-layer auth (<code style="color:var(--blue)">[server.auth] bearer_token</code> in intendant.toml), the same token must be set here so federation REST calls and the <code style="color:var(--blue)">/ws</code> WebSocket carry it. Stored locally in this browser only — never sent to any peer except via the standard <code style="color:var(--blue)">Authorization: Bearer</code> header (REST) and <code style="color:var(--blue)">?token=</code> URL parameter (<code style="color:var(--blue)">/ws</code> upgrade, since browsers can't set headers on WebSocket opens).
-              </p>
-              <div class="daemon-add-row">
-                <input id="federation-token-input" type="password" placeholder="(no token configured)" autocomplete="off">
-                <button id="federation-token-save" type="button">Save</button>
-                <button id="federation-token-clear" type="button">Clear</button>
-              </div>
-              <span id="federation-token-status" class="daemons-status"></span>
             </fieldset>
           </div>
         </div>
@@ -10427,22 +10414,21 @@ import init, { PresenceWeb } from '/wasm-web/presence_web.js';
 import stationInit, { StationWeb } from '/wasm-station/station_web.js';
 import * as THREE from '/three.module.min.js';
 
-// ── Federation auth ──
+// ── Legacy federation auth compatibility ──
 //
 // When the daemon's `[server.auth] bearer_token` is set, federation
 // REST endpoints (/api/peers*, /api/coordinator/*, /api/sessions,
 // /api/worktrees) and
 // /ws all require the matching token. The dashboard stores the
-// operator-supplied token in localStorage (set via Settings → Network
-// → Federation auth) and:
+// operator-supplied token in localStorage when configured by older
+// builds or custom tooling and:
 //
 //   - includes it in `Authorization: Bearer <token>` on federation
 //     fetch() calls via `authedFetch()`
 //   - appends it as `?token=<token>` on the /ws URL via `buildWsUrl()`,
 //     since browser `WebSocket` opens can't natively set headers
 //
-// When unset (the common case for trusted-LAN deployments without
-// bearer configured), all paths sail through with no Authorization
+// When unset (the normal certificate-first path), all paths sail through with no Authorization
 // header and no `?token=` query — the daemon's `verify_bearer_*`
 // helpers treat None as "no enforcement."
 const FEDERATION_TOKEN_KEY = 'intendantFederationBearerToken';
@@ -44459,7 +44445,7 @@ async function addDaemon() {
   // the browser's cryptic CORS/mixed-content error.
   if (location.protocol === 'https:' && baseUrl.startsWith('http://')) {
     setDaemonsStatus(
-      'This dashboard is served over HTTPS, so secondaries must also be HTTPS (browser mixed-content rule). Either set up mTLS on the remote daemon via `intendant access setup`, or open this dashboard over plain HTTP.',
+      'This dashboard is served over HTTPS, so secondaries must also be HTTPS (browser mixed-content rule). Set up access certificates on the remote daemon with `intendant access setup`, or use an explicit local/debug HTTP setup for both daemons.',
       'error'
     );
     return;
@@ -44691,12 +44677,9 @@ async function initDaemons() {
     });
   }
 
-  // Wire the Federation auth panel. The token is stored in
-  // localStorage; this UI is the only place it's set/cleared. The
-  // input is type=password so it's masked at rest; we never display
-  // the actual token (only a placeholder noting whether one's set).
-  // Changing the token requires a reload to reconnect /ws — the
-  // active WebSocket connection still carries the old URL.
+  // Legacy bearer controls were removed from the default dashboard UX, but
+  // this stays null-safe so older/custom pages with these IDs can still set
+  // the localStorage compatibility token.
   const fedInput = document.getElementById('federation-token-input');
   const fedSave = document.getElementById('federation-token-save');
   const fedClear = document.getElementById('federation-token-clear');

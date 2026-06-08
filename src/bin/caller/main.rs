@@ -70,6 +70,7 @@ use serde::Serialize;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
+use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9518,10 +9519,17 @@ struct CliFlags {
     /// --web [PORT]: Serve TUI via web (xterm.js + optional voice).
     web: bool,
     web_port: u16,
+    /// --bind <ADDR>: IP address for the web dashboard listener. Defaults
+    /// to wildcard dual-stack when available. Use 127.0.0.1 with --no-tls
+    /// for local automation.
+    web_bind: Option<IpAddr>,
     /// --no-tls: Explicitly serve the web dashboard over plain HTTP. The
     /// dashboard defaults to mTLS; this flag is the debug/programmatic escape
     /// hatch for callers that knowingly want cleartext.
     no_tls: bool,
+    /// --allow-public-plaintext: Acknowledge that --no-tls on a wildcard
+    /// listener can expose the dashboard on public interfaces.
+    allow_public_plaintext: bool,
     /// --tls: Serve the `--web` dashboard over HTTPS/WSS without requiring
     /// browser/client certificates. Installed access certs are preferred when
     /// present, otherwise a self-signed cert is minted at startup.
@@ -9579,9 +9587,11 @@ fn print_help() {
     println!("    --direct              Force single-agent mode (skip orchestrator/sub-agent delegation)");
     println!("    --no-presence         Disable the presence layer (direct agent interaction)");
     println!("    --web [PORT]          Web dashboard (default: on, port 8765; idle starts daemon/no TUI)");
+    println!("    --bind <ADDR>         IP address for the web dashboard listener");
     println!(
         "    --no-tls              Serve the web dashboard over plain HTTP (explicit debug escape)"
     );
+    println!("    --allow-public-plaintext  Allow --no-tls wildcard bind when public IPs exist");
     println!(
         "    --tls                 Serve HTTPS/WSS without requiring browser client certificates"
     );
@@ -9600,7 +9610,7 @@ fn print_help() {
     println!("    --advertise-url <URL> WebSocket URL to advertise to peers in this daemon's");
     println!("                          Agent Card (repeatable, preference order). Overrides");
     println!("                          [server.advertise] in intendant.toml when given.");
-    println!("                          Example: --advertise-url ws://192.168.1.42:8765/ws");
+    println!("                          Example: --advertise-url wss://192.168.1.42:8765/ws");
     println!(
         "                                   --advertise-url wss://node.tail-abcd.ts.net:8443/ws"
     );
@@ -9655,10 +9665,11 @@ fn print_help() {
 /// so the card's URL list stays consistent with the bind.
 async fn find_available_port(
     preferred: u16,
+    bind_ip: Option<IpAddr>,
 ) -> Result<(u16, tokio::net::TcpListener), CallerError> {
     for offset in 0..20u16 {
         let port = preferred.checked_add(offset).unwrap_or(preferred);
-        match bind_dual_stack_or_v4(port).await {
+        match bind_web_listener(port, bind_ip).await {
             Ok(listener) => return Ok((port, listener)),
             Err(e) if e.kind() == std::io::ErrorKind::AddrInUse => continue,
             Err(e) => {
@@ -9674,6 +9685,36 @@ async fn find_available_port(
         preferred,
         preferred + 19
     )))
+}
+
+async fn bind_web_listener(
+    port: u16,
+    bind_ip: Option<IpAddr>,
+) -> std::io::Result<tokio::net::TcpListener> {
+    match bind_ip {
+        None => bind_dual_stack_or_v4(port).await,
+        Some(IpAddr::V6(ip)) if ip.is_unspecified() => bind_dual_stack_or_v4(port).await,
+        Some(IpAddr::V4(ip)) => {
+            bind_single_stack(SocketAddr::new(IpAddr::V4(ip), port), socket2::Domain::IPV4)
+        }
+        Some(IpAddr::V6(ip)) => {
+            bind_single_stack(SocketAddr::new(IpAddr::V6(ip), port), socket2::Domain::IPV6)
+        }
+    }
+}
+
+fn bind_single_stack(
+    addr: SocketAddr,
+    domain: socket2::Domain,
+) -> std::io::Result<tokio::net::TcpListener> {
+    use socket2::{Protocol, Socket, Type};
+    let socket = Socket::new(domain, Type::STREAM, Some(Protocol::TCP))?;
+    let _ = socket.set_reuse_address(true);
+    socket.bind(&addr.into())?;
+    socket.listen(1024)?;
+    socket.set_nonblocking(true)?;
+    let std_listener: std::net::TcpListener = socket.into();
+    tokio::net::TcpListener::from_std(std_listener)
 }
 
 /// Bind a TCP listener on `port`, preferring IPv6 dual-stack.
@@ -9695,7 +9736,6 @@ async fn find_available_port(
 /// port stable across restarts.
 async fn bind_dual_stack_or_v4(port: u16) -> std::io::Result<tokio::net::TcpListener> {
     use socket2::{Domain, Protocol, Socket, Type};
-    use std::net::SocketAddr;
     if let Ok(socket) = Socket::new(Domain::IPV6, Type::STREAM, Some(Protocol::TCP)) {
         // Flip V6ONLY off so the listener accepts IPv4 too. If the
         // kernel doesn't support the toggle (hardened sandboxes),
@@ -9863,7 +9903,8 @@ fn missing_default_mtls_cert_message(cert_dir: &Path) -> String {
         "Dashboard mTLS is enabled by default, but no installed access server certificate was \
          found in {cert_dir} (expected server.crt and server.key). Run `intendant access setup` \
          to create/enroll dashboard access certificates, pass `--tls` for HTTPS without client \
-         certificate authentication, or pass `--no-tls` only for explicit local/debug plaintext.",
+         certificate authentication, or pass `--no-tls --bind 127.0.0.1` only for explicit \
+         local/debug plaintext.",
         cert_dir = cert_dir.display()
     )
 }
@@ -9972,19 +10013,33 @@ fn installed_access_mtls_ca_path_from_dir(cert_dir: &Path) -> Option<PathBuf> {
 fn web_tui_display_url(
     web_tls_acceptor: &Option<tokio_rustls::TlsAcceptor>,
     web_port: u16,
+    web_bind: Option<IpAddr>,
 ) -> String {
     let scheme = if web_tls_acceptor.is_some() {
         "https"
     } else {
         "http"
     };
-    format!("{scheme}://0.0.0.0:{web_port}")
+    let host = web_tui_display_host(web_bind);
+    format!("{scheme}://{host}:{web_port}")
 }
 
-fn web_tui_log_line(web_tls_acceptor: &Option<tokio_rustls::TlsAcceptor>, web_port: u16) -> String {
+fn web_tui_display_host(web_bind: Option<IpAddr>) -> String {
+    match web_bind {
+        Some(IpAddr::V4(ip)) => ip.to_string(),
+        Some(IpAddr::V6(ip)) => format!("[{ip}]"),
+        None => "0.0.0.0".to_string(),
+    }
+}
+
+fn web_tui_log_line(
+    web_tls_acceptor: &Option<tokio_rustls::TlsAcceptor>,
+    web_port: u16,
+    web_bind: Option<IpAddr>,
+) -> String {
     format!(
         "Web TUI: {}",
-        web_tui_display_url(web_tls_acceptor, web_port)
+        web_tui_display_url(web_tls_acceptor, web_port, web_bind)
     )
 }
 
@@ -10008,7 +10063,9 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
         no_presence: false,
         web: false,
         web_port: web_gateway::DEFAULT_PORT,
+        web_bind: None,
         no_tls: false,
+        allow_public_plaintext: false,
         tls: false,
         tls_cert: None,
         tls_key: None,
@@ -10134,8 +10191,26 @@ fn parse_cli_flags() -> Result<CliFlags, CallerError> {
                     i += 1;
                 }
             }
+            "--bind" => {
+                if i + 1 < args.len() {
+                    let ip = args[i + 1].parse::<IpAddr>().map_err(|_| {
+                        CallerError::Config(format!(
+                            "--bind: '{}' is not a valid IP address",
+                            args[i + 1]
+                        ))
+                    })?;
+                    flags.web_bind = Some(ip);
+                    i += 2;
+                } else {
+                    return Err(CallerError::Config("Missing value for --bind".to_string()));
+                }
+            }
             "--no-tls" => {
                 flags.no_tls = true;
+                i += 1;
+            }
+            "--allow-public-plaintext" => {
+                flags.allow_public_plaintext = true;
                 i += 1;
             }
             "--tls" => {
@@ -10267,6 +10342,95 @@ fn validate_tls_cli_flags(flags: &CliFlags) -> Result<(), CallerError> {
         ));
     }
     Ok(())
+}
+
+fn effective_web_bind_ip(flags: &CliFlags, server_cfg: &project::ServerConfig) -> Option<IpAddr> {
+    flags.web_bind.or(server_cfg.bind)
+}
+
+fn validate_plaintext_web_bind(
+    flags: &CliFlags,
+    bind_ip: Option<IpAddr>,
+) -> Result<(), CallerError> {
+    let public_addrs = public_routable_local_addrs();
+    validate_plaintext_web_bind_with_public_addrs(flags, bind_ip, &public_addrs)
+}
+
+fn validate_plaintext_web_bind_with_public_addrs(
+    flags: &CliFlags,
+    bind_ip: Option<IpAddr>,
+    public_addrs: &[IpAddr],
+) -> Result<(), CallerError> {
+    if !flags.no_tls
+        || flags.allow_public_plaintext
+        || !web_bind_is_wildcard(bind_ip)
+        || public_addrs.is_empty()
+    {
+        return Ok(());
+    }
+
+    let public_list = public_addrs
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(CallerError::Config(format!(
+        "Refusing `--no-tls` on a wildcard dashboard listener because this host has public \
+         interface address(es): {public_list}. Plain HTTP would expose Intendant on those \
+         addresses. Use default mTLS, `--tls`, `--bind 127.0.0.1`, bind a specific private \
+         interface, or pass `--allow-public-plaintext` if this is intentional."
+    )))
+}
+
+fn web_bind_is_wildcard(bind_ip: Option<IpAddr>) -> bool {
+    bind_ip.map(|ip| ip.is_unspecified()).unwrap_or(true)
+}
+
+fn public_routable_local_addrs() -> Vec<IpAddr> {
+    let mut addrs = access::routable_local_addrs(false)
+        .into_iter()
+        .filter(is_public_ip)
+        .collect::<Vec<_>>();
+    addrs.sort_by_key(|ip| ip.to_string());
+    addrs.dedup();
+    addrs
+}
+
+fn is_public_ip(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(ip) => is_public_ipv4(*ip),
+        IpAddr::V6(ip) => is_public_ipv6(*ip),
+    }
+}
+
+fn is_public_ipv4(ip: Ipv4Addr) -> bool {
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_private()
+        && !ip.is_link_local()
+        && !ip.is_multicast()
+        && !ip.is_broadcast()
+        && !ip.is_documentation()
+        && !is_shared_carrier_nat_ipv4(ip)
+}
+
+fn is_shared_carrier_nat_ipv4(ip: Ipv4Addr) -> bool {
+    let octets = ip.octets();
+    octets[0] == 100 && (octets[1] & 0b1100_0000) == 64
+}
+
+fn is_public_ipv6(ip: Ipv6Addr) -> bool {
+    let segments = ip.segments();
+    let first = segments[0];
+    let is_unique_local = (first & 0xfe00) == 0xfc00;
+    let is_link_local = (first & 0xffc0) == 0xfe80;
+    let is_documentation = segments[0] == 0x2001 && segments[1] == 0x0db8;
+    !ip.is_unspecified()
+        && !ip.is_loopback()
+        && !ip.is_multicast()
+        && !is_unique_local
+        && !is_link_local
+        && !is_documentation
 }
 
 fn should_start_idle_web_daemon(use_web: bool, flags: &CliFlags) -> bool {
@@ -15340,7 +15504,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            web_bind: None,
             no_tls: false,
+            allow_public_plaintext: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15391,7 +15557,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: false,
             web_port: web_gateway::DEFAULT_PORT,
+            web_bind: None,
             no_tls: false,
+            allow_public_plaintext: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15442,7 +15610,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: web_gateway::DEFAULT_PORT,
+            web_bind: None,
             no_tls: false,
+            allow_public_plaintext: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15481,7 +15651,9 @@ Also: {"source": "bare"}"#;
             no_presence: false,
             web: true,
             web_port: 9000,
+            web_bind: None,
             no_tls: false,
+            allow_public_plaintext: false,
             tls: false,
             tls_cert: None,
             tls_key: None,
@@ -15548,6 +15720,74 @@ Also: {"source": "bare"}"#;
         flags.tls = true;
         let err = validate_tls_cli_flags(&flags).unwrap_err();
         assert!(err.to_string().contains("--no-tls"), "err: {err}");
+    }
+
+    #[test]
+    fn effective_web_bind_cli_overrides_config() {
+        let mut flags = cli_flags_for_tests();
+        flags.web_bind = Some("127.0.0.1".parse().unwrap());
+        let server_cfg = project::ServerConfig {
+            bind: Some("10.0.0.2".parse().unwrap()),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_web_bind_ip(&flags, &server_cfg),
+            Some("127.0.0.1".parse().unwrap())
+        );
+    }
+
+    #[test]
+    fn no_tls_wildcard_rejects_public_interface_without_override() {
+        let mut flags = cli_flags_for_tests();
+        flags.no_tls = true;
+        let public_addrs = vec!["8.8.8.8".parse().unwrap()];
+        let err =
+            validate_plaintext_web_bind_with_public_addrs(&flags, None, &public_addrs).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("--no-tls"), "msg: {msg}");
+        assert!(msg.contains("--bind 127.0.0.1"), "msg: {msg}");
+    }
+
+    #[test]
+    fn no_tls_wildcard_allows_private_interfaces() {
+        let mut flags = cli_flags_for_tests();
+        flags.no_tls = true;
+        assert!(validate_plaintext_web_bind_with_public_addrs(&flags, None, &[]).is_ok());
+    }
+
+    #[test]
+    fn no_tls_specific_bind_allows_public_interface() {
+        let mut flags = cli_flags_for_tests();
+        flags.no_tls = true;
+        let public_addrs = vec!["8.8.8.8".parse().unwrap()];
+        assert!(validate_plaintext_web_bind_with_public_addrs(
+            &flags,
+            Some("127.0.0.1".parse().unwrap()),
+            &public_addrs,
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn no_tls_wildcard_public_override_is_explicit() {
+        let mut flags = cli_flags_for_tests();
+        flags.no_tls = true;
+        flags.allow_public_plaintext = true;
+        let public_addrs = vec!["8.8.8.8".parse().unwrap()];
+        assert!(validate_plaintext_web_bind_with_public_addrs(&flags, None, &public_addrs).is_ok());
+    }
+
+    #[test]
+    fn public_ip_classification_excludes_private_and_documentation_ranges() {
+        assert!(is_public_ip(&"8.8.8.8".parse().unwrap()));
+        assert!(!is_public_ip(&"10.0.0.1".parse().unwrap()));
+        assert!(!is_public_ip(&"192.168.1.10".parse().unwrap()));
+        assert!(!is_public_ip(&"100.64.0.1".parse().unwrap()));
+        assert!(!is_public_ip(&"203.0.113.10".parse().unwrap()));
+        assert!(is_public_ip(&"2001:4860:4860::8888".parse().unwrap()));
+        assert!(!is_public_ip(&"fc00::1".parse().unwrap()));
+        assert!(!is_public_ip(&"fe80::1".parse().unwrap()));
+        assert!(!is_public_ip(&"2001:db8::1".parse().unwrap()));
     }
 
     #[test]
@@ -24893,6 +25133,10 @@ async fn main() -> Result<(), CallerError> {
     // Web gateway is on by default unless explicitly disabled, or when running
     // in MCP/JSON modes that own stdio.
     let use_web = !flags.no_web && !flags.mcp && !flags.json_output;
+    let web_bind_ip = effective_web_bind_ip(&flags, &project.config.server);
+    if use_web {
+        validate_plaintext_web_bind(&flags, web_bind_ip)?;
+    }
 
     // Resolve CLI/config external-agent choice once and share the effective
     // runtime value with dashboard APIs. This intentionally happens before
@@ -24906,7 +25150,7 @@ async fn main() -> Result<(), CallerError> {
 
     // Resolve web port via auto-discovery, keeping the listener alive (no TOCTOU).
     let (web_port, mut web_listener) = if use_web {
-        let (port, listener) = find_available_port(flags.web_port).await?;
+        let (port, listener) = find_available_port(flags.web_port, web_bind_ip).await?;
         (port, Some(listener))
     } else {
         (flags.web_port, None)
@@ -25173,7 +25417,10 @@ async fn main() -> Result<(), CallerError> {
             )?,
             web_tls_acceptor.clone(),
         );
-        eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
+        eprintln!(
+            "{}",
+            web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip)
+        );
 
         let shared_codex_config: control_plane::SharedCodexConfig = {
             let cfg = &project.config.agent.codex;
@@ -25407,9 +25654,12 @@ async fn main() -> Result<(), CallerError> {
                 web_tls_acceptor.clone(),
             );
             slog(&session_log, |l| {
-                l.info(&web_tui_log_line(&web_tls_acceptor, web_port))
+                l.info(&web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip))
             });
-            eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
+            eprintln!(
+                "{}",
+                web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip)
+            );
             Some(handle)
         } else {
             None
@@ -26016,7 +26266,7 @@ async fn main() -> Result<(), CallerError> {
             );
             app.log(
                 types::LogLevel::Info,
-                web_tui_log_line(&web_tls_acceptor, web_port),
+                web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip),
             );
             Some(handle)
         } else {
@@ -26328,7 +26578,10 @@ async fn main() -> Result<(), CallerError> {
                 app.set_control_socket(tx.clone());
                 tx
             });
-            eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
+            eprintln!(
+                "{}",
+                web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip)
+            );
             let mut web_tui = tui::web::WebTui::new(120, 40, broadcast_tx)
                 .map_err(|e| CallerError::Tui(format!("Failed to initialize Web TUI: {}", e)))?;
             let cmd_rx = web_tui_rx.expect("web_tui_rx must exist in web mode");
@@ -26531,7 +26784,10 @@ async fn main() -> Result<(), CallerError> {
                 )?,
                 web_tls_acceptor.clone(),
             );
-            eprintln!("{}", web_tui_log_line(&web_tls_acceptor, web_port));
+            eprintln!(
+                "{}",
+                web_tui_log_line(&web_tls_acceptor, web_port, web_bind_ip)
+            );
             Some(shared_session)
         } else {
             None
