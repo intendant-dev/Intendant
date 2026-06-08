@@ -24166,8 +24166,10 @@ function processCommands(cmds) {
         if (isStatsShowingSelf()) {
           renderUsageTab(c);
           if (activeTab === 'stats') {
-            renderCachedStatsSessionSections(currentStatsHostKey());
-            loadAllSessionsUsage(currentStatsHostKey(), { force: false });
+            const statsHost = currentStatsHostKey();
+            if (!Array.isArray(cachedStatsSessions(statsHost))) {
+              loadAllSessionsUsage(statsHost, { force: false });
+            }
           }
         }
         updateTickerFromUsage(c);
@@ -45168,6 +45170,7 @@ document.getElementById('settings-save-keys').addEventListener('click', saveApiK
 
 function fetchSessionsForHost(hostId, options = {}) {
   hostId = hostId || selfPeerId;
+  const cacheSessionMetadata = options.cacheSessionMetadata !== false;
   const cacheKey = sessionListCacheKey(hostId, options);
   const cached = sessionsListCache.get(cacheKey);
   if (cached && !options.force) {
@@ -45200,7 +45203,7 @@ function fetchSessionsForHost(hostId, options = {}) {
         throw new Error('/api/sessions returned a non-array payload');
       }
       sessionsListCache.set(cacheKey, sessions);
-      if (hostId === selfPeerId) cacheSessionWindowMetadata(sessions);
+      if (hostId === selfPeerId && cacheSessionMetadata) cacheSessionWindowMetadata(sessions);
       return sessions;
     })
     .finally(() => {
@@ -45800,7 +45803,7 @@ function loadAllSessionsUsage(hostId, options = {}) {
     clearStatsSessionSections();
     setStatsSessionLoading(hostId, true);
   }
-  fetchSessionsForHost(hostId, { force: !!options.force, limit: 'all' })
+  fetchSessionsForHost(hostId, { force: !!options.force, limit: 'all', cacheSessionMetadata: false })
     .then(sessions => {
       // Only render if the user is still viewing this host. A slow
       // fetch that finishes after the user switched away would
