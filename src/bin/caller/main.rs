@@ -5208,6 +5208,152 @@ fn managed_context_rewind_only_tool_allowed(tool_name: &str, preview: &str) -> b
             .is_some_and(|(_, name)| allowed_name(name))
 }
 
+fn shellish_command_tokens(command: &str) -> Vec<String> {
+    command
+        .split_whitespace()
+        .map(|token| {
+            token
+                .trim_matches(|c: char| {
+                    matches!(
+                        c,
+                        '"' | '\'' | '`' | '(' | ')' | '{' | '}' | '[' | ']' | ';' | ','
+                    )
+                })
+                .to_string()
+        })
+        .filter(|token| !token.is_empty())
+        .collect()
+}
+
+fn shell_token_basename(token: &str) -> &str {
+    token
+        .rsplit(|c| c == '/' || c == '\\')
+        .next()
+        .unwrap_or(token)
+}
+
+fn shell_token_is_assignment(token: &str) -> bool {
+    let Some((name, _)) = token.split_once('=') else {
+        return false;
+    };
+    let mut chars = name.chars();
+    let Some(first) = chars.next() else {
+        return false;
+    };
+    (first == '_' || first.is_ascii_alphabetic())
+        && chars.all(|c| c == '_' || c.is_ascii_alphanumeric())
+}
+
+fn shell_command_starts_with_non_execution_reader(tokens: &[String]) -> bool {
+    let Some(first) = tokens
+        .iter()
+        .find(|token| !shell_token_is_assignment(token))
+        .map(|token| shell_token_basename(token).to_ascii_lowercase())
+    else {
+        return false;
+    };
+    matches!(
+        first.as_str(),
+        "rg" | "grep"
+            | "sed"
+            | "cat"
+            | "printf"
+            | "echo"
+            | "awk"
+            | "jq"
+            | "find"
+            | "ls"
+            | "ps"
+            | "pgrep"
+            | "pkill"
+            | "kill"
+            | "python"
+            | "python3"
+            | "node"
+            | "perl"
+    )
+}
+
+fn shell_token_is_intendant_binary(token: &str) -> bool {
+    matches!(shell_token_basename(token), "intendant" | "intendant.exe")
+}
+
+fn shell_token_is_web_flag(token: &str) -> bool {
+    token == "--web" || token.starts_with("--web=")
+}
+
+fn shell_command_invokes_intendant_web(tokens: &[String]) -> bool {
+    if shell_command_starts_with_non_execution_reader(tokens) {
+        return false;
+    }
+    tokens
+        .iter()
+        .any(|token| shell_token_is_intendant_binary(token))
+        && tokens.iter().any(|token| shell_token_is_web_flag(token))
+}
+
+fn shell_command_has_background_operator(command: &str) -> bool {
+    let chars: Vec<char> = command.chars().collect();
+    for (idx, ch) in chars.iter().enumerate() {
+        if *ch != '&' {
+            continue;
+        }
+        let prev = idx.checked_sub(1).and_then(|i| chars.get(i)).copied();
+        let next = chars.get(idx + 1).copied();
+        if matches!(prev, Some('&' | '>' | '<')) || matches!(next, Some('&' | '>')) {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+fn shell_command_has_explicit_dashboard_cleanup(command: &str, tokens: &[String]) -> bool {
+    if !shell_command_has_background_operator(command) {
+        return false;
+    }
+    let has_trap = tokens.iter().any(|token| token == "trap");
+    let has_kill = tokens
+        .iter()
+        .any(|token| matches!(shell_token_basename(token), "kill" | "killall"));
+    let references_background_pid = command.contains("$!")
+        || tokens
+            .iter()
+            .any(|token| token.to_ascii_lowercase().contains("pid"));
+    has_kill && (has_trap || references_background_pid)
+}
+
+fn shell_command_has_owned_dashboard_lifecycle(command: &str, tokens: &[String]) -> bool {
+    let lower = command.to_ascii_lowercase();
+    if lower.contains("validate-dashboard.cjs") && lower.contains("--launch-dashboard") {
+        return true;
+    }
+    if tokens
+        .iter()
+        .any(|token| matches!(shell_token_basename(token), "timeout" | "gtimeout"))
+    {
+        return true;
+    }
+    shell_command_has_explicit_dashboard_cleanup(command, tokens)
+}
+
+fn managed_codex_foreground_dashboard_command(tool_name: &str, preview: &str) -> bool {
+    if tool_name.trim() != "command" {
+        return false;
+    }
+    let command = preview
+        .trim()
+        .strip_prefix("command:")
+        .map(str::trim)
+        .unwrap_or_else(|| preview.trim());
+    if command.is_empty() {
+        return false;
+    }
+    let tokens = shellish_command_tokens(command);
+    shell_command_invokes_intendant_web(&tokens)
+        && !shell_command_has_owned_dashboard_lifecycle(command, &tokens)
+}
+
 fn managed_context_recovery_pressure(
     snapshot: &external_agent::AgentContextSnapshot,
 ) -> Option<ManagedContextRewindOnlyPressure> {
@@ -7524,6 +7670,7 @@ async fn drain_external_agent_events(
         || managed_context_density_handoff
         || managed_context_density_handoff_completed;
     let mut managed_context_blocked_tool_items: HashSet<String> = HashSet::new();
+    let mut managed_dashboard_command_interrupt_sent = false;
 
     // Background watcher: if an interrupt arrives while an approval handler
     // below is blocked on `rx.await`, we need to drain the approval registry
@@ -8635,6 +8782,54 @@ async fn drain_external_agent_events(
                 preview,
                 tool_name,
             } => {
+                if event_is_primary
+                    && agent.supports_item_anchor_rewind()
+                    && managed_codex_foreground_dashboard_command(&tool_name, &preview)
+                {
+                    if !item_id.is_empty() {
+                        managed_context_blocked_tool_items.insert(item_id.clone());
+                    }
+                    pending_backend_recovery.get_or_insert_with(|| ExternalBackendRecovery {
+                        message:
+                            "managed Codex foreground dashboard command interrupted before it could hang the turn"
+                                .to_string(),
+                        recovery_hint: Some(
+                            "Use `node scripts/validate-dashboard.cjs --launch-dashboard --port <port> ...` for temporary dashboard smoke checks, or launch `intendant --web` in the background with a tracked PID, health check, and cleanup trap/kill. Do not run `intendant --web` as a foreground command."
+                                .to_string(),
+                        ),
+                    });
+                    let content = format!(
+                        "Managed Codex started an unmanaged Intendant dashboard server command; interrupting before it can hang the app-server turn. Command: {}",
+                        summarize_external_activity_text(
+                            &preview,
+                            EXTERNAL_TOOL_PREVIEW_ACTIVITY_LIMIT
+                        )
+                    );
+                    slog(config.session_log, |l| l.warn(&content));
+                    config.bus.send(AppEvent::LogEntry {
+                        session_id: config.session_id.clone(),
+                        level: "warn".to_string(),
+                        source: "Intendant".to_string(),
+                        content,
+                        turn: None,
+                    });
+                    if !managed_dashboard_command_interrupt_sent {
+                        managed_dashboard_command_interrupt_sent = true;
+                        if let Err(e) = agent.interrupt_turn().await {
+                            let content =
+                                format!("Managed Codex dashboard command interrupt failed: {}", e);
+                            slog(config.session_log, |l| l.warn(&content));
+                            config.bus.send(AppEvent::LogEntry {
+                                session_id: config.session_id.clone(),
+                                level: "warn".to_string(),
+                                source: "Intendant".to_string(),
+                                content,
+                                turn: None,
+                            });
+                        }
+                    }
+                    continue;
+                }
                 if event_is_primary
                     && agent.supports_item_anchor_rewind()
                     && managed_context_rewind_only_pressure.is_some()
@@ -11878,6 +12073,42 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn managed_codex_dashboard_command_classifier_flags_foreground_launch() {
+        assert!(managed_codex_foreground_dashboard_command(
+            "command",
+            "./target/release/intendant --web 8997 --no-tui --no-tls --agent codex"
+        ));
+        assert!(managed_codex_foreground_dashboard_command(
+            "command",
+            "bash -lc './target/release/intendant --web=8997 --no-tui --no-tls --agent codex'"
+        ));
+    }
+
+    #[test]
+    fn managed_codex_dashboard_command_classifier_allows_owned_lifecycle() {
+        assert!(!managed_codex_foreground_dashboard_command(
+            "command",
+            "node scripts/validate-dashboard.cjs --launch-dashboard --port 8997 --selector '#app'"
+        ));
+        assert!(!managed_codex_foreground_dashboard_command(
+            "command",
+            "timeout 60 ./target/release/intendant --web 8997 --no-tui --no-tls"
+        ));
+        assert!(!managed_codex_foreground_dashboard_command(
+            "command",
+            "set -e; ./target/release/intendant --web 8997 --no-tui > /tmp/intendant.log 2>&1 & server_pid=$!; trap 'kill $server_pid' EXIT; curl -fsS http://127.0.0.1:8997/debug"
+        ));
+        assert!(!managed_codex_foreground_dashboard_command(
+            "command",
+            "rg './target/release/intendant --web 8997' docs/src"
+        ));
+        assert!(!managed_codex_foreground_dashboard_command(
+            "mcp",
+            "./target/release/intendant --web 8997 --no-tui"
+        ));
+    }
+
     struct ManagedDrainTestAgent {
         interrupts: Arc<std::sync::atomic::AtomicUsize>,
         steers: Arc<Mutex<Vec<String>>>,
@@ -12077,6 +12308,138 @@ mod tests {
             }
         }
         assert!(saw_block_log);
+    }
+
+    #[tokio::test]
+    async fn managed_codex_drain_interrupts_foreground_dashboard_command() {
+        let bus = EventBus::new();
+        let mut bus_rx_for_drain = bus.subscribe();
+        let mut observed = bus.subscribe();
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let autonomy = autonomy::shared_autonomy(AutonomyState::default());
+        let config = DrainConfig {
+            bus: &bus,
+            web_port: None,
+            session_id: Some("thread-1".to_string()),
+            alias_session_id: None,
+            autonomy,
+            session_log: &session_log,
+            project_root: dir.path(),
+            log_dir: &log_dir,
+            approval_registry: &approval_registry,
+            json_approval: None,
+            agent_source: Some("Codex".to_string()),
+            suppress_agent_started: false,
+            persist_model_responses_inline: true,
+            headless: true,
+            context_injection: &context_injection,
+        };
+        let (event_tx, mut event_rx) = tokio::sync::mpsc::unbounded_channel();
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "cmd-1".to_string(),
+                tool_name: "command".to_string(),
+                preview: "./target/release/intendant --web 8997 --no-tui --no-tls --agent codex"
+                    .to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolOutputDelta {
+                item_id: "cmd-1".to_string(),
+                text: "dashboard server output that should not be surfaced".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "cmd-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Cancelled,
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::TurnCompleted { message: None })
+            .unwrap();
+        drop(event_tx);
+
+        let interrupts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let steers = Arc::new(Mutex::new(Vec::new()));
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(ManagedDrainTestAgent {
+            interrupts: interrupts.clone(),
+            steers: steers.clone(),
+        });
+        let mut stats = LoopStats::default();
+        let mut diff_tracker = ExternalDiffDeltaTracker::default();
+        let mut pending_runtime_steers = std::collections::VecDeque::new();
+        let mut handled_steer_ids = std::collections::HashSet::new();
+        let mut cancelled_follow_ups = HashSet::new();
+        let mut dedupe = CodexThreadActionDedupe::default();
+
+        let outcome = drain_external_agent_events(
+            &mut agent,
+            &mut event_rx,
+            &mut bus_rx_for_drain,
+            &config,
+            &mut stats,
+            &mut diff_tracker,
+            &mut pending_runtime_steers,
+            &mut handled_steer_ids,
+            &mut cancelled_follow_ups,
+            &mut dedupe,
+            None,
+            false,
+            false,
+            false,
+        )
+        .await;
+
+        match outcome {
+            DrainOutcome::RecoveryRequired {
+                message,
+                recovery_hint,
+                ..
+            } => {
+                assert!(message.contains("foreground dashboard command interrupted"));
+                assert!(recovery_hint
+                    .as_deref()
+                    .is_some_and(|hint| hint.contains("--launch-dashboard")));
+            }
+            _ => panic!("expected RecoveryRequired"),
+        }
+        assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(steers.lock().unwrap().is_empty());
+
+        let mut saw_guard_log = false;
+        loop {
+            match observed.try_recv() {
+                Ok(AppEvent::LogEntry { content, .. }) => {
+                    if content.contains("unmanaged Intendant dashboard server command") {
+                        saw_guard_log = true;
+                    }
+                    assert!(
+                        !content.contains("dashboard server output that should not be surfaced"),
+                        "blocked dashboard command output leaked through log entry"
+                    );
+                }
+                Ok(AppEvent::AgentStarted {
+                    commands_preview, ..
+                }) => {
+                    panic!("blocked dashboard command emitted AgentStarted: {commands_preview}");
+                }
+                Ok(AppEvent::AgentOutput { stdout, .. }) => {
+                    panic!("blocked dashboard command output leaked: {stdout}");
+                }
+                Ok(_) => {}
+                Err(tokio::sync::broadcast::error::TryRecvError::Empty) => break,
+                Err(tokio::sync::broadcast::error::TryRecvError::Lagged(_)) => continue,
+                Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
+            }
+        }
+        assert!(saw_guard_log);
     }
 
     #[tokio::test]
