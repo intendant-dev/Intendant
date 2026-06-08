@@ -10754,6 +10754,7 @@ let stationCurrentTask = '';
 let stationCurrentApproval = null;
 let stationCurrentHumanQuestion = '';
 const stationLogEvents = [];
+const STATION_ACTIVITY_EVENT_LIMIT = 180;
 const stationLogAnchorRows = new Map();
 const stationLogAnchorKeys = [];
 const STATION_LOG_ANCHOR_LIMIT = 10000;
@@ -22609,6 +22610,60 @@ function stableStationMetric(seed, base, span) {
   return base + Math.abs(h % span);
 }
 
+function stationActivityTimestampLabel() {
+  return new Date().toTimeString().substring(0, 8);
+}
+
+function stationTrimActivityEvents() {
+  if (stationLogEvents.length > STATION_ACTIVITY_EVENT_LIMIT) {
+    stationLogEvents.splice(0, stationLogEvents.length - STATION_ACTIVITY_EVENT_LIMIT);
+  }
+}
+
+function stationUpsertActivityEvent(event) {
+  if (!event) return;
+  const hostId = event.hostId || event.host_id || selfPeerId || 'local';
+  const sessionId = event.sessionId || event.session_id || '';
+  const id = stationActivityEventKey(event) || stationLogEventId({
+    host_id: hostId,
+    session_id: sessionId,
+    ts: event.ts || '',
+    source: event.source || event.event || event.level || 'info',
+    content: event.msg || event.content || event.message || '',
+  }, stationLogEvents.length);
+  const next = {
+    id,
+    action: event.action || 'log',
+    hostId,
+    sessionId,
+    agentId: event.agentId || (hostId === selfPeerId ? 'primary-agent' : 'peer-' + sanitizeStationId(hostId)),
+    ts: event.ts || stationActivityTimestampLabel(),
+    level: event.level || 'info',
+    source: event.source || event.event || event.level || 'info',
+    msg: event.msg || event.content || event.message || '',
+  };
+  const existingIndex = stationLogEvents.findIndex(row => stationActivityEventKey(row) === id);
+  if (existingIndex >= 0) stationLogEvents[existingIndex] = { ...stationLogEvents[existingIndex], ...next };
+  else stationLogEvents.push(next);
+  stationTrimActivityEvents();
+  stationScheduleUpdate();
+}
+
+function stationPublishActivityEvent(event, options = {}) {
+  if (!event) return;
+  stationUpsertActivityEvent(event);
+  if (options.renderLog === false) return;
+  renderLogEntry({
+    level: event.level || 'info',
+    source: event.source || event.event || event.level || 'info',
+    content: event.msg || event.content || event.message || '',
+    ts: event.ts || stationActivityTimestampLabel(),
+    session_id: event.sessionId || event.session_id || '',
+    host_id: event.hostId || event.host_id || selfPeerId || 'local',
+    station_event_id: event.id || '',
+  });
+}
+
 function stationPushLogEvent(c) {
   const hostId = c.host_id || selfPeerId;
   const eventId = stationLogEventId(c, stationLogEvents.length);
@@ -22623,8 +22678,61 @@ function stationPushLogEvent(c) {
     source: c.source || c.event || c.level || 'info',
     msg: c.content || c.source || c.event || '',
   });
-  if (stationLogEvents.length > 180) stationLogEvents.splice(0, stationLogEvents.length - 180);
+  stationTrimActivityEvents();
   stationTrackLogAnchor(c);
+}
+
+function stationThreadActionActivityId(sessionId, op) {
+  const sid = String(sessionId || '').trim() || 'target';
+  const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
+  return `codex-thread-action:${sid}:${normalizedOp || 'action'}`;
+}
+
+function stationThreadActionActivityMessage(op, sessionId, status, message = '') {
+  const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-') || 'action';
+  const sid = String(sessionId || '').trim();
+  const target = sid ? ` for ${shortSessionId(sid)}` : '';
+  const detail = compactSessionText(message || '').trim();
+  if (status === 'attaching') return `/${normalizedOp} waiting to attach${target}`;
+  if (status === 'timeout') return `/${normalizedOp} still pending${target}; no result yet`;
+  if (status === 'ok') return `/${normalizedOp} ok${target}${detail ? `: ${detail}` : ''}`;
+  if (status === 'failed') return `/${normalizedOp} failed${target}${detail ? `: ${detail}` : ''}`;
+  return `/${normalizedOp} requested${target}`;
+}
+
+function stationUpsertCodexThreadActionActivity(op, sessionId, status = 'requested', message = '', options = {}) {
+  const sid = String(sessionId || '').trim();
+  const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
+  if (!normalizedOp) return;
+  const level = status === 'failed' ? 'error' : (status === 'timeout' ? 'warn' : 'info');
+  stationPublishActivityEvent({
+    id: stationThreadActionActivityId(sid, normalizedOp),
+    action: 'codex_thread_action',
+    hostId: selfPeerId || 'local',
+    sessionId: sid,
+    level,
+    source: 'codex',
+    msg: stationThreadActionActivityMessage(normalizedOp, sid, status, message),
+  }, options);
+}
+
+function stationPushSessionRelationshipActivity(evt = {}, options = {}) {
+  const parent = String(evt.parent_session_id || evt.parentSessionId || evt.parent_id || evt.parentId || '').trim();
+  const child = String(evt.child_session_id || evt.childSessionId || evt.child_id || evt.childId || evt.session_id || evt.sessionId || '').trim();
+  const relationship = String(evt.relationship || evt.kind || '').trim().toLowerCase() || 'relationship';
+  if (!parent && !child) return;
+  const label = relationship === 'fork' ? 'Fork' : (relationship === 'side' ? 'Side thread' : (relationship === 'subagent' ? 'Subagent' : 'Session relationship'));
+  const parentLabel = parent ? shortSessionId(parent) : 'unknown';
+  const childLabel = child ? shortSessionId(child) : 'unknown';
+  stationPublishActivityEvent({
+    id: `session-relationship:${relationship}:${parent || 'none'}:${child || 'none'}`,
+    action: 'session_relationship',
+    hostId: selfPeerId || 'local',
+    sessionId: child || parent,
+    level: 'info',
+    source: 'session',
+    msg: `${label}: ${parentLabel} -> ${childLabel}${evt.ephemeral ? ' (ephemeral)' : ''}`,
+  }, options);
 }
 
 function stationTrackLogAnchorRow(itemId, sessionId, detail, value = 'log') {
@@ -23204,6 +23312,7 @@ async function main() {
       applyExternalIdentityFromLogEntry(d);
       if (d.event === 'session_relationship') {
         applySessionRelationship(d);
+        stationPushSessionRelationshipActivity(d, { renderLog: false });
       }
       if (d.event === 'session_capabilities') {
         applySessionCapabilities(d);
@@ -23885,7 +23994,10 @@ function processCommands(cmds) {
         scheduleManagedContextRefresh(400);
         stationScheduleUpdate();
         break;
-      case 'session_relationship': applySessionRelationship(c); break;
+      case 'session_relationship':
+        applySessionRelationship(c);
+        stationPushSessionRelationshipActivity(c);
+        break;
       case 'session_capabilities': applySessionCapabilities(c); break;
       case 'session_goal': applySessionGoal(c); break;
       case 'session_attached':
@@ -25237,6 +25349,7 @@ function queueDetachedCodexThreadAction(sessionId, op, params = {}) {
   queue.push(item);
   pendingDetachedCodexThreadActions.set(sid, queue);
   if (shouldRequestAttach) dispatchControlMsg(resume);
+  stationUpsertCodexThreadActionActivity(op, sid, 'attaching');
   showControlToast('info', `Attaching Codex session before /${op}`);
   return true;
 }
@@ -25303,6 +25416,7 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const payload = { action: 'codex_thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
   dispatchControlMsg(payload);
+  stationUpsertCodexThreadActionActivity(op, sid, 'requested');
   return true;
 }
 
@@ -25547,13 +25661,13 @@ function dispatchCodexSlashCommand(parsed) {
     return false;
   }
   if (dispatchCodexThreadAction(parsed.op, parsed.params || {}, sid)) {
-    markActionPending(parsed.op);
+    markActionPending(parsed.op, sid);
     return true;
   }
   return false;
 }
 
-function markActionPending(op) {
+function markActionPending(op, sessionId = '') {
   // Codex + Gemini share the "new" op name. We mark whichever section is
   // currently visible — the one that was just clicked. querySelectorAll
   // finds both, then `offsetParent` filters to the visible one.
@@ -25561,12 +25675,14 @@ function markActionPending(op) {
     `.control-action-btn[data-codex-action="${op}"], .control-action-btn[data-gemini-action="${op}"]`
   )).filter(el => el.offsetParent !== null);
   btns.forEach(btn => btn.classList.add('pending'));
-  // Safety: if no result arrives in 10s, release the button(s) ourselves.
+  // Safety: if no result arrives, release the button ourselves but keep a
+  // visible Activity row so the action does not silently disappear.
   const timeoutHandle = setTimeout(() => {
     controlPendingActions.delete(op);
     btns.forEach(btn => btn.classList.remove('pending'));
-  }, 10000);
-  controlPendingActions.set(op, { timeoutHandle, btnEls: btns });
+    if (sessionId) stationUpsertCodexThreadActionActivity(op, sessionId, 'timeout');
+  }, 60000);
+  controlPendingActions.set(op, { timeoutHandle, btnEls: btns, sessionId });
 }
 
 function releaseActionPending(op) {
@@ -25628,6 +25744,12 @@ function handleCodexThreadActionResult(evt) {
   releaseActionPending(evt.action);
   const goal = goalFromCodexActionResult(evt);
   const goalSessionId = evt.session_id || evt.sessionId;
+  stationUpsertCodexThreadActionActivity(
+    evt.action,
+    goalSessionId,
+    evt.success ? 'ok' : 'failed',
+    evt.message
+  );
   if (goal !== undefined && goalSessionId) {
     applySessionGoal({ session_id: goalSessionId, goal });
   }
@@ -25818,8 +25940,9 @@ async function runCodexThreadActionFromUi(op, opts = {}, sessionId = '') {
     }
     return;
   }
-  if (dispatchCodexThreadAction(op, params, sessionId)) {
-    markActionPending(op);
+  const sid = String(sessionId || '').trim() || resolvePromptTargetSessionId();
+  if (dispatchCodexThreadAction(op, params, sid)) {
+    markActionPending(op, sid);
   }
 }
 
@@ -28835,6 +28958,32 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   }
   if (event === 'session_attached') {
     return { ...base, level: 'info', source: 'system', content: `Session attached: ${sessionId} (${source || entry.backend_source || ''})`, kind };
+  }
+  if (event === 'session_relationship') {
+    const parent = String(entry.parent_session_id || entry.parentSessionId || '').trim();
+    const child = String(entry.child_session_id || entry.childSessionId || '').trim();
+    const relationship = String(entry.relationship || '').trim().toLowerCase() || 'relationship';
+    const label = relationship === 'fork' ? 'Fork' : (relationship === 'side' ? 'Side thread' : (relationship === 'subagent' ? 'Subagent' : 'Session relationship'));
+    return {
+      ...base,
+      session_id: child || parent || sessionId,
+      level: 'info',
+      source: 'session',
+      content: `${label}: ${parent ? shortSessionId(parent) : 'unknown'} -> ${child ? shortSessionId(child) : 'unknown'}${entry.ephemeral ? ' (ephemeral)' : ''}`,
+      kind,
+    };
+  }
+  if (event === 'codex_thread_action_result') {
+    const action = String(entry.action || '').trim().toLowerCase().replace(/_/g, '-') || 'action';
+    const message = String(entry.message || '').trim();
+    const success = entry.success !== false;
+    return {
+      ...base,
+      level: success ? 'info' : 'error',
+      source: 'codex',
+      content: `/${action} ${success ? 'ok' : 'failed'}${sessionId ? ` for ${shortSessionId(sessionId)}` : ''}${message ? `: ${message}` : ''}`,
+      kind,
+    };
   }
   if (event === 'session_ended') {
     const reason = String(entry.reason || '').trim();
