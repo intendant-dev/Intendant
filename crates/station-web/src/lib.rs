@@ -6447,25 +6447,25 @@ impl StationInner {
                 C_SUBTEXT0_CSS,
                 "normal",
             );
-            if !row.id.is_empty() && row.action == "part" {
-                self.pill_at(
-                    x + panel_w - 78.0,
-                    yy + 15.0,
-                    50.0,
-                    19.0,
-                    "open",
-                    C_BLUE_CSS,
-                );
-                self.hit_zones.push(HitZone::new(
-                    x + panel_w - 78.0,
-                    yy + 15.0,
-                    50.0,
-                    19.0,
-                    HitAction::ContextAction {
-                        action: row.action.clone(),
-                        id: row.id.clone(),
-                    },
-                ));
+            let buttons = context_row_buttons(row);
+            if !buttons.is_empty() {
+                let total_w = buttons.iter().map(|(_, _, w, _)| *w).sum::<f32>()
+                    + buttons.len().saturating_sub(1) as f32 * 6.0;
+                let mut bx = x + panel_w - total_w - 28.0;
+                for (label, action, width, color) in buttons {
+                    self.pill_at(bx, yy + 15.0, width, 19.0, label, color);
+                    self.hit_zones.push(HitZone::new(
+                        bx,
+                        yy + 15.0,
+                        width,
+                        19.0,
+                        HitAction::ContextAction {
+                            action: action.to_string(),
+                            id: row.id.clone(),
+                        },
+                    ));
+                    bx += width + 6.0;
+                }
             }
             yy += 47.0;
         }
@@ -8843,6 +8843,19 @@ fn managed_row_buttons(row: &StationDetailRow) -> Vec<(&'static str, &'static st
         "branch" => vec![("claim", "branch", 50.0)],
         _ => Vec::new(),
     }
+}
+
+fn context_row_buttons(
+    row: &StationDetailRow,
+) -> Vec<(&'static str, &'static str, f32, &'static str)> {
+    if row.id.is_empty() || row.action != "part" {
+        return Vec::new();
+    }
+    vec![
+        ("focus", "part", 48.0, C_BLUE_CSS),
+        ("copy", "copy-part", 42.0, C_TEAL_CSS),
+        ("exact", "load-exact", 46.0, C_MAUVE_CSS),
+    ]
 }
 
 fn rotate_y(v: Vec3, a: f32) -> Vec3 {

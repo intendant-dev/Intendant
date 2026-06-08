@@ -20157,8 +20157,19 @@ function stationHandleContextAction(action) {
     stationCopyContextSnapshot();
     return;
   }
+  if (op === 'copy-part') {
+    const part = stationSelectedContextPartDetail(id || stationSelectedContextPart);
+    if (part) stationCopyContextPart(part);
+    else showControlToast?.('error', 'No context item selected');
+    return;
+  }
+  if (op === 'copy-id') {
+    const partId = id || stationSelectedContextPart;
+    if (partId) copyTextToClipboard(partId);
+    return;
+  }
   if (op === 'load-exact') {
-    stationLoadExactContextSnapshot(stationSelectedContextPart || id)
+    stationLoadExactContextSnapshot(id || stationSelectedContextPart)
       .catch(err => showControlToast?.('error', `Load exact context failed: ${err?.message || err}`));
     return;
   }
