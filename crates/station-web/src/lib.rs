@@ -6289,6 +6289,19 @@ impl StationInner {
             ),
         );
         yy += 22.0;
+        if !sessions.filtered_sessions.is_empty() {
+            self.section_title_color(x, yy + 8.0, "Matching sessions", C_TEAL_CSS);
+            yy += 26.0;
+            yy = self.session_detail_rows(
+                x,
+                yy,
+                panel_w,
+                &sessions.filtered_sessions,
+                "No sessions match filters",
+                4,
+            );
+            yy += 12.0;
+        }
         self.panel_row(
             x,
             yy,
@@ -9580,20 +9593,20 @@ impl StationInner {
             if row.can_attach && !row.id.is_empty() {
                 buttons.push(("attach", "attach", 58.0, C_TEAL_CSS));
             }
+            if row.can_config && !row.id.is_empty() {
+                buttons.push(("config", "config", 58.0, C_MAUVE_CSS));
+            }
+            if row.can_restart && !row.id.is_empty() {
+                buttons.push(("restart", "restart", 62.0, C_PEACH_CSS));
+            }
+            if row.can_resume && !row.id.is_empty() {
+                buttons.push(("resume", "resume", 58.0, C_TEAL_CSS));
+            }
             if !row.id.is_empty() {
                 buttons.push(("copy", "copy", 44.0, C_BLUE_CSS));
             }
             if !row.backend_id.is_empty() && !row.id.is_empty() {
                 buttons.push(("copy-backend", "backend", 70.0, C_BLUE_CSS));
-            }
-            if row.can_resume && !row.id.is_empty() {
-                buttons.push(("resume", "resume", 58.0, C_TEAL_CSS));
-            }
-            if row.can_restart && !row.id.is_empty() {
-                buttons.push(("restart", "restart", 62.0, C_PEACH_CSS));
-            }
-            if row.can_config && !row.id.is_empty() {
-                buttons.push(("config", "config", 58.0, C_MAUVE_CSS));
             }
             if row.can_fork && !row.id.is_empty() {
                 buttons.push(("fork", "fork", 42.0, C_MAUVE_CSS));
@@ -11306,6 +11319,7 @@ struct StationSessionsSummary {
     project_filter: String,
     filtered: u32,
     external_targets: Vec<StationDetailRow>,
+    filtered_sessions: Vec<StationDetailRow>,
     recent: Vec<StationDetailRow>,
     recent_worktrees: Vec<StationDetailRow>,
 }
@@ -11335,6 +11349,7 @@ impl Default for StationSessionsSummary {
             project_filter: String::new(),
             filtered: 0,
             external_targets: Vec::new(),
+            filtered_sessions: Vec::new(),
             recent: Vec::new(),
             recent_worktrees: Vec::new(),
         }

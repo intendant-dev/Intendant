@@ -22016,10 +22016,26 @@ function stationBuildSessionsSummary() {
   }
   if (!active && isAgentActivePhase(currentPhase)) active = 1;
   const latest = [...sessions].sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))[0] || null;
-  const recent = [...sessions]
+  const sessionRows = [...sessions]
     .sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a))
-    .slice(0, 6)
     .map(session => stationSessionRowForDock(session, indexedIds));
+  const sessionQuery = stationSessionDockFilter.trim();
+  const filteredRows = sessionRows.filter(row =>
+    stationSessionDockRowMatchesFilters(
+      row,
+      sessionQuery,
+      stationSessionDockSourceFilter,
+      stationSessionDockStatusFilter,
+      stationSessionDockProjectFilter
+    )
+  );
+  const hasSessionFilters = !!(
+    sessionQuery ||
+    stationSessionDockSourceFilter ||
+    stationSessionDockStatusFilter ||
+    stationSessionDockProjectFilter
+  );
+  const recent = sessionRows.slice(0, 6);
   let externalTargets = [];
   try {
     externalTargets = stationExternalTargetRowsForDock(5).map(row => ({
@@ -22077,15 +22093,8 @@ function stationBuildSessionsSummary() {
     sourceFilter: stationSessionDockSourceFilter || '',
     statusFilter: stationSessionDockStatusFilter || '',
     projectFilter: stationSessionDockProjectFilter || '',
-    filtered: stationSessionRowsForDock().filter(row =>
-      stationSessionDockRowMatchesFilters(
-        row,
-        stationSessionDockFilter.trim(),
-        stationSessionDockSourceFilter,
-        stationSessionDockStatusFilter,
-        stationSessionDockProjectFilter
-      )
-    ).length,
+    filtered: filteredRows.length,
+    filteredSessions: hasSessionFilters ? filteredRows.slice(0, 8) : [],
     externalTargets,
     recent,
     ...worktrees,
