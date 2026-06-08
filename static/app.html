@@ -377,6 +377,13 @@ html, body {
   color: transparent;
   cursor: pointer;
   pointer-events: none;
+  outline: none;
+  box-shadow: none;
+}
+.station-hotspot:focus,
+.station-hotspot:focus-visible {
+  outline: none;
+  box-shadow: none;
 }
 .station-pane.station-dom-fallback .station-hotspots {
   pointer-events: auto;
@@ -391,6 +398,7 @@ html, body {
   background: rgba(17, 17, 27, 0.72);
   color: var(--text);
   pointer-events: auto;
+  outline: revert;
   font-size: 10px;
   line-height: 1.2;
   text-align: left;
@@ -412,9 +420,11 @@ html, body {
 }
 .station-status {
   position: absolute;
-  left: 12px;
-  top: 44px;
-  max-width: min(360px, calc(100% - 28px));
+  left: -10000px;
+  top: auto;
+  width: 1px;
+  height: 1px;
+  max-width: 1px;
   z-index: 4;
   color: var(--overlay1);
   font-size: 10px;
@@ -427,6 +437,13 @@ html, body {
   text-overflow: ellipsis;
   white-space: nowrap;
   pointer-events: none;
+}
+.station-pane.station-dom-fallback .station-status {
+  left: 12px;
+  top: 44px;
+  width: auto;
+  height: auto;
+  max-width: min(360px, calc(100% - 28px));
 }
 .station-dock {
   position: absolute;
@@ -11643,27 +11660,23 @@ const STATION_DASHBOARD_ROUTES = Object.freeze([
   Object.freeze({ label: 'Account', detail: 'API keys and account configuration', tab: 'settings', subtab: 'account', tokens: 'settings account api keys credentials' }),
 ]);
 
-// Mirrors crates/station-web/src/lib.rs StationInner::draw_toolbar and
-// StationInner::draw_systems_panel. Keep these constants byte-close to Rust.
+// Mirrors crates/station-web/src/lib.rs StationInner::draw_station_* geometry.
+// Keep these constants byte-close to Rust so fallback/accessibility hotspots
+// activate the same rendered control regions.
 const STATION_HUD_GEOMETRY = Object.freeze({
   layoutButtons: Object.freeze([
-    Object.freeze({ name: 'layout:orbital', x: 86, y: 9, w: 66, h: 22 }),
-    Object.freeze({ name: 'layout:constellation', x: 158, y: 9, w: 102, h: 22 }),
+    Object.freeze({ name: 'layout:orbital', x: 96, y: 10, w: 78, h: 23 }),
+    Object.freeze({ name: 'layout:constellation', x: 182, y: 10, w: 116, h: 23 }),
   ]),
-  compactWidthMin: 760,
-  compactHeightMax: 620,
-  fullPanel: Object.freeze({ x: 12, y: 242, w: 222 }),
-  compactPanel: Object.freeze({ x: 246, y: 52, w: 390 }),
-  panelInsetX: 10,
-  cardTopOffset: 34,
-  panelHeaderHeight: 45,
-  fullCardGap: 4,
-  compactCardGap: 6,
-  compactCardColGap: 6,
-  fullCardMinH: 32,
-  fullCardMaxH: 47,
-  compactCardH: 44,
-  bottomInset: 14,
+  renderedDesktopMin: 820,
+  margin: 24,
+  topY: 58,
+  gap: 14,
+  compactX: 18,
+  compactY: 130,
+  compactGapX: 16,
+  compactGapY: 58,
+  compactTileH: 48,
 });
 
 function stationCurrentDockKind() {
@@ -11938,7 +11951,7 @@ function stationDockBegin(kind, title, subtitle = '') {
   if (stationRenderedPrimaryActive() && stationDockFallbackDepth <= 0) {
     const target = stationDockSystemTarget(kind);
     if (target) {
-      stationRenderedSelectPanel(target, `${title || 'Station'} is rendered in Station`);
+      stationRenderedSelectPanel(target, `Opening ${kind || 'station'} in rendered Station`);
     }
     return null;
   }
@@ -12117,18 +12130,41 @@ function stationHotspotBoxes(cssW, cssH) {
   for (const box of STATION_HUD_GEOMETRY.layoutButtons) {
     add(box.name, box.x, box.y, box.w, box.h);
   }
-  const geom = stationSystemsGeometry(cssW, cssH);
-  STATION_SYSTEM_TARGETS.forEach(([name], idx) => {
-    const col = geom.compactGrid ? idx % 2 : 0;
-    const row = geom.compactGrid ? Math.floor(idx / 2) : idx;
-    add(
-      name,
-      geom.panel.x + STATION_HUD_GEOMETRY.panelInsetX + col * (geom.cardW + geom.cardColGap),
-      geom.panel.y + STATION_HUD_GEOMETRY.cardTopOffset + row * (geom.cardH + geom.cardGap),
-      geom.cardW,
-      geom.cardH,
-    );
-  });
+  const g = STATION_HUD_GEOMETRY;
+  if (cssW < g.renderedDesktopMin) {
+    const tileW = ((cssW - 36) - 44) * 0.5;
+    STATION_SYSTEM_TARGETS.slice(0, 8).forEach(([name], idx) => {
+      const col = idx % 2;
+      const row = Math.floor(idx / 2);
+      add(
+        name,
+        g.compactX + 14 + col * (tileW + g.compactGapX),
+        g.compactY + row * g.compactGapY,
+        tileW,
+        g.compactTileH,
+      );
+    });
+    return boxes;
+  }
+  const margin = g.margin;
+  const gap = g.gap;
+  const availableW = Math.max(760, cssW - margin * 2);
+  const availableH = Math.max(420, cssH - g.topY - 24);
+  const commandH = cssH < 640 ? 78 : 92;
+  const laneH = cssH < 640 ? 68 : 78;
+  const mainH = Math.max(250, availableH - commandH - laneH - gap * 2);
+  const centerW = availableW;
+  const centerX = margin;
+  const mainY = g.topY + commandH + gap;
+  const coreH = Math.min(560, Math.max(330, mainH));
+  const matrixY = mainY + coreH - 118;
+  const matrixW = (centerW - 72) / 3;
+  ['system:activity', 'system:context', 'system:managed', 'system:sessions', 'system:peers', 'system:changes', 'system:worktrees', 'system:controls', 'system:view']
+    .forEach((name, idx) => {
+      const col = idx % 3;
+      const row = Math.floor(idx / 3);
+      add(name, centerX + 30 + col * matrixW, matrixY + 25 + row * 31, matrixW - 8, 25);
+    });
   return boxes;
 }
 
@@ -13830,7 +13866,7 @@ function stationDispatchHotspot(target, ev) {
   stationLastHotspotDispatch = { target: name, at };
   ev?.preventDefault?.();
   ev?.stopPropagation?.();
-  if (keyboardActivation) {
+  if (keyboardActivation && !(station && !stationDomFallback)) {
     stationWithDockFallback(() => stationHandleHotspot(name));
   } else {
     stationHandleHotspot(name);
