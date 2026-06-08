@@ -4424,6 +4424,10 @@ impl StationInner {
                 .unwrap_or(C_OVERLAY1_CSS),
         );
         yy += 30.0;
+        yy = self.draw_activity_thread_signals(x, yy, panel_w, &events);
+        if !events.is_empty() {
+            yy += 12.0;
+        }
         self.section_title_color(x, yy, "Log controls", C_TEAL_CSS);
         yy += 22.0;
         let log_actions = [
@@ -4519,6 +4523,98 @@ impl StationInner {
                 ey += 16.0;
             }
         }
+    }
+
+    fn draw_activity_thread_signals(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        events: &[StationEvent],
+    ) -> f32 {
+        let threads = activity_thread_signals(events);
+        if threads.is_empty() {
+            return y;
+        }
+        self.section_title_color(x, y, "Signal threads", C_PEACH_CSS);
+        let mut yy = y + 18.0;
+        for row in threads.iter().take(3) {
+            self.round_rect(
+                x + 12.0,
+                yy - 9.0,
+                panel_w - 24.0,
+                46.0,
+                4.0,
+                "rgba(17,17,27,0.76)",
+                "rgba(250,179,135,0.42)",
+            );
+            let color = level_color_css(&row.latest_level);
+            self.ctx.set_fill_style(&JsValue::from_str(color));
+            self.ctx
+                .fill_rect((x + 20.0) as f64, (yy - 1.0) as f64, 3.0, 26.0);
+            self.text(
+                &truncate(&row.label, 28),
+                x + 30.0,
+                yy + 3.0,
+                9.5,
+                C_PEACH_CSS,
+                "bold",
+            );
+            self.text(
+                &format!("{} events", row.count),
+                x + panel_w - 106.0,
+                yy + 3.0,
+                8.5,
+                color,
+                "bold",
+            );
+            let detail = format!(
+                "{}{} / {}",
+                nonempty(&row.latest_level, "info"),
+                if row.managed > 0 {
+                    format!(" / {} managed", row.managed)
+                } else {
+                    String::new()
+                },
+                truncate(&row.latest_msg, 32)
+            );
+            self.text(&detail, x + 30.0, yy + 20.0, 8.5, C_SUBTEXT0_CSS, "normal");
+            if !row.latest_id.is_empty() {
+                self.pill_at(x + panel_w - 108.0, yy + 17.0, 48.0, 18.0, "open", C_TEAL_CSS);
+                self.hit_zones.push(HitZone::new(
+                    x + panel_w - 108.0,
+                    yy + 17.0,
+                    48.0,
+                    18.0,
+                    HitAction::ActivityAction {
+                        action: "show-log".to_string(),
+                        id: row.latest_id.clone(),
+                    },
+                ));
+            }
+            if !row.managed_latest_id.is_empty() {
+                self.pill_at(
+                    x + panel_w - 55.0,
+                    yy + 17.0,
+                    38.0,
+                    18.0,
+                    "mgd",
+                    C_MAUVE_CSS,
+                );
+                self.hit_zones.push(HitZone::new(
+                    x + panel_w - 55.0,
+                    yy + 17.0,
+                    38.0,
+                    18.0,
+                    HitAction::ActivityAction {
+                        action: "activity-managed".to_string(),
+                        id: row.managed_latest_id.clone(),
+                    },
+                ));
+            }
+            yy += 50.0;
+        }
+        yy
     }
 
     fn draw_context_info(&mut self, x: f32, y: f32, panel_w: f32) {
@@ -8337,6 +8433,18 @@ impl Default for StationEvent {
     }
 }
 
+#[derive(Clone)]
+struct ActivityThreadSignal {
+    label: String,
+    count: u32,
+    managed: u32,
+    latest_id: String,
+    managed_latest_id: String,
+    latest_level: String,
+    latest_msg: String,
+    latest_ts: String,
+}
+
 #[derive(Clone, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct StationContextSummary {
@@ -9580,6 +9688,64 @@ fn activity_event_is_managed(event: &StationEvent) -> bool {
     ]
     .iter()
     .any(|needle| text.contains(needle))
+}
+
+fn activity_level_rank(level: &str) -> u8 {
+    match level {
+        "error" => 5,
+        "warn" => 4,
+        "agent" | "subagent" | "model" => 3,
+        "presence" => 2,
+        _ => 1,
+    }
+}
+
+fn activity_thread_signals(events: &[StationEvent]) -> Vec<ActivityThreadSignal> {
+    let mut rows: HashMap<String, ActivityThreadSignal> = HashMap::new();
+    for event in events {
+        let (key, label) = if !event.session_id.is_empty() {
+            (
+                format!("session:{}", event.session_id),
+                format!("session {}", truncate(&event.session_id, 12)),
+            )
+        } else {
+            let host = nonempty(&event.host_id, "local");
+            let source = nonempty(&event.source, "activity");
+            (format!("source:{host}:{source}"), format!("{host} / {source}"))
+        };
+        let managed = activity_event_is_managed(event);
+        let entry = rows.entry(key).or_insert_with(|| ActivityThreadSignal {
+            label,
+            count: 0,
+            managed: 0,
+            latest_id: String::new(),
+            managed_latest_id: String::new(),
+            latest_level: String::new(),
+            latest_msg: String::new(),
+            latest_ts: String::new(),
+        });
+        entry.count += 1;
+        if managed {
+            entry.managed += 1;
+            entry.managed_latest_id = event.id.clone();
+        }
+        if activity_level_rank(&event.level) >= activity_level_rank(&entry.latest_level)
+            || event.ts >= entry.latest_ts
+        {
+            entry.latest_id = event.id.clone();
+            entry.latest_level = event.level.clone();
+            entry.latest_msg = event.msg.clone();
+            entry.latest_ts = event.ts.clone();
+        }
+    }
+    let mut out = rows.into_values().collect::<Vec<_>>();
+    out.sort_by(|a, b| {
+        b.count
+            .cmp(&a.count)
+            .then_with(|| b.managed.cmp(&a.managed))
+            .then_with(|| b.latest_ts.cmp(&a.latest_ts))
+    });
+    out
 }
 
 fn tone_color_css(tone: &str) -> &'static str {
