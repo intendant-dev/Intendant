@@ -6891,9 +6891,17 @@ impl StationInner {
             return yy + 20.0;
         }
         for row in rows.iter().take(max_rows) {
+            let external_runway = Self::external_runway_label(row);
             let has_goal = !row.goal_status.is_empty() || !row.goal_objective.is_empty();
             let show_thread_controls = row.is_codex || has_goal;
-            let card_h = if show_thread_controls { 68.0 } else { 43.0 };
+            let show_external_runway = !show_thread_controls && !external_runway.is_empty();
+            let card_h = if show_thread_controls {
+                68.0
+            } else if show_external_runway {
+                62.0
+            } else {
+                43.0
+            };
             self.round_rect(
                 x + 12.0,
                 yy - 11.0,
@@ -6947,7 +6955,9 @@ impl StationInner {
             if show_thread_controls {
                 let goal_status = nonempty(&row.goal_status, "goal");
                 let goal_detail = if row.goal_objective.is_empty() {
-                    if row.is_codex {
+                    if !external_runway.is_empty() {
+                        external_runway.clone()
+                    } else if row.is_codex {
                         "goal controls available".to_string()
                     } else {
                         "goal --".to_string()
@@ -6967,7 +6977,9 @@ impl StationInner {
                     x + 20.0,
                     yy + 35.0,
                     8.5,
-                    if row.goal_status == "active" {
+                    if !external_runway.is_empty() && row.goal_status.is_empty() {
+                        C_TEAL_CSS
+                    } else if row.goal_status == "active" {
                         C_GREEN_CSS
                     } else if row.goal_status == "paused" {
                         C_YELLOW_CSS
@@ -7009,6 +7021,16 @@ impl StationInner {
                         bx += width + 6.0;
                     }
                 }
+            }
+            if show_external_runway {
+                self.text(
+                    &truncate(&external_runway, 46),
+                    x + 20.0,
+                    yy + 36.0,
+                    8.5,
+                    C_TEAL_CSS,
+                    "normal",
+                );
             }
             let mut buttons = Vec::new();
             if row.can_attach && !row.id.is_empty() {
@@ -7052,6 +7074,32 @@ impl StationInner {
             yy += card_h + 4.0;
         }
         yy
+    }
+
+    fn external_runway_label(row: &StationDetailRow) -> String {
+        let mut parts = Vec::new();
+        if !row.external_status.is_empty() {
+            parts.push(row.external_status.clone());
+        }
+        if !row.live_id.is_empty() {
+            parts.push(format!("live {}", truncate(&row.live_id, 7)));
+        } else if row.external_detached {
+            parts.push("detached".to_string());
+        }
+        if !row.action_id.is_empty() {
+            parts.push(format!("actions {}", truncate(&row.action_id, 7)));
+        }
+        if row.can_attach {
+            parts.push("attach ready".to_string());
+        } else if !row.attach_id.is_empty() {
+            parts.push(format!("attach {}", truncate(&row.attach_id, 7)));
+        }
+        if row.can_stop {
+            parts.push("stop ready".to_string());
+        } else if !row.stop_id.is_empty() {
+            parts.push(format!("stop {}", truncate(&row.stop_id, 7)));
+        }
+        parts.join(" · ")
     }
 
     fn managed_detail_rows(
@@ -8865,6 +8913,12 @@ struct StationDetailRow {
     value: String,
     detail: String,
     tone: String,
+    external_status: String,
+    live_id: String,
+    action_id: String,
+    attach_id: String,
+    stop_id: String,
+    external_detached: bool,
     is_codex: bool,
     thread_action_session_id: String,
     goal_status: String,
@@ -8888,6 +8942,12 @@ impl Default for StationDetailRow {
             value: String::new(),
             detail: String::new(),
             tone: String::new(),
+            external_status: String::new(),
+            live_id: String::new(),
+            action_id: String::new(),
+            attach_id: String::new(),
+            stop_id: String::new(),
+            external_detached: false,
             is_codex: false,
             thread_action_session_id: String::new(),
             goal_status: String::new(),
