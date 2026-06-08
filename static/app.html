@@ -13644,6 +13644,7 @@ function stationActivityEventIsManaged(ev) {
 
 function stationOpenManagedFromActivity(ev) {
   if (ev?.sessionId) stationSetManagedSession(ev.sessionId);
+  if (stationRenderedSelectPanel('system:managed', 'Managed activity selected')) return;
   stationRenderManagedDock(/\b(backout|record)\b/i.test(ev?.msg || ev?.source || '') ? 'backout' : '');
 }
 
@@ -20176,6 +20177,7 @@ function stationCssEscape(value) {
 function stationHandleActivityAction(action) {
   const op = String(action.action || '').trim();
   const id = String(action.id || '').trim();
+  const eventForId = () => stationActivityEvents().find(row => stationActivityEventKey(row) === id);
   if (op.startsWith('verbosity:')) {
     stationSetActivityVerbosity(op.slice('verbosity:'.length));
     return;
@@ -20221,6 +20223,36 @@ function stationHandleActivityAction(action) {
   }
   if (op === 'clear-log') {
     stationClearActivityLog();
+    return;
+  }
+  if (id && ['show-log', 'copy-event', 'copy-event-json', 'activity-session', 'activity-managed', 'edit', 'branch'].includes(op)) {
+    const ev = eventForId();
+    if (!ev) return;
+    if (op === 'show-log') {
+      focusActivityLogEvent(id);
+      return;
+    }
+    if (op === 'copy-event') {
+      copyTextToClipboard(stationActivityEventCopyText(ev))
+        .then(() => showControlToast?.('success', 'Copied Station activity event'));
+      return;
+    }
+    if (op === 'copy-event-json') {
+      stationCopyActivityEventJson(ev);
+      return;
+    }
+    if (op === 'activity-session') {
+      const sessionId = ev.sessionId || ev.session_id || '';
+      if (!sessionId) return;
+      if (stationRenderedSelectPanel('system:sessions', 'Activity session selected')) return;
+      stationRenderSessionsDock(sessionId);
+      return;
+    }
+    if (op === 'activity-managed') {
+      stationOpenManagedFromActivity(ev);
+      return;
+    }
+    stationEditActivityEvent(id);
     return;
   }
   if (op !== 'log' || !id) return;

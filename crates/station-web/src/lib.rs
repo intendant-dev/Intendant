@@ -679,6 +679,9 @@ impl StationInner {
                 .hosts
                 .iter()
                 .any(|h| format!("host:{}", h.id) == id)
+            || id
+                .strip_prefix("activity:")
+                .is_some_and(|event_id| self.activity_event(event_id).is_some())
             || self.snapshot.agents.iter().any(|a| a.id == id)
     }
 
@@ -3449,6 +3452,10 @@ impl StationInner {
             self.draw_activity_info(x, y, panel_w);
             return;
         }
+        if let Some(event_id) = id.strip_prefix("activity:") {
+            self.draw_activity_event_info(event_id, x, y, panel_w);
+            return;
+        }
         if id == "system:context" {
             self.draw_context_info(x, y, panel_w);
             return;
@@ -4106,6 +4113,157 @@ impl StationInner {
             "bold",
         );
         self.hit_zones.push(HitZone::new(x, y, w, 24.0, action.hit));
+    }
+
+    fn activity_event(&self, event_id: &str) -> Option<StationEvent> {
+        self.snapshot
+            .events
+            .iter()
+            .find(|event| event.id == event_id)
+            .cloned()
+    }
+
+    fn draw_activity_event_info(&mut self, event_id: &str, x: f32, y: f32, panel_w: f32) {
+        let Some(event) = self.activity_event(event_id) else {
+            self.text("activity", x + 12.0, y + 25.0, 10.0, C_TEAL_CSS, "bold");
+            self.text(
+                "event expired",
+                x + 92.0,
+                y + 25.0,
+                13.0,
+                C_TEXT_CSS,
+                "bold",
+            );
+            self.panel_row(x, y + 58.0, "id", &truncate(event_id, 42));
+            return;
+        };
+        let color = level_color_css(&event.level);
+        self.text(
+            "activity event",
+            x + 12.0,
+            y + 25.0,
+            10.0,
+            C_TEAL_CSS,
+            "bold",
+        );
+        self.text(
+            &truncate(&event.level, 22),
+            x + 126.0,
+            y + 25.0,
+            13.0,
+            color,
+            "bold",
+        );
+        let mut yy = y + 58.0 - self.panel_scroll;
+        self.panel_row(x, yy, "id", &truncate(&event.id, 42));
+        yy += 22.0;
+        self.panel_row(x, yy, "time", &nonempty(&event.ts, "--"));
+        yy += 22.0;
+        self.panel_row_color(x, yy, "level", &event.level, color);
+        yy += 22.0;
+        self.panel_row(x, yy, "source", &nonempty(&event.source, "--"));
+        yy += 22.0;
+        self.panel_row(x, yy, "host", &nonempty(&event.host_id, "local"));
+        yy += 22.0;
+        self.panel_row(x, yy, "session", &truncate(&event.session_id, 42));
+        yy += 30.0;
+        self.section_title_color(x, yy, "Rendered event detail", C_TEAL_CSS);
+        yy += 18.0;
+        self.round_rect(
+            x + 12.0,
+            yy - 8.0,
+            panel_w - 24.0,
+            92.0,
+            4.0,
+            "rgba(17,17,27,0.82)",
+            "rgba(148,226,213,0.42)",
+        );
+        self.text(
+            &truncate(&event.msg, 66),
+            x + 20.0,
+            yy + 12.0,
+            10.0,
+            C_TEXT_CSS,
+            "normal",
+        );
+        let detail = format!(
+            "{} / {}{}{}",
+            nonempty(&event.action, "log"),
+            nonempty(&event.source, "activity"),
+            if event.editable { " / editable" } else { "" },
+            if event.historical {
+                " / historical"
+            } else {
+                ""
+            }
+        );
+        self.text(
+            &truncate(&detail, 66),
+            x + 20.0,
+            yy + 32.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        yy += 112.0;
+        self.section_title_color(x, yy, "Actions", C_TEAL_CSS);
+        yy += 22.0;
+        let mut actions = vec![
+            ("show-log", "show log", 78.0, C_TEAL_CSS.to_string()),
+            ("copy-event", "copy text", 82.0, C_BLUE_CSS.to_string()),
+            (
+                "copy-event-json",
+                "copy JSON",
+                86.0,
+                C_MAUVE_CSS.to_string(),
+            ),
+        ];
+        if !event.session_id.is_empty() {
+            actions.push(("activity-session", "session", 70.0, C_PEACH_CSS.to_string()));
+        }
+        if activity_event_is_managed(&event) {
+            actions.push(("activity-managed", "managed", 78.0, C_MAUVE_CSS.to_string()));
+        }
+        if event.editable {
+            actions.push((
+                if event.historical { "branch" } else { "edit" },
+                if event.historical { "branch" } else { "edit" },
+                58.0,
+                C_YELLOW_CSS.to_string(),
+            ));
+        }
+        self.draw_activity_event_action_pills(x, panel_w, yy - 14.0, &actions, &event.id);
+    }
+
+    fn draw_activity_event_action_pills(
+        &mut self,
+        x: f32,
+        panel_w: f32,
+        y: f32,
+        actions: &[(&str, &str, f32, String)],
+        event_id: &str,
+    ) -> f32 {
+        let mut ax = x + 14.0;
+        let mut ay = y;
+        for (action, label, width, color) in actions {
+            if ax + *width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, *width, 21.0, label, color);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                *width,
+                21.0,
+                HitAction::ActivityAction {
+                    action: (*action).to_string(),
+                    id: event_id.to_string(),
+                },
+            ));
+            ax += *width + 8.0;
+        }
+        ay + 35.0
     }
 
     fn draw_activity_info(&mut self, x: f32, y: f32, panel_w: f32) {
@@ -6724,6 +6882,12 @@ impl StationInner {
                     "action": action,
                     "id": id,
             })),
+            HitAction::ActivityAction { action, id } if action == "log" && !id.is_empty() => {
+                self.selected_id = Some(format!("activity:{id}"));
+                self.panel_scroll = 0.0;
+                self.last_render_ms = 0.0;
+                None
+            }
             HitAction::ActivityAction { action, id } => Some(serde_json::json!({
                     "type": "activity_action",
                     "action": action,
@@ -7486,10 +7650,14 @@ struct StationEvent {
     id: String,
     action: String,
     host_id: String,
+    session_id: String,
     agent_id: Option<String>,
     ts: String,
     level: String,
+    source: String,
     msg: String,
+    editable: bool,
+    historical: bool,
 }
 
 impl Default for StationEvent {
@@ -7498,10 +7666,14 @@ impl Default for StationEvent {
             id: "event".into(),
             action: String::new(),
             host_id: "local".into(),
+            session_id: String::new(),
             agent_id: None,
             ts: String::new(),
             level: "info".into(),
+            source: String::new(),
             msg: String::new(),
+            editable: false,
+            historical: false,
         }
     }
 }
@@ -8626,6 +8798,15 @@ fn level_color_css(level: &str) -> &'static str {
         "presence" => C_GREEN_CSS,
         _ => C_OVERLAY1_CSS,
     }
+}
+
+fn activity_event_is_managed(event: &StationEvent) -> bool {
+    let text = format!("{} {} {}", event.source, event.msg, event.level).to_lowercase();
+    [
+        "managed", "context", "rewind", "backout", "anchor", "lineage", "fission",
+    ]
+    .iter()
+    .any(|needle| text.contains(needle))
 }
 
 fn tone_color_css(tone: &str) -> &'static str {
