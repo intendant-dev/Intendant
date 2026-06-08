@@ -721,7 +721,8 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
     match platform {
         ClientPlatform::AppleMobile => {
             r#"<ol>
-<li>On the browser warning page, open certificate details for this site.</li>
+<li>Stop at the browser warning page; do not continue to page content yet.</li>
+<li>Open certificate details for this site from that warning page.</li>
 <li>Copy only the server certificate's SHA-256 fingerprint. Do not copy page text around it.</li>
 <li>Paste it into the Intendant terminal. The terminal reveals the enrollment secret only if it matches.</li>
 </ol>
@@ -729,7 +730,8 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
         }
         ClientPlatform::AppleDesktop | ClientPlatform::ChromeMac => {
             r#"<ol>
-<li>Open the certificate viewer for this HTTPS page from the browser warning or site security details.</li>
+<li>Stop at the browser warning page; do not continue to page content yet.</li>
+<li>Open the certificate viewer for this HTTPS site from the warning page.</li>
 <li>Copy only the SHA-256 fingerprint for the server certificate.</li>
 <li>Paste it into the Intendant terminal, then return here with the one-time secret.</li>
 </ol>
@@ -737,7 +739,8 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
         }
         ClientPlatform::Android => {
             r#"<ol>
-<li>Open certificate details from Chrome's warning page.</li>
+<li>Stop at Chrome's warning page; do not continue to page content yet.</li>
+<li>Open certificate details from that warning page.</li>
 <li>Copy the server certificate SHA-256 fingerprint.</li>
 <li>Paste it into the Intendant terminal, then enter the one-time secret here.</li>
 </ol>
@@ -745,7 +748,8 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
         }
         ClientPlatform::FirefoxDesktop => {
             r#"<ol>
-<li>Open the certificate viewer from Firefox's warning page or page info.</li>
+<li>Stop at Firefox's warning page; do not continue to page content yet.</li>
+<li>Open the certificate viewer from that warning page.</li>
 <li>Copy the server certificate SHA-256 fingerprint.</li>
 <li>Paste it into the Intendant terminal, then enter the one-time secret here.</li>
 </ol>
@@ -753,7 +757,8 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
         }
         ClientPlatform::ChromeLinux => {
             r#"<ol>
-<li>Open certificate details from Chrome's warning page or security details.</li>
+<li>Stop at Chrome's warning page; do not continue to page content yet.</li>
+<li>Open certificate details from that warning page.</li>
 <li>Copy the server certificate SHA-256 fingerprint.</li>
 <li>Paste it into the Intendant terminal, then enter the one-time secret here.</li>
 </ol>
@@ -761,7 +766,8 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
         }
         ClientPlatform::ChromeWindows | ClientPlatform::EdgeWindows => {
             r#"<ol>
-<li>Open certificate details from the browser warning or site security details.</li>
+<li>Stop at the browser warning page; do not continue to page content yet.</li>
+<li>Open certificate details from that warning page.</li>
 <li>Copy the server certificate SHA-256 fingerprint.</li>
 <li>Paste it into the Intendant terminal, then enter the one-time secret here.</li>
 </ol>
@@ -769,7 +775,8 @@ fn locked_platform_steps(platform: ClientPlatform) -> &'static str {
         }
         ClientPlatform::Generic => {
             r#"<ol>
-<li>Open your browser's certificate details for this HTTPS page.</li>
+<li>Do not continue past a browser warning or interact with page content yet.</li>
+<li>Open your browser's certificate details for this HTTPS site.</li>
 <li>Copy only the server certificate SHA-256 fingerprint.</li>
 <li>Paste it into the Intendant terminal, then enter the one-time secret here.</li>
 </ol>"#
@@ -1174,6 +1181,7 @@ summary {{ cursor: pointer; color: #89b4fa; font-weight: 700; }}
 <p class="muted">Detected setup path: <strong>{}</strong>. Use the manual notes if this device was detected incorrectly.</p>
 <div class="box">
 <p>This page is locked until the terminal verifies that your browser is connected to the real Intendant server certificate.</p>
+<p class="warn">Treat any enrollment page content as untrusted until the terminal accepts the certificate fingerprint. If you bypassed a browser warning before pairing, close this page and inspect the certificate from the warning page first.</p>
 {}
 <p>Do not enter any secret unless the terminal accepted the browser-observed fingerprint.</p>
 </div>
@@ -1184,7 +1192,7 @@ summary {{ cursor: pointer; color: #89b4fa; font-weight: 700; }}
 <details>
 <summary>Manual fingerprint check</summary>
 <div class="box">
-<p>Any browser may be used as long as you inspect this page's server certificate and paste only the SHA-256 fingerprint into the terminal. The terminal intentionally does not print the expected fingerprint first.</p>
+<p>Any browser may be used as long as you inspect the server certificate before trusting or interacting with page content, then paste only the SHA-256 fingerprint into the terminal. Prefer the browser warning page's certificate details. If the browser cannot show certificate details before loading the page, use a client-side certificate inspection tool instead. The terminal intentionally does not print the expected fingerprint first.</p>
 </div>
 </details>
 <p style="color:#a6adc8;margin-top:2em;font-size:.9em">Enrollment host: {}</p>
@@ -1266,8 +1274,14 @@ fn print_client_setup_banner(lan_ip: &str, cert_port: u16, https_port: u16) {
     println!("    https://{lan_ip}:{cert_port}/");
     println!();
     println!("  The browser may warn because the Intendant CA is not installed yet.");
-    println!("  Before entering any secret, inspect the browser-observed server");
-    println!("  certificate and paste its SHA-256 fingerprint into this terminal.");
+    println!("  Stop at that warning page. Do not continue to page content, enter");
+    println!("  secrets, click downloads, or install anything until this terminal");
+    println!("  accepts the browser-observed server certificate fingerprint.");
+    println!();
+    println!("  Inspect the server certificate from the browser warning/details UI,");
+    println!("  then paste its SHA-256 fingerprint into this terminal. If the browser");
+    println!("  cannot show the certificate before loading the page, use a client-side");
+    println!("  certificate inspection tool first.");
     println!();
     println!("  This terminal intentionally does not print the expected fingerprint.");
     println!("  It will reveal a one-time enrollment secret only after the pasted");

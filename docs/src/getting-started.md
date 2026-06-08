@@ -332,12 +332,17 @@ Client certificate enrollment is deliberately strict. The temporary enrollment
 server is HTTPS, using the same LAN server certificate as the dashboard. Before
 the CLI reveals the one-time enrollment secret, the operator must copy the
 server certificate SHA-256 fingerprint observed in the browser certificate UI
-and paste it into the `intendant lan` terminal. Only after that fingerprint
-matches the local `server.crt` can the browser redeem the secret and download
-enrollment artifacts. Apple clients get a single `intendant.mobileconfig`
-profile; other clients can download `ca.crt` plus `client.p12` (or the same
-identity as `client.pfx`). This avoids the unsafe pattern where a MITM page can
-steal a secret from an unauthenticated HTTP download page.
+and paste it into the `intendant lan` terminal. Treat any enrollment web content
+as untrusted until that terminal check succeeds: stop at the browser certificate
+warning/details UI, do not continue to page content, enter secrets, click
+downloads, or install anything first. If the browser cannot expose certificate
+details before loading the page, inspect the server certificate with a
+client-side certificate tool instead. Only after the pasted fingerprint matches
+the local `server.crt` can the browser redeem the secret and download enrollment
+artifacts. Apple clients get a single `intendant.mobileconfig` profile; other
+clients can download `ca.crt` plus `client.p12` (or the same identity as
+`client.pfx`). This avoids the unsafe pattern where a MITM page can serve
+active content or steal a secret from an unauthenticated download page.
 
 The enrollment page uses the browser's User-Agent only to prioritize the
 instructions and download buttons for that device. The authorization decision is
