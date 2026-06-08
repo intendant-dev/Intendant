@@ -380,8 +380,11 @@ is required.
 Peers added through the dashboard at runtime live only in the in-memory registry
 (and the browser's localStorage); they are not written back to `intendant.toml`.
 For independent mTLS daemons, configure `client_cert` / `client_key` with a
-client identity issued by the peer's access CA. The installed local access
-client cert fallback is only sufficient when the peer trusts the same issuing CA.
+client identity issued by the peer's access CA. `intendant peer invite` on the
+accepting daemon and `intendant peer join <invite>` on the connecting daemon is
+the default way to write those fields plus `pinned_fingerprints`. The installed
+local access client cert fallback is only sufficient when the peer trusts the
+same issuing CA.
 
 ### `mcp_servers`
 

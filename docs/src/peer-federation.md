@@ -385,6 +385,37 @@ intended for explicit local/debug use; `--no-tls` on a wildcard listener refuses
 startup when a public interface exists unless `--allow-public-plaintext` is
 passed.
 
+### Peer pairing — `intendant peer invite` / `join`
+
+Daemon-to-daemon mTLS uses the same access CA, but the UX is CLI-first so a peer
+can be paired without opening the dashboard:
+
+```bash
+# On the daemon that will accept inbound peer connections:
+intendant access setup --name workstation --port 8765
+intendant peer invite --card-url https://workstation.example:8765
+
+# On the daemon that should connect to it:
+intendant peer join 'intendant-peer-v1....'
+```
+
+`invite` issues a fresh client certificate from the accepting daemon's access CA,
+adds the accepting daemon's Agent Card URL, and includes the accepting daemon's
+server certificate fingerprint. The invite contains the client private key, so
+treat it as a secret and paste it only to the daemon that should connect.
+
+`join` stores that peer-issued client identity under the local per-user access
+cert store and writes or updates a `[[peer]]` block in `intendant.toml` with:
+
+- `card_url` — where to fetch the peer's Agent Card
+- `client_cert` / `client_key` — the peer-issued mTLS keycard this daemon presents
+- `pinned_fingerprints` — the accepting daemon's exact server certificate pin
+
+If `--card-url` is omitted, `invite` derives
+`https://<access-primary-ip>:8765/.well-known/agent-card.json` from
+`intendant access setup` metadata. Use `--card-url` when peers reach the daemon
+through DNS, Tailscale, a tunnel, NAT, or a non-default port.
+
 ### How auth maps to the Agent Card
 
 The human model is certificate-first: the server certificate proves the daemon
@@ -404,8 +435,8 @@ during the HTTPS/WSS handshake. Config-driven peers can set
 remote peer's access CA. If those fields are absent, Intendant tries the
 installed local access `client.crt` / `client.key` for TLS peer URLs; that works
 only when the remote peer trusts the same issuing CA. Independent daemons still
-need a pairing/provisioning step that gives each side a peer-issued client
-identity.
+need a pairing/provisioning step; `intendant peer invite` / `join` is the
+built-in path for that.
 
 `PinnedMutualTls` is the stricter transport form when an operator pins a server
 certificate fingerprint out of band. Bearer `ApplicationAuth` still exists in the

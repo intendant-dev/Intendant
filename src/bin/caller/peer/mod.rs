@@ -96,6 +96,7 @@ pub mod event;
 pub mod handle;
 pub mod id;
 pub mod log_writer;
+pub mod pairing;
 pub mod registry;
 pub mod traits;
 pub mod transport;

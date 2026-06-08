@@ -9825,6 +9825,7 @@ fn print_help() {
     println!("SUBCOMMANDS:");
     println!("    ctl                   Control a running Intendant daemon over MCP");
     println!("    access                Configure dashboard TLS/mTLS access certificates");
+    println!("    peer                  Pair and configure federated Intendant peers");
     println!("    setup                 Install or verify host-level Intendant dependencies");
     println!();
     println!("SESSION LOGS:");
@@ -25558,6 +25559,20 @@ async fn main() -> Result<(), CallerError> {
             eprintln!("error: `intendant access` is not supported on Windows yet");
             std::process::exit(1);
         }
+    }
+
+    // Intercept `intendant peer <action>` before normal project/provider
+    // initialization. Pairing creates or imports peer-issued mTLS client
+    // identities and writes `[[peer]]` config; it should not need an API key.
+    if env::args().nth(1).as_deref() == Some("peer") {
+        let argv: Vec<String> = env::args().skip(2).collect();
+        return match peer::pairing::run(argv).await {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
     }
 
     // Intercept `intendant setup <action>` before normal project/provider
