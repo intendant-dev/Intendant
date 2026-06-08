@@ -27942,6 +27942,22 @@ function externalSourceForSessionWindow(sessionId, win = null) {
   );
 }
 
+function sessionMetadataStatusIsTerminal(session = {}) {
+  const status = String(
+    session.status ||
+    session.intendant_status ||
+    session.intendantStatus ||
+    ''
+  ).trim().toLowerCase();
+  return status === 'abandoned' || status === 'deleted' || status === 'missing';
+}
+
+function clearStaleSessionWindowDetached(sessionId, reason = '') {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !sessionWindows.has(sid) || !sessionWindowIsDetached(sid)) return;
+  setSessionWindowDetached(sid, false, reason || 'session is attached');
+}
+
 function setSessionWindowDetached(sessionId, detached, reason = '') {
   const sid = String(sessionId || '').trim();
   if (!sid) return;
@@ -28873,6 +28889,21 @@ function cacheSessionWindowMetadata(sessions) {
         source: session.backend_source,
         backend_source_label: session.backend_source_label,
       });
+    }
+    if (!sessionMetadataStatusIsTerminal(session)) {
+      const rawSource = String(session.source || '').trim().toLowerCase();
+      const source = rawSource === 'intendant'
+        ? 'intendant'
+        : normalizeAgentId(session.source || session.backend_source || '');
+      const backendSessionId = String(session.backend_session_id || '').trim();
+      const intendantSessionId = String(session.intendant_session_id || '').trim();
+      const sessionId = String(session.session_id || '').trim();
+      if (source && source !== 'intendant' && intendantSessionId) {
+        clearStaleSessionWindowDetached(sessionId, 'session metadata reports an attached wrapper');
+      }
+      if (source === 'intendant' && backendSessionId) {
+        clearStaleSessionWindowDetached(backendSessionId, 'wrapper metadata reports this session is attached');
+      }
     }
   }
   for (const session of sessions) {
@@ -32470,6 +32501,9 @@ function appendSessionWindowRecord(record, batch = null) {
   if (!targetSid) return;
   const win = sessionWindows.get(targetSid) || (processingLogReplay ? null : ensureSessionWindow(targetSid));
   if (!win) return;
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+    clearStaleSessionWindowDetached(targetSid, 'live output observed');
+  }
   const normalized = { ...record, session_id: targetSid };
   const shouldFollow = sessionWindowShouldFollowNextOutput(win);
   if (batch) {
@@ -32495,6 +32529,9 @@ function appendLogEntryToSessionWindow(entry, batch = null) {
   if (!targetSid) return;
   const win = ensureSessionWindow(targetSid);
   if (!win) return;
+  if (!processingLogReplay && sessionWindowIsDetached(targetSid) && externalSourceForSessionWindow(targetSid, win)) {
+    clearStaleSessionWindowDetached(targetSid, 'live output observed');
+  }
   const empty = win.log.querySelector('.session-window-empty');
   if (empty) empty.remove();
   const shouldFollow = sessionWindowShouldFollowNextOutput(win);
@@ -32522,6 +32559,7 @@ function inferSessionPhaseFromLog(c) {
   const level = String(c.level || '').toLowerCase();
   let phase = '';
   if (content.startsWith('Turn ')) phase = 'thinking';
+  else if (!processingLogReplay && level === 'model') phase = 'thinking';
   else if (level === 'agent' || content.startsWith('Running on display')) phase = 'running';
   else if (content.startsWith('Approval required') || content.startsWith('Question:')) phase = 'waiting';
   else if (content.startsWith('Task complete:')) phase = 'done';
@@ -46270,14 +46308,9 @@ window.submitActivityTask = function(options = {}) {
   const attachmentReceipt = pendingAttachments.slice();
   const direct = document.getElementById('direct-mode-toggle')?.checked || false;
   const targetSessionId = resolvePromptTargetSessionId();
-  const shouldResumeExternalTarget = targetSessionId
-    && !!externalSourceForSessionWindow(targetSessionId)
-    && !isSessionWindowEffectivelyActive(targetSessionId);
-  const msg = targetSessionId && (sessionWindowIsDetached(targetSessionId) || shouldResumeExternalTarget)
-    ? detachedSessionResumeMessage(targetSessionId, text, direct, attachments)
-    : (targetSessionId
-      ? { action: 'start_task', task: text, session_id: targetSessionId }
-      : { action: 'create_session', task: text });
+  const msg = targetSessionId
+    ? { action: 'start_task', task: text, session_id: targetSessionId }
+    : { action: 'create_session', task: text };
   if (!msg) return;
   if (targetSessionId && msg.action === 'start_task') {
     const id = nextFollowUpId();
