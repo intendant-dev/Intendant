@@ -2399,6 +2399,20 @@ fn context_rewind_should_interrupt_active_turn(request: &ExternalContextRewindRe
     request.auto_resume
 }
 
+fn context_rewind_active_tool_defer_message(
+    request: &ExternalContextRewindRequest,
+    active_tool_count: usize,
+    normal_tools_allowed: bool,
+) -> Option<String> {
+    if !request.auto_resume || active_tool_count == 0 || !normal_tools_allowed {
+        return None;
+    }
+    Some(format!(
+        "context rewind deferred to {}; {active_tool_count} active tool(s)/command(s) are still running and normal tools are currently allowed. Intendant did not stop the active turn or schedule the rewind. Wait for the active tool/command completion, then retry rewind_context with the same anchor and primer if cleanup is still needed.",
+        request.target_label()
+    ))
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ResolvedContextRewindAnchor {
     item_id: String,
@@ -7801,6 +7815,25 @@ async fn drain_external_agent_events(
                                             });
                                             continue;
                                         }
+                                        let normal_tools_allowed = !managed_context_recovery_kickstart
+                                            && pending_backend_recovery.is_none()
+                                            && managed_context_rewind_only_pressure.is_none();
+                                        if let Some(message) =
+                                            context_rewind_active_tool_defer_message(
+                                                &request,
+                                                active_tool_ids.len(),
+                                                normal_tools_allowed,
+                                            )
+                                        {
+                                            slog(config.session_log, |l| l.info(&message));
+                                            config.bus.send(AppEvent::CodexThreadActionResult {
+                                                session_id: result_session_id.clone(),
+                                                action,
+                                                success: false,
+                                                message,
+                                            });
+                                            continue;
+                                        }
                                         let target = request.target_label();
                                         let should_finish_naturally = request.auto_resume
                                             && !context_rewind_should_interrupt_active_turn(
@@ -12335,6 +12368,50 @@ mod tests {
         assert!(primer.contains("- bad assumption"));
         assert!(!primer.contains("- \n"));
         assert!(request.resume_followup().is_some());
+    }
+
+    #[test]
+    fn context_rewind_deferred_when_active_tool_and_normal_tools_allowed() {
+        let params = serde_json::json!({
+            "anchor": {"item_id": "call-123", "position": "after"},
+            "reason": "cleanup stale build warning noise",
+            "primer": "Keep the durable build result once it completes."
+        });
+        let request = external_context_rewind_request_from_action(
+            "rewind_context",
+            &params,
+            Some("s".into()),
+        )
+        .expect("rewind action")
+        .expect("valid request");
+
+        let message = context_rewind_active_tool_defer_message(&request, 1, true)
+            .expect("active optional cleanup rewind should defer");
+
+        assert!(message.contains("context rewind deferred"));
+        assert!(message.contains("1 active tool(s)/command(s) are still running"));
+        assert!(message.contains("normal tools are currently allowed"));
+        assert!(message.contains("did not stop the active turn or schedule the rewind"));
+        assert!(message.contains("retry rewind_context"));
+    }
+
+    #[test]
+    fn context_rewind_not_deferred_without_active_tool_or_under_recovery_pressure() {
+        let params = serde_json::json!({
+            "anchor": {"item_id": "call-123", "position": "after"},
+            "reason": "recover context",
+            "primer": "Keep only the recovery facts."
+        });
+        let request = external_context_rewind_request_from_action(
+            "rewind_context",
+            &params,
+            Some("s".into()),
+        )
+        .expect("rewind action")
+        .expect("valid request");
+
+        assert!(context_rewind_active_tool_defer_message(&request, 0, true).is_none());
+        assert!(context_rewind_active_tool_defer_message(&request, 1, false).is_none());
     }
 
     #[test]
