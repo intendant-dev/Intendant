@@ -5100,16 +5100,21 @@ fn managed_context_rewind_only_pressure_from_usage(
     })
 }
 
-fn managed_context_preflight_pressure_gate_enabled(
+fn managed_context_preflight_rewind_only_gate_enabled(
     codex_managed_context_enabled: bool,
     managed_context_recovery_kickstart: bool,
     managed_context_density_handoff: bool,
-    managed_context_density_handoff_completed: bool,
 ) -> bool {
     codex_managed_context_enabled
         && !managed_context_recovery_kickstart
         && !managed_context_density_handoff
-        && !managed_context_density_handoff_completed
+}
+
+fn managed_context_preflight_density_gate_enabled(
+    managed_context_rewind_only_gate_enabled: bool,
+    managed_context_density_handoff_completed: bool,
+) -> bool {
+    managed_context_rewind_only_gate_enabled && !managed_context_density_handoff_completed
 }
 
 fn managed_context_density_pressure_from_usage(
@@ -9733,6 +9738,13 @@ fn managed_context_rewind_continuation(
         .or(automatic_resume)
 }
 
+fn managed_context_recovery_without_rewind_blocks_held_replay(
+    managed_context_recovery_kickstart: bool,
+    pending_replays: &std::collections::VecDeque<FollowUpMessage>,
+) -> bool {
+    managed_context_recovery_kickstart && !pending_replays.is_empty()
+}
+
 fn managed_context_density_retry_after_rewind(
     active_followup: &FollowUpMessage,
     post_rewind_snapshot: Option<&external_agent::AgentContextSnapshot>,
@@ -12396,24 +12408,46 @@ mod tests {
     }
 
     #[test]
-    fn managed_context_density_handoff_completed_allows_one_queued_replay() {
-        assert!(managed_context_preflight_pressure_gate_enabled(
-            true, false, false, false
+    fn managed_context_density_handoff_completed_still_checks_rewind_only_pressure() {
+        assert!(managed_context_preflight_rewind_only_gate_enabled(
+            true, false, false
         ));
-        assert!(!managed_context_preflight_pressure_gate_enabled(
-            true, true, false, false
+        assert!(!managed_context_preflight_rewind_only_gate_enabled(
+            true, true, false
         ));
-        assert!(!managed_context_preflight_pressure_gate_enabled(
-            true, false, true, false
-        ));
-        assert!(!managed_context_preflight_pressure_gate_enabled(
-            true, false, false, true
+        assert!(!managed_context_preflight_rewind_only_gate_enabled(
+            true, false, true
         ));
 
         let replay =
             FollowUpMessage::text("held follow-up".into()).after_managed_context_density_handoff();
         assert!(replay.managed_context_density_handoff_completed);
         assert!(!replay.managed_context_density_handoff);
+        assert!(managed_context_preflight_rewind_only_gate_enabled(
+            true,
+            replay.managed_context_recovery_kickstart,
+            replay.managed_context_density_handoff,
+        ));
+        assert!(!managed_context_preflight_density_gate_enabled(
+            true,
+            replay.managed_context_density_handoff_completed,
+        ));
+    }
+
+    #[test]
+    fn managed_context_recovery_without_rewind_does_not_release_held_followup() {
+        let held = FollowUpMessage::text("implement the queued normal task".into());
+        let pending = std::collections::VecDeque::from([held]);
+        assert!(managed_context_recovery_without_rewind_blocks_held_replay(
+            true, &pending
+        ));
+        assert!(!managed_context_recovery_without_rewind_blocks_held_replay(
+            false, &pending
+        ));
+        assert!(!managed_context_recovery_without_rewind_blocks_held_replay(
+            true,
+            &std::collections::VecDeque::new(),
+        ));
     }
 
     #[test]
@@ -23149,12 +23183,13 @@ async fn run_external_agent_mode(
             continue;
         }
 
-        if managed_context_preflight_pressure_gate_enabled(
-            codex_managed_context_enabled,
-            managed_context_recovery_kickstart,
-            managed_context_density_handoff,
-            managed_context_density_handoff_completed,
-        ) {
+        let managed_context_rewind_only_preflight_enabled =
+            managed_context_preflight_rewind_only_gate_enabled(
+                codex_managed_context_enabled,
+                managed_context_recovery_kickstart,
+                managed_context_density_handoff,
+            );
+        if managed_context_rewind_only_preflight_enabled {
             match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
                 Ok(Some(snapshot)) => {
                     if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot) {
@@ -23237,56 +23272,62 @@ async fn run_external_agent_mode(
                         }
                         next_turn = Some(recovery_followup);
                         continue 'outer;
-                    } else if let Some(pressure) = managed_context_density_pressure(&snapshot) {
-                        pending_managed_context_replays.push_back(FollowUpMessage {
-                            text: turn_text.clone(),
-                            attachments: attachments.clone(),
-                            steer_id: steer_id.clone(),
-                            follow_up_id: follow_up_id.clone(),
-                            edit_user_turn_index,
-                            edit_user_turn_revision,
-                            edit_original_text: edit_original_text.clone(),
-                            unresolved_attachment_ids: unresolved_attachment_ids.clone(),
-                            target_session_id: target_session_id.clone(),
-                            managed_context_recovery_kickstart: false,
-                            managed_context_density_handoff: false,
-                            managed_context_density_handoff_completed: false,
-                        });
-                        emit_follow_up_status(
-                            &bus,
-                            live_session_id.as_deref(),
-                            &follow_up_id,
-                            None,
-                            "queued",
-                            Some(
-                                "managed context is above the recommended density threshold; sending density handoff before broad follow-up",
-                            ),
-                        );
-                        let handoff_text = managed_context_density_handoff_text(pressure);
-                        slog(&session_log, |l| {
-                            l.info(&format!(
-                                "Holding Codex follow-up during managed-context density watch ({}/{} tokens, threshold {}); sending density handoff",
-                                pressure.used_tokens,
-                                pressure.rewind_only_limit,
-                                pressure.recommended_rewind_limit
-                            ))
-                        });
-                        bus.send(AppEvent::LogEntry {
-                            session_id: live_session_id.clone(),
-                            level: "info".to_string(),
-                            source: "Intendant".to_string(),
-                            content: format!(
-                                "Managed context is above the recommended density threshold ({}/{} tokens, threshold {}); sending a density handoff before broad follow-up work. Normal tools remain allowed below rewind-only pressure.",
-                                pressure.used_tokens,
-                                pressure.rewind_only_limit,
-                                pressure.recommended_rewind_limit
-                            ),
-                            turn: None,
-                        });
-                        next_turn = Some(
-                            FollowUpMessage::text(handoff_text).managed_context_density_handoff(),
-                        );
-                        continue 'outer;
+                    } else if managed_context_preflight_density_gate_enabled(
+                        managed_context_rewind_only_preflight_enabled,
+                        managed_context_density_handoff_completed,
+                    ) {
+                        if let Some(pressure) = managed_context_density_pressure(&snapshot) {
+                            pending_managed_context_replays.push_back(FollowUpMessage {
+                                text: turn_text.clone(),
+                                attachments: attachments.clone(),
+                                steer_id: steer_id.clone(),
+                                follow_up_id: follow_up_id.clone(),
+                                edit_user_turn_index,
+                                edit_user_turn_revision,
+                                edit_original_text: edit_original_text.clone(),
+                                unresolved_attachment_ids: unresolved_attachment_ids.clone(),
+                                target_session_id: target_session_id.clone(),
+                                managed_context_recovery_kickstart: false,
+                                managed_context_density_handoff: false,
+                                managed_context_density_handoff_completed: false,
+                            });
+                            emit_follow_up_status(
+                                &bus,
+                                live_session_id.as_deref(),
+                                &follow_up_id,
+                                None,
+                                "queued",
+                                Some(
+                                    "managed context is above the recommended density threshold; sending density handoff before broad follow-up",
+                                ),
+                            );
+                            let handoff_text = managed_context_density_handoff_text(pressure);
+                            slog(&session_log, |l| {
+                                l.info(&format!(
+                                    "Holding Codex follow-up during managed-context density watch ({}/{} tokens, threshold {}); sending density handoff",
+                                    pressure.used_tokens,
+                                    pressure.rewind_only_limit,
+                                    pressure.recommended_rewind_limit
+                                ))
+                            });
+                            bus.send(AppEvent::LogEntry {
+                                session_id: live_session_id.clone(),
+                                level: "info".to_string(),
+                                source: "Intendant".to_string(),
+                                content: format!(
+                                    "Managed context is above the recommended density threshold ({}/{} tokens, threshold {}). Sending a density handoff before broad follow-up work. Normal tools remain allowed below rewind-only pressure.",
+                                    pressure.used_tokens,
+                                    pressure.rewind_only_limit,
+                                    pressure.recommended_rewind_limit
+                                ),
+                                turn: None,
+                            });
+                            next_turn = Some(
+                                FollowUpMessage::text(handoff_text)
+                                    .managed_context_density_handoff(),
+                            );
+                            continue 'outer;
+                        }
                     }
                 }
                 Ok(None) => {}
@@ -23844,6 +23885,29 @@ async fn run_external_agent_mode(
                                 }
                             } else {
                                 managed_context_recovery_kickstarts_without_rewind = 0;
+                                if managed_context_recovery_without_rewind_blocks_held_replay(
+                                    managed_context_recovery_kickstart,
+                                    &pending_managed_context_replays,
+                                ) {
+                                    let message = "Managed-context recovery turn completed without rewind_context; refusing to replay held normal follow-up until a successful rewind lowers context pressure.".to_string();
+                                    slog(&session_log, |l| l.warn(&message));
+                                    record_external_round_inline(
+                                        &session_log,
+                                        persist_model_responses_inline,
+                                        round,
+                                        turns_in_round,
+                                    );
+                                    bus.send(AppEvent::RoundComplete {
+                                        session_id: live_session_id.clone(),
+                                        round,
+                                        turns_in_round,
+                                        native_message_count: None,
+                                    });
+                                    bus.send(AppEvent::LoopError(message));
+                                    stats.terminal_outcome =
+                                        Some("managed Codex recovery did not rewind".to_string());
+                                    break;
+                                }
                                 if let Some(mut replay) =
                                     pending_managed_context_replays.pop_front()
                                 {
