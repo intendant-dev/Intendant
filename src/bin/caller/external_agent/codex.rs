@@ -3731,21 +3731,30 @@ async fn reader_task(
         } else {
             active_turn_id.lock().await.clone()
         };
-        let terminal_key = turn_id
-            .clone()
-            .or_else(|| active_turn_for_thread.clone())
-            .or_else(|| thread_id.clone());
-        let turn_terminal_observed = terminal_key
-            .as_ref()
-            .is_some_and(|key| terminal_turns_observed.contains(key));
-
         let final_answer_completed =
             method == "item/completed" && codex_item_completed_final_answer(&params);
-        if matches!(
+        let terminal_keys = codex_terminal_observation_keys(
+            &params,
+            turn_id.as_deref(),
+            active_turn_for_thread.as_deref(),
+            thread_id.as_deref(),
+            final_answer_completed,
+        );
+        let turn_terminal_observed =
+            codex_any_terminal_observed(&terminal_turns_observed, &terminal_keys);
+
+        if codex_notification_stale_for_active_turn(
+            turn_id.as_deref(),
+            active_turn_for_thread.as_deref(),
+        ) {
+            continue;
+        }
+
+        if codex_terminal_notification_already_observed(
             method,
-            "turn/completed" | "turn/interrupted" | "turn/failed"
-        ) && turn_terminal_observed
-        {
+            final_answer_completed,
+            turn_terminal_observed,
+        ) {
             continue;
         }
 
@@ -3791,9 +3800,7 @@ async fn reader_task(
 
         match method {
             "turn/started" | "thread/started" => {
-                if let Some(key) = terminal_key.as_ref() {
-                    terminal_turns_observed.remove(key);
-                }
+                codex_clear_terminal_observed(&mut terminal_turns_observed, &terminal_keys);
                 if let (Some(thread_id), Some(turn_id)) = (thread_id.as_deref(), turn_id.as_deref())
                 {
                     active_turns
@@ -3806,9 +3813,7 @@ async fn reader_task(
                 }
             }
             "turn/completed" | "turn/interrupted" | "turn/failed" => {
-                if let Some(key) = terminal_key.as_ref() {
-                    terminal_turns_observed.insert(key.clone());
-                }
+                codex_mark_terminal_observed(&mut terminal_turns_observed, &terminal_keys);
                 if let Some(thread_id) = thread_id.as_deref() {
                     active_turns.lock().await.remove(thread_id);
                     if active_thread_snapshot.as_deref() == Some(thread_id) {
@@ -3822,9 +3827,7 @@ async fn reader_task(
                 if codex_thread_status_type(&params)
                     .is_some_and(|status| matches!(status, "completed" | "idle"))
                 {
-                    if let Some(key) = terminal_key.as_ref() {
-                        terminal_turns_observed.insert(key.clone());
-                    }
+                    codex_mark_terminal_observed(&mut terminal_turns_observed, &terminal_keys);
                     if let Some(thread_id) = thread_id.as_deref() {
                         active_turns.lock().await.remove(thread_id);
                         if active_thread_snapshot.as_deref() == Some(thread_id) {
@@ -3836,9 +3839,7 @@ async fn reader_task(
                 }
             }
             "item/completed" if final_answer_completed => {
-                if let Some(key) = terminal_key.as_ref() {
-                    terminal_turns_observed.insert(key.clone());
-                }
+                codex_mark_terminal_observed(&mut terminal_turns_observed, &terminal_keys);
                 if let Some(thread_id) = thread_id.as_deref() {
                     active_turns.lock().await.remove(thread_id);
                     if active_thread_snapshot.as_deref() == Some(thread_id) {
@@ -4030,6 +4031,79 @@ fn codex_thread_status_can_complete_turn(
     }
 
     active_turn_id.is_some() || extract_turn_id(params).is_some()
+}
+
+fn codex_notification_stale_for_active_turn(
+    event_turn_id: Option<&str>,
+    active_turn_id: Option<&str>,
+) -> bool {
+    match (event_turn_id, active_turn_id) {
+        (Some(event_turn_id), Some(active_turn_id)) => event_turn_id != active_turn_id,
+        _ => false,
+    }
+}
+
+fn codex_terminal_notification_already_observed(
+    method: &str,
+    final_answer_completed: bool,
+    turn_terminal_observed: bool,
+) -> bool {
+    if !turn_terminal_observed {
+        return false;
+    }
+
+    matches!(
+        method,
+        "turn/completed" | "turn/interrupted" | "turn/failed"
+    ) || (method == "item/completed" && final_answer_completed)
+}
+
+fn codex_final_answer_item_id(params: &serde_json::Value) -> Option<String> {
+    let item = params.get("item").unwrap_or(params);
+    item.get("id")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(str::to_string)
+}
+
+fn codex_terminal_observation_keys(
+    params: &serde_json::Value,
+    turn_id: Option<&str>,
+    active_turn_id: Option<&str>,
+    thread_id: Option<&str>,
+    final_answer_completed: bool,
+) -> Vec<String> {
+    let mut keys = Vec::new();
+    if final_answer_completed {
+        if let Some(item_id) = codex_final_answer_item_id(params) {
+            keys.push(format!("item:{item_id}"));
+        }
+    }
+    if let Some(turn_id) = turn_id.map(str::trim).filter(|id| !id.is_empty()) {
+        keys.push(format!("turn:{turn_id}"));
+    } else if let Some(active_turn_id) = active_turn_id.map(str::trim).filter(|id| !id.is_empty()) {
+        keys.push(format!("turn:{active_turn_id}"));
+    } else if let Some(thread_id) = thread_id.map(str::trim).filter(|id| !id.is_empty()) {
+        keys.push(format!("thread:{thread_id}"));
+    }
+    keys.sort();
+    keys.dedup();
+    keys
+}
+
+fn codex_any_terminal_observed(observed: &HashSet<String>, keys: &[String]) -> bool {
+    keys.iter().any(|key| observed.contains(key))
+}
+
+fn codex_mark_terminal_observed(observed: &mut HashSet<String>, keys: &[String]) {
+    observed.extend(keys.iter().cloned());
+}
+
+fn codex_clear_terminal_observed(observed: &mut HashSet<String>, keys: &[String]) {
+    for key in keys {
+        observed.remove(key);
+    }
 }
 
 fn codex_item_completed_final_answer(params: &serde_json::Value) -> bool {
@@ -9357,6 +9431,100 @@ error: build failed
             }
         });
         assert!(!codex_item_completed_final_answer(&failed));
+    }
+
+    #[test]
+    fn stale_turn_scoped_final_answer_is_rejected_after_new_turn_starts() {
+        assert!(codex_notification_stale_for_active_turn(
+            Some("old-turn"),
+            Some("new-turn")
+        ));
+        assert!(!codex_notification_stale_for_active_turn(
+            Some("new-turn"),
+            Some("new-turn")
+        ));
+        assert!(!codex_notification_stale_for_active_turn(
+            Some("old-turn"),
+            None
+        ));
+    }
+
+    #[test]
+    fn final_answer_item_id_dedupes_stale_completion_without_turn_id() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "item": {
+                "id": "msg-final-1",
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "previous checkpoint summary"
+            }
+        });
+        let mut observed = HashSet::new();
+        let first_keys = codex_terminal_observation_keys(
+            &params,
+            None,
+            Some("old-turn"),
+            Some("parent-thread"),
+            true,
+        );
+        codex_mark_terminal_observed(&mut observed, &first_keys);
+
+        let replayed_after_new_turn = codex_terminal_observation_keys(
+            &params,
+            None,
+            Some("new-turn"),
+            Some("parent-thread"),
+            true,
+        );
+
+        assert!(codex_any_terminal_observed(
+            &observed,
+            &replayed_after_new_turn
+        ));
+        assert!(codex_terminal_notification_already_observed(
+            "item/completed",
+            true,
+            true,
+        ));
+    }
+
+    #[test]
+    fn final_answer_terminal_keys_cover_following_turn_completed() {
+        let params = serde_json::json!({
+            "threadId": "parent-thread",
+            "turnId": "turn-1",
+            "item": {
+                "id": "msg-final-1",
+                "type": "agentMessage",
+                "phase": "final_answer",
+                "text": "done"
+            }
+        });
+        let mut observed = HashSet::new();
+        let final_answer_keys = codex_terminal_observation_keys(
+            &params,
+            Some("turn-1"),
+            Some("turn-1"),
+            Some("parent-thread"),
+            true,
+        );
+        codex_mark_terminal_observed(&mut observed, &final_answer_keys);
+
+        let turn_completed_keys = codex_terminal_observation_keys(
+            &serde_json::json!({}),
+            Some("turn-1"),
+            None,
+            Some("parent-thread"),
+            false,
+        );
+
+        assert!(codex_any_terminal_observed(&observed, &turn_completed_keys));
+        assert!(codex_terminal_notification_already_observed(
+            "turn/completed",
+            false,
+            true,
+        ));
     }
 
     #[test]
