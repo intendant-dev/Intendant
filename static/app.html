@@ -20168,6 +20168,18 @@ function stationHandleContextAction(action) {
     if (partId) copyTextToClipboard(partId);
     return;
   }
+  if (op === 'replay-prev' || op === 'replay-next' || op === 'replay-latest') {
+    const { index, max, timeline } = stationContextTimelineState();
+    if (!timeline.length) return;
+    const next = op === 'replay-prev'
+      ? index - 1
+      : op === 'replay-next'
+        ? index + 1
+        : max;
+    stationSetContextReplayIndex(next);
+    stationRenderedSelectPanel('system:context', `Context ${op.replace('replay-', '')}`);
+    return;
+  }
   if (op === 'load-exact') {
     stationLoadExactContextSnapshot(id || stationSelectedContextPart)
       .catch(err => showControlToast?.('error', `Load exact context failed: ${err?.message || err}`));
@@ -20474,6 +20486,7 @@ function stationSnapshotForContext() {
 
 function stationBuildContextSummary() {
   const snapshot = stationSnapshotForContext();
+  const replay = stationContextTimelineState();
   if (!snapshot) {
     return {
       available: false,
@@ -20489,6 +20502,11 @@ function stationBuildContextSummary() {
       categoryCount: 0,
       topCategories: [],
       topItems: [],
+      replayMode: contextReplayMode || 'live',
+      replayCount: replay.timeline.length,
+      replayIndex: replay.timeline.length ? replay.index + 1 : 0,
+      replayTime: '',
+      exactStatus: 'none',
     };
   }
   const analysis = analyzeContextSnapshot(snapshot);
@@ -20541,6 +20559,11 @@ function stationBuildContextSummary() {
     categoryCount: categories.length,
     topCategories: categories,
     topItems,
+    replayMode: contextReplayMode || 'live',
+    replayCount: replay.timeline.length,
+    replayIndex: replay.timeline.length ? replay.index + 1 : 0,
+    replayTime: formatContextTimestamp(replay.snapshot?.ts),
+    exactStatus: stationContextExactStatus(replay.snapshot || snapshot),
   };
 }
 

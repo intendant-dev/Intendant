@@ -4444,6 +4444,7 @@ impl StationInner {
             ax += width + 8.0;
         }
         yy = ay + 35.0;
+        yy = self.draw_context_replay_controls(x, yy, panel_w, &ctx);
         self.section_title(x, yy, "Token pressure");
         yy += 18.0;
         self.meter(
@@ -4512,6 +4513,94 @@ impl StationInner {
             "No item details in this snapshot",
             5,
         );
+    }
+
+    fn draw_context_replay_controls(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        ctx: &StationContextSummary,
+    ) -> f32 {
+        let mut yy = y;
+        self.section_title_color(x, yy, "Replay timeline", C_BLUE_CSS);
+        yy += 18.0;
+        self.round_rect(
+            x + 12.0,
+            yy - 10.0,
+            panel_w - 24.0,
+            66.0,
+            4.0,
+            "rgba(17,17,27,0.76)",
+            "rgba(137,180,250,0.46)",
+        );
+        let selected = if ctx.replay_count > 0 {
+            format!("{} / {}", ctx.replay_index, ctx.replay_count)
+        } else {
+            "--".to_string()
+        };
+        self.text(
+            &format!("{} snapshots", ctx.replay_count),
+            x + 22.0,
+            yy + 4.0,
+            9.0,
+            C_TEXT_CSS,
+            "bold",
+        );
+        self.text(
+            &format!(
+                "{} / {} / {}",
+                nonempty(&ctx.replay_mode, "live"),
+                selected,
+                nonempty(&ctx.replay_time, "--")
+            ),
+            x + 22.0,
+            yy + 21.0,
+            8.5,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+        self.text(
+            &format!("raw {}", nonempty(&ctx.exact_status, "compact")),
+            x + 22.0,
+            yy + 38.0,
+            8.5,
+            if ctx.exact_status.contains("failed") {
+                C_YELLOW_CSS
+            } else {
+                C_OVERLAY1_CSS
+            },
+            "normal",
+        );
+
+        let actions = [
+            ("replay-prev", "prev", 48.0, C_BLUE_CSS),
+            ("replay-next", "next", 50.0, C_BLUE_CSS),
+            ("replay-latest", "latest", 58.0, C_TEAL_CSS),
+            ("live", "live", 46.0, C_GREEN_CSS),
+            ("copy-snapshot", "copy", 48.0, C_MAUVE_CSS),
+            ("load-exact", "exact", 52.0, C_PEACH_CSS),
+        ];
+        let mut bx = x + panel_w - 22.0;
+        for (action, label, width, color) in actions.into_iter().rev() {
+            bx -= width;
+            if bx < x + 106.0 {
+                break;
+            }
+            self.pill_at(bx, yy + 39.0, width, 18.0, label, color);
+            self.hit_zones.push(HitZone::new(
+                bx,
+                yy + 39.0,
+                width,
+                18.0,
+                HitAction::ContextAction {
+                    action: action.to_string(),
+                    id: String::new(),
+                },
+            ));
+            bx -= 6.0;
+        }
+        yy + 82.0
     }
 
     fn draw_managed_info(&mut self, x: f32, y: f32, panel_w: f32) {
@@ -7692,6 +7781,11 @@ struct StationContextSummary {
     hard_window: f32,
     item_count: u32,
     category_count: u32,
+    replay_mode: String,
+    replay_count: u32,
+    replay_index: u32,
+    replay_time: String,
+    exact_status: String,
     top_categories: Vec<StationBreakdown>,
     top_items: Vec<StationDetailRow>,
 }
@@ -7710,6 +7804,11 @@ impl Default for StationContextSummary {
             hard_window: 0.0,
             item_count: 0,
             category_count: 0,
+            replay_mode: "live".into(),
+            replay_count: 0,
+            replay_index: 0,
+            replay_time: String::new(),
+            exact_status: "none".into(),
             top_categories: Vec::new(),
             top_items: Vec::new(),
         }
