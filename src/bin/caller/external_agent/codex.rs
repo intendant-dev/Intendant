@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -71,6 +71,7 @@ Keep the live transcript informationally dense:
 
 const GENERATION_STARVATION_HINT: &str = "The previous Codex response appears to have been cut off near the backend context limit. Avoid regenerating the same long output; rewind context first or produce a much shorter recovery response.";
 const CODEX_INITIALIZE_TIMEOUT_SECS: u64 = 60;
+const CODEX_INTERRUPT_REQUEST_TIMEOUT: Duration = Duration::from_secs(2);
 pub(crate) const CODEX_FAST_SERVICE_TIER: &str = "priority";
 const CODEX_DANGER_FULL_ACCESS_SANDBOX: &str = "danger-full-access";
 const CODEX_NEVER_APPROVAL_POLICY: &str = "never";
@@ -1725,10 +1726,26 @@ impl CodexAgent {
         method: &str,
         params: Option<serde_json::Value>,
     ) -> Result<serde_json::Value, CallerError> {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
-        let (tx, rx) = oneshot::channel();
-        self.pending_requests.lock().await.insert(id, tx);
+        self.send_request_bounded(method, params, None).await
+    }
 
+    async fn send_request_with_timeout(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout: Duration,
+    ) -> Result<serde_json::Value, CallerError> {
+        self.send_request_bounded(method, params, Some(timeout))
+            .await
+    }
+
+    async fn send_request_bounded(
+        &mut self,
+        method: &str,
+        params: Option<serde_json::Value>,
+        timeout: Option<Duration>,
+    ) -> Result<serde_json::Value, CallerError> {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let request = JsonRpcRequest {
             jsonrpc: "2.0".to_string(),
             id,
@@ -1736,20 +1753,42 @@ impl CodexAgent {
             params,
         };
         let line = serde_json::to_string(&request)?;
+        let (tx, rx) = oneshot::channel();
 
-        let writer = self
-            .writer
-            .as_mut()
-            .ok_or_else(|| CallerError::ExternalAgent("Not initialized".into()))?;
-        writer.write_all(line.as_bytes()).await?;
-        writer.write_all(b"\n").await?;
-        writer.flush().await?;
+        if self.writer.is_none() {
+            return Err(CallerError::ExternalAgent("Not initialized".into()));
+        }
+        self.pending_requests.lock().await.insert(id, tx);
+        let (result, remove_pending) = {
+            let writer = self.writer.as_mut().expect("writer checked above");
+            let request_fut = async {
+                writer.write_all(line.as_bytes()).await?;
+                writer.write_all(b"\n").await?;
+                writer.flush().await?;
+                let result = rx
+                    .await
+                    .map_err(|_| CallerError::ExternalAgent("Request channel closed".into()))?;
+                result.map_err(|msg| CallerError::ExternalAgent(msg))
+            };
 
-        let result = rx
-            .await
-            .map_err(|_| CallerError::ExternalAgent("Request channel closed".into()))?;
-
-        result.map_err(|msg| CallerError::ExternalAgent(msg))
+            match timeout {
+                Some(timeout) => match tokio::time::timeout(timeout, request_fut).await {
+                    Ok(result) => (result, false),
+                    Err(_) => (
+                        Err(CallerError::ExternalAgent(format!(
+                            "{method} request timed out after {}ms",
+                            timeout.as_millis()
+                        ))),
+                        true,
+                    ),
+                },
+                None => (request_fut.await, false),
+            }
+        };
+        if remove_pending || result.is_err() {
+            self.pending_requests.lock().await.remove(&id);
+        }
+        result
     }
 
     async fn send_notification(
@@ -6444,7 +6483,13 @@ impl ExternalAgent for CodexAgent {
             // and emits a `turn/completed` notification with
             // status="interrupted" shortly after. The reader task handles that
             // notification like any other turn completion.
-            let interrupt_result = self.send_request("turn/interrupt", Some(params)).await;
+            let interrupt_result = self
+                .send_request_with_timeout(
+                    "turn/interrupt",
+                    Some(params),
+                    CODEX_INTERRUPT_REQUEST_TIMEOUT,
+                )
+                .await;
             match interrupt_result {
                 Ok(_) => {}
                 Err(err) => {
@@ -6461,7 +6506,14 @@ impl ExternalAgent for CodexAgent {
                         "threadId": thread_id,
                         "turnId": actual_turn_id,
                     });
-                    if let Err(err) = self.send_request("turn/interrupt", Some(params)).await {
+                    if let Err(err) = self
+                        .send_request_with_timeout(
+                            "turn/interrupt",
+                            Some(params),
+                            CODEX_INTERRUPT_REQUEST_TIMEOUT,
+                        )
+                        .await
+                    {
                         if first_error.is_none() {
                             first_error = Some(err);
                         }
@@ -10179,6 +10231,48 @@ error: build failed
             "workspace-write".into(),
             None,
         )
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_request_timeout_removes_pending_request() {
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "cat >/dev/null"])
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("spawn stdin sink");
+        let stdin = child.stdin.take().expect("child stdin");
+
+        let mut agent = test_agent();
+        agent.writer = Some(BufWriter::new(stdin));
+        agent.child = Some(child);
+
+        let err = agent
+            .send_request_with_timeout(
+                "turn/interrupt",
+                Some(serde_json::json!({
+                    "threadId": "thread-abc",
+                    "turnId": "turn-xyz",
+                })),
+                Duration::from_millis(20),
+            )
+            .await
+            .unwrap_err();
+
+        match err {
+            CallerError::ExternalAgent(msg) => {
+                assert!(
+                    msg.contains("turn/interrupt request timed out"),
+                    "got: {msg}"
+                );
+            }
+            other => panic!("expected ExternalAgent error, got {other:?}"),
+        }
+        assert!(agent.pending_requests.lock().await.is_empty());
+
+        agent.shutdown().await.unwrap();
     }
 
     #[tokio::test]

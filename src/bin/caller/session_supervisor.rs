@@ -2951,15 +2951,11 @@ impl SessionSupervisor {
     ) {
         let reason = match &result {
             Ok(stats) => {
+                let outcome = stats.terminal_outcome.as_deref().unwrap_or("completed");
                 slog(&session_log, |log| {
-                    log.write_summary_with_rounds(
-                        &task,
-                        "completed",
-                        stats.turns,
-                        Some(stats.rounds),
-                    );
+                    log.write_summary_with_rounds(&task, outcome, stats.turns, Some(stats.rounds));
                 });
-                "completed".to_string()
+                outcome.to_string()
             }
             Err(e) => {
                 slog(&session_log, |log| {
@@ -4128,6 +4124,35 @@ mod tests {
         }
         assert!(saw_stop_request, "expected SessionStopRequested");
         assert!(saw_session_ended, "expected SessionEnded");
+    }
+
+    #[tokio::test]
+    async fn finish_session_writes_terminal_outcome_to_summary() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("session");
+        let session_log = Arc::new(std::sync::Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), EventBus::new());
+        let mut stats = LoopStats::default();
+        stats.turns = 1;
+        stats.rounds = 1;
+        stats.terminal_outcome = Some("stopped by user".to_string());
+
+        supervisor
+            .finish_session(
+                "session-id".to_string(),
+                0,
+                session_log,
+                "task".to_string(),
+                Ok(stats),
+            )
+            .await;
+
+        let summary: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(log_dir.join("summary.json")).unwrap())
+                .unwrap();
+        assert_eq!(summary["outcome"], "stopped by user");
     }
 
     #[tokio::test]
