@@ -188,10 +188,15 @@ features they lack.
   launching the Intendant-aware Codex fork; that mode advertises
   `rewind_context` / `rewind_backout`, suppresses Codex auto-compaction, and
   uses same-thread rollback/restore to keep the active thread informationally
-  dense. Rewinds are not just emergency context-limit recovery: they should also
-  happen after noisy tool output, failed exploration, or a long research branch
-  whose useful result can be crystallized into a compact primer. Model-driven
-  rewinds must first call `list_rewind_anchors`; by default it returns one
+  dense. Rewinds are not just emergency context-limit recovery: they can also be
+  appropriate after noisy tool output, failed exploration, or a long research
+  branch whose useful result can be crystallized into a compact primer. Managed
+  agents should not call `list_rewind_anchors` at startup or merely prefetch the
+  catalog while backend pressure is `ok`/below the recommended density
+  threshold; listing anchors is for an immediate recovery, density handoff, or
+  targeted cleanup rewind that is expected to materially improve the live
+  transcript. Model-driven rewinds must first call `list_rewind_anchors`; by
+  default it returns one
   compact whole-catalog result with exact `item_id` values and short semantic
   rows for all matching valid anchors instead of a paged crawl. When a compact
   row is ambiguous, `inspect_rewind_anchor` returns a small before/after window
