@@ -39,6 +39,16 @@ const BROWSER_EXECUTABLE_ENVS = [
   'CHROME_PATH',
   'CHROME_BIN',
 ];
+const GRAPHICAL_SESSION_ENV_KEYS = [
+  'DISPLAY',
+  'WAYLAND_DISPLAY',
+  'XDG_RUNTIME_DIR',
+  'XDG_SESSION_TYPE',
+  'DBUS_SESSION_BUS_ADDRESS',
+  'XAUTHORITY',
+  'XDG_CURRENT_DESKTOP',
+  'DESKTOP_SESSION',
+];
 
 function printUsage() {
   console.log(`Usage:
@@ -74,7 +84,10 @@ Options:
 
 If --url/--port are omitted, the script derives the dashboard port from
 INTENDANT_MCP_URL when available. It never defaults to port 8765.
---check-static-scripts may run by itself without --url/--port.`);
+--check-static-scripts may run by itself without --url/--port.
+
+On Linux, --headed browser runs launched from SSH import graphical session
+variables from systemd --user when DISPLAY/WAYLAND_DISPLAY are absent.`);
 }
 
 function parseArgs(argv, env = process.env) {
@@ -387,10 +400,11 @@ async function main() {
     await closeOwnedProcesses();
   });
   try {
+    const launchEnv = resolveLaunchEnvironment(opts);
     if (opts.launchDashboard) {
-      dashboard = await TemporaryDashboard.launch(opts);
+      dashboard = await TemporaryDashboard.launch(opts, launchEnv);
     }
-    harness = await BrowserHarness.launch(opts);
+    harness = await BrowserHarness.launch(opts, launchEnv);
     await harness.validate(opts);
     const result = {
       status: 'pass',
@@ -442,7 +456,7 @@ function staticScriptsOnly(opts) {
 }
 
 class TemporaryDashboard {
-  static async launch(opts) {
+  static async launch(opts, launchEnv = { env: process.env }) {
     const port = validateDashboardLaunchOptions(opts);
     await assertDashboardPortAvailable(port, opts.url);
     const executable = resolveDashboardBinary(opts.dashboardBinary);
@@ -451,7 +465,7 @@ class TemporaryDashboard {
     const child = spawn(executable, args, {
       cwd: process.cwd(),
       detached: process.platform !== 'win32',
-      env: process.env,
+      env: launchEnv.env || process.env,
       stdio: ['ignore', 'pipe', 'pipe'],
     });
     recordChildOutput(child.stdout, logs, 'dashboard.stdout');
@@ -885,14 +899,17 @@ function installSignalCleanup(cleanup) {
 }
 
 class BrowserHarness {
-  static async launch(opts) {
+  static async launch(opts, launchEnv = { env: process.env, notes: [] }) {
     const executable = resolveBrowserExecutable(opts.browser);
     const userDataDir = fs.mkdtempSync(path.join(os.tmpdir(), 'intendant-dashboard-validate-'));
     const stderr = new BoundedLog(LOG_BUFFER_LIMIT);
     const args = browserArgs(userDataDir, opts);
+    for (const note of launchEnv.notes || []) {
+      stderr.push('browser.env', note);
+    }
     const child = spawn(executable, args, {
       stdio: ['ignore', 'ignore', 'pipe'],
-      env: process.env,
+      env: launchEnv.env || process.env,
     });
     child.stderr.on('data', (chunk) => {
       for (const line of String(chunk).split(/\r?\n/)) {
@@ -1101,6 +1118,95 @@ class BrowserHarness {
   }
 }
 
+function resolveLaunchEnvironment(
+  opts,
+  baseEnv = process.env,
+  loadGraphicalEnv = loadSystemdUserEnvironment,
+  platform = process.platform,
+) {
+  const env = { ...baseEnv };
+  const notes = [];
+  if (platform !== 'linux' || opts.headless) {
+    return { env, notes };
+  }
+
+  const existingDisplayEnv = hasGraphicalDisplayEnv(env);
+  const needsSupportEnv =
+    (env.WAYLAND_DISPLAY && !env.XDG_RUNTIME_DIR)
+    || (env.DISPLAY && !env.XAUTHORITY && !env.DBUS_SESSION_BUS_ADDRESS);
+  if (!existingDisplayEnv || needsSupportEnv) {
+    const graphicalEnv = loadGraphicalEnv(env);
+    const imported = importMissingGraphicalSessionEnv(env, graphicalEnv);
+    if (imported.length) {
+      notes.push(`imported Linux graphical session env from systemd user manager: ${formatGraphicalEnvSummary(env, imported)}`);
+    }
+  }
+
+  if (!hasGraphicalDisplayEnv(env)) {
+    throw new Error(
+      'headed browser validation requires DISPLAY or WAYLAND_DISPLAY, but neither was set and systemd --user did not expose a graphical session; run from the graphical/RDP session or export DISPLAY/WAYLAND_DISPLAY plus XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and XAUTHORITY from `systemctl --user show-environment`',
+    );
+  }
+
+  return { env, notes };
+}
+
+function hasGraphicalDisplayEnv(env) {
+  return Boolean((env.DISPLAY && String(env.DISPLAY).trim()) || (env.WAYLAND_DISPLAY && String(env.WAYLAND_DISPLAY).trim()));
+}
+
+function importMissingGraphicalSessionEnv(targetEnv, sourceEnv) {
+  const imported = [];
+  for (const key of GRAPHICAL_SESSION_ENV_KEYS) {
+    if (!targetEnv[key] && sourceEnv && sourceEnv[key]) {
+      targetEnv[key] = sourceEnv[key];
+      imported.push(key);
+    }
+  }
+  return imported;
+}
+
+function formatGraphicalEnvSummary(env, keys) {
+  return keys
+    .filter((key) => env[key])
+    .map((key) => `${key}=${truncateMiddle(env[key], 80)}`)
+    .join(' ');
+}
+
+function loadSystemdUserEnvironment(baseEnv = process.env) {
+  const env = { ...baseEnv };
+  if (!env.XDG_RUNTIME_DIR && typeof process.getuid === 'function') {
+    env.XDG_RUNTIME_DIR = `/run/user/${process.getuid()}`;
+  }
+  if (!env.DBUS_SESSION_BUS_ADDRESS && env.XDG_RUNTIME_DIR) {
+    env.DBUS_SESSION_BUS_ADDRESS = `unix:path=${env.XDG_RUNTIME_DIR}/bus`;
+  }
+  const result = spawnSync('systemctl', ['--user', 'show-environment'], {
+    env,
+    encoding: 'utf8',
+    maxBuffer: 1024 * 1024,
+  });
+  if (result.error || result.status !== 0) {
+    return {};
+  }
+  return parseSystemdUserEnvironment(result.stdout);
+}
+
+function parseSystemdUserEnvironment(output) {
+  const parsed = {};
+  for (const line of String(output || '').split(/\r?\n/)) {
+    const index = line.indexOf('=');
+    if (index <= 0) {
+      continue;
+    }
+    const key = line.slice(0, index);
+    if (GRAPHICAL_SESSION_ENV_KEYS.includes(key)) {
+      parsed[key] = line.slice(index + 1);
+    }
+  }
+  return parsed;
+}
+
 function browserArgs(userDataDir, opts) {
   const args = [
     '--remote-debugging-port=0',
@@ -1264,7 +1370,7 @@ async function waitForDevToolsPort(userDataDir, child, stderr, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {
     if (child.exitCode !== null) {
-      throw new Error(`Chromium exited before CDP was ready${formatStderrSuffix(stderr)}`);
+      throw new Error(chromiumCdpReadinessFailure(stderr, 'Chromium exited before CDP was ready'));
     }
     if (fs.existsSync(activePortPath)) {
       const lines = fs.readFileSync(activePortPath, 'utf8').trim().split(/\r?\n/);
@@ -1276,6 +1382,22 @@ async function waitForDevToolsPort(userDataDir, child, stderr, timeoutMs) {
     await delay(80);
   }
   throw new Error(`CDP was not ready within ${timeoutMs}ms${formatStderrSuffix(stderr)}`);
+}
+
+function chromiumCdpReadinessFailure(stderr, prefix) {
+  const displayHint = chromiumDisplayStartupHint(stderr);
+  if (displayHint) {
+    return `${prefix}; ${displayHint}${formatStderrSuffix(stderr)}`;
+  }
+  return `${prefix}${formatStderrSuffix(stderr)}`;
+}
+
+function chromiumDisplayStartupHint(stderr) {
+  const text = stderr.excerpt(LOG_BUFFER_LIMIT).join('\n');
+  if (!/Missing X server or \$DISPLAY|platform failed to initialize|ozone_platform_x11/i.test(text)) {
+    return '';
+  }
+  return 'headed Linux Chromium could not reach the graphical display. For SSH validation, run with a live GNOME/RDP session or export DISPLAY/WAYLAND_DISPLAY plus XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and XAUTHORITY from `systemctl --user show-environment`';
 }
 
 function formatStderrSuffix(stderr) {
@@ -2020,6 +2142,9 @@ function compactResultForOutput(opts, result) {
 }
 
 function validationFailureNextStep(result) {
+  if (/headed Linux Chromium could not reach the graphical display|Missing X server or \$DISPLAY|ozone_platform_x11/i.test(result.reason || '')) {
+    return 'fix the remote graphical session environment first: on SSH hosts, prepend ~/.cargo/bin to PATH and run from a live GNOME/RDP session or import DISPLAY/WAYLAND_DISPLAY, XDG_RUNTIME_DIR, DBUS_SESSION_BUS_ADDRESS, and XAUTHORITY from systemctl --user show-environment';
+  }
   if (result.failureKind === 'renderer') {
     return 'treat as renderer validation failure; use the Station diagnostics here instead of repeating broad DOM/source dumps';
   }
@@ -2496,6 +2621,52 @@ async function runSelfTest() {
   assert.ok(!gpuBrowserArgs.includes('--disable-gpu'));
   assert.ok(gpuBrowserArgs.includes('--ozone-platform=x11'));
   assert.ok(gpuBrowserArgs.includes('--enable-unsafe-webgpu'));
+  const displayStartupLog = new BoundedLog(4);
+  displayStartupLog.push('browser.stderr', '[123:123:0607/230000.000000:ERROR:ui/ozone/platform/x11/ozone_platform_x11.cc:257] Missing X server or $DISPLAY');
+  displayStartupLog.push('browser.stderr', '[123:123:0607/230000.000001:ERROR:ui/aura/env.cc:246] The platform failed to initialize.  Exiting.');
+  assert.ok(chromiumCdpReadinessFailure(displayStartupLog, 'Chromium exited before CDP was ready').includes('headed Linux Chromium could not reach the graphical display'));
+  assert.ok(
+    validationFailureNextStep({
+      failureKind: 'harness',
+      reason: chromiumCdpReadinessFailure(displayStartupLog, 'Chromium exited before CDP was ready'),
+    }).includes('systemctl --user show-environment'),
+  );
+  const parsedSystemdEnv = parseSystemdUserEnvironment([
+    'DISPLAY=:0',
+    'WAYLAND_DISPLAY=wayland-0',
+    'DBUS_SESSION_BUS_ADDRESS=unix:path=/run/user/1000/bus',
+    'IGNORED=value',
+    'XAUTHORITY=/run/user/1000/.mutter-Xwaylandauth.TEIUP3',
+    'DESKTOP_SESSION=gnome=wayland',
+  ].join('\n'));
+  assert.deepStrictEqual(parsedSystemdEnv, {
+    DISPLAY: ':0',
+    WAYLAND_DISPLAY: 'wayland-0',
+    DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
+    XAUTHORITY: '/run/user/1000/.mutter-Xwaylandauth.TEIUP3',
+    DESKTOP_SESSION: 'gnome=wayland',
+  });
+  const headedEnv = resolveLaunchEnvironment(
+    parseArgs(['--headed'], {}),
+    { PATH: '/usr/bin' },
+    () => ({
+      DISPLAY: ':0',
+      WAYLAND_DISPLAY: 'wayland-0',
+      XDG_RUNTIME_DIR: '/run/user/1000',
+      DBUS_SESSION_BUS_ADDRESS: 'unix:path=/run/user/1000/bus',
+      XAUTHORITY: '/run/user/1000/.mutter-Xwaylandauth.TEIUP3',
+      XDG_SESSION_TYPE: 'wayland',
+    }),
+    'linux',
+  );
+  assert.strictEqual(headedEnv.env.DISPLAY, ':0');
+  assert.strictEqual(headedEnv.env.WAYLAND_DISPLAY, 'wayland-0');
+  assert.strictEqual(headedEnv.env.XDG_RUNTIME_DIR, '/run/user/1000');
+  assert.ok(headedEnv.notes[0].includes('systemd user manager'));
+  assert.throws(
+    () => resolveLaunchEnvironment(parseArgs(['--headed'], {}), { PATH: '/usr/bin' }, () => ({}), 'linux'),
+    /headed browser validation requires DISPLAY or WAYLAND_DISPLAY/,
+  );
   assert.strictEqual(staticScriptsOnly(parseArgs(['--check-static-scripts'], {
     INTENDANT_MCP_URL: 'http://127.0.0.1:7777/mcp',
   })), true);
