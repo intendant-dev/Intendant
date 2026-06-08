@@ -1977,6 +1977,14 @@ fn controller_loop_latest_status(
     wrappers: &[serde_json::Value],
 ) -> serde_json::Value {
     let active_wrapper_status = latest_status_from_active_wrappers(wrappers);
+    if let Some(status) = active_wrapper_status.as_ref().filter(|status| {
+        status
+            .get("live_status_source")
+            .and_then(|source| source.as_str())
+            == Some("mcp_state")
+    }) {
+        return status.clone();
+    }
     if latest_status_file.is_null() {
         return active_wrapper_status.unwrap_or(serde_json::Value::Null);
     }
@@ -1994,12 +2002,14 @@ fn latest_status_from_active_wrappers(wrappers: &[serde_json::Value]) -> Option<
     let wrapper = wrappers.iter().find(|wrapper| {
         wrapper.get("source").and_then(|v| v.as_str()) == Some("external_wrapper_index")
     })?;
+    let state = wrapper
+        .get("phase")
+        .and_then(|v| v.as_str())
+        .or_else(|| wrapper.get("status").and_then(|v| v.as_str()))
+        .unwrap_or("active");
     Some(serde_json::json!({
         "run_id": serde_json::Value::Null,
-        "state": wrapper
-            .get("status")
-            .and_then(|v| v.as_str())
-            .unwrap_or("active"),
+        "state": state,
         "pid": serde_json::Value::Null,
         "codex_pid": wrapper.get("codex_pid").cloned().unwrap_or(serde_json::Value::Null),
         "source": "external_wrapper_index",
@@ -12731,12 +12741,99 @@ mod tests {
                 .and_then(|value| value.as_u64()),
             Some(10)
         );
+        assert_eq!(
+            status
+                .pointer("/latest/status/state")
+                .and_then(|value| value.as_str()),
+            Some("waiting_follow_up")
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/phase")
+                .and_then(|value| value.as_str()),
+            Some("waiting_follow_up")
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/turn")
+                .and_then(|value| value.as_u64()),
+            Some(14)
+        );
         assert!(controller_loop_intervention_markers_are_stale(
             false,
             false,
             &[wrapper.clone()],
             &[serde_json::json!({"pid": 8892})]
         ));
+    }
+
+    #[test]
+    fn controller_loop_status_reports_live_interrupted_phase_over_app_server_residency() {
+        let mut app_state = McpAppState::new(
+            "openai".to_string(),
+            "gpt-5.2-codex".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test-session"),
+        );
+        app_state.link_session_aliases("wrapper-session", "codex-thread");
+        app_state.note_session_phase(
+            Some("codex-thread"),
+            Some(14),
+            Phase::Interrupted,
+            Some("Codex follow-up round 14 interrupted"),
+        );
+        app_state.note_session_round(Some("codex-thread"), 14);
+
+        let mut status = serde_json::json!({
+            "latest": {
+                "status": {
+                    "run_id": "stale-run",
+                    "state": "running"
+                }
+            },
+            "active": {
+                "wrappers": [{
+                    "run_id": null,
+                    "pid": null,
+                    "codex_pid": 8892,
+                    "app_server_pid": 8892,
+                    "app_server_active": true,
+                    "source": "external_wrapper_index",
+                    "backend_source": "codex",
+                    "backend_session_id": "codex-thread",
+                    "intendant_session_id": "wrapper-session",
+                    "log_path": "/tmp/test-session",
+                    "status": "unknown_running",
+                    "session_meta_status": "idle",
+                    "process_tree_active": true,
+                    "updated_at_secs": 10
+                }]
+            }
+        });
+
+        enrich_controller_loop_status_with_mcp_state_at(&mut status, &app_state, 12345);
+
+        let wrapper = status.pointer("/active/wrappers/0").unwrap();
+        assert_eq!(
+            wrapper.get("phase").and_then(|value| value.as_str()),
+            Some("interrupted")
+        );
+        assert_eq!(
+            wrapper.get("status").and_then(|value| value.as_str()),
+            Some("unknown_running")
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/state")
+                .and_then(|value| value.as_str()),
+            Some("interrupted")
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/turn")
+                .and_then(|value| value.as_u64()),
+            Some(14)
+        );
     }
 
     #[test]
