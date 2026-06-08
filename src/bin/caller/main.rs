@@ -2704,7 +2704,7 @@ fn validate_context_rewind_anchor_density_improvement(
                 return Ok(());
             }
             return Err(format!(
-                "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: a prior rewind to that exact item was followed by {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an earlier exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+                "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: a prior rewind to that exact item was followed by {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
                 position.as_str(),
                 outcome.used_tokens,
                 managed_context_density_recommended_limit(outcome.rewind_only_limit),
@@ -2715,7 +2715,7 @@ fn validate_context_rewind_anchor_density_improvement(
     }
 
     Err(format!(
-        "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: restoring {} item would keep {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an earlier exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
+        "density handoff rewind anchor item_id `{requested_item_id}` is too shallow for position `{}`: restoring {} item would keep {} tokens, still at or above the recommended density threshold {} for the {} token context. Choose an exact item_id/position from list_rewind_anchors whose density_eligible_positions includes the requested position, or reply with a concise no-rewind handoff and stop.",
         position.as_str(),
         usage_kind,
         used_tokens,
@@ -3101,6 +3101,26 @@ struct ContextRewindAnchorCatalogEntry {
 }
 
 #[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCompactEntry {
+    ordinal: usize,
+    item_id: String,
+    item_type: String,
+    positions: Vec<&'static str>,
+    position_hint: &'static str,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    names: Vec<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    roles: Vec<String>,
+    summary: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    density_eligible_positions: Option<Vec<&'static str>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approx_pruned_tokens_before: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    approx_pruned_tokens_after: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize)]
 struct ContextRewindAnchorCatalog {
     total: usize,
     filtered_total: usize,
@@ -3113,6 +3133,22 @@ struct ContextRewindAnchorCatalog {
     recovery_candidates_only: bool,
     pruning_estimates_included: bool,
     anchors: Vec<ContextRewindAnchorCatalogEntry>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct ContextRewindAnchorCompactCatalog {
+    catalog_format: &'static str,
+    total: usize,
+    filtered_total: usize,
+    offset: usize,
+    limit: usize,
+    next_offset: Option<usize>,
+    query: Option<String>,
+    include_management_tools: bool,
+    include_non_recovery: bool,
+    recovery_candidates_only: bool,
+    pruning_estimates_included: bool,
+    anchors: Vec<ContextRewindAnchorCompactEntry>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -3139,6 +3175,7 @@ const CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT: usize = 5;
 const CONTEXT_REWIND_ANCHOR_LIST_MAX_LIMIT: usize = 10;
 const CONTEXT_REWIND_ANCHOR_INSPECT_DEFAULT_RADIUS: usize = 2;
 const CONTEXT_REWIND_ANCHOR_INSPECT_MAX_RADIUS: usize = 5;
+const CONTEXT_REWIND_ANCHOR_COMPACT_SUMMARY_LIMIT: usize = 96;
 const CONTEXT_REWIND_ANCHOR_SUMMARY_LIMIT: usize = 120;
 const CONTEXT_REWIND_ANCHOR_MERGED_SUMMARY_LIMIT: usize = 160;
 const CONTEXT_REWIND_RECOVERY_MIN_RESUME_HEADROOM_TOKENS: u64 = 8_000;
@@ -3212,6 +3249,7 @@ fn list_context_rewind_anchors_from_rollout(
         .or_else(|| params.get("includePruningEstimates"))
         .and_then(|value| value.as_bool())
         .unwrap_or(reverse || query.is_some());
+    let compact_catalog = context_rewind_anchor_use_compact_catalog(params, include_non_recovery);
 
     let mut anchors = scan_context_rewind_anchor_catalog(source_rollout_path).map_err(|err| {
         format!(
@@ -3247,6 +3285,28 @@ fn list_context_rewind_anchors_from_rollout(
         anchors.retain(|anchor| context_rewind_anchor_matches_query(anchor, &needle));
     }
     let filtered_total = anchors.len();
+    if compact_catalog {
+        let compact = ContextRewindAnchorCompactCatalog {
+            catalog_format: "compact_all",
+            total,
+            filtered_total,
+            offset: 0,
+            limit: filtered_total,
+            next_offset: None,
+            query,
+            include_management_tools,
+            include_non_recovery,
+            recovery_candidates_only,
+            pruning_estimates_included: include_pruning_estimates,
+            anchors: anchors
+                .iter()
+                .map(|anchor| {
+                    context_rewind_anchor_compact_entry(anchor, include_pruning_estimates)
+                })
+                .collect(),
+        };
+        return serde_json::to_string(&compact).map_err(|err| err.to_string());
+    }
     let mut page = anchors
         .into_iter()
         .skip(offset)
@@ -3274,6 +3334,63 @@ fn list_context_rewind_anchors_from_rollout(
         anchors: page,
     };
     serde_json::to_string(&catalog).map_err(|err| err.to_string())
+}
+
+fn context_rewind_anchor_use_compact_catalog(
+    params: &serde_json::Value,
+    include_non_recovery: bool,
+) -> bool {
+    if include_non_recovery {
+        return false;
+    }
+    if params
+        .get("detail")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return false;
+    }
+    if params
+        .get("compact_catalog")
+        .or_else(|| params.get("compactCatalog"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+    {
+        return true;
+    }
+    !params.get("offset").is_some()
+        && !params.get("start_index").is_some()
+        && !params.get("limit").is_some()
+}
+
+fn context_rewind_anchor_compact_entry(
+    anchor: &ContextRewindAnchorCatalogEntry,
+    include_pruning_estimates: bool,
+) -> ContextRewindAnchorCompactEntry {
+    let item_type = if anchor.first_item_type == anchor.last_item_type {
+        anchor.first_item_type.clone()
+    } else {
+        format!("{}..{}", anchor.first_item_type, anchor.last_item_type)
+    };
+    let mut summary = anchor.summary.clone();
+    truncate_string(&mut summary, CONTEXT_REWIND_ANCHOR_COMPACT_SUMMARY_LIMIT);
+    ContextRewindAnchorCompactEntry {
+        ordinal: anchor.ordinal,
+        item_id: anchor.item_id.clone(),
+        item_type,
+        positions: anchor.positions.clone(),
+        position_hint: anchor.position_hint,
+        names: anchor.names.clone(),
+        roles: anchor.roles.clone(),
+        summary,
+        density_eligible_positions: anchor.density_eligible_positions.clone(),
+        approx_pruned_tokens_before: include_pruning_estimates
+            .then_some(anchor.approx_pruned_tokens_before)
+            .flatten(),
+        approx_pruned_tokens_after: include_pruning_estimates
+            .then_some(anchor.approx_pruned_tokens_after)
+            .flatten(),
+    }
 }
 
 fn inspect_context_rewind_anchor_from_rollout(
@@ -4861,7 +4978,7 @@ fn managed_context_recovery_kickstart_text(
         ""
     };
     format!(
-        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
+        "<managed_context_recovery>\nBackend-reported Codex context pressure is {status} ({used}/{limit} tokens{hard}), leaving too little room for a normal tool/result cycle. Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the compact valid non-management recovery catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.{held}\n</managed_context_recovery>",
         status = pressure.status,
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
@@ -4908,7 +5025,7 @@ fn managed_context_backend_recovery_kickstart_text(
         .map(|hint| format!(" Codex recovery hint: {hint}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the valid non-management recovery catalog; use pagination and only then a focused query if the unfiltered catalog is insufficient. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If the compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
+        "<managed_context_recovery>\nCodex reported backend recovery required before completing the turn: {message}.{hint} Do not continue normally. The Intendant MCP tools list_rewind_anchors and inspect_rewind_anchor are callable in this turn; any earlier transcript claim that either is unavailable is stale and incorrect. First call list_rewind_anchors without a query to inspect the compact valid non-management recovery catalog. The normal catalog hides anchors known to remain at/above the rewind-only limit or without enough normal-tool resume headroom; include_non_recovery=true is diagnostic-only and rows with recovery_eligible=false must not be passed to rewind_context. If a compact catalog row is ambiguous, call inspect_rewind_anchor for the candidate item_id before mutating the thread. Then call rewind_context with one exact returned item_id, the returned position_hint or a value in positions, and a dense carry-forward primer. A successful rewind only validates lineage; normal tools remain unavailable until backend-reported pressure has enough normal-tool headroom below the rewind-only limit. Do not synthesize anchor ids from prior failed tool calls. Do not use auto anchors or N-turn rewinds.\n</managed_context_recovery>"
     )
 }
 
@@ -13173,7 +13290,7 @@ mod tests {
     }
 
     #[test]
-    fn context_rewind_anchor_catalog_default_page_is_compact() {
+    fn context_rewind_anchor_catalog_default_is_compact_whole_catalog() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         let lines = (0..6)
@@ -13196,18 +13313,81 @@ mod tests {
         let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
             .expect("anchor catalog");
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(
-            catalog["limit"].as_u64(),
-            Some(CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT as u64)
-        );
-        assert_eq!(catalog["next_offset"].as_u64(), Some(5));
-        assert_eq!(
-            catalog["anchors"].as_array().unwrap().len(),
-            CONTEXT_REWIND_ANCHOR_LIST_DEFAULT_LIMIT
-        );
+        assert_eq!(catalog["catalog_format"].as_str(), Some("compact_all"));
+        assert_eq!(catalog["limit"].as_u64(), Some(6));
+        assert!(catalog["next_offset"].is_null());
+        assert_eq!(catalog["anchors"].as_array().unwrap().len(), 6);
         assert!(catalog.get("selection_note").is_none());
         assert!(catalog.get("usage").is_none());
         assert!(raw.len() < 2_000, "catalog too large: {} bytes", raw.len());
+    }
+
+    #[test]
+    fn context_rewind_anchor_compact_default_covers_all_without_detail_bloat() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let long_output = "large diagnostic output ".repeat(80);
+        let lines = (0..12)
+            .flat_map(|idx| {
+                let call_id = format!("call_{idx}");
+                [
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call",
+                            "name": "exec_command",
+                            "call_id": call_id,
+                            "arguments": format!("{{\"command\":\"step {idx}\"}}")
+                        }
+                    }),
+                    serde_json::json!({
+                        "type": "response_item",
+                        "payload": {
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": long_output
+                        }
+                    }),
+                ]
+            })
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        std::fs::write(&path, lines).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("anchor catalog");
+        assert!(!raw.contains('\n'), "catalog should use compact JSON");
+        assert!(
+            !raw.contains(&"large diagnostic output ".repeat(10)),
+            "compact catalog should not expose repeated raw output blobs"
+        );
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["catalog_format"].as_str(), Some("compact_all"));
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(12));
+        assert_eq!(catalog["limit"].as_u64(), Some(12));
+        assert!(catalog["next_offset"].is_null());
+        let anchors = catalog["anchors"].as_array().unwrap();
+        assert_eq!(anchors.len(), 12);
+        let ids = anchors
+            .iter()
+            .filter_map(|anchor| anchor["item_id"].as_str())
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            ids,
+            (0..12).map(|idx| format!("call_{idx}")).collect::<Vec<_>>()
+        );
+        for anchor in anchors {
+            assert!(anchor.get("first_line").is_none(), "got {anchor}");
+            assert!(
+                anchor.get("backend_usage_at_or_after_anchor").is_none(),
+                "got {anchor}"
+            );
+            let summary = anchor["summary"].as_str().unwrap_or_default();
+            assert!(summary.len() <= CONTEXT_REWIND_ANCHOR_COMPACT_SUMMARY_LIMIT + 3);
+        }
+        assert!(raw.len() < 4_000, "catalog too large: {} bytes", raw.len());
     }
 
     #[test]
