@@ -3044,9 +3044,10 @@ impl StationInner {
             .unwrap_or_else(|| {
                 truncate(
                     &format!(
-                        "{} / {}",
+                        "{} / {} / {}",
                         nonempty(&ctx.source, "snapshot"),
-                        nonempty(&ctx.turn, "--")
+                        nonempty(&ctx.turn, "--"),
+                        nonempty(&ctx.backend_label, &ctx.backend_source)
                     ),
                     42,
                 )
@@ -3111,8 +3112,11 @@ impl StationInner {
         } else {
             truncate(
                 &format!(
-                    "{} records / {} anchors / {} branches",
-                    managed.records, managed.anchors, managed.branches
+                    "{} / {} records / {} anchors / {} branches",
+                    nonempty(&managed.backend_label, &managed.backend_source),
+                    managed.records,
+                    managed.anchors,
+                    managed.branches
                 ),
                 42,
             )
@@ -3364,11 +3368,7 @@ impl StationInner {
                 hit: HitAction::Select("system:context".to_string()),
             });
         }
-        merge_attention_with_reserved_critical(
-            primary_items,
-            critical_items,
-            ATTENTION_VISIBLE_CAP,
-        )
+        merge_attention_with_reserved_critical(primary_items, critical_items, ATTENTION_VISIBLE_CAP)
     }
 
     fn rendered_attention_items(&self) -> Vec<AttentionItem> {
@@ -4192,6 +4192,8 @@ impl StationInner {
                     MenuAction::context("Focus item", "focus", C_TEAL_CSS),
                     MenuAction::context("Raw view", "raw", C_PEACH_CSS),
                     MenuAction::context("Copy snapshot", "copy-snapshot", C_TEAL_CSS),
+                    MenuAction::context("Copy continuity", "copy-continuity", C_BLUE_CSS),
+                    MenuAction::context("Seed managed rewind", "seed-managed", C_MAUVE_CSS),
                     MenuAction::context("Load exact", "load-exact", C_YELLOW_CSS),
                     MenuAction::context("Reset view", "reset", C_OVERLAY1_CSS),
                 ],
@@ -4213,6 +4215,34 @@ impl StationInner {
                         "",
                         &managed.session_id,
                         C_MAUVE_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Seed from context",
+                        "seed-context",
+                        "",
+                        &managed.session_id,
+                        C_GREEN_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Inspect selected anchor",
+                        "anchor-inspect",
+                        &managed.action_state.anchor,
+                        &managed.session_id,
+                        C_PEACH_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Dispatch selected rewind",
+                        "dispatch-rewind",
+                        &managed.action_state.anchor,
+                        &managed.session_id,
+                        C_MAUVE_CSS,
+                    ),
+                    MenuAction::managed(
+                        "Run selected backout",
+                        "run-backout",
+                        &managed.action_state.record,
+                        &managed.session_id,
+                        C_TEAL_CSS,
                     ),
                     MenuAction::managed(
                         "Backout record",
@@ -4885,7 +4915,14 @@ impl StationInner {
             );
             self.text(&detail, x + 30.0, yy + 20.0, 8.5, C_SUBTEXT0_CSS, "normal");
             if !row.latest_id.is_empty() {
-                self.pill_at(x + panel_w - 108.0, yy + 17.0, 48.0, 18.0, "open", C_TEAL_CSS);
+                self.pill_at(
+                    x + panel_w - 108.0,
+                    yy + 17.0,
+                    48.0,
+                    18.0,
+                    "open",
+                    C_TEAL_CSS,
+                );
                 self.hit_zones.push(HitZone::new(
                     x + panel_w - 108.0,
                     yy + 17.0,
@@ -4942,6 +4979,33 @@ impl StationInner {
         yy += 22.0;
         self.panel_row(x, yy, "session", &truncate(&ctx.session_id, 42));
         yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "identity",
+            &truncate(
+                &nonempty(
+                    &ctx.session_label,
+                    &nonempty(&ctx.backend_session_id, &ctx.session_id),
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "backend",
+            &truncate(
+                &format!(
+                    "{} · {}",
+                    nonempty(&ctx.backend_label, &ctx.backend_source),
+                    nonempty(&ctx.managed_mode, "vanilla")
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
         self.panel_row(x, yy, "turn", &nonempty(&ctx.turn, "--"));
         yy += 22.0;
         self.panel_row(x, yy, "format", &nonempty(&ctx.format, "--"));
@@ -4955,6 +5019,8 @@ impl StationInner {
             ("raw", "raw", 46.0),
             ("reset", "reset", 54.0),
             ("copy-snapshot", "copy", 54.0),
+            ("copy-continuity", "packet", 62.0),
+            ("seed-managed", "seed", 54.0),
             ("load-exact", "exact", 54.0),
         ];
         let mut ax = x + 14.0;
@@ -5151,6 +5217,33 @@ impl StationInner {
         let mut yy = y + 58.0 - self.panel_scroll;
         self.panel_row(x, yy, "session", &truncate(&managed.session_id, 42));
         yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "identity",
+            &truncate(
+                &nonempty(
+                    &managed.session_label,
+                    &nonempty(&managed.backend_session_id, &managed.session_id),
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "backend",
+            &truncate(
+                &format!(
+                    "{} · archive {}",
+                    nonempty(&managed.backend_label, &managed.backend_source),
+                    nonempty(&managed.context_archive, "--")
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
         self.panel_row_color(
             x,
             yy,
@@ -5188,6 +5281,23 @@ impl StationInner {
             if managed.rewind_only { "on" } else { "off" },
         );
         yy += 22.0;
+        let remaining = if managed.action_state.readiness.is_empty() {
+            "--".to_string()
+        } else {
+            truncate(&managed.action_state.readiness, 42)
+        };
+        self.panel_row_color(
+            x,
+            yy,
+            "readiness",
+            &remaining,
+            if managed.action_state.can_rewind || managed.action_state.can_backout {
+                C_GREEN_CSS
+            } else {
+                C_YELLOW_CSS
+            },
+        );
+        yy += 22.0;
         self.panel_row(
             x,
             yy,
@@ -5208,6 +5318,7 @@ impl StationInner {
         self.section_title_color(x, yy, "Actions", C_MAUVE_CSS);
         yy += 22.0;
         let managed_actions = [
+            ("seed-context", "seed", 54.0),
             ("rewind", "prepare rewind", 116.0),
             ("backout", "backout", 72.0),
             ("refresh", "refresh", 68.0),
@@ -5360,8 +5471,16 @@ impl StationInner {
         let draft_state = format!(
             "{} / reason {} / primer {}",
             nonempty(&action.position, "after"),
-            if action.has_reason { "ready" } else { "missing" },
-            if action.has_primer { "ready" } else { "missing" }
+            if action.has_reason {
+                "ready"
+            } else {
+                "missing"
+            },
+            if action.has_primer {
+                "ready"
+            } else {
+                "missing"
+            }
         );
         self.text(
             &truncate(&draft_state, 37),
@@ -6215,12 +6334,7 @@ impl StationInner {
             yy += 20.0;
         }
         if !runway.peer_status.is_empty() {
-            self.panel_row(
-                x,
-                yy,
-                "status",
-                &truncate(&runway.peer_status, 42),
-            );
+            self.panel_row(x, yy, "status", &truncate(&runway.peer_status, 42));
             yy += 22.0;
         }
         let mut peer_actions = vec![
@@ -6829,7 +6943,8 @@ impl StationInner {
         if controls.session_can_config {
             self.section_title_color(x, yy + 8.0, "Launch config", C_PEACH_CSS);
             yy += 30.0;
-            if !controls.session_backend_id.is_empty() || !controls.session_intendant_id.is_empty() {
+            if !controls.session_backend_id.is_empty() || !controls.session_intendant_id.is_empty()
+            {
                 self.panel_row(
                     x,
                     yy,
@@ -6988,7 +7103,12 @@ impl StationInner {
             );
             yy += 28.0;
             let context_actions = [
-                ("live".to_string(), "live".to_string(), 50.0, C_GREEN_CSS.to_string()),
+                (
+                    "live".to_string(),
+                    "live".to_string(),
+                    50.0,
+                    C_GREEN_CSS.to_string(),
+                ),
                 (
                     "replay".to_string(),
                     "replay".to_string(),
@@ -9547,6 +9667,13 @@ struct StationContextSummary {
     label: String,
     source: String,
     session_id: String,
+    session_label: String,
+    backend_source: String,
+    backend_label: String,
+    backend_session_id: String,
+    intendant_session_id: String,
+    managed_mode: String,
+    context_archive: String,
     format: String,
     turn: String,
     tokens: f32,
@@ -9570,6 +9697,13 @@ impl Default for StationContextSummary {
             label: String::new(),
             source: String::new(),
             session_id: String::new(),
+            session_label: String::new(),
+            backend_source: String::new(),
+            backend_label: String::new(),
+            backend_session_id: String::new(),
+            intendant_session_id: String::new(),
+            managed_mode: String::new(),
+            context_archive: String::new(),
             format: String::new(),
             turn: String::new(),
             tokens: 0.0,
@@ -9592,6 +9726,13 @@ impl Default for StationContextSummary {
 #[serde(default, rename_all = "camelCase")]
 struct StationManagedSummary {
     session_id: String,
+    session_label: String,
+    backend_source: String,
+    backend_label: String,
+    backend_session_id: String,
+    intendant_session_id: String,
+    context_archive: String,
+    configured_mode: String,
     mode: String,
     status: String,
     used_tokens: f32,
@@ -9615,6 +9756,13 @@ impl Default for StationManagedSummary {
     fn default() -> Self {
         Self {
             session_id: String::new(),
+            session_label: String::new(),
+            backend_source: String::new(),
+            backend_label: String::new(),
+            backend_session_id: String::new(),
+            intendant_session_id: String::new(),
+            context_archive: String::new(),
+            configured_mode: String::new(),
             mode: "unknown".into(),
             status: "unknown".into(),
             used_tokens: 0.0,
@@ -10810,7 +10958,9 @@ fn merge_attention_with_reserved_critical(
         primary_items.truncate(cap);
         return primary_items;
     }
-    let primary_keep = cap.saturating_sub(critical_items.len()).min(primary_items.len());
+    let primary_keep = cap
+        .saturating_sub(critical_items.len())
+        .min(primary_items.len());
     primary_items.truncate(primary_keep);
     primary_items.append(&mut critical_items);
     primary_items.truncate(cap);
@@ -10925,7 +11075,10 @@ fn activity_thread_signals(events: &[StationEvent]) -> Vec<ActivityThreadSignal>
         } else {
             let host = nonempty(&event.host_id, "local");
             let source = nonempty(&event.source, "activity");
-            (format!("source:{host}:{source}"), format!("{host} / {source}"))
+            (
+                format!("source:{host}:{source}"),
+                format!("{host} / {source}"),
+            )
         };
         let managed = activity_event_is_managed(event);
         let entry = rows.entry(key).or_insert_with(|| ActivityThreadSignal {

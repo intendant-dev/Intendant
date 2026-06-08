@@ -20332,6 +20332,16 @@ function stationHandleContextAction(action) {
     stationCopyContextSnapshot();
     return;
   }
+  if (op === 'copy-continuity') {
+    stationCopyContextContinuityPayload(stationBuildContextSummary())
+      .catch(err => showControlToast?.('error', `Copy context continuity failed: ${err?.message || err}`));
+    return;
+  }
+  if (op === 'seed-managed') {
+    stationSeedManagedDraftFromContext();
+    stationRenderedSelectPanel('system:managed', 'Managed rewind draft seeded from rendered context');
+    return;
+  }
   if (op === 'copy-part') {
     const part = stationSelectedContextPartDetail(id || stationSelectedContextPart);
     if (part) stationCopyContextPart(part);
@@ -20706,15 +20716,43 @@ function stationSnapshotForContext() {
   return latestContextSnapshot || null;
 }
 
+function stationSessionIdentitySummary(sessionId = '') {
+  const sid = String(sessionId || '').trim();
+  const session = sid ? stationFindSessionById(sid) : null;
+  const meta = sid ? sessionConfigMetadata(session || sid) : {};
+  const backendId = managedContextBackendSessionId(meta);
+  const intendantId = managedContextIntendantSessionId(meta);
+  const source = sessionConfigSource(meta) || stationSessionSource(session) || managedContextCanonicalSource(meta) || '';
+  const sourceLabel = managedContextSourceLabel(meta) || prettyAgentName(source) || source || '';
+  return {
+    sessionId: sid,
+    sessionLabel: stationSessionShortLabel(sid) || stationSessionTask(session) || shortSessionId(sid) || '',
+    backendSource: source || '',
+    backendLabel: sourceLabel || '',
+    backendSessionId: backendId || '',
+    intendantSessionId: intendantId || '',
+    managedMode: sessionConfigManagedMode(meta) || managedContextConfiguredMode(meta) || '',
+    contextArchive: sessionConfigArchiveMode(meta) || '',
+  };
+}
+
 function stationBuildContextSummary() {
   const snapshot = stationSnapshotForContext();
   const replay = stationContextTimelineState();
   if (!snapshot) {
+    const identity = stationSessionIdentitySummary(resolvePromptTargetSessionId?.() || stationManagedSessionCandidate?.() || '');
     return {
       available: false,
       label: '',
       source: '',
-      sessionId: '',
+      sessionId: identity.sessionId || '',
+      sessionLabel: identity.sessionLabel || '',
+      backendSource: identity.backendSource || '',
+      backendLabel: identity.backendLabel || '',
+      backendSessionId: identity.backendSessionId || '',
+      intendantSessionId: identity.intendantSessionId || '',
+      managedMode: identity.managedMode || '',
+      contextArchive: identity.contextArchive || '',
       format: '',
       turn: '',
       tokens: 0,
@@ -20734,6 +20772,8 @@ function stationBuildContextSummary() {
   const analysis = analyzeContextSnapshot(snapshot);
   const effectiveWindow = Number(snapshot.effective_context_window || snapshot.context_window || analysis.effectiveWindow || 0);
   const hardWindow = Number(snapshot.hard_context_window || snapshot.hardContextWindow || analysis.hardWindow || effectiveWindow || 0);
+  const sessionId = contextSessionKey(snapshot) === CONTEXT_GLOBAL_SESSION ? '' : contextSessionKey(snapshot);
+  const identity = stationSessionIdentitySummary(sessionId || resolvePromptTargetSessionId?.() || '');
   const categories = Array.from(analysis.byCategory.entries())
     .map(([category, stats]) => {
       const def = CONTEXT_CATEGORY_DEFS[category] || CONTEXT_CATEGORY_DEFS.other;
@@ -20771,7 +20811,14 @@ function stationBuildContextSummary() {
     available: true,
     label: snapshot.label || snapshot.source || 'model',
     source: snapshot.label || snapshot.source || 'model',
-    sessionId: contextSessionKey(snapshot) === CONTEXT_GLOBAL_SESSION ? '' : contextSessionKey(snapshot),
+    sessionId,
+    sessionLabel: identity.sessionLabel || '',
+    backendSource: identity.backendSource || '',
+    backendLabel: identity.backendLabel || '',
+    backendSessionId: identity.backendSessionId || '',
+    intendantSessionId: identity.intendantSessionId || '',
+    managedMode: identity.managedMode || '',
+    contextArchive: identity.contextArchive || '',
     format: snapshot.format || '',
     turn: contextSnapshotRequestLabel(snapshot),
     tokens: stationNum(analysis.totalTokens || snapshot.token_count),
@@ -20913,6 +20960,7 @@ function stationManagedLedgerSummary() {
 function stationBuildManagedSummary(contextSummary) {
   const sessionId = stationManagedSessionCandidate();
   const meta = managedContextSessionMeta(sessionId);
+  const identity = stationSessionIdentitySummary(sessionId);
   const live = managedContextSessionIsLive(sessionId, meta);
   const pressure = live ? (managedContextStatus?.context_pressure || {}) : {};
   const ledgers = stationManagedLedgerSummary();
@@ -20934,6 +20982,13 @@ function stationBuildManagedSummary(contextSummary) {
     : (controlCodexConfig.managed_context || 'vanilla');
   const summary = {
     sessionId: sessionId || '',
+    sessionLabel: identity.sessionLabel || '',
+    backendSource: identity.backendSource || '',
+    backendLabel: identity.backendLabel || '',
+    backendSessionId: identity.backendSessionId || '',
+    intendantSessionId: identity.intendantSessionId || '',
+    contextArchive: identity.contextArchive || '',
+    configuredMode: identity.managedMode || '',
     live,
     mode,
     status: live ? (pressure.status || 'unknown') : (sessionId ? 'historical' : 'unknown'),
