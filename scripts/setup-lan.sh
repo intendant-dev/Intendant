@@ -9,15 +9,15 @@
 # working unchanged.
 #
 # Usage:
-#   sudo ./setup-lan.sh                      # Full setup
-#   sudo ./setup-lan.sh --recert             # Regenerate server cert
-#   sudo ./setup-lan.sh --remove             # Tear everything down
-#   sudo ./setup-lan.sh --name mac-work      # Label this host
+#   ./setup-lan.sh                      # Full setup
+#   ./setup-lan.sh --recert             # Regenerate server cert
+#   ./setup-lan.sh --remove             # Tear everything down
+#   ./setup-lan.sh --name mac-work      # Label this host
 #
 # Or use the native subcommand directly:
-#   sudo intendant lan setup [flags]
-#   sudo intendant lan recert
-#   sudo intendant lan remove
+#   intendant lan setup [flags]
+#   intendant lan recert
+#   intendant lan remove
 #
 set -euo pipefail
 

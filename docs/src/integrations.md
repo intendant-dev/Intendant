@@ -168,7 +168,7 @@ X11 displays are auto-launched via Xvfb when the agent first needs one. See
 | `setup-macos.sh` | Install macOS deps (cliclick, ffmpeg, sox, SwitchAudioSource, Vortex/BlackHole, wasm-pack), build, and provision a managed Chrome for Testing browser; `--check` to report only |
 | `setup-windows.ps1` | Windows toolchain + build for `x86_64-pc-windows-msvc`, plus managed Chrome for Testing provisioning (see [Windows Support](./windows-support.md)) |
 | `bundle-macos.sh` | Build and codesign the macOS `.app` (WKWebView wrapper over the `intendant://` scheme) and install to `/Applications` |
-| `setup-lan.sh`, `setup-lan-macos.sh`, `setup-lan-guest-macos.sh`, `setup-lan.bat` | Wrappers around the `intendant lan` mTLS reverse-proxy flow |
+| `setup-lan.sh`, `setup-lan-macos.sh`, `setup-lan-guest-macos.sh`, `setup-lan.bat` | Wrappers/orchestrators around the native `intendant lan` cert enrollment flow |
 | `intendant-ctl.sh` | Convenience wrapper over the control socket (`status`, `approve`, `follow`, `start`, …) |
 
 `intendant setup browsers` can also be run directly to install or repair the

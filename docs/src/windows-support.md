@@ -254,17 +254,14 @@ than a panic or silent no-op.
   bridge is wired up but has not yet been validated end-to-end on a Windows
   host. It also requires the manual VB-CABLE install (see
   [Audio](#audio-ffmpeg--vb-cable-wasapi-bridge)).
-- **`intendant lan` is gated off Windows.** The mTLS LAN-access *setup* command
-  drives an nginx reverse proxy plus systemd/launchd service management and
-  apt/brew package installs — none of which apply on Windows — so the Windows
-  `LanBackend` returns `"intendant lan is not supported on Windows"`. (The
-  certificate generation itself is now pure-Rust and cross-platform; only the
-  proxy/service plumbing is Unix-specific.) To expose the dashboard to other
-  devices from a Windows host, use native HTTPS/WSS via `--tls` (also pure-Rust
-  and cross-platform), use the `scripts/setup-lan.bat` orchestrator (which drives
-  `intendant lan` on a Linux guest over SSH/WSL), or front the dashboard with your
-  own reverse proxy. See [Peer Federation](./peer-federation.md#lan-access-and-tls)
-  for the full LAN/TLS and federation auth story.
+- **`intendant lan` enrollment is still Unix-validated.** Native HTTPS/WSS via
+  `--tls` and `--mtls` is pure Rust and cross-platform, but the interactive LAN
+  enrollment command has only been validated on Unix hosts so far. To expose the
+  dashboard to other devices from a Windows host, use native HTTPS/WSS with
+  explicit `--tls-cert` / `--tls-key`, run enrollment from a Unix peer, or front
+  the dashboard with your own reverse proxy. See
+  [Peer Federation](./peer-federation.md#lan-access-and-tls) for the full
+  LAN/TLS and federation auth story.
 - **No virtual-display equivalent.** There is no Windows analogue of Xvfb, so
   the lazily-launched virtual displays the Linux pipeline uses do not exist on
   Windows. Capture targets the real interactive desktop only.

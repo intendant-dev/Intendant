@@ -289,16 +289,10 @@ too. See
 [Configuration](./configuration.md) for `[server.tls]` and `--tls-cert` /
 `--tls-key`.
 
-On Linux, `intendant lan setup` stores the nginx-facing LAN certs under
-`/etc/intendant-lan`; private keys there are often root-readable only. If
-native `--tls` reports that it cannot read `server.key`, either run Intendant
-as a user that can read the key, pass a readable pair with `--tls-cert` /
-`--tls-key`, or make the key readable by the runtime user's group:
-
-```bash
-sudo chgrp "$(id -gn)" /etc/intendant-lan/server.key
-sudo chmod 0640 /etc/intendant-lan/server.key
-```
+`intendant lan setup` stores the LAN CA, server cert, and client identity in
+the current user's native cert store (`~/.intendant/lan-certs` on Unix-like
+hosts). Run setup as the same user that launches the daemon; the native gateway
+reads `server.crt` / `server.key` directly from that store.
 
 For stricter LAN access control, require client certificates:
 
@@ -312,25 +306,27 @@ overrides it. This is native mTLS on the dashboard port; unlike plain `--tls`,
 clients without the installed client identity cannot complete the TLS
 handshake.
 
-### 2. mTLS reverse proxy (`intendant lan setup`)
+### 2. Native LAN cert enrollment (`intendant lan setup`)
 
 For mutual-TLS with client certificates (so only enrolled devices can connect),
-the `intendant lan` subcommand sets up an nginx reverse proxy and a certificate
-authority:
+the `intendant lan` subcommand creates a per-user LAN certificate authority,
+server cert, client identity, and strict enrollment page for installing those
+certs on browsers and mobile devices:
 
 ```bash
-intendant lan setup            # install mTLS nginx proxy + generate CA/server/client certs
+intendant lan setup            # generate CA/server/client certs + start enrollment
 intendant lan recert           # regenerate the server cert after a LAN IP change
 intendant lan list             # show current setup state
 intendant lan serve-certs      # run strict HTTPS client-cert enrollment
-intendant lan remove           # tear down the nginx config and remove certs
+intendant lan remove           # remove the per-user LAN cert store
 ```
 
-Useful flags: `--port <N>` (HTTPS port exposed to clients, default 8443),
+Useful flags: `--port <N>` (native dashboard HTTPS port to advertise, default
+8765),
 `--cert-port <N>` (HTTPS enrollment server, default 9999), `--lan-ip <IP>`,
-`--name <label>`, `--backend <addr>` (upstream intendant, default
-`127.0.0.1:8765`), `--force`, `--no-serve-certs`. (Linux/macOS only; the
-`scripts/setup-lan*.sh` helpers wrap the same flow.)
+`--name <label>`, `--force`, `--no-serve-certs`. The old `--backend` flag is
+accepted as an ignored compatibility no-op; Intendant no longer installs or
+configures an upstream proxy.
 
 Client certificate enrollment is deliberately strict. The temporary enrollment
 server is HTTPS, using the same LAN server certificate as the dashboard. Before

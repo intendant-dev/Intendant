@@ -35,8 +35,9 @@ $script:VmUser = ""
 $script:VmAddress = ""
 $script:SshHost = ""
 $script:SshPort = 22
-$script:Port = 8443
+$script:Port = 8765
 $script:CertPort = 9999
+$script:GuestDashboardPort = 8765
 $script:IsVBoxNat = $false
 $script:VmName = ""
 $script:ConfigPath = Join-Path $env:USERPROFILE ".intendant-lan.json"
@@ -153,7 +154,7 @@ function Add-PortForwarding {
         $vbm = Find-VBoxManage
         if (-not $vbm) { Die "VBoxManage not found -- is VirtualBox installed?" }
         $rules = @(
-            @{ Name = "HTTPS"; HP = $script:Port;     GP = $script:Port }
+            @{ Name = "HTTPS"; HP = $script:Port;     GP = $script:GuestDashboardPort }
             @{ Name = "Cert";  HP = $script:CertPort; GP = $script:CertPort }
         )
         foreach ($r in $rules) {
@@ -163,13 +164,17 @@ function Add-PortForwarding {
         }
     } else {
         # WSL/Hyper-V/Bridged: use netsh portproxy
-        $ports = @($script:Port, $script:CertPort)
-        foreach ($p in $ports) {
+        $rules = @(
+            @{ HP = $script:Port;     GP = $script:GuestDashboardPort }
+            @{ HP = $script:CertPort; GP = $script:CertPort }
+        )
+        foreach ($r in $rules) {
+            $p = $r.HP
             netsh interface portproxy delete v4tov4 listenport=$p listenaddress=0.0.0.0 2>$null | Out-Null
-            Info "forwarding 0.0.0.0:$p -> $($script:GuestIp):$p"
+            Info "forwarding 0.0.0.0:$p -> $($script:GuestIp):$($r.GP)"
             netsh interface portproxy add v4tov4 `
                 listenport=$p listenaddress=0.0.0.0 `
-                connectport=$p connectaddress=$script:GuestIp | Out-Null
+                connectport=$($r.GP) connectaddress=$script:GuestIp | Out-Null
         }
     }
 }
@@ -271,9 +276,9 @@ function Quote-GuestArg($s) {
     return "'" + ($s -replace "'", "'\''") + "'"
 }
 
-# Run `intendant lan <action> [args]` on the guest. Linux guest means
-# sudo is required (backend writes to /etc); we only support Linux
-# guests on the Windows orchestrator.
+# Run `intendant lan <action> [args]` on the guest as the daemon user.
+# The native LAN cert store is per-user; using sudo would create certs
+# that the normal dashboard daemon cannot read.
 function Invoke-IntendantLan {
     param(
         [string]$Action,
@@ -284,7 +289,7 @@ function Invoke-IntendantLan {
 
     $intendant = Resolve-GuestIntendantPath
     $quoted = ($LanArgs | ForEach-Object { Quote-GuestArg $_ }) -join " "
-    $cmd = "sudo $intendant lan $Action $quoted"
+    $cmd = "$intendant lan $Action $quoted"
 
     Invoke-GuestCommand $cmd
 }
@@ -429,7 +434,7 @@ function Run-Wizard {
 
     # Step 2: Port
     Write-Host ""
-    $portInput = Ask "HTTPS port for phone access" "8443"
+    $portInput = Ask "Native dashboard HTTPS port for phone access" "8765"
     $script:Port = [int]$portInput
 
     # Step 3: Detect host IP
@@ -466,7 +471,7 @@ function Run-Wizard {
 
     Info "running setup on guest..."
     # --no-serve-certs: the guest-side `intendant lan setup` returns
-    # once the certs + nginx config are in place. We run the cert
+    # once the native LAN certs are in place. We run the cert
     # distribution server ourselves below so we can display the p12
     # password in the Windows console (the guest's SSH stdout isn't
     # always visible, especially for WSL flows).
@@ -532,7 +537,7 @@ function Run-Wizard {
 function Run-Remove {
     if (-not (Load-Config)) {
         Warn "no saved config found -- using defaults"
-        $script:Port = 8443
+        $script:Port = 8765
     }
 
     Info "removing intendant LAN setup..."
@@ -549,7 +554,7 @@ function Run-Remove {
         }
         Invoke-IntendantLan "remove"
     } catch {
-        Warn "could not remove guest config (run 'sudo intendant lan remove' manually in the guest)"
+        Warn "could not remove guest config (run 'intendant lan remove' manually in the guest as the daemon user)"
     }
 
     Remove-Item $script:ConfigPath -ErrorAction SilentlyContinue

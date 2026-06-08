@@ -548,8 +548,8 @@ pub struct ServerConfig {
 /// from the STUN length-prefix/magic-cookie pattern.
 ///
 /// This is the pure-Rust (`rustls` + `rcgen`) path to encrypted serving,
-/// available on every platform including Windows — no `intendant lan
-/// setup` / nginx / OpenSSL dependency. It is independent of
+/// available on every platform including Windows — no nginx or OpenSSL
+/// dependency. It is independent of
 /// [`ServerAuthConfig::advertised_transport`]'s mTLS pinning, which
 /// concerns federation peer auth at a proxy layer.
 ///
@@ -601,7 +601,7 @@ pub struct ServerTlsConfig {
 /// [server.mtls]
 /// enabled = true
 /// # optional CA override; omit to use the installed Intendant LAN CA
-/// # ca = "/etc/intendant-lan/ca.crt"
+/// # ca = "~/.intendant/lan-certs/ca.crt"
 /// ```
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ServerMutualTlsConfig {
@@ -659,10 +659,10 @@ pub struct ServerAuthConfig {
     /// - `"none"` (default) — advertise no transport-layer
     ///   requirement. Right for trusted-LAN federation behind a
     ///   firewall.
-    /// - `"mutual-tls"` — advertise plain mTLS. Operator must have
-    ///   set up `intendant lan setup` so the nginx proxy actually
-    ///   enforces it. The card just announces the requirement;
-    ///   enforcement is at the proxy layer.
+    /// - `"mutual-tls"` — advertise plain mTLS. Operator must enable
+    ///   native `--mtls` / `[server.mtls]` so the dashboard gateway
+    ///   actually enforces client certificates. The card just announces
+    ///   the requirement.
     /// - `"pin-self-cert"` — advertise mTLS PLUS pin this daemon's
     ///   server cert by SHA-256 fingerprint. Daemon reads its own
     ///   `server.crt` from the LAN cert dir at startup, computes

@@ -1,8 +1,7 @@
 //! Native TLS for the `--web` dashboard gateway.
 //!
 //! Provides a pure-Rust ([`rustls`] + [`rcgen`]) path to serving the
-//! dashboard over HTTPS/WSS on every platform — including Windows, where
-//! the `intendant lan` / nginx / OpenSSL story is gated off. The accept
+//! dashboard over HTTPS/WSS on every platform. The accept
 //! loop's per-connection demux (in [`crate::web_gateway`]) peeks the first
 //! bytes of each connection and, when it sees a TLS ClientHello, wraps the
 //! socket in the [`tokio_rustls::TlsAcceptor`] built here before handing

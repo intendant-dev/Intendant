@@ -809,7 +809,7 @@ fn unlocked_platform_steps(
 <li>If Safari still shows Not Secure, open Keychain Access and set the Intendant CA to Always Trust. Station WebGPU, microphone/camera, and browser capture require Safari to treat this page as secure.</li>
 <li>Open <code>{dashboard}</code>.</li>
 </ol>
-<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below and regenerate old LAN certs with <code>intendant lan setup --force</code> so the Apple profile uses an Apple-compatible client identity bundle.</p>
+<p class="warn">The profile includes the client identity password. Keep it on the paired device only. If macOS reports that the certificate could not be verified, use the manual downloads below or regenerate LAN certs with <code>intendant lan setup --force</code>.</p>
 </div>"#
         ),
         ClientPlatform::Android => format!(
@@ -878,7 +878,7 @@ fn alternate_downloads_html(password: &str) -> String {
 <li><code>client.p12</code> is the password-protected client identity.</li>
 <li><code>client.pfx</code> is the same client identity with an Android/Windows-friendly extension.</li>
 <li>Secure browser features such as Station WebGPU, microphone/camera, and browser capture work only after the browser stops showing Not Secure for the dashboard.</li>
-<li><code>intendant.mobileconfig</code> bundles the CA and client identity for Apple platforms. If it fails on macOS, install <code>ca.crt</code> and <code>client.p12</code> manually or regenerate old LAN certs with <code>intendant lan setup --force</code>.</li>
+<li><code>intendant.mobileconfig</code> bundles the CA and client identity for Apple platforms. If it fails on macOS, install <code>ca.crt</code> and <code>client.p12</code> manually or regenerate LAN certs with <code>intendant lan setup --force</code>.</li>
 </ul>
 </div>
 </details>"#,
@@ -1006,7 +1006,7 @@ fn ensure_apple_profile_cert_compatible(
 
 fn apple_profile_regen_message(label: &str, reason: &str) -> String {
     format!(
-        "{label} {reason}. macOS may reject Apple configuration profiles for this legacy LAN cert directory; install ca.crt and client.p12 manually or regenerate old LAN certs with `intendant lan setup --force` so the Apple profile uses an Apple-compatible client identity bundle."
+        "{label} {reason}. macOS may reject this Apple configuration profile; install ca.crt and client.p12 manually or regenerate LAN certs with `intendant lan setup --force` so the profile uses an Apple-compatible client identity bundle."
     )
 }
 
