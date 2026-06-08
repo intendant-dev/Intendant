@@ -2860,6 +2860,20 @@ function stationStateSummarySource() {
       if (!Array.isArray(value)) return;
       for (const item of value) out.push(candidateFrom(item, { evidence }));
     };
+    const stationSnapshotBuilder = () => {
+      if (typeof buildStationSnapshot === 'function') {
+        return () => buildStationSnapshot();
+      }
+      const root = typeof window !== 'undefined' ? window : (typeof globalThis !== 'undefined' ? globalThis : null);
+      if (root && typeof root.buildStationSnapshot === 'function') {
+        return () => root.buildStationSnapshot();
+      }
+      const probe = root && root.stationProbe;
+      if (probe && typeof probe.snapshot === 'function') {
+        return () => probe.snapshot();
+      }
+      return null;
+    };
     const liveAgentSession = (snapshot) => {
       const candidates = [];
       try { collectMapCandidates(candidates, typeof sessionMetadataById !== 'undefined' ? sessionMetadataById : null, 'sessionMetadataById'); } catch (_) {}
@@ -2932,9 +2946,10 @@ function stationStateSummarySource() {
       };
     };
     try {
-      const snapshot = typeof buildStationSnapshot === 'function' ? buildStationSnapshot() : null;
+      const buildSnapshot = stationSnapshotBuilder();
+      const snapshot = buildSnapshot ? buildSnapshot() : null;
       if (!snapshot || typeof snapshot !== 'object') {
-        return { ok: false, reason: 'buildStationSnapshot is unavailable' };
+        return { ok: false, reason: 'Station snapshot hook is unavailable (checked buildStationSnapshot and window.stationProbe.snapshot)' };
       }
       const sessions = Number(snapshot.sessions && snapshot.sessions.total) || 0;
       const events = Math.max(
@@ -3945,6 +3960,35 @@ async function runSelfTest() {
   assert.deepStrictEqual(JSON.parse(JSON.stringify(stationStateSummary.counts)), {
     sessions: 0,
     events: 0,
+    managed: 0,
+    peers: 0,
+  });
+  const stationProbeSnapshotSummary = vm.runInNewContext(`(${stationStateSummarySource()})`, {
+    window: {
+      stationProbe: {
+        snapshot: () => ({
+          hosts: [{ id: 'local' }],
+          agents: [{ id: 'primary-agent' }],
+          events: [{ id: 'probe-event' }],
+          activity: { retainedCount: 1, shownCount: 1 },
+          managed: { records: 0, anchors: 0 },
+          sessions: { total: 0 },
+        }),
+      },
+    },
+    daemons: [],
+    Map,
+    Set,
+    Array,
+    Object,
+    Number,
+    String,
+  })();
+  assert.strictEqual(stationProbeSnapshotSummary.ok, true);
+  assert.strictEqual(stationProbeSnapshotSummary.nonEmpty, true);
+  assert.deepStrictEqual(JSON.parse(JSON.stringify(stationProbeSnapshotSummary.counts)), {
+    sessions: 0,
+    events: 1,
     managed: 0,
     peers: 0,
   });
