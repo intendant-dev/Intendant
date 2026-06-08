@@ -58,6 +58,7 @@ Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
 - For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
 - For browser/dashboard validation against an existing Intendant web port, prefer `node scripts/validate-dashboard.cjs --port <port> --selector <css>` or `--url <url>` before writing ad-hoc Chromium/CDP scripts. For Station smoke checks, prefer named probes such as `--station-probe rendered --station-probe dock-hidden` over giant inline `--wait-for-function` expressions. For headed Station QA, use the helper's first-class artifacts and rendered controls probe, for example `--headed --station-interaction-probe --screenshot /tmp/intendant-station.png --json`; read the returned artifact path, interaction names/count, warm-up latency, and subsequent latency instead of scraping the helper's temporary Chromium profile or `DevToolsActivePort`. For a temporary local dashboard smoke, prefer one owned-lifecycle command such as `node scripts/validate-dashboard.cjs --launch-dashboard --port <throwaway_port> --selector <css>`; the helper launches the built intendant binary as `--web <port> --no-tui`, waits for HTTP readiness, and stops it afterward. Do not start a separate foreground/nohup dashboard just so the helper can connect. The helper launches isolated Chromium, waits for CDP and selectors/functions/probes, handles WebSocket fallbacks, captures requested artifacts, and prints compact PASS/FAIL output with bounded failure excerpts.
+- Do not use broad argv-pattern process cleanup such as `pkill -f validate-dashboard`, `pkill -f intendant`, or similar. Managed controller argv can contain the task prompt, and prompts often include command examples, so `pkill -f` can match and kill the controller supervising you. Prefer helper-owned cleanup, tracked child PIDs, process groups created by the command you launched, temporary workspace/profile directories, or exact PIDs you verified with `ps`.
 - Browser validation retry discipline: run one primary helper smoke. If it fails or times out, run at most one compact diagnostic retry with `--diagnostics --json` and a targeted selector/function. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the helper reason/logs/diagnostics. Do not cycle through raw CDP, Node, Python, Browser, Chrome, and plugin automation stacks unless the user explicitly asks for deeper manual investigation or the helper itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid repeating `cargo run` or other build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
 - While a long-running command/tool is still active, do not emit assistant status messages that only say you are still waiting/building/running and have no new output or errors, such as "No output yet", "Still active", or "Polling". Wait silently for material output, completion, an approval need, or a real decision; Intendant surfaces tool lifecycle separately.
@@ -5395,6 +5396,24 @@ fn translate_notification_with_state(
     translate_notification_with_scope(method, params, event_tx, state, None, None);
 }
 
+fn codex_item_event_id<'a>(
+    params: &'a serde_json::Value,
+    item: &'a serde_json::Value,
+) -> Option<&'a str> {
+    [
+        item.get("id"),
+        item.get("call_id"),
+        item.get("callId"),
+        params.get("itemId"),
+        params.get("call_id"),
+        params.get("callId"),
+    ]
+    .into_iter()
+    .flatten()
+    .filter_map(|value| value.as_str().map(str::trim))
+    .find(|value| !value.is_empty())
+}
+
 fn translate_notification_with_scope(
     method: &str,
     params: &serde_json::Value,
@@ -5427,15 +5446,10 @@ fn translate_notification_with_scope(
         }
 
         "item/started" => {
-            let item_type = params
-                .pointer("/item/type")
-                .and_then(|v| v.as_str())
-                .unwrap_or("");
-            let item_id = params
-                .pointer("/item/id")
-                .or_else(|| params.get("itemId"))
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            let item = params.get("item").unwrap_or(params);
+            let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
+            let item_id = codex_item_event_id(params, item)
+                .unwrap_or_default()
                 .to_string();
 
             match item_type {
@@ -5569,10 +5583,8 @@ fn translate_notification_with_scope(
 
         "item/completed" => {
             let item = params.get("item").unwrap_or(params);
-            let item_id = item
-                .get("id")
-                .and_then(|v| v.as_str())
-                .unwrap_or("")
+            let item_id = codex_item_event_id(params, item)
+                .unwrap_or_default()
                 .to_string();
             let item_type = item.get("type").and_then(|v| v.as_str()).unwrap_or("");
 
@@ -8801,6 +8813,50 @@ error: build failed
         match event {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "item-1");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_function_call_output_completion_uses_call_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "item": {
+                "type": "function_call_output",
+                "call_id": "call_CP7ok6SOm9fbU9zYp8Ok1IL3",
+                "output": "Chunk ID: d1ff8c\nWall time: 30.0011 seconds\nProcess running with session ID 1404\n"
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
+                assert_eq!(status, ToolCompletionStatus::Success);
+            }
+            other => panic!("expected ToolCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_function_call_output_completion_uses_top_level_call_id() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "callId": "call_IXwDrmqUWzOZ8mBwjyG3rJqd",
+            "item": {
+                "type": "function_call_output",
+                "output": "Chunk ID: c36672\nWall time: 17.4574 seconds\nProcess exited with code 0\n"
+            }
+        });
+
+        translate_notification("item/completed", &params, &tx);
+
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolCompleted { item_id, status } => {
+                assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
                 assert_eq!(status, ToolCompletionStatus::Success);
             }
             other => panic!("expected ToolCompleted, got {:?}", other),
