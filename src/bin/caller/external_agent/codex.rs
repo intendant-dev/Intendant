@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -4440,6 +4441,7 @@ impl CodexCommandOutputHygiene {
             self.pending.clear();
         }
         combined.push_str(text);
+        let combined = normalize_codex_command_output_record_separators(&combined);
         self.source_seen_bytes = self.source_seen_bytes.saturating_add(combined.len());
         self.source_signals.observe(&combined);
         if self
@@ -4729,6 +4731,28 @@ fn compact_codex_command_preview(command: &str) -> String {
     )
 }
 
+fn normalize_codex_command_output_record_separators(text: &str) -> Cow<'_, str> {
+    if !text.contains('\r') {
+        return Cow::Borrowed(text);
+    }
+
+    let mut normalized = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\r' {
+            if !normalized.is_empty() && !normalized.ends_with('\n') {
+                normalized.push('\n');
+            }
+            if chars.peek() == Some(&'\n') {
+                chars.next();
+            }
+        } else {
+            normalized.push(ch);
+        }
+    }
+    Cow::Owned(normalized)
+}
+
 fn push_compact_codex_output_line(out: &mut String, line: &str) {
     out.push_str(&compact_codex_output_line(line));
 }
@@ -4830,7 +4854,7 @@ fn codex_command_output_strip_numeric_line_prefix(line: &str) -> Option<&str> {
 }
 
 fn is_codex_build_progress_line(line: &str) -> bool {
-    let trimmed = line.trim_start();
+    let trimmed = trim_codex_output_classification_prefix(line);
     if trimmed.is_empty() {
         return false;
     }
@@ -4845,7 +4869,17 @@ fn is_codex_build_progress_line(line: &str) -> bool {
     if let Some(first) = trimmed.split_whitespace().next() {
         if matches!(
             first,
-            "Compiling" | "Checking" | "Building" | "Fresh" | "Downloading" | "Downloaded"
+            "Adding"
+                | "Building"
+                | "Checking"
+                | "Compiling"
+                | "Downloaded"
+                | "Downloading"
+                | "Fetching"
+                | "Fresh"
+                | "Installing"
+                | "Locking"
+                | "Updating"
         ) {
             return true;
         }
@@ -4854,6 +4888,25 @@ fn is_codex_build_progress_line(line: &str) -> bool {
         && (lower.contains("compiling")
             || lower.contains("checking")
             || lower.contains("installing wasm-bindgen"))
+}
+
+fn trim_codex_output_classification_prefix(mut line: &str) -> &str {
+    line = line.trim_start();
+    loop {
+        let Some(after_escape) = line.strip_prefix('\u{1b}') else {
+            return line;
+        };
+        let Some(after_csi) = after_escape.strip_prefix('[') else {
+            return line;
+        };
+        let Some((idx, ch)) = after_csi
+            .char_indices()
+            .find(|(_, ch)| matches!(ch, '@'..='~'))
+        else {
+            return line;
+        };
+        line = after_csi[idx + ch.len_utf8()..].trim_start();
+    }
 }
 
 fn codex_source_line_has_code_token(line: &str) -> bool {
@@ -8197,6 +8250,33 @@ error: could not compile `intendant`
     }
 
     #[test]
+    fn codex_command_output_hygiene_collapses_carriage_return_build_progress() {
+        let mut hygiene = CodexCommandOutputHygiene::default();
+        let mut filtered = String::new();
+
+        for i in 0..30 {
+            let chunk = format!("\r\u{1b}[K   Compiling redraw_crate_{i} v0.1.0");
+            if let Some(output) = hygiene.filter(&chunk, false) {
+                filtered.push_str(&output);
+            }
+        }
+        if let Some(output) = hygiene.filter(
+            "\rerror: could not compile `redraw_crate` due to previous error\n",
+            true,
+        ) {
+            filtered.push_str(&output);
+        }
+
+        assert!(filtered.contains("Compiling redraw_crate_0"));
+        assert!(filtered.contains("Compiling redraw_crate_1"));
+        assert!(filtered.contains("suppressed repetitive build progress"));
+        assert!(filtered.contains("suppressed 26 repetitive build progress lines"));
+        assert!(filtered.contains("last: \u{1b}[K   Compiling redraw_crate_29 v0.1.0"));
+        assert!(filtered.contains("error: could not compile `redraw_crate`"));
+        assert!(!filtered.contains("Compiling redraw_crate_20"));
+    }
+
+    #[test]
     fn codex_command_output_hygiene_compacts_large_static_app_html_source() {
         let mut hygiene = CodexCommandOutputHygiene::default();
         let input = large_static_app_html_js_output();
@@ -8326,6 +8406,54 @@ error: could not compile `intendant`
         assert!(!joined.contains("warning: noisy diagnostic 4"));
         assert!(joined.contains("suppressed additional repeated warning diagnostics"));
         assert!(joined.contains("error: build failed"));
+    }
+
+    #[test]
+    fn translate_output_delta_coalesces_active_carriage_return_build_progress() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let mut state = CodexNotificationState::default();
+        for idx in 0..40 {
+            let params = serde_json::json!({
+                "itemId": "item-build",
+                "delta": format!("\r\u{1b}[K    Checking active_crate_{idx} v0.1.0")
+            });
+            translate_notification_with_state(
+                "item/commandExecution/outputDelta",
+                &params,
+                &tx,
+                &mut state,
+            );
+        }
+        let params = serde_json::json!({
+            "itemId": "item-build",
+            "delta": "\rerror: build failed\n"
+        });
+        translate_notification_with_state(
+            "item/commandExecution/outputDelta",
+            &params,
+            &tx,
+            &mut state,
+        );
+
+        let mut texts = Vec::new();
+        while let Ok(event) = rx.try_recv() {
+            match event {
+                AgentEvent::ToolOutputDelta { text, .. } => texts.push(text),
+                other => panic!("expected ToolOutputDelta, got {:?}", other),
+            }
+        }
+
+        let joined = texts.join("");
+        assert!(joined.contains("Checking active_crate_0"));
+        assert!(joined.contains("Checking active_crate_1"));
+        assert!(joined.contains("suppressed repetitive build progress"));
+        assert!(joined.contains("error: build failed"));
+        assert!(!joined.contains("Checking active_crate_20"));
+        assert!(
+            texts.len() <= CODEX_BUILD_PROGRESS_INLINE_LIMIT + 2,
+            "active progress should emit a bounded number of deltas, got {}",
+            texts.len()
+        );
     }
 
     #[test]
