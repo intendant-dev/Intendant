@@ -11276,14 +11276,29 @@ function stationBuildActivitySummary(allEventsInput = null) {
   }
   const allEvents = state.allEvents || [];
   const events = state.events || [];
+  const latest = events.length ? events[events.length - 1] : null;
+  const threadKeys = new Set(events.map(ev => {
+    const sessionId = String(ev.sessionId || ev.session_id || '').trim();
+    if (sessionId) return `session:${sessionId}`;
+    const hostId = String(ev.hostId || ev.host_id || selfPeerId || 'local').trim();
+    return `source:${hostId}:${stationActivitySourceFor(ev) || 'activity'}`;
+  }));
   return {
     retainedCount: allEvents.length,
     shownCount: events.length,
+    managedCount: events.filter(stationActivityEventIsManaged).length,
+    threadCount: threadKeys.size,
     hostFilter: state.hostFilter || '',
     levelFilter: state.levelFilter || '',
     sourceFilter: state.sourceFilter || '',
     query: state.query || '',
     verbosity: document.getElementById('verbosity-select')?.value || 'normal',
+    latestId: latest ? stationActivityEventKey(latest) : '',
+    latestLevel: latest ? stationActivityLevelFor(latest) : '',
+    latestSource: latest ? stationActivitySourceFor(latest) : '',
+    latestHost: latest ? (latest.hostId || latest.host_id || selfPeerId || 'local') : '',
+    latestSessionId: latest ? (latest.sessionId || latest.session_id || '') : '',
+    latestText: latest ? stationActivityEventCopyText(latest) : '',
     visibleEvents: events.slice(-24),
     topLevels: stationActivityTopSummary(events, stationActivityLevelFor),
     topSources: stationActivityTopSummary(events, stationActivitySourceFor),

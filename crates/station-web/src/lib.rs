@@ -3006,13 +3006,32 @@ impl StationInner {
                 46,
             )
         };
-        self.text(&identity, x + 133.0, y + 19.0, 9.0, C_SUBTEXT0_CSS, "normal");
+        self.text(
+            &identity,
+            x + 133.0,
+            y + 19.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
         if !selected_session.is_empty() {
             let mut actions = vec![
                 RunwayAction::session("mgd", "managed-jump", &selected_session, 40.0, C_MAUVE_CSS),
                 RunwayAction::session("ctx", "context-jump", &selected_session, 36.0, C_BLUE_CSS),
-                RunwayAction::session("wrap", "copy-intendant", &selected_session, 42.0, C_PEACH_CSS),
-                RunwayAction::session("backend", "copy-backend", &selected_session, 60.0, C_TEAL_CSS),
+                RunwayAction::session(
+                    "wrap",
+                    "copy-intendant",
+                    &selected_session,
+                    42.0,
+                    C_PEACH_CSS,
+                ),
+                RunwayAction::session(
+                    "backend",
+                    "copy-backend",
+                    &selected_session,
+                    60.0,
+                    C_TEAL_CSS,
+                ),
                 RunwayAction::session("sid", "copy", &selected_session, 34.0, C_BLUE_CSS),
             ];
             if controls.session_is_codex && !thread_id.is_empty() {
@@ -3215,21 +3234,28 @@ impl StationInner {
         };
         self.text(&detail, x + 16.0, y + 32.0, 8.5, C_SUBTEXT0_CSS, "normal");
         if h > 72.0 {
-            let latest = if !managed.latest_rewind.id.is_empty() || !managed.latest_backout.id.is_empty()
-            {
-                format!(
-                    "rewind {} / backout {}",
-                    short_id(&managed.latest_rewind.id),
-                    short_id(&managed.latest_backout.id)
-                )
-            } else {
-                format!(
-                    "{} / {}",
-                    nonempty(&managed.session_label, &short_id(&managed.session_id)),
-                    nonempty(&managed.action_state.readiness, "ready")
-                )
-            };
-            self.text(&truncate(&latest, 42), x + 16.0, y + 49.0, 8.0, C_OVERLAY1_CSS, "normal");
+            let latest =
+                if !managed.latest_rewind.id.is_empty() || !managed.latest_backout.id.is_empty() {
+                    format!(
+                        "rewind {} / backout {}",
+                        short_id(&managed.latest_rewind.id),
+                        short_id(&managed.latest_backout.id)
+                    )
+                } else {
+                    format!(
+                        "{} / {}",
+                        nonempty(&managed.session_label, &short_id(&managed.session_id)),
+                        nonempty(&managed.action_state.readiness, "ready")
+                    )
+                };
+            self.text(
+                &truncate(&latest, 42),
+                x + 16.0,
+                y + 49.0,
+                8.0,
+                C_OVERLAY1_CSS,
+                "normal",
+            );
         }
         self.meter(x + 16.0, y + h - 4.0, w - 32.0, pct, color);
 
@@ -3267,8 +3293,22 @@ impl StationInner {
         let actions = [
             rewind_action,
             backout_action,
-            RunwayAction::managed("refresh", "refresh", "", &managed.session_id, 58.0, C_BLUE_CSS),
-            RunwayAction::managed("copy", "copy-status", "", &managed.session_id, 40.0, C_TEAL_CSS),
+            RunwayAction::managed(
+                "refresh",
+                "refresh",
+                "",
+                &managed.session_id,
+                58.0,
+                C_BLUE_CSS,
+            ),
+            RunwayAction::managed(
+                "copy",
+                "copy-status",
+                "",
+                &managed.session_id,
+                40.0,
+                C_TEAL_CSS,
+            ),
             RunwayAction::select("panel", "system:managed", 48.0, C_OVERLAY1_CSS),
         ];
         let mut ax = x + w - 8.0;
@@ -4813,12 +4853,67 @@ impl StationInner {
             x,
             yy,
             "latest",
-            latest.map(|ev| ev.level.as_str()).unwrap_or("--"),
+            &nonempty(
+                &activity.latest_level,
+                latest.map(|ev| ev.level.as_str()).unwrap_or("--"),
+            ),
             latest
                 .map(|ev| level_color_css(&ev.level))
                 .unwrap_or(C_OVERLAY1_CSS),
         );
-        yy += 30.0;
+        yy += 22.0;
+        if latest.is_some() || !activity.latest_id.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "category",
+                &truncate(
+                    &format!(
+                        "{} / {}",
+                        nonempty(&activity.latest_source, "activity"),
+                        nonempty(&activity.latest_host, "local")
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
+        self.panel_row(
+            x,
+            yy,
+            "lanes",
+            &format!(
+                "{} threads · {} managed",
+                activity.thread_count, activity.managed_count
+            ),
+        );
+        yy += 22.0;
+        if !activity.latest_session_id.is_empty() || !activity.latest_id.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "latest id",
+                &truncate(
+                    &format!(
+                        "{}{}{}",
+                        short_id(&activity.latest_id),
+                        if activity.latest_session_id.is_empty() {
+                            ""
+                        } else {
+                            " / "
+                        },
+                        short_id(&activity.latest_session_id)
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
+        if !activity.latest_text.is_empty() {
+            self.panel_row(x, yy, "message", &truncate(&activity.latest_text, 42));
+            yy += 22.0;
+        }
+        yy += 8.0;
         yy = self.draw_activity_thread_signals(x, yy, panel_w, &events);
         if !events.is_empty() {
             yy += 12.0;
@@ -5142,6 +5237,38 @@ impl StationInner {
             ),
         );
         yy += 22.0;
+        if !ctx.backend_session_id.is_empty() || !ctx.intendant_session_id.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "external ids",
+                &truncate(
+                    &format!(
+                        "backend {} · wrapper {}",
+                        short_id(&ctx.backend_session_id),
+                        short_id(&ctx.intendant_session_id)
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
+        if !ctx.context_archive.is_empty() || !ctx.managed_mode.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "context mode",
+                &truncate(
+                    &format!(
+                        "{} / archive {}",
+                        nonempty(&ctx.managed_mode, "vanilla"),
+                        nonempty(&ctx.context_archive, "--")
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
         self.panel_row(x, yy, "turn", &nonempty(&ctx.turn, "--"));
         yy += 22.0;
         self.panel_row(x, yy, "format", &nonempty(&ctx.format, "--"));
@@ -5397,6 +5524,22 @@ impl StationInner {
             ),
         );
         yy += 22.0;
+        if !managed.backend_session_id.is_empty() || !managed.intendant_session_id.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "external ids",
+                &truncate(
+                    &format!(
+                        "backend {} · wrapper {}",
+                        short_id(&managed.backend_session_id),
+                        short_id(&managed.intendant_session_id)
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
         self.panel_row_color(
             x,
             yy,
@@ -5427,6 +5570,44 @@ impl StationInner {
             &format_token_ratio(managed.used_tokens, managed.hard_window),
         );
         yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "density",
+            &truncate(
+                &format!(
+                    "{} effective · {} hard",
+                    percent_label(
+                        managed.effective_pct,
+                        managed.used_tokens,
+                        managed.effective_window
+                    ),
+                    percent_label(managed.hard_pct, managed.used_tokens, managed.hard_window)
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
+        if let Some(limit) = managed.rewind_only_limit.filter(|value| *value > 0.0) {
+            let remaining = managed
+                .remaining_to_rewind_only
+                .map(|value| compact_number(value.max(0.0) as f64))
+                .unwrap_or_else(|| "--".to_string());
+            self.panel_row(
+                x,
+                yy,
+                "rewind limit",
+                &truncate(
+                    &format!(
+                        "{} tokens · {} left",
+                        compact_number(limit as f64),
+                        remaining
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
         self.panel_row(
             x,
             yy,
@@ -7153,6 +7334,76 @@ impl StationInner {
 
         let events = self.snapshot.events.clone();
         yy = self.draw_activity_control_runway(x, yy, panel_w, &events);
+
+        self.section_title_color(x, yy, "Controller state", C_PEACH_CSS);
+        yy += 22.0;
+        self.panel_row_color(
+            x,
+            yy,
+            "turn",
+            &truncate(
+                &format!(
+                    "{} / {}",
+                    nonempty(&controls.external_turn_label, "controller"),
+                    nonempty(&controls.external_turn_state, "idle")
+                ),
+                42,
+            ),
+            if controls.external_turn_state == "running tools"
+                || controls.external_turn_state == "thinking"
+            {
+                C_GREEN_CSS
+            } else if controls.external_turn_state == "waiting" {
+                C_YELLOW_CSS
+            } else {
+                C_TEXT_CSS
+            },
+        );
+        yy += 22.0;
+        self.panel_row(
+            x,
+            yy,
+            "backend",
+            &truncate(
+                &format!(
+                    "{} · {}",
+                    nonempty(&controls.external_turn_backend, &controls.backend),
+                    nonempty(&controls.session_live_phase, "no live phase")
+                ),
+                42,
+            ),
+        );
+        yy += 22.0;
+        if !controls.external_turn_session_id.is_empty()
+            || !controls.session_backend_id.is_empty()
+            || !controls.session_intendant_id.is_empty()
+        {
+            self.panel_row(
+                x,
+                yy,
+                "selected ids",
+                &truncate(
+                    &format!(
+                        "turn {} · backend {} · wrapper {}",
+                        short_id(&controls.external_turn_session_id),
+                        short_id(&controls.session_backend_id),
+                        short_id(&controls.session_intendant_id)
+                    ),
+                    42,
+                ),
+            );
+            yy += 22.0;
+        }
+        if !controls.external_turn_detail.is_empty() {
+            self.panel_row(
+                x,
+                yy,
+                "detail",
+                &truncate(&controls.external_turn_detail, 42),
+            );
+            yy += 22.0;
+        }
+        yy += 8.0;
 
         self.section_title_color(x, yy, "Launch defaults", C_MAUVE_CSS);
         yy += 22.0;
@@ -10440,11 +10691,19 @@ struct StationSnapshot {
 struct StationActivitySummary {
     retained_count: usize,
     shown_count: usize,
+    managed_count: usize,
+    thread_count: usize,
     host_filter: String,
     level_filter: String,
     source_filter: String,
     query: String,
     verbosity: String,
+    latest_id: String,
+    latest_level: String,
+    latest_source: String,
+    latest_host: String,
+    latest_session_id: String,
+    latest_text: String,
     top_levels: String,
     top_sources: String,
     top_hosts: String,
@@ -10660,6 +10919,10 @@ struct StationManagedSummary {
     used_tokens: f32,
     effective_window: f32,
     hard_window: f32,
+    effective_pct: f32,
+    hard_pct: f32,
+    rewind_only_limit: Option<f32>,
+    remaining_to_rewind_only: Option<f32>,
     rewind_only: bool,
     records: u32,
     anchors: u32,
@@ -10693,6 +10956,10 @@ impl Default for StationManagedSummary {
             used_tokens: 0.0,
             effective_window: 0.0,
             hard_window: 0.0,
+            effective_pct: 0.0,
+            hard_pct: 0.0,
+            rewind_only_limit: None,
+            remaining_to_rewind_only: None,
             rewind_only: false,
             records: 0,
             anchors: 0,
@@ -12281,6 +12548,18 @@ fn percent(value: f32, max: f32) -> f32 {
 
 fn pct_label(pct: f32) -> String {
     format!("{:.0}%", pct.clamp(0.0, 1.0) * 100.0)
+}
+
+fn percent_label(reported_pct: f32, used: f32, window: f32) -> String {
+    if window <= 0.0 {
+        return "--".to_string();
+    }
+    let pct = if reported_pct > 0.0 {
+        reported_pct
+    } else {
+        (used / window) * 100.0
+    };
+    format!("{:.0}%", pct.clamp(0.0, 999.0))
 }
 
 fn nonempty(value: &str, fallback: &str) -> String {
