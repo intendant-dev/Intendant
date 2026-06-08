@@ -6089,6 +6089,9 @@ impl StationInner {
         );
         yy += 30.0;
 
+        let events = self.snapshot.events.clone();
+        yy = self.draw_activity_control_runway(x, yy, panel_w, &events);
+
         self.section_title_color(x, yy, "Launch defaults", C_MAUVE_CSS);
         yy += 22.0;
         self.panel_row(x, yy, "binary", &truncate(&controls.command, 42));
@@ -6981,6 +6984,164 @@ impl StationInner {
                 },
             ));
             ax += *width + 8.0;
+        }
+        ay + 35.0
+    }
+
+    fn draw_activity_control_runway(
+        &mut self,
+        x: f32,
+        y: f32,
+        panel_w: f32,
+        events: &[StationEvent],
+    ) -> f32 {
+        let mut yy = y;
+        self.section_title_color(x, yy, "Activity runway", C_TEAL_CSS);
+        yy += 22.0;
+        let latest = events.last();
+        let managed_count = events
+            .iter()
+            .filter(|event| activity_event_is_managed(event))
+            .count();
+        self.round_rect(
+            x + 12.0,
+            yy - 10.0,
+            panel_w - 24.0,
+            72.0,
+            4.0,
+            "rgba(17,17,27,0.78)",
+            "rgba(148,226,213,0.42)",
+        );
+        if let Some(event) = latest {
+            let color = level_color_css(&event.level);
+            self.ctx.set_fill_style(&JsValue::from_str(color));
+            self.ctx
+                .fill_rect((x + 20.0) as f64, (yy - 2.0) as f64, 3.0, 43.0);
+            self.text(
+                &truncate(&nonempty(&event.source, "activity"), 20),
+                x + 30.0,
+                yy + 2.0,
+                9.5,
+                C_TEAL_CSS,
+                "bold",
+            );
+            self.text(
+                &truncate(&event.level, 10),
+                x + panel_w - 94.0,
+                yy + 2.0,
+                9.0,
+                color,
+                "bold",
+            );
+            self.text(
+                &truncate(&event.msg, 50),
+                x + 30.0,
+                yy + 20.0,
+                9.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            self.text(
+                &format!(
+                    "{} retained / {} managed{}",
+                    events.len(),
+                    managed_count,
+                    if event.session_id.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" / {}", truncate(&event.session_id, 10))
+                    }
+                ),
+                x + 30.0,
+                yy + 38.0,
+                8.5,
+                C_OVERLAY1_CSS,
+                "normal",
+            );
+        } else {
+            self.text(
+                "Waiting for activity",
+                x + 30.0,
+                yy + 14.0,
+                10.0,
+                C_SUBTEXT0_CSS,
+                "normal",
+            );
+            self.text(
+                "No retained log events yet",
+                x + 30.0,
+                yy + 34.0,
+                8.5,
+                C_OVERLAY1_CSS,
+                "normal",
+            );
+        }
+        yy += 88.0;
+
+        let latest_id = latest.map(|event| event.id.clone()).unwrap_or_default();
+        let latest_managed_id = events
+            .iter()
+            .rev()
+            .find(|event| activity_event_is_managed(event))
+            .map(|event| event.id.clone())
+            .unwrap_or_default();
+        let mut actions = vec![
+            (
+                "bottom".to_string(),
+                "latest".to_string(),
+                62.0,
+                C_TEAL_CSS.to_string(),
+                String::new(),
+            ),
+            (
+                "copy-visible".to_string(),
+                "copy log".to_string(),
+                76.0,
+                C_BLUE_CSS.to_string(),
+                String::new(),
+            ),
+            (
+                "clear-triage".to_string(),
+                "clear triage".to_string(),
+                96.0,
+                C_YELLOW_CSS.to_string(),
+                String::new(),
+            ),
+        ];
+        if !latest_id.is_empty() {
+            actions.push((
+                "show-log".to_string(),
+                "open latest".to_string(),
+                96.0,
+                C_PEACH_CSS.to_string(),
+                latest_id,
+            ));
+        }
+        if !latest_managed_id.is_empty() {
+            actions.push((
+                "activity-managed".to_string(),
+                "managed".to_string(),
+                74.0,
+                C_MAUVE_CSS.to_string(),
+                latest_managed_id,
+            ));
+        }
+        let mut ax = x + 14.0;
+        let mut ay = yy - 14.0;
+        for (action, label, width, color, id) in actions {
+            if ax + width > x + panel_w - 14.0 {
+                ax = x + 14.0;
+                ay += 25.0;
+            }
+            self.pill_at(ax, ay, width, 21.0, &label, &color);
+            self.hit_zones.push(HitZone::new(
+                ax,
+                ay,
+                width,
+                21.0,
+                HitAction::ActivityAction { action, id },
+            ));
+            ax += width + 8.0;
         }
         ay + 35.0
     }
