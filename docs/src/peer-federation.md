@@ -487,7 +487,25 @@ until local approval. Default mTLS leaves this public doorbell reachable while
 all other dashboard/API/WebSocket paths still require a verified client
 certificate. For public deployments, keep TLS enabled; plaintext `--no-tls` is
 for explicit local/debug use. Set `INTENDANT_PEER_ACCESS_REQUESTS=0` to disable
-public request creation entirely.
+public request creation entirely, or set `[server.peer_access_requests]
+enabled = false` in `intendant.toml`.
+
+The hardening defaults are intentionally conservative and configurable:
+`body_limit_bytes = 4096`, `ttl_secs = 600`, `max_pending = 32`,
+`max_pending_per_source = 5`, `rate_limit_window_secs = 60`,
+`max_creates_per_window = 64`, and
+`max_creates_per_source_per_window = 8`.
+
+For a real two-machine check, run the VM harness from a worktree:
+
+```bash
+scripts/e2e-peer-pairing-vm.sh --remote vm@192.168.66.7
+```
+
+The harness builds/syncs the current worktree, creates isolated local and remote
+access cert stores, starts the VM daemon with default TLS/mTLS, runs
+request/approve/complete headlessly, then starts a local dashboard daemon and
+waits until `/api/peers` reports the VM connected.
 
 ### How auth maps to the Agent Card
 

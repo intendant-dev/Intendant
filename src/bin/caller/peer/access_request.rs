@@ -15,23 +15,16 @@ use sha2::{Digest, Sha256};
 
 use crate::access;
 use crate::error::CallerError;
-use crate::project::{PeerConfig, Project};
+use crate::project::{PeerAccessRequestConfig, PeerConfig, Project};
 
 use super::pairing::{
     storage_slug, unix_timestamp, write_secret_file, JoinOutcome, AGENT_CARD_PATH,
 };
 
 pub(crate) const PUBLIC_REQUEST_PATH: &str = "/api/peer-pairing/requests";
-pub(crate) const REQUEST_BODY_LIMIT_BYTES: usize = 4096;
 const REQUEST_STORE_DIR: &str = "peer-access-requests";
 const OUTGOING_STORE_DIR: &str = "peer-access-outgoing";
-const REQUEST_TTL_SECS: i64 = 10 * 60;
-const MAX_PENDING_REQUESTS: usize = 32;
-const MAX_PENDING_PER_SOURCE: usize = 5;
-const RATE_LIMIT_WINDOW_SECS: i64 = 60;
-const MAX_CREATE_REQUESTS_PER_WINDOW: usize = 64;
-const MAX_CREATE_REQUESTS_PER_SOURCE_PER_WINDOW: usize = 8;
-const DEFAULT_PROFILE: &str = "peer-daemon";
+const DEFAULT_PROFILE: &str = super::access_policy::DEFAULT_PROFILE;
 const REQUEST_HTTP_TIMEOUT: Duration = Duration::from_secs(10);
 
 static CREATE_RATE_LIMITER: OnceLock<StdMutex<CreateRateLimiter>> = OnceLock::new();
@@ -170,16 +163,17 @@ pub(crate) fn create_pending_request(
     request: AccessRequestCreate,
     target_card_url: String,
     source_hint: Option<String>,
+    config: &PeerAccessRequestConfig,
 ) -> Result<AccessRequestCreated, CallerError> {
-    if !public_requests_enabled_from_env() {
+    if !public_requests_enabled(config) {
         return Err(CallerError::Config(
-            "peer access requests are disabled by INTENDANT_PEER_ACCESS_REQUESTS".into(),
+            "peer access requests are disabled by configuration".into(),
         ));
     }
     validate_create_request(&request)?;
-    enforce_create_rate_limits(source_hint.as_deref())?;
+    enforce_create_rate_limits(source_hint.as_deref(), config)?;
     prune_expired(cert_dir)?;
-    enforce_pending_limits(cert_dir, source_hint.as_deref())?;
+    enforce_pending_limits(cert_dir, source_hint.as_deref(), config)?;
 
     let server_cert_fingerprint = access::certs::read_server_cert_fingerprint(cert_dir)
         .ok_or_else(|| {
@@ -201,7 +195,7 @@ pub(crate) fn create_pending_request(
         &target_card_url,
     );
     let now = unix_timestamp();
-    let expires_at_unix = now + REQUEST_TTL_SECS;
+    let expires_at_unix = now + effective_ttl_secs(config);
     let path = request_path(cert_dir, &request_id);
     if let Some(existing) = read_request_path(&path)? {
         if !matches!(effective_status(&existing), AccessRequestStatus::Pending) {
@@ -308,6 +302,15 @@ pub(crate) fn approve_request(
         &stored.public_key_pem,
     )
     .map_err(|e| CallerError::Config(e.to_string()))?;
+    let client_fingerprint = super::access_policy::fingerprint_pem(&cert_pem)?;
+    super::access_policy::write_approved_identity(
+        cert_dir,
+        &client_fingerprint,
+        &stored.requester_label,
+        &profile,
+        stored.requester_card_url.as_deref(),
+        Some(&stored.request_id),
+    )?;
     stored.status = AccessRequestStatus::Approved;
     stored.approved_profile = Some(profile);
     stored.approved_at_unix = Some(unix_timestamp());
@@ -566,24 +569,7 @@ fn clean_label(raw: &str) -> Result<String, CallerError> {
 }
 
 fn clean_profile(raw: &str) -> Result<String, CallerError> {
-    let profile = raw.trim();
-    if profile.is_empty() {
-        return Err(CallerError::Config("profile cannot be empty".into()));
-    }
-    if profile.len() > 64 {
-        return Err(CallerError::Config(
-            "profile must be at most 64 bytes".into(),
-        ));
-    }
-    let valid = profile
-        .chars()
-        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '-' | '_' | ':' | '.'));
-    if !valid {
-        return Err(CallerError::Config(
-            "profile may contain only letters, numbers, '-', '_', ':', or '.'".into(),
-        ));
-    }
-    Ok(profile.to_string())
+    super::access_policy::normalize_profile(raw)
 }
 
 fn status_response(stored: &StoredAccessRequest) -> AccessRequestStatusResponse {
@@ -726,13 +712,29 @@ fn prune_expired(cert_dir: &Path) -> Result<(), CallerError> {
     Ok(())
 }
 
-fn enforce_pending_limits(cert_dir: &Path, source_hint: Option<&str>) -> Result<(), CallerError> {
+pub(crate) fn effective_body_limit_bytes(config: &PeerAccessRequestConfig) -> usize {
+    config.body_limit_bytes.max(1)
+}
+
+fn effective_ttl_secs(config: &PeerAccessRequestConfig) -> i64 {
+    config.ttl_secs.max(1)
+}
+
+fn effective_rate_limit_window_secs(config: &PeerAccessRequestConfig) -> i64 {
+    config.rate_limit_window_secs.max(1)
+}
+
+fn enforce_pending_limits(
+    cert_dir: &Path,
+    source_hint: Option<&str>,
+    config: &PeerAccessRequestConfig,
+) -> Result<(), CallerError> {
     let requests = read_all_requests(cert_dir)?;
     let pending: Vec<&StoredAccessRequest> = requests
         .iter()
         .filter(|r| effective_status(r) == AccessRequestStatus::Pending)
         .collect();
-    if pending.len() >= MAX_PENDING_REQUESTS {
+    if pending.len() >= config.max_pending {
         return Err(CallerError::Config(
             "too many pending peer access requests; approve, deny, or wait for expiry".into(),
         ));
@@ -742,13 +744,17 @@ fn enforce_pending_limits(cert_dir: &Path, source_hint: Option<&str>) -> Result<
             .iter()
             .filter(|r| r.source_hint.as_deref() == Some(source))
             .count();
-        if source_count >= MAX_PENDING_PER_SOURCE {
+        if source_count >= config.max_pending_per_source {
             return Err(CallerError::Config(format!(
                 "too many pending peer access requests from {source}"
             )));
         }
     }
     Ok(())
+}
+
+fn public_requests_enabled(config: &PeerAccessRequestConfig) -> bool {
+    config.enabled && public_requests_enabled_from_env()
 }
 
 fn public_requests_enabled_from_env() -> bool {
@@ -761,15 +767,19 @@ fn public_requests_enabled_from_env() -> bool {
     }
 }
 
-fn enforce_create_rate_limits(source_hint: Option<&str>) -> Result<(), CallerError> {
+fn enforce_create_rate_limits(
+    source_hint: Option<&str>,
+    config: &PeerAccessRequestConfig,
+) -> Result<(), CallerError> {
     let now = unix_timestamp();
     let limiter = CREATE_RATE_LIMITER.get_or_init(|| StdMutex::new(CreateRateLimiter::default()));
     let mut limiter = limiter
         .lock()
         .map_err(|_| CallerError::Config("peer access request rate limiter poisoned".into()))?;
+    let window_secs = effective_rate_limit_window_secs(config);
 
-    prune_rate_queue(&mut limiter.global, now);
-    if limiter.global.len() >= MAX_CREATE_REQUESTS_PER_WINDOW {
+    prune_rate_queue(&mut limiter.global, now, window_secs);
+    if limiter.global.len() >= config.max_creates_per_window {
         return Err(CallerError::Config(
             "peer access request rate limit exceeded".into(),
         ));
@@ -778,8 +788,8 @@ fn enforce_create_rate_limits(source_hint: Option<&str>) -> Result<(), CallerErr
     let source = source_hint.unwrap_or("unknown").to_string();
     {
         let source_queue = limiter.per_source.entry(source.clone()).or_default();
-        prune_rate_queue(source_queue, now);
-        if source_queue.len() >= MAX_CREATE_REQUESTS_PER_SOURCE_PER_WINDOW {
+        prune_rate_queue(source_queue, now, window_secs);
+        if source_queue.len() >= config.max_creates_per_source_per_window {
             return Err(CallerError::Config(format!(
                 "peer access request rate limit exceeded for {source}"
             )));
@@ -791,9 +801,9 @@ fn enforce_create_rate_limits(source_hint: Option<&str>) -> Result<(), CallerErr
     Ok(())
 }
 
-fn prune_rate_queue(queue: &mut VecDeque<i64>, now: i64) {
+fn prune_rate_queue(queue: &mut VecDeque<i64>, now: i64, window_secs: i64) {
     while let Some(ts) = queue.front().copied() {
-        if now - ts < RATE_LIMIT_WINDOW_SECS {
+        if now - ts < window_secs {
             break;
         }
         queue.pop_front();
@@ -897,6 +907,47 @@ mod tests {
     }
 
     #[test]
+    fn disabled_public_access_request_config_rejects_before_creating() {
+        let certs = tempfile::TempDir::new().unwrap();
+        let request = AccessRequestCreate {
+            version: 1,
+            requester_label: "primary".into(),
+            public_key_pem: "not checked while disabled".into(),
+            nonce: "0123456789abcdef".into(),
+            requested_profile: None,
+            requester_card_url: None,
+        };
+        let config = PeerAccessRequestConfig {
+            enabled: false,
+            ..Default::default()
+        };
+
+        let err = create_pending_request(
+            certs.path(),
+            request,
+            "https://target/.well-known/agent-card.json".into(),
+            Some("127.0.0.1".into()),
+            &config,
+        )
+        .unwrap_err();
+
+        assert!(err
+            .to_string()
+            .contains("peer access requests are disabled"));
+        assert!(read_all_requests(certs.path()).unwrap().is_empty());
+    }
+
+    #[test]
+    fn public_access_request_body_limit_clamps_to_one_byte() {
+        let config = PeerAccessRequestConfig {
+            body_limit_bytes: 0,
+            ..Default::default()
+        };
+
+        assert_eq!(effective_body_limit_bytes(&config), 1);
+    }
+
+    #[test]
     fn approve_request_signs_requester_public_key_without_private_key() {
         let certs = tempfile::TempDir::new().unwrap();
         setup_certs(certs.path());
@@ -915,6 +966,7 @@ mod tests {
             request,
             "https://target/.well-known/agent-card.json".into(),
             Some("127.0.0.1".into()),
+            &PeerAccessRequestConfig::default(),
         )
         .unwrap();
         let approved = approve_request(certs.path(), &created.code, None).unwrap();
@@ -977,11 +1029,16 @@ mod tests {
             unix_timestamp(),
             std::thread::current().id()
         );
-        for _ in 0..MAX_CREATE_REQUESTS_PER_SOURCE_PER_WINDOW {
-            enforce_create_rate_limits(Some(&source)).unwrap();
+        let config = PeerAccessRequestConfig {
+            max_creates_per_window: 1024,
+            max_creates_per_source_per_window: 2,
+            ..Default::default()
+        };
+        for _ in 0..config.max_creates_per_source_per_window {
+            enforce_create_rate_limits(Some(&source), &config).unwrap();
         }
 
-        let err = enforce_create_rate_limits(Some(&source)).unwrap_err();
+        let err = enforce_create_rate_limits(Some(&source), &config).unwrap_err();
         assert!(
             err.to_string()
                 .contains("peer access request rate limit exceeded"),
