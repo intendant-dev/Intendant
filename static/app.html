@@ -29798,6 +29798,70 @@ function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId
   return record ? sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, options) : [];
 }
 
+function sessionWindowTranscriptTimestampMs(value) {
+  const raw = String(value || '').trim();
+  if (!raw) return null;
+  const parenthetical = raw.match(/\(([^()]+)\)\s*$/);
+  if (parenthetical) {
+    const parsed = Date.parse(parenthetical[1]);
+    if (Number.isFinite(parsed)) return parsed;
+  }
+  const direct = Date.parse(raw);
+  if (Number.isFinite(direct)) return direct;
+  let match = raw.match(/^(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (match) {
+    const date = new Date();
+    date.setHours(Number(match[1]), Number(match[2]), Number(match[3] || 0), 0);
+    return date.getTime();
+  }
+  match = raw.match(/^(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{2})(?::(\d{2}))?$/);
+  if (match) {
+    const date = new Date();
+    date.setMonth(Number(match[1]) - 1, Number(match[2]));
+    date.setHours(Number(match[3]), Number(match[4]), Number(match[5] || 0), 0);
+    return date.getTime();
+  }
+  return null;
+}
+
+function sessionWindowTranscriptTimestampForHistoryItem(item) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) {
+    const ts = node.querySelector?.('.log-ts');
+    return sessionWindowTranscriptTimestampMs(ts?.title || ts?.textContent || '');
+  }
+  const record = sessionWindowHistoryRecord(item);
+  return sessionWindowTranscriptTimestampMs(record?.ts || record?.timestamp || '');
+}
+
+function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
+  if (!win || !Array.isArray(records) || records.length === 0) return;
+  const history = ensureSessionWindowHistory(win);
+  const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
+  for (const record of records) {
+    const item = prepareSessionWindowHistoryItem(record);
+    stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
+    const recordTs = sessionWindowTranscriptTimestampMs(record.ts || record.timestamp || '');
+    let index = history.length;
+    if (recordTs !== null) {
+      for (let i = 0; i < history.length; i++) {
+        const itemTs = sessionWindowTranscriptTimestampForHistoryItem(history[i]);
+        if (itemTs !== null && itemTs > recordTs) {
+          index = i;
+          break;
+        }
+      }
+    }
+    history.splice(index, 0, item);
+  }
+  if (shouldFollow || wasRenderingTail) {
+    renderSessionWindowTail(win);
+  } else {
+    renderSessionWindowRange(win, win.renderStart);
+  }
+  applySessionWindowOutputScroll(win, shouldFollow);
+}
+
 function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
   if (!win || !Array.isArray(entries)) return 0;
   const records = entries
@@ -29825,7 +29889,7 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
     }
   }
   if (!missing.length) return 0;
-  appendSessionWindowHistoryBatch(win, missing, sessionWindowShouldFollowNextOutput(win));
+  insertSessionWindowHistoryRecords(win, missing, sessionWindowShouldFollowNextOutput(win));
   return missing.length;
 }
 
