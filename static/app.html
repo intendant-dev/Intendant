@@ -29732,9 +29732,9 @@ function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = 
   return {
     sessionId,
     ts: String(record.ts || record.timestamp || '').trim(),
-    level: String(record.level || '').trim(),
-    source: String(record.source || '').trim(),
-    kind: String(record.kind || '').trim(),
+    level: String(record.level || '').trim().toLowerCase(),
+    source: String(record.source || '').trim().toLowerCase(),
+    kind: String(record.kind || '').trim().toLowerCase(),
     itemId: String(record.item_id || record.itemId || '').trim(),
     outputId: String(record.output_id || record.outputId || '').trim(),
     userTurnIndex: record.user_turn_index ?? record.userTurnIndex ?? '',
