@@ -423,9 +423,19 @@ impl StationInner {
     /// time-based animation (spins, pulses, breathing, auto-orbit) is gated
     /// behind `motion > 0`; live video thumbnails, an in-flight camera
     /// drag/pinch, and still-fading event particles also keep it running.
+    ///
+    /// In WebGPU mode the loop additionally never parks while active: the page
+    /// compositor pulls the canvas's SharedImage every compositor frame, and a
+    /// configured-but-unpresented WebGPU surface (after a resize, tab switch,
+    /// or display grant) reads back as uninitialized GPU memory — visually a
+    /// garbage/inverted frame, and ultimately a GPU-process crash. Presenting
+    /// every frame keeps the surface valid. Per-frame cost is bounded by the
+    /// cached layout/targets/fonts and persistent vertex buffers. The 2D-canvas
+    /// fallback has no SharedImage hazard, so it still parks on idle.
     fn is_animating(&self) -> bool {
         self.active
-            && (self.motion > 0.0
+            && (self.gpu.is_some()
+                || self.motion > 0.0
                 || !self.display_sources.is_empty()
                 || self.pointer_down.is_some()
                 || self.pinch_zoom.is_some()
