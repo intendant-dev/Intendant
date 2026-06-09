@@ -1323,6 +1323,7 @@ html, body {
   flex-wrap: wrap;
 }
 .daemon-pairing-row input,
+.daemon-pairing-row select,
 .daemon-pairing-textarea {
   flex: 1;
   min-width: 150px;
@@ -1333,6 +1334,9 @@ html, body {
   color: var(--text);
   font-size: 12px;
 }
+.daemon-pairing-row select {
+  cursor: pointer;
+}
 .daemon-pairing-textarea {
   width: 100%;
   min-height: 78px;
@@ -1341,6 +1345,7 @@ html, body {
   line-height: 1.35;
 }
 .daemon-pairing-row input:focus,
+.daemon-pairing-row select:focus,
 .daemon-pairing-textarea:focus {
   outline: none;
   border-color: var(--blue);
@@ -1374,6 +1379,42 @@ html, body {
 .daemon-pairing-secret {
   color: var(--yellow);
   font-size: 11px;
+}
+.daemon-pairing-mode-tabs {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+  padding: 3px;
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+}
+.daemon-pairing-mode-tabs button {
+  flex: 1 1 96px;
+  min-height: 30px;
+  padding: 5px 8px;
+  border: 1px solid transparent;
+  border-radius: 3px;
+  background: transparent;
+  color: var(--subtext0);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+.daemon-pairing-mode-tabs button.active {
+  background: var(--blue);
+  color: var(--crust);
+}
+.daemon-pairing-pane {
+  display: none;
+  flex-direction: column;
+  gap: 8px;
+}
+.daemon-pairing-pane.active {
+  display: flex;
+}
+.daemon-relationships-panel {
+  margin-top: 10px;
 }
 .daemon-access-request-card {
   display: grid;
@@ -1434,6 +1475,58 @@ html, body {
 }
 .daemon-access-request-actions button:hover:not(:disabled) {
   background: var(--surface1);
+}
+.daemon-identity-card {
+  display: grid;
+  gap: 6px;
+  padding: 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+}
+.daemon-identity-card.revoked {
+  opacity: 0.72;
+}
+.daemon-identity-head {
+  display: flex;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+}
+.daemon-identity-profile,
+.daemon-identity-status,
+.daemon-identity-fingerprint {
+  font-size: 11px;
+  color: var(--subtext0);
+}
+.daemon-identity-fingerprint {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.daemon-identity-status.approved { color: var(--green); }
+.daemon-identity-status.revoked { color: var(--red); }
+.daemon-identity-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 6px;
+}
+.daemon-identity-actions button {
+  padding: 4px 10px;
+  border: 1px solid var(--red);
+  border-radius: 3px;
+  background: transparent;
+  color: var(--red);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 700;
+}
+.daemon-identity-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
 }
 .daemon-manual-section {
   margin-top: 8px;
@@ -10280,54 +10373,83 @@ body.display-fullscreen-open {
           <div class="settings-pane-body settings-pane-body--wide">
             <fieldset class="settings-group">
               <legend>Daemons</legend>
-              <p style="color:var(--subtext0);font-size:12px;margin:0 0 10px">
-                Pair Intendant daemons with one-time invites. The invite contains a peer-scoped client certificate and server pin; treat it as a secret until the other daemon imports it.
-              </p>
               <div id="daemons-list" class="daemons-list"></div>
               <div class="daemon-pairing-grid">
-                <div class="daemon-pairing-panel">
-                  <div class="daemon-pairing-title">Create Invite</div>
-                  <div class="daemon-pairing-row">
-                    <input id="daemon-invite-card-url" type="text" placeholder="advertised URL (optional)" autocomplete="off">
-                    <input id="daemon-invite-label" type="text" placeholder="label (optional)" autocomplete="off">
+                <div class="daemon-pairing-panel daemon-add-wizard">
+                  <div class="daemon-pairing-title">Add Instance</div>
+                  <div class="daemon-pairing-mode-tabs" role="tablist" aria-label="Add instance mode">
+                    <button type="button" class="active" data-daemon-pairing-mode="request">Request</button>
+                    <button type="button" data-daemon-pairing-mode="join">Join Invite</button>
+                    <button type="button" data-daemon-pairing-mode="invite">Create Invite</button>
+                    <button type="button" data-daemon-pairing-mode="manual">Manual</button>
                   </div>
-                  <div class="daemon-pairing-row">
-                    <input id="daemon-invite-client-name" type="text" placeholder="client name (optional)" autocomplete="off">
-                    <button id="daemon-invite-create-btn" type="button">Create</button>
+
+                  <div class="daemon-pairing-pane active" data-daemon-pairing-pane="request">
+                    <div class="daemon-pairing-row">
+                      <input id="daemon-request-target-url" type="text" placeholder="target URL" autocomplete="off">
+                      <input id="daemon-request-label" type="text" placeholder="this daemon label" autocomplete="off">
+                    </div>
+                    <div class="daemon-pairing-row">
+                      <select id="daemon-request-profile">
+                        <option value="operator">Operator</option>
+                        <option value="read-only-display">Read-only display</option>
+                        <option value="task-runner">Task runner</option>
+                        <option value="stats">Stats</option>
+                        <option value="presence-only">Presence only</option>
+                        <option value="peer-daemon">Admin peer</option>
+                      </select>
+                      <button id="daemon-request-btn" type="button">Request</button>
+                    </div>
+                    <div class="daemon-pairing-row">
+                      <input id="daemon-request-id" type="text" placeholder="request id" autocomplete="off">
+                      <button id="daemon-request-complete-btn" type="button">Check</button>
+                    </div>
+                    <div id="daemon-request-code" class="daemon-pairing-secret"></div>
+                    <span id="daemon-request-status" class="daemon-pairing-status"></span>
                   </div>
-                  <textarea id="daemon-invite-output" class="daemon-pairing-textarea" rows="4" readonly placeholder="Invite appears here"></textarea>
-                  <div class="daemon-pairing-actions">
-                    <button id="daemon-invite-copy-btn" type="button" disabled>Copy</button>
-                    <span id="daemon-invite-status" class="daemon-pairing-status"></span>
+
+                  <div class="daemon-pairing-pane" data-daemon-pairing-pane="join">
+                    <textarea id="daemon-join-invite" class="daemon-pairing-textarea" rows="6" placeholder="Paste invite"></textarea>
+                    <div class="daemon-pairing-row">
+                      <input id="daemon-join-label" type="text" placeholder="label override" autocomplete="off">
+                      <button id="daemon-join-btn" type="button">Join</button>
+                    </div>
+                    <span id="daemon-join-status" class="daemon-pairing-status"></span>
                   </div>
-                  <div class="daemon-pairing-secret">Contains a client private key.</div>
+
+                  <div class="daemon-pairing-pane" data-daemon-pairing-pane="invite">
+                    <div class="daemon-pairing-row">
+                      <input id="daemon-invite-card-url" type="text" placeholder="advertised URL" autocomplete="off">
+                      <input id="daemon-invite-label" type="text" placeholder="label" autocomplete="off">
+                    </div>
+                    <div class="daemon-pairing-row">
+                      <input id="daemon-invite-client-name" type="text" placeholder="client name" autocomplete="off">
+                      <button id="daemon-invite-create-btn" type="button">Create</button>
+                    </div>
+                    <textarea id="daemon-invite-output" class="daemon-pairing-textarea" rows="4" readonly placeholder="Invite appears here"></textarea>
+                    <div class="daemon-pairing-actions">
+                      <button id="daemon-invite-copy-btn" type="button" disabled>Copy</button>
+                      <span id="daemon-invite-status" class="daemon-pairing-status"></span>
+                    </div>
+                    <div class="daemon-pairing-secret">Contains a client private key.</div>
+                  </div>
+
+                  <div class="daemon-pairing-pane" data-daemon-pairing-pane="manual">
+                    <div class="daemon-add-row">
+                      <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
+                      <input id="daemon-add-label" type="text" placeholder="label" autocomplete="off">
+                      <button id="daemon-add-btn" type="button">Add</button>
+                    </div>
+                    <div class="daemon-add-row daemon-add-row-via">
+                      <input id="daemon-add-via" type="text" placeholder="via URL(s)" autocomplete="off">
+                    </div>
+                    <div class="daemon-add-row daemon-add-row-via">
+                      <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL" autocomplete="off">
+                    </div>
+                    <span id="daemons-status" class="daemons-status"></span>
+                  </div>
                 </div>
-                <div class="daemon-pairing-panel">
-                  <div class="daemon-pairing-title">Join Invite</div>
-                  <textarea id="daemon-join-invite" class="daemon-pairing-textarea" rows="6" placeholder="Paste invite"></textarea>
-                  <div class="daemon-pairing-row">
-                    <input id="daemon-join-label" type="text" placeholder="label override (optional)" autocomplete="off">
-                    <button id="daemon-join-btn" type="button">Join</button>
-                  </div>
-                  <span id="daemon-join-status" class="daemon-pairing-status"></span>
-                </div>
-                <div class="daemon-pairing-panel">
-                  <div class="daemon-pairing-title">Request Access</div>
-                  <div class="daemon-pairing-row">
-                    <input id="daemon-request-target-url" type="text" placeholder="target URL" autocomplete="off">
-                    <input id="daemon-request-label" type="text" placeholder="this daemon label (optional)" autocomplete="off">
-                  </div>
-                  <div class="daemon-pairing-row">
-                    <input id="daemon-request-profile" type="text" placeholder="profile (optional)" autocomplete="off">
-                    <button id="daemon-request-btn" type="button">Request</button>
-                  </div>
-                  <div class="daemon-pairing-row">
-                    <input id="daemon-request-id" type="text" placeholder="request id" autocomplete="off">
-                    <button id="daemon-request-complete-btn" type="button">Check</button>
-                  </div>
-                  <div id="daemon-request-code" class="daemon-pairing-secret"></div>
-                  <span id="daemon-request-status" class="daemon-pairing-status"></span>
-                </div>
+
                 <div class="daemon-pairing-panel">
                   <div class="daemon-pairing-title">Incoming Requests</div>
                   <div id="daemon-access-requests-list" class="daemons-list"></div>
@@ -10337,20 +10459,14 @@ body.display-fullscreen-open {
                   </div>
                 </div>
               </div>
-              <div class="daemon-manual-section">
-                <div class="daemon-manual-title">Manual Runtime Connection</div>
-                <div class="daemon-add-row">
-                  <input id="daemon-add-url" type="text" placeholder="https://mac-work:8765" autocomplete="off">
-                  <input id="daemon-add-label" type="text" placeholder="label (optional)" autocomplete="off">
-                  <button id="daemon-add-btn" type="button">Add</button>
+
+              <div class="daemon-pairing-panel daemon-relationships-panel">
+                <div class="daemon-pairing-title">Trusted Relationships</div>
+                <div id="daemon-peer-identities-list" class="daemons-list"></div>
+                <div class="daemon-pairing-actions">
+                  <button id="daemon-peer-identities-refresh-btn" type="button">Refresh</button>
+                  <span id="daemon-peer-identities-status" class="daemon-pairing-status"></span>
                 </div>
-                <div class="daemon-add-row daemon-add-row-via">
-                  <input id="daemon-add-via" type="text" placeholder="via URL(s), e.g. ws://192.168.1.42:8766/ws — override card's transports (optional)" autocomplete="off">
-                </div>
-                <div class="daemon-add-row daemon-add-row-via">
-                  <input id="daemon-add-browser-tcp-via" type="text" placeholder="browser TCP URL, e.g. ws://192.168.1.42:8766/ws — WebRTC ICE-TCP when browser's view differs from via URL (optional)" autocomplete="off">
-                </div>
-                <span id="daemons-status" class="daemons-status"></span>
               </div>
             </fieldset>
 
@@ -45003,6 +45119,32 @@ function setDaemonPairingStatus(id, msg, kind) {
   el.className = 'daemon-pairing-status' + (kind ? ' ' + kind : '');
 }
 
+const PEER_PROFILE_OPTIONS = [
+  ['operator', 'Operator'],
+  ['read-only-display', 'Read-only display'],
+  ['task-runner', 'Task runner'],
+  ['stats', 'Stats'],
+  ['presence-only', 'Presence only'],
+  ['peer-daemon', 'Admin peer'],
+];
+
+function renderPeerProfileOptions(selected) {
+  const value = String(selected || 'operator').toLowerCase();
+  return PEER_PROFILE_OPTIONS.map(([profile, label]) => (
+    `<option value="${escapeHtml(profile)}" ${profile === value ? 'selected' : ''}>${escapeHtml(label)}</option>`
+  )).join('');
+}
+
+function setDaemonPairingMode(mode) {
+  const next = mode || 'request';
+  document.querySelectorAll('[data-daemon-pairing-mode]').forEach(button => {
+    button.classList.toggle('active', button.getAttribute('data-daemon-pairing-mode') === next);
+  });
+  document.querySelectorAll('[data-daemon-pairing-pane]').forEach(pane => {
+    pane.classList.toggle('active', pane.getAttribute('data-daemon-pairing-pane') === next);
+  });
+}
+
 async function createDaemonInvite() {
   const cardUrlInput = document.getElementById('daemon-invite-card-url');
   const labelInput = document.getElementById('daemon-invite-label');
@@ -45040,6 +45182,7 @@ async function createDaemonInvite() {
     if (copyBtn) copyBtn.disabled = !output.value;
     const target = result.card_url ? ` for ${result.card_url}` : '';
     setDaemonPairingStatus('daemon-invite-status', `Invite ready${target}`, 'ok');
+    await loadPeerIdentities();
   } catch (e) {
     setDaemonPairingStatus('daemon-invite-status', `Request failed: ${e.message}`, 'error');
   } finally {
@@ -45244,6 +45387,7 @@ function renderPeerAccessRequests(requests) {
     const expires = req.expires_at_unix ? `Expires ${escapeHtml(accessRequestTimeLabel(req.expires_at_unix))}` : '';
     const timing = [source, expires].filter(Boolean).join(' - ');
     const pending = status === 'pending';
+    const requestedProfile = req.approved_profile || req.requested_profile || 'operator';
     return `
       <div class="daemon-access-request-card">
         <div class="daemon-access-request-head">
@@ -45252,6 +45396,7 @@ function renderPeerAccessRequests(requests) {
         </div>
         <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - Profile ${profile}</div>
         ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
+        ${pending ? `<div class="daemon-pairing-row"><select data-access-request-profile="${escapeHtml(requestId)}">${renderPeerProfileOptions(requestedProfile)}</select></div>` : ''}
         <div class="daemon-access-request-actions">
           <button class="approve" type="button" data-access-request-action="approve" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Approve</button>
           <button class="deny" type="button" data-access-request-action="deny" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Deny</button>
@@ -45273,10 +45418,15 @@ async function decidePeerAccessRequest(requestId, op) {
   if (!requestId || !/^(approve|deny)$/.test(op)) return;
   setDaemonPairingStatus('daemon-access-requests-status', `${op === 'approve' ? 'Approving' : 'Denying'}...`, '');
   try {
+    const body = {};
+    if (op === 'approve') {
+      const profileSelect = document.querySelector(`[data-access-request-profile="${CSS.escape(requestId)}"]`);
+      if (profileSelect && profileSelect.value) body.profile = profileSelect.value;
+    }
     const resp = await authedFetch(`/api/peers/pairing/requests/${encodeURIComponent(requestId)}/${op}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: '{}',
+      body: JSON.stringify(body),
     });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
@@ -45289,8 +45439,86 @@ async function decidePeerAccessRequest(requestId, op) {
       op === 'approve' ? 'ok' : ''
     );
     await loadPeerAccessRequests();
+    if (op === 'approve') await loadPeerIdentities();
   } catch (e) {
     setDaemonPairingStatus('daemon-access-requests-status', `Request failed: ${e.message}`, 'error');
+  }
+}
+
+async function loadPeerIdentities() {
+  const list = document.getElementById('daemon-peer-identities-list');
+  if (!list) return;
+  setDaemonPairingStatus('daemon-peer-identities-status', 'Loading...', '');
+  try {
+    const resp = await authedFetch('/api/peers/pairing/identities');
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    renderPeerIdentities(Array.isArray(result.identities) ? result.identities : []);
+    setDaemonPairingStatus('daemon-peer-identities-status', 'Updated', 'ok');
+  } catch (e) {
+    setDaemonPairingStatus('daemon-peer-identities-status', `Request failed: ${e.message}`, 'error');
+  }
+}
+
+function renderPeerIdentities(identities) {
+  const list = document.getElementById('daemon-peer-identities-list');
+  if (!list) return;
+  if (!identities.length) {
+    list.innerHTML = '<div class="daemon-access-request-meta">No trusted peer identities.</div>';
+    return;
+  }
+
+  list.innerHTML = identities.map(identity => {
+    const fingerprint = String(identity.fingerprint || '');
+    const label = escapeHtml(identity.label || 'Unnamed daemon');
+    const status = String(identity.status || 'unknown').toLowerCase();
+    const profile = escapeHtml(identity.profile || 'presence-only');
+    const request = identity.request_id ? `Request ${escapeHtml(identity.request_id)}` : '';
+    const card = identity.card_url ? escapeHtml(identity.card_url) : '';
+    const active = status === 'approved';
+    return `
+      <div class="daemon-identity-card ${escapeHtml(status)}">
+        <div class="daemon-identity-head">
+          <span>${label}</span>
+          <span class="daemon-identity-status ${escapeHtml(status)}">${escapeHtml(status)}</span>
+        </div>
+        <div class="daemon-identity-profile">Profile ${profile}${request ? ` - ${request}` : ''}</div>
+        ${card ? `<div class="daemon-identity-profile">${card}</div>` : ''}
+        <div class="daemon-identity-fingerprint" title="${escapeHtml(fingerprint)}">${escapeHtml(fingerprint)}</div>
+        <div class="daemon-identity-actions">
+          <button type="button" data-peer-identity-revoke="${escapeHtml(fingerprint)}" ${active ? '' : 'disabled'}>Revoke</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  list.querySelectorAll('[data-peer-identity-revoke]').forEach(button => {
+    button.addEventListener('click', () => revokePeerIdentity(button.getAttribute('data-peer-identity-revoke') || ''));
+  });
+}
+
+async function revokePeerIdentity(identity) {
+  const value = String(identity || '').trim();
+  if (!value) return;
+  setDaemonPairingStatus('daemon-peer-identities-status', 'Revoking...', '');
+  try {
+    const resp = await authedFetch('/api/peers/pairing/identities/revoke', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ identity: value }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    setDaemonPairingStatus('daemon-peer-identities-status', 'Revoked', 'ok');
+    await loadPeerIdentities();
+  } catch (e) {
+    setDaemonPairingStatus('daemon-peer-identities-status', `Request failed: ${e.message}`, 'error');
   }
 }
 
@@ -45533,6 +45761,13 @@ async function initDaemons() {
   // Apply remembered Settings sub-tab now that the DOM is ready.
   applyInitialSettingsSubtab();
 
+  document.querySelectorAll('[data-daemon-pairing-mode]').forEach(button => {
+    button.addEventListener('click', () => {
+      setDaemonPairingMode(button.getAttribute('data-daemon-pairing-mode') || 'request');
+    });
+  });
+  setDaemonPairingMode('request');
+
   const inviteCreateBtn = document.getElementById('daemon-invite-create-btn');
   if (inviteCreateBtn) inviteCreateBtn.addEventListener('click', createDaemonInvite);
   const inviteCopyBtn = document.getElementById('daemon-invite-copy-btn');
@@ -45580,6 +45815,9 @@ async function initDaemons() {
   const requestsRefreshBtn = document.getElementById('daemon-access-requests-refresh-btn');
   if (requestsRefreshBtn) requestsRefreshBtn.addEventListener('click', loadPeerAccessRequests);
   loadPeerAccessRequests().catch(() => {});
+  const identitiesRefreshBtn = document.getElementById('daemon-peer-identities-refresh-btn');
+  if (identitiesRefreshBtn) identitiesRefreshBtn.addEventListener('click', loadPeerIdentities);
+  loadPeerIdentities().catch(() => {});
 
   // Wire the add form.
   document.getElementById('daemon-add-btn').addEventListener('click', addDaemon);

@@ -87,6 +87,8 @@ type WsStream = WebSocketStream<MaybeTlsStream<TcpStream>>;
 type WsSink = futures_util::stream::SplitSink<WsStream, Message>;
 
 const CARD_FETCH_TIMEOUT: Duration = Duration::from_secs(10);
+pub const PEER_CLIENT_HEADER: &str = "x-intendant-peer";
+pub const PEER_CLIENT_HEADER_VALUE: &str = "1";
 
 pub struct IntendantWsTransport {
     spec: TransportSpec,
@@ -230,7 +232,9 @@ impl IntendantWsTransport {
             self.creds.client_identity.as_ref(),
         )?;
 
-        let mut request = client.get(&card_url);
+        let mut request = client
+            .get(&card_url)
+            .header(PEER_CLIENT_HEADER, PEER_CLIENT_HEADER_VALUE);
         if let Some(token) = &self.creds.bearer_token {
             request = request.bearer_auth(token);
         }
@@ -293,6 +297,12 @@ impl IntendantWsTransport {
             })?;
             request.headers_mut().insert("Authorization", value);
         }
+        request.headers_mut().insert(
+            PEER_CLIENT_HEADER,
+            PEER_CLIENT_HEADER_VALUE
+                .parse()
+                .expect("static header value"),
+        );
 
         let connector: Option<Connector> = super::tls_client::rustls_client_config(
             &self.creds.pinned_fingerprints,

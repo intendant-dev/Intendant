@@ -87,6 +87,8 @@ enum PeerAction {
     Approve,
     Deny,
     Complete,
+    Identities,
+    Revoke,
     Help,
 }
 
@@ -120,6 +122,8 @@ pub async fn run(argv: Vec<String>) -> Result<(), CallerError> {
         PeerAction::Approve => cmd_approve(args),
         PeerAction::Deny => cmd_deny(args),
         PeerAction::Complete => cmd_complete(args).await,
+        PeerAction::Identities => cmd_identities(),
+        PeerAction::Revoke => cmd_revoke(args),
     }
 }
 
@@ -141,10 +145,12 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
         "approve" => PeerAction::Approve,
         "deny" => PeerAction::Deny,
         "complete" | "poll" => PeerAction::Complete,
+        "identities" | "identity" => PeerAction::Identities,
+        "revoke" => PeerAction::Revoke,
         "help" | "-h" | "--help" => return Ok(args),
         other => {
             return Err(CallerError::Config(format!(
-                "unknown peer subcommand '{other}' (expected invite/join/request/requests/approve/deny/complete)"
+                "unknown peer subcommand '{other}' (expected invite/join/request/requests/approve/deny/complete/identities/revoke)"
             )));
         }
     };
@@ -204,7 +210,10 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
                 PeerAction::Request if args.target_url.is_none() => {
                     args.target_url = Some(other.to_string());
                 }
-                PeerAction::Approve | PeerAction::Deny | PeerAction::Complete
+                PeerAction::Approve
+                | PeerAction::Deny
+                | PeerAction::Complete
+                | PeerAction::Revoke
                     if args.code_or_id.is_none() =>
                 {
                     args.code_or_id = Some(other.to_string());
@@ -229,9 +238,14 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
                         "unexpected extra request argument '{other}'"
                     )));
                 }
-                PeerAction::Requests => {
+                PeerAction::Revoke => {
                     return Err(CallerError::Config(format!(
-                        "unexpected argument '{other}' for `intendant peer requests`"
+                        "unexpected extra identity argument '{other}'"
+                    )));
+                }
+                PeerAction::Requests | PeerAction::Identities => {
+                    return Err(CallerError::Config(format!(
+                        "unexpected argument '{other}' for this peer subcommand"
                     )));
                 }
                 PeerAction::Help => {}
@@ -253,6 +267,8 @@ fn print_help() {
     println!("    intendant peer approve <CODE_OR_ID> [--profile PROFILE]");
     println!("    intendant peer deny <CODE_OR_ID>");
     println!("    intendant peer complete <REQUEST_ID> [--label NAME]");
+    println!("    intendant peer identities");
+    println!("    intendant peer revoke <FINGERPRINT_OR_LABEL>");
     println!();
     println!("ACTIONS:");
     println!("    invite        Issue a secret peer invite from this daemon");
@@ -262,6 +278,8 @@ fn print_help() {
     println!("    approve       Approve an incoming access request and issue its cert");
     println!("    deny          Deny an incoming access request");
     println!("    complete      Poll an outgoing access request and install it if approved");
+    println!("    identities    List approved/revoked inbound peer identities");
+    println!("    revoke        Revoke an inbound peer identity certificate");
     println!();
     println!("FLAGS:");
     println!("    --card-url <URL>     Agent Card URL to store in the invite");
@@ -446,6 +464,49 @@ async fn cmd_complete(args: PeerArgs) -> Result<(), CallerError> {
     Ok(())
 }
 
+fn cmd_identities() -> Result<(), CallerError> {
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let identities = crate::peer::access_policy::list_identities(&cert_dir)?;
+    if identities.is_empty() {
+        println!(":: no inbound peer identities");
+        return Ok(());
+    }
+    for identity in identities {
+        println!(
+            "{}  {:?}  profile={}  label={}{}{}",
+            identity.fingerprint,
+            identity.status,
+            identity.profile,
+            identity.label,
+            identity
+                .request_id
+                .as_deref()
+                .map(|id| format!("  request_id={id}"))
+                .unwrap_or_default(),
+            identity
+                .card_url
+                .as_deref()
+                .map(|url| format!("  card_url={url}"))
+                .unwrap_or_default(),
+        );
+    }
+    Ok(())
+}
+
+fn cmd_revoke(args: PeerArgs) -> Result<(), CallerError> {
+    let identity = args.code_or_id.ok_or_else(|| {
+        CallerError::Config("`intendant peer revoke` requires a fingerprint or label".into())
+    })?;
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let record = crate::peer::access_policy::revoke_identity(&cert_dir, &identity)?;
+    println!(
+        ":: revoked peer identity {} for {}",
+        record.fingerprint, record.label
+    );
+    println!(":: profile was {}", record.profile);
+    Ok(())
+}
+
 pub(crate) fn create_invite(options: InviteOptions) -> Result<InviteOutcome, CallerError> {
     let cert_dir = access::backend::select_backend().cert_dir();
     create_invite_from_cert_dir(&cert_dir, options)
@@ -465,6 +526,7 @@ pub(crate) fn create_invite_from_cert_dir(
     };
     let identity =
         access::certs::issue_client_identity(cert_dir, &client_name).map_err(access_error)?;
+    let client_fingerprint = crate::peer::access_policy::fingerprint_pem(&identity.cert_pem)?;
     let server_cert_fingerprint = access::certs::read_server_cert_fingerprint(cert_dir)
         .ok_or_else(|| {
             CallerError::Config(format!(
@@ -476,6 +538,14 @@ pub(crate) fn create_invite_from_cert_dir(
     crate::peer::transport::pinning::parse_fingerprint(&server_cert_fingerprint).map_err(|e| {
         CallerError::Config(format!("local server cert fingerprint is invalid: {e}"))
     })?;
+    crate::peer::access_policy::write_approved_identity(
+        cert_dir,
+        &client_fingerprint,
+        &client_name,
+        crate::peer::access_policy::DEFAULT_PROFILE,
+        Some(&card_url),
+        None,
+    )?;
 
     let invite = PeerInvite {
         version: 1,

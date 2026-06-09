@@ -361,6 +361,19 @@ pairing approval. It is bounded and rate-limited, and approval still happens
 locally before any client certificate is issued. Set
 `INTENDANT_PEER_ACCESS_REQUESTS=0` to disable public request creation entirely.
 
+`[server.peer_access_requests]` — public access-request hardening:
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `true` | Allow unauthenticated callers to create bounded pending peer access requests; `INTENDANT_PEER_ACCESS_REQUESTS=0` still disables this at runtime |
+| `body_limit_bytes` | integer | `4096` | Maximum body size for `POST /api/peer-pairing/requests` |
+| `ttl_secs` | integer | `600` | Lifetime of a pending request before it expires |
+| `max_pending` | integer | `32` | Global cap on simultaneously pending requests |
+| `max_pending_per_source` | integer | `5` | Cap on simultaneously pending requests from one source IP/hint |
+| `rate_limit_window_secs` | integer | `60` | Sliding-window duration for create-rate limits |
+| `max_creates_per_window` | integer | `64` | Global request creations allowed per rate-limit window |
+| `max_creates_per_source_per_window` | integer | `8` | Request creations allowed from one source IP/hint per rate-limit window |
+
 `[server.auth]` — advanced compatibility auth for federation peers:
 
 | Key | Type | Default | Description |

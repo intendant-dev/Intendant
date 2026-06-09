@@ -40,6 +40,13 @@ impl<T: AsyncRead + AsyncWrite + Unpin + Send> AsyncReadWrite for T {}
 /// HTTP/WebSocket handling.
 type DemuxStream = std::pin::Pin<Box<dyn AsyncReadWrite>>;
 
+#[derive(Debug, Clone)]
+struct PeerConnectionIdentity {
+    fingerprint: String,
+    label: String,
+    profile: String,
+}
+
 /// Finalize a one-shot HTTP response on a demuxed stream before it drops.
 ///
 /// Every dashboard HTTP reply is a single buffered response sent with
@@ -812,12 +819,13 @@ fn build_federated_authority_handler(
     session_id: String,
     authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
     authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
+    allow_input_authority: bool,
 ) -> crate::display::webrtc::AuthorityChannelHandler {
     use crate::display::webrtc::AuthorityChannelMessage;
     Arc::new(move |msg| match msg {
         AuthorityChannelMessage::Request {
             display_id: req_did,
-        } if req_did == display_id => {
+        } if req_did == display_id && allow_input_authority => {
             apply_grant_input_authority_federated(
                 display_id,
                 federation_connection_id.clone(),
@@ -825,6 +833,12 @@ fn build_federated_authority_handler(
                 &authority,
                 &authority_change_tx,
             );
+        }
+        AuthorityChannelMessage::Request { .. } if !allow_input_authority => {
+            // Read-only peer profile: view signaling is allowed, input authority
+            // requests are ignored. The input-injection authorizer below is also
+            // deny-all, so a malformed client cannot bypass this by sending input
+            // without first becoming the holder.
         }
         AuthorityChannelMessage::Release {
             display_id: req_did,
@@ -1413,6 +1427,10 @@ pub struct WebGatewayConfig {
     /// intendant.toml.
     #[serde(default)]
     pub federation_allow_h264: bool,
+    /// Public peer access-request hardening. This is gateway runtime state,
+    /// not browser config, so `/config` intentionally omits it.
+    #[serde(skip)]
+    pub peer_access_requests: crate::project::PeerAccessRequestConfig,
 }
 
 impl Default for WebGatewayConfig {
@@ -1427,6 +1445,7 @@ impl Default for WebGatewayConfig {
             transcription_enabled: false,
             ice_servers: Vec::new(),
             federation_allow_h264: false,
+            peer_access_requests: crate::project::PeerAccessRequestConfig::default(),
         }
     }
 }
@@ -13025,6 +13044,7 @@ pub fn spawn_web_gateway(
     tls_acceptor: Option<tokio_rustls::TlsAcceptor>,
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
+    let peer_access_request_config = config.peer_access_requests.clone();
 
     // Build the local Agent Card from live runtime state so
     // `/.well-known/agent-card.json` can serve it. The transport URLs
@@ -13431,6 +13451,7 @@ pub fn spawn_web_gateway(
             let broadcast_tx = broadcast_tx.clone();
             let config_json = config_json.clone();
             let agent_card_json = agent_card_json.clone();
+            let peer_access_request_config = peer_access_request_config.clone();
             let peer_registry = peer_registry.clone();
             let ice_config = ice_config.clone();
             let tcp_peer_registry = Arc::clone(&tcp_peer_registry);
@@ -13653,6 +13674,7 @@ pub fn spawn_web_gateway(
                 let n: usize;
                 let mut stream: DemuxStream;
                 let tls_client_cert_present: bool;
+                let tls_client_cert_fingerprint: Option<String>;
                 if is_tls {
                     let acceptor = tls_acceptor
                         .as_ref()
@@ -13665,12 +13687,16 @@ pub fn spawn_web_gateway(
                             return;
                         }
                     };
-                    tls_client_cert_present = tls_stream
+                    let peer_certs = tls_stream
                         .get_ref()
                         .1
                         .peer_certificates()
-                        .map(|certs| !certs.is_empty())
-                        .unwrap_or(false);
+                        .map(|certs| certs.to_vec())
+                        .unwrap_or_default();
+                    tls_client_cert_present = !peer_certs.is_empty();
+                    tls_client_cert_fingerprint = peer_certs
+                        .first()
+                        .map(|cert| crate::peer::access_policy::fingerprint_der(cert.as_ref()));
                     // Read the first segment of the *decrypted* request so
                     // we can route on the real HTTP request line/headers.
                     // This is the TLS analogue of the plain-path peek.
@@ -13699,6 +13725,7 @@ pub fn spawn_web_gateway(
                     n = peeked;
                     buf_owned = buf[..peeked].to_vec();
                     tls_client_cert_present = false;
+                    tls_client_cert_fingerprint = None;
                     stream = Box::pin(crate::web_tls::PrefixedStream::new(Vec::new(), raw_stream));
                 }
                 // Downstream code reads `buf[..n]`; point `buf` at the
@@ -13707,6 +13734,33 @@ pub fn spawn_web_gateway(
 
                 let header_text = String::from_utf8_lossy(&buf[..n]);
                 let request_line = header_text.lines().next().unwrap_or("");
+                let peer_connection_identity = match resolve_peer_connection_identity(
+                    &header_text,
+                    tls_client_cert_fingerprint.as_deref(),
+                ) {
+                    Ok(identity) => identity,
+                    Err((status, body)) => {
+                        use tokio::io::AsyncWriteExt;
+                        let reason = match status {
+                            401 => "Unauthorized",
+                            403 => "Forbidden",
+                            _ => "Error",
+                        };
+                        let response = format!(
+                            "HTTP/1.1 {status} {reason}\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}",
+                            body.len(),
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
+                };
                 let is_websocket = header_text
                     .lines()
                     .any(|l| l.to_lowercase().contains("upgrade: websocket"));
@@ -13780,6 +13834,12 @@ pub fn spawn_web_gateway(
                         finalize_http_stream(&mut stream).await;
                         return;
                     }
+                    let peer_profile_for_ws = peer_connection_identity
+                        .as_ref()
+                        .map(|identity| identity.profile.clone());
+                    let peer_label_for_ws = peer_connection_identity
+                        .as_ref()
+                        .map(|identity| identity.label.clone());
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(_) => return,
@@ -14085,6 +14145,8 @@ pub fn spawn_web_gateway(
                     let session_registry_inbound = session_registry.clone();
                     let task_tx_inbound = task_tx.clone();
                     let terminal_registry_inbound = terminal_registry.clone();
+                    let peer_profile_inbound = peer_profile_for_ws.clone();
+                    let peer_label_inbound = peer_label_for_ws.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -15789,11 +15851,23 @@ pub fn spawn_web_gateway(
                                             // gets re-broadcast as AppEvent::ControlCommand
                                             // for the agent loop / TUI / MCP consumers.
                                             match serde_json::from_value::<ControlMsg>(json) {
+                                                Ok(ctrl)
+                                                    if !peer_profile_allows_ws_control(
+                                                        peer_profile_inbound.as_deref(),
+                                                        peer_label_inbound.as_deref(),
+                                                        &ctrl,
+                                                        &bus_inbound,
+                                                    ) => {}
                                                 Ok(ControlMsg::WebRtcSignal {
                                                     display_id,
                                                     session_id,
                                                     signal,
                                                 }) => {
+                                                    let federated_display_input_allowed =
+                                                        peer_profile_inbound
+                                                            .as_deref()
+                                                            .map(crate::peer::access_policy::profile_allows_federated_display_input)
+                                                            .unwrap_or(true);
                                                     handle_federated_webrtc_signal(
                                                         display_id,
                                                         session_id,
@@ -15813,6 +15887,7 @@ pub fn spawn_web_gateway(
                                                         Arc::clone(&display_input_authority_inbound),
                                                         authority_change_tx_inbound.clone(),
                                                         Arc::clone(&federated_authority_subscribers_inbound),
+                                                        federated_display_input_allowed,
                                                     ).await;
                                                 }
                                                 Ok(ControlMsg::RequestDisplayInputAuthority {
@@ -16264,6 +16339,34 @@ pub fn spawn_web_gateway(
                     // `inbound_bearer_token` docs on `spawn_web_gateway`
                     // for the design rationale.
                     if is_federation_path(request_line) {
+                        if let Some(identity) = &peer_connection_identity {
+                            if !crate::peer::access_policy::profile_allows_federation_http(
+                                &identity.profile,
+                                request_line,
+                            ) {
+                                use tokio::io::AsyncWriteExt;
+                                let body = serde_json::json!({
+                                    "error": "peer profile does not allow this operation",
+                                    "profile": identity.profile,
+                                    "peer": identity.label,
+                                    "fingerprint": identity.fingerprint,
+                                })
+                                .to_string();
+                                let response = format!(
+                                    "HTTP/1.1 403 Forbidden\r\n\
+                                     Content-Type: application/json\r\n\
+                                     Content-Length: {}\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Connection: close\r\n\
+                                     \r\n\
+                                     {body}",
+                                    body.len(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                                finalize_http_stream(&mut stream).await;
+                                return;
+                            }
+                        }
                         if let Err((status, body)) =
                             verify_bearer_token(&header_text, inbound_bearer_token.as_deref())
                         {
@@ -17910,7 +18013,9 @@ pub fn spawn_web_gateway(
                                 match read_request_body_capped(
                                     &mut stream,
                                     &header_text,
-                                    crate::peer::access_request::REQUEST_BODY_LIMIT_BYTES,
+                                    crate::peer::access_request::effective_body_limit_bytes(
+                                        &peer_access_request_config,
+                                    ),
                                 )
                                 .await
                                 {
@@ -17919,6 +18024,7 @@ pub fn spawn_web_gateway(
                                         &header_text,
                                         is_tls,
                                         Some(source_hint.clone()),
+                                        &peer_access_request_config,
                                     ),
                                     Err((status, body)) => (status, body),
                                 }
@@ -17998,6 +18104,15 @@ pub fn spawn_web_gateway(
                             && request_line.starts_with("GET")
                         {
                             peers_pairing_requests_list()
+                        } else if segments == ["pairing", "identities"]
+                            && request_line.starts_with("GET")
+                        {
+                            peers_pairing_identities_list()
+                        } else if segments == ["pairing", "identities", "revoke"]
+                            && request_line.starts_with("POST")
+                        {
+                            let body_text = read_request_body(&mut stream, &header_text).await;
+                            peers_pairing_identity_revoke(&body_text)
                         } else if segments.len() == 4
                             && segments[0] == "pairing"
                             && segments[1] == "requests"
@@ -18676,6 +18791,11 @@ struct PairingAccessRequestDecision {
 }
 
 #[derive(Deserialize)]
+struct PairingIdentityRevokeRequest {
+    identity: String,
+}
+
+#[derive(Deserialize)]
 struct RemovePeerRequest {
     peer_id: String,
 }
@@ -18795,6 +18915,7 @@ fn peer_access_request_create(
     header_text: &str,
     is_tls: bool,
     source_hint: Option<String>,
+    config: &crate::project::PeerAccessRequestConfig,
 ) -> (u16, String) {
     let req: crate::peer::access_request::AccessRequestCreate =
         match serde_json::from_str(body_text) {
@@ -18813,8 +18934,13 @@ fn peer_access_request_create(
         );
     };
     let cert_dir = crate::access::backend::select_backend().cert_dir();
-    match crate::peer::access_request::create_pending_request(&cert_dir, req, card_url, source_hint)
-    {
+    match crate::peer::access_request::create_pending_request(
+        &cert_dir,
+        req,
+        card_url,
+        source_hint,
+        config,
+    ) {
         Ok(created) => (200, serde_json::to_string(&created).unwrap_or_default()),
         Err(crate::error::CallerError::Config(msg))
             if msg.contains("peer access requests are disabled") =>
@@ -19080,6 +19206,58 @@ fn peers_pairing_request_decision(code_or_id: &str, op: &str, body_text: &str) -
     }
 }
 
+fn peers_pairing_identities_list() -> (u16, String) {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    peers_pairing_identities_list_from_cert_dir(&cert_dir)
+}
+
+fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u16, String) {
+    match crate::peer::access_policy::list_identities(&cert_dir) {
+        Ok(records) => {
+            let identities: Vec<serde_json::Value> =
+                records.into_iter().map(identity_summary_json).collect();
+            (
+                200,
+                serde_json::json!({ "identities": identities }).to_string(),
+            )
+        }
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
+fn peers_pairing_identity_revoke(body_text: &str) -> (u16, String) {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    peers_pairing_identity_revoke_from_cert_dir(&cert_dir, body_text)
+}
+
+fn peers_pairing_identity_revoke_from_cert_dir(cert_dir: &Path, body_text: &str) -> (u16, String) {
+    let body: PairingIdentityRevokeRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    if body.identity.trim().is_empty() {
+        return (
+            400,
+            serde_json::json!({"error": "identity is required"}).to_string(),
+        );
+    }
+    match crate::peer::access_policy::revoke_identity(&cert_dir, &body.identity) {
+        Ok(record) => (200, identity_summary_json(record).to_string()),
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
 fn access_request_summary_json(
     request: crate::peer::access_request::StoredAccessRequest,
 ) -> serde_json::Value {
@@ -19096,6 +19274,21 @@ fn access_request_summary_json(
         "expires_at_unix": request.expires_at_unix,
         "approved_at_unix": request.approved_at_unix,
         "denied_at_unix": request.denied_at_unix,
+    })
+}
+
+fn identity_summary_json(
+    record: crate::peer::access_policy::PeerIdentityRecord,
+) -> serde_json::Value {
+    serde_json::json!({
+        "fingerprint": record.fingerprint,
+        "label": record.label,
+        "profile": record.profile,
+        "status": record.status,
+        "card_url": record.card_url,
+        "request_id": record.request_id,
+        "created_at_unix": record.created_at_unix,
+        "revoked_at_unix": record.revoked_at_unix,
     })
 }
 
@@ -19824,6 +20017,7 @@ async fn handle_federated_webrtc_signal(
     display_input_authority: Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
     authority_change_tx: broadcast::Sender<DisplayInputAuthorityChange>,
     federated_authority_subscribers: FederatedAuthoritySubscribers,
+    federated_display_input_allowed: bool,
 ) {
     // Short tag used as the `source` on every log line this handler
     // emits, so the operator can filter the session log to just the
@@ -19961,12 +20155,17 @@ async fn handle_federated_webrtc_signal(
             // holder); only the matching federated holder identity
             // returns true. See [`build_federated_input_authorizer`]
             // for the matching positive/negative test cases.
-            let input_authorized = build_federated_input_authorizer(
-                display_id,
-                federation_connection_id.clone(),
-                session_id.clone(),
-                Arc::clone(&display_input_authority),
-            );
+            let input_authorized: Arc<dyn Fn() -> bool + Send + Sync> =
+                if federated_display_input_allowed {
+                    build_federated_input_authorizer(
+                        display_id,
+                        federation_connection_id.clone(),
+                        session_id.clone(),
+                        Arc::clone(&display_input_authority),
+                    )
+                } else {
+                    Arc::new(|| false)
+                };
             // F-1.3b3: real federated authority handler. Identity is
             // captured at construction so messages from this peer
             // always arbitrate against this peer's
@@ -19979,6 +20178,7 @@ async fn handle_federated_webrtc_signal(
                 session_id.clone(),
                 Arc::clone(&display_input_authority),
                 authority_change_tx.clone(),
+                federated_display_input_allowed,
             );
             let answer_result = session
                 .handle_offer(
@@ -20508,6 +20708,103 @@ fn is_public_peer_access_request_path(request_line: &str) -> bool {
             .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
             .map(|rest| rest.starts_with('/'))
             .unwrap_or(false)
+}
+
+fn peer_client_header_present(header_text: &str) -> bool {
+    header_text.lines().any(|line| {
+        let Some((name, value)) = line.split_once(':') else {
+            return false;
+        };
+        name.eq_ignore_ascii_case(crate::peer::transport::intendant::PEER_CLIENT_HEADER)
+            && value.trim() == crate::peer::transport::intendant::PEER_CLIENT_HEADER_VALUE
+    })
+}
+
+fn resolve_peer_connection_identity(
+    header_text: &str,
+    tls_client_cert_fingerprint: Option<&str>,
+) -> Result<Option<PeerConnectionIdentity>, (u16, String)> {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    resolve_peer_connection_identity_from_cert_dir(
+        &cert_dir,
+        header_text,
+        tls_client_cert_fingerprint,
+    )
+}
+
+fn resolve_peer_connection_identity_from_cert_dir(
+    cert_dir: &Path,
+    header_text: &str,
+    tls_client_cert_fingerprint: Option<&str>,
+) -> Result<Option<PeerConnectionIdentity>, (u16, String)> {
+    let peer_mode = peer_client_header_present(header_text);
+    let Some(fingerprint) = tls_client_cert_fingerprint else {
+        return if peer_mode {
+            Err((
+                401,
+                serde_json::json!({"error": "peer client certificate required"}).to_string(),
+            ))
+        } else {
+            Ok(None)
+        };
+    };
+
+    let record = crate::peer::access_policy::lookup_identity(&cert_dir, fingerprint)
+        .map_err(|e| (500, serde_json::json!({"error": e.to_string()}).to_string()))?;
+    match record {
+        Some(record)
+            if record.status == crate::peer::access_policy::PeerIdentityStatus::Approved =>
+        {
+            Ok(Some(PeerConnectionIdentity {
+                fingerprint: record.fingerprint,
+                label: record.label,
+                profile: record.profile,
+            }))
+        }
+        Some(record) => Err((
+            403,
+            serde_json::json!({
+                "error": "peer identity revoked",
+                "fingerprint": record.fingerprint,
+                "label": record.label,
+            })
+            .to_string(),
+        )),
+        None if peer_mode => Err((
+            403,
+            serde_json::json!({
+                "error": "unknown peer client certificate",
+                "fingerprint": fingerprint,
+            })
+            .to_string(),
+        )),
+        None => Ok(None),
+    }
+}
+
+fn peer_profile_allows_ws_control(
+    profile: Option<&str>,
+    label: Option<&str>,
+    ctrl: &ControlMsg,
+    bus: &EventBus,
+) -> bool {
+    let Some(profile) = profile else {
+        return true;
+    };
+    if crate::peer::access_policy::profile_allows_control_msg(profile, ctrl) {
+        return true;
+    }
+    bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[ws] denied peer control frame from {}: profile={} op={:?}",
+            label.unwrap_or("<unknown peer>"),
+            profile,
+            crate::peer::access_policy::control_msg_operation(ctrl),
+        ),
+        level: Some(LogLevel::Warn),
+        turn: None,
+    });
+    false
 }
 
 /// Extract a token from the `?token=...` query parameter of an HTTP
@@ -28811,6 +29108,45 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn peer_connection_identity_requires_approved_record_for_peer_mode() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let fp = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let header = concat!(
+            "GET /ws HTTP/1.1\r\n",
+            "Host: x\r\n",
+            "x-intendant-peer: 1\r\n\r\n"
+        );
+
+        let err = resolve_peer_connection_identity_from_cert_dir(tmp.path(), header, Some(fp))
+            .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("unknown peer client certificate"));
+
+        crate::peer::access_policy::write_approved_identity(
+            tmp.path(),
+            fp,
+            "peer-a",
+            "read-only-display",
+            Some("https://peer/.well-known/agent-card.json"),
+            None,
+        )
+        .unwrap();
+
+        let identity = resolve_peer_connection_identity_from_cert_dir(tmp.path(), header, Some(fp))
+            .unwrap()
+            .unwrap();
+        assert_eq!(identity.label, "peer-a");
+        assert_eq!(identity.profile, "read-only-display");
+        assert_eq!(identity.fingerprint, fp);
+
+        crate::peer::access_policy::revoke_identity(tmp.path(), fp).unwrap();
+        let err = resolve_peer_connection_identity_from_cert_dir(tmp.path(), header, Some(fp))
+            .unwrap_err();
+        assert_eq!(err.0, 403);
+        assert!(err.1.contains("peer identity revoked"));
+    }
+
     // -----------------------------------------------------------------
     // End-to-end: federation REST auth enforcement
     // -----------------------------------------------------------------
@@ -29279,6 +29615,40 @@ mod tests {
         assert_eq!(status, 400);
         assert!(response.contains("invalid peer invite encoding"));
         assert!(!response.contains("Config error"));
+    }
+
+    #[test]
+    fn test_api_peers_pairing_identities_list_and_revoke() {
+        let root = tempfile::TempDir::new().unwrap();
+        let fp = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+        crate::peer::access_policy::write_approved_identity(
+            root.path(),
+            fp,
+            "peer-b",
+            "operator",
+            Some("https://peer-b/.well-known/agent-card.json"),
+            Some("req-b"),
+        )
+        .unwrap();
+
+        let (status, body) = peers_pairing_identities_list_from_cert_dir(root.path());
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["identities"][0]["label"], "peer-b");
+        assert_eq!(parsed["identities"][0]["status"], "approved");
+
+        let revoke_body = serde_json::json!({"identity": "peer-b"}).to_string();
+        let (status, body) = peers_pairing_identity_revoke_from_cert_dir(root.path(), &revoke_body);
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["fingerprint"], fp);
+        assert_eq!(parsed["status"], "revoked");
+
+        let (status, body) = peers_pairing_identities_list_from_cert_dir(root.path());
+        assert_eq!(status, 200);
+        let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(parsed["identities"][0]["status"], "revoked");
+        assert!(parsed["identities"][0]["revoked_at_unix"].is_number());
     }
 
     /// `GET /api/peers` on a registry with no peers returns
@@ -32309,6 +32679,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
+            true,
         );
 
         handler(AuthorityChannelMessage::Request { display_id: 0 });
@@ -32349,6 +32720,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
+            true,
         );
         handler(AuthorityChannelMessage::Release { display_id: 0 });
 
@@ -32385,6 +32757,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
+            true,
         );
         handler(AuthorityChannelMessage::Release { display_id: 0 });
 
@@ -32414,6 +32787,7 @@ mod tests {
             "sess-A".to_string(),
             Arc::clone(&map),
             change_tx.clone(),
+            true,
         );
 
         handler(AuthorityChannelMessage::Request { display_id: 99 });
@@ -32422,6 +32796,28 @@ mod tests {
         assert!(
             map.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
             "display-id mismatch must not mutate the registry"
+        );
+    }
+
+    #[test]
+    fn build_federated_authority_handler_denies_request_when_profile_read_only() {
+        use crate::display::webrtc::AuthorityChannelMessage;
+        let map = empty_authority_map();
+        let (change_tx, _change_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+        let handler = build_federated_authority_handler(
+            0,
+            "fed-1".to_string(),
+            "sess-A".to_string(),
+            Arc::clone(&map),
+            change_tx.clone(),
+            false,
+        );
+
+        handler(AuthorityChannelMessage::Request { display_id: 0 });
+
+        assert!(
+            map.read().unwrap_or_else(|e| e.into_inner()).is_empty(),
+            "read-only profile must not grant federated input authority"
         );
     }
 

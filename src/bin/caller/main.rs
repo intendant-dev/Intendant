@@ -28191,6 +28191,7 @@ async fn main() -> Result<(), CallerError> {
             project.config.webrtc.to_ice_config(),
             project.config.webrtc.federation_allow_h264,
         );
+        web_config.peer_access_requests = project.config.server.peer_access_requests.clone();
         web_config.presence_enabled = runtime_presence_enabled;
         web_config.external_agent = initial_agent_backend
             .as_ref()
@@ -28426,6 +28427,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.to_ice_config(),
                 project.config.webrtc.federation_allow_h264,
             );
+            config.peer_access_requests = project.config.server.peer_access_requests.clone();
             config.presence_enabled = runtime_presence_enabled;
             config.external_agent = initial_agent_backend
                 .as_ref()
@@ -29033,6 +29035,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.to_ice_config(),
                 project.config.webrtc.federation_allow_h264,
             );
+            config.peer_access_requests = project.config.server.peer_access_requests.clone();
             config.presence_enabled = runtime_presence_enabled;
             config.external_agent = initial_agent_backend
                 .as_ref()
@@ -29560,6 +29563,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.to_ice_config(),
                 project.config.webrtc.federation_allow_h264,
             );
+            config.peer_access_requests = project.config.server.peer_access_requests.clone();
             config.presence_enabled = runtime_presence_enabled;
             config.external_agent = initial_agent_backend
                 .as_ref()

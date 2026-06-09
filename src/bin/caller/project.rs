@@ -549,6 +549,92 @@ pub struct ServerConfig {
     /// [`ServerMutualTlsConfig`].
     #[serde(default)]
     pub mtls: ServerMutualTlsConfig,
+
+    /// Public peer access-request doorbell hardening. See
+    /// [`PeerAccessRequestConfig`].
+    #[serde(default)]
+    pub peer_access_requests: PeerAccessRequestConfig,
+}
+
+/// Public peer access-request hardening, lives under
+/// `[server.peer_access_requests]` in intendant.toml.
+///
+/// This controls only the unauthenticated doorbell endpoint:
+/// `POST /api/peer-pairing/requests`. Approval, certificate issuance, peer
+/// listing, revocation, and all normal federation traffic remain on the
+/// authenticated dashboard/peer paths.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PeerAccessRequestConfig {
+    /// Whether unauthenticated callers may create bounded pending access
+    /// requests. The `INTENDANT_PEER_ACCESS_REQUESTS=0` environment variable
+    /// still disables this at runtime even when the config is enabled.
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+    /// Maximum request body size accepted by the public doorbell endpoint.
+    #[serde(default = "default_peer_access_request_body_limit_bytes")]
+    pub body_limit_bytes: usize,
+    /// Pending request lifetime in seconds.
+    #[serde(default = "default_peer_access_request_ttl_secs")]
+    pub ttl_secs: i64,
+    /// Global cap on simultaneously pending requests.
+    #[serde(default = "default_peer_access_request_max_pending")]
+    pub max_pending: usize,
+    /// Cap on simultaneously pending requests from one source hint/IP.
+    #[serde(default = "default_peer_access_request_max_pending_per_source")]
+    pub max_pending_per_source: usize,
+    /// Sliding-window duration for create-rate limits, in seconds.
+    #[serde(default = "default_peer_access_request_rate_limit_window_secs")]
+    pub rate_limit_window_secs: i64,
+    /// Global creates allowed per rate-limit window.
+    #[serde(default = "default_peer_access_request_max_creates_per_window")]
+    pub max_creates_per_window: usize,
+    /// Creates allowed from one source hint/IP per rate-limit window.
+    #[serde(default = "default_peer_access_request_max_creates_per_source_per_window")]
+    pub max_creates_per_source_per_window: usize,
+}
+
+impl Default for PeerAccessRequestConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            body_limit_bytes: default_peer_access_request_body_limit_bytes(),
+            ttl_secs: default_peer_access_request_ttl_secs(),
+            max_pending: default_peer_access_request_max_pending(),
+            max_pending_per_source: default_peer_access_request_max_pending_per_source(),
+            rate_limit_window_secs: default_peer_access_request_rate_limit_window_secs(),
+            max_creates_per_window: default_peer_access_request_max_creates_per_window(),
+            max_creates_per_source_per_window:
+                default_peer_access_request_max_creates_per_source_per_window(),
+        }
+    }
+}
+
+fn default_peer_access_request_body_limit_bytes() -> usize {
+    4096
+}
+
+fn default_peer_access_request_ttl_secs() -> i64 {
+    10 * 60
+}
+
+fn default_peer_access_request_max_pending() -> usize {
+    32
+}
+
+fn default_peer_access_request_max_pending_per_source() -> usize {
+    5
+}
+
+fn default_peer_access_request_rate_limit_window_secs() -> i64 {
+    60
+}
+
+fn default_peer_access_request_max_creates_per_window() -> usize {
+    64
+}
+
+fn default_peer_access_request_max_creates_per_source_per_window() -> usize {
+    8
 }
 
 /// Native TLS-only HTTPS/WSS for the `--web` dashboard, lives under
