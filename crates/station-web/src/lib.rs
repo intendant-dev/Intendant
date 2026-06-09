@@ -13,8 +13,6 @@ use web_sys::{
     CanvasRenderingContext2d, DeviceOrientationEvent, Event, HtmlCanvasElement, HtmlVideoElement,
     KeyboardEvent, PointerEvent, WheelEvent,
 };
-#[cfg(target_arch = "wasm32")]
-use wgpu::util::DeviceExt;
 
 #[wasm_bindgen]
 pub struct StationWeb {
@@ -64,9 +62,12 @@ impl StationWeb {
         {
             let mut inner = self.inner.borrow_mut();
             inner.active = active;
-            inner.last_render_ms = 0.0;
+            // The pane may have moved or resized while the tab was hidden.
+            inner.canvas_origin = None;
         }
-        StationInner::schedule_next_loop(&self.inner);
+        if active {
+            StationInner::schedule_frame(&self.inner);
+        }
     }
 
     pub fn set_action_callback(&self, callback: js_sys::Function) {
@@ -74,18 +75,14 @@ impl StationWeb {
     }
 
     pub fn resize(&self) {
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.resize();
-            inner.last_render_ms = 0.0;
-        }
-        StationInner::schedule_next_loop(&self.inner);
+        self.inner.borrow_mut().resize();
+        StationInner::schedule_frame(&self.inner);
     }
 
     pub fn update_snapshot(&self, snapshot: JsValue) -> Result<(), JsValue> {
         let snapshot: StationSnapshot = serde_wasm_bindgen::from_value(snapshot)?;
         self.inner.borrow_mut().apply_snapshot(snapshot);
-        StationInner::schedule_next_loop(&self.inner);
+        StationInner::schedule_frame(&self.inner);
         Ok(())
     }
 
@@ -108,27 +105,26 @@ impl StationWeb {
                     video,
                 },
             );
-            inner.last_render_ms = 0.0;
+            inner.targets_dirty = true;
         }
-        StationInner::schedule_next_loop(&self.inner);
+        StationInner::schedule_frame(&self.inner);
     }
 
     pub fn unregister_display_source(&self, source_id: String) {
         {
             let mut inner = self.inner.borrow_mut();
             inner.display_sources.remove(&source_id);
-            inner.last_render_ms = 0.0;
+            inner.targets_dirty = true;
         }
-        StationInner::schedule_next_loop(&self.inner);
+        StationInner::schedule_frame(&self.inner);
     }
 
     pub fn set_layout(&self, layout: String) {
         {
             let mut inner = self.inner.borrow_mut();
-            inner.layout = LayoutName::from_str(&layout);
-            inner.last_render_ms = 0.0;
+            inner.set_layout(LayoutName::from_str(&layout));
         }
-        StationInner::schedule_next_loop(&self.inner);
+        StationInner::schedule_frame(&self.inner);
     }
 
     pub fn set_visuals(
@@ -146,37 +142,36 @@ impl StationWeb {
             inner.motion = motion.clamp(0.0, 2.0);
             inner.ar_strength = ar_strength.clamp(0.0, 1.0);
             inner.density = density.clamp(0.5, 1.8);
-            inner.last_render_ms = 0.0;
+            inner.targets_dirty = true;
+            // The vignette treatment depends on the mood.
+            inner.hud.invalidate_vignette();
         }
-        StationInner::schedule_next_loop(&self.inner);
+        StationInner::schedule_frame(&self.inner);
     }
 
     pub fn select_by_id(&self, id: Option<String>) {
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.selected_id = id;
-            inner.last_render_ms = 0.0;
-        }
-        StationInner::schedule_next_loop(&self.inner);
+        self.inner.borrow_mut().selected_id = id;
+        StationInner::schedule_frame(&self.inner);
     }
 
     pub fn focus_on(&self, id: String) {
-        {
-            let mut inner = self.inner.borrow_mut();
-            inner.focus_id = Some(id);
-            inner.last_render_ms = 0.0;
-        }
-        StationInner::schedule_next_loop(&self.inner);
+        self.inner.borrow_mut().focus_id = Some(id);
+        StationInner::schedule_frame(&self.inner);
     }
 
     pub fn debug_state(&self) -> String {
         let inner = self.inner.borrow();
         format!(
-            "station hosts={} agents={} events={} displays={} gpu={}",
+            "station hosts={} agents={} events={} displays={} renderer={} gpu={}",
             inner.snapshot.hosts.len(),
             inner.snapshot.agents.len(),
             inner.snapshot.events.len(),
             inner.display_sources.len(),
+            if inner.gpu.is_some() {
+                "WebGPU"
+            } else {
+                "Canvas"
+            },
             inner.gpu.is_some(),
         )
     }
@@ -185,7 +180,7 @@ impl StationWeb {
 struct StationInner {
     scene_canvas: HtmlCanvasElement,
     hud_canvas: HtmlCanvasElement,
-    ctx: CanvasRenderingContext2d,
+    hud: Hud,
     scene_ctx: Option<CanvasRenderingContext2d>,
     gpu: Option<GpuState>,
     active: bool,
@@ -214,14 +209,25 @@ struct StationInner {
     pinch_zoom: Option<PinchZoom>,
     ar_x: f32,
     ar_y: f32,
-    projected_nodes: Vec<ProjectedNode>,
     hit_zones: Vec<HitZone>,
     action_callback: Option<js_sys::Function>,
+    /// World positions per node id, rebuilt when the snapshot or layout
+    /// changes (never per frame).
+    layout_cache: HashMap<String, Vec3>,
+    /// Control-center summaries, rebuilt lazily when `targets_dirty`.
+    system_targets: Vec<SystemTarget>,
+    targets_dirty: bool,
+    /// Reused per-frame geometry; cleared and refilled, never reallocated.
+    frame: GpuFrame,
+    /// Cached canvas origin for pointer math; None forces one
+    /// getBoundingClientRect on the next event.
+    canvas_origin: Option<(f64, f64)>,
     _events: Vec<Closure<dyn FnMut(Event)>>,
-    _raf: Option<Closure<dyn FnMut(f64)>>,
-    loop_pending: bool,
-    boot_started_ms: f64,
-    last_render_ms: f64,
+    raf_cb: Option<Closure<dyn FnMut(f64)>>,
+    raf_pending: bool,
+    /// Timestamp of the previously rendered frame, for frame-rate-independent
+    /// accumulation (auto-orbit drift).
+    last_tick_ms: f64,
 }
 
 impl StationInner {
@@ -250,7 +256,7 @@ impl StationInner {
         let mut inner = Self {
             scene_canvas,
             hud_canvas,
-            ctx,
+            hud: Hud::new(ctx),
             scene_ctx,
             gpu: None,
             active: false,
@@ -279,17 +285,33 @@ impl StationInner {
             pinch_zoom: None,
             ar_x: 0.0,
             ar_y: 0.0,
-            projected_nodes: Vec::new(),
             hit_zones: Vec::new(),
             action_callback: None,
+            layout_cache: HashMap::new(),
+            system_targets: Vec::new(),
+            targets_dirty: true,
+            frame: GpuFrame::default(),
+            canvas_origin: None,
             _events: Vec::new(),
-            _raf: None,
-            loop_pending: false,
-            boot_started_ms: now_ms(),
-            last_render_ms: 0.0,
+            raf_cb: None,
+            raf_pending: false,
+            last_tick_ms: 0.0,
         };
+        inner.rebuild_layout_cache();
         inner.resize();
         inner
+    }
+
+    fn set_layout(&mut self, layout: LayoutName) {
+        if self.layout != layout {
+            self.layout = layout;
+            self.rebuild_layout_cache();
+            self.targets_dirty = true;
+        }
+    }
+
+    fn rebuild_layout_cache(&mut self) {
+        self.layout_cache = layout_positions(&self.snapshot, self.layout);
     }
 
     fn install_events(inner: Rc<RefCell<Self>>) -> Result<(), JsValue> {
@@ -305,37 +327,33 @@ impl StationInner {
             };
             e.prevent_default();
             let _ = down_canvas.set_pointer_capture(e.pointer_id());
-            let mut s = down_inner.borrow_mut();
-            s.mark_input();
-            let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
-            s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
-            if s.active_pointers.len() >= 2 {
-                s.begin_pinch();
-                s.pointer_down = None;
-                s.set_cursor("drag");
-                return;
+            {
+                let mut s = down_inner.borrow_mut();
+                s.mark_input();
+                let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+                s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
+                if s.active_pointers.len() >= 2 {
+                    s.begin_pinch();
+                    s.pointer_down = None;
+                    s.set_cursor("drag");
+                } else {
+                    let pending_action = s.hit_action_at(x, y);
+                    s.set_cursor(if pending_action.is_some() {
+                        "pointer"
+                    } else {
+                        "drag"
+                    });
+                    s.pointer_down = Some(PointerDrag {
+                        x,
+                        y,
+                        last_x: x,
+                        last_y: y,
+                        moved: false,
+                        pending_action,
+                    });
+                }
             }
-            if let Some(action) = s.hit_action_at(x, y) {
-                s.pointer_down = Some(PointerDrag {
-                    x,
-                    y,
-                    last_x: x,
-                    last_y: y,
-                    moved: false,
-                    pending_action: Some(action),
-                });
-                s.set_cursor("pointer");
-                return;
-            }
-            s.pointer_down = Some(PointerDrag {
-                x,
-                y,
-                last_x: x,
-                last_y: y,
-                moved: false,
-                pending_action: None,
-            });
-            s.set_cursor("drag");
+            StationInner::schedule_frame(&down_inner);
         }) as Box<dyn FnMut(_)>);
         target.add_event_listener_with_callback("pointerdown", down.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(down);
@@ -345,40 +363,41 @@ impl StationInner {
             let Some(e) = event.dyn_ref::<PointerEvent>() else {
                 return;
             };
-            let mut s = move_inner.borrow_mut();
-            let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
-            if s.active_pointers.contains_key(&e.pointer_id()) {
-                s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
-            }
-            if s.active_pointers.len() >= 2 {
-                s.apply_pinch();
-                s.mark_input();
-                s.set_cursor("drag");
-                return;
-            }
-            if let Some(drag) = s.pointer_down.as_mut() {
-                let dx = x - drag.last_x;
-                let dy = y - drag.last_y;
-                drag.last_x = x;
-                drag.last_y = y;
-                let travel = (x - drag.x).abs() + (y - drag.y).abs();
-                if drag.pending_action.is_some() && travel <= 12.0 {
+            {
+                let mut s = move_inner.borrow_mut();
+                let (x, y) = s.event_xy(e.client_x() as f64, e.client_y() as f64);
+                if s.active_pointers.contains_key(&e.pointer_id()) {
+                    s.active_pointers.insert(e.pointer_id(), Vec2::new(x, y));
+                }
+                if s.active_pointers.len() >= 2 {
+                    s.apply_pinch();
                     s.mark_input();
-                    return;
+                    s.set_cursor("drag");
+                } else if let Some(drag) = s.pointer_down.as_mut() {
+                    let dx = x - drag.last_x;
+                    let dy = y - drag.last_y;
+                    drag.last_x = x;
+                    drag.last_y = y;
+                    let travel = (x - drag.x).abs() + (y - drag.y).abs();
+                    if drag.pending_action.is_some() && travel <= 12.0 {
+                        s.mark_input();
+                    } else {
+                        if travel > 4.0 {
+                            drag.moved = true;
+                            drag.pending_action = None;
+                        }
+                        s.yaw -= dx * 0.006;
+                        s.pitch = (s.pitch + dy * 0.005).clamp(-1.05, 1.05);
+                        s.mark_input();
+                        s.set_cursor("drag");
+                    }
+                } else if s.hit_action_at(x, y).is_some() || s.pick_node(x, y).is_some() {
+                    s.set_cursor("pointer");
+                } else {
+                    s.set_cursor("grab");
                 }
-                if travel > 4.0 {
-                    drag.moved = true;
-                    drag.pending_action = None;
-                }
-                s.yaw -= dx * 0.006;
-                s.pitch = (s.pitch + dy * 0.005).clamp(-1.05, 1.05);
-                s.mark_input();
-                s.set_cursor("drag");
-            } else if s.hit_action_at(x, y).is_some() || s.pick_node(x, y).is_some() {
-                s.set_cursor("pointer");
-            } else {
-                s.set_cursor("grab");
             }
+            StationInner::schedule_frame(&move_inner);
         }) as Box<dyn FnMut(_)>);
         target.add_event_listener_with_callback("pointermove", mv.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(mv);
@@ -403,7 +422,6 @@ impl StationInner {
                         s.dispatch_hit(action)
                     } else if !drag.moved {
                         s.selected_id = s.pick_node(x, y);
-                        s.last_render_ms = 0.0;
                         None
                     } else {
                         None
@@ -413,6 +431,7 @@ impl StationInner {
                 }
             };
             up_inner.borrow_mut().set_cursor("grab");
+            StationInner::schedule_frame(&up_inner);
             if let Some(action) = outbound {
                 let callback = up_inner.borrow().action_callback.clone();
                 StationInner::emit_action(callback, action);
@@ -428,9 +447,12 @@ impl StationInner {
                 return;
             };
             e.prevent_default();
-            let mut s = wheel_inner.borrow_mut();
-            s.mark_input();
-            s.distance = (s.distance + e.delta_y() as f32 * 0.014).clamp(4.2, 25.0);
+            {
+                let mut s = wheel_inner.borrow_mut();
+                s.mark_input();
+                s.distance = (s.distance + e.delta_y() as f32 * 0.014).clamp(4.2, 25.0);
+            }
+            StationInner::schedule_frame(&wheel_inner);
         }) as Box<dyn FnMut(_)>);
         target.add_event_listener_with_callback("wheel", wheel.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(wheel);
@@ -440,26 +462,32 @@ impl StationInner {
             let Some(e) = event.dyn_ref::<KeyboardEvent>() else {
                 return;
             };
-            let mut s = key_inner.borrow_mut();
-            if !s.active {
-                return;
-            }
-            let mut used = true;
-            match e.key().as_str() {
-                "ArrowLeft" | "a" | "A" => s.yaw += 0.08,
-                "ArrowRight" | "d" | "D" => s.yaw -= 0.08,
-                "ArrowUp" | "w" | "W" => s.pitch = (s.pitch - 0.06).clamp(-1.05, 1.05),
-                "ArrowDown" | "s" | "S" => s.pitch = (s.pitch + 0.06).clamp(-1.05, 1.05),
-                "+" | "=" => s.distance = (s.distance - 0.6).clamp(4.2, 25.0),
-                "-" | "_" => s.distance = (s.distance + 0.6).clamp(4.2, 25.0),
-                "Escape" => s.selected_id = None,
-                "1" => s.layout = LayoutName::Orbital,
-                "2" => s.layout = LayoutName::Constellation,
-                _ => used = false,
-            }
+            let used = {
+                let mut s = key_inner.borrow_mut();
+                if !s.active {
+                    return;
+                }
+                let mut used = true;
+                match e.key().as_str() {
+                    "ArrowLeft" | "a" | "A" => s.yaw += 0.08,
+                    "ArrowRight" | "d" | "D" => s.yaw -= 0.08,
+                    "ArrowUp" | "w" | "W" => s.pitch = (s.pitch - 0.06).clamp(-1.05, 1.05),
+                    "ArrowDown" | "s" | "S" => s.pitch = (s.pitch + 0.06).clamp(-1.05, 1.05),
+                    "+" | "=" => s.distance = (s.distance - 0.6).clamp(4.2, 25.0),
+                    "-" | "_" => s.distance = (s.distance + 0.6).clamp(4.2, 25.0),
+                    "Escape" => s.selected_id = None,
+                    "1" => s.set_layout(LayoutName::Orbital),
+                    "2" => s.set_layout(LayoutName::Constellation),
+                    _ => used = false,
+                }
+                if used {
+                    e.prevent_default();
+                    s.mark_input();
+                }
+                used
+            };
             if used {
-                e.prevent_default();
-                s.mark_input();
+                StationInner::schedule_frame(&key_inner);
             }
         }) as Box<dyn FnMut(_)>);
         window.add_event_listener_with_callback("keydown", key.as_ref().unchecked_ref())?;
@@ -470,11 +498,14 @@ impl StationInner {
             let Some(e) = event.dyn_ref::<DeviceOrientationEvent>() else {
                 return;
             };
-            let mut s = orientation_inner.borrow_mut();
-            let gamma = e.gamma().unwrap_or(0.0) as f32;
-            let beta = e.beta().unwrap_or(0.0) as f32;
-            s.ar_x = (gamma / 45.0).clamp(-1.0, 1.0);
-            s.ar_y = (beta / 60.0).clamp(-1.0, 1.0);
+            {
+                let mut s = orientation_inner.borrow_mut();
+                let gamma = e.gamma().unwrap_or(0.0) as f32;
+                let beta = e.beta().unwrap_or(0.0) as f32;
+                s.ar_x = (gamma / 45.0).clamp(-1.0, 1.0);
+                s.ar_y = (beta / 60.0).clamp(-1.0, 1.0);
+            }
+            StationInner::schedule_frame(&orientation_inner);
         }) as Box<dyn FnMut(_)>);
         window.add_event_listener_with_callback(
             "deviceorientation",
@@ -484,15 +515,25 @@ impl StationInner {
 
         let resize_inner = inner.clone();
         let resize = Closure::wrap(Box::new(move |_event: Event| {
-            {
-                let mut s = resize_inner.borrow_mut();
-                s.resize();
-                s.last_render_ms = 0.0;
-            }
-            StationInner::schedule_next_loop(&resize_inner);
+            resize_inner.borrow_mut().resize();
+            StationInner::schedule_frame(&resize_inner);
         }) as Box<dyn FnMut(_)>);
         window.add_event_listener_with_callback("resize", resize.as_ref().unchecked_ref())?;
         inner.borrow_mut()._events.push(resize);
+
+        // Scrolling moves the canvas within the viewport without resizing it;
+        // only the cached pointer-math origin needs to be invalidated.
+        // Capture phase so scrolls inside nested containers are seen too.
+        let scroll_inner = inner.clone();
+        let scroll = Closure::wrap(Box::new(move |_event: Event| {
+            scroll_inner.borrow_mut().canvas_origin = None;
+        }) as Box<dyn FnMut(_)>);
+        window.add_event_listener_with_callback_and_bool(
+            "scroll",
+            scroll.as_ref().unchecked_ref(),
+            true,
+        )?;
+        inner.borrow_mut()._events.push(scroll);
 
         Ok(())
     }
@@ -503,89 +544,112 @@ impl StationInner {
         spawn_local(async move {
             match GpuState::new(canvas).await {
                 Ok(gpu) => {
-                    {
-                        let mut s = inner.borrow_mut();
-                        s.gpu = Some(gpu);
-                        s.last_render_ms = 0.0;
-                        s.resize();
-                    }
-                    StationInner::schedule_next_loop(&inner);
+                    let mut s = inner.borrow_mut();
+                    s.gpu = Some(gpu);
+                    s.resize();
                 }
                 Err(err) => {
                     web_sys::console::warn_1(&JsValue::from_str(&format!(
-                        "Station WebGPU unavailable, using HUD canvas fallback: {err:?}"
+                        "Station WebGPU unavailable, falling back to Canvas renderer: {err:?}"
                     )));
+                    inner.borrow_mut().install_canvas_scene_fallback();
                 }
             }
+            StationInner::schedule_frame(&inner);
         });
     }
 
     #[cfg(not(target_arch = "wasm32"))]
     fn start_gpu(_inner: Rc<RefCell<Self>>) {}
 
-    fn start_loop(inner: Rc<RefCell<Self>>) {
-        let loop_inner = inner.clone();
-        let cb = Closure::wrap(Box::new(move |time_ms: f64| {
-            {
-                let mut s = loop_inner.borrow_mut();
-                s.loop_pending = false;
-                s.render(time_ms);
-            }
-            StationInner::schedule_next_loop(&loop_inner);
-        }) as Box<dyn FnMut(f64)>);
-
-        inner.borrow_mut()._raf = Some(cb);
-        StationInner::schedule_next_loop(&inner);
-    }
-
-    fn schedule_next_loop(inner: &Rc<RefCell<Self>>) {
-        let (next, has_gpu) = {
-            let mut s = inner.borrow_mut();
-            let Some(next) = s
-                ._raf
-                .as_ref()
-                .map(|cb| cb.as_ref().unchecked_ref::<js_sys::Function>().clone())
-            else {
-                return;
-            };
-            let has_gpu = s.gpu.is_some();
-            let should_schedule = if has_gpu {
-                s.active
-            } else {
-                s.active
-                    && (s.last_render_ms == 0.0
-                        || s.last_input_ms > s.last_render_ms
-                        || now_ms() - s.boot_started_ms < 1300.0)
-            };
-            if !should_schedule || s.loop_pending {
-                return;
-            }
-            s.loop_pending = true;
-            (next, has_gpu)
-        };
-        let Some(window) = web_sys::window() else {
-            inner.borrow_mut().loop_pending = false;
+    /// Runtime WebGPU failure: give the scene a 2D context so the wireframe
+    /// fallback renders, matching the `?station_gpu=canvas` visual. If wgpu
+    /// already claimed the canvas with a `webgpu` context (adapter or device
+    /// request failed after the surface was created), a 2D context can no
+    /// longer be obtained from it; `draw_hud` then paints the scene as an
+    /// underlay on the HUD canvas instead.
+    #[cfg(target_arch = "wasm32")]
+    fn install_canvas_scene_fallback(&mut self) {
+        if self.scene_ctx.is_some() {
             return;
-        };
-        let callback = Closure::once_into_js(move || {
-            let _ = next.call1(&JsValue::NULL, &JsValue::from_f64(now_ms()));
-        });
-        let delay_ms = if has_gpu { 250 } else { 180 };
-        if window
-            .set_timeout_with_callback_and_timeout_and_arguments_0(
-                callback.as_ref().unchecked_ref(),
-                delay_ms,
-            )
-            .is_err()
-        {
-            inner.borrow_mut().loop_pending = false;
+        }
+        self.scene_ctx = self
+            .scene_canvas
+            .get_context("2d")
+            .ok()
+            .flatten()
+            .and_then(|ctx| ctx.dyn_into::<CanvasRenderingContext2d>().ok());
+        if self.scene_ctx.is_none() {
+            web_sys::console::warn_1(&JsValue::from_str(
+                "Station scene canvas already consumed by WebGPU; drawing scene on HUD canvas",
+            ));
         }
     }
 
+    /// One persistent rAF callback drives rendering. `schedule_frame` arms it
+    /// after any state change; the tick re-arms itself only while something
+    /// is actually animating, so an idle station costs zero CPU.
+    fn start_loop(inner: Rc<RefCell<Self>>) {
+        let loop_inner = inner.clone();
+        let cb = Closure::wrap(Box::new(move |time_ms: f64| {
+            let animating = {
+                let mut s = loop_inner.borrow_mut();
+                s.raf_pending = false;
+                if !s.active {
+                    false
+                } else {
+                    s.render(time_ms);
+                    s.is_animating()
+                }
+            };
+            if animating {
+                StationInner::schedule_frame(&loop_inner);
+            }
+        }) as Box<dyn FnMut(f64)>);
+
+        inner.borrow_mut().raf_cb = Some(cb);
+        StationInner::schedule_frame(&inner);
+    }
+
+    /// Request one animation frame if the tab is active and none is pending.
+    fn schedule_frame(inner: &Rc<RefCell<Self>>) {
+        let mut s = inner.borrow_mut();
+        if !s.active || s.raf_pending {
+            return;
+        }
+        let Some(cb) = s.raf_cb.as_ref() else {
+            return;
+        };
+        let Some(window) = web_sys::window() else {
+            return;
+        };
+        if window
+            .request_animation_frame(cb.as_ref().unchecked_ref())
+            .is_ok()
+        {
+            s.raf_pending = true;
+        }
+    }
+
+    /// Whether the loop must keep ticking without further input. All ambient
+    /// time-based animation (spins, pulses, breathing, auto-orbit) is gated
+    /// behind `motion > 0`; live video thumbnails, an in-flight camera
+    /// drag/pinch, and still-fading event particles also keep it running.
+    fn is_animating(&self) -> bool {
+        self.active
+            && (self.motion > 0.0
+                || !self.display_sources.is_empty()
+                || self.pointer_down.is_some()
+                || self.pinch_zoom.is_some()
+                || !self.particles.is_empty())
+    }
+
     fn apply_snapshot(&mut self, snapshot: StationSnapshot) {
+        // Spawn a particle per newly seen event, positioned with the layout
+        // of the snapshot being replaced (the cache is rebuilt below).
+        let positions = &self.layout_cache;
         for event in &snapshot.events {
-            if self.seen_events.insert(event.id.clone()) {
-                let positions = self.layout_positions();
+            if !self.seen_events.contains(&event.id) {
                 let start = event
                     .agent_id
                     .as_ref()
@@ -608,7 +672,15 @@ impl StationInner {
                 });
             }
         }
+        // Event ids are unique and the snapshot carries a rolling window, so
+        // retaining only the current window's ids bounds the set while still
+        // deduplicating every id that can reappear.
+        self.seen_events.clear();
+        self.seen_events
+            .extend(snapshot.events.iter().map(|event| event.id.clone()));
         self.snapshot = snapshot;
+        self.rebuild_layout_cache();
+        self.targets_dirty = true;
         if self
             .selected_id
             .as_ref()
@@ -616,7 +688,6 @@ impl StationInner {
         {
             self.selected_id = None;
         }
-        self.last_render_ms = 0.0;
     }
 
     fn node_exists(&self, id: &str) -> bool {
@@ -647,7 +718,7 @@ impl StationInner {
     fn resize(&mut self) {
         let max_dpr = if self.gpu.is_some() { 2.0 } else { 1.0 };
         let dpr = web_sys::window()
-            .and_then(|w| Some(w.device_pixel_ratio()))
+            .map(|w| w.device_pixel_ratio())
             .unwrap_or(1.0)
             .clamp(1.0, max_dpr);
         let css_w = self.hud_canvas.client_width().max(1) as f64;
@@ -655,6 +726,7 @@ impl StationInner {
         let width = (css_w * dpr).round().max(1.0) as u32;
         let height = (css_h * dpr).round().max(1.0) as u32;
         self.dpr = dpr;
+        self.canvas_origin = None;
         if self.width == width && self.height == height {
             return;
         }
@@ -664,6 +736,8 @@ impl StationInner {
         self.scene_canvas.set_height(height);
         self.hud_canvas.set_width(width);
         self.hud_canvas.set_height(height);
+        // Setting a canvas size resets its 2D context state.
+        self.hud.invalidate();
         if let Some(gpu) = self.gpu.as_mut() {
             gpu.resize(width, height);
         }
@@ -673,24 +747,28 @@ impl StationInner {
         if !self.active {
             return;
         }
-        if self.gpu.is_none()
-            && self.last_render_ms > 0.0
-            && self.last_input_ms <= self.last_render_ms
-        {
-            return;
+        // Guard against the backing store being resized behind our back.
+        // Plain attribute reads; the JS side is responsible for calling
+        // resize() when the pane's CSS size changes.
+        if self.hud_canvas.width() != self.width || self.hud_canvas.height() != self.height {
+            self.resize();
         }
-        self.resize();
-        let min_frame_ms = if self.gpu.is_some() { 120.0 } else { 250.0 };
-        if self.last_render_ms > 0.0 && time_ms - self.last_render_ms < min_frame_ms {
-            return;
-        }
-        self.last_render_ms = time_ms;
+        // With motion at zero every time-based phase freezes; events still
+        // schedule one-shot frames through schedule_frame.
+        let anim_ms = if self.motion > 0.0 { time_ms } else { 0.0 };
         let idle_ms = time_ms - self.last_input_ms;
-        if idle_ms > 2400.0 {
-            self.yaw -= 0.000055 * self.motion * (idle_ms.min(5000.0) as f32 / 1000.0);
+        // dt-scaled so the drift rate is frame-rate independent (tuned
+        // against the old ~250ms tick); clamped to absorb parked gaps.
+        let dt_ms = (time_ms - self.last_tick_ms).clamp(0.0, 1000.0);
+        self.last_tick_ms = time_ms;
+        if self.motion > 0.0 && idle_ms > 2400.0 {
+            self.yaw -= 0.000055
+                * self.motion
+                * (idle_ms.min(5000.0) as f32 / 1000.0)
+                * (dt_ms as f32 / 250.0);
         }
         if let Some(focus_id) = self.focus_id.take() {
-            if let Some(pos) = self.layout_positions().get(&focus_id).copied() {
+            if let Some(pos) = self.layout_cache.get(&focus_id).copied() {
                 let dir = pos.normalized();
                 if dir.len() > 0.001 {
                     self.yaw = dir.x.atan2(dir.z);
@@ -699,51 +777,60 @@ impl StationInner {
                 }
             }
         }
+        if self.targets_dirty {
+            self.system_targets = self.compute_system_targets();
+            self.targets_dirty = false;
+        }
 
-        let frame = self.build_frame(time_ms);
+        self.build_frame(anim_ms, time_ms);
         if let Some(gpu) = self.gpu.as_mut() {
-            if let Err(err) = gpu.render(&frame) {
+            if let Err(err) = gpu.render(&self.frame) {
                 web_sys::console::warn_1(&JsValue::from_str(&format!(
                     "Station GPU render failed: {err:?}"
                 )));
             }
-        } else {
-            self.draw_fallback_scene(&frame);
+        } else if let Some(scene_ctx) = self.scene_ctx.as_ref() {
+            self.draw_scene_lines(scene_ctx);
         }
-        self.draw_hud(&frame, time_ms);
-        self.projected_nodes = frame.projected_nodes;
+        self.draw_hud(anim_ms);
     }
 
-    fn build_frame(&mut self, time_ms: f64) -> GpuFrame {
-        let mut frame = GpuFrame::default();
-        let layout = self.layout_positions();
+    /// Refill `self.frame` for this frame, reusing its buffers. `anim_ms`
+    /// drives ambient animation phases (frozen at motion 0); `time_ms` is
+    /// real time, used for self-expiring event particles.
+    fn build_frame(&mut self, anim_ms: f64, time_ms: f64) {
+        let mut frame = std::mem::take(&mut self.frame);
+        frame.clear();
         let camera = self.camera();
         let aspect = self.width as f32 / self.height.max(1) as f32;
+        let fov_deg = self.fov_deg;
+        let density = self.density;
 
-        let mut project = |p: Vec3| camera.project(p, aspect, self.fov_deg);
+        let mut project = move |p: Vec3| camera.project(p, aspect, fov_deg);
 
         for star in &self.starfield {
             if let Some(p) = project(*star) {
-                let s = 0.0045 * self.density;
+                let s = 0.0045 * density;
                 frame.add_quad_ndc(p.x, p.y, s, [0.35, 0.36, 0.44, 0.55]);
             }
         }
 
         self.add_grid(&mut frame, &mut project);
-        self.add_operator(&mut frame, &layout, &mut project, time_ms);
+        self.add_operator(&mut frame, &mut project, anim_ms);
 
         for host in &self.snapshot.hosts {
             let id = format!("host:{}", host.id);
-            if let Some(pos) = layout.get(&id).copied() {
-                self.add_host(&mut frame, host, pos, &mut project, time_ms);
+            if let Some(pos) = self.layout_cache.get(&id).copied() {
+                self.add_host(&mut frame, host, pos, &mut project, anim_ms);
             }
         }
         for agent in &self.snapshot.agents {
-            if let Some(pos) = layout.get(&agent.id).copied() {
-                self.add_agent(&mut frame, agent, pos, &layout, &mut project, time_ms);
+            if let Some(pos) = self.layout_cache.get(&agent.id).copied() {
+                self.add_agent(&mut frame, agent, pos, &mut project, anim_ms);
             }
         }
 
+        let layout = &self.layout_cache;
         for agent in &self.snapshot.agents {
             let Some(a_pos) = layout.get(&agent.id).copied() else {
                 continue;
@@ -776,27 +863,26 @@ impl StationInner {
             }
         }
 
-        let mut live_particles = Vec::with_capacity(self.particles.len());
-        for particle in self.particles.drain(..) {
+        self.particles.retain(|particle| {
             let t = ((time_ms - particle.born_ms) as f32 / particle.ttl_ms as f32).clamp(0.0, 1.0);
-            if t < 1.0 {
-                let lifted = particle.start.lerp(particle.end, t)
-                    + Vec3::new(0.0, (t * PI).sin() * 0.6, 0.0);
-                if let Some(p) = project(lifted) {
-                    let size = (0.026 * (1.0 - t) + 0.006) * self.density;
-                    frame.add_quad_ndc(
-                        p.x,
-                        p.y,
-                        size,
-                        particle.color.with_alpha(0.88 * (1.0 - t)).into(),
-                    );
-                }
-                live_particles.push(particle);
+            if t >= 1.0 {
+                return false;
             }
-        }
-        self.particles = live_particles;
+            let lifted =
+                particle.start.lerp(particle.end, t) + Vec3::new(0.0, (t * PI).sin() * 0.6, 0.0);
+            if let Some(p) = project(lifted) {
+                let size = (0.026 * (1.0 - t) + 0.006) * density;
+                frame.add_quad_ndc(
+                    p.x,
+                    p.y,
+                    size,
+                    particle.color.with_alpha(0.88 * (1.0 - t)).into(),
+                );
+            }
+            true
+        });
 
-        frame
+        self.frame = frame;
     }
 
     fn add_grid(&self, frame: &mut GpuFrame, project: &mut impl FnMut(Vec3) -> Option<Vec2>) {
@@ -822,11 +908,10 @@ impl StationInner {
     fn add_operator(
         &self,
         frame: &mut GpuFrame,
-        layout: &HashMap<String, Vec3>,
         project: &mut impl FnMut(Vec3) -> Option<Vec2>,
         time_ms: f64,
     ) {
-        let pos = layout.get("op").copied().unwrap_or(Vec3::ZERO);
+        let pos = self.layout_cache.get("op").copied().unwrap_or(Vec3::ZERO);
         let spin = time_ms as f32 * 0.00032 * self.motion;
         frame.add_wire_octa(project, pos, 0.48, spin, C_BLUE.with_alpha(0.95));
         frame.add_ring(project, pos, 0.82, C_SAPPHIRE.with_alpha(0.55), Plane::XZ);
@@ -881,7 +966,6 @@ impl StationInner {
         frame: &mut GpuFrame,
         agent: &StationAgent,
         pos: Vec3,
-        layout: &HashMap<String, Vec3>,
         project: &mut impl FnMut(Vec3) -> Option<Vec2>,
         time_ms: f64,
     ) {
@@ -929,7 +1013,7 @@ impl StationInner {
             frame.add_ring(project, pos, 0.96, C_BLUE.with_alpha(0.84), Plane::XY);
         }
         if let Some(parent_id) = agent.parent_id.as_ref().filter(|s| !s.is_empty()) {
-            if let Some(parent) = layout.get(parent_id).copied() {
+            if let Some(parent) = self.layout_cache.get(parent_id).copied() {
                 frame.add_line_projected(project, parent, pos, C_MAUVE.with_alpha(0.5));
             }
         }
@@ -943,68 +1027,85 @@ impl StationInner {
         }
     }
 
-    fn draw_fallback_scene(&self, frame: &GpuFrame) {
-        let Some(ctx) = self.scene_ctx.as_ref() else {
-            return;
-        };
-        ctx.save();
-        ctx.set_global_alpha(1.0);
-        ctx.set_fill_style(&JsValue::from_str("rgba(17,17,27,0.94)"));
+    /// Stroke the frame's projected line list into a 2D context: the scene
+    /// canvas when WebGPU is off, or the HUD canvas (as an underlay) when the
+    /// scene canvas was consumed by a failed WebGPU init. Consecutive
+    /// same-color segments share one path, and the stroke style is only
+    /// touched when the color changes.
+    fn draw_scene_lines(&self, ctx: &CanvasRenderingContext2d) {
+        ctx.set_fill_style_str("rgba(17,17,27,0.94)");
         ctx.fill_rect(0.0, 0.0, self.width as f64, self.height as f64);
-        for pair in frame.line_vertices.chunks_exact(2) {
+        let mut current: Option<[f32; 4]> = None;
+        let mut open = false;
+        for pair in self.frame.line_vertices.chunks_exact(2) {
+            if current != Some(pair[0].color) {
+                if open {
+                    ctx.stroke();
+                }
+                ctx.set_stroke_style_str(&css_rgba(pair[0].color));
+                ctx.begin_path();
+                current = Some(pair[0].color);
+                open = true;
+            }
             let a = ndc_to_screen(pair[0].pos, self.width, self.height);
             let b = ndc_to_screen(pair[1].pos, self.width, self.height);
-            let color = css_rgba(pair[0].color);
-            ctx.set_stroke_style(&JsValue::from_str(&color));
-            ctx.begin_path();
             ctx.move_to(a.x as f64, a.y as f64);
             ctx.line_to(b.x as f64, b.y as f64);
+        }
+        if open {
             ctx.stroke();
         }
-        ctx.restore();
     }
 
-    fn draw_hud(&mut self, frame: &GpuFrame, time_ms: f64) {
-        self.ctx.save();
-        self.ctx
+    fn draw_hud(&mut self, time_ms: f64) {
+        self.hud
+            .ctx
             .set_transform(self.dpr, 0.0, 0.0, self.dpr, 0.0, 0.0)
             .ok();
         let w = self.css_width();
         let h = self.css_height();
-        self.ctx.clear_rect(0.0, 0.0, w as f64, h as f64);
+        self.hud.ctx.clear_rect(0.0, 0.0, w as f64, h as f64);
         self.hit_zones.clear();
 
+        if self.gpu.is_none() && self.scene_ctx.is_none() {
+            // Runtime WebGPU failure with a consumed scene canvas: paint the
+            // wireframe under the HUD. The identity transform matches the
+            // device-pixel coordinates draw_scene_lines expects.
+            self.hud.ctx.save();
+            self.hud
+                .ctx
+                .set_transform(1.0, 0.0, 0.0, 1.0, 0.0, 0.0)
+                .ok();
+            self.draw_scene_lines(&self.hud.ctx);
+            self.hud.ctx.restore();
+            self.hud.invalidate_styles();
+        }
+
         self.draw_vignette(w, h);
-        self.draw_display_thumbnails(frame);
+        self.draw_display_thumbnails();
         self.draw_station_header(w);
         self.draw_station_control_center(w, h, time_ms);
         self.draw_corners(w, h);
         self.draw_compass(w, h);
         if let Some(id) = self.selected_id.clone() {
-            self.draw_station_focus_detail(&id, w, h, time_ms);
+            self.draw_station_focus_detail(&id, w, h);
         }
-        self.ctx.restore();
     }
 
     fn draw_vignette(&self, w: f32, h: f32) {
-        if let Ok(gradient) = self.ctx.create_radial_gradient(
-            (w / 2.0) as f64,
-            (h / 2.0) as f64,
-            20.0,
-            (w / 2.0) as f64,
-            (h / 2.0) as f64,
-            (w.max(h) * 0.72) as f64,
-        ) {
-            let _ = gradient.add_color_stop(0.0, "rgba(30,30,46,0.04)");
-            let _ = gradient.add_color_stop(0.75, "rgba(17,17,27,0.16)");
-            let _ = gradient.add_color_stop(1.0, "rgba(4,4,9,0.48)");
-            self.ctx.set_fill_style(&gradient.into());
-            self.ctx.fill_rect(0.0, 0.0, w as f64, h as f64);
+        if let Some(gradient) = self.hud.vignette(w, h) {
+            self.hud.ctx.set_fill_style_canvas_gradient(&gradient);
+            self.hud.note_fill_unknown();
+            self.hud.ctx.fill_rect(0.0, 0.0, w as f64, h as f64);
         }
     }
 
-    fn draw_display_thumbnails(&self, frame: &GpuFrame) {
-        let by_host: HashMap<&str, &ProjectedNode> = frame
+    fn draw_display_thumbnails(&self) {
+        if self.display_sources.is_empty() {
+            return;
+        }
+        let by_host: HashMap<&str, &ProjectedNode> = self
+            .frame
             .projected_nodes
             .iter()
             .filter(|n| n.kind == NodeKind::Host)
@@ -1032,17 +1133,19 @@ impl StationInner {
             );
             let video_ready = source.video.video_width() > 0 && source.video.video_height() > 0;
             if video_ready {
-                let _ = self.ctx.draw_image_with_html_video_element_and_dw_and_dh(
-                    &source.video,
-                    (x + 3.0) as f64,
-                    (y + 3.0) as f64,
-                    (tw - 6.0) as f64,
-                    (th - 6.0) as f64,
-                );
+                let _ = self
+                    .hud
+                    .ctx
+                    .draw_image_with_html_video_element_and_dw_and_dh(
+                        &source.video,
+                        (x + 3.0) as f64,
+                        (y + 3.0) as f64,
+                        (tw - 6.0) as f64,
+                        (th - 6.0) as f64,
+                    );
             } else {
-                self.ctx
-                    .set_fill_style(&JsValue::from_str("rgba(49,50,68,0.55)"));
-                self.ctx.fill_rect(
+                self.hud.set_fill("rgba(49,50,68,0.55)");
+                self.hud.ctx.fill_rect(
                     (x + 3.0) as f64,
                     (y + 3.0) as f64,
                     (tw - 6.0) as f64,
@@ -1069,11 +1172,9 @@ impl StationInner {
     }
 
     fn draw_station_header(&mut self, w: f32) {
-        self.ctx
-            .set_fill_style(&JsValue::from_str("rgba(11,11,19,0.78)"));
-        self.ctx.fill_rect(0.0, 0.0, w as f64, 42.0);
-        self.ctx
-            .set_stroke_style(&JsValue::from_str("rgba(49,50,68,0.82)"));
+        self.hud.set_fill("rgba(11,11,19,0.78)");
+        self.hud.ctx.fill_rect(0.0, 0.0, w as f64, 42.0);
+        self.hud.set_stroke("rgba(49,50,68,0.82)");
         self.line(0.0, 42.0, w, 42.0);
         self.text("STATION", 24.0, 26.0, 11.0, C_TEXT_CSS, "bold");
         self.pill_button(
@@ -1160,11 +1261,12 @@ impl StationInner {
     }
 
     fn draw_station_command_deck(&mut self, x: f32, y: f32, w: f32, h: f32) {
-        self.ctx
-            .set_stroke_style(&JsValue::from_str("rgba(137,180,250,0.32)"));
+        self.hud.set_stroke("rgba(137,180,250,0.32)");
         self.line(x, y + h - 1.0, x + w, y + h - 1.0);
-        self.ctx.set_fill_style(&JsValue::from_str(C_BLUE_CSS));
-        self.ctx.fill_rect(x as f64, (y + 15.0) as f64, 3.0, 38.0);
+        self.hud.set_fill(C_BLUE_CSS);
+        self.hud
+            .ctx
+            .fill_rect(x as f64, (y + 15.0) as f64, 3.0, 38.0);
         self.text(
             "CONTROL CENTER",
             x + 18.0,
@@ -1185,7 +1287,7 @@ impl StationInner {
             "bold",
         );
 
-        let controls = self.snapshot.controls.clone();
+        let controls = &self.snapshot.controls;
         let session_state = if controls.session_detached {
             "detached"
         } else if controls.session_active {
@@ -1195,21 +1297,19 @@ impl StationInner {
         } else {
             "idle"
         };
+        let session_line = format!(
+            "{} / {} / {} / {}",
+            nonempty(&controls.backend, "agent"),
+            if controls.direct_mode {
+                "direct"
+            } else {
+                "presence"
+            },
+            nonempty(&controls.approval_policy, "approval"),
+            session_state
+        );
         self.text(
-            &truncate(
-                &format!(
-                    "{} / {} / {} / {}",
-                    nonempty(&controls.backend, "agent"),
-                    if controls.direct_mode {
-                        "direct"
-                    } else {
-                        "presence"
-                    },
-                    nonempty(&controls.approval_policy, "approval"),
-                    session_state
-                ),
-                ((w * 0.46) / 6.2).max(42.0) as usize,
-            ),
+            &truncate(&session_line, ((w * 0.46) / 6.2).max(42.0) as usize),
             x + 18.0,
             y + 68.0,
             10.0,
@@ -1328,29 +1428,19 @@ impl StationInner {
             "normal",
         );
 
-        let targets = self.station_system_targets();
+        let targets = std::mem::take(&mut self.system_targets);
         let tile_w = (panel_w - 44.0) * 0.5;
         let mut tx = x + 14.0;
         let mut ty = y + 66.0;
-        for (idx, target) in targets.into_iter().take(8).enumerate() {
+        for (idx, target) in targets.iter().take(8).enumerate() {
             if idx > 0 && idx % 2 == 0 {
                 tx = x + 14.0;
                 ty += 58.0;
             }
-            self.station_focus_button(
-                tx,
-                ty,
-                tile_w,
-                48.0,
-                target.kicker,
-                target.title,
-                &target.value,
-                &target.detail,
-                target.color,
-                target.id,
-            );
+            self.station_focus_button(tx, ty, tile_w, 48.0, target);
             tx += tile_w + 16.0;
         }
+        self.system_targets = targets;
     }
 
     fn draw_station_scene_core(&mut self, x: f32, y: f32, w: f32, h: f32, time_ms: f64) {
@@ -1370,18 +1460,17 @@ impl StationInner {
         let cx = x + w * 0.5;
         let cy = y + core_h * 0.52;
         let ring_scale = (core_h * 0.42).clamp(132.0, 230.0);
-        self.ctx
-            .set_stroke_style(&JsValue::from_str("rgba(137,180,250,0.28)"));
+        self.hud.set_stroke("rgba(137,180,250,0.28)");
         for radius in [ring_scale * 0.36, ring_scale * 0.62, ring_scale] {
-            self.ctx.begin_path();
-            let _ = self.ctx.arc(
+            self.hud.ctx.begin_path();
+            let _ = self.hud.ctx.arc(
                 cx as f64,
                 cy as f64,
                 (radius + (time_ms as f32 * 0.001).sin() * 2.0) as f64,
                 0.0,
                 std::f64::consts::TAU,
             );
-            self.ctx.stroke();
+            self.hud.ctx.stroke();
         }
         self.text(
             "LIVE STATE",
@@ -1391,7 +1480,7 @@ impl StationInner {
             C_OVERLAY1_CSS,
             "bold",
         );
-        let targets = self.station_system_targets();
+        let targets = std::mem::take(&mut self.system_targets);
         let selected = self
             .selected_id
             .as_deref()
@@ -1474,6 +1563,8 @@ impl StationInner {
             }
         }
 
+        self.system_targets = targets;
+
         let row_y = y + core_h - 118.0;
         let matrix_ids = [
             "system:activity",
@@ -1500,6 +1591,7 @@ impl StationInner {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn station_orbital_node(
         &mut self,
         cx: f32,
@@ -1508,54 +1600,53 @@ impl StationInner {
         y: f32,
         w: f32,
         h: f32,
-        target: &StationSystemTarget<'_>,
+        target: &SystemTarget,
     ) {
         let selected = self.selected_id.as_deref() == Some(target.id);
         let is_display = target.id == "system:peers";
         let anchor_x = if x + w * 0.5 < cx { x + w } else { x };
         let anchor_y = y + h * 0.5;
-        self.ctx.set_stroke_style(&JsValue::from_str(if selected {
+        self.hud.set_stroke(if selected {
             target.color
         } else {
             "rgba(137,180,250,0.22)"
-        }));
+        });
         self.line(cx, cy, anchor_x, anchor_y);
-        self.ctx.set_fill_style(&JsValue::from_str(target.color));
-        self.ctx.begin_path();
-        let _ = self.ctx.arc(
+        self.hud.set_fill(target.color);
+        self.hud.ctx.begin_path();
+        let _ = self.hud.ctx.arc(
             anchor_x as f64,
             anchor_y as f64,
             4.0,
             0.0,
             std::f64::consts::TAU,
         );
-        self.ctx.fill();
-        self.ctx.set_stroke_style(&JsValue::from_str(target.color));
-        self.ctx.begin_path();
-        let _ = self.ctx.arc(
+        self.hud.ctx.fill();
+        self.hud.set_stroke(target.color);
+        self.hud.ctx.begin_path();
+        let _ = self.hud.ctx.arc(
             anchor_x as f64,
             anchor_y as f64,
             13.0,
             0.0,
             std::f64::consts::TAU,
         );
-        self.ctx.stroke();
+        self.hud.ctx.stroke();
         if is_display {
-            self.ctx
-                .set_stroke_style(&JsValue::from_str("rgba(250,179,135,0.58)"));
+            self.hud.set_stroke("rgba(250,179,135,0.58)");
             let aperture_w = (w * 0.34).max(92.0);
             let aperture_cx = x + aperture_w * 0.5;
             let aperture_cy = y + 29.0;
             for radius in [aperture_w * 0.22, aperture_w * 0.34] {
-                self.ctx.begin_path();
-                let _ = self.ctx.arc(
+                self.hud.ctx.begin_path();
+                let _ = self.hud.ctx.arc(
                     aperture_cx as f64,
                     aperture_cy as f64,
                     radius as f64,
                     0.0,
                     std::f64::consts::TAU,
                 );
-                self.ctx.stroke();
+                self.hud.ctx.stroke();
             }
             self.text(
                 target.kicker,
@@ -1625,11 +1716,11 @@ impl StationInner {
     fn draw_station_activity_lane(&mut self, x: f32, h: f32, w: f32) {
         let lane_h = 78.0;
         let y = (h - lane_h - 24.0).max(282.0);
-        self.ctx
-            .set_stroke_style(&JsValue::from_str("rgba(148,226,213,0.34)"));
+        self.hud.set_stroke("rgba(148,226,213,0.34)");
         self.line(x, y, x + w, y);
-        self.ctx.set_fill_style(&JsValue::from_str(C_TEAL_CSS));
-        self.ctx
+        self.hud.set_fill(C_TEAL_CSS);
+        self.hud
+            .ctx
             .fill_rect((x + 1.0) as f64, (y + 18.0) as f64, 3.0, 34.0);
         self.text(
             "ACTIVITY RUNWAY",
@@ -1659,8 +1750,9 @@ impl StationInner {
             for (idx, event) in latest.into_iter().enumerate() {
                 let row_y = y + 43.0 + idx as f32 * 18.0;
                 let color = level_color_css(&event.level);
-                self.ctx.set_fill_style(&JsValue::from_str(color));
-                self.ctx
+                self.hud.set_fill(color);
+                self.hud
+                    .ctx
                     .fill_rect((x + 19.0) as f64, (row_y - 9.0) as f64, 4.0, 14.0);
                 self.text(
                     &truncate(&nonempty(&event.ts, "--"), 10),
@@ -1703,7 +1795,7 @@ impl StationInner {
         }
     }
 
-    fn draw_station_focus_detail(&mut self, id: &str, w: f32, h: f32, _time_ms: f64) {
+    fn draw_station_focus_detail(&mut self, id: &str, w: f32, h: f32) {
         if id.starts_with("system:") {
             return;
         }
@@ -1712,18 +1804,21 @@ impl StationInner {
         let x = (w - panel_w - 24.0).max(24.0);
         let activity_lane_y = (h - 126.0 - 24.0).max(282.0);
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
-        let target = self
-            .station_system_targets()
-            .into_iter()
-            .find(|target| target.id == id)
-            .unwrap_or_else(|| StationSystemTarget {
-                id,
-                kicker: "focus",
-                title: "Selection",
-                value: truncate(id, 42),
-                detail: "scene node selected".to_string(),
-                color: C_BLUE_CSS,
-            });
+        let (title, value, detail, color) =
+            match self.system_targets.iter().find(|target| target.id == id) {
+                Some(target) => (
+                    target.title,
+                    truncate(&target.value, 52),
+                    truncate(&target.detail, 58),
+                    target.color,
+                ),
+                None => (
+                    "Selection",
+                    truncate(id, 42),
+                    "scene node selected".to_string(),
+                    C_BLUE_CSS,
+                ),
+            };
         self.round_rect(
             x,
             y,
@@ -1736,23 +1831,9 @@ impl StationInner {
         self.hit_zones
             .push(HitZone::new(x, y, panel_w, panel_h, HitAction::Noop));
         self.text("FOCUS", x + 16.0, y + 23.0, 10.0, C_OVERLAY1_CSS, "bold");
-        self.text(target.title, x + 16.0, y + 47.0, 14.0, target.color, "bold");
-        self.text(
-            &truncate(&target.value, 52),
-            x + 16.0,
-            y + 68.0,
-            11.0,
-            C_TEXT_CSS,
-            "normal",
-        );
-        self.text(
-            &truncate(&target.detail, 58),
-            x + 16.0,
-            y + 88.0,
-            10.0,
-            C_SUBTEXT0_CSS,
-            "normal",
-        );
+        self.text(title, x + 16.0, y + 47.0, 14.0, color, "bold");
+        self.text(&value, x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
+        self.text(&detail, x + 16.0, y + 88.0, 10.0, C_SUBTEXT0_CSS, "normal");
         self.pill_at(
             x + panel_w - 70.0,
             y + 13.0,
@@ -1770,19 +1851,16 @@ impl StationInner {
         ));
     }
 
-    fn station_focus_button(
-        &mut self,
-        x: f32,
-        y: f32,
-        w: f32,
-        h: f32,
-        kicker: &str,
-        title: &str,
-        value: &str,
-        detail: &str,
-        color: &str,
-        id: &str,
-    ) {
+    fn station_focus_button(&mut self, x: f32, y: f32, w: f32, h: f32, target: &SystemTarget) {
+        let SystemTarget {
+            id,
+            kicker,
+            title,
+            color,
+            ..
+        } = *target;
+        let value = &target.value;
+        let detail = &target.detail;
         let selected = self.selected_id.as_deref() == Some(id);
         self.round_rect(
             x,
@@ -1801,8 +1879,9 @@ impl StationInner {
                 "rgba(69,71,90,0.70)"
             },
         );
-        self.ctx.set_fill_style(&JsValue::from_str(color));
-        self.ctx
+        self.hud.set_fill(color);
+        self.hud
+            .ctx
             .fill_rect((x + 9.0) as f64, (y + 10.0) as f64, 4.0, (h - 20.0) as f64);
         let max_chars = ((w - 34.0) / 6.2).max(12.0) as usize;
         if h < 38.0 {
@@ -1942,7 +2021,7 @@ impl StationInner {
         actions
     }
 
-    fn station_system_targets(&self) -> Vec<StationSystemTarget<'static>> {
+    fn compute_system_targets(&self) -> Vec<SystemTarget> {
         let latest_event = self.snapshot.events.last();
         let ctx_pct = percent(
             self.snapshot.context.tokens,
@@ -1956,7 +2035,7 @@ impl StationInner {
         let controls = &self.snapshot.controls;
         let peer_count = self.snapshot.hosts.len().saturating_sub(1);
         vec![
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:activity",
                 kicker: "signal",
                 title: "Activity",
@@ -1968,7 +2047,7 @@ impl StationInner {
                     .map(|event| level_color_css(&event.level))
                     .unwrap_or(C_TEAL_CSS),
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:context",
                 kicker: "memory",
                 title: "Context",
@@ -1991,7 +2070,7 @@ impl StationInner {
                 ),
                 color: pressure_color(ctx_pct),
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:managed",
                 kicker: "lineage",
                 title: "Managed",
@@ -2006,7 +2085,7 @@ impl StationInner {
                 ),
                 color: pressure_color(managed_pct),
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:controls",
                 kicker: "operator",
                 title: "Controls",
@@ -2028,7 +2107,7 @@ impl StationInner {
                 ),
                 color: C_MAUVE_CSS,
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:sessions",
                 kicker: "work",
                 title: "Sessions",
@@ -2046,7 +2125,7 @@ impl StationInner {
                     C_BLUE_CSS
                 },
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:peers",
                 kicker: "display",
                 title: "Peers",
@@ -2064,7 +2143,7 @@ impl StationInner {
                 ),
                 color: C_PEACH_CSS,
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:changes",
                 kicker: "tree",
                 title: "Changes",
@@ -2083,7 +2162,7 @@ impl StationInner {
                     C_GREEN_CSS
                 },
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:worktrees",
                 kicker: "project",
                 title: "Worktrees",
@@ -2103,7 +2182,7 @@ impl StationInner {
                     C_BLUE_CSS
                 },
             },
-            StationSystemTarget {
+            SystemTarget {
                 id: "system:view",
                 kicker: "scene",
                 title: "View",
@@ -2120,7 +2199,7 @@ impl StationInner {
 
     fn draw_corners(&self, w: f32, h: f32) {
         let c = "rgba(69,71,90,0.8)";
-        self.ctx.set_stroke_style(&JsValue::from_str(c));
+        self.hud.set_stroke(c);
         let len = 26.0;
         for (x, y, sx, sy) in [
             (11.0, 50.0, 1.0, 1.0),
@@ -2136,22 +2215,22 @@ impl StationInner {
     fn draw_compass(&self, w: f32, h: f32) {
         let cx = w - 71.0;
         let cy = h - 33.0;
-        self.ctx
-            .set_stroke_style(&JsValue::from_str("rgba(69,71,90,0.9)"));
-        self.ctx.begin_path();
+        self.hud.set_stroke("rgba(69,71,90,0.9)");
+        self.hud.ctx.begin_path();
         let _ = self
+            .hud
             .ctx
             .arc(cx as f64, cy as f64, 18.0, 0.0, std::f64::consts::TAU);
-        self.ctx.stroke();
+        self.hud.ctx.stroke();
         let angle = -self.yaw as f64;
-        self.ctx.set_stroke_style(&JsValue::from_str(C_BLUE_CSS));
-        self.ctx.begin_path();
-        self.ctx.move_to(cx as f64, cy as f64);
-        self.ctx.line_to(
+        self.hud.set_stroke(C_BLUE_CSS);
+        self.hud.ctx.begin_path();
+        self.hud.ctx.move_to(cx as f64, cy as f64);
+        self.hud.ctx.line_to(
             cx as f64 + angle.sin() * 14.0,
             cy as f64 - angle.cos() * 14.0,
         );
-        self.ctx.stroke();
+        self.hud.ctx.stroke();
         self.text("N", cx + 27.0, cy + 4.0, 10.0, C_OVERLAY1_CSS, "bold");
     }
 
@@ -2165,19 +2244,21 @@ impl StationInner {
 
     fn meter(&self, x: f32, y: f32, w: f32, pct: f32, color: &str) {
         let pct = pct.clamp(0.0, 1.0);
-        self.ctx
-            .set_fill_style(&JsValue::from_str("rgba(49,50,68,0.92)"));
-        self.ctx
+        self.hud.set_fill("rgba(49,50,68,0.92)");
+        self.hud
+            .ctx
             .fill_rect(x as f64, (y - 6.0) as f64, w as f64, 5.0);
-        self.ctx.set_fill_style(&JsValue::from_str(color));
-        self.ctx
+        self.hud.set_fill(color);
+        self.hud
+            .ctx
             .fill_rect(x as f64, (y - 6.0) as f64, (w * pct) as f64, 5.0);
-        self.ctx
-            .set_stroke_style(&JsValue::from_str("rgba(127,132,156,0.5)"));
-        self.ctx
+        self.hud.set_stroke("rgba(127,132,156,0.5)");
+        self.hud
+            .ctx
             .stroke_rect(x as f64, (y - 6.0) as f64, w as f64, 5.0);
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn pill_button(
         &mut self,
         x: f32,
@@ -2204,115 +2285,42 @@ impl StationInner {
         self.text(label, x + 8.0, y + h * 0.65, 10.0, color, "bold");
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn round_rect(&self, x: f32, y: f32, w: f32, h: f32, r: f32, fill: &str, stroke: &str) {
-        let ctx = &self.ctx;
+        let ctx = &self.hud.ctx;
         ctx.begin_path();
         ctx.move_to((x + r) as f64, y as f64);
         ctx.line_to((x + w - r) as f64, y as f64);
-        let _ = ctx.quadratic_curve_to((x + w) as f64, y as f64, (x + w) as f64, (y + r) as f64);
+        ctx.quadratic_curve_to((x + w) as f64, y as f64, (x + w) as f64, (y + r) as f64);
         ctx.line_to((x + w) as f64, (y + h - r) as f64);
-        let _ = ctx.quadratic_curve_to(
+        ctx.quadratic_curve_to(
             (x + w) as f64,
             (y + h) as f64,
             (x + w - r) as f64,
             (y + h) as f64,
         );
         ctx.line_to((x + r) as f64, (y + h) as f64);
-        let _ = ctx.quadratic_curve_to(x as f64, (y + h) as f64, x as f64, (y + h - r) as f64);
+        ctx.quadratic_curve_to(x as f64, (y + h) as f64, x as f64, (y + h - r) as f64);
         ctx.line_to(x as f64, (y + r) as f64);
-        let _ = ctx.quadratic_curve_to(x as f64, y as f64, (x + r) as f64, y as f64);
+        ctx.quadratic_curve_to(x as f64, y as f64, (x + r) as f64, y as f64);
         ctx.close_path();
-        ctx.set_fill_style(&JsValue::from_str(fill));
+        self.hud.set_fill(fill);
         ctx.fill();
-        ctx.set_stroke_style(&JsValue::from_str(stroke));
+        self.hud.set_stroke(stroke);
         ctx.stroke();
     }
 
     fn text(&self, text: &str, x: f32, y: f32, px: f32, color: &str, weight: &str) {
-        self.ctx.set_fill_style(&JsValue::from_str(color));
-        self.ctx.set_font(&format!(
-            "{weight} {px}px 'SF Mono', Menlo, Consolas, monospace"
-        ));
-        let _ = self.ctx.fill_text(text, x as f64, y as f64);
+        self.hud.set_fill(color);
+        self.hud.set_font(px, weight == "bold");
+        let _ = self.hud.ctx.fill_text(text, x as f64, y as f64);
     }
 
     fn line(&self, x1: f32, y1: f32, x2: f32, y2: f32) {
-        self.ctx.begin_path();
-        self.ctx.move_to(x1 as f64, y1 as f64);
-        self.ctx.line_to(x2 as f64, y2 as f64);
-        self.ctx.stroke();
-    }
-
-    fn layout_positions(&self) -> HashMap<String, Vec3> {
-        let mut map = HashMap::new();
-        map.insert("op".to_string(), Vec3::ZERO);
-        let host_count = self.snapshot.hosts.len().max(1);
-        for (i, host) in self.snapshot.hosts.iter().enumerate() {
-            let t = i as f32 / host_count as f32;
-            let pos = match self.layout {
-                LayoutName::Orbital => {
-                    let angle = t * PI * 2.0 + PI * 0.08;
-                    let radius = 4.2 + (host_count as f32 * 0.18).min(1.3);
-                    Vec3::new(angle.cos() * radius, 0.0, angle.sin() * radius)
-                }
-                LayoutName::Constellation => {
-                    let spread = (host_count as f32 - 1.0).max(1.0);
-                    let x = (i as f32 - spread * 0.5) * 3.2;
-                    let z = -1.3 + (stable_unit(&host.id) - 0.5) * 2.3;
-                    Vec3::new(
-                        x,
-                        -0.05 + (stable_unit(&(host.id.clone() + "y")) - 0.5) * 0.8,
-                        z,
-                    )
-                }
-            };
-            map.insert(format!("host:{}", host.id), pos);
-        }
-        let mut by_host: HashMap<&str, Vec<&StationAgent>> = HashMap::new();
-        for agent in &self.snapshot.agents {
-            by_host
-                .entry(agent.host_id.as_str())
-                .or_default()
-                .push(agent);
-        }
-        for host in &self.snapshot.hosts {
-            let host_pos = map
-                .get(&format!("host:{}", host.id))
-                .copied()
-                .unwrap_or(Vec3::ZERO);
-            let agents = by_host.get(host.id.as_str()).cloned().unwrap_or_default();
-            let count = agents.len().max(1);
-            for (idx, agent) in agents.into_iter().enumerate() {
-                let pos = match self.layout {
-                    LayoutName::Orbital => {
-                        let angle = idx as f32 / count as f32 * PI * 2.0 + stable_angle(&agent.id);
-                        let ring = if agent.role == "sub-agent" {
-                            1.55
-                        } else {
-                            1.18
-                        };
-                        host_pos
-                            + Vec3::new(
-                                angle.cos() * ring,
-                                0.55 + (idx % 3) as f32 * 0.28,
-                                angle.sin() * ring * 0.72,
-                            )
-                    }
-                    LayoutName::Constellation => {
-                        let u = stable_unit(&agent.id);
-                        let v = stable_unit(&(agent.id.clone() + "v"));
-                        host_pos
-                            + Vec3::new(
-                                (u - 0.5) * 2.9,
-                                0.7 + v * 1.8,
-                                (stable_unit(&(agent.id.clone() + "z")) - 0.5) * 2.0,
-                            )
-                    }
-                };
-                map.insert(agent.id.clone(), pos);
-            }
-        }
-        map
+        self.hud.ctx.begin_path();
+        self.hud.ctx.move_to(x1 as f64, y1 as f64);
+        self.hud.ctx.line_to(x2 as f64, y2 as f64);
+        self.hud.ctx.stroke();
     }
 
     fn camera(&self) -> Camera {
@@ -2333,7 +2341,8 @@ impl StationInner {
     fn pick_node(&self, x: f32, y: f32) -> Option<String> {
         let px = x * self.dpr as f32;
         let py = y * self.dpr as f32;
-        self.projected_nodes
+        self.frame
+            .projected_nodes
             .iter()
             .filter_map(|n| {
                 let p = ndc_to_screen([n.ndc.x, n.ndc.y], self.width, self.height);
@@ -2347,18 +2356,15 @@ impl StationInner {
     fn dispatch_hit(&mut self, action: HitAction) -> Option<serde_json::Value> {
         match action {
             HitAction::Layout(layout) => {
-                self.layout = layout;
-                self.last_render_ms = 0.0;
+                self.set_layout(layout);
                 None
             }
             HitAction::ClosePanel => {
                 self.selected_id = None;
-                self.last_render_ms = 0.0;
                 None
             }
             HitAction::Select(id) => {
                 self.selected_id = Some(id);
-                self.last_render_ms = 0.0;
                 None
             }
             HitAction::Noop => None,
@@ -2421,7 +2427,6 @@ impl StationInner {
         let dist = ((a.x - b.x).powi(2) + (a.y - b.y).powi(2)).sqrt().max(1.0);
         let scale = (pinch.start_distance / dist).clamp(0.25, 4.0);
         self.distance = (pinch.start_camera_distance * scale).clamp(4.2, 25.0);
-        self.last_render_ms = 0.0;
     }
 
     fn set_cursor(&self, cursor: &str) {
@@ -2440,17 +2445,24 @@ impl StationInner {
             .map(|z| z.action.clone())
     }
 
-    fn event_xy(&self, client_x: f64, client_y: f64) -> (f32, f32) {
-        let rect = self.hud_canvas.get_bounding_client_rect();
-        (
-            (client_x - rect.left()) as f32,
-            (client_y - rect.top()) as f32,
-        )
+    /// Map client coordinates into canvas CSS coordinates, reusing a cached
+    /// canvas origin so pointermove storms do not force layout. The cache is
+    /// dropped on resize, scroll, and tab activation.
+    fn event_xy(&mut self, client_x: f64, client_y: f64) -> (f32, f32) {
+        let (left, top) = match self.canvas_origin {
+            Some(origin) => origin,
+            None => {
+                let rect = self.hud_canvas.get_bounding_client_rect();
+                let origin = (rect.left(), rect.top());
+                self.canvas_origin = Some(origin);
+                origin
+            }
+        };
+        ((client_x - left) as f32, (client_y - top) as f32)
     }
 
     fn mark_input(&mut self) {
         self.last_input_ms = now_ms();
-        self.last_render_ms = 0.0;
     }
 
     fn css_width(&self) -> f32 {
@@ -2462,6 +2474,205 @@ impl StationInner {
     }
 }
 
+/// The HUD 2D context plus memoized style state. Canvas style setters are
+/// expensive to spam and the HUD repeats the same handful of fills, strokes,
+/// and fonts hundreds of times per frame, so each setter only touches the
+/// context when the value actually changes. Font strings are interned per
+/// (size, weight). Interior mutability keeps the draw helpers callable
+/// through `&self`.
+struct Hud {
+    ctx: CanvasRenderingContext2d,
+    style: RefCell<HudStyle>,
+}
+
+#[derive(Default)]
+struct HudStyle {
+    fill: String,
+    stroke: String,
+    font: (u32, bool),
+    fonts: HashMap<(u32, bool), String>,
+    vignette: Option<Vignette>,
+}
+
+struct Vignette {
+    width: f32,
+    height: f32,
+    gradient: web_sys::CanvasGradient,
+}
+
+impl Hud {
+    fn new(ctx: CanvasRenderingContext2d) -> Self {
+        Self {
+            ctx,
+            style: RefCell::new(HudStyle::default()),
+        }
+    }
+
+    fn set_fill(&self, css: &str) {
+        let mut style = self.style.borrow_mut();
+        if style.fill != css {
+            style.fill.clear();
+            style.fill.push_str(css);
+            self.ctx.set_fill_style_str(css);
+        }
+    }
+
+    fn set_stroke(&self, css: &str) {
+        let mut style = self.style.borrow_mut();
+        if style.stroke != css {
+            style.stroke.clear();
+            style.stroke.push_str(css);
+            self.ctx.set_stroke_style_str(css);
+        }
+    }
+
+    fn set_font(&self, px: f32, bold: bool) {
+        let key = ((px * 10.0).round() as u32, bold);
+        let mut style = self.style.borrow_mut();
+        if style.font == key {
+            return;
+        }
+        style.font = key;
+        let font = style.fonts.entry(key).or_insert_with(|| {
+            format!(
+                "{} {px}px 'SF Mono', Menlo, Consolas, monospace",
+                if bold { "bold" } else { "normal" }
+            )
+        });
+        self.ctx.set_font(font);
+    }
+
+    /// The fill was set to a non-string paint (e.g. a gradient) behind the
+    /// memo's back; force the next `set_fill` through.
+    fn note_fill_unknown(&self) {
+        self.style.borrow_mut().fill.clear();
+    }
+
+    /// Radial vignette gradient, rebuilt only when the size changes.
+    fn vignette(&self, w: f32, h: f32) -> Option<web_sys::CanvasGradient> {
+        let mut style = self.style.borrow_mut();
+        if let Some(v) = style.vignette.as_ref() {
+            if v.width == w && v.height == h {
+                return Some(v.gradient.clone());
+            }
+        }
+        let gradient = self
+            .ctx
+            .create_radial_gradient(
+                (w / 2.0) as f64,
+                (h / 2.0) as f64,
+                20.0,
+                (w / 2.0) as f64,
+                (h / 2.0) as f64,
+                (w.max(h) * 0.72) as f64,
+            )
+            .ok()?;
+        let _ = gradient.add_color_stop(0.0, "rgba(30,30,46,0.04)");
+        let _ = gradient.add_color_stop(0.75, "rgba(17,17,27,0.16)");
+        let _ = gradient.add_color_stop(1.0, "rgba(4,4,9,0.48)");
+        style.vignette = Some(Vignette {
+            width: w,
+            height: h,
+            gradient: gradient.clone(),
+        });
+        Some(gradient)
+    }
+
+    fn invalidate_vignette(&self) {
+        self.style.borrow_mut().vignette = None;
+    }
+
+    /// Forget memoized style state after the real context state was reset
+    /// (canvas resize) or mutated outside the memo (scene underlay).
+    fn invalidate_styles(&self) {
+        let mut style = self.style.borrow_mut();
+        style.fill.clear();
+        style.stroke.clear();
+        style.font = (0, false);
+    }
+
+    /// Full reset: styles and the size-dependent vignette.
+    fn invalidate(&self) {
+        self.invalidate_styles();
+        self.invalidate_vignette();
+    }
+}
+
+/// World position per node id ("op", "host:<id>", agent ids) for the given
+/// layout. Pure: depends only on the snapshot and layout, so callers cache
+/// the result per (snapshot, layout) change.
+fn layout_positions(snapshot: &StationSnapshot, layout: LayoutName) -> HashMap<String, Vec3> {
+    let mut map = HashMap::new();
+    map.insert("op".to_string(), Vec3::ZERO);
+    let host_count = snapshot.hosts.len().max(1);
+    for (i, host) in snapshot.hosts.iter().enumerate() {
+        let t = i as f32 / host_count as f32;
+        let pos = match layout {
+            LayoutName::Orbital => {
+                let angle = t * PI * 2.0 + PI * 0.08;
+                let radius = 4.2 + (host_count as f32 * 0.18).min(1.3);
+                Vec3::new(angle.cos() * radius, 0.0, angle.sin() * radius)
+            }
+            LayoutName::Constellation => {
+                let spread = (host_count as f32 - 1.0).max(1.0);
+                let x = (i as f32 - spread * 0.5) * 3.2;
+                let z = -1.3 + (stable_unit(&host.id) - 0.5) * 2.3;
+                Vec3::new(
+                    x,
+                    -0.05 + (stable_unit(&(host.id.clone() + "y")) - 0.5) * 0.8,
+                    z,
+                )
+            }
+        };
+        map.insert(format!("host:{}", host.id), pos);
+    }
+    let mut by_host: HashMap<&str, Vec<&StationAgent>> = HashMap::new();
+    for agent in &snapshot.agents {
+        by_host
+            .entry(agent.host_id.as_str())
+            .or_default()
+            .push(agent);
+    }
+    for host in &snapshot.hosts {
+        let host_pos = map
+            .get(&format!("host:{}", host.id))
+            .copied()
+            .unwrap_or(Vec3::ZERO);
+        let agents = by_host.get(host.id.as_str()).cloned().unwrap_or_default();
+        let count = agents.len().max(1);
+        for (idx, agent) in agents.into_iter().enumerate() {
+            let pos = match layout {
+                LayoutName::Orbital => {
+                    let angle = idx as f32 / count as f32 * PI * 2.0 + stable_angle(&agent.id);
+                    let ring = if agent.role == "sub-agent" {
+                        1.55
+                    } else {
+                        1.18
+                    };
+                    host_pos
+                        + Vec3::new(
+                            angle.cos() * ring,
+                            0.55 + (idx % 3) as f32 * 0.28,
+                            angle.sin() * ring * 0.72,
+                        )
+                }
+                LayoutName::Constellation => {
+                    let u = stable_unit(&agent.id);
+                    let v = stable_unit(&(agent.id.clone() + "v"));
+                    host_pos
+                        + Vec3::new(
+                            (u - 0.5) * 2.9,
+                            0.7 + v * 1.8,
+                            (stable_unit(&(agent.id.clone() + "z")) - 0.5) * 2.0,
+                        )
+                }
+            };
+            map.insert(agent.id.clone(), pos);
+        }
+    }
+    map
+}
+
 #[cfg(target_arch = "wasm32")]
 struct GpuState {
     surface: wgpu::Surface<'static>,
@@ -2470,6 +2681,54 @@ struct GpuState {
     config: wgpu::SurfaceConfiguration,
     line_pipeline: wgpu::RenderPipeline,
     tri_pipeline: wgpu::RenderPipeline,
+    /// Persistent vertex buffers, uploaded via `Queue::write_buffer` and
+    /// grown geometrically on demand; never recreated per frame.
+    line_buffer: GpuVertexBuffer,
+    tri_buffer: GpuVertexBuffer,
+}
+
+#[cfg(target_arch = "wasm32")]
+struct GpuVertexBuffer {
+    label: &'static str,
+    buffer: wgpu::Buffer,
+    capacity: u64,
+}
+
+#[cfg(target_arch = "wasm32")]
+impl GpuVertexBuffer {
+    /// Comfortably holds a typical scene; grows if a frame outsizes it.
+    const INITIAL_CAPACITY: u64 = 256 * 1024;
+
+    fn new(device: &wgpu::Device, label: &'static str) -> Self {
+        Self {
+            label,
+            buffer: Self::create(device, label, Self::INITIAL_CAPACITY),
+            capacity: Self::INITIAL_CAPACITY,
+        }
+    }
+
+    fn create(device: &wgpu::Device, label: &'static str, capacity: u64) -> wgpu::Buffer {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(label),
+            size: capacity,
+            usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        })
+    }
+
+    /// Upload this frame's vertices, growing the buffer if needed.
+    fn upload(&mut self, device: &wgpu::Device, queue: &wgpu::Queue, vertices: &[GpuVertex]) {
+        if vertices.is_empty() {
+            return;
+        }
+        let bytes: &[u8] = bytemuck::cast_slice(vertices);
+        let needed = bytes.len() as u64;
+        if needed > self.capacity {
+            self.capacity = needed.next_power_of_two();
+            self.buffer = Self::create(device, self.label, self.capacity);
+        }
+        queue.write_buffer(&self.buffer, 0, bytes);
+    }
 }
 
 #[cfg(target_arch = "wasm32")]
@@ -2571,6 +2830,8 @@ impl GpuState {
         };
         let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList);
         let tri_pipeline = make_pipeline(wgpu::PrimitiveTopology::TriangleList);
+        let line_buffer = GpuVertexBuffer::new(&device, "Station Lines");
+        let tri_buffer = GpuVertexBuffer::new(&device, "Station Triangles");
 
         Ok(Self {
             surface,
@@ -2579,6 +2840,8 @@ impl GpuState {
             config,
             line_pipeline,
             tri_pipeline,
+            line_buffer,
+            tri_buffer,
         })
     }
 
@@ -2622,20 +2885,10 @@ impl GpuState {
                 label: Some("Station Encoder"),
             });
 
-        let line_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Station Lines"),
-                contents: bytemuck::cast_slice(&frame.line_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
-        let tri_buffer = self
-            .device
-            .create_buffer_init(&wgpu::util::BufferInitDescriptor {
-                label: Some("Station Triangles"),
-                contents: bytemuck::cast_slice(&frame.tri_vertices),
-                usage: wgpu::BufferUsages::VERTEX,
-            });
+        self.line_buffer
+            .upload(&self.device, &self.queue, &frame.line_vertices);
+        self.tri_buffer
+            .upload(&self.device, &self.queue, &frame.tri_vertices);
 
         {
             let mut pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -2660,13 +2913,15 @@ impl GpuState {
                 multiview_mask: None,
             });
             if !frame.line_vertices.is_empty() {
+                let bytes = std::mem::size_of_val(frame.line_vertices.as_slice()) as u64;
                 pass.set_pipeline(&self.line_pipeline);
-                pass.set_vertex_buffer(0, line_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.line_buffer.buffer.slice(..bytes));
                 pass.draw(0..frame.line_vertices.len() as u32, 0..1);
             }
             if !frame.tri_vertices.is_empty() {
+                let bytes = std::mem::size_of_val(frame.tri_vertices.as_slice()) as u64;
                 pass.set_pipeline(&self.tri_pipeline);
-                pass.set_vertex_buffer(0, tri_buffer.slice(..));
+                pass.set_vertex_buffer(0, self.tri_buffer.buffer.slice(..bytes));
                 pass.draw(0..frame.tri_vertices.len() as u32, 0..1);
             }
         }
@@ -2739,6 +2994,13 @@ struct GpuFrame {
 }
 
 impl GpuFrame {
+    /// Empty the frame while keeping the buffers' capacity for reuse.
+    fn clear(&mut self) {
+        self.line_vertices.clear();
+        self.tri_vertices.clear();
+        self.projected_nodes.clear();
+    }
+
     fn add_line_ndc(&mut self, a: Vec2, b: Vec2, color: Color) {
         self.line_vertices.push(GpuVertex {
             pos: [a.x, a.y],
@@ -2940,6 +3202,7 @@ impl GpuFrame {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn add_edges(
         &mut self,
         project: &mut impl FnMut(Vec3) -> Option<Vec2>,
@@ -3732,7 +3995,7 @@ impl Default for StationBreakdown {
     }
 }
 
-#[derive(Clone, Deserialize)]
+#[derive(Clone, Default, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 struct StationDetailRow {
     id: String,
@@ -3771,49 +4034,6 @@ struct StationDetailRow {
     can_restart: bool,
     can_open_log: bool,
     can_fork: bool,
-}
-
-impl Default for StationDetailRow {
-    fn default() -> Self {
-        Self {
-            id: String::new(),
-            session_id: String::new(),
-            action: String::new(),
-            label: String::new(),
-            value: String::new(),
-            detail: String::new(),
-            tone: String::new(),
-            external_status: String::new(),
-            backend_id: String::new(),
-            intendant_id: String::new(),
-            live_id: String::new(),
-            action_id: String::new(),
-            attach_id: String::new(),
-            stop_id: String::new(),
-            live_phase: String::new(),
-            command: String::new(),
-            managed_context: String::new(),
-            context_archive: String::new(),
-            launch_persistent: false,
-            external_detached: false,
-            is_codex: false,
-            thread_action_session_id: String::new(),
-            goal_status: String::new(),
-            goal_objective: String::new(),
-            goal_tokens: String::new(),
-            goal_token_budget: String::new(),
-            can_resume: false,
-            can_config: false,
-            can_rename: false,
-            can_focus: false,
-            can_attach: false,
-            can_stop: false,
-            can_interrupt: false,
-            can_restart: false,
-            can_open_log: false,
-            can_fork: false,
-        }
-    }
 }
 
 struct DisplaySource {
@@ -3872,13 +4092,8 @@ enum HitAction {
     Noop,
     Select(String),
     ClosePanel,
-    ActivityAction {
-        action: String,
-        id: String,
-    },
-    ControlsAction {
-        action: String,
-    },
+    ActivityAction { action: String, id: String },
+    ControlsAction { action: String },
 }
 
 struct HitZone {
@@ -3902,10 +4117,12 @@ struct LaneAction {
     hit: HitAction,
 }
 
-struct StationSystemTarget<'a> {
-    id: &'a str,
-    kicker: &'a str,
-    title: &'a str,
+/// One control-center summary tile, derived from the snapshot. Rebuilt
+/// only when the underlying state changes, then reused across frames.
+struct SystemTarget {
+    id: &'static str,
+    kicker: &'static str,
+    title: &'static str,
     value: String,
     detail: String,
     color: &'static str,
@@ -4332,9 +4549,7 @@ fn station_enable_webgpu() -> bool {
     web_sys::window()
         .and_then(|w| w.document())
         .and_then(|document| document.url().ok())
-        .map_or(true, |url| {
-            !url.contains("station_gpu=canvas") && !url.contains("station_gpu=off")
-        })
+        .is_none_or(|url| !url.contains("station_gpu=canvas") && !url.contains("station_gpu=off"))
 }
 
 fn f32_or_default<'de, D>(deserializer: D) -> Result<f32, D::Error>
@@ -4344,9 +4559,16 @@ where
     Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(0.0) as f32)
 }
 
+#[cfg(target_arch = "wasm32")]
 fn now_ms() -> f64 {
-    web_sys::window()
-        .and_then(|w| w.performance())
-        .map(|p| p.now())
-        .unwrap_or(0.0)
+    thread_local! {
+        static PERFORMANCE: Option<web_sys::Performance> =
+            web_sys::window().and_then(|w| w.performance());
+    }
+    PERFORMANCE.with(|p| p.as_ref().map_or(0.0, |p| p.now()))
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn now_ms() -> f64 {
+    0.0
 }
