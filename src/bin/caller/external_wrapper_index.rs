@@ -117,6 +117,14 @@ pub fn upsert(
         record.updated_at_secs = 0;
     }
 
+    for record in index.wrappers.iter_mut().filter(|record| {
+        record.source == source
+            && record.intendant_session_id == stored_intendant_session_id
+            && record.backend_session_id != backend_session_id
+    }) {
+        record.updated_at_secs = 0;
+    }
+
     if let Some(existing) = index.wrappers.iter_mut().find(|record| {
         record.source == source
             && record.backend_session_id == backend_session_id
@@ -320,5 +328,45 @@ mod tests {
                 .map(|record| record.intendant_session_id.as_str()),
             Some("ec5865e5-a5af-4b8c-81a1-545a3a6f8ba9")
         );
+    }
+
+    #[test]
+    fn upsert_demotes_stale_backend_for_same_wrapper_session() {
+        let home = tempfile::tempdir().unwrap();
+        let log_dir = home
+            .path()
+            .join(".intendant")
+            .join("logs")
+            .join("6036429e-54f9-4f93-b74d-04c060c79054");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let old_backend_id = "019ea99e-af1d-7c23-a57a-55a89c77f90b";
+        let new_backend_id = "019ea9cc-76d0-7153-94cf-e98948d8ee8a";
+        let wrapper_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+
+        upsert(
+            home.path(),
+            "codex",
+            old_backend_id,
+            wrapper_id,
+            &log_dir,
+            None,
+        )
+        .unwrap();
+        upsert(
+            home.path(),
+            "codex",
+            new_backend_id,
+            wrapper_id,
+            &log_dir,
+            None,
+        )
+        .unwrap();
+
+        let source_wrappers = wrappers_for_source(home.path(), "codex");
+        assert_eq!(source_wrappers.len(), 2);
+        assert_eq!(source_wrappers[0].backend_session_id, new_backend_id);
+        assert_eq!(source_wrappers[0].intendant_session_id, wrapper_id);
+        assert_eq!(source_wrappers[1].backend_session_id, old_backend_id);
+        assert_eq!(source_wrappers[1].updated_at_secs, 0);
     }
 }
