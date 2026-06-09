@@ -2753,7 +2753,7 @@ fn write_event_to_session_log(session_log: &crate::SharedSessionLog, event: &App
         }
         AppEvent::UserDisplayGranted { display_id } => {
             log.info(&format!(
-                "User display access granted (display_id: {})",
+                "User display access grant recorded (display_id: {})",
                 display_id
             ));
         }

@@ -122,6 +122,10 @@ pub struct McpAppState {
     /// the operator is approving the first one, but still lets stale/canceled
     /// approval paths be refreshed.
     user_display_activation_pending: std::collections::HashMap<u32, std::time::Instant>,
+    /// Displays whose latest observed capture state is ready. This is a
+    /// reducer-level guard against stale portal-pending events arriving after
+    /// a ready event or successful screenshot.
+    display_capture_ready: HashSet<u32>,
     /// Directory for screenshot output.
     pub screenshot_dir: Option<std::path::PathBuf>,
     /// Persistent counter for screenshot filenames (avoids overwriting).
@@ -237,6 +241,7 @@ impl McpAppState {
             frame_registry: None,
             session_registry: None,
             user_display_activation_pending: std::collections::HashMap::new(),
+            display_capture_ready: HashSet::new(),
             screenshot_dir: None,
             screenshot_counter: std::sync::atomic::AtomicU64::new(0),
             external_agent: None,
@@ -274,6 +279,61 @@ impl McpAppState {
             level: frontend::log_level_to_str(&level).to_string(),
             content,
         });
+    }
+
+    fn display_session_probe_now(&self, display_id: u32) -> Option<Option<(u32, u32)>> {
+        let Some(registry) = self.session_registry.as_ref() else {
+            return Some(None);
+        };
+        let Ok(registry) = registry.try_read() else {
+            return None;
+        };
+        Some(registry.get(display_id).map(|session| session.resolution()))
+    }
+
+    fn display_session_resolution_now(&self, display_id: u32) -> Option<(u32, u32)> {
+        self.display_session_probe_now(display_id).flatten()
+    }
+
+    fn display_capture_ready_now(&mut self, display_id: u32) -> bool {
+        match self.display_session_probe_now(display_id) {
+            Some(Some(_)) => {
+                self.display_capture_ready.insert(display_id);
+                true
+            }
+            Some(None) => {
+                self.display_capture_ready.remove(&display_id);
+                false
+            }
+            None => self.display_capture_ready.contains(&display_id),
+        }
+    }
+
+    fn note_display_capture_ready(&mut self, display_id: u32) {
+        self.user_display_activation_pending.remove(&display_id);
+        self.display_capture_ready.insert(display_id);
+    }
+
+    fn note_display_capture_lost(&mut self, display_id: u32) {
+        self.user_display_activation_pending.remove(&display_id);
+        self.display_capture_ready.remove(&display_id);
+    }
+
+    fn note_display_approval_pending(&mut self, display_id: u32, backend: &str) -> bool {
+        if self.display_capture_ready_now(display_id) {
+            self.note_display_capture_ready(display_id);
+            return false;
+        }
+        self.user_display_activation_pending
+            .insert(display_id, std::time::Instant::now());
+        self.push_log(
+            LogLevel::Info,
+            format!(
+                "Display :{} waiting for OS portal approval ({backend}); enable Allow Remote Interaction before Share for Computer Use input",
+                display_id
+            ),
+        );
+        true
     }
 
     fn status_snapshot(&self) -> StatusSnapshot {
@@ -4785,6 +4845,7 @@ async fn handle_control_command_mcp(
         }
         ControlMsg::GrantUserDisplay { display_id } => {
             let did = display_id.unwrap_or(0);
+            let active_resolution = active_display_session_resolution(state, did).await;
             let autonomy = {
                 let mut s = state.write().await;
                 s.user_display_activation_pending.remove(&did);
@@ -4792,12 +4853,20 @@ async fn handle_control_command_mcp(
             };
             autonomy.write().await.user_display_granted = true;
             std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-            bus.send(AppEvent::UserDisplayGranted { display_id: did });
+            if let Some((width, height)) = active_resolution {
+                bus.send(AppEvent::DisplayReady {
+                    display_id: did,
+                    width,
+                    height,
+                });
+            } else {
+                bus.send(AppEvent::UserDisplayGranted { display_id: did });
+            }
             emit_control_result(
                 control_tx,
                 "grant_user_display",
                 true,
-                format!("User display access granted (display_id: {})", did),
+                user_display_grant_result_message(did, active_resolution),
                 None,
             );
             Some(RESOURCE_LOGS_URI)
@@ -5530,7 +5599,7 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::DisplayReady { display_id, .. } => {
-                        s.user_display_activation_pending.remove(&display_id);
+                        s.note_display_capture_ready(display_id);
                         s.push_log(LogLevel::Detail, format!("Display :{}", display_id));
                         resource_changed = Some("intendant://logs");
                     }
@@ -5571,9 +5640,10 @@ pub fn spawn_event_listener(
                     }
 
                     AppEvent::UserDisplayGranted { display_id } => {
+                        let active_resolution = s.display_session_resolution_now(display_id);
                         s.push_log(
                             LogLevel::Warn,
-                            format!("User display access granted (display_id: {})", display_id),
+                            user_display_grant_result_message(display_id, active_resolution),
                         );
                         resource_changed = Some("intendant://logs");
                     }
@@ -5582,7 +5652,7 @@ pub fn spawn_event_listener(
                         display_id,
                         ref note,
                     } => {
-                        s.user_display_activation_pending.remove(&display_id);
+                        s.note_display_capture_lost(display_id);
                         let msg = format!(
                             "User display access revoked (display_id: {}){}",
                             display_id,
@@ -5851,7 +5921,7 @@ pub fn spawn_event_listener(
                         display_id,
                         ref reason,
                     } => {
-                        s.user_display_activation_pending.remove(&display_id);
+                        s.note_display_capture_lost(display_id);
                         s.push_log(
                             LogLevel::Warn,
                             format!("Display :{} capture lost: {}", display_id, reason),
@@ -5861,15 +5931,9 @@ pub fn spawn_event_listener(
                         display_id,
                         backend,
                     } => {
-                        s.user_display_activation_pending
-                            .insert(display_id, std::time::Instant::now());
-                        s.push_log(
-                            LogLevel::Info,
-                            format!(
-                                "Display :{} waiting for OS portal approval ({backend}); enable Allow Remote Interaction before Share for Computer Use input",
-                                display_id
-                            ),
-                        );
+                        if s.note_display_approval_pending(display_id, backend) {
+                            resource_changed = Some("intendant://logs");
+                        }
                     }
                     AppEvent::InterruptRequested { ref session_id } => {
                         s.set_phase(Phase::Interrupting);
@@ -7698,6 +7762,58 @@ enum UserSessionDisplayActivationRequest {
 const WAYLAND_USER_DISPLAY_ACTIVATION_PENDING_STALE_AFTER: std::time::Duration =
     std::time::Duration::from_secs(30);
 
+fn display_id_for_cu_target(target: crate::computer_use::DisplayTarget) -> u32 {
+    match target {
+        crate::computer_use::DisplayTarget::UserSession => 0,
+        crate::computer_use::DisplayTarget::Virtual { id } => id,
+    }
+}
+
+async fn active_display_session_resolution(
+    state: &SharedMcpState,
+    display_id: u32,
+) -> Option<(u32, u32)> {
+    let registry = state.read().await.session_registry.clone()?;
+    let session = registry.read().await.get(display_id)?;
+    Some(session.resolution())
+}
+
+async fn clear_wayland_user_session_activation_pending_after_capture(
+    state: &SharedMcpState,
+    target: crate::computer_use::DisplayTarget,
+    backend: crate::computer_use::DisplayBackend,
+) {
+    if backend == crate::computer_use::DisplayBackend::Wayland
+        && target == crate::computer_use::DisplayTarget::UserSession
+    {
+        state
+            .write()
+            .await
+            .note_display_capture_ready(display_id_for_cu_target(target));
+    }
+}
+
+fn user_display_grant_result_message(
+    display_id: u32,
+    active_resolution: Option<(u32, u32)>,
+) -> String {
+    if let Some((width, height)) = active_resolution {
+        return format!(
+            "User display capture already active (display_id: {display_id}, {width}x{height})"
+        );
+    }
+    if crate::computer_use::DisplayBackend::detect() == crate::computer_use::DisplayBackend::Wayland
+    {
+        format!(
+            "User display access requested (display_id: {display_id}); waiting for GNOME portal approval with Allow Remote Interaction enabled"
+        )
+    } else {
+        format!(
+            "User display access grant recorded (display_id: {display_id}); capture is ready after DisplayReady"
+        )
+    }
+}
+
 impl UserSessionDisplayActivationRequest {
     fn hint(self) -> Option<&'static str> {
         match self {
@@ -9215,6 +9331,7 @@ impl IntendantServer {
         Parameters(params): Parameters<GrantUserDisplayParams>,
     ) -> String {
         let display_id = params.display_id.unwrap_or(0);
+        let active_resolution = active_display_session_resolution(&self.state, display_id).await;
         let autonomy = {
             let mut state = self.state.write().await;
             state.user_display_activation_pending.remove(&display_id);
@@ -9222,8 +9339,16 @@ impl IntendantServer {
         };
         autonomy.write().await.user_display_granted = true;
         std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-        self.bus.send(AppEvent::UserDisplayGranted { display_id });
-        format!("User display access granted (display_id: {display_id})")
+        if let Some((width, height)) = active_resolution {
+            self.bus.send(AppEvent::DisplayReady {
+                display_id,
+                width,
+                height,
+            });
+        } else {
+            self.bus.send(AppEvent::UserDisplayGranted { display_id });
+        }
+        user_display_grant_result_message(display_id, active_resolution)
     }
 
     #[tool(description = "Revoke access to the user's real display session.")]
@@ -9299,6 +9424,7 @@ impl IntendantServer {
         };
         if let Some(registry) = &session_registry {
             if registry.read().await.get(0).is_some() {
+                self.state.write().await.note_display_capture_ready(0);
                 return UserSessionDisplayActivationRequest::AlreadyActive;
             }
         }
@@ -9581,6 +9707,12 @@ impl IntendantServer {
 
         if let Some(result) = results.first() {
             if let Some(ref screenshot) = result.screenshot {
+                clear_wayland_user_session_activation_pending_after_capture(
+                    &self.state,
+                    target,
+                    backend,
+                )
+                .await;
                 let metadata = serde_json::json!({
                     "status": "screenshot captured",
                     "screenshot_path": screenshot.path,
@@ -9709,6 +9841,12 @@ impl IntendantServer {
         // picks it up for the Activity tab.
         let last_screenshot = results.iter().rev().find_map(|r| r.screenshot.as_ref());
         if let Some(ss) = last_screenshot {
+            clear_wayland_user_session_activation_pending_after_capture(
+                &self.state,
+                target,
+                backend,
+            )
+            .await;
             let annotated = annotate_screenshot_with_clicks(&ss.base64_png, &actions);
             // Save annotated screenshot to disk (overwrite the raw one)
             if let Ok(bytes) =
@@ -10431,6 +10569,52 @@ mod tests {
             autonomy,
             log_dir,
         )))
+    }
+
+    struct TestDisplayBackend {
+        width: u32,
+        height: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::display::DisplayBackend for TestDisplayBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<tokio::sync::mpsc::Receiver<crate::display::Frame>, crate::error::CallerError>
+        {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: crate::display::InputEvent,
+        ) -> Result<(), crate::error::CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    fn test_session_registry_with_display(
+        display_id: u32,
+        width: u32,
+        height: u32,
+    ) -> crate::display::SharedSessionRegistry {
+        let backend = Arc::new(TestDisplayBackend { width, height });
+        let session = Arc::new(crate::display::DisplaySession::new(display_id, backend));
+        let mut registry = crate::display::SessionRegistry::new();
+        registry.insert(display_id, session);
+        Arc::new(RwLock::new(registry))
     }
 
     #[test]
@@ -11603,6 +11787,51 @@ mod tests {
     }
 
     #[test]
+    fn wayland_user_session_reacquire_is_already_active_when_session_registered() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            let state = test_state();
+            let autonomy = {
+                let mut s = state.write().await;
+                s.session_registry = Some(test_session_registry_with_display(0, 1920, 1080));
+                s.user_display_activation_pending
+                    .insert(0, std::time::Instant::now());
+                s.autonomy.clone()
+            };
+            autonomy.write().await.user_display_granted = true;
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state.clone(), bus);
+
+            let request = server
+                .ensure_wayland_user_session_display_activation(
+                    crate::computer_use::DisplayTarget::UserSession,
+                    crate::computer_use::DisplayBackend::Wayland,
+                )
+                .await;
+            assert_eq!(request, UserSessionDisplayActivationRequest::AlreadyActive);
+            assert!(
+                !state
+                    .read()
+                    .await
+                    .user_display_activation_pending
+                    .contains_key(&0),
+                "active session should clear stale portal-pending state"
+            );
+            assert!(
+                timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+                "active session must not queue a duplicate portal grant event"
+            );
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+        });
+    }
+
+    #[test]
     fn wayland_user_session_reacquire_refreshes_stale_pending_request() {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -11654,6 +11883,99 @@ mod tests {
                 }
                 other => panic!("expected refreshed UserDisplayGranted event, got {other:?}"),
             }
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+        });
+    }
+
+    #[test]
+    fn display_approval_pending_does_not_overwrite_active_display_state() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.session_registry = Some(test_session_registry_with_display(0, 1920, 1080));
+            s.user_display_activation_pending
+                .insert(0, std::time::Instant::now());
+
+            assert!(
+                !s.note_display_approval_pending(0, "wayland"),
+                "active display sessions should ignore stale portal-pending events"
+            );
+            assert!(
+                !s.user_display_activation_pending.contains_key(&0),
+                "stale portal-pending state should be cleared"
+            );
+            assert!(
+                s.log_entries
+                    .iter()
+                    .all(|entry| !entry.content.contains("waiting for OS portal approval")),
+                "stale pending event must not log a waiting-for-approval status"
+            );
+        });
+    }
+
+    #[test]
+    fn grant_user_display_with_active_session_emits_ready_not_duplicate_grant() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.session_registry = Some(test_session_registry_with_display(0, 1920, 1080));
+                s.user_display_activation_pending
+                    .insert(0, std::time::Instant::now());
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state.clone(), bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "grant_user_display",
+                    serde_json::json!({ "display_id": 0 }),
+                    Some("managed-session"),
+                    Some(true),
+                )
+                .await
+                .expect("grant_user_display should route");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains("capture already active"),
+                "tool result should report active capture, got {rendered}"
+            );
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayReady {
+                    display_id,
+                    width,
+                    height,
+                })) => {
+                    assert_eq!(display_id, 0);
+                    assert_eq!((width, height), (1920, 1080));
+                }
+                other => panic!("expected DisplayReady event, got {other:?}"),
+            }
+            assert!(
+                timeout(Duration::from_millis(50), rx.recv()).await.is_err(),
+                "active grant should not emit UserDisplayGranted"
+            );
+            assert!(
+                !state
+                    .read()
+                    .await
+                    .user_display_activation_pending
+                    .contains_key(&0),
+                "active grant should clear stale pending state"
+            );
             std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
         });
     }
