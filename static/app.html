@@ -4000,6 +4000,14 @@ body.context-focus-active {
 #daily-usage-grid .value.total {
   color: var(--text);
 }
+#agent-usage-grid .period {
+  color: var(--subtext0);
+  font-weight: 600;
+}
+#agent-usage-grid .value.total,
+#all-sessions-grid .value.total {
+  color: var(--text);
+}
 
 /* Token activity */
 .token-activity-section {
@@ -8428,8 +8436,8 @@ body.display-fullscreen-open {
   .cost-grid {
     min-width: max-content;
   }
-  #all-sessions-grid { min-width: 480px; }
-  #agent-usage-grid { min-width: 560px; }
+  #all-sessions-grid { min-width: 560px; }
+  #agent-usage-grid { min-width: 720px; }
   #daily-usage-grid { min-width: 640px; }
   .usage-card { min-width: unset; }
   .usage-cards { flex-direction: column; }
@@ -9412,7 +9420,7 @@ body.display-fullscreen-open {
           <div class="cost-grid" id="daily-usage-grid"></div>
         </div>
         <div class="cost-section" id="agent-usage-section" style="display:none">
-          <div class="cost-title">By Agent</div>
+          <div class="cost-title">By Agent And Period</div>
           <div class="cost-grid" id="agent-usage-grid"></div>
         </div>
         <div class="cost-section" id="disk-usage-section" style="display:none">
@@ -45854,8 +45862,11 @@ function sessionUsageEntries(session) {
       output: sessionNumber(entry.completion_tokens),
       total: sessionNumber(entry.total_tokens) || sessionNumber(entry.prompt_tokens) + sessionNumber(entry.completion_tokens),
       cost: sessionCost(entry.estimated_cost),
+      pricingKnown: entry.pricing_known === true,
     }))
-    .filter(entry => entry.day && (entry.total > 0 || entry.input > 0 || entry.output > 0 || entry.cost > 0));
+    .filter(entry => entry.day && (
+      entry.total > 0 || entry.input > 0 || entry.cached > 0 || entry.output > 0 || entry.cost > 0
+    ));
   if (entries.length > 0) return entries;
   if (!fallbackDay) return [];
   const input = sessionNumber(session && session.prompt_tokens);
@@ -45867,6 +45878,7 @@ function sessionUsageEntries(session) {
     output,
     total: sessionNumber(session && session.total_tokens) || input + output,
     cost: sessionCost(session && session.estimated_cost),
+    pricingKnown: session && session.pricing_known === true,
   }];
 }
 
@@ -45925,56 +45937,86 @@ function agentUsageLabel(key) {
   }[key] || key;
 }
 
-function summarizeUsageByAgent(sessions) {
-  const order = ['codex', 'claude', 'gemini', 'intendant', 'other'];
-  const buckets = new Map(order.map(key => [key, {
+function agentUsagePeriodBucket(key, periodKey, periodLabel) {
+  return {
     key,
     label: agentUsageLabel(key),
+    periodKey,
+    periodLabel,
     sessions: 0,
-    turns: 0,
     input: 0,
     cached: 0,
     output: 0,
     total: 0,
     cost: 0,
     unpricedTokens: 0,
-  }]));
+    sessionIds: new Set(),
+  };
+}
 
-  for (const s of sessions) {
-    const key = agentUsageKey(s);
-    if (!buckets.has(key)) {
-      buckets.set(key, {
-        key,
-        label: agentUsageLabel(key),
-        sessions: 0,
-        turns: 0,
-        input: 0,
-        cached: 0,
-        output: 0,
-        total: 0,
-        cost: 0,
-        unpricedTokens: 0,
-      });
+function agentUsageSessionIdentity(session, index) {
+  const id = (session && (session.session_id || session.resume_id || session.path || session.updated_at)) || index;
+  return `${agentUsageKey(session)}:${id}`;
+}
+
+function addEntryToAgentUsageBucket(bucket, sessionId, entry) {
+  if (!bucket.sessionIds.has(sessionId)) {
+    bucket.sessionIds.add(sessionId);
+    bucket.sessions += 1;
+  }
+  bucket.input += entry.input;
+  bucket.cached += entry.cached;
+  bucket.output += entry.output;
+  bucket.total += entry.total;
+  bucket.cost += entry.cost;
+  if (entry.total > 0 && entry.cost === 0 && entry.pricingKnown !== true) {
+    bucket.unpricedTokens += entry.total;
+  }
+}
+
+function summarizeUsageByAgent(sessions) {
+  const order = ['codex', 'claude', 'gemini', 'intendant', 'other'];
+  const periods = [
+    { key: 'today', label: 'Today' },
+    { key: 'week', label: 'This Week' },
+    { key: 'all', label: 'All Time' },
+  ];
+  const buckets = new Map();
+  const todayIso = tokenActivityIsoToday();
+
+  function bucketFor(agentKey, period) {
+    const bucketKey = `${agentKey}:${period.key}`;
+    if (!buckets.has(bucketKey)) {
+      buckets.set(bucketKey, agentUsagePeriodBucket(agentKey, period.key, period.label));
     }
-    const b = buckets.get(key);
-    const input = sessionNumber(s.prompt_tokens);
-    const cached = sessionNumber(s.cached_tokens);
-    const output = sessionNumber(s.completion_tokens);
-    const total = sessionNumber(s.total_tokens) || input + output;
-    const cost = sessionCost(s.estimated_cost);
-    b.sessions += 1;
-    b.turns += sessionNumber(s.turns);
-    b.input += input;
-    b.cached += cached;
-    b.output += output;
-    b.total += total;
-    b.cost += cost;
-    if (total > 0 && cost === 0 && s.pricing_known !== true) {
-      b.unpricedTokens += total;
-    }
+    return buckets.get(bucketKey);
   }
 
-  return Array.from(buckets.values()).filter(b => b.sessions > 0);
+  sessions.forEach((s, index) => {
+    const key = agentUsageKey(s);
+    const sessionId = agentUsageSessionIdentity(s, index);
+    for (const entry of sessionUsageEntries(s)) {
+      for (const period of periods) {
+        if (
+          period.key === 'all' ||
+          (period.key === 'today' && entry.day === todayIso) ||
+          (period.key === 'week' && usageEntryInCalendarWeek(entry.day, todayIso))
+        ) {
+          addEntryToAgentUsageBucket(bucketFor(key, period), sessionId, entry);
+        }
+      }
+    }
+  });
+
+  const agentRank = new Map(order.map((key, index) => [key, index]));
+  const periodRank = new Map(periods.map((period, index) => [period.key, index]));
+  return Array.from(buckets.values())
+    .filter(b => b.sessions > 0)
+    .sort((a, b) => {
+      const byAgent = (agentRank.get(a.key) ?? order.length) - (agentRank.get(b.key) ?? order.length);
+      if (byAgent !== 0) return byAgent;
+      return (periodRank.get(a.periodKey) ?? periods.length) - (periodRank.get(b.periodKey) ?? periods.length);
+    });
 }
 
 let tokenActivityAgent = 'all';
@@ -46466,15 +46508,17 @@ function renderAllSessionsUsage(sessions) {
 
   const todayIso = tokenActivityIsoToday();
 
-  let allInput = 0, allOutput = 0, allCached = 0, allCost = 0;
-  let todayInput = 0, todayOutput = 0, todayCached = 0, todayCost = 0;
-  let weekInput = 0, weekOutput = 0, weekCached = 0, weekCost = 0;
+  let allTotal = 0, allInput = 0, allOutput = 0, allCached = 0, allCost = 0;
+  let todayTotal = 0, todayInput = 0, todayOutput = 0, todayCached = 0, todayCost = 0;
+  let weekTotal = 0, weekInput = 0, weekOutput = 0, weekCached = 0, weekCost = 0;
 
   for (const s of sessions) {
-    const input = s.prompt_tokens || 0;
-    const output = s.completion_tokens || 0;
-    const cached = s.cached_tokens || 0;
-    const cost = s.estimated_cost || 0;
+    const input = sessionNumber(s.prompt_tokens);
+    const output = sessionNumber(s.completion_tokens);
+    const cached = sessionNumber(s.cached_tokens);
+    const total = sessionNumber(s.total_tokens) || input + output;
+    const cost = sessionCost(s.estimated_cost);
+    allTotal += total;
     allInput += input;
     allOutput += output;
     allCached += cached;
@@ -46482,12 +46526,14 @@ function renderAllSessionsUsage(sessions) {
 
     for (const entry of sessionUsageEntries(s)) {
       if (entry.day === todayIso) {
+        todayTotal += entry.total;
         todayInput += entry.input;
         todayOutput += entry.output;
         todayCached += entry.cached;
         todayCost += entry.cost;
       }
       if (usageEntryInCalendarWeek(entry.day, todayIso)) {
+        weekTotal += entry.total;
         weekInput += entry.input;
         weekOutput += entry.output;
         weekCached += entry.cached;
@@ -46500,24 +46546,26 @@ function renderAllSessionsUsage(sessions) {
   grid.innerHTML = '';
 
   const rows = [
-    ['Today', todayInput, todayCached, todayOutput, todayCost],
-    ['This Week', weekInput, weekCached, weekOutput, weekCost],
-    ['All Time', allInput, allCached, allOutput, allCost],
+    ['Today', todayTotal, todayInput, todayCached, todayOutput, todayCost],
+    ['This Week', weekTotal, weekInput, weekCached, weekOutput, weekCost],
+    ['All Time', allTotal, allInput, allCached, allOutput, allCost],
   ];
 
   // Header
   grid.innerHTML = `
     <span class="label" style="font-weight:600"></span>
+    <span class="value" style="font-size:10px;color:var(--overlay1)">Total</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
   `;
-  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr 1fr';
+  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr 1fr 1fr';
 
-  for (const [label, input, cached, output, cost] of rows) {
+  for (const [label, total, input, cached, output, cost] of rows) {
     grid.innerHTML += `
       <span class="label">${label}</span>
+      <span class="value total">${total.toLocaleString()}</span>
       <span class="value">${input.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">${cached.toLocaleString()}</span>
       <span class="value">${output.toLocaleString()}</span>
@@ -46583,7 +46631,8 @@ function renderAgentUsage(sessions) {
 
   el.style.display = 'block';
   grid.innerHTML = `
-    <span class="label" style="font-weight:600"></span>
+    <span class="label" style="font-weight:600">Agent</span>
+    <span class="label" style="font-weight:600">Period</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Sessions</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Total</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
@@ -46591,7 +46640,7 @@ function renderAgentUsage(sessions) {
     <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
     <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
   `;
-  grid.style.gridTemplateColumns = 'auto 0.75fr 1fr 1fr 1fr 1fr 1fr';
+  grid.style.gridTemplateColumns = 'minmax(90px, auto) minmax(72px, auto) 0.75fr 1fr 1fr 1fr 1fr 1fr';
 
   for (const b of buckets) {
     const unpriced = b.unpricedTokens > 0
@@ -46599,8 +46648,9 @@ function renderAgentUsage(sessions) {
       : '';
     grid.innerHTML += `
       <span class="label">${escapeHtml(b.label)}</span>
+      <span class="label period">${escapeHtml(b.periodLabel)}</span>
       <span class="value">${b.sessions.toLocaleString()}</span>
-      <span class="value">${b.total.toLocaleString()}</span>
+      <span class="value total">${b.total.toLocaleString()}</span>
       <span class="value">${b.input.toLocaleString()}</span>
       <span class="value" style="color:var(--green)">${b.cached.toLocaleString()}</span>
       <span class="value">${b.output.toLocaleString()}</span>
