@@ -45901,18 +45901,13 @@ function summarizeSessionUsage(sessions) {
     weekCost: 0,
   };
   for (const s of sessions) {
-    const input = sessionNumber(s.prompt_tokens);
-    const cached = sessionNumber(s.cached_tokens);
-    const output = sessionNumber(s.completion_tokens);
-    const total = sessionNumber(s.total_tokens) || input + output;
-    const cost = sessionCost(s.estimated_cost);
     totals.turns += sessionNumber(s.turns);
-    totals.allInput += input;
-    totals.allCached += cached;
-    totals.allOutput += output;
-    totals.allTokens += total;
-    totals.allCost += cost;
     for (const entry of sessionUsageEntries(s)) {
+      totals.allInput += entry.input;
+      totals.allCached += entry.cached;
+      totals.allOutput += entry.output;
+      totals.allTokens += entry.total;
+      totals.allCost += entry.cost;
       if (entry.day === todayIso) totals.todayCost += entry.cost;
       if (usageEntryInCalendarWeek(entry.day, todayIso)) totals.weekCost += entry.cost;
     }
@@ -46513,18 +46508,12 @@ function renderAllSessionsUsage(sessions) {
   let weekTotal = 0, weekInput = 0, weekOutput = 0, weekCached = 0, weekCost = 0;
 
   for (const s of sessions) {
-    const input = sessionNumber(s.prompt_tokens);
-    const output = sessionNumber(s.completion_tokens);
-    const cached = sessionNumber(s.cached_tokens);
-    const total = sessionNumber(s.total_tokens) || input + output;
-    const cost = sessionCost(s.estimated_cost);
-    allTotal += total;
-    allInput += input;
-    allOutput += output;
-    allCached += cached;
-    allCost += cost;
-
     for (const entry of sessionUsageEntries(s)) {
+      allTotal += entry.total;
+      allInput += entry.input;
+      allOutput += entry.output;
+      allCached += entry.cached;
+      allCost += entry.cost;
       if (entry.day === todayIso) {
         todayTotal += entry.total;
         todayInput += entry.input;
