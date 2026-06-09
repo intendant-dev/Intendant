@@ -10146,9 +10146,7 @@ fn managed_context_sanitize_queued_followup_replay(
     mut followup: FollowUpMessage,
 ) -> FollowUpMessage {
     let canonical = managed_context_canonical_followup_replay_text(&followup.text);
-    if canonical.trim() != followup.text.trim() {
-        followup.text = managed_context_followup_replay_text(&canonical);
-    }
+    followup.text = managed_context_followup_replay_text(&canonical);
     followup
 }
 
@@ -13221,7 +13219,12 @@ mod tests {
         .expect("held follow-up should replay")
         .after_managed_context_density_handoff();
 
-        assert_eq!(continuation.text, "Run the next narrow browser QA step.");
+        assert_eq!(
+            continuation.text,
+            managed_context_followup_replay_text("Run the next narrow browser QA step.")
+        );
+        assert!(continuation.text.contains("has already succeeded"));
+        assert!(continuation.text.contains("User follow-up:"));
         assert!(continuation.managed_context_density_handoff_completed);
         assert!(!continuation.managed_context_density_handoff);
     }
@@ -13599,7 +13602,13 @@ mod tests {
         )
         .expect("continuation");
 
-        assert_eq!(continuation.text, "original queued user request");
+        assert_eq!(
+            continuation.text,
+            managed_context_followup_replay_text("original queued user request")
+        );
+        assert!(continuation
+            .text
+            .contains("Do not call rewind_context again merely to satisfy"));
         assert!(pending.is_empty());
     }
 

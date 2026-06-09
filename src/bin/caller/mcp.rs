@@ -755,6 +755,8 @@ impl McpAppState {
                         .insert(related, record_id.clone());
                 }
                 self.remove_insufficient_rewind_notice_for_key(&key);
+                self.remove_density_maintenance_satisfied_for_key(&key);
+                self.clear_session_usage_for_id(&key);
             }
         } else {
             // A failed rewind must not leave a pending pressure check behind: a
@@ -773,16 +775,21 @@ impl McpAppState {
         let Some(key) = self.rewind_session_key(session_id) else {
             return;
         };
-        let Some(record_id) = self.remove_pending_rewind_pressure_check_for_key(&key) else {
+        let Some(record_id) = self.pending_rewind_pressure_check_for(Some(&key)).cloned() else {
             return;
         };
         if !self.active_codex_managed_context_enabled_for(Some(&key), None) {
             return;
         }
+        let (used_tokens, context_window, _hard_context_window) =
+            self.session_usage_values(Some(&key));
+        if context_window == 0 {
+            return;
+        }
+        self.remove_pending_rewind_pressure_check_for_key(&key);
         if let Some((used_tokens, rewind_only_limit, _status)) =
             self.context_pressure_rewind_only_for(Some(&key))
         {
-            let context_window = self.session_usage_values(Some(&key)).1;
             self.remove_density_maintenance_satisfied_for_key(&key);
             self.insert_insufficient_rewind_notice_for_key(
                 &key,
@@ -795,8 +802,6 @@ impl McpAppState {
             );
         } else {
             self.remove_insufficient_rewind_notice_for_key(&key);
-            let (used_tokens, context_window, _hard_context_window) =
-                self.session_usage_values(Some(&key));
             if context_window > 0 {
                 let recommended_rewind_limit =
                     (context_window as f64 * CONTEXT_PRESSURE_REWIND_THRESHOLD_PCT / 100.0).floor()
@@ -819,6 +824,13 @@ impl McpAppState {
                 self.remove_density_maintenance_satisfied_for_key(&key);
             }
         }
+    }
+
+    fn pending_rewind_pressure_check_for(&self, session_id: Option<&str>) -> Option<&String> {
+        let key = self.rewind_session_key(session_id)?;
+        self.rewind_related_keys(&key)
+            .into_iter()
+            .find_map(|related| self.pending_rewind_pressure_checks.get(&related))
     }
 
     fn insufficient_rewind_notice_for(
@@ -907,6 +919,36 @@ impl McpAppState {
             self.session_usage_values(session_id);
         let managed_context =
             self.exposed_codex_managed_context_enabled_for(session_id, managed_context_override);
+        if managed_context {
+            if let Some(record_id) = self.pending_rewind_pressure_check_for(session_id) {
+                return serde_json::json!({
+                    "source": "stale_after_rewind",
+                    "status": "refreshing",
+                    "used_tokens": null,
+                    "context_window": null,
+                    "effective_context_window": null,
+                    "remaining_tokens": null,
+                    "remaining_hard_tokens": null,
+                    "remaining_percent": null,
+                    "recommended_rewind_limit": null,
+                    "rewind_only_limit": null,
+                    "hard_limit": hard_context_window,
+                    "rewind_only": false,
+                    "density_pressure": false,
+                    "density_maintenance_recommended": false,
+                    "normal_tools_allowed": true,
+                    "broad_followup_allowed": true,
+                    "narrow_inflight_validation_allowed": true,
+                    "required_action": "continue_after_rewind_refresh_pending",
+                    "message": "A managed-context rewind just succeeded, but Codex has not reported a fresh backend token count yet. The previous pressure reading is stale and must not trigger another recovery or density handoff. Continue the queued follow-up from the rewound context; if a later backend-reported status reaches rewind_only=true, recover then.",
+                    "managed_context": Self::managed_context_mode(managed_context),
+                    "last_rewind_insufficient": null,
+                    "density_maintenance_satisfied": null,
+                    "pending_rewind_record_id": record_id,
+                    "stale_after_rewind": true,
+                });
+            }
+        }
         if context_window == 0 {
             return serde_json::json!({
                 "source": "backend_reported",
@@ -13376,6 +13418,113 @@ mod tests {
     }
 
     #[test]
+    fn successful_rewind_marks_prior_pressure_stale_until_fresh_backend_usage() {
+        let mut s = McpAppState::new(
+            "none".to_string(),
+            "none".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test_session"),
+        );
+        s.session_id = "codex-thread".to_string();
+        s.active_session_source = Some("codex".to_string());
+        s.codex_managed_context = true;
+        s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+            provider: "openai".to_string(),
+            model: "gpt-5.2-codex".to_string(),
+            tokens_used: 226_000,
+            context_window: 258_400,
+            hard_context_window: Some(272_000),
+            usage_pct: 87.5,
+            prompt_tokens: 225_500,
+            completion_tokens: 500,
+            cached_tokens: 0,
+        });
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(pressure["status"], "watch");
+        assert_eq!(pressure["density_maintenance_recommended"], true);
+        assert_eq!(pressure["broad_followup_allowed"], false);
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::CodexThreadActionResult {
+                session_id: Some("codex-thread".to_string()),
+                action: "rewind_context".to_string(),
+                success: true,
+                message: "Rewound Codex thread and saved record rewind-fresh.".to_string(),
+            },
+        );
+
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(pressure["source"], "stale_after_rewind");
+        assert_eq!(pressure["status"], "refreshing");
+        assert_eq!(pressure["used_tokens"], serde_json::Value::Null);
+        assert_eq!(pressure["density_maintenance_recommended"], false);
+        assert_eq!(pressure["broad_followup_allowed"], true);
+        assert_eq!(
+            pressure["required_action"],
+            "continue_after_rewind_refresh_pending"
+        );
+        assert_eq!(pressure["pending_rewind_record_id"], "rewind-fresh");
+        assert_eq!(pressure["stale_after_rewind"], true);
+        assert!(s
+            .pending_rewind_pressure_checks
+            .get("codex-thread")
+            .is_some());
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::ContextSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                source: "codex".to_string(),
+                label: "Codex resolved request payload".to_string(),
+                request_id: Some("req-after-rewind".to_string()),
+                request_index: Some(12),
+                turn: Some(1),
+                format: "openai.responses.resolved_request.v1".to_string(),
+                token_count: None,
+                token_count_kind: None,
+                context_window: Some(258_400),
+                hard_context_window: Some(272_000),
+                item_count: Some(300),
+                raw: serde_json::json!({ "model": "gpt-5.2-codex" }),
+            },
+        );
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(pressure["source"], "stale_after_rewind");
+        assert_eq!(pressure["broad_followup_allowed"], true);
+
+        apply_observed_event_to_mcp_state(
+            &mut s,
+            &AppEvent::UsageSnapshot {
+                session_id: Some("codex-thread".to_string()),
+                main: frontend::ModelUsageSnapshot {
+                    provider: "openai".to_string(),
+                    model: "gpt-5.2-codex".to_string(),
+                    tokens_used: 211_178,
+                    context_window: 258_400,
+                    hard_context_window: Some(272_000),
+                    usage_pct: 81.7,
+                    prompt_tokens: 211_000,
+                    completion_tokens: 178,
+                    cached_tokens: 0,
+                },
+                presence: None,
+            },
+        );
+
+        let pressure = s.context_pressure_snapshot();
+        assert_eq!(pressure["source"], "backend_reported");
+        assert_eq!(pressure["status"], "ok");
+        assert_eq!(pressure["density_maintenance_recommended"], false);
+        assert_eq!(pressure["broad_followup_allowed"], true);
+        assert_eq!(pressure["required_action"], "continue");
+        assert!(s
+            .pending_rewind_pressure_checks
+            .get("codex-thread")
+            .is_none());
+    }
+
+    #[test]
     fn successful_rewind_then_watch_usage_satisfies_current_density_handoff_across_growth() {
         let mut s = McpAppState::new(
             "none".to_string(),
@@ -13465,6 +13614,12 @@ mod tests {
             .insert("session-a".to_string(), true);
         s.session_codex_managed_context
             .insert("session-b".to_string(), true);
+
+        s.note_context_rewind_result_for(
+            Some("session-b"),
+            true,
+            "Rewound Codex thread and saved record rewind-b.",
+        );
         s.session_usage.insert(
             "session-b".to_string(),
             frontend::ModelUsageSnapshot {
@@ -13478,12 +13633,6 @@ mod tests {
                 completion_tokens: 4_000,
                 cached_tokens: 0,
             },
-        );
-
-        s.note_context_rewind_result_for(
-            Some("session-b"),
-            true,
-            "Rewound Codex thread and saved record rewind-b.",
         );
         s.complete_pending_rewind_pressure_check_for(Some("session-b"));
 
@@ -13534,6 +13683,11 @@ mod tests {
                 backend_session_id: "codex-thread".to_string(),
             },
         );
+        s.note_context_rewind_result_for(
+            Some("wrapper-session"),
+            true,
+            "Rewound Codex thread and saved record rewind-alias.",
+        );
         s.session_usage.insert(
             "codex-thread".to_string(),
             frontend::ModelUsageSnapshot {
@@ -13547,12 +13701,6 @@ mod tests {
                 completion_tokens: 4_000,
                 cached_tokens: 0,
             },
-        );
-
-        s.note_context_rewind_result_for(
-            Some("wrapper-session"),
-            true,
-            "Rewound Codex thread and saved record rewind-alias.",
         );
         s.complete_pending_rewind_pressure_check_for(Some("codex-thread"));
 
