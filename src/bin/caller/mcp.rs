@@ -2527,7 +2527,8 @@ where
             if seen_backend_ids.contains(&record.backend_session_id) {
                 continue;
             }
-            let status = session_meta_status(std::path::Path::new(&record.log_path));
+            let session_meta = session_meta_snapshot(std::path::Path::new(&record.log_path));
+            let status = session_meta.as_ref().and_then(|meta| meta.status.clone());
             if external_wrapper_status_is_terminal(status.as_deref()) {
                 continue;
             }
@@ -2556,6 +2557,16 @@ where
                 .and_then(project_root_from_process_cwd)
                 .map(|path| path.to_string_lossy().to_string())
                 .or_else(|| record.project_root.clone());
+            let session_meta_last_turn = session_meta
+                .as_ref()
+                .and_then(|meta| meta.last_turn)
+                .map(|turn| serde_json::Value::Number(serde_json::Number::from(turn as u64)))
+                .unwrap_or(serde_json::Value::Null);
+            let session_meta_rounds = session_meta
+                .as_ref()
+                .and_then(|meta| meta.rounds)
+                .map(|rounds| serde_json::Value::Number(serde_json::Number::from(rounds as u64)))
+                .unwrap_or(serde_json::Value::Null);
             let updated_at_secs =
                 fresh_external_wrapper_updated_at_secs(std::path::Path::new(&record.log_path))
                     .max(record.updated_at_secs);
@@ -2575,6 +2586,8 @@ where
                 "project_root": project_root,
                 "status": effective_status,
                 "session_meta_status": status,
+                "session_meta_last_turn": session_meta_last_turn,
+                "session_meta_rounds": session_meta_rounds,
                 "process_tree_active": process_tree_active,
                 "updated_at_secs": updated_at_secs,
             }));
@@ -2906,6 +2919,18 @@ fn enrich_controller_loop_wrapper_with_mcp_state(
     let Some(obj) = wrapper.as_object_mut() else {
         return;
     };
+    if external_wrapper_finalized_meta_wins_over_live_status(obj, &live_status) {
+        let raw_meta_status = obj
+            .get("session_meta_status")
+            .cloned()
+            .unwrap_or(serde_json::Value::Null);
+        obj.entry("raw_session_meta_status".to_string())
+            .or_insert(raw_meta_status.clone());
+        obj.insert("phase".to_string(), raw_meta_status.clone());
+        obj.insert("status".to_string(), raw_meta_status.clone());
+        obj.insert("session_meta_status".to_string(), raw_meta_status);
+        return;
+    }
     obj.insert(
         "phase".to_string(),
         serde_json::Value::String(phase.to_string()),
@@ -2971,6 +2996,40 @@ fn controller_loop_phase_is_active_turn(phase: &Phase) -> bool {
     )
 }
 
+fn external_wrapper_finalized_meta_wins_over_live_status(
+    wrapper: &serde_json::Map<String, serde_json::Value>,
+    live_status: &SessionStatusState,
+) -> bool {
+    if !controller_loop_phase_is_active_turn(&live_status.phase) {
+        return false;
+    }
+    let Some(meta_status) = wrapper
+        .get("session_meta_status")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|status| !status.is_empty())
+    else {
+        return false;
+    };
+    if external_wrapper_status_is_terminal(Some(meta_status)) {
+        return true;
+    }
+    if !controller_loop_state_is_idle(meta_status) {
+        return false;
+    }
+    if wrapper
+        .get("session_meta_rounds")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|rounds| live_status.round <= rounds as usize)
+    {
+        return true;
+    }
+    wrapper
+        .get("session_meta_last_turn")
+        .and_then(serde_json::Value::as_u64)
+        .is_some_and(|last_turn| live_status.turn <= last_turn as usize)
+}
+
 fn fresh_external_wrapper_updated_at_secs(log_dir: &std::path::Path) -> u64 {
     file_mtime_secs(&log_dir.join("session.jsonl")).max(file_mtime_secs(log_dir))
 }
@@ -3016,11 +3075,22 @@ fn controller_loop_wrapper_index_homes(loop_dir: &std::path::Path) -> Vec<std::p
     homes
 }
 
-fn session_meta_status(log_dir: &std::path::Path) -> Option<String> {
+#[derive(Clone, Debug)]
+struct ExternalWrapperSessionMetaSnapshot {
+    status: Option<String>,
+    last_turn: Option<usize>,
+    rounds: Option<usize>,
+}
+
+fn session_meta_snapshot(log_dir: &std::path::Path) -> Option<ExternalWrapperSessionMetaSnapshot> {
     let text = std::fs::read_to_string(log_dir.join("session_meta.json")).ok()?;
     serde_json::from_str::<crate::session_log::SessionMeta>(&text)
         .ok()
-        .and_then(|meta| meta.status)
+        .map(|meta| ExternalWrapperSessionMetaSnapshot {
+            status: meta.status,
+            last_turn: meta.last_turn,
+            rounds: meta.rounds,
+        })
 }
 
 fn external_wrapper_status_is_terminal(status: Option<&str>) -> bool {
@@ -15326,6 +15396,156 @@ mod tests {
             &[wrapper.clone()],
             &[serde_json::json!({"pid": 8892})]
         ));
+    }
+
+    #[test]
+    fn controller_loop_status_keeps_finalized_wrapper_idle_over_stale_live_mcp_phase() {
+        let mut app_state = McpAppState::new(
+            "openai".to_string(),
+            "gpt-5.2-codex".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test-session"),
+        );
+        app_state.link_session_aliases("wrapper-session", "codex-thread");
+        app_state.note_session_phase(
+            Some("codex-thread"),
+            Some(14),
+            Phase::Thinking,
+            Some("stale Codex follow-up round 14 thinking"),
+        );
+        app_state.note_session_round(Some("codex-thread"), 14);
+
+        let mut status = serde_json::json!({
+            "latest": {
+                "status": {
+                    "run_id": "stale-run",
+                    "state": "idle"
+                }
+            },
+            "active": {
+                "wrappers": [{
+                    "run_id": null,
+                    "pid": null,
+                    "codex_pid": 8892,
+                    "app_server_pid": 8892,
+                    "app_server_active": true,
+                    "source": "external_wrapper_index",
+                    "backend_source": "codex",
+                    "backend_session_id": "codex-thread",
+                    "intendant_session_id": "wrapper-session",
+                    "log_path": "/tmp/test-session",
+                    "status": "unknown_running",
+                    "session_meta_status": "idle",
+                    "session_meta_last_turn": 14,
+                    "session_meta_rounds": 14,
+                    "process_tree_active": true,
+                    "updated_at_secs": 10
+                }]
+            }
+        });
+
+        enrich_controller_loop_status_with_mcp_state_at(&mut status, &app_state, 12345);
+
+        let wrapper = status.pointer("/active/wrappers/0").unwrap();
+        assert_eq!(
+            wrapper.get("phase").and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            wrapper.get("status").and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            wrapper
+                .get("session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            wrapper
+                .get("raw_session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/state")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+    }
+
+    #[test]
+    fn controller_loop_status_reports_new_live_round_over_prior_idle_meta() {
+        let mut app_state = McpAppState::new(
+            "openai".to_string(),
+            "gpt-5.2-codex".to_string(),
+            autonomy::shared_autonomy(AutonomyState::default()),
+            std::path::PathBuf::from("/tmp/test-session"),
+        );
+        app_state.link_session_aliases("wrapper-session", "codex-thread");
+        app_state.note_session_phase(
+            Some("codex-thread"),
+            Some(15),
+            Phase::RunningAgent,
+            Some("Codex follow-up round 15 in progress"),
+        );
+        app_state.note_session_round(Some("codex-thread"), 15);
+
+        let mut status = serde_json::json!({
+            "latest": {
+                "status": {
+                    "run_id": "stale-run",
+                    "state": "idle"
+                }
+            },
+            "active": {
+                "wrappers": [{
+                    "run_id": null,
+                    "pid": null,
+                    "codex_pid": 8892,
+                    "app_server_pid": 8892,
+                    "app_server_active": true,
+                    "source": "external_wrapper_index",
+                    "backend_source": "codex",
+                    "backend_session_id": "codex-thread",
+                    "intendant_session_id": "wrapper-session",
+                    "log_path": "/tmp/test-session",
+                    "status": "unknown_running",
+                    "session_meta_status": "idle",
+                    "session_meta_last_turn": 14,
+                    "session_meta_rounds": 14,
+                    "process_tree_active": true,
+                    "updated_at_secs": 10
+                }]
+            }
+        });
+
+        enrich_controller_loop_status_with_mcp_state_at(&mut status, &app_state, 12345);
+
+        let wrapper = status.pointer("/active/wrappers/0").unwrap();
+        assert_eq!(
+            wrapper.get("status").and_then(|value| value.as_str()),
+            Some("running_agent")
+        );
+        assert_eq!(
+            wrapper
+                .get("session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("running_agent")
+        );
+        assert_eq!(
+            wrapper
+                .get("raw_session_meta_status")
+                .and_then(|value| value.as_str()),
+            Some("idle")
+        );
+        assert_eq!(
+            status
+                .pointer("/latest/status/state")
+                .and_then(|value| value.as_str()),
+            Some("running_agent")
+        );
     }
 
     #[test]
