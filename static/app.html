@@ -36872,6 +36872,10 @@ class PeerDisplayConnection {
     const videoEl = container.querySelector('.peer-display-video');
     if (videoEl && this.stream) {
       videoEl.srcObject = this.stream;
+      // autoplay doesn't re-fire when a stream is (re)attached to an
+      // element living in the offscreen endpoint container; without an
+      // explicit play() the pane sits paused on a black first frame.
+      videoEl.play().catch(() => {});
     }
     stationRegisterVideoSource(
       `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
@@ -37154,7 +37158,12 @@ class PeerDisplayConnection {
         || document.getElementById(`peer-display-${this.hostId}`)
         || stationPeerDisplayContainer(this.hostId, preferStationEndpoint);
       const videoEl = container && container.querySelector('.peer-display-video');
-      if (videoEl) videoEl.srcObject = this.stream;
+      if (videoEl) {
+        videoEl.srcObject = this.stream;
+        // See the reapply path above: explicit play() because autoplay
+        // doesn't re-fire on (re)attached offscreen elements.
+        videoEl.play().catch(() => {});
+      }
       if (videoEl) {
         stationRegisterVideoSource(
           `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
