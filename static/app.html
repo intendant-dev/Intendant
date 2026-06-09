@@ -8824,16 +8824,16 @@ body.display-fullscreen-open {
                   <button class="control-action-btn" data-codex-action="new" title="Tear down the Codex thread so the next task starts fresh (/new)">New thread</button>
                   <button class="control-action-btn" data-codex-action="fast" title="Toggle Codex Fast service tier for future turns (/fast)">Fast</button>
                   <button class="control-action-btn" data-codex-action="compact" title="Compact conversation history to free context (/compact)">Compact</button>
-                  <button class="control-action-btn" data-codex-action="undo" data-turns="1" title="Roll back the last turn (/undo)">Undo</button>
-                  <button class="control-action-btn" data-codex-action="fork" data-prompt-name="1" title="Fork the current thread into a new branch (/fork)">Fork…</button>
-                  <button class="control-action-btn" data-codex-action="side" data-prompt-side="1" title="Ask a side question in an ephemeral Codex fork (/side)">Side…</button>
-                  <button class="control-action-btn" data-codex-action="review" data-prompt-review="1" title="Review pending changes (/review)">Review…</button>
-                  <button class="control-action-btn" data-codex-action="rename" data-prompt-rename="1" title="Rename the current Codex thread (/rename)">Rename…</button>
-                  <button class="control-action-btn" data-codex-action="goal" data-prompt-goal="1" title="Create or update the persisted Codex thread goal (/goal)">Goal…</button>
+                  <button class="control-action-btn" data-codex-action="undo" title="Roll back the last turn (/undo)">Undo</button>
+                  <button class="control-action-btn" data-codex-action="fork" title="Fork the current thread into a new branch (/fork)">Fork…</button>
+                  <button class="control-action-btn" data-codex-action="side" title="Ask a side question in an ephemeral Codex fork (/side)">Side…</button>
+                  <button class="control-action-btn" data-codex-action="review" title="Review pending changes (/review)">Review…</button>
+                  <button class="control-action-btn" data-codex-action="rename" title="Rename the current Codex thread (/rename)">Rename…</button>
+                  <button class="control-action-btn" data-codex-action="goal" title="Create or update the persisted Codex thread goal (/goal)">Goal…</button>
                   <button class="control-action-btn" data-codex-action="goal-get" title="Fetch the current persisted Codex thread goal (/goal)">Goal status</button>
                   <button class="control-action-btn" data-codex-action="goal-pause" title="Pause the current Codex thread goal (/goal pause)">Pause goal</button>
                   <button class="control-action-btn" data-codex-action="goal-resume" title="Resume the current Codex thread goal (/goal resume)">Resume goal</button>
-                  <button class="control-action-btn" data-codex-action="goal-clear" data-confirm="Clear the current Codex goal?" title="Clear the current persisted Codex thread goal (/goal clear)">Clear goal</button>
+                  <button class="control-action-btn" data-codex-action="goal-clear" title="Clear the current persisted Codex thread goal (/goal clear)">Clear goal</button>
                   <button class="control-action-btn" data-codex-action="init" title="Create an AGENTS.md for this project (/init)">Init AGENTS.md</button>
                   <button class="control-action-btn" data-codex-action="memory-reset" title="Reset Codex's thread memory (/memory reset)">Reset memory</button>
                 </div>
@@ -10824,7 +10824,7 @@ async function ensureStation() {
   stationInitPromise = (async () => {
     if (!stationWasmReady) {
       stationStatus('Loading Station WASM');
-      await stationInit('/wasm-station/station_web_bg.wasm?v=wgpu29');
+      await stationInit('/wasm-station/station_web_bg.wasm');
       stationWasmReady = true;
     }
     const scene = document.getElementById('station-scene-canvas');
@@ -11384,12 +11384,16 @@ function stationApplyViewSettings(showToast = false, persist = true) {
   stationViewDraft.layout = layout;
   if (station?.set_layout) station.set_layout(layout);
   if (station?.set_visuals) {
+    // Fall back to STATION_VIEW_DEFAULTS only for missing/invalid values so a
+    // legitimate user-chosen 0 (motion or AR) survives the round trip.
+    const visualNumber = (value, fallback) =>
+      (Number.isFinite(Number(value)) ? Number(value) : fallback);
     station.set_visuals(
       stationViewDraft.mood === 'calm' ? 'calm' : 'cockpit',
-      Number(stationViewDraft.fov) || 55,
-      Number(stationViewDraft.motion) || 0,
-      Number(stationViewDraft.ar) || 0,
-      Number(stationViewDraft.density) || 1,
+      visualNumber(stationViewDraft.fov, STATION_VIEW_DEFAULTS.fov),
+      visualNumber(stationViewDraft.motion, STATION_VIEW_DEFAULTS.motion),
+      visualNumber(stationViewDraft.ar, STATION_VIEW_DEFAULTS.ar),
+      visualNumber(stationViewDraft.density, STATION_VIEW_DEFAULTS.density),
     );
   }
   if (persist) stationSaveViewDraft();
@@ -13996,26 +14000,12 @@ async function stationHandleThreadAction(action) {
   const op = String(action.op || action.action || '').trim();
   if (!op) return;
   const sessionId = String(action.session_id || action.sessionId || '').trim();
-  const spec = stationControlThreadActionOptions(op) || sessionWindowCodexActionByOp(op) || {};
+  const spec = codexThreadActionSpec(op);
+  if (!spec) {
+    showControlToast?.('error', `Unknown Codex thread action /${op}`);
+    return;
+  }
   await runCodexThreadActionFromUi(op, spec, sessionId);
-}
-
-function stationControlThreadActionOptions(op) {
-  const action = String(op || '').trim();
-  if (!action) return null;
-  const btn = document.querySelector(`.control-action-btn[data-codex-action="${stationCssEscape(action)}"]`);
-  if (!btn) return null;
-  return {
-    promptName: btn.dataset.promptName,
-    promptSide: btn.dataset.promptSide,
-    promptReview: btn.dataset.promptReview,
-    promptRename: btn.dataset.promptRename,
-    promptGoal: btn.dataset.promptGoal,
-    turns: btn.dataset.turns,
-    confirm: btn.dataset.confirm,
-    confirmTitle: btn.dataset.confirmTitle,
-    confirmLabel: btn.dataset.confirmLabel,
-  };
 }
 
 function stationHandleManagedAction(action) {
@@ -19295,17 +19285,12 @@ async function onControlActionBtnClick(ev) {
   if (btn.classList.contains('pending') || btn.disabled) return;
   const op = btn.dataset.codexAction;
   if (!op) return;
-  await runCodexThreadActionFromUi(op, {
-    promptName: btn.dataset.promptName,
-    promptSide: btn.dataset.promptSide,
-    promptReview: btn.dataset.promptReview,
-    promptRename: btn.dataset.promptRename,
-    promptGoal: btn.dataset.promptGoal,
-    turns: btn.dataset.turns,
-    confirm: btn.dataset.confirm,
-    confirmTitle: btn.dataset.confirmTitle,
-    confirmLabel: btn.dataset.confirmLabel,
-  });
+  const spec = codexThreadActionSpec(op);
+  if (!spec) {
+    showControlToast('error', `Unknown Codex thread action /${op}`);
+    return;
+  }
+  await runCodexThreadActionFromUi(op, spec);
 }
 
 async function runCodexThreadActionFromUi(op, opts = {}, sessionId = '') {
@@ -23999,16 +23984,42 @@ const SESSION_WINDOW_GENERIC_ACTIONS = [
   { op: 'stop-session', label: 'Stop session...', title: 'Stop the live backend and remove it from active dashboards', danger: true },
 ];
 
+// Single source of truth for Codex thread-action metadata (prompt and
+// confirmation requirements). The legacy Control-pane buttons, the session
+// window action menus, and Station thread actions all read this registry so
+// an action can never be dispatched without its confirm/prompt config.
+const CODEX_THREAD_ACTION_SPECS = Object.freeze({
+  'new': Object.freeze({}),
+  fast: Object.freeze({}),
+  compact: Object.freeze({}),
+  undo: Object.freeze({ turns: '1' }),
+  fork: Object.freeze({ promptName: true }),
+  side: Object.freeze({ promptSide: true }),
+  review: Object.freeze({ promptReview: true }),
+  rename: Object.freeze({ promptRename: true }),
+  goal: Object.freeze({ promptGoal: true }),
+  'goal-get': Object.freeze({}),
+  'goal-pause': Object.freeze({}),
+  'goal-resume': Object.freeze({}),
+  'goal-clear': Object.freeze({ confirm: 'Clear the current Codex goal?' }),
+  init: Object.freeze({}),
+  'memory-reset': Object.freeze({}),
+});
+
+function codexThreadActionSpec(op) {
+  return CODEX_THREAD_ACTION_SPECS[String(op || '').trim()] || null;
+}
+
 const SESSION_WINDOW_CODEX_ACTIONS = [
-  { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', promptName: true },
-  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', promptSide: true },
+  { op: 'fork', label: 'Fork...', title: 'Fork this Codex thread', ...CODEX_THREAD_ACTION_SPECS.fork },
+  { op: 'side', label: 'Side...', title: 'Ask a side question in an ephemeral Codex fork', ...CODEX_THREAD_ACTION_SPECS.side },
   { op: 'fast', label: 'Fast', title: 'Toggle Codex Fast service tier for future turns' },
   {
     label: 'Configure goal...',
     title: 'Configure this thread goal',
     children: [
-      { op: 'goal', label: 'Set goal...', title: 'Create or update this thread goal', promptGoal: true },
-      { op: 'goal-clear', label: 'Clear goal', title: 'Clear this thread goal', confirm: 'Clear the current Codex goal?' },
+      { op: 'goal', label: 'Set goal...', title: 'Create or update this thread goal', ...CODEX_THREAD_ACTION_SPECS.goal },
+      { op: 'goal-clear', label: 'Clear goal', title: 'Clear this thread goal', ...CODEX_THREAD_ACTION_SPECS['goal-clear'] },
     ],
   },
   { op: 'goal-get', label: 'Goal status', title: 'Fetch this thread goal' },
