@@ -2218,7 +2218,10 @@ impl App {
                 // LogEntry is the primary visible source.
                 self.log(
                     LogLevel::Warn,
-                    format!("User display access granted (display_id: {})", display_id),
+                    format!(
+                        "User display access grant recorded (display_id: {})",
+                        display_id
+                    ),
                 );
             }
             AppEvent::UserDisplayRevoked {

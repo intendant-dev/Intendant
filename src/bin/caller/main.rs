@@ -17775,6 +17775,79 @@ Also: {"source": "bare"}"#;
         assert!(frame_has_visible_rgb(&frame));
     }
 
+    struct ActiveDisplayBackend {
+        width: u32,
+        height: u32,
+    }
+
+    #[async_trait::async_trait]
+    impl display::DisplayBackend for ActiveDisplayBackend {
+        async fn start_capture(
+            &self,
+            _fps: u32,
+        ) -> Result<tokio::sync::mpsc::Receiver<display::Frame>, error::CallerError> {
+            let (_tx, rx) = tokio::sync::mpsc::channel(1);
+            Ok(rx)
+        }
+
+        async fn stop_capture(&self) {}
+
+        async fn inject_input(
+            &self,
+            _event: display::InputEvent,
+        ) -> Result<(), error::CallerError> {
+            Ok(())
+        }
+
+        fn resolution(&self) -> (u32, u32) {
+            (self.width, self.height)
+        }
+
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+    }
+
+    #[test]
+    fn activate_user_display_skips_activation_when_capture_already_active() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let backend = std::sync::Arc::new(ActiveDisplayBackend {
+                width: 1920,
+                height: 1080,
+            });
+            let session = std::sync::Arc::new(display::DisplaySession::new(0, backend));
+            let mut registry = display::SessionRegistry::new();
+            registry.insert(0, session);
+            let registry = std::sync::Arc::new(tokio::sync::RwLock::new(registry));
+
+            activate_user_display(&bus, &registry, None, 0).await;
+
+            match tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::DisplayReady {
+                    display_id,
+                    width,
+                    height,
+                })) => {
+                    assert_eq!(display_id, 0);
+                    assert_eq!((width, height), (1920, 1080));
+                }
+                other => panic!("expected DisplayReady for active capture, got {other:?}"),
+            }
+            assert!(
+                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                    .await
+                    .is_err(),
+                "already-active capture should not emit a portal-pending event"
+            );
+        });
+    }
+
     #[test]
     fn parse_cli_flags_empty() {
         // Can't easily test parse_cli_flags since it reads env::args(),
@@ -26690,6 +26763,20 @@ async fn activate_user_display(
     target_display_id: u32,
 ) {
     let display_id: u32 = target_display_id;
+
+    if let Some(session) = session_registry.read().await.get(display_id) {
+        let (width, height) = session.resolution();
+        eprintln!(
+            "[user_display] Display :{} capture already active ({}x{}); skipping activation",
+            display_id, width, height
+        );
+        bus.send(AppEvent::DisplayReady {
+            display_id,
+            width,
+            height,
+        });
+        return;
+    }
 
     #[cfg(target_os = "linux")]
     crate::linux_display_env::ensure_gui_session_env("user display activation");
