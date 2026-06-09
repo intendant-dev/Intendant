@@ -5382,12 +5382,56 @@ body.context-focus-active {
   gap: 8px;
   padding: 4px 0;
   flex-shrink: 0;
+  flex-wrap: wrap;
 }
 .session-detail-log-status {
   color: var(--overlay0);
   font-size: 11px;
   font-variant-numeric: tabular-nums;
   white-space: nowrap;
+}
+.session-detail-log-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+  margin-left: auto;
+}
+.session-detail-log-actions button,
+.session-detail-log-actions select,
+.session-detail-log-jump {
+  border: 1px solid var(--surface1);
+  background: var(--surface0);
+  color: var(--subtext1);
+  border-radius: 4px;
+  font-size: 11px;
+  min-height: 26px;
+}
+.session-detail-log-actions button {
+  padding: 3px 8px;
+  cursor: pointer;
+}
+.session-detail-log-actions button:hover:not(:disabled) {
+  border-color: var(--blue);
+  color: var(--text);
+}
+.session-detail-log-actions button:disabled {
+  opacity: 0.45;
+  cursor: default;
+}
+.session-detail-log-actions select {
+  padding: 3px 6px;
+}
+.session-detail-log-jump {
+  width: 84px;
+  padding: 3px 6px;
+  font-variant-numeric: tabular-nums;
+}
+.session-detail-log-jump:focus,
+.session-detail-log-actions select:focus {
+  outline: none;
+  border-color: var(--blue);
 }
 .session-detail-log-stream {
   flex: 1;
@@ -51622,34 +51666,92 @@ const SESSION_DETAIL_RENDER_LIMIT = 600;
 const SESSION_DETAIL_SCROLL_CHUNK = 300;
 const SESSION_DETAIL_SCROLL_THRESHOLD_PX = 64;
 let detailVerbosity = 'normal';
+let detailLogFilter = 'all';
 let sessionDetailLogView = null;
+
+function makeSessionDetailLogButton(label, title, onClick) {
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.textContent = label;
+  btn.title = title;
+  btn.addEventListener('click', onClick);
+  return btn;
+}
 
 function renderSessionDetailLogs(entries, el) {
   el.innerHTML = '';
   sessionDetailLogView = null;
 
-  // Verbosity toggle
   const toolbar = document.createElement('div');
   toolbar.className = 'session-detail-log-toolbar';
   const status = document.createElement('div');
   status.className = 'session-detail-log-status';
-  const select = document.createElement('select');
-  select.className = 'verbosity-select';
-  select.innerHTML = '<option value="normal">Normal</option><option value="verbose">Verbose</option><option value="debug">Debug</option>';
-  select.value = detailVerbosity;
-  select.addEventListener('change', () => {
-    detailVerbosity = select.value;
-    renderSessionDetailEntries(entries, logsContainer, status);
+
+  const controls = document.createElement('div');
+  controls.className = 'session-detail-log-actions';
+  const firstBtn = makeSessionDetailLogButton('First', 'Show earliest loaded entries', () => {
+    setSessionDetailLogRange(sessionDetailLogView, 0);
   });
+  const prevBtn = makeSessionDetailLogButton('Prev', 'Show previous entries', () => {
+    setSessionDetailLogRange(sessionDetailLogView, (sessionDetailLogView?.renderStart || 0) - SESSION_DETAIL_RENDER_LIMIT);
+  });
+  const jumpInput = document.createElement('input');
+  jumpInput.className = 'session-detail-log-jump';
+  jumpInput.type = 'number';
+  jumpInput.min = '1';
+  jumpInput.step = '1';
+  jumpInput.placeholder = 'Entry';
+  jumpInput.title = 'Jump to entry number';
+  jumpInput.addEventListener('change', () => jumpSessionDetailLogToEntry(sessionDetailLogView, jumpInput.value));
+  jumpInput.addEventListener('keydown', (event) => {
+    if (event.key === 'Enter') {
+      event.preventDefault();
+      jumpSessionDetailLogToEntry(sessionDetailLogView, jumpInput.value);
+    }
+  });
+  const nextBtn = makeSessionDetailLogButton('Next', 'Show next entries', () => {
+    setSessionDetailLogRange(sessionDetailLogView, (sessionDetailLogView?.renderStart || 0) + SESSION_DETAIL_RENDER_LIMIT);
+  });
+  const latestBtn = makeSessionDetailLogButton('Latest', 'Show latest loaded entries', () => {
+    setSessionDetailLogRange(sessionDetailLogView, sessionDetailMaxRenderStart(sessionDetailLogView), 'bottom');
+  });
+  const filterSelect = document.createElement('select');
+  filterSelect.className = 'session-detail-log-filter';
+  filterSelect.title = 'Log source filter';
+  filterSelect.innerHTML = '<option value="all">All messages</option><option value="user">User only</option><option value="non-user">Hide user</option>';
+  filterSelect.value = detailLogFilter;
+  const verbositySelect = document.createElement('select');
+  verbositySelect.className = 'verbosity-select';
+  verbositySelect.title = 'Log verbosity';
+  verbositySelect.innerHTML = '<option value="normal">Normal</option><option value="verbose">Verbose</option><option value="debug">Debug</option>';
+  verbositySelect.value = detailVerbosity;
+  controls.appendChild(firstBtn);
+  controls.appendChild(prevBtn);
+  controls.appendChild(jumpInput);
+  controls.appendChild(nextBtn);
+  controls.appendChild(latestBtn);
+  controls.appendChild(filterSelect);
+  controls.appendChild(verbositySelect);
   toolbar.appendChild(status);
-  toolbar.appendChild(select);
+  toolbar.appendChild(controls);
   el.appendChild(toolbar);
 
   const logsContainer = document.createElement('div');
   logsContainer.className = 'session-detail-log-stream';
   el.appendChild(logsContainer);
 
-  renderSessionDetailEntries(entries, logsContainer, status);
+  const pagerControls = { firstBtn, prevBtn, nextBtn, latestBtn, jumpInput };
+  const renderCurrent = () => renderSessionDetailEntries(entries, logsContainer, status, pagerControls);
+  filterSelect.addEventListener('change', () => {
+    detailLogFilter = filterSelect.value;
+    renderCurrent();
+  });
+  verbositySelect.addEventListener('change', () => {
+    detailVerbosity = verbositySelect.value;
+    renderCurrent();
+  });
+
+  renderCurrent();
 }
 
 function sessionDetailVisibleLevels() {
@@ -51668,8 +51770,21 @@ const sessionDetailLevelColors = {
 const sessionDetailSourceLabels = {
   system: '\u2139', worker: 'Model', agent: 'Run',
   server: 'Servr', live: 'Live', sub: 'Sub', orch: 'Orch',
-  presence: 'Prsnc',
+  presence: 'Prsnc', user: 'User',
 };
+
+function isSessionDetailUserEntry(entry) {
+  const source = String(entry?.source || '').trim().toLowerCase();
+  const role = String(entry?.role || entry?.type || '').trim().toLowerCase();
+  return source === 'user' || role === 'user' || role === 'human' ||
+    (entry?.user_turn_index !== undefined && entry?.user_turn_index !== null);
+}
+
+function sessionDetailEntryMatchesLogFilter(entry) {
+  if (detailLogFilter === 'user') return isSessionDetailUserEntry(entry);
+  if (detailLogFilter === 'non-user') return !isSessionDetailUserEntry(entry);
+  return true;
+}
 
 function buildSessionDetailRows(entries) {
   const rows = [];
@@ -51679,6 +51794,7 @@ function buildSessionDetailRows(entries) {
   for (const e of entries || []) {
     const level = e.level || 'info';
     if (!visibleLevels.includes(level)) continue;
+    if (!sessionDetailEntryMatchesLogFilter(e)) continue;
     const source = e.source || '';
     const displaySource = sessionDetailSourceLabels[source] || source || '\u2139';
     const content = e.content || e.summary || e.message || '';
@@ -51706,11 +51822,12 @@ function buildSessionDetailRows(entries) {
   return rows;
 }
 
-function renderSessionDetailEntries(entries, el, statusEl = null) {
+function renderSessionDetailEntries(entries, el, statusEl = null, pagerControls = null) {
   const view = {
     rows: buildSessionDetailRows(entries),
     scroller: el,
     statusEl,
+    pagerControls,
     renderStart: 0,
     renderEnd: 0,
     expandedRows: new Set(),
@@ -51725,6 +51842,40 @@ function renderSessionDetailEntries(entries, el, statusEl = null) {
   el._sessionDetailScrollHandler = () => handleSessionDetailLogScroll(view);
   el.addEventListener('scroll', el._sessionDetailScrollHandler);
   renderSessionDetailRange(view, 0);
+  el.scrollTop = 0;
+}
+
+function sessionDetailMaxRenderStart(view) {
+  return Math.max(0, (view?.rows?.length || 0) - SESSION_DETAIL_RENDER_LIMIT);
+}
+
+function setSessionDetailLogRange(view, start, scrollMode = 'top') {
+  if (!view) return;
+  renderSessionDetailRange(view, start);
+  if (!view.scroller) return;
+  if (scrollMode === 'bottom') {
+    view.scroller.scrollTop = Math.max(0, view.scroller.scrollHeight - view.scroller.clientHeight);
+  } else {
+    view.scroller.scrollTop = 0;
+  }
+}
+
+function sessionDetailRowIndexForEntryOrdinal(rows, ordinal) {
+  const target = Math.max(1, Math.floor(Number(ordinal) || 1));
+  let count = 0;
+  for (let i = 0; i < rows.length; i++) {
+    if (rows[i]?.kind !== 'entry') continue;
+    count += 1;
+    if (count >= target) return i;
+  }
+  return sessionDetailMaxRenderStart({ rows });
+}
+
+function jumpSessionDetailLogToEntry(view, value) {
+  if (!view || !view.entryCount) return;
+  const ordinal = Math.max(1, Math.min(view.entryCount, Math.floor(Number(value) || 1)));
+  const rowIndex = sessionDetailRowIndexForEntryOrdinal(view.rows, ordinal);
+  setSessionDetailLogRange(view, Math.min(rowIndex, sessionDetailMaxRenderStart(view)));
 }
 
 function renderSessionDetailRange(view, start) {
@@ -51733,12 +51884,12 @@ function renderSessionDetailRange(view, start) {
   if (rows.length === 0) {
     view.renderStart = 0;
     view.renderEnd = 0;
-    scroller.innerHTML = '<div class="empty-state">No log entries at this verbosity</div>';
+    scroller.innerHTML = '<div class="empty-state">No matching log entries</div>';
     updateSessionDetailLogStatus(view);
     return;
   }
 
-  const maxStart = Math.max(0, rows.length - SESSION_DETAIL_RENDER_LIMIT);
+  const maxStart = sessionDetailMaxRenderStart(view);
   const safeStart = Math.max(0, Math.min(Number(start) || 0, maxStart));
   const safeEnd = Math.min(rows.length, safeStart + SESSION_DETAIL_RENDER_LIMIT);
   const fragment = document.createDocumentFragment();
@@ -51753,15 +51904,40 @@ function renderSessionDetailRange(view, start) {
 }
 
 function updateSessionDetailLogStatus(view) {
-  if (!view?.statusEl) return;
+  if (!view) return;
   const total = view.entryCount || 0;
   if (total === 0) {
-    view.statusEl.textContent = '0 entries';
+    if (view.statusEl) view.statusEl.textContent = `0 ${sessionDetailLogFilterLabel()}`;
+    updateSessionDetailLogPager(view, 0, 0, total);
     return;
   }
   const before = countSessionDetailEntries(view.rows, 0, view.renderStart);
   const current = countSessionDetailEntries(view.rows, view.renderStart, view.renderEnd);
-  view.statusEl.textContent = `Showing ${before + 1}-${before + current} of ${total} entries`;
+  if (view.statusEl) {
+    view.statusEl.textContent = `Showing ${before + 1}-${before + current} of ${total} ${sessionDetailLogFilterLabel()}`;
+  }
+  updateSessionDetailLogPager(view, before, current, total);
+}
+
+function sessionDetailLogFilterLabel() {
+  if (detailLogFilter === 'user') return 'user entries';
+  if (detailLogFilter === 'non-user') return 'non-user entries';
+  return 'entries';
+}
+
+function updateSessionDetailLogPager(view, before, current, total) {
+  const controls = view?.pagerControls;
+  if (!controls) return;
+  const hasRows = total > 0 && view.rows.length > 0;
+  controls.firstBtn.disabled = !hasRows || view.renderStart <= 0;
+  controls.prevBtn.disabled = controls.firstBtn.disabled;
+  controls.nextBtn.disabled = !hasRows || view.renderEnd >= view.rows.length;
+  controls.latestBtn.disabled = controls.nextBtn.disabled;
+  controls.jumpInput.disabled = !hasRows;
+  controls.jumpInput.max = String(Math.max(1, total));
+  if (document.activeElement !== controls.jumpInput) {
+    controls.jumpInput.value = hasRows ? String(before + (current > 0 ? 1 : 0)) : '';
+  }
 }
 
 function countSessionDetailEntries(rows, start, end) {
