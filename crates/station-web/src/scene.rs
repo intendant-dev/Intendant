@@ -311,7 +311,7 @@ impl StationInner {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum LayoutName {
     Orbital,
     Constellation,
@@ -333,7 +333,7 @@ impl LayoutName {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Mood {
     Cockpit,
     Calm,
@@ -661,4 +661,149 @@ pub(crate) fn layout_positions(
         }
     }
     map
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::model::StationAgent;
+
+    fn snapshot() -> StationSnapshot {
+        StationSnapshot {
+            hosts: vec![
+                StationHost {
+                    id: "alpha".into(),
+                    ..Default::default()
+                },
+                StationHost {
+                    id: "beta".into(),
+                    ..Default::default()
+                },
+            ],
+            agents: vec![
+                StationAgent {
+                    id: "agent-1".into(),
+                    host_id: "alpha".into(),
+                    ..Default::default()
+                },
+                StationAgent {
+                    id: "agent-2".into(),
+                    host_id: "alpha".into(),
+                    role: "sub-agent".into(),
+                    ..Default::default()
+                },
+                StationAgent {
+                    id: "agent-3".into(),
+                    host_id: "beta".into(),
+                    ..Default::default()
+                },
+            ],
+            ..Default::default()
+        }
+    }
+
+    fn assert_same_positions(a: &HashMap<String, Vec3>, b: &HashMap<String, Vec3>) {
+        assert_eq!(a.len(), b.len());
+        for (key, pa) in a {
+            let pb = b.get(key).unwrap_or_else(|| panic!("missing key {key}"));
+            assert_eq!(
+                (pa.x.to_bits(), pa.y.to_bits(), pa.z.to_bits()),
+                (pb.x.to_bits(), pb.y.to_bits(), pb.z.to_bits()),
+                "position differs for {key}"
+            );
+        }
+    }
+
+    #[test]
+    fn layout_positions_is_deterministic() {
+        let snapshot = snapshot();
+        for layout in [LayoutName::Orbital, LayoutName::Constellation] {
+            let a = layout_positions(&snapshot, layout);
+            let b = layout_positions(&snapshot, layout);
+            assert_same_positions(&a, &b);
+        }
+    }
+
+    #[test]
+    fn layout_positions_covers_every_node() {
+        let snapshot = snapshot();
+        let map = layout_positions(&snapshot, LayoutName::Orbital);
+        assert!(map.contains_key("op"));
+        assert!(map.contains_key("host:alpha"));
+        assert!(map.contains_key("host:beta"));
+        for agent in &snapshot.agents {
+            assert!(map.contains_key(&agent.id), "missing {}", agent.id);
+        }
+        assert_eq!(map.len(), 1 + snapshot.hosts.len() + snapshot.agents.len());
+    }
+
+    #[test]
+    fn layouts_actually_differ() {
+        let snapshot = snapshot();
+        let orbital = layout_positions(&snapshot, LayoutName::Orbital);
+        let constellation = layout_positions(&snapshot, LayoutName::Constellation);
+        let a = orbital.get("host:alpha").unwrap();
+        let b = constellation.get("host:alpha").unwrap();
+        assert!(
+            (a.x - b.x).abs() > 1e-6 || (a.y - b.y).abs() > 1e-6 || (a.z - b.z).abs() > 1e-6,
+            "orbital and constellation should place hosts differently"
+        );
+    }
+
+    #[test]
+    fn camera_projects_target_near_center_and_culls_behind() {
+        let eye = Vec3::new(0.0, 0.0, 10.0);
+        let camera = Camera::look_at(eye, Vec3::ZERO, Vec3::Y);
+        let center = camera.project(Vec3::ZERO, 16.0 / 9.0, 55.0).unwrap();
+        assert!(center.x.abs() < 1e-5 && center.y.abs() < 1e-5);
+        // A point behind the camera must be culled.
+        assert!(camera
+            .project(Vec3::new(0.0, 0.0, 20.0), 16.0 / 9.0, 55.0)
+            .is_none());
+    }
+
+    #[test]
+    fn vec3_math_basics() {
+        let v = Vec3::new(3.0, 0.0, 4.0);
+        assert_eq!(v.len(), 5.0);
+        let n = v.normalized();
+        assert!((n.len() - 1.0).abs() < 1e-6);
+        assert_eq!(Vec3::ZERO.normalized().len(), 0.0);
+        let lerped = Vec3::ZERO.lerp(Vec3::new(2.0, 2.0, 2.0), 0.5);
+        assert_eq!((lerped.x, lerped.y, lerped.z), (1.0, 1.0, 1.0));
+        let cross = Vec3::new(1.0, 0.0, 0.0).cross(Vec3::new(0.0, 1.0, 0.0));
+        assert_eq!((cross.x, cross.y, cross.z), (0.0, 0.0, 1.0));
+    }
+
+    #[test]
+    fn rotations_preserve_length() {
+        let v = Vec3::new(1.0, 2.0, 3.0);
+        assert!((rotate_y(v, 1.3).len() - v.len()).abs() < 1e-5);
+        assert!((rotate_x(v, -0.7).len() - v.len()).abs() < 1e-5);
+    }
+
+    #[test]
+    fn ndc_to_screen_maps_corners() {
+        let top_left = ndc_to_screen([-1.0, 1.0], 200, 100);
+        assert_eq!((top_left.x, top_left.y), (0.0, 0.0));
+        let bottom_right = ndc_to_screen([1.0, -1.0], 200, 100);
+        assert_eq!((bottom_right.x, bottom_right.y), (200.0, 100.0));
+        let center = ndc_to_screen([0.0, 0.0], 200, 100);
+        assert_eq!((center.x, center.y), (100.0, 50.0));
+    }
+
+    #[test]
+    fn mood_parsing_and_factors() {
+        assert_eq!(Mood::from_str("calm"), Mood::Calm);
+        assert_eq!(Mood::from_str("anything"), Mood::Cockpit);
+        assert!(Mood::Calm.starfield_alpha() < Mood::Cockpit.starfield_alpha());
+        assert!(Mood::Calm.pulse() < Mood::Cockpit.pulse());
+        assert!(Mood::Calm.glow() < Mood::Cockpit.glow());
+        assert_eq!(Mood::Calm.starfield_stride(), 2);
+        assert_eq!(
+            LayoutName::from_str("constellation"),
+            LayoutName::Constellation
+        );
+        assert_eq!(LayoutName::from_str("bogus"), LayoutName::Orbital);
+    }
 }

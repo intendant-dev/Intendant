@@ -567,3 +567,56 @@ impl GpuFrame {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::util::Color;
+
+    #[test]
+    fn quads_push_two_triangles() {
+        let mut frame = GpuFrame::default();
+        frame.add_quad_ndc(0.0, 0.0, 0.1, [1.0, 1.0, 1.0, 1.0]);
+        assert_eq!(frame.tri_vertices.len(), 6);
+        assert!(frame.line_vertices.is_empty());
+    }
+
+    #[test]
+    fn lines_push_vertex_pairs_and_projection_culls() {
+        let mut frame = GpuFrame::default();
+        let color = Color::rgb(255, 0, 0);
+        frame.add_line_ndc(Vec2::new(0.0, 0.0), Vec2::new(1.0, 1.0), color);
+        assert_eq!(frame.line_vertices.len(), 2);
+        // A projector that culls everything adds nothing.
+        let mut cull = |_: Vec3| -> Option<Vec2> { None };
+        frame.add_line_projected(&mut cull, Vec3::ZERO, Vec3::Y, color);
+        assert_eq!(frame.line_vertices.len(), 2);
+    }
+
+    #[test]
+    fn ring_segments_share_endpoints() {
+        let mut frame = GpuFrame::default();
+        let mut identity = |v: Vec3| Some(Vec2::new(v.x, v.y));
+        frame.add_ring(
+            &mut identity,
+            Vec3::ZERO,
+            1.0,
+            Color::rgb(0, 255, 0),
+            Plane::XY,
+        );
+        // 64 segments, two vertices each.
+        assert_eq!(frame.line_vertices.len(), 128);
+    }
+
+    #[test]
+    fn clear_empties_but_keeps_capacity() {
+        let mut frame = GpuFrame::default();
+        frame.add_quad_ndc(0.0, 0.0, 0.1, [1.0; 4]);
+        let cap = frame.tri_vertices.capacity();
+        frame.clear();
+        assert!(frame.tri_vertices.is_empty());
+        assert!(frame.line_vertices.is_empty());
+        assert!(frame.projected_nodes.is_empty());
+        assert_eq!(frame.tri_vertices.capacity(), cap);
+    }
+}

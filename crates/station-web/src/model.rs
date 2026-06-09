@@ -827,3 +827,65 @@ where
 {
     Ok(Option::<f64>::deserialize(deserializer)?.unwrap_or(0.0) as f32)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn snapshot_deserializes_camel_case_with_defaults() {
+        let snapshot: StationSnapshot = serde_json::from_value(serde_json::json!({
+            "hosts": [{"id": "h1", "name": "Host One", "connected": false, "cpu": null}],
+            "agents": [{"id": "a1", "hostId": "h1", "needsApproval": true, "tokens": 12.5}],
+            "events": [{"id": "e1", "level": "warn", "msg": "hello"}],
+            "controls": {"sessionActive": true, "backend": "codex"},
+            "sessions": {"total": 4, "worktreeDirty": 2}
+        }))
+        .expect("snapshot should deserialize");
+
+        let host = &snapshot.hosts[0];
+        assert_eq!(host.id, "h1");
+        assert!(!host.connected);
+        // f32_or_default maps JSON null to 0.0 instead of failing.
+        assert_eq!(host.cpu, 0.0);
+        // Unspecified fields take their struct defaults.
+        assert_eq!(host.region, "local");
+
+        let agent = &snapshot.agents[0];
+        assert_eq!(agent.host_id, "h1");
+        assert!(agent.needs_approval);
+        assert_eq!(agent.tokens, 12.5);
+        assert_eq!(agent.token_cap, 200_000.0);
+
+        assert_eq!(snapshot.events[0].level, "warn");
+        assert!(snapshot.controls.session_active);
+        assert_eq!(snapshot.controls.backend, "codex");
+        assert_eq!(snapshot.sessions.total, 4);
+        assert_eq!(snapshot.sessions.worktree_dirty, 2);
+        // Sections absent from the payload fall back wholesale.
+        assert_eq!(snapshot.context.replay_mode, "live");
+    }
+
+    #[test]
+    fn display_runway_lane_renames_type_to_kind() {
+        let lane: StationDisplayRunwayLane = serde_json::from_value(serde_json::json!({
+            "type": "local_stream",
+            "id": "lane-1",
+            "fps": 30.0
+        }))
+        .expect("lane should deserialize");
+        assert_eq!(lane.kind, "local_stream");
+        assert_eq!(lane.fps, 30.0);
+    }
+
+    #[test]
+    fn activity_retained_count_prefers_the_larger_signal() {
+        let mut snapshot = StationSnapshot {
+            events: vec![StationEvent::default(), StationEvent::default()],
+            ..Default::default()
+        };
+        assert_eq!(activity_retained_count(&snapshot), 2);
+        snapshot.activity.retained_count = 40;
+        assert_eq!(activity_retained_count(&snapshot), 40);
+    }
+}

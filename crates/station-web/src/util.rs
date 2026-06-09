@@ -194,3 +194,99 @@ pub(crate) fn now_ms() -> f64 {
 pub(crate) fn now_ms() -> f64 {
     0.0
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn truncate_passes_short_strings_through() {
+        assert_eq!(truncate("hello", 10), "hello");
+        assert_eq!(truncate("", 4), "");
+    }
+
+    #[test]
+    fn truncate_cuts_on_chars_not_bytes() {
+        assert_eq!(truncate("hello", 3), "hel…");
+        // Multi-byte characters count as one.
+        assert_eq!(truncate("héllo wörld", 5), "héllo…");
+    }
+
+    #[test]
+    fn nonempty_trims_and_falls_back() {
+        assert_eq!(nonempty("  value  ", "fb"), "value");
+        assert_eq!(nonempty("   ", "fb"), "fb");
+        assert_eq!(nonempty("", "fb"), "fb");
+    }
+
+    #[test]
+    fn percent_clamps_and_handles_empty_window() {
+        assert_eq!(percent(50.0, 200.0), 0.25);
+        assert_eq!(percent(500.0, 200.0), 1.0);
+        assert_eq!(percent(-1.0, 200.0), 0.0);
+        assert_eq!(percent(10.0, 0.0), 0.0);
+        assert_eq!(percent(10.0, -5.0), 0.0);
+    }
+
+    #[test]
+    fn pct_label_rounds_and_clamps() {
+        assert_eq!(pct_label(0.0), "0%");
+        assert_eq!(pct_label(0.254), "25%");
+        assert_eq!(pct_label(1.7), "100%");
+    }
+
+    #[test]
+    fn pressure_color_thresholds() {
+        assert_eq!(pressure_color(0.1), C_GREEN_CSS);
+        assert_eq!(pressure_color(0.5), C_BLUE_CSS);
+        assert_eq!(pressure_color(0.72), C_YELLOW_CSS);
+        assert_eq!(pressure_color(0.9), C_RED_CSS);
+    }
+
+    #[test]
+    fn stable_unit_is_deterministic_and_in_range() {
+        for id in ["", "agent-1", "host:alpha", "x"] {
+            let a = stable_unit(id);
+            assert_eq!(a, stable_unit(id));
+            assert!((0.0..=1.0).contains(&a), "{id} -> {a}");
+        }
+        assert_ne!(stable_unit("agent-1"), stable_unit("agent-2"));
+        assert_eq!(stable_angle("a"), stable_unit("a") * PI * 2.0);
+    }
+
+    #[test]
+    fn lcg_and_unit_are_deterministic() {
+        let s1 = lcg(1);
+        assert_eq!(s1, lcg(1));
+        assert!((0.0..=1.0).contains(&unit(s1)));
+    }
+
+    #[test]
+    fn css_rgba_formats_components() {
+        assert_eq!(css_rgba([1.0, 0.0, 0.5, 0.25]), "rgba(255,0,128,0.250)");
+    }
+
+    #[test]
+    fn color_with_alpha_keeps_rgb() {
+        let c = C_BLUE.with_alpha(0.5);
+        let arr: [f32; 4] = c.into();
+        assert_eq!(arr[3], 0.5);
+        assert_eq!(arr[0], C_BLUE.r);
+    }
+
+    #[test]
+    fn semantic_color_maps_cover_known_keys() {
+        assert_eq!(level_color_css("error"), C_RED_CSS);
+        assert_eq!(level_color_css("warn"), C_YELLOW_CSS);
+        assert_eq!(level_color_css("unknown"), C_OVERLAY1_CSS);
+        let err: [f32; 4] = level_color("error").into();
+        let red: [f32; 4] = C_RED.into();
+        assert_eq!(err, red);
+        let orch: [f32; 4] = role_color("orchestrator").into();
+        let blue: [f32; 4] = C_BLUE.into();
+        assert_eq!(orch, blue);
+        let think: [f32; 4] = phase_color("thinking").into();
+        let lavender: [f32; 4] = C_LAVENDER.into();
+        assert_eq!(think, lavender);
+    }
+}
