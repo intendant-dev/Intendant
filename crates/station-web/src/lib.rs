@@ -143,8 +143,6 @@ impl StationWeb {
             inner.ar_strength = ar_strength.clamp(0.0, 1.0);
             inner.density = density.clamp(0.5, 1.8);
             inner.targets_dirty = true;
-            // The vignette treatment depends on the mood.
-            inner.hud.invalidate_vignette();
         }
         StationInner::schedule_frame(&self.inner);
     }
@@ -808,10 +806,11 @@ impl StationInner {
 
         let mut project = move |p: Vec3| camera.project(p, aspect, fov_deg);
 
-        for star in &self.starfield {
+        let star_alpha = self.mood.starfield_alpha();
+        for star in self.starfield.iter().step_by(self.mood.starfield_stride()) {
             if let Some(p) = project(*star) {
                 let s = 0.0045 * density;
-                frame.add_quad_ndc(p.x, p.y, s, [0.35, 0.36, 0.44, 0.55]);
+                frame.add_quad_ndc(p.x, p.y, s, [0.35, 0.36, 0.44, star_alpha]);
             }
         }
 
@@ -913,9 +912,22 @@ impl StationInner {
     ) {
         let pos = self.layout_cache.get("op").copied().unwrap_or(Vec3::ZERO);
         let spin = time_ms as f32 * 0.00032 * self.motion;
+        let glow = self.mood.glow();
         frame.add_wire_octa(project, pos, 0.48, spin, C_BLUE.with_alpha(0.95));
-        frame.add_ring(project, pos, 0.82, C_SAPPHIRE.with_alpha(0.55), Plane::XZ);
-        frame.add_ring(project, pos, 1.18, C_BLUE.with_alpha(0.18), Plane::XZ);
+        frame.add_ring(
+            project,
+            pos,
+            0.82,
+            C_SAPPHIRE.with_alpha(0.55 * glow),
+            Plane::XZ,
+        );
+        frame.add_ring(
+            project,
+            pos,
+            1.18,
+            C_BLUE.with_alpha(0.18 * glow),
+            Plane::XZ,
+        );
         if let Some(p) = project(pos) {
             frame.projected_nodes.push(ProjectedNode::new(
                 "op",
@@ -947,8 +959,8 @@ impl StationInner {
         frame.add_ring(
             project,
             pos + Vec3::new(0.0, -0.17, 0.0),
-            0.82 + (time_ms as f32 * 0.003).sin() * 0.035,
-            C_PEACH.with_alpha(0.28),
+            0.82 + (time_ms as f32 * 0.003).sin() * 0.035 * self.mood.pulse(),
+            C_PEACH.with_alpha(0.28 * self.mood.glow()),
             Plane::XZ,
         );
         if let Some(p) = project(pos) {
@@ -995,8 +1007,8 @@ impl StationInner {
             frame.add_ring(
                 project,
                 pos,
-                0.72 + (time_ms as f32 * 0.004).sin() * 0.05,
-                C_TEAL.with_alpha(0.22),
+                0.72 + (time_ms as f32 * 0.004).sin() * 0.05 * self.mood.pulse(),
+                C_TEAL.with_alpha(0.22 * self.mood.glow()),
                 Plane::XY,
             );
         }
@@ -1004,7 +1016,7 @@ impl StationInner {
             frame.add_ring(
                 project,
                 pos,
-                0.84 + (time_ms as f32 * 0.006).sin() * 0.07,
+                0.84 + (time_ms as f32 * 0.006).sin() * 0.07 * self.mood.pulse(),
                 C_YELLOW.with_alpha(0.58),
                 Plane::XY,
             );
@@ -1093,7 +1105,7 @@ impl StationInner {
     }
 
     fn draw_vignette(&self, w: f32, h: f32) {
-        if let Some(gradient) = self.hud.vignette(w, h) {
+        if let Some(gradient) = self.hud.vignette(w, h, self.mood) {
             self.hud.ctx.set_fill_style_canvas_gradient(&gradient);
             self.hud.note_fill_unknown();
             self.hud.ctx.fill_rect(0.0, 0.0, w as f64, h as f64);
@@ -1460,13 +1472,17 @@ impl StationInner {
         let cx = x + w * 0.5;
         let cy = y + core_h * 0.52;
         let ring_scale = (core_h * 0.42).clamp(132.0, 230.0);
-        self.hud.set_stroke("rgba(137,180,250,0.28)");
+        self.hud.set_stroke(match self.mood {
+            Mood::Cockpit => "rgba(137,180,250,0.28)",
+            Mood::Calm => "rgba(137,180,250,0.18)",
+        });
+        let breathe = (time_ms as f32 * 0.001).sin() * 2.0 * self.mood.pulse();
         for radius in [ring_scale * 0.36, ring_scale * 0.62, ring_scale] {
             self.hud.ctx.begin_path();
             let _ = self.hud.ctx.arc(
                 cx as f64,
                 cy as f64,
-                (radius + (time_ms as f32 * 0.001).sin() * 2.0) as f64,
+                (radius + breathe) as f64,
                 0.0,
                 std::f64::consts::TAU,
             );
@@ -2497,6 +2513,7 @@ struct HudStyle {
 struct Vignette {
     width: f32,
     height: f32,
+    mood: Mood,
     gradient: web_sys::CanvasGradient,
 }
 
@@ -2548,11 +2565,11 @@ impl Hud {
         self.style.borrow_mut().fill.clear();
     }
 
-    /// Radial vignette gradient, rebuilt only when the size changes.
-    fn vignette(&self, w: f32, h: f32) -> Option<web_sys::CanvasGradient> {
+    /// Radial vignette gradient, rebuilt only when the size or mood changes.
+    fn vignette(&self, w: f32, h: f32, mood: Mood) -> Option<web_sys::CanvasGradient> {
         let mut style = self.style.borrow_mut();
         if let Some(v) = style.vignette.as_ref() {
-            if v.width == w && v.height == h {
+            if v.width == w && v.height == h && v.mood == mood {
                 return Some(v.gradient.clone());
             }
         }
@@ -2567,12 +2584,13 @@ impl Hud {
                 (w.max(h) * 0.72) as f64,
             )
             .ok()?;
-        let _ = gradient.add_color_stop(0.0, "rgba(30,30,46,0.04)");
-        let _ = gradient.add_color_stop(0.75, "rgba(17,17,27,0.16)");
-        let _ = gradient.add_color_stop(1.0, "rgba(4,4,9,0.48)");
+        for (offset, color) in mood.vignette_stops() {
+            let _ = gradient.add_color_stop(offset as f32, color);
+        }
         style.vignette = Some(Vignette {
             width: w,
             height: h,
+            mood,
             gradient: gradient.clone(),
         });
         Some(gradient)
@@ -4082,6 +4100,54 @@ impl Mood {
         match self {
             Self::Cockpit => "cockpit",
             Self::Calm => "calm",
+        }
+    }
+
+    /// Starfield quad alpha: calm dims the backdrop.
+    fn starfield_alpha(self) -> f32 {
+        match self {
+            Self::Cockpit => 0.55,
+            Self::Calm => 0.32,
+        }
+    }
+
+    /// Starfield sampling stride: calm draws every other star.
+    fn starfield_stride(self) -> usize {
+        match self {
+            Self::Cockpit => 1,
+            Self::Calm => 2,
+        }
+    }
+
+    /// Amplitude scale for breathing/pulse animations.
+    fn pulse(self) -> f32 {
+        match self {
+            Self::Cockpit => 1.0,
+            Self::Calm => 0.45,
+        }
+    }
+
+    /// Alpha scale for decorative (non-semantic) glow rings.
+    fn glow(self) -> f32 {
+        match self {
+            Self::Cockpit => 1.0,
+            Self::Calm => 0.65,
+        }
+    }
+
+    /// Radial vignette color stops; calm is softer and less saturated.
+    fn vignette_stops(self) -> [(f64, &'static str); 3] {
+        match self {
+            Self::Cockpit => [
+                (0.0, "rgba(30,30,46,0.04)"),
+                (0.75, "rgba(17,17,27,0.16)"),
+                (1.0, "rgba(4,4,9,0.48)"),
+            ],
+            Self::Calm => [
+                (0.0, "rgba(30,30,46,0.03)"),
+                (0.75, "rgba(17,17,27,0.10)"),
+                (1.0, "rgba(4,4,9,0.36)"),
+            ],
         }
     }
 }
