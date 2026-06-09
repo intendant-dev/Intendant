@@ -10746,6 +10746,13 @@ const STATION_ACTIVITY_EVENT_LIMIT = 180;
 const stationLogAnchorRows = new Map();
 const stationLogAnchorKeys = [];
 const STATION_LOG_ANCHOR_LIMIT = 10000;
+// Incremental per-session index over stationLogAnchorRows so managed-context
+// summaries never rescan the full (10k-cap) anchor map per snapshot rebuild:
+// distinct-id refcounts for counting plus a newest-first tail per session.
+const stationAnchorsBySession = new Map(); // sid -> { ids: Set<id>, tail: [row, ...] oldest->newest }
+const stationAnchorIdRefs = new Map(); // id -> number of sessions holding it
+const STATION_ANCHOR_TAIL_LIMIT = 8;
+let stationLogAnchorSeq = 0;
 const stationRegisteredSources = new Set();
 let stationLastSnapshotJson = '';
 let stationSessionsIndexLoading = false;
@@ -10893,15 +10900,30 @@ function stationRefreshSharedCaches() {
     .catch(err => console.warn('Station changes refresh failed:', err));
 }
 
-function stationScheduleUpdate() {
+// Coalesce snapshot rebuilds: dashboard event streams (log lines, status,
+// usage, peer logs) call this per event, but while Station is visible we
+// rebuild at most once per window on the trailing edge. Tab activation
+// (stationSetActive) and local user actions (handleStationAction /
+// stationRenderedSelectPanel) rebuild immediately. Hidden tab: skip
+// entirely; activation rebuilds unconditionally.
+const STATION_SNAPSHOT_COALESCE_MS = 300;
+
+function stationScheduleUpdate(opts = {}) {
   if (!station) return;
   if (!stationSnapshotVisible()) return;
-  if (stationScheduleUpdate._pending) return;
-  stationScheduleUpdate._pending = true;
-  requestAnimationFrame(() => {
-    stationScheduleUpdate._pending = false;
+  if (opts.immediate) {
+    if (stationScheduleUpdate._timer) {
+      clearTimeout(stationScheduleUpdate._timer);
+      stationScheduleUpdate._timer = null;
+    }
     stationUpdateSnapshot();
-  });
+    return;
+  }
+  if (stationScheduleUpdate._timer) return;
+  stationScheduleUpdate._timer = setTimeout(() => {
+    stationScheduleUpdate._timer = null;
+    stationUpdateSnapshot();
+  }, STATION_SNAPSHOT_COALESCE_MS);
 }
 
 function stationUpdateSnapshot() {
@@ -10928,7 +10950,7 @@ function stationRenderedSelectPanel(target, message = '') {
   if (!stationRenderedPrimaryActive()) return false;
   if (target) station.select_by_id?.(target);
   stationStatus(message || (station.debug_state?.() || 'Station online'));
-  stationScheduleUpdate();
+  stationScheduleUpdate({ immediate: true });
   return true;
 }
 
@@ -11131,7 +11153,11 @@ function handleStationAction(action) {
     if (tab === 'settings' && subtab && !VALID_SETTINGS_SUBTABS.includes(subtab)) return;
     if (tab === 'sessions' && subtab && !VALID_SESSIONS_SUBTABS.includes(subtab)) return;
     stationForceRouteTo(tab, subtab);
+    return;
   }
+  // Local user action: reflect the result in the rendered panel immediately
+  // instead of waiting out the coalescing window.
+  stationScheduleUpdate({ immediate: true });
 }
 
 function stationForceRouteTo(tab, subtab, after) {
@@ -11367,7 +11393,7 @@ function stationApplyViewSettings(showToast = false, persist = true) {
     );
   }
   if (persist) stationSaveViewDraft();
-  stationScheduleUpdate();
+  stationScheduleUpdate({ immediate: true });
   if (showToast) showControlToast?.('success', 'Station view updated');
 }
 
@@ -12501,7 +12527,7 @@ function stationContextLaneParts(category) {
   const normalized = typeof contextNormalizeCategory === 'function'
     ? contextNormalizeCategory(category)
     : String(category || 'other').trim();
-  const analysis = analyzeContextSnapshot(snapshot);
+  const analysis = analyzeContextSnapshotCached(snapshot);
   return analysis.parts.filter(part => part.category === normalized);
 }
 
@@ -12525,7 +12551,7 @@ function stationSelectedContextPartDetail(partId = stationSelectedContextPart) {
   const id = String(partId || '').trim();
   const snapshot = stationSnapshotForContext();
   if (!id || !snapshot) return null;
-  const analysis = analyzeContextSnapshot(snapshot);
+  const analysis = analyzeContextSnapshotCached(snapshot);
   return analysis.parts.find(part => part.id === id) || null;
 }
 
@@ -12965,7 +12991,23 @@ async function stationRunChangesPruneFromDock(selectedPath = stationSelectedChan
   await stationRefreshChangesHistoryForDock(selectedPath);
 }
 
+// Merging the session index, live windows, metadata, and the daemon session
+// (plus the recency sort and byte/token totals) is too expensive to redo on
+// every coalesced snapshot rebuild. Cache the derived set; session-list loads
+// invalidate it explicitly (stationInvalidateSessionSet) and a short TTL
+// covers window/metadata churn that has no single mutation choke point.
+let stationSessionSetCache = null;
+const STATION_SESSION_SET_TTL_MS = 1500;
+
+function stationInvalidateSessionSet() {
+  stationSessionSetCache = null;
+}
+
 function stationCollectSessionSet() {
+  const now = Date.now();
+  if (stationSessionSetCache && now - stationSessionSetCache.at < STATION_SESSION_SET_TTL_MS) {
+    return stationSessionSetCache;
+  }
   const indexedSessions = Array.isArray(_cachedSessions) && _cachedSessions.length
     ? _cachedSessions
     : (sessionsListCache.get(sessionListCacheKey(selfPeerId)) || []);
@@ -12989,7 +13031,16 @@ function stationCollectSessionSet() {
     const id = currentDaemonSession.session_id || JSON.stringify(currentDaemonSession);
     if (!byId.has(String(id))) byId.set(String(id), currentDaemonSession);
   }
-  return { sessions: [...byId.values()], indexedIds };
+  const sessions = [...byId.values()];
+  const sortedSessions = [...sessions].sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a));
+  let totalTokens = 0;
+  let diskBytes = 0;
+  for (const session of sessions) {
+    totalTokens += stationNum(session?.total_tokens);
+    diskBytes += stationSessionBytes(session);
+  }
+  stationSessionSetCache = { at: now, sessions, indexedIds, sortedSessions, totalTokens, diskBytes };
+  return stationSessionSetCache;
 }
 
 function stationSessionRowForDock(session, indexedIds = new Set()) {
@@ -14538,7 +14589,7 @@ function stationBuildContextSummary() {
       pressureState: {},
     };
   }
-  const analysis = analyzeContextSnapshot(snapshot);
+  const analysis = analyzeContextSnapshotCached(snapshot);
   const effectiveWindow = Number(snapshot.effective_context_window || snapshot.context_window || analysis.effectiveWindow || 0);
   const hardWindow = Number(snapshot.hard_context_window || snapshot.hardContextWindow || analysis.hardWindow || effectiveWindow || 0);
   const sessionId = contextSessionKey(snapshot) === CONTEXT_GLOBAL_SESSION ? '' : contextSessionKey(snapshot);
@@ -14636,26 +14687,35 @@ function stationManagedSessionCandidate() {
   return resolvePromptTargetSessionId();
 }
 
+function stationAnchorSessionMatches(sid, target) {
+  if (!target) return true;
+  return sid === target || sessionWindowTargetForLogSession(sid) === target;
+}
+
 function stationManagedAnchorCount(sessionId) {
+  const target = String(sessionId || '').trim();
+  if (!target) {
+    let count = stationAnchorIdRefs.size;
+    for (const anchor of managedContextAnchors || []) {
+      const id = String(anchor?.item_id || anchor?.itemId || '').trim();
+      if (id && !stationAnchorIdRefs.has(id)) count += 1;
+    }
+    return count;
+  }
   const seen = new Set();
   for (const anchor of managedContextAnchors || []) {
     const id = anchor?.item_id || anchor?.itemId;
     if (id) seen.add(String(id));
   }
-  for (const row of stationLogAnchorRows.values()) {
-    if (stationLogAnchorMatchesSession(row, sessionId)) seen.add(row.id);
+  for (const [sid, entry] of stationAnchorsBySession) {
+    if (!stationAnchorSessionMatches(sid, target)) continue;
+    for (const id of entry.ids) seen.add(id);
   }
   return seen.size;
 }
 
-function stationLogAnchorMatchesSession(row, sessionId) {
-  const target = String(sessionId || '').trim();
-  if (!target) return true;
-  const sid = String(row?.sessionId || '').trim();
-  return sid === target || sessionWindowTargetForLogSession(sid) === target;
-}
-
 function stationManagedAnchorRows(sessionId) {
+  const target = String(sessionId || '').trim();
   const seen = new Set();
   const rows = [];
   const add = (itemId, detail, value = 'anchor', rowSessionId = '') => {
@@ -14673,12 +14733,15 @@ function stationManagedAnchorRows(sessionId) {
       tone: 'peer',
     });
   };
-  for (let i = stationLogAnchorKeys.length - 1; i >= 0 && rows.length < 8; i--) {
-    const row = stationLogAnchorRows.get(stationLogAnchorKeys[i]);
-    if (!row) continue;
-    if (stationLogAnchorMatchesSession(row, sessionId)) {
-      add(row.id, row.detail, row.value || 'log', row.sessionId);
-    }
+  const candidates = [];
+  for (const [sid, entry] of stationAnchorsBySession) {
+    if (!stationAnchorSessionMatches(sid, target)) continue;
+    candidates.push(...entry.tail);
+  }
+  candidates.sort((a, b) => (b.seq || 0) - (a.seq || 0));
+  for (const row of candidates) {
+    if (rows.length >= 8) break;
+    add(row.id, row.detail, row.value || 'log', row.sessionId);
   }
   for (const anchor of managedContextAnchors || []) {
     add(
@@ -15157,7 +15220,7 @@ function stationCurrentDaemonSessionSummary() {
 
 function stationBuildSessionsSummary() {
   const worktrees = stationBuildWorktreesSummary();
-  const { sessions, indexedIds } = stationCollectSessionSet();
+  const { sessions, indexedIds, sortedSessions, totalTokens, diskBytes } = stationCollectSessionSet();
   const externalIds = new Set();
   for (const session of sessions) {
     const source = normalizeAgentId(session?.backend_source || session?.backendSource || session?.source || '');
@@ -15183,7 +15246,6 @@ function stationBuildSessionsSummary() {
     stationSessionDockStatusFilter ||
     stationSessionDockProjectFilter
   );
-  const sortedSessions = [...sessions].sort((a, b) => stationSessionUpdatedMs(b) - stationSessionUpdatedMs(a));
   const latest = sortedSessions[0] || null;
   let recent = [];
   let filteredRows = [];
@@ -15247,8 +15309,8 @@ function stationBuildSessionsSummary() {
     total: sessions.length,
     active,
     external: externalIds.size,
-    totalTokens: sessions.reduce((sum, session) => sum + stationNum(session?.total_tokens), 0),
-    diskBytes: sessions.reduce((sum, session) => sum + stationSessionBytes(session), 0),
+    totalTokens,
+    diskBytes,
     latestTask: latest ? (stationSessionTask(latest) || 'Untitled session') : '',
     latestSource: latest
       ? (sessionConfigSource(sessionConfigMetadata(latest)) || stationSessionSource(latest) || latest?.source || 'session')
@@ -16034,18 +16096,54 @@ function stationTrackLogAnchorRow(itemId, sessionId, detail, value = 'log') {
   if (!id) return;
   const sid = String(sessionId || '').trim();
   const key = `${sid}\u001f${id}`;
-  if (!stationLogAnchorRows.has(key)) stationLogAnchorKeys.push(key);
-  stationLogAnchorRows.set(key, {
+  const isNew = !stationLogAnchorRows.has(key);
+  if (isNew) stationLogAnchorKeys.push(key);
+  const row = {
     id,
     sessionId: sid,
     value: value || 'log',
     detail: detail || '',
-  });
+    seq: isNew ? ++stationLogAnchorSeq : (stationLogAnchorRows.get(key)?.seq ?? ++stationLogAnchorSeq),
+  };
+  stationLogAnchorRows.set(key, row);
+  stationAnchorIndexUpsert(row, isNew);
   while (stationLogAnchorKeys.length > STATION_LOG_ANCHOR_LIMIT) {
     const oldestKey = stationLogAnchorKeys.shift();
     if (!oldestKey) break;
+    const evicted = stationLogAnchorRows.get(oldestKey);
     stationLogAnchorRows.delete(oldestKey);
+    if (evicted) stationAnchorIndexEvict(evicted);
   }
+}
+
+function stationAnchorIndexUpsert(row, isNew) {
+  let entry = stationAnchorsBySession.get(row.sessionId);
+  if (!entry) {
+    entry = { ids: new Set(), tail: [] };
+    stationAnchorsBySession.set(row.sessionId, entry);
+  }
+  const tailIndex = entry.tail.findIndex(item => item.id === row.id);
+  if (tailIndex >= 0) {
+    entry.tail[tailIndex] = row;
+    return;
+  }
+  if (!isNew) return; // updated row already aged out of the tail; keep order
+  entry.ids.add(row.id);
+  stationAnchorIdRefs.set(row.id, (stationAnchorIdRefs.get(row.id) || 0) + 1);
+  entry.tail.push(row);
+  if (entry.tail.length > STATION_ANCHOR_TAIL_LIMIT) entry.tail.shift();
+}
+
+function stationAnchorIndexEvict(row) {
+  const entry = stationAnchorsBySession.get(row.sessionId);
+  if (!entry) return;
+  entry.ids.delete(row.id);
+  const tailIndex = entry.tail.findIndex(item => item.id === row.id);
+  if (tailIndex >= 0) entry.tail.splice(tailIndex, 1);
+  if (!entry.ids.size) stationAnchorsBySession.delete(row.sessionId);
+  const refs = (stationAnchorIdRefs.get(row.id) || 0) - 1;
+  if (refs > 0) stationAnchorIdRefs.set(row.id, refs);
+  else stationAnchorIdRefs.delete(row.id);
 }
 
 function stationTrackLogAnchor(c) {
@@ -16072,6 +16170,9 @@ function stationClearLogState() {
   stationLogEvents.length = 0;
   stationLogAnchorRows.clear();
   stationLogAnchorKeys.length = 0;
+  stationAnchorsBySession.clear();
+  stationAnchorIdRefs.clear();
+  stationLogAnchorSeq = 0;
 }
 
 function stationRegisterVideoSource(sourceId, hostId, displayId, label, kind, videoEl) {
@@ -19807,10 +19908,11 @@ function renderManagedContextAnchors() {
   const sid = managedContextCurrentSessionId();
   const seen = new Set();
   const rows = [];
+  const target = String(sid || '').trim();
   for (let i = stationLogAnchorKeys.length - 1; i >= 0 && rows.length < 18; i--) {
     const row = stationLogAnchorRows.get(stationLogAnchorKeys[i]);
     if (!row) continue;
-    if (stationLogAnchorMatchesSession(row, sid)) {
+    if (stationAnchorSessionMatches(String(row.sessionId || '').trim(), target)) {
       rows.push({
         itemId: row.id,
         sessionId: row.sessionId || sid,
@@ -33029,6 +33131,23 @@ function contextAddSummaryParts(parts, summaryParts) {
   }
 }
 
+// analyzeContextSnapshot walks the entire raw payload, which is expensive at
+// large context sizes. Both the legacy Context pane and the Station snapshot
+// builders need the same analysis, so memoize it per snapshot object. Exact
+// raw loads replace the snapshot object (replaceStoredContextSnapshot), which
+// naturally invalidates the memo entry.
+const contextAnalysisBySnapshot = new WeakMap();
+
+function analyzeContextSnapshotCached(snapshot) {
+  if (!snapshot || typeof snapshot !== 'object') return analyzeContextSnapshot(snapshot);
+  let analysis = contextAnalysisBySnapshot.get(snapshot);
+  if (!analysis) {
+    analysis = analyzeContextSnapshot(snapshot);
+    contextAnalysisBySnapshot.set(snapshot, analysis);
+  }
+  return analysis;
+}
+
 function analyzeContextSnapshot(snapshot) {
   const raw = contextRawValue(snapshot);
   const parts = [];
@@ -33928,7 +34047,7 @@ function renderContextPane() {
   set('context-tokens', tokens);
   set('context-format', d.format || '--');
   renderContextRaw(snapshot);
-  const analysis = analyzeContextSnapshot(snapshot);
+  const analysis = analyzeContextSnapshotCached(snapshot);
   contextLastAnalysis = analysis;
   const selected = selectedContextPart(analysis);
   renderContextLegend(analysis);
@@ -41868,6 +41987,7 @@ let _sessionDeepSearch = {
 function applyLoadedSessions(sessions, aggEl) {
   sessionsLoaded = true;
   _cachedSessions = sessions;
+  stationInvalidateSessionSet();
   updateSessionProjectFilterOptions(sessions);
   updateNewSessionProjectPrefills(sessions);
   cacheSessionWindowMetadata(sessions);
