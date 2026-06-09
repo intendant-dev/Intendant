@@ -12277,7 +12277,10 @@ document.getElementById('station-hotspots')?.addEventListener('click', stationHo
 document.getElementById('station-hud-canvas')?.addEventListener('click', stationHotspotLayerEvent);
 window.addEventListener('resize', stationSyncHotspots);
 if ('ResizeObserver' in window) {
-  const stationHotspotResizeObserver = new ResizeObserver(() => stationSyncHotspots());
+  const stationHotspotResizeObserver = new ResizeObserver(() => {
+    station?.resize?.();
+    stationSyncHotspots();
+  });
   const stationPaneForHotspots = document.querySelector('.station-pane');
   if (stationPaneForHotspots) stationHotspotResizeObserver.observe(stationPaneForHotspots);
 }
