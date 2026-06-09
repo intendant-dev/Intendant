@@ -28444,10 +28444,23 @@ class DisplaySlot {
     // Handle incoming video track
     this.pc.ontrack = (e) => {
       this.videoEl.srcObject = e.streams[0];
+      this.videoEl.play().catch(() => {});
       this.connected = true;
       const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
       this.statusEl.textContent = `Connected (view-only)${res}`;
       this.statusEl.className = 'display-status connected';
+      // The slot was registered with the Station at creation, before this
+      // track existed (srcObject was null, so the play-kick was a no-op and
+      // the Station held a frameless element). Re-register now that the
+      // stream is live so the local pane shows without a manual toggle.
+      stationRegisterVideoSource(
+        `local:${this.displayId}`,
+        selfPeerId,
+        String(this.displayId),
+        `${selfHostLabel || 'local'} :${this.displayId}`,
+        'local',
+        this.videoEl,
+      );
     };
 
     // ICE candidates — send to server via WASM app

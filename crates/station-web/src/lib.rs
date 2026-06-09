@@ -403,15 +403,26 @@ impl StationInner {
         StationInner::schedule_frame(&inner);
     }
 
-    /// Frame-rate governor. Within 150ms of real input everything renders at
-    /// display rate so drags, hovers, and slider scrubs stay fluid; ambient
-    /// frames (video thumbnails, WebGPU surface keepalive, slow orbit drift,
-    /// particles) are capped at ~30fps — they're 30fps sources or sub-pixel
-    /// motion anyway, and the full scene+HUD repaint is the dominant GPU cost
-    /// on weaker iGPUs. Skipped ticks still re-arm, so nothing stalls.
+    /// Frame-rate governor. Three tiers, because the full scene+HUD repaint
+    /// (and especially uploading live `<video>` frames into the 2D HUD canvas)
+    /// is the dominant GPU cost on weaker iGPUs:
+    ///   • within 150ms of real input  → render at display rate (fluid drags)
+    ///   • motion/particles/drag active → ~30fps (smooth ambient animation)
+    ///   • only video thumbnails live   → ~12fps (monitoring panes; the
+    ///     per-frame video texture upload is the expensive part, and small
+    ///     thumbnails don't need more)
+    /// Skipped ticks still re-arm, so nothing stalls.
     fn frame_due(&mut self, time_ms: f64) -> bool {
-        let interactive = time_ms - self.last_input_ms < 150.0;
-        if interactive || time_ms - self.last_present_ms >= 31.0 {
+        if time_ms - self.last_input_ms < 150.0 {
+            self.last_present_ms = time_ms;
+            return true;
+        }
+        let lively = self.motion > 0.0
+            || !self.particles.is_empty()
+            || self.pointer_down.is_some()
+            || self.pinch_zoom.is_some();
+        let min_interval = if lively { 31.0 } else { 82.0 };
+        if time_ms - self.last_present_ms >= min_interval {
             self.last_present_ms = time_ms;
             return true;
         }
