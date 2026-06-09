@@ -29793,7 +29793,7 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
   const signatures = [];
   if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
   if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
-  const canUseTextSignature = parts.level === 'model' || parts.level === 'detail';
+  const canUseTextSignature = parts.level === 'model' || parts.level === 'detail' || parts.kind === 'agent_output';
   const textParts = [
     parts.sessionId,
     parts.level,

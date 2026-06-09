@@ -4453,6 +4453,22 @@ fn codex_payload_text(payload: &serde_json::Value) -> Option<(String, String)> {
     message_content_text(content).map(|text| (role, text))
 }
 
+fn codex_function_call_output(payload: &serde_json::Value) -> Option<(Option<String>, String)> {
+    if payload.get("type").and_then(|v| v.as_str()) != Some("function_call_output") {
+        return None;
+    }
+    let output = value_str(payload, "output")?;
+    if output.trim().is_empty() {
+        return None;
+    }
+    let output_id = value_str(payload, "call_id")
+        .or_else(|| value_str(payload, "callId"))
+        .or_else(|| value_str(payload, "id"))
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+    Some((output_id, output))
+}
+
 fn codex_session_goal_from_value(goal: &serde_json::Value) -> Option<SessionGoal> {
     if goal.is_null() || goal.as_bool() == Some(false) {
         return None;
@@ -6949,6 +6965,24 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     &role,
                     text,
                 );
+            }
+            if let Some((output_id, output)) = codex_function_call_output(payload) {
+                let mut entry = serde_json::json!({
+                    "ts": ts,
+                    "event": "agent_output",
+                    "level": "agent",
+                    "source": "codex",
+                    "kind": "agent_output",
+                    "stdout": output,
+                    "stderr": "",
+                });
+                if let Some(session_id) = rollout_session_id.as_deref() {
+                    entry["session_id"] = serde_json::json!(session_id);
+                }
+                if let Some(output_id) = output_id {
+                    entry["output_id"] = serde_json::json!(output_id);
+                }
+                entries.push(entry);
             }
         }
         // Record where this item sits in the entry stream so a later item-anchor
@@ -25156,6 +25190,66 @@ mod tests {
         assert_eq!(
             contents,
             vec!["first cached message", "second uncached message"]
+        );
+    }
+
+    #[test]
+    fn codex_transcript_imports_function_call_output() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-function-output";
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_empty",
+                        "output": ""
+                    }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:01Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_output",
+                        "output": "Chunk ID: abc123\nOutput:\nactual command output\n"
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let entries = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should parse");
+        let outputs: Vec<_> = entries
+            .iter()
+            .filter(|entry| entry.get("event").and_then(|v| v.as_str()) == Some("agent_output"))
+            .collect();
+
+        assert_eq!(outputs.len(), 1);
+        assert_eq!(outputs[0]["session_id"], session_id);
+        assert_eq!(outputs[0]["source"], "codex");
+        assert_eq!(outputs[0]["kind"], "agent_output");
+        assert_eq!(outputs[0]["output_id"], "call_output");
+        assert_eq!(
+            outputs[0]["stdout"],
+            "Chunk ID: abc123\nOutput:\nactual command output\n"
         );
     }
 

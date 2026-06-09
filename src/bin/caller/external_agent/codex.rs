@@ -5804,6 +5804,25 @@ fn translate_notification_with_scope(
                 }
             }
 
+            if item_type == "function_call_output" {
+                if let Some(output) = item.get("output").and_then(|v| v.as_str()) {
+                    if let Some(text) = filter_codex_command_output(state, &item_id, output, true) {
+                        send_scoped_agent_event(
+                            event_tx,
+                            thread_id,
+                            turn_id,
+                            AgentEvent::ToolOutputDelta {
+                                item_id: item_id.clone(),
+                                text,
+                            },
+                        );
+                    }
+                    state
+                        .command_output_hygiene
+                        .remove(&codex_command_output_hygiene_key(&item_id));
+                }
+            }
+
             // Extract MCP tool call results
             if item_type == "mcpToolCall" {
                 // MCP results may contain structured data; surface as output
@@ -9157,6 +9176,13 @@ error: build failed
         translate_notification("item/completed", &params, &tx);
 
         match rx.try_recv().unwrap() {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
+                assert!(text.contains("Process running with session ID 1404"));
+            }
+            other => panic!("expected ToolOutputDelta, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
                 assert_eq!(status, ToolCompletionStatus::Success);
@@ -9178,6 +9204,13 @@ error: build failed
 
         translate_notification("item/completed", &params, &tx);
 
+        match rx.try_recv().unwrap() {
+            AgentEvent::ToolOutputDelta { item_id, text } => {
+                assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
+                assert!(text.contains("Process exited with code 0"));
+            }
+            other => panic!("expected ToolOutputDelta, got {:?}", other),
+        }
         match rx.try_recv().unwrap() {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
