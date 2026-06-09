@@ -10659,7 +10659,7 @@ fn build_web_tls_acceptor(
                     .to_string(),
             ));
         };
-        web_tls::ClientAuth::RequireCa { ca_path }
+        web_tls::ClientAuth::OptionalCa { ca_path }
     } else {
         web_tls::ClientAuth::None
     };
@@ -28005,6 +28005,15 @@ async fn main() -> Result<(), CallerError> {
     // A misconfiguration (bad cert/key, half-specified pair) fails startup
     // here rather than silently degrading to plain HTTP. The bind address
     // feeds the self-signed cert's SAN list.
+    let web_tls_client_cert_required = if use_web {
+        web_mtls_enabled(
+            &flags,
+            &project.config.server.tls,
+            &project.config.server.mtls,
+        )
+    } else {
+        false
+    };
     let web_tls_acceptor = if use_web {
         let bind_addr = web_listener.as_ref().and_then(|l| l.local_addr().ok());
         build_web_tls_acceptor(
@@ -28017,16 +28026,11 @@ async fn main() -> Result<(), CallerError> {
         None
     };
     if web_tls_acceptor.is_some() {
-        let mtls_enabled = web_mtls_enabled(
-            &flags,
-            &project.config.server.tls,
-            &project.config.server.mtls,
-        );
         eprintln!(
             "[web_gateway] TLS enabled — dashboard is HTTPS/WSS-only on port {web_port} \
              (cleartext HTTP/WS connections are refused){}",
-            if mtls_enabled {
-                "; mTLS client certificates are required"
+            if web_tls_client_cert_required {
+                "; mTLS client certificates are required except for peer access requests"
             } else {
                 ""
             }
@@ -28244,6 +28248,7 @@ async fn main() -> Result<(), CallerError> {
                 &project.config.server.auth,
                 &access::backend::select_backend().cert_dir(),
             )?,
+            web_tls_client_cert_required,
             web_tls_acceptor.clone(),
         );
         eprintln!(
@@ -28480,6 +28485,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &access::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_client_cert_required,
                 web_tls_acceptor.clone(),
             );
             slog(&session_log, |l| {
@@ -29091,6 +29097,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &access::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_client_cert_required,
                 web_tls_acceptor.clone(),
             );
             app.log(
@@ -29612,6 +29619,7 @@ async fn main() -> Result<(), CallerError> {
                     &project.config.server.auth,
                     &access::backend::select_backend().cert_dir(),
                 )?,
+                web_tls_client_cert_required,
                 web_tls_acceptor.clone(),
             );
             eprintln!(

@@ -30,7 +30,8 @@ use p12_keystore::{
 use rcgen::string::Ia5String;
 use rcgen::{
     BasicConstraints, Certificate, CertificateParams, DnType, ExtendedKeyUsagePurpose, IsCa,
-    Issuer, KeyPair, KeyUsagePurpose, SanType, PKCS_RSA_SHA256,
+    Issuer, KeyPair, KeyUsagePurpose, PublicKeyData, SanType, SubjectPublicKeyInfo,
+    PKCS_RSA_SHA256,
 };
 use rsa::pkcs8::{EncodePrivateKey, LineEnding};
 use time::{Duration, OffsetDateTime};
@@ -60,6 +61,12 @@ pub struct CertState {
 #[derive(Debug)]
 pub struct IssuedClientIdentity {
     pub cert_pem: String,
+    pub key_pem: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct GeneratedClientKey {
+    pub public_key_pem: String,
     pub key_pem: String,
 }
 
@@ -244,6 +251,48 @@ pub fn issue_client_identity(cert_dir: &Path, label: &str) -> AccessResult<Issue
     })
 }
 
+/// Generate requester-side key material for peer access requests.
+///
+/// The private key stays on the requesting daemon. The public key is sent to
+/// the target daemon and signed only after target-local approval.
+pub fn generate_client_key_material() -> AccessResult<GeneratedClientKey> {
+    let key = generate_rsa_key_pair()?;
+    let public_key_pem = pem::encode(&pem::Pem::new("PUBLIC KEY", key.subject_public_key_info()));
+    Ok(GeneratedClientKey {
+        public_key_pem,
+        key_pem: key.serialize_pem(),
+    })
+}
+
+/// Issue a client certificate for a requester-supplied public key.
+///
+/// Used by access-request approval so the target daemon never receives the
+/// requester's private key.
+pub fn issue_client_certificate_for_public_key(
+    cert_dir: &Path,
+    label: &str,
+    public_key_pem: &str,
+) -> AccessResult<String> {
+    let ca_path = cert_dir.join(CA_CRT);
+    let key_path = cert_dir.join(CA_KEY);
+    if !ca_path.exists() || !key_path.exists() {
+        return Err(AccessError(format!(
+            "no access CA found in {} — run `intendant access setup` first",
+            cert_dir.display()
+        )));
+    }
+
+    let ca_pem = std::fs::read_to_string(ca_path)?;
+    let ca_key_pem = std::fs::read_to_string(key_path)?;
+    let ca_key = KeyPair::from_pem(&ca_key_pem)?;
+    let ca_issuer = issuer_from_pem(&ca_pem, ca_key)?;
+    let public_key = SubjectPublicKeyInfo::from_pem(public_key_pem)
+        .map_err(|e| AccessError(format!("parse requester public key: {e}")))?;
+    let params = client_cert_params(label)?;
+    let cert = params.signed_by(&public_key, &ca_issuer)?;
+    Ok(cert.pem())
+}
+
 fn regenerate_server_cert(cert_dir: &Path, server_names: &ServerNames) -> AccessResult<()> {
     let ca_pem = std::fs::read_to_string(cert_dir.join(CA_CRT))?;
     let ca_key_pem = std::fs::read_to_string(cert_dir.join(CA_KEY))?;
@@ -426,6 +475,13 @@ fn generate_client_cert(
     ca_issuer: &Issuer<'_, KeyPair>,
     label: &str,
 ) -> AccessResult<(Certificate, KeyPair)> {
+    let params = client_cert_params(label)?;
+    let key = generate_rsa_key_pair()?;
+    let cert = params.signed_by(&key, ca_issuer)?;
+    Ok((cert, key))
+}
+
+fn client_cert_params(label: &str) -> AccessResult<CertificateParams> {
     let mut params =
         CertificateParams::new(vec![]).map_err(|e| AccessError(format!("client params: {e}")))?;
     params
@@ -440,10 +496,7 @@ fn generate_client_cert(
     let now = OffsetDateTime::now_utc();
     params.not_before = now - Duration::hours(1);
     params.not_after = now + Duration::days(3650);
-
-    let key = generate_rsa_key_pair()?;
-    let cert = params.signed_by(&key, ca_issuer)?;
-    Ok((cert, key))
+    Ok(params)
 }
 
 /// Build a PKCS#12 bundle using Apple auto-detect-compatible legacy

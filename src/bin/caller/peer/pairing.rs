@@ -22,7 +22,7 @@ use crate::error::CallerError;
 use crate::project::{PeerConfig, Project};
 
 const INVITE_PREFIX: &str = "intendant-peer-v1.";
-const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
+pub(crate) const AGENT_CARD_PATH: &str = "/.well-known/agent-card.json";
 const DEFAULT_WEB_PORT: u16 = crate::web_gateway::DEFAULT_PORT;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -72,12 +72,21 @@ struct PeerArgs {
     client_name: Option<String>,
     port: u16,
     invite: Option<String>,
+    target_url: Option<String>,
+    code_or_id: Option<String>,
+    profile: Option<String>,
+    requester_card_url: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PeerAction {
     Invite,
     Join,
+    Request,
+    Requests,
+    Approve,
+    Deny,
+    Complete,
     Help,
 }
 
@@ -106,6 +115,11 @@ pub async fn run(argv: Vec<String>) -> Result<(), CallerError> {
         }
         PeerAction::Invite => cmd_invite(args),
         PeerAction::Join => cmd_join(args),
+        PeerAction::Request => cmd_request(args).await,
+        PeerAction::Requests => cmd_requests(),
+        PeerAction::Approve => cmd_approve(args),
+        PeerAction::Deny => cmd_deny(args),
+        PeerAction::Complete => cmd_complete(args).await,
     }
 }
 
@@ -122,10 +136,15 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
     args.action = match first.as_str() {
         "invite" => PeerAction::Invite,
         "join" => PeerAction::Join,
+        "request" => PeerAction::Request,
+        "requests" => PeerAction::Requests,
+        "approve" => PeerAction::Approve,
+        "deny" => PeerAction::Deny,
+        "complete" | "poll" => PeerAction::Complete,
         "help" | "-h" | "--help" => return Ok(args),
         other => {
             return Err(CallerError::Config(format!(
-                "unknown peer subcommand '{other}' (expected invite/join)"
+                "unknown peer subcommand '{other}' (expected invite/join/request/requests/approve/deny/complete)"
             )));
         }
     };
@@ -151,6 +170,18 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
                     .ok_or_else(|| CallerError::Config("missing value for --client-name".into()))?;
                 args.client_name = Some(value.clone());
             }
+            "--profile" => {
+                let value = iter
+                    .next()
+                    .ok_or_else(|| CallerError::Config("missing value for --profile".into()))?;
+                args.profile = Some(value.clone());
+            }
+            "--requester-card-url" => {
+                let value = iter.next().ok_or_else(|| {
+                    CallerError::Config("missing value for --requester-card-url".into())
+                })?;
+                args.requester_card_url = Some(value.clone());
+            }
             "--port" => {
                 let value = iter
                     .next()
@@ -170,6 +201,14 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
                 PeerAction::Join if args.invite.is_none() => {
                     args.invite = Some(other.to_string());
                 }
+                PeerAction::Request if args.target_url.is_none() => {
+                    args.target_url = Some(other.to_string());
+                }
+                PeerAction::Approve | PeerAction::Deny | PeerAction::Complete
+                    if args.code_or_id.is_none() =>
+                {
+                    args.code_or_id = Some(other.to_string());
+                }
                 PeerAction::Invite => {
                     return Err(CallerError::Config(format!(
                         "unexpected argument '{other}' for `intendant peer invite`"
@@ -178,6 +217,21 @@ fn parse_args(argv: &[String]) -> Result<PeerArgs, CallerError> {
                 PeerAction::Join => {
                     return Err(CallerError::Config(format!(
                         "unexpected extra invite argument '{other}'"
+                    )));
+                }
+                PeerAction::Request => {
+                    return Err(CallerError::Config(format!(
+                        "unexpected extra target argument '{other}'"
+                    )));
+                }
+                PeerAction::Approve | PeerAction::Deny | PeerAction::Complete => {
+                    return Err(CallerError::Config(format!(
+                        "unexpected extra request argument '{other}'"
+                    )));
+                }
+                PeerAction::Requests => {
+                    return Err(CallerError::Config(format!(
+                        "unexpected argument '{other}' for `intendant peer requests`"
                     )));
                 }
                 PeerAction::Help => {}
@@ -194,10 +248,20 @@ fn print_help() {
     println!("USAGE:");
     println!("    intendant peer invite [--card-url URL] [--label NAME] [--client-name NAME]");
     println!("    intendant peer join <INVITE> [--label NAME]");
+    println!("    intendant peer request <TARGET_URL> [--label NAME] [--profile PROFILE]");
+    println!("    intendant peer requests");
+    println!("    intendant peer approve <CODE_OR_ID> [--profile PROFILE]");
+    println!("    intendant peer deny <CODE_OR_ID>");
+    println!("    intendant peer complete <REQUEST_ID> [--label NAME]");
     println!();
     println!("ACTIONS:");
     println!("    invite        Issue a secret peer invite from this daemon");
     println!("    join          Import an invite and write/update [[peer]] in intendant.toml");
+    println!("    request       Ask a target daemon for peer access");
+    println!("    requests      List pending incoming peer access requests");
+    println!("    approve       Approve an incoming access request and issue its cert");
+    println!("    deny          Deny an incoming access request");
+    println!("    complete      Poll an outgoing access request and install it if approved");
     println!();
     println!("FLAGS:");
     println!("    --card-url <URL>     Agent Card URL to store in the invite");
@@ -205,6 +269,8 @@ fn print_help() {
     println!("    --port <N>           Port for the default Agent Card URL (default 8765)");
     println!("    --label <NAME>       Display label for this peer in the joining daemon");
     println!("    --client-name <NAME> Common name hint for the issued client certificate");
+    println!("    --profile <NAME>     Requested or approved access profile (default peer-daemon)");
+    println!("    --requester-card-url <URL>  Optional Agent Card URL for the requesting daemon");
     println!();
     println!("NOTES:");
     println!("    Run invite on the daemon that will accept inbound peer connections.");
@@ -259,6 +325,124 @@ fn cmd_join(args: PeerArgs) -> Result<(), CallerError> {
     println!(":: client cert: {}", outcome.client_cert_path.display());
     println!(":: client key:  {}", outcome.client_key_path.display());
     println!(":: restart or reload the daemon to connect from startup config");
+    Ok(())
+}
+
+async fn cmd_request(args: PeerArgs) -> Result<(), CallerError> {
+    let target_url = args.target_url.ok_or_else(|| {
+        CallerError::Config("`intendant peer request` requires a target URL".into())
+    })?;
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let outgoing = crate::peer::access_request::initiate_access_request(
+        &cert_dir,
+        crate::peer::access_request::InitiateAccessRequestOptions {
+            target_url,
+            requester_label: args.label,
+            requested_profile: args.profile,
+            requester_card_url: args.requester_card_url,
+        },
+    )
+    .await?;
+    println!(":: access request sent to {}", outgoing.target_card_url);
+    println!(":: request id: {}", outgoing.request_id);
+    println!(":: approval code: {}", outgoing.code);
+    println!(
+        ":: approve on the target with: intendant peer approve {}",
+        outgoing.code
+    );
+    println!(
+        ":: after approval run: intendant peer complete {}",
+        outgoing.request_id
+    );
+    Ok(())
+}
+
+fn cmd_requests() -> Result<(), CallerError> {
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let requests = crate::peer::access_request::list_requests(&cert_dir)?;
+    if requests.is_empty() {
+        println!(":: no peer access requests");
+        return Ok(());
+    }
+    for request in requests {
+        println!(
+            "{}  {:?}  {}  profile={}  expires={}",
+            request.code,
+            request.status,
+            request.requester_label,
+            request
+                .requested_profile
+                .as_deref()
+                .unwrap_or("peer-daemon"),
+            request.expires_at_unix
+        );
+    }
+    Ok(())
+}
+
+fn cmd_approve(args: PeerArgs) -> Result<(), CallerError> {
+    let code = args.code_or_id.ok_or_else(|| {
+        CallerError::Config("`intendant peer approve` requires a code or request id".into())
+    })?;
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let request =
+        crate::peer::access_request::approve_request(&cert_dir, &code, args.profile.as_deref())?;
+    println!(
+        ":: approved peer access request {} for {}",
+        request.code, request.requester_label
+    );
+    println!(
+        ":: approved profile: {}",
+        request.approved_profile.as_deref().unwrap_or("peer-daemon")
+    );
+    Ok(())
+}
+
+fn cmd_deny(args: PeerArgs) -> Result<(), CallerError> {
+    let code = args.code_or_id.ok_or_else(|| {
+        CallerError::Config("`intendant peer deny` requires a code or request id".into())
+    })?;
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let request = crate::peer::access_request::deny_request(&cert_dir, &code)?;
+    println!(
+        ":: denied peer access request {} for {}",
+        request.code, request.requester_label
+    );
+    Ok(())
+}
+
+async fn cmd_complete(args: PeerArgs) -> Result<(), CallerError> {
+    let request_id = args.code_or_id.ok_or_else(|| {
+        CallerError::Config("`intendant peer complete` requires a request id".into())
+    })?;
+    let cert_dir = access::backend::select_backend().cert_dir();
+    let mut project = Project::detect()?;
+    let outcome = crate::peer::access_request::poll_access_request(
+        &mut project,
+        &cert_dir,
+        &request_id,
+        args.label.as_deref(),
+    )
+    .await?;
+    match outcome.install {
+        Some(install) => {
+            let action = if install.updated_existing {
+                "updated"
+            } else {
+                "added"
+            };
+            println!(":: {action} peer {}", install.card_url);
+            println!(":: wrote {}", install.config_path.display());
+            println!(":: client cert: {}", install.client_cert_path.display());
+            println!(":: client key:  {}", install.client_key_path.display());
+        }
+        None => {
+            println!(
+                ":: request {} is {:?}; approve it on the target first",
+                outcome.code, outcome.status
+            );
+        }
+    }
     Ok(())
 }
 
@@ -428,7 +612,7 @@ fn default_card_url(cert_dir: &Path, port: u16) -> Result<String, CallerError> {
     ))
 }
 
-fn normalize_card_url(raw: &str) -> Result<String, CallerError> {
+pub(crate) fn normalize_card_url(raw: &str) -> Result<String, CallerError> {
     let trimmed = raw.trim().trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(CallerError::Config("--card-url cannot be empty".into()));
@@ -469,7 +653,7 @@ fn url_host(host: &str) -> String {
     }
 }
 
-fn storage_slug(label: Option<&str>, card_url: &str) -> String {
+pub(crate) fn storage_slug(label: Option<&str>, card_url: &str) -> String {
     let raw = label
         .filter(|s| !s.trim().is_empty())
         .map(str::to_string)
@@ -516,14 +700,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
     out
 }
 
-fn unix_timestamp() -> i64 {
+pub(crate) fn unix_timestamp() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or_default()
 }
 
-fn write_secret_file(path: &Path, contents: &str) -> io::Result<()> {
+pub(crate) fn write_secret_file(path: &Path, contents: &str) -> io::Result<()> {
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;

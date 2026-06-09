@@ -187,7 +187,6 @@ mod tests {
     use crate::peer::card::{AgentCard, AuthRequirements, TransportSpec};
     use crate::peer::event::TaggedPeerEvent;
     use crate::peer::id::PeerKind;
-    use crate::peer::transport::IntendantWsTransport;
     use crate::web_gateway::{spawn_web_gateway, ActiveSessionState, WebGatewayConfig};
     use std::time::{Duration, Instant};
     use tokio::sync::{broadcast, mpsc};
@@ -212,6 +211,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(Duration::from_millis(150)).await;

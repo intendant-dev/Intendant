@@ -146,6 +146,10 @@ pub enum TlsCertSource {
 pub enum ClientAuth {
     /// Do not request or require a browser/client certificate.
     None,
+    /// Request and verify a client certificate when one is presented, but
+    /// allow the TLS handshake to complete without one. The HTTP layer must
+    /// then decide which paths are allowed to proceed unauthenticated.
+    OptionalCa { ca_path: std::path::PathBuf },
     /// Require a client certificate chaining to the supplied CA bundle.
     RequireCa { ca_path: std::path::PathBuf },
 }
@@ -194,6 +198,19 @@ fn server_config_from(
         .map_err(|e| format!("rustls protocol version setup failed: {e}"))?;
     let builder = match client_auth {
         ClientAuth::None => builder.with_no_client_auth(),
+        ClientAuth::OptionalCa { ca_path } => {
+            let roots = load_ca_roots(ca_path)?;
+            let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))
+                .allow_unauthenticated()
+                .build()
+                .map_err(|e| {
+                    format!(
+                        "rustls optional client certificate verifier setup failed for {}: {e}",
+                        ca_path.display()
+                    )
+                })?;
+            builder.with_client_cert_verifier(verifier)
+        }
         ClientAuth::RequireCa { ca_path } => {
             let roots = load_ca_roots(ca_path)?;
             let verifier = rustls::server::WebPkiClientVerifier::builder(Arc::new(roots))

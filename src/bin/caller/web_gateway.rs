@@ -13010,6 +13010,10 @@ pub fn spawn_web_gateway(
     // don't exercise the advertise path; production call sites in
     // main.rs build the requirements from the project config.
     local_card_auth: crate::peer::AuthRequirements,
+    // When true, the TLS layer may complete without a client certificate so
+    // public peer-access requests can reach the doorbell endpoint, but every
+    // other HTTP/WS path is rejected unless rustls verified a client cert.
+    tls_client_cert_required: bool,
     // Native TLS for the dashboard. `Some(acceptor)` (built in main.rs
     // from `[server.tls]` / `--tls`) makes the per-connection demux wrap
     // any connection whose first bytes are a TLS ClientHello, serving the
@@ -13418,7 +13422,7 @@ pub fn spawn_web_gateway(
         }
 
         loop {
-            let (stream, _peer) = match listener.accept().await {
+            let (stream, peer_addr) = match listener.accept().await {
                 Ok(conn) => conn,
                 Err(_) => break,
             };
@@ -13457,6 +13461,8 @@ pub fn spawn_web_gateway(
             let terminal_registry = terminal_registry.clone();
             let inbound_bearer_token = inbound_bearer_token.clone();
             let worktree_inventory_cache = worktree_inventory_cache.clone();
+            let tls_client_cert_required = tls_client_cert_required;
+            let source_hint = peer_addr.ip().to_string();
             // `TlsAcceptor` wraps an `Arc<ServerConfig>`, so cloning is cheap
             // (one Arc bump). `None` when TLS is disabled.
             let tls_acceptor = tls_acceptor.clone();
@@ -13646,6 +13652,7 @@ pub fn spawn_web_gateway(
                 let buf_owned: Vec<u8>;
                 let n: usize;
                 let mut stream: DemuxStream;
+                let tls_client_cert_present: bool;
                 if is_tls {
                     let acceptor = tls_acceptor
                         .as_ref()
@@ -13658,6 +13665,12 @@ pub fn spawn_web_gateway(
                             return;
                         }
                     };
+                    tls_client_cert_present = tls_stream
+                        .get_ref()
+                        .1
+                        .peer_certificates()
+                        .map(|certs| !certs.is_empty())
+                        .unwrap_or(false);
                     // Read the first segment of the *decrypted* request so
                     // we can route on the real HTTP request line/headers.
                     // This is the TLS analogue of the plain-path peek.
@@ -13685,6 +13698,7 @@ pub fn spawn_web_gateway(
                     // reads the request straight from the socket.
                     n = peeked;
                     buf_owned = buf[..peeked].to_vec();
+                    tls_client_cert_present = false;
                     stream = Box::pin(crate::web_tls::PrefixedStream::new(Vec::new(), raw_stream));
                 }
                 // Downstream code reads `buf[..n]`; point `buf` at the
@@ -13692,6 +13706,7 @@ pub fn spawn_web_gateway(
                 let buf = buf_owned.as_slice();
 
                 let header_text = String::from_utf8_lossy(&buf[..n]);
+                let request_line = header_text.lines().next().unwrap_or("");
                 let is_websocket = header_text
                     .lines()
                     .any(|l| l.to_lowercase().contains("upgrade: websocket"));
@@ -13712,6 +13727,26 @@ pub fn spawn_web_gateway(
                     extract_host_header_ip(&header_text);
 
                 if is_websocket {
+                    if tls_client_cert_required && !tls_client_cert_present {
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "error": "mTLS client certificate required"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}",
+                            body.len(),
+                        );
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
                     // Bearer enforcement on /ws — dual-mode (Authorization
                     // header from daemons, ?token= query param from
                     // browsers). Reject with a plain HTTP 401 *before*
@@ -16179,9 +16214,6 @@ pub fn spawn_web_gateway(
                     use tokio::io::AsyncReadExt;
                     let _ = stream.read_exact(&mut discard).await;
 
-                    // Route by request path
-                    let request_line = header_text.lines().next().unwrap_or("");
-
                     // CORS preflight: respond to OPTIONS with permissive headers.
                     // Needed when the page is served from a custom scheme (intendant://)
                     // in the macOS app bundle — API fetches become cross-origin.
@@ -16194,6 +16226,30 @@ pub fn spawn_web_gateway(
                             Access-Control-Max-Age: 86400\r\n\
                             Connection: close\r\n\
                             \r\n";
+                        let _ = stream.write_all(response.as_bytes()).await;
+                        finalize_http_stream(&mut stream).await;
+                        return;
+                    }
+
+                    if tls_client_cert_required
+                        && !tls_client_cert_present
+                        && !is_public_peer_access_request_path(request_line)
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let body = serde_json::json!({
+                            "error": "mTLS client certificate required"
+                        })
+                        .to_string();
+                        let response = format!(
+                            "HTTP/1.1 401 Unauthorized\r\n\
+                             Content-Type: application/json\r\n\
+                             Content-Length: {}\r\n\
+                             Cache-Control: no-cache\r\n\
+                             Connection: close\r\n\
+                             \r\n\
+                             {body}",
+                            body.len(),
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -17839,6 +17895,44 @@ pub fn spawn_web_gateway(
                             body
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if is_public_peer_access_request_path(request_line) {
+                        use tokio::io::AsyncWriteExt;
+                        let path_token = request_line.split_whitespace().nth(1).unwrap_or("");
+                        let path = path_token.split('?').next().unwrap_or(path_token);
+                        let subpath = path
+                            .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
+                            .unwrap_or("")
+                            .trim_start_matches('/');
+                        let segments: Vec<&str> =
+                            subpath.split('/').filter(|s| !s.is_empty()).collect();
+                        let (status, body) =
+                            if segments.is_empty() && request_line.starts_with("POST") {
+                                match read_request_body_capped(
+                                    &mut stream,
+                                    &header_text,
+                                    crate::peer::access_request::REQUEST_BODY_LIMIT_BYTES,
+                                )
+                                .await
+                                {
+                                    Ok(body_text) => peer_access_request_create(
+                                        &body_text,
+                                        &header_text,
+                                        is_tls,
+                                        Some(source_hint.clone()),
+                                    ),
+                                    Err((status, body)) => (status, body),
+                                }
+                            } else if segments.len() == 1 && request_line.starts_with("GET") {
+                                peer_access_request_status(segments[0])
+                            } else {
+                                (
+                                404,
+                                serde_json::json!({"error": "unknown peer access request endpoint"})
+                                    .to_string(),
+                            )
+                            };
+                        let response = json_response(status_reason(status), body);
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/peers") {
                         // Peer registry endpoints. Dispatch:
                         //   GET    /api/peers                  → list
@@ -17885,6 +17979,32 @@ pub fn spawn_web_gateway(
                         {
                             let body_text = read_request_body(&mut stream, &header_text).await;
                             peers_pairing_invite(&body_text)
+                        } else if segments == ["pairing", "request-access"]
+                            && request_line.starts_with("POST")
+                        {
+                            let body_text = read_request_body(&mut stream, &header_text).await;
+                            peers_pairing_request_access(&body_text).await
+                        } else if segments == ["pairing", "request-access", "poll"]
+                            && request_line.starts_with("POST")
+                        {
+                            let body_text = read_request_body(&mut stream, &header_text).await;
+                            peers_pairing_request_access_poll(
+                                peer_registry.as_ref(),
+                                project_root.as_deref(),
+                                &body_text,
+                            )
+                            .await
+                        } else if segments == ["pairing", "requests"]
+                            && request_line.starts_with("GET")
+                        {
+                            peers_pairing_requests_list()
+                        } else if segments.len() == 4
+                            && segments[0] == "pairing"
+                            && segments[1] == "requests"
+                            && request_line.starts_with("POST")
+                        {
+                            let body_text = read_request_body(&mut stream, &header_text).await;
+                            peers_pairing_request_decision(segments[2], segments[3], &body_text)
                         } else {
                             match peer_registry.as_ref() {
                                 None => (
@@ -18532,6 +18652,30 @@ struct PairingJoinRequest {
 }
 
 #[derive(Deserialize)]
+struct PairingAccessRequestStart {
+    target_url: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    requester_card_url: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct PairingAccessRequestPoll {
+    request_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
+}
+
+#[derive(Deserialize, Default)]
+struct PairingAccessRequestDecision {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    profile: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct RemovePeerRequest {
     peer_id: String,
 }
@@ -18643,6 +18787,316 @@ fn pairing_error_message(err: &crate::error::CallerError) -> String {
         crate::error::CallerError::Json(e) => format!("invalid JSON: {e}"),
         _ => err.to_string(),
     }
+}
+
+/// Public unauthenticated doorbell: create a bounded pending access request.
+fn peer_access_request_create(
+    body_text: &str,
+    header_text: &str,
+    is_tls: bool,
+    source_hint: Option<String>,
+) -> (u16, String) {
+    let req: crate::peer::access_request::AccessRequestCreate =
+        match serde_json::from_str(body_text) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    400,
+                    serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+                );
+            }
+        };
+    let Some(card_url) = target_card_url_from_request(header_text, is_tls) else {
+        return (
+            400,
+            serde_json::json!({"error": "Host header required"}).to_string(),
+        );
+    };
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    match crate::peer::access_request::create_pending_request(&cert_dir, req, card_url, source_hint)
+    {
+        Ok(created) => (200, serde_json::to_string(&created).unwrap_or_default()),
+        Err(crate::error::CallerError::Config(msg))
+            if msg.contains("peer access requests are disabled") =>
+        {
+            (403, serde_json::json!({"error": msg}).to_string())
+        }
+        Err(crate::error::CallerError::Config(msg))
+            if msg.contains("peer access request rate limit exceeded") =>
+        {
+            (429, serde_json::json!({"error": msg}).to_string())
+        }
+        Err(crate::error::CallerError::Config(msg))
+            if msg.contains("too many pending peer access requests") =>
+        {
+            (429, serde_json::json!({"error": msg}).to_string())
+        }
+        Err(crate::error::CallerError::Config(msg))
+            if msg.contains("too many pending peer access requests from") =>
+        {
+            (429, serde_json::json!({"error": msg}).to_string())
+        }
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
+/// Public status poll. Approved responses include only the signed client cert,
+/// never the requester's private key.
+fn peer_access_request_status(request_id: &str) -> (u16, String) {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    match crate::peer::access_request::request_status(&cert_dir, request_id) {
+        Ok(status) => (200, serde_json::to_string(&status).unwrap_or_default()),
+        Err(crate::error::CallerError::Config(msg)) if msg.contains("not found") => {
+            (404, serde_json::json!({"error": msg}).to_string())
+        }
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
+fn target_card_url_from_request(header_text: &str, is_tls: bool) -> Option<String> {
+    let host = header_text
+        .lines()
+        .find_map(|line| {
+            line.split_once(':')
+                .filter(|(k, _)| k.eq_ignore_ascii_case("host"))
+        })
+        .map(|(_, v)| v.trim())
+        .filter(|v| !v.is_empty())?;
+    let scheme = if is_tls { "https" } else { "http" };
+    Some(format!(
+        "{scheme}://{}{}",
+        host.trim_end_matches('/'),
+        crate::peer::pairing::AGENT_CARD_PATH
+    ))
+}
+
+async fn peers_pairing_request_access(body_text: &str) -> (u16, String) {
+    let req: PairingAccessRequestStart = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    if req.target_url.trim().is_empty() {
+        return (
+            400,
+            serde_json::json!({"error": "target_url is required"}).to_string(),
+        );
+    }
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    match crate::peer::access_request::initiate_access_request(
+        &cert_dir,
+        crate::peer::access_request::InitiateAccessRequestOptions {
+            target_url: req.target_url,
+            requester_label: req.label,
+            requested_profile: req.profile,
+            requester_card_url: req.requester_card_url,
+        },
+    )
+    .await
+    {
+        Ok(outgoing) => (
+            200,
+            serde_json::json!({
+                "request_id": outgoing.request_id,
+                "code": outgoing.code,
+                "status": "pending",
+                "target_card_url": outgoing.target_card_url,
+                "server_cert_fingerprint": outgoing.server_cert_fingerprint,
+                "expires_at_unix": outgoing.expires_at_unix,
+            })
+            .to_string(),
+        ),
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
+async fn peers_pairing_request_access_poll(
+    registry: Option<&crate::peer::PeerRegistry>,
+    project_root: Option<&Path>,
+    body_text: &str,
+) -> (u16, String) {
+    let req: PairingAccessRequestPoll = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    let Some(project_root) = project_root else {
+        return (
+            503,
+            serde_json::json!({"error": "project root not available"}).to_string(),
+        );
+    };
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let mut project = match crate::project::Project::from_root(project_root.to_path_buf()) {
+        Ok(project) => project,
+        Err(e) => return (500, serde_json::json!({"error": e.to_string()}).to_string()),
+    };
+    match crate::peer::access_request::poll_access_request(
+        &mut project,
+        &cert_dir,
+        req.request_id.trim(),
+        req.label.as_deref(),
+    )
+    .await
+    {
+        Ok(outcome) => {
+            if let Some(install) = outcome.install {
+                if let Some(registry) = registry {
+                    let registry_for_task = registry.clone();
+                    let card_url_for_task = install.card_url.clone();
+                    let pinned_fingerprints = outcome
+                        .server_cert_fingerprint
+                        .clone()
+                        .map(|fp| vec![fp])
+                        .unwrap_or_default();
+                    let client_identity = crate::peer::transport::tls_client::ClientIdentityPaths {
+                        cert_path: install.client_cert_path.clone(),
+                        key_path: install.client_key_path.clone(),
+                    };
+                    tokio::spawn(async move {
+                        if let Err(e) = registry_for_task
+                            .add_peer_with_credentials_and_client_identity(
+                                &card_url_for_task,
+                                Vec::new(),
+                                None,
+                                pinned_fingerprints,
+                                None,
+                                Some(client_identity),
+                            )
+                            .await
+                        {
+                            eprintln!(
+                                "intendant: access-request peer saved but live registration failed \
+                                 ({card_url_for_task}): {e}"
+                            );
+                        }
+                    });
+                }
+                (
+                    200,
+                    serde_json::json!({
+                        "request_id": outcome.request_id,
+                        "code": outcome.code,
+                        "status": outcome.status,
+                        "approved_profile": outcome.approved_profile,
+                        "card_url": install.card_url,
+                        "config_path": install.config_path.to_string_lossy(),
+                        "client_cert_path": install.client_cert_path.to_string_lossy(),
+                        "client_key_path": install.client_key_path.to_string_lossy(),
+                        "updated_existing": install.updated_existing,
+                        "runtime_status": if registry.is_some() { "connecting" } else { "saved" },
+                    })
+                    .to_string(),
+                )
+            } else {
+                (
+                    200,
+                    serde_json::json!({
+                        "request_id": outcome.request_id,
+                        "code": outcome.code,
+                        "status": outcome.status,
+                        "approved_profile": outcome.approved_profile,
+                    })
+                    .to_string(),
+                )
+            }
+        }
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
+fn peers_pairing_requests_list() -> (u16, String) {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    match crate::peer::access_request::list_requests(&cert_dir) {
+        Ok(requests) => {
+            let items: Vec<serde_json::Value> = requests
+                .into_iter()
+                .map(access_request_summary_json)
+                .collect();
+            (200, serde_json::json!({ "requests": items }).to_string())
+        }
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
+fn peers_pairing_request_decision(code_or_id: &str, op: &str, body_text: &str) -> (u16, String) {
+    let body: PairingAccessRequestDecision = if body_text.trim().is_empty() {
+        PairingAccessRequestDecision::default()
+    } else {
+        match serde_json::from_str(body_text) {
+            Ok(r) => r,
+            Err(e) => {
+                return (
+                    400,
+                    serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+                );
+            }
+        }
+    };
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let result = match op {
+        "approve" => crate::peer::access_request::approve_request(
+            &cert_dir,
+            code_or_id,
+            body.profile.as_deref(),
+        ),
+        "deny" => crate::peer::access_request::deny_request(&cert_dir, code_or_id),
+        _ => {
+            return (
+                404,
+                serde_json::json!({"error": "unknown pairing request decision"}).to_string(),
+            )
+        }
+    };
+    match result {
+        Ok(request) => (200, access_request_summary_json(request).to_string()),
+        Err(e) => (
+            400,
+            serde_json::json!({"error": pairing_error_message(&e)}).to_string(),
+        ),
+    }
+}
+
+fn access_request_summary_json(
+    request: crate::peer::access_request::StoredAccessRequest,
+) -> serde_json::Value {
+    serde_json::json!({
+        "request_id": request.request_id,
+        "code": request.code,
+        "status": request.status,
+        "requester_label": request.requester_label,
+        "requested_profile": request.requested_profile,
+        "approved_profile": request.approved_profile,
+        "source_hint": request.source_hint,
+        "target_card_url": request.target_card_url,
+        "created_at_unix": request.created_at_unix,
+        "expires_at_unix": request.expires_at_unix,
+        "approved_at_unix": request.approved_at_unix,
+        "denied_at_unix": request.denied_at_unix,
+    })
 }
 
 /// Handle `POST /api/peers/pairing/join`: import an encoded invite,
@@ -18802,6 +19256,57 @@ async fn read_request_body<S: AsyncRead + Unpin>(stream: &mut S, header_text: &s
         full.push_str(&String::from_utf8_lossy(&rest));
     }
     full
+}
+
+async fn read_request_body_capped<S: AsyncRead + Unpin>(
+    stream: &mut S,
+    header_text: &str,
+    max_bytes: usize,
+) -> Result<String, (u16, String)> {
+    use tokio::io::AsyncReadExt;
+    let content_length: usize = header_text
+        .lines()
+        .find(|l| l.to_lowercase().starts_with("content-length:"))
+        .and_then(|l| l.split(':').nth(1))
+        .and_then(|v| v.trim().parse().ok())
+        .unwrap_or(0);
+    if content_length > max_bytes {
+        return Err((
+            413,
+            serde_json::json!({"error": "request body too large"}).to_string(),
+        ));
+    }
+    if content_length == 0 {
+        return Ok(String::new());
+    }
+    let peeked_body = header_text.split("\r\n\r\n").nth(1).unwrap_or("");
+    if peeked_body.len() >= content_length {
+        return Ok(peeked_body[..content_length].to_string());
+    }
+    let remaining = content_length.saturating_sub(peeked_body.len());
+    let mut full = peeked_body.to_string();
+    let mut rest = vec![0u8; remaining];
+    if stream.read_exact(&mut rest).await.is_ok() {
+        full.push_str(&String::from_utf8_lossy(&rest));
+    }
+    Ok(full)
+}
+
+fn status_reason(status: u16) -> &'static str {
+    match status {
+        200 => "200 OK",
+        201 => "201 Created",
+        400 => "400 Bad Request",
+        401 => "401 Unauthorized",
+        403 => "403 Forbidden",
+        404 => "404 Not Found",
+        405 => "405 Method Not Allowed",
+        413 => "413 Payload Too Large",
+        429 => "429 Too Many Requests",
+        500 => "500 Internal Server Error",
+        503 => "503 Service Unavailable",
+        _ => "500 Internal Server Error",
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -19991,6 +20496,18 @@ fn is_federation_path(request_line: &str) -> bool {
         || request_line.contains(" /api/coordinator/")
         || request_line.contains(" /api/sessions")
         || request_line.contains(" /api/worktrees")
+}
+
+fn is_public_peer_access_request_path(request_line: &str) -> bool {
+    let Some(path) = request_line.split_whitespace().nth(1) else {
+        return false;
+    };
+    let path = path.split('?').next().unwrap_or(path);
+    path == crate::peer::access_request::PUBLIC_REQUEST_PATH
+        || path
+            .strip_prefix(crate::peer::access_request::PUBLIC_REQUEST_PATH)
+            .map(|rest| rest.starts_with('/'))
+            .unwrap_or(false)
 }
 
 /// Extract a token from the `?token=...` query parameter of an HTTP
@@ -27852,6 +28369,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
 
@@ -27887,6 +28405,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -27943,6 +28462,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -28001,6 +28521,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -28054,6 +28575,7 @@ mod tests {
             Vec::new(),
             bearer_token,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -28094,6 +28616,7 @@ mod tests {
             Vec::new(),
             bearer_token,
             crate::peer::AuthRequirements::none(),
+            false,
             Some(acceptor),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -28266,6 +28789,26 @@ mod tests {
         ));
         assert!(!is_federation_path("GET /api/settings HTTP/1.1"));
         assert!(!is_federation_path("POST /api/api-keys HTTP/1.1"));
+    }
+
+    #[test]
+    fn public_peer_access_request_path_is_narrow() {
+        assert!(is_public_peer_access_request_path(
+            "POST /api/peer-pairing/requests HTTP/1.1"
+        ));
+        assert!(is_public_peer_access_request_path(
+            "GET /api/peer-pairing/requests/abc123?poll=1 HTTP/1.1"
+        ));
+
+        assert!(!is_public_peer_access_request_path(
+            "POST /api/peer-pairing/requests-old HTTP/1.1"
+        ));
+        assert!(!is_public_peer_access_request_path(
+            "GET /api/peer-pairing HTTP/1.1"
+        ));
+        assert!(!is_public_peer_access_request_path(
+            "GET /api/peers/pairing/requests HTTP/1.1"
+        ));
     }
 
     // -----------------------------------------------------------------
@@ -29442,6 +29985,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -29502,6 +30046,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -29557,6 +30102,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -29615,7 +30161,7 @@ mod tests {
     /// before anyone hits it in the browser.
     #[tokio::test]
     async fn test_agent_card_endpoint_reflects_live_state() {
-        use crate::peer::{AgentCard, AuthRequirements, Capability, TransportAuth, TransportSpec};
+        use crate::peer::{AgentCard, Capability, TransportAuth, TransportSpec};
 
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
@@ -29636,6 +30182,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -29755,6 +30302,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -29826,6 +30374,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -29903,6 +30452,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                false,
                 None,
             )
         };
@@ -29958,6 +30508,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                false,
                 None,
             )
         };
@@ -30022,6 +30573,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                false,
                 None,
             )
         };
@@ -30095,6 +30647,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                false,
                 None,
             )
         };
@@ -30158,6 +30711,7 @@ mod tests {
                 Vec::new(),
                 None,
                 crate::peer::AuthRequirements::none(),
+                false,
                 None,
             )
         };
@@ -30226,6 +30780,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30287,6 +30842,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30351,6 +30907,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30410,6 +30967,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30475,6 +31033,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30531,6 +31090,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30622,6 +31182,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30748,6 +31309,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -30849,6 +31411,7 @@ mod tests {
             Vec::new(),
             None,
             crate::peer::AuthRequirements::none(),
+            false,
             None,
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;

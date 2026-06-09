@@ -385,10 +385,20 @@ intended for explicit local/debug use; `--no-tls` on a wildcard listener refuses
 startup when a public interface exists unless `--allow-public-plaintext` is
 passed.
 
-### Peer pairing — dashboard or `intendant peer invite` / `join`
+### Peer pairing — invites and access requests
 
-Daemon-to-daemon mTLS uses the same access CA. The dashboard's
-**Settings → Network → Daemons** panel is the normal operator flow:
+Daemon-to-daemon mTLS uses the same access CA. The human model is: peers are
+relationships, not raw endpoints. A daemon relationship has identity, a server
+certificate pin, a peer-scoped client certificate, capability metadata, and local
+policy that can later be changed or revoked.
+
+The dashboard's **Settings → Network → Daemons** panel exposes two pairing
+flows.
+
+#### Invite flow
+
+Use an invite when the accepting daemon's operator can copy a secret directly to
+the connecting daemon:
 
 1. On the daemon that will accept inbound peer connections, click
    **Create Invite**.
@@ -428,6 +438,56 @@ If `--card-url` is omitted, `invite` derives
 `https://<access-primary-ip>:8765/.well-known/agent-card.json` from
 `intendant access setup` metadata. Use `--card-url` when peers reach the daemon
 through DNS, Tailscale, a tunnel, NAT, or a non-default port.
+
+#### Access-request flow
+
+Use an access request when a primary daemon wants to add another Intendant
+without first copying a private-key-bearing invite, or when the target daemon is
+headless and should be approved from its own CLI/logs.
+
+1. On the daemon that wants access, use **Request Access** in the dashboard or:
+
+   ```bash
+   intendant peer request https://target.example:8765 --profile peer-daemon
+   ```
+
+2. The requester generates a client keypair locally and sends only a bounded
+   public request to the target: requester label, public key, nonce, requested
+   profile, and optional requester card URL.
+3. The target records a short-lived pending request and shows it in
+   **Incoming Requests**, `intendant peer requests`, and the daemon log.
+4. The target operator approves, denies, or approves with a downgraded profile:
+
+   ```bash
+   intendant peer approve ABCD-1234
+   intendant peer deny ABCD-1234
+   ```
+
+5. Approval signs the requester's public key with the target's access CA and
+   exposes only the signed client certificate to the requester. The requester's
+   private key never leaves the requester.
+6. The requester clicks **Check** or runs:
+
+   ```bash
+   intendant peer complete <request-id>
+   ```
+
+   This installs the signed client certificate/key pair under the requester's
+   access cert store, writes or updates `[[peer]]`, pins the target server
+   fingerprint, and starts the live peer registration when the dashboard daemon
+   is running.
+
+The unauthenticated public surface for this flow is intentionally tiny:
+`POST /api/peer-pairing/requests` creates a pending request and
+`GET /api/peer-pairing/requests/<id>` lets the requester poll. Those endpoints do
+not list peers, read config, mint certificates, or approve anything. They enforce
+a small body limit, strict JSON schema, short TTL, global and per-source pending
+caps, in-process global and per-source rate limits, and no certificate signing
+until local approval. Default mTLS leaves this public doorbell reachable while
+all other dashboard/API/WebSocket paths still require a verified client
+certificate. For public deployments, keep TLS enabled; plaintext `--no-tls` is
+for explicit local/debug use. Set `INTENDANT_PEER_ACCESS_REQUESTS=0` to disable
+public request creation entirely.
 
 ### How auth maps to the Agent Card
 

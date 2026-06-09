@@ -355,6 +355,12 @@ app wrapper starts its bundled backend with native mTLS by default and fails
 closed with setup guidance when access certs are missing; see
 [Web Dashboard: Secure Browser Contexts](./web-dashboard.md#secure-browser-contexts).
 
+Peer access requests use the unauthenticated
+`/api/peer-pairing/requests` doorbell endpoint so one daemon can ask another for
+pairing approval. It is bounded and rate-limited, and approval still happens
+locally before any client certificate is issued. Set
+`INTENDANT_PEER_ACCESS_REQUESTS=0` to disable public request creation entirely.
+
 `[server.auth]` — advanced compatibility auth for federation peers:
 
 | Key | Type | Default | Description |
@@ -377,14 +383,13 @@ is required.
 | `pinned_fingerprints` | array | `[]` | Operator-pinned SHA-256 cert fingerprints; when set, replaces the card's `auth.transport` claim |
 | `browser_tcp_via_url` | string | from primary | Explicit URL the browser uses to reach this peer's HTTP port for WebRTC ICE-TCP |
 
-Peers added through the dashboard at runtime live only in the in-memory registry
-(and the browser's localStorage); they are not written back to `intendant.toml`.
-For independent mTLS daemons, configure `client_cert` / `client_key` with a
-client identity issued by the peer's access CA. `intendant peer invite` on the
-accepting daemon and `intendant peer join <invite>` on the connecting daemon is
-the default way to write those fields plus `pinned_fingerprints`. The installed
-local access client cert fallback is only sufficient when the peer trusts the
-same issuing CA.
+Manual runtime URL additions from the dashboard live only in the in-memory
+registry. Pairing flows are different: `intendant peer join <invite>` and
+`intendant peer complete <request-id>` write these fields plus
+`pinned_fingerprints` to `intendant.toml`. For independent mTLS daemons,
+configure `client_cert` / `client_key` with a client identity issued by the
+peer's access CA. The installed local access client cert fallback is only
+sufficient when the peer trusts the same issuing CA.
 
 ### `mcp_servers`
 

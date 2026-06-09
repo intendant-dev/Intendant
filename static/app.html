@@ -1375,6 +1375,66 @@ html, body {
   color: var(--yellow);
   font-size: 11px;
 }
+.daemon-access-request-card {
+  display: grid;
+  gap: 7px;
+  padding: 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+}
+.daemon-access-request-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 600;
+}
+.daemon-access-request-code {
+  color: var(--yellow);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.daemon-access-request-meta {
+  color: var(--subtext0);
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.daemon-access-request-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.daemon-access-request-actions button {
+  padding: 5px 10px;
+  border: 1px solid var(--surface2);
+  border-radius: 4px;
+  background: transparent;
+  color: var(--subtext0);
+  cursor: pointer;
+  font-size: 11px;
+  font-weight: 600;
+}
+.daemon-access-request-actions button.approve {
+  border-color: var(--green);
+  color: var(--green);
+}
+.daemon-access-request-actions button.deny {
+  border-color: var(--red);
+  color: var(--red);
+}
+.daemon-access-request-actions button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.daemon-access-request-actions button:hover:not(:disabled) {
+  background: var(--surface1);
+}
 .daemon-manual-section {
   margin-top: 8px;
   padding-top: 10px;
@@ -10250,6 +10310,31 @@ body.display-fullscreen-open {
                     <button id="daemon-join-btn" type="button">Join</button>
                   </div>
                   <span id="daemon-join-status" class="daemon-pairing-status"></span>
+                </div>
+                <div class="daemon-pairing-panel">
+                  <div class="daemon-pairing-title">Request Access</div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-request-target-url" type="text" placeholder="target URL" autocomplete="off">
+                    <input id="daemon-request-label" type="text" placeholder="this daemon label (optional)" autocomplete="off">
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-request-profile" type="text" placeholder="profile (optional)" autocomplete="off">
+                    <button id="daemon-request-btn" type="button">Request</button>
+                  </div>
+                  <div class="daemon-pairing-row">
+                    <input id="daemon-request-id" type="text" placeholder="request id" autocomplete="off">
+                    <button id="daemon-request-complete-btn" type="button">Check</button>
+                  </div>
+                  <div id="daemon-request-code" class="daemon-pairing-secret"></div>
+                  <span id="daemon-request-status" class="daemon-pairing-status"></span>
+                </div>
+                <div class="daemon-pairing-panel">
+                  <div class="daemon-pairing-title">Incoming Requests</div>
+                  <div id="daemon-access-requests-list" class="daemons-list"></div>
+                  <div class="daemon-pairing-actions">
+                    <button id="daemon-access-requests-refresh-btn" type="button">Refresh</button>
+                    <span id="daemon-access-requests-status" class="daemon-pairing-status"></span>
+                  </div>
                 </div>
               </div>
               <div class="daemon-manual-section">
@@ -44888,6 +44973,195 @@ async function joinDaemonInvite() {
   }
 }
 
+async function requestDaemonAccess() {
+  const targetInput = document.getElementById('daemon-request-target-url');
+  const labelInput = document.getElementById('daemon-request-label');
+  const profileInput = document.getElementById('daemon-request-profile');
+  const requestIdInput = document.getElementById('daemon-request-id');
+  const codeEl = document.getElementById('daemon-request-code');
+  const btn = document.getElementById('daemon-request-btn');
+  const targetUrl = targetInput ? targetInput.value.trim() : '';
+
+  if (!targetUrl) {
+    setDaemonPairingStatus('daemon-request-status', 'Target URL is required', 'error');
+    return;
+  }
+  if (!/^https?:\/\//.test(targetUrl)) {
+    setDaemonPairingStatus('daemon-request-status', 'URL must start with http:// or https://', 'error');
+    return;
+  }
+
+  const body = { target_url: targetUrl };
+  if (labelInput && labelInput.value.trim()) body.label = labelInput.value.trim();
+  if (profileInput && profileInput.value.trim()) body.profile = profileInput.value.trim();
+
+  if (btn) btn.disabled = true;
+  if (codeEl) codeEl.textContent = '';
+  setDaemonPairingStatus('daemon-request-status', 'Requesting...', '');
+  try {
+    const resp = await authedFetch('/api/peers/pairing/request-access', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    if (requestIdInput) requestIdInput.value = result.request_id || '';
+    if (codeEl) codeEl.textContent = result.code ? `Approval code ${result.code}` : '';
+    setDaemonPairingStatus('daemon-request-status', 'Waiting for approval on target daemon', 'ok');
+  } catch (e) {
+    setDaemonPairingStatus('daemon-request-status', `Request failed: ${e.message}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function completeDaemonAccessRequest() {
+  const requestIdInput = document.getElementById('daemon-request-id');
+  const btn = document.getElementById('daemon-request-complete-btn');
+  const requestId = requestIdInput ? requestIdInput.value.trim() : '';
+  if (!requestId) {
+    setDaemonPairingStatus('daemon-request-status', 'Request id is required', 'error');
+    return;
+  }
+
+  if (btn) btn.disabled = true;
+  setDaemonPairingStatus('daemon-request-status', 'Checking approval...', '');
+  try {
+    const resp = await authedFetch('/api/peers/pairing/request-access/poll', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ request_id: requestId }),
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    const status = String(result.status || '').toLowerCase();
+    if (status === 'approved' && result.card_url) {
+      const action = result.updated_existing ? 'Updated peer config' : 'Paired peer';
+      setDaemonPairingStatus('daemon-request-status', `${action}; connecting in background`, 'ok');
+      await refreshPeersFromApi();
+      window.setTimeout(() => {
+        refreshPeersFromApi().catch(() => {});
+      }, 1200);
+    } else if (status === 'pending') {
+      setDaemonPairingStatus('daemon-request-status', 'Still waiting for approval', '');
+    } else if (status === 'denied') {
+      setDaemonPairingStatus('daemon-request-status', 'Request denied on target daemon', 'error');
+    } else if (status === 'expired') {
+      setDaemonPairingStatus('daemon-request-status', 'Request expired', 'error');
+    } else {
+      setDaemonPairingStatus('daemon-request-status', `Status: ${status || 'unknown'}`, '');
+    }
+  } catch (e) {
+    setDaemonPairingStatus('daemon-request-status', `Request failed: ${e.message}`, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+async function loadPeerAccessRequests() {
+  const list = document.getElementById('daemon-access-requests-list');
+  if (!list) return;
+  setDaemonPairingStatus('daemon-access-requests-status', 'Loading...', '');
+  try {
+    const resp = await authedFetch('/api/peers/pairing/requests');
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    renderPeerAccessRequests(Array.isArray(result.requests) ? result.requests : []);
+    setDaemonPairingStatus('daemon-access-requests-status', 'Updated', 'ok');
+  } catch (e) {
+    setDaemonPairingStatus('daemon-access-requests-status', `Request failed: ${e.message}`, 'error');
+  }
+}
+
+function accessRequestTimeLabel(unixSeconds) {
+  if (!Number.isFinite(Number(unixSeconds)) || Number(unixSeconds) <= 0) return '';
+  const date = new Date(Number(unixSeconds) * 1000);
+  return date.toLocaleString([], {
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+  });
+}
+
+function renderPeerAccessRequests(requests) {
+  const list = document.getElementById('daemon-access-requests-list');
+  if (!list) return;
+  if (!requests.length) {
+    list.innerHTML = '<div class="daemon-access-request-meta">No incoming requests.</div>';
+    return;
+  }
+
+  list.innerHTML = requests.map(req => {
+    const requestId = String(req.request_id || '');
+    const label = escapeHtml(req.requester_label || 'Unnamed daemon');
+    const code = escapeHtml(req.code || '');
+    const status = String(req.status || 'unknown').toLowerCase();
+    const profile = escapeHtml(req.approved_profile || req.requested_profile || 'peer-daemon');
+    const source = req.source_hint ? `Source ${escapeHtml(req.source_hint)}` : '';
+    const expires = req.expires_at_unix ? `Expires ${escapeHtml(accessRequestTimeLabel(req.expires_at_unix))}` : '';
+    const timing = [source, expires].filter(Boolean).join(' - ');
+    const pending = status === 'pending';
+    return `
+      <div class="daemon-access-request-card">
+        <div class="daemon-access-request-head">
+          <span>${label}</span>
+          <span class="daemon-access-request-code">${code}</span>
+        </div>
+        <div class="daemon-access-request-meta">Status ${escapeHtml(status)} - Profile ${profile}</div>
+        ${timing ? `<div class="daemon-access-request-meta">${timing}</div>` : ''}
+        <div class="daemon-access-request-actions">
+          <button class="approve" type="button" data-access-request-action="approve" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Approve</button>
+          <button class="deny" type="button" data-access-request-action="deny" data-request-id="${escapeHtml(requestId)}" ${pending ? '' : 'disabled'}>Deny</button>
+        </div>
+      </div>
+    `;
+  }).join('');
+
+  list.querySelectorAll('[data-access-request-action]').forEach(button => {
+    button.addEventListener('click', () => {
+      const requestId = button.getAttribute('data-request-id') || '';
+      const action = button.getAttribute('data-access-request-action') || '';
+      decidePeerAccessRequest(requestId, action);
+    });
+  });
+}
+
+async function decidePeerAccessRequest(requestId, op) {
+  if (!requestId || !/^(approve|deny)$/.test(op)) return;
+  setDaemonPairingStatus('daemon-access-requests-status', `${op === 'approve' ? 'Approving' : 'Denying'}...`, '');
+  try {
+    const resp = await authedFetch(`/api/peers/pairing/requests/${encodeURIComponent(requestId)}/${op}`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: '{}',
+    });
+    const result = await resp.json().catch(() => ({}));
+    if (!resp.ok) {
+      setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
+      return;
+    }
+    setDaemonPairingStatus(
+      'daemon-access-requests-status',
+      op === 'approve' ? 'Approved request' : 'Denied request',
+      op === 'approve' ? 'ok' : ''
+    );
+    await loadPeerAccessRequests();
+  } catch (e) {
+    setDaemonPairingStatus('daemon-access-requests-status', `Request failed: ${e.message}`, 'error');
+  }
+}
+
 async function addDaemon() {
   const urlInput = document.getElementById('daemon-add-url');
   const labelInput = document.getElementById('daemon-add-label');
@@ -45153,6 +45427,27 @@ async function initDaemons() {
       if (e.key === 'Enter') joinDaemonInvite();
     });
   }
+  const requestBtn = document.getElementById('daemon-request-btn');
+  if (requestBtn) requestBtn.addEventListener('click', requestDaemonAccess);
+  const requestCompleteBtn = document.getElementById('daemon-request-complete-btn');
+  if (requestCompleteBtn) requestCompleteBtn.addEventListener('click', completeDaemonAccessRequest);
+  for (const id of ['daemon-request-target-url', 'daemon-request-label', 'daemon-request-profile']) {
+    const el = document.getElementById(id);
+    if (el) {
+      el.addEventListener('keydown', e => {
+        if (e.key === 'Enter') requestDaemonAccess();
+      });
+    }
+  }
+  const requestIdEl = document.getElementById('daemon-request-id');
+  if (requestIdEl) {
+    requestIdEl.addEventListener('keydown', e => {
+      if (e.key === 'Enter') completeDaemonAccessRequest();
+    });
+  }
+  const requestsRefreshBtn = document.getElementById('daemon-access-requests-refresh-btn');
+  if (requestsRefreshBtn) requestsRefreshBtn.addEventListener('click', loadPeerAccessRequests);
+  loadPeerAccessRequests().catch(() => {});
 
   // Wire the add form.
   document.getElementById('daemon-add-btn').addEventListener('click', addDaemon);
