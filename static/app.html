@@ -10704,6 +10704,10 @@ let concurrentLogDetachedScrollTop = 0;
 let restoredPersistedSessionWindows = false;
 let restoringPersistedSessionWindows = false;
 const sessionWindowRestoreInFlight = new Set();
+const externalSessionWindowSyncInFlight = new Set();
+const externalSessionWindowSyncLastAt = new Map();
+const externalSessionWindowSyncTimers = new Map();
+const EXTERNAL_SESSION_WINDOW_SYNC_COOLDOWN_MS = 1500;
 let currentSessionDetail = null;
 let currentSessionDetailContext = null;
 let pendingApprovalId = null;
@@ -23608,6 +23612,7 @@ async function main() {
         const contextSid = sessionWindowTargetForLogSession(d.session_id);
         if (contextSid) markSessionWindowPendingActive(contextSid);
         handleContextSnapshot(d);
+        scheduleExternalSessionWindowTranscriptSync(d.session_id, 700);
         return;
       }
       if (d.event === 'shared_view') {
@@ -23652,8 +23657,15 @@ async function main() {
       }
       if (d.event === 'session_identity') {
         applySessionIdentity(d);
+        scheduleExternalSessionWindowTranscriptSync(d.backend_session_id || d.backendSessionId || d.session_id, 600);
         // `session_identity` arrives before the external worker subscribes for
         // thread actions; queued detached actions wait for `session_attached`.
+      }
+      if (
+        (d.event === 'done_signal' || d.event === 'round_complete' || d.event === 'task_complete') &&
+        d.session_id
+      ) {
+        scheduleExternalSessionWindowTranscriptSync(d.session_id, 300);
       }
       applyExternalIdentityFromLogEntry(d);
       if (d.event === 'session_relationship') {
@@ -29398,6 +29410,89 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
   resetSessionWindowLog(win);
   appendSessionWindowHistoryBatch(win, records, true);
   return records.length;
+}
+
+function externalSessionWindowSyncRecord(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return null;
+  const targetSid = sessionWindowTargetForLogSession(sid) || sid;
+  const win = sessionWindows.get(targetSid) || sessionWindows.get(sid) || null;
+  if (!win) return null;
+  const source = externalSourceForSessionWindow(targetSid, win) ||
+    externalSourceForSessionWindow(sid, win);
+  if (!source || source === 'intendant') return null;
+  return { sessionId: targetSid, source, win };
+}
+
+function scheduleExternalSessionWindowTranscriptSync(sessionId, delay = 0) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return;
+  const targetSid = sessionWindowTargetForLogSession(sid) || sid;
+  if (!targetSid) return;
+  if (externalSessionWindowSyncTimers.has(targetSid)) {
+    clearTimeout(externalSessionWindowSyncTimers.get(targetSid));
+  }
+  const timeout = setTimeout(() => {
+    externalSessionWindowSyncTimers.delete(targetSid);
+    syncExternalSessionWindowTranscript(targetSid);
+  }, Math.max(0, Number(delay) || 0));
+  externalSessionWindowSyncTimers.set(targetSid, timeout);
+}
+
+async function syncExternalSessionWindowTranscript(sessionId) {
+  const record = externalSessionWindowSyncRecord(sessionId);
+  if (!record) return;
+  const key = `${record.source}:${record.sessionId}`;
+  if (externalSessionWindowSyncInFlight.has(key)) return;
+  const now = Date.now();
+  const lastAt = externalSessionWindowSyncLastAt.get(key) || 0;
+  if (now - lastAt < EXTERNAL_SESSION_WINDOW_SYNC_COOLDOWN_MS) {
+    scheduleExternalSessionWindowTranscriptSync(
+      record.sessionId,
+      EXTERNAL_SESSION_WINDOW_SYNC_COOLDOWN_MS - (now - lastAt)
+    );
+    return;
+  }
+  externalSessionWindowSyncInFlight.add(key);
+  const controller = new AbortController();
+  const timeout = setTimeout(() => controller.abort(), 10000);
+  try {
+    let data = null;
+    let lastError = null;
+    const sources = record.source === 'intendant' ? [record.source] : [record.source, 'intendant'];
+    for (const source of sources) {
+      const url = `/api/session/${encodeURIComponent(record.sessionId)}?source=${encodeURIComponent(source)}&limit=${SESSION_WINDOW_RESTORE_LOG_LIMIT}`;
+      const resp = await fetch(url, { signal: controller.signal, cache: 'no-store' });
+      let candidate = {};
+      try {
+        candidate = await resp.json();
+      } catch {
+        candidate = {};
+      }
+      if (resp.ok && !candidate.error) {
+        data = candidate;
+        break;
+      }
+      lastError = new Error(candidate.error || resp.statusText || 'session detail fetch failed');
+      if (resp.status !== 404) break;
+    }
+    if (!data) throw lastError || new Error('session detail fetch failed');
+    const entries = Array.isArray(data.entries) ? data.entries : [];
+    if (!entries.length) return;
+    applySessionIdentitiesFromReplayEntries(entries);
+    applyExternalIdentitiesFromLogEntries(entries);
+    applySessionGoalsFromReplayEntries(entries);
+    const targetSid = sessionWindowTargetForLogSession(record.sessionId) || record.sessionId;
+    const targetWin = sessionWindows.get(targetSid) || record.win;
+    const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
+    if (rendered > 0) stationScheduleUpdate();
+  } catch (err) {
+    console.warn('Failed to sync external session window transcript', record.sessionId, err);
+  } finally {
+    clearTimeout(timeout);
+    externalSessionWindowSyncLastAt.set(key, Date.now());
+    externalSessionWindowSyncInFlight.delete(key);
+  }
 }
 
 async function hydrateRestoredSessionWindow(win, record) {
@@ -39324,9 +39419,14 @@ function highlightJson(jsonText) {
   return html;
 }
 
+function contextTargetSessionId(sessionId) {
+  const sid = String(sessionId || '').trim();
+  return sid ? (sessionWindowTargetForLogSession(sid) || sid) : '';
+}
+
 function contextSessionKey(snapshot) {
   const sid = snapshot && String(snapshot.session_id || '').trim();
-  return sid || CONTEXT_GLOBAL_SESSION;
+  return contextTargetSessionId(sid) || CONTEXT_GLOBAL_SESSION;
 }
 
 function contextSnapshotFingerprint(snapshot) {
@@ -39423,7 +39523,7 @@ function handleContextReplaySnapshots(snapshots) {
 }
 
 function contextTimelineForForegroundSession() {
-  const sid = resolvePromptTargetSessionId();
+  const sid = contextTargetSessionId(resolvePromptTargetSessionId());
   if (sid && contextSnapshotTimelinesBySession.has(sid)) {
     return { key: sid, timeline: contextSnapshotTimelinesBySession.get(sid) || [] };
   }
@@ -40599,7 +40699,7 @@ function contextSnapshotForForegroundSession() {
     contextReplayIndexBySession.set(key, idx);
     return timeline[idx];
   }
-  const sid = resolvePromptTargetSessionId();
+  const sid = contextTargetSessionId(resolvePromptTargetSessionId());
   if (sid && contextSnapshotsBySession.has(sid)) return contextSnapshotsBySession.get(sid);
   if (sid && contextSnapshotsBySession.size === 1) return contextSnapshotsBySession.values().next().value;
   if (sid && contextSnapshotsBySession.size > 0) return null;

@@ -7252,8 +7252,34 @@ fn external_attached_session_from_wire(line: &str) -> Option<(String, String)> {
     Some((session_id.to_string(), source))
 }
 
+fn external_identity_session_from_wire(line: &str) -> Option<(String, String)> {
+    let parsed = serde_json::from_str::<serde_json::Value>(line).ok()?;
+    if parsed.get("event").and_then(|v| v.as_str()) != Some("session_identity") {
+        return None;
+    }
+    let data = parsed.get("data").filter(|value| value.is_object());
+    let backend_session_id = parsed
+        .get("backend_session_id")
+        .or_else(|| data.and_then(|data| data.get("backend_session_id")))
+        .and_then(|v| v.as_str())
+        .and_then(clean_external_thread_id)?;
+    let source = parsed
+        .get("source")
+        .or_else(|| data.and_then(|data| data.get("source")))
+        .and_then(|v| v.as_str())
+        .map(crate::session_names::normalize_source)?;
+    if source.is_empty() || source == "intendant" {
+        return None;
+    }
+    Some((backend_session_id, source))
+}
+
 fn update_external_attached_sessions_from_wire(sessions: &mut HashMap<String, String>, line: &str) {
     if let Some((session_id, source)) = external_attached_session_from_wire(line) {
+        sessions.insert(session_id, source);
+        return;
+    }
+    if let Some((session_id, source)) = external_identity_session_from_wire(line) {
         sessions.insert(session_id, source);
         return;
     }
@@ -12991,7 +13017,9 @@ pub fn spawn_web_gateway(
                                 *guard = Some(line.clone());
                             }
                         }
-                        if line.contains("\"event\":\"session_attached\"") {
+                        if line.contains("\"event\":\"session_attached\"")
+                            || line.contains("\"event\":\"session_identity\"")
+                        {
                             if let Ok(mut guard) = session_attached_cache.lock() {
                                 update_external_attached_sessions_from_wire(&mut guard, &line);
                             }
@@ -24836,6 +24864,18 @@ mod tests {
             ),
             Some(("external".to_string(), "codex".to_string()))
         );
+        assert_eq!(
+            external_identity_session_from_wire(
+                &serde_json::json!({
+                    "event": "session_identity",
+                    "session_id": "wrapper",
+                    "source": "intendant",
+                    "backend_session_id": "backend",
+                })
+                .to_string()
+            ),
+            None
+        );
     }
 
     #[test]
@@ -24881,6 +24921,29 @@ mod tests {
         assert_eq!(
             sessions.get("claude-b").map(String::as_str),
             Some("claude-code")
+        );
+    }
+
+    #[test]
+    fn external_attached_session_cache_tracks_identity_backend_session() {
+        let mut sessions = HashMap::new();
+        update_external_attached_sessions_from_wire(
+            &mut sessions,
+            &serde_json::json!({
+                "event": "session_identity",
+                "session_id": "wrapper-session",
+                "source": "codex",
+                "backend_session_id": "019eab28-008c-7e21-af02-9da557405f6f",
+            })
+            .to_string(),
+        );
+
+        assert!(!sessions.contains_key("wrapper-session"));
+        assert_eq!(
+            sessions
+                .get("019eab28-008c-7e21-af02-9da557405f6f")
+                .map(String::as_str),
+            Some("codex")
         );
     }
 
