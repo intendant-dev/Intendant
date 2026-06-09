@@ -29811,7 +29811,7 @@ function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSession
   }
   const existing = new Set();
   for (const item of ensureSessionWindowHistory(win)) {
-    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeText: false })) {
+    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId)) {
       existing.add(signature);
     }
   }
