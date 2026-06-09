@@ -29484,6 +29484,9 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     applySessionGoalsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(record.sessionId) || record.sessionId;
     const targetWin = sessionWindows.get(targetSid) || record.win;
+    // External transcript detail is chat-oriented; live windows may already
+    // contain streamed command starts/output that the transcript cannot rebuild.
+    if (sessionWindowHasStreamedHistory(targetWin)) return;
     const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
     if (rendered > 0) stationScheduleUpdate();
   } catch (err) {
@@ -29493,6 +29496,16 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     externalSessionWindowSyncLastAt.set(key, Date.now());
     externalSessionWindowSyncInFlight.delete(key);
   }
+}
+
+function sessionWindowHasStreamedHistory(win) {
+  return ensureSessionWindowHistory(win).some(item => {
+    const node = sessionWindowHistoryNode(item);
+    if (node) return !node.classList.contains('session-window-empty');
+    const record = sessionWindowHistoryRecord(item);
+    if (!record) return false;
+    return String(record.content || '').trim() || record.kind === 'rollback_marker';
+  });
 }
 
 async function hydrateRestoredSessionWindow(win, record) {
