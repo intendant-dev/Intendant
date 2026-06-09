@@ -240,6 +240,7 @@ struct StationInner {
     /// Timestamp of the previously rendered frame, for frame-rate-independent
     /// accumulation (auto-orbit drift).
     last_tick_ms: f64,
+    last_present_ms: f64,
 }
 
 impl StationInner {
@@ -308,6 +309,7 @@ impl StationInner {
             raf_cb: None,
             raf_pending: false,
             last_tick_ms: 0.0,
+            last_present_ms: 0.0,
         };
         inner.rebuild_layout_cache();
         inner.resize();
@@ -386,7 +388,9 @@ impl StationInner {
                 if !s.active {
                     false
                 } else {
-                    s.render(time_ms);
+                    if s.frame_due(time_ms) {
+                        s.render(time_ms);
+                    }
                     s.is_animating()
                 }
             };
@@ -397,6 +401,32 @@ impl StationInner {
 
         inner.borrow_mut().raf_cb = Some(cb);
         StationInner::schedule_frame(&inner);
+    }
+
+    /// Frame-rate governor. Three tiers, because the full scene+HUD repaint
+    /// (and especially uploading live `<video>` frames into the 2D HUD canvas)
+    /// is the dominant GPU cost on weaker iGPUs:
+    ///   • within 150ms of real input  → render at display rate (fluid drags)
+    ///   • motion/particles/drag active → ~30fps (smooth ambient animation)
+    ///   • only video thumbnails live   → ~12fps (monitoring panes; the
+    ///     per-frame video texture upload is the expensive part, and small
+    ///     thumbnails don't need more)
+    /// Skipped ticks still re-arm, so nothing stalls.
+    fn frame_due(&mut self, time_ms: f64) -> bool {
+        if time_ms - self.last_input_ms < 150.0 {
+            self.last_present_ms = time_ms;
+            return true;
+        }
+        let lively = self.motion > 0.0
+            || !self.particles.is_empty()
+            || self.pointer_down.is_some()
+            || self.pinch_zoom.is_some();
+        let min_interval = if lively { 31.0 } else { 82.0 };
+        if time_ms - self.last_present_ms >= min_interval {
+            self.last_present_ms = time_ms;
+            return true;
+        }
+        false
     }
 
     /// Request one animation frame if the tab is active and none is pending.

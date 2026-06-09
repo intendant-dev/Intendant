@@ -16170,6 +16170,11 @@ function stationClearLogState() {
 
 function stationRegisterVideoSource(sourceId, hostId, displayId, label, kind, videoEl) {
   if (!station || !videoEl || !sourceId) return;
+  // Videos parked in offscreen containers don't (re)start on autoplay;
+  // a paused element renders as a frozen black pane in the Station. Kick
+  // play() on every registration — covers local slots, peer panes, and
+  // re-registrations after DOM re-renders alike.
+  if (videoEl.paused && videoEl.srcObject) videoEl.play().catch(() => {});
   try {
     station.register_display_source(String(sourceId), String(hostId), String(displayId), String(label), String(kind || 'video'), videoEl);
     stationRegisteredSources.add(String(sourceId));
@@ -28467,10 +28472,23 @@ class DisplaySlot {
     // Handle incoming video track
     this.pc.ontrack = (e) => {
       this.videoEl.srcObject = e.streams[0];
+      this.videoEl.play().catch(() => {});
       this.connected = true;
       const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
       this.statusEl.textContent = `Connected (view-only)${res}`;
       this.statusEl.className = 'display-status connected';
+      // The slot was registered with the Station at creation, before this
+      // track existed (srcObject was null, so the play-kick was a no-op and
+      // the Station held a frameless element). Re-register now that the
+      // stream is live so the local pane shows without a manual toggle.
+      stationRegisterVideoSource(
+        `local:${this.displayId}`,
+        selfPeerId,
+        String(this.displayId),
+        `${selfHostLabel || 'local'} :${this.displayId}`,
+        'local',
+        this.videoEl,
+      );
     };
 
     // ICE candidates — send to server via WASM app
@@ -36900,6 +36918,10 @@ class PeerDisplayConnection {
     const videoEl = container.querySelector('.peer-display-video');
     if (videoEl && this.stream) {
       videoEl.srcObject = this.stream;
+      // autoplay doesn't re-fire when a stream is (re)attached to an
+      // element living in the offscreen endpoint container; without an
+      // explicit play() the pane sits paused on a black first frame.
+      videoEl.play().catch(() => {});
     }
     stationRegisterVideoSource(
       `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
@@ -37182,7 +37204,12 @@ class PeerDisplayConnection {
         || document.getElementById(`peer-display-${this.hostId}`)
         || stationPeerDisplayContainer(this.hostId, preferStationEndpoint);
       const videoEl = container && container.querySelector('.peer-display-video');
-      if (videoEl) videoEl.srcObject = this.stream;
+      if (videoEl) {
+        videoEl.srcObject = this.stream;
+        // See the reapply path above: explicit play() because autoplay
+        // doesn't re-fire on (re)attached offscreen elements.
+        videoEl.play().catch(() => {});
+      }
       if (videoEl) {
         stationRegisterVideoSource(
           `peer:${this.hostId}:${this.displayId}:${this.sessionId}`,
