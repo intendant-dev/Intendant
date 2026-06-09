@@ -29311,11 +29311,40 @@ function cacheSessionWindowMetadata(sessions) {
         clearStaleSessionWindowDetached(backendSessionId, 'wrapper metadata reports this session is attached');
       }
     }
+    scheduleExternalSessionWindowTranscriptSyncFromMetadata(session);
   }
   for (const session of sessions) {
     applySessionRelationshipsFromSession(session);
   }
   persistSessionWindowState();
+}
+
+function scheduleExternalSessionWindowTranscriptSyncFromMetadata(session) {
+  if (!session || typeof session !== 'object' || sessionMetadataStatusIsTerminal(session)) return;
+  const ids = new Set([
+    session.session_id,
+    session.resume_id,
+    session.backend_session_id,
+    session.backendSessionId,
+    session.intendant_session_id,
+    session.intendantSessionId,
+  ].map(id => String(id || '').trim()).filter(Boolean));
+  for (const id of ids) {
+    const targetSid = sessionWindowTargetForLogSession(id) || id;
+    if (!targetSid || !sessionWindows.has(targetSid)) continue;
+    const win = sessionWindows.get(targetSid);
+    const meta = sessionMetadataById.get(targetSid) || {};
+    const source = externalSourceForSessionWindow(targetSid, win) ||
+      normalizeAgentId(session.source || session.backend_source || session.backendSource || '');
+    if (!source || source === 'intendant') continue;
+    const status = String(session.status || meta.status || '').trim().toLowerCase();
+    const goal = meta.goal || session.goal || session.session_goal || session.sessionGoal || null;
+    const goalStatus = goal ? normalizeGoalStatus(goal.status || '') : '';
+    const sessionComplete = status === 'complete' || status === 'completed';
+    if (sessionComplete && goalStatus !== 'active') continue;
+    if ((win?.ended || win?.phase === 'done') && goalStatus !== 'active') continue;
+    scheduleExternalSessionWindowTranscriptSync(targetSid, 0);
+  }
 }
 
 function sessionWindowMetadataRequestIds() {
@@ -29578,6 +29607,112 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
   return records.length;
 }
 
+function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = '') {
+  const sessionId = String(record.session_id || record.sessionId || fallbackSessionId || '').trim();
+  const content = String(record.content || record.summary || record.message || '')
+    .trim()
+    .replace(/\s+/g, ' ');
+  if (!sessionId || !content) return null;
+  return {
+    sessionId,
+    ts: String(record.ts || record.timestamp || '').trim(),
+    level: String(record.level || '').trim(),
+    source: String(record.source || '').trim(),
+    kind: String(record.kind || '').trim(),
+    itemId: String(record.item_id || record.itemId || '').trim(),
+    outputId: String(record.output_id || record.outputId || '').trim(),
+    userTurnIndex: record.user_turn_index ?? record.userTurnIndex ?? '',
+    userTurnRevision: record.user_turn_revision ?? record.userTurnRevision ?? '',
+    replacementTurnIndex: record.replacement_for_user_turn_index ?? record.replacementForUserTurnIndex ?? '',
+    content,
+  };
+}
+
+function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
+  if (!parts) return [];
+  const signatures = [];
+  if (parts.itemId) signatures.push(['item', parts.sessionId, parts.itemId].join('\u001f'));
+  if (parts.outputId) signatures.push(['output', parts.sessionId, parts.kind, parts.outputId].join('\u001f'));
+  const textParts = [
+    parts.sessionId,
+    parts.level,
+    parts.source,
+    parts.kind,
+    parts.userTurnIndex,
+    parts.userTurnRevision,
+    parts.replacementTurnIndex,
+    parts.content,
+  ];
+  if (options.includeText !== false || !parts.ts) {
+    signatures.push(['text', ...textParts].join('\u001f'));
+  }
+  if (parts.ts) signatures.push(['exact', parts.ts, ...textParts].join('\u001f'));
+  return signatures;
+}
+
+function sessionWindowTranscriptSignaturesForRecord(record = {}, fallbackSessionId = '', options = {}) {
+  return sessionWindowTranscriptSignaturesFromParts(
+    sessionWindowTranscriptSignatureParts(record, fallbackSessionId),
+    options
+  );
+}
+
+function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
+  if (!node) return [];
+  const content = node.querySelector?.('.log-content')?.textContent || node.textContent || '';
+  const parts = sessionWindowTranscriptSignatureParts({
+    session_id: node.dataset?.sessionId || fallbackSessionId,
+    ts: node.querySelector?.('.log-ts')?.title || node.querySelector?.('.log-ts')?.textContent || '',
+    level: node.dataset?.level || '',
+    source: node.querySelector?.('.log-level')?.textContent || '',
+    kind: node.dataset?.kind || '',
+    item_id: node.dataset?.itemId || '',
+    user_turn_index: node.dataset?.userTurnIndex,
+    user_turn_revision: node.dataset?.userTurnRevision,
+    replacement_for_user_turn_index: node.dataset?.replacementForUserTurnIndex,
+    content,
+  }, fallbackSessionId);
+  return sessionWindowTranscriptSignaturesFromParts(parts);
+}
+
+function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId = '', options = {}) {
+  const node = sessionWindowHistoryNode(item);
+  if (node) return sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId);
+  const record = sessionWindowHistoryRecord(item);
+  return record ? sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, options) : [];
+}
+
+function appendMissingRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
+  if (!win || !Array.isArray(entries)) return 0;
+  const records = entries
+    .map(entry => sessionWindowRecordFromReplayEntry(entry, fallbackSessionId))
+    .filter(Boolean);
+  if (!records.length) return 0;
+  if (!sessionWindowHasStreamedHistory(win)) {
+    resetSessionWindowLog(win);
+    appendSessionWindowHistoryBatch(win, records, true);
+    return records.length;
+  }
+  const existing = new Set();
+  for (const item of ensureSessionWindowHistory(win)) {
+    for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, { includeText: false })) {
+      existing.add(signature);
+    }
+  }
+  const missing = [];
+  for (const record of records) {
+    const signatures = sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId);
+    if (signatures.length > 0 && signatures.some(signature => existing.has(signature))) continue;
+    missing.push(record);
+    for (const signature of sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, { includeText: false })) {
+      existing.add(signature);
+    }
+  }
+  if (!missing.length) return 0;
+  appendSessionWindowHistoryBatch(win, missing, sessionWindowShouldFollowNextOutput(win));
+  return missing.length;
+}
+
 function externalSessionWindowSyncRecord(sessionId) {
   const sid = String(sessionId || '').trim();
   if (!sid) return null;
@@ -29650,10 +29785,7 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     applySessionGoalsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(record.sessionId) || record.sessionId;
     const targetWin = sessionWindows.get(targetSid) || record.win;
-    // External transcript detail is chat-oriented; live windows may already
-    // contain streamed command starts/output that the transcript cannot rebuild.
-    if (sessionWindowHasStreamedHistory(targetWin)) return;
-    const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
+    const rendered = appendMissingRestoredSessionWindowEntries(targetWin, entries, targetSid);
     if (rendered > 0) stationScheduleUpdate();
   } catch (err) {
     console.warn('Failed to sync external session window transcript', record.sessionId, err);
