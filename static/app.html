@@ -39079,16 +39079,22 @@ async function saveSettings() {
   } catch (e) {
     console.error('Failed to save settings:', e);
   }
-  // Also emit the control message so the in-memory shared state
+  // Also emit the control messages so the in-memory shared state
   // updates immediately (without waiting for the next daemon restart
-  // to re-read the TOML). The POST above persists, this command
-  // propagates.
+  // to re-read the TOML). The POST above persists — and the gateway
+  // re-dispatches the codex fields server-side too — but keep this
+  // list complete so the dashboard never depends on that, and cover
+  // every codex field with a live control-plane setter.
   const agentVal = g('set-external-agent').value || null;
   if (app) {
     app.send_server_action({ action: 'set_external_agent', agent: agentVal });
     app.send_server_action({
       action: 'set_codex_command',
       command: (g('set-codex-command').value || '').trim() || null,
+    });
+    app.send_server_action({
+      action: 'set_codex_managed_context',
+      mode: controlCodexConfig.managed_context || 'vanilla',
     });
     app.send_server_action({
       action: 'set_codex_context_archive',
