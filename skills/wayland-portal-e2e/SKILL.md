@@ -266,7 +266,8 @@ asyncio.run(main())
 
 6. In the FreeRDP window, approve the GNOME portal:
 
-- Toggle **Allow Remote Interaction** on if input testing is needed.
+- Toggle **Allow Remote Interaction** on before clicking **Share** when
+  `execute_cu_actions` or browser input forwarding will be tested.
 - Select **Display**.
 - Click **Share**.
 
@@ -283,6 +284,11 @@ Look for a successful portal/PipeWire stream start, then verify the dashboard di
 - `wtype` may fail with `Compositor does not support the virtual keyboard protocol` on GNOME.
 - `grim` may fail with `compositor doesn't support wlr-screencopy-unstable-v1`; GNOME is not wlroots.
 - GNOME Shell screenshot D-Bus calls may return `Access denied`.
+- If `display screenshot --target user_session` succeeds but
+  `execute_cu_actions` fails with a portal input error such as
+  `Session is no longer active`, the portal was probably approved for
+  screen sharing without **Allow Remote Interaction**. Revoke and re-grant the
+  user display, then enable that toggle before **Share**.
 - A wrapper app that simply shells out to `/opt/homebrew/bin/sdl-freerdp` may appear in LaunchServices but still leave Computer Use unable to attach to the SDL child window.
 - If the portal timeout is too short, remote approval becomes flaky. Current Intendant builds intentionally allow a generous Wayland portal approval window; older builds may time out before a remote operator can click the dialog.
 - If the portal dialog disappears but the daemon still times out, check portal and session logs before repeatedly clicking:

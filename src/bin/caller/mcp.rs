@@ -1403,7 +1403,7 @@ fn append_manual_http_tool_definitions(
         "grant_user_display",
         manual_http_tool_definition!(
             "grant_user_display",
-            "Grant access to the user's real display session. On Wayland this starts the screen-sharing portal flow; approve the physical portal dialog before taking screenshots or executing CU actions against user_session.",
+            "Grant access to the user's real display session. On Wayland this starts the GNOME portal flow; enable Allow Remote Interaction in the physical portal dialog before clicking Share so execute_cu_actions can inject input against user_session.",
             GrantUserDisplayParams
         ),
     );
@@ -5740,7 +5740,13 @@ pub fn spawn_event_listener(
                         display_id,
                         backend,
                     } => {
-                        s.push_log(LogLevel::Info, format!("Display :{} waiting for OS screen-share approval ({backend} portal)", display_id));
+                        s.push_log(
+                            LogLevel::Info,
+                            format!(
+                                "Display :{} waiting for OS portal approval ({backend}); enable Allow Remote Interaction before Share for Computer Use input",
+                                display_id
+                            ),
+                        );
                     }
                     AppEvent::InterruptRequested { ref session_id } => {
                         s.set_phase(Phase::Interrupting);
@@ -9049,7 +9055,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Grant access to the user's real display session. On Wayland this starts the screen-sharing portal flow; approve the physical portal dialog before taking screenshots or executing CU actions against user_session."
+        description = "Grant access to the user's real display session. On Wayland this starts the GNOME portal flow; enable Allow Remote Interaction in the physical portal dialog before clicking Share so execute_cu_actions can inject input against user_session."
     )]
     async fn grant_user_display(
         &self,

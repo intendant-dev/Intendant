@@ -25677,7 +25677,8 @@ async fn activate_user_display(
         eprintln!("[user_display] Requesting Wayland screen capture via XDG portal...");
         eprintln!(
             "[user_display] A screen-sharing dialog should appear on the display — \
-             approve it to enable video capture"
+             enable Allow Remote Interaction, then approve it to enable video capture \
+             and Computer Use input"
         );
         let backend = display::wayland::WaylandBackend::new();
         let session = display::DisplaySession::new(display_id, Arc::new(backend));

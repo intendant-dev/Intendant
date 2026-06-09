@@ -183,7 +183,7 @@ impl DisplayBackend for WaylandBackend {
         let shutdown_flag = Arc::clone(&self.shutdown);
         let shared_w = Arc::clone(&self.shared_width);
         let shared_h = Arc::clone(&self.shared_height);
-        let pw_thread = std::thread::spawn(move || {
+        let mut pw_thread = Some(std::thread::spawn(move || {
             run_pipewire_capture(
                 pw_fd,
                 node_id,
@@ -195,37 +195,33 @@ impl DisplayBackend for WaylandBackend {
                 shared_w,
                 shared_h,
             );
-        });
+        }));
 
-        // Wake Mutter's screencast pipeline by injecting a 1-pixel cursor
-        // wiggle (right then left). Mutter only pushes frames when it sees
-        // damage on the desktop; on a freshly-granted session with nobody
-        // touching the guest, the consumer gets the initial format frame
-        // (often blank/black) and then nothing until the user manually
-        // moves the cursor or interacts with a window. The wiggle creates
-        // immediate damage so the consumer's first delivered frame
-        // reflects the actual desktop. Best-effort — log on failure but
-        // don't fail the grant. The cursor visibly twitches once on
-        // every grant, which is acceptable as the alternative is a
-        // black dashboard until someone interacts with the guest.
-        if let Err(e) = remote_desktop
-            .notify_pointer_motion(&session, 1.0, 0.0)
-            .await
-        {
-            eprintln!("[display/wayland] initial cursor wiggle (right) failed: {e}");
-        }
-        if let Err(e) = remote_desktop
-            .notify_pointer_motion(&session, -1.0, 0.0)
-            .await
-        {
-            eprintln!("[display/wayland] initial cursor wiggle (left) failed: {e}");
+        // Prove the approved portal session includes RemoteDesktop input
+        // authority before exposing it as an active DisplaySession. GNOME can
+        // approve screen capture while leaving "Allow Remote Interaction" off;
+        // that still yields PipeWire frames, so screenshots work, but all
+        // notify_* input calls fail later with an inactive-session portal
+        // error. The same 1-pixel cursor wiggle also wakes Mutter's screencast
+        // pipeline after the PipeWire consumer is connected, avoiding an idle
+        // black first frame.
+        if let Err(e) = verify_remote_interaction(&remote_desktop, &session).await {
+            self.shutdown.store(true, Ordering::SeqCst);
+            if let Some(handle) = pw_thread.take() {
+                let _ = tokio::task::spawn_blocking(move || {
+                    let _ = handle.join();
+                })
+                .await;
+            }
+            let _ = session.close().await;
+            return Err(e);
         }
 
         // Store the RemoteDesktop proxy and session handle so inject_input()
         // can call notify_* methods on the original portal session.
         *self.portal_session.lock().await = Some(PortalSession {
             node_id,
-            pw_thread: Some(pw_thread),
+            pw_thread,
             remote_desktop,
             session,
         });
@@ -275,7 +271,7 @@ impl DisplayBackend for WaylandBackend {
                 })?;
                 rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Pressed)
                     .await
-                    .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
+                    .map_err(|e| wayland_input_error("key inject", e))?;
             }
             InputEvent::KeyUp { ref code, .. } => {
                 let keycode = super::keymap::dom_code_to_evdev(code).ok_or_else(|| {
@@ -283,7 +279,7 @@ impl DisplayBackend for WaylandBackend {
                 })?;
                 rd.notify_keyboard_keycode(session, keycode as i32, KeyState::Released)
                     .await
-                    .map_err(|e| CallerError::Display(format!("key inject: {e}")))?;
+                    .map_err(|e| wayland_input_error("key inject", e))?;
             }
             InputEvent::MouseMove { x, y, .. } => {
                 rd.notify_pointer_motion_absolute(
@@ -293,7 +289,7 @@ impl DisplayBackend for WaylandBackend {
                     y * height as f64,
                 )
                 .await
-                .map_err(|e| CallerError::Display(format!("pointer inject: {e}")))?;
+                .map_err(|e| wayland_input_error("pointer inject", e))?;
             }
             InputEvent::MouseDown { x, y, b } => {
                 // Move to position first (best-effort).
@@ -314,7 +310,7 @@ impl DisplayBackend for WaylandBackend {
                 };
                 rd.notify_pointer_button(session, button_code, KeyState::Pressed)
                     .await
-                    .map_err(|e| CallerError::Display(format!("button inject: {e}")))?;
+                    .map_err(|e| wayland_input_error("button inject", e))?;
             }
             InputEvent::MouseUp { x, y, b } => {
                 let _ = rd
@@ -333,7 +329,7 @@ impl DisplayBackend for WaylandBackend {
                 };
                 rd.notify_pointer_button(session, button_code, KeyState::Released)
                     .await
-                    .map_err(|e| CallerError::Display(format!("button inject: {e}")))?;
+                    .map_err(|e| wayland_input_error("button inject", e))?;
             }
             InputEvent::Scroll { dx, dy, .. } => {
                 // Use discrete axis scrolling: convert raw deltas to integer
@@ -344,7 +340,7 @@ impl DisplayBackend for WaylandBackend {
                     if steps != 0 {
                         rd.notify_pointer_axis_discrete(session, Axis::Vertical, steps)
                             .await
-                            .map_err(|e| CallerError::Display(format!("scroll inject: {e}")))?;
+                            .map_err(|e| wayland_input_error("scroll inject", e))?;
                     }
                 }
                 if dx.abs() > f64::EPSILON {
@@ -352,7 +348,7 @@ impl DisplayBackend for WaylandBackend {
                     if steps != 0 {
                         rd.notify_pointer_axis_discrete(session, Axis::Horizontal, steps)
                             .await
-                            .map_err(|e| CallerError::Display(format!("scroll inject: {e}")))?;
+                            .map_err(|e| wayland_input_error("scroll inject", e))?;
                     }
                 }
             }
@@ -378,10 +374,10 @@ impl DisplayBackend for WaylandBackend {
             })?;
             rd.notify_keyboard_keysym(session, keysym, KeyState::Pressed)
                 .await
-                .map_err(|e| CallerError::Display(format!("text inject: {e}")))?;
+                .map_err(|e| wayland_input_error("text inject", e))?;
             rd.notify_keyboard_keysym(session, keysym, KeyState::Released)
                 .await
-                .map_err(|e| CallerError::Display(format!("text inject: {e}")))?;
+                .map_err(|e| wayland_input_error("text inject", e))?;
         }
 
         Ok(())
@@ -397,6 +393,44 @@ impl DisplayBackend for WaylandBackend {
     fn kind(&self) -> &'static str {
         "wayland"
     }
+}
+
+async fn verify_remote_interaction(
+    remote_desktop: &RemoteDesktop<'static>,
+    session: &Session<'static, RemoteDesktop<'static>>,
+) -> Result<(), CallerError> {
+    remote_desktop
+        .notify_pointer_motion(session, 1.0, 0.0)
+        .await
+        .map_err(|e| wayland_remote_interaction_error(e))?;
+    remote_desktop
+        .notify_pointer_motion(session, -1.0, 0.0)
+        .await
+        .map_err(|e| wayland_remote_interaction_error(e))?;
+    Ok(())
+}
+
+fn wayland_remote_interaction_error(error: impl std::fmt::Display) -> CallerError {
+    let raw = error.to_string();
+    CallerError::Display(format!(
+        "Wayland portal remote interaction is not active after approval: {raw}. \
+         Revoke and grant the user display again, then approve the GNOME portal \
+         with Allow Remote Interaction enabled before clicking Share; approving \
+         screen sharing alone allows screenshots but not Computer Use input."
+    ))
+}
+
+fn wayland_input_error(action: &str, error: impl std::fmt::Display) -> CallerError {
+    CallerError::Display(format!(
+        "{}: {}. {}",
+        action,
+        error,
+        wayland_input_recovery_hint(),
+    ))
+}
+
+fn wayland_input_recovery_hint() -> &'static str {
+    "Wayland portal input is not active. Revoke and grant the user display again, then approve the GNOME portal with Allow Remote Interaction enabled; screenshot-only approval is insufficient for Computer Use input."
 }
 
 fn char_to_x11_keysym(ch: char) -> Option<i32> {
@@ -805,7 +839,10 @@ fn target_pipewire_framerate(fps: u32) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{char_to_x11_keysym, target_pipewire_framerate};
+    use super::{
+        char_to_x11_keysym, target_pipewire_framerate, wayland_input_error,
+        wayland_remote_interaction_error,
+    };
 
     #[test]
     fn target_pipewire_framerate_clamps_to_supported_range() {
@@ -827,5 +864,30 @@ mod tests {
     #[test]
     fn text_keysyms_use_unicode_keysym_for_non_latin1() {
         assert_eq!(char_to_x11_keysym('€'), Some(0x010020ac));
+    }
+
+    #[test]
+    fn inactive_input_error_tells_operator_to_regrant_with_remote_interaction() {
+        let err = wayland_input_error(
+            "key inject",
+            "Portal request failed: org.freedesktop.zbus.Error: Session is no longer active",
+        )
+        .to_string();
+
+        assert!(err.contains("key inject"));
+        assert!(err.contains("Allow Remote Interaction"));
+        assert!(err.contains("screenshot-only approval is insufficient"));
+    }
+
+    #[test]
+    fn remote_interaction_preflight_error_explains_screenshot_only_approval() {
+        let err = wayland_remote_interaction_error(
+            "Portal request failed: org.freedesktop.zbus.Error: Session is no longer active",
+        )
+        .to_string();
+
+        assert!(err.contains("remote interaction is not active"));
+        assert!(err.contains("Allow Remote Interaction"));
+        assert!(err.contains("screen sharing alone allows screenshots"));
     }
 }

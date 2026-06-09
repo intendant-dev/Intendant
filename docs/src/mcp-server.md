@@ -114,7 +114,7 @@ Full MCP tool groups:
 | `list_displays`      | Enumerate displays with their session state. | — |
 | `take_display`       | Take control of a display. | `display_id` |
 | `release_display`    | Release control of a display. | `display_id`, `note?` |
-| `grant_user_display` | Grant access to the user's real display session; on Wayland, approve the portal dialog before capture. | `display_id?` |
+| `grant_user_display` | Grant access to the user's real display session; on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
 | `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
 | `execute_cu_actions` | Run a batch of [computer-use](./computer-use-and-audio.md) actions. | CU action params |
