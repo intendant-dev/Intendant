@@ -128,6 +128,12 @@ impl GpuState {
         };
         surface.configure(&device, &config);
 
+        // Shader/pipeline validation errors surface asynchronously on
+        // WebGPU; without an error scope a broken shader yields pipelines
+        // that silently no-op every render pass while init "succeeds".
+        // Scope the whole pipeline setup so we fail loudly into the canvas
+        // fallback instead.
+        let error_scope = device.push_error_scope(wgpu::ErrorFilter::Validation);
         let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
             label: Some("Station Shader"),
             source: wgpu::ShaderSource::Wgsl(STATION_WGSL.into()),
@@ -175,6 +181,11 @@ impl GpuState {
         };
         let line_pipeline = make_pipeline(wgpu::PrimitiveTopology::LineList);
         let tri_pipeline = make_pipeline(wgpu::PrimitiveTopology::TriangleList);
+        if let Some(error) = error_scope.pop().await {
+            return Err(JsValue::from_str(&format!(
+                "WebGPU pipeline validation failed: {error}"
+            )));
+        }
         let line_buffer = GpuVertexBuffer::new(&device, "Station Lines");
         let tri_buffer = GpuVertexBuffer::new(&device, "Station Triangles");
 
@@ -290,13 +301,13 @@ impl GpuState {
 
 #[cfg(target_arch = "wasm32")]
 const STATION_WGSL: &str = r#"
-pub(crate) struct VertexOut {
+struct VertexOut {
   @builtin(position) position: vec4<f32>,
   @location(0) color: vec4<f32>,
 };
 
 @vertex
-pub(crate) fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> VertexOut {
+fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec4<f32>) -> VertexOut {
   var out: VertexOut;
   out.position = vec4<f32>(position, 0.0, 1.0);
   out.color = color;
@@ -304,7 +315,7 @@ pub(crate) fn vs_main(@location(0) position: vec2<f32>, @location(1) color: vec4
 }
 
 @fragment
-pub(crate) fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
+fn fs_main(in: VertexOut) -> @location(0) vec4<f32> {
   return in.color;
 }
 "#;

@@ -572,6 +572,11 @@ impl StationInner {
 
         self.build_frame(anim_ms, time_ms);
         if let Some(gpu) = self.gpu.as_mut() {
+            // The canvas backing store can be resized by JS (or by a missed
+            // resize event) after the surface was configured; presenting at a
+            // stale size makes every frame's swapchain texture invalid. The
+            // attribute reads are layout-free, so guard each frame.
+            gpu.resize(self.scene_canvas.width(), self.scene_canvas.height());
             if let Err(err) = gpu.render(&self.frame) {
                 web_sys::console::warn_1(&JsValue::from_str(&format!(
                     "Station GPU render failed: {err:?}"
