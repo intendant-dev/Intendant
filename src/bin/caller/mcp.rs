@@ -91,6 +91,8 @@ pub struct McpAppState {
     pub should_quit: bool,
     /// Session log directory for askHuman files.
     pub log_dir: std::path::PathBuf,
+    controller_loop_dir_override: Option<std::path::PathBuf>,
+    controller_loop_status_override: Option<serde_json::Value>,
     /// Optional launcher for starting tasks via MCP. Set by main.rs.
     pub launcher: Option<Arc<TaskLauncher>>,
     /// Handle to the currently running agent loop, if any.
@@ -213,6 +215,8 @@ impl McpAppState {
             human_question: None,
             should_quit: false,
             log_dir,
+            controller_loop_dir_override: None,
+            controller_loop_status_override: None,
             launcher: None,
             task_handle: None,
             controller_restart: None,
@@ -2068,6 +2072,7 @@ fn collect_controller_loop_status_inner(
         "latest": {
             "run_id": latest_run_id,
             "pid": latest_pid,
+            "pid_alive": latest_pid_alive,
             "status": latest_status,
             "target": latest_target,
             "intervention_order": intervention_order,
@@ -2079,6 +2084,154 @@ fn collect_controller_loop_status_inner(
             "codex": active_codex,
         }
     })
+}
+
+fn controller_loop_dir_has_observable_state(loop_dir: &std::path::Path) -> bool {
+    loop_dir.join("active.lock").exists()
+        || loop_dir.join("latest.pid").exists()
+        || loop_dir.join("latest.run_id").exists()
+        || loop_dir.join("latest.status.json").exists()
+        || loop_dir.join("latest").exists()
+        || !loop_run_dirs(loop_dir).is_empty()
+}
+
+fn controller_loop_status_has_live_owner_or_process(status: &serde_json::Value) -> bool {
+    status
+        .pointer("/lock/owner_alive")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+        || status
+            .pointer("/latest/pid_alive")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        || status
+            .pointer("/active/wrapper_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+        || status
+            .pointer("/active/codex_count")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0)
+            > 0
+}
+
+fn mcp_state_session_source_for_id(s: &McpAppState, session_id: &str) -> Option<String> {
+    s.session_source_for_id(session_id)
+        .map(str::to_string)
+        .or_else(|| {
+            (s.session_id == session_id)
+                .then(|| s.active_session_source.clone())
+                .flatten()
+        })
+        .or_else(|| match resolve_persisted_start_target(session_id) {
+            PersistedStartTarget::External(target) => Some(target.source),
+            PersistedStartTarget::ExternalMissingResume { source } => source,
+            PersistedStartTarget::NotFound | PersistedStartTarget::NonExternal => None,
+        })
+}
+
+fn mcp_state_controller_loop_dir(s: &McpAppState) -> std::path::PathBuf {
+    s.controller_loop_dir_override
+        .clone()
+        .unwrap_or_else(controller_loop_dir)
+}
+
+fn mcp_state_controller_loop_status(s: &McpAppState) -> serde_json::Value {
+    s.controller_loop_status_override
+        .clone()
+        .unwrap_or_else(|| {
+            let loop_dir = mcp_state_controller_loop_dir(s);
+            collect_controller_loop_status_for_mcp_state(&loop_dir, s)
+        })
+}
+
+fn controller_loop_process_field_matches(
+    process: &serde_json::Value,
+    field: &str,
+    session_ids: &std::collections::HashSet<String>,
+) -> bool {
+    process
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .is_some_and(|id| session_ids.contains(id))
+}
+
+fn controller_loop_process_matches_session(
+    process: &serde_json::Value,
+    session_ids: &std::collections::HashSet<String>,
+) -> bool {
+    [
+        "intendant_session_id",
+        "backend_session_id",
+        "mcp_session_id",
+        "session_id",
+    ]
+    .into_iter()
+    .any(|field| controller_loop_process_field_matches(process, field, session_ids))
+}
+
+fn controller_loop_process_reports_active(process: &serde_json::Value) -> bool {
+    process
+        .get("app_server_active")
+        .or_else(|| process.get("process_tree_active"))
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(true)
+}
+
+fn controller_loop_status_has_active_codex_for_session(
+    status: &serde_json::Value,
+    session_ids: &std::collections::HashSet<String>,
+) -> bool {
+    ["/active/wrappers", "/active/codex"]
+        .into_iter()
+        .filter_map(|ptr| status.pointer(ptr).and_then(serde_json::Value::as_array))
+        .flatten()
+        .any(|process| {
+            controller_loop_process_reports_active(process)
+                && controller_loop_process_matches_session(process, session_ids)
+        })
+}
+
+fn mcp_state_controller_loop_has_active_codex_for_session(
+    s: &McpAppState,
+    session_id: &str,
+) -> bool {
+    let session_ids = s
+        .session_related_ids(session_id)
+        .into_iter()
+        .chain(std::iter::once(session_id.trim().to_string()))
+        .filter(|id| !id.is_empty())
+        .collect::<std::collections::HashSet<_>>();
+    if session_ids.is_empty() {
+        return false;
+    }
+    let status = mcp_state_controller_loop_status(s);
+    controller_loop_status_has_active_codex_for_session(&status, &session_ids)
+}
+
+fn mcp_state_codex_active_phase_has_stale_controller(
+    s: &McpAppState,
+    session_id: &str,
+    phase: &Phase,
+) -> bool {
+    if !target_phase_is_active_turn(phase) {
+        return false;
+    }
+    if !mcp_state_session_source_for_id(s, session_id)
+        .as_deref()
+        .is_some_and(|source| source.eq_ignore_ascii_case("codex"))
+    {
+        return false;
+    }
+    let loop_dir = mcp_state_controller_loop_dir(s);
+    if !controller_loop_dir_has_observable_state(&loop_dir) {
+        return false;
+    }
+    let status = mcp_state_controller_loop_status(s);
+    !controller_loop_status_has_live_owner_or_process(&status)
 }
 
 fn controller_loop_intervention_markers_are_stale(
@@ -7372,12 +7525,41 @@ impl IntendantServer {
         session_id_override: Option<&str>,
         managed_context_override: Option<bool>,
     ) -> String {
-        if let Some(requested_session_id) = session_id_override
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
         {
             let mut s = self.state.write().await;
-            hydrate_requested_session_status_from_logs(&mut s, requested_session_id);
+            if let Some(requested_session_id) = session_id_override
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                hydrate_requested_session_status_from_logs(&mut s, requested_session_id);
+            }
+            let target_session_id = session_id_override
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .unwrap_or_else(|| s.session_id.clone());
+            if !target_session_id.is_empty() {
+                let mut target_phase = s
+                    .session_status_for_id(&target_session_id)
+                    .map(|status| status.phase.clone())
+                    .or_else(|| (s.session_id == target_session_id).then(|| s.phase.clone()));
+                if !target_phase
+                    .as_ref()
+                    .is_some_and(target_phase_is_active_turn)
+                    && mcp_state_controller_loop_has_active_codex_for_session(
+                        &s,
+                        &target_session_id,
+                    )
+                {
+                    s.note_session_phase(Some(&target_session_id), None, Phase::Thinking, None);
+                    target_phase = Some(Phase::Thinking);
+                }
+                if target_phase.as_ref().is_some_and(|phase| {
+                    mcp_state_codex_active_phase_has_stale_controller(&s, &target_session_id, phase)
+                }) {
+                    s.note_session_phase(Some(&target_session_id), None, Phase::Done, None);
+                }
+            }
         }
         let s = self.state.read().await;
         let mut snap = s.status_snapshot();
@@ -7778,10 +7960,24 @@ impl IntendantServer {
     }
 
     async fn target_session_phase(&self, session_id: &str) -> Option<Phase> {
-        let s = self.state.read().await;
-        s.session_status_for_id(session_id)
+        let mut s = self.state.write().await;
+        let mut phase = s
+            .session_status_for_id(session_id)
             .map(|status| status.phase.clone())
-            .or_else(|| (s.session_id == session_id).then(|| s.phase.clone()))
+            .or_else(|| (s.session_id == session_id).then(|| s.phase.clone()));
+        if !phase.as_ref().is_some_and(target_phase_is_active_turn)
+            && mcp_state_controller_loop_has_active_codex_for_session(&s, session_id)
+        {
+            s.note_session_phase(Some(session_id), None, Phase::Thinking, None);
+            phase = Some(Phase::Thinking);
+        }
+        if phase.as_ref().is_some_and(|phase| {
+            mcp_state_codex_active_phase_has_stale_controller(&s, session_id, phase)
+        }) {
+            s.note_session_phase(Some(session_id), None, Phase::Done, None);
+            return Some(Phase::Done);
+        }
+        phase
     }
 
     async fn target_session_source(&self, session_id: &str) -> Option<String> {
@@ -7792,6 +7988,10 @@ impl IntendantServer {
                 (s.session_id == session_id)
                     .then(|| s.active_session_source.clone())
                     .flatten()
+            })
+            .or_else(|| {
+                mcp_state_controller_loop_has_active_codex_for_session(&s, session_id)
+                    .then(|| "codex".to_string())
             })
     }
 }
@@ -11760,6 +11960,256 @@ mod tests {
                     assert_eq!(task, "please prioritize the harness status fix");
                 }
                 other => panic!("expected queued StartTask control event, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn start_task_targets_live_controller_codex_process_without_duplicate_resume() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let wrapper_session_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+            let backend_session_id = "019ea99e-live-resumed-backend";
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.controller_loop_status_override = Some(serde_json::json!({
+                    "lock": {
+                        "present": true,
+                        "owner_pid": 4242,
+                        "owner_alive": true
+                    },
+                    "latest": {
+                        "pid": 4242,
+                        "pid_alive": true
+                    },
+                    "active": {
+                        "wrapper_count": 1,
+                        "codex_count": 1,
+                        "wrappers": [{
+                            "source": "external_wrapper_index",
+                            "backend_source": "codex",
+                            "backend_session_id": backend_session_id,
+                            "intendant_session_id": wrapper_session_id,
+                            "app_server_pid": 5252,
+                            "app_server_active": true,
+                            "project_root": "/home/user/projects/intendant-station-mainline-123e28c",
+                            "status": "running_agent"
+                        }],
+                        "codex": [{
+                            "source": "process_tree",
+                            "backend_session_id": backend_session_id,
+                            "intendant_session_id": wrapper_session_id,
+                            "mcp_session_id": wrapper_session_id,
+                            "pid": 5252,
+                            "app_server_active": true,
+                            "project_root": "/home/user/projects/intendant-station-mainline-123e28c"
+                        }]
+                    }
+                }));
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue on the live resumed backend",
+                        "orchestrate": false
+                    }),
+                    Some(wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("tool should queue onto live controller process");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains(
+                    "ok (follow-up queued for next turn; active Codex turn is still running)"
+                ),
+                "got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("session resume dispatched"),
+                "live controller process must not trigger another resume: {rendered}"
+            );
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::StartTask {
+                    session_id,
+                    task,
+                    ..
+                }))) => {
+                    assert_eq!(session_id.as_deref(), Some(wrapper_session_id));
+                    assert_eq!(task, "continue on the live resumed backend");
+                }
+                other => panic!("expected StartTask control event, got {other:?}"),
+            }
+
+            match timeout(Duration::from_millis(50), rx.recv()).await {
+                Err(_) => {}
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::ResumeSession { .. }))) => {
+                    panic!("must not dispatch ResumeSession while live Codex process is active")
+                }
+                Ok(other) => panic!("unexpected extra event: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn status_downgrades_codex_active_phase_when_controller_loop_is_gone() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let root = tempdir().unwrap();
+            let loop_dir = root.path().join(".intendant/controller-loop");
+            std::fs::create_dir_all(&loop_dir).unwrap();
+            std::fs::write(loop_dir.join("latest.pid"), u32::MAX.to_string()).unwrap();
+            std::fs::write(
+                loop_dir.join("latest.status.json"),
+                r#"{"run_id":"stale-run","state":"running_agent"}"#,
+            )
+            .unwrap();
+
+            let wrapper_session_id = "17ea6240-138a-4db6-8954-22f11437aa0d";
+            let backend_session_id = "019e9fa2-stale-active-turn";
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.controller_loop_dir_override = Some(loop_dir);
+                s.session_id = wrapper_session_id.to_string();
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: wrapper_session_id.to_string(),
+                        source: "codex".to_string(),
+                        backend_session_id: backend_session_id.to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 9,
+                        phase: "running_agent".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: wrapper_session_id.to_string(),
+                        task: "stale managed Codex turn".to_string(),
+                    },
+                );
+            }
+
+            let server = IntendantServer::new(state, EventBus::new());
+            let status: serde_json::Value =
+                serde_json::from_str(&server.get_status().await).unwrap();
+            assert_eq!(status.pointer("/phase"), Some(&"done".into()));
+        });
+    }
+
+    #[test]
+    fn start_task_resumes_stale_running_codex_wrapper_without_live_controller_loop() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let root = tempdir().unwrap();
+            let loop_dir = root.path().join(".intendant/controller-loop");
+            std::fs::create_dir_all(&loop_dir).unwrap();
+            std::fs::write(loop_dir.join("latest.pid"), u32::MAX.to_string()).unwrap();
+            std::fs::write(
+                loop_dir.join("latest.status.json"),
+                r#"{"run_id":"stale-run","state":"running_agent"}"#,
+            )
+            .unwrap();
+
+            let backend_session_id = "019e9fa2-stale-active-turn";
+            let project_root = root.path().join("project");
+            std::fs::create_dir_all(&project_root).unwrap();
+            let wrapper_dir = root.path().join(".intendant").join("logs").join("wrapper");
+            let wrapper_session_id = wrapper_dir.to_string_lossy().to_string();
+            {
+                let mut log = crate::session_log::SessionLog::open(wrapper_dir.clone()).unwrap();
+                log.write_meta(Some(&project_root), Some("old managed Codex task"));
+                log.session_identity(&wrapper_session_id, "codex", backend_session_id);
+            }
+
+            let state = test_state();
+            {
+                let mut s = state.write().await;
+                s.controller_loop_dir_override = Some(loop_dir);
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::SessionIdentity {
+                        session_id: wrapper_session_id.clone(),
+                        source: "codex".to_string(),
+                        backend_session_id: backend_session_id.to_string(),
+                    },
+                );
+                apply_observed_event_to_mcp_state(
+                    &mut s,
+                    &AppEvent::StatusUpdate {
+                        turn: 9,
+                        phase: "running_agent".to_string(),
+                        autonomy: "medium".to_string(),
+                        session_id: wrapper_session_id.clone(),
+                        task: "stale managed Codex turn".to_string(),
+                    },
+                );
+            }
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .call_tool_by_name_for_session(
+                    "start_task",
+                    serde_json::json!({
+                        "task": "continue after stale controller relaunch",
+                        "orchestrate": false
+                    }),
+                    Some(&wrapper_session_id),
+                    None,
+                )
+                .await
+                .expect("tool should resume stale wrapper");
+            assert!(!result.is_error.unwrap_or(false));
+            let rendered = format!("{result:?}");
+            assert!(
+                rendered.contains("ok (session resume dispatched"),
+                "got: {rendered}"
+            );
+            assert!(
+                !rendered.contains("active Codex turn is still running"),
+                "stale turn must not be reported as live: {rendered}"
+            );
+
+            match timeout(Duration::from_secs(1), rx.recv()).await {
+                Ok(Ok(AppEvent::ControlCommand(ControlMsg::ResumeSession {
+                    source,
+                    session_id,
+                    resume_id,
+                    task,
+                    direct,
+                    ..
+                }))) => {
+                    assert_eq!(source, "codex");
+                    assert_eq!(session_id, wrapper_session_id);
+                    assert_eq!(resume_id.as_deref(), Some(backend_session_id));
+                    assert_eq!(
+                        task.as_deref(),
+                        Some("continue after stale controller relaunch")
+                    );
+                    assert_eq!(direct, Some(true));
+                }
+                other => panic!("expected ResumeSession control event, got {other:?}"),
             }
         });
     }

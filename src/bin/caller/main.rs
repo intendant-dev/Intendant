@@ -16736,6 +16736,26 @@ Also: {"source": "bare"}"#;
         assert_eq!(task, "long managed prompt");
     }
 
+    #[test]
+    fn web_task_file_is_initial_task_even_when_tui_mode_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        let task_path = dir.path().join("task.txt");
+        std::fs::write(&task_path, "resume managed harness\n").unwrap();
+
+        let mut flags = cli_flags_for_tests();
+        flags.task_file = Some(task_path.to_string_lossy().into_owned());
+        flags.web = true;
+        flags.no_tui = true;
+        flags.no_presence = true;
+        flags.agent_backend = Some(external_agent::AgentBackend::Codex);
+        flags.resume_id = Some("6036429e-54f9-4f93-b74d-04c060c79054".to_string());
+
+        let web_daemon_requested = should_start_idle_web_daemon(true, &flags);
+        let use_tui = !web_daemon_requested;
+        let task = resolve_initial_task_for_startup(&flags, web_daemon_requested, use_tui).unwrap();
+        assert_eq!(task.as_deref(), Some("resume managed harness"));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn black_frame_detector_rejects_all_zero_rgb() {
@@ -20239,6 +20259,34 @@ fn get_task_from_flags_or_env(flags: &CliFlags) -> Result<String, CallerError> {
     let mut line = String::new();
     io::stdin().lock().read_line(&mut line)?;
     Ok(line.trim().to_string())
+}
+
+fn resolve_initial_task_for_startup(
+    flags: &CliFlags,
+    web_daemon_requested: bool,
+    use_tui: bool,
+) -> Result<Option<String>, CallerError> {
+    if web_daemon_requested {
+        return Ok(None);
+    }
+    if flags.mcp {
+        return Ok(flags.task.clone().filter(|t| !t.is_empty()));
+    }
+    if flags.task_file.is_some() {
+        let task = get_task_from_flags_or_env(flags)?;
+        if task.is_empty() {
+            return Err(CallerError::Config("No task provided".to_string()));
+        }
+        return Ok(Some(task));
+    }
+    if use_tui {
+        return Ok(flags.task.clone().filter(|t| !t.is_empty()));
+    }
+    let task = get_task_from_flags_or_env(flags)?;
+    if task.is_empty() {
+        return Err(CallerError::Config("No task provided".to_string()));
+    }
+    Ok(Some(task))
 }
 
 /// Legacy get_task for sub-agent mode (doesn't use CliFlags).
@@ -26796,19 +26844,7 @@ async fn main() -> Result<(), CallerError> {
     // print to stdout and read from stdin, both reserved for JSON-RPC.
     // TUI mode can accept a task later via the follow-up input panel.
     // Headless mode still requires a task upfront.
-    let task = if web_daemon_requested {
-        None
-    } else if flags.mcp {
-        flags.task.clone().filter(|t| !t.is_empty())
-    } else if use_tui {
-        flags.task.clone().filter(|t| !t.is_empty())
-    } else {
-        let t = get_task_from_flags_or_env(&flags)?;
-        if t.is_empty() {
-            return Err(CallerError::Config("No task provided".to_string()));
-        }
-        Some(t)
-    };
+    let task = resolve_initial_task_for_startup(&flags, web_daemon_requested, use_tui)?;
 
     if let Some(ref t) = task {
         slog(&session_log, |l| l.info(&format!("Task: {}", t)));
