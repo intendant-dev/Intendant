@@ -15667,8 +15667,38 @@ function stationBuildExternalTurnSummary(input = {}) {
   };
 }
 
+// stationLatestConfigurableExternalSessionId scans every session across four
+// pools (each via sessionConfigMetadata's merge) to produce a single id that
+// only changes when sessions come, go, or update. It runs inside every
+// Station snapshot build, where the scan dominated build time (CDP-profiled).
+// Memoize per sourceFilter, guarded by the session stores' identities/sizes
+// plus a short TTL for in-place metadata updates.
+const _stationLatestExternalMemo = new Map();
+
 function stationLatestConfigurableExternalSessionId(sourceFilter = '') {
   const wantedSource = normalizeAgentId(sourceFilter || '');
+  const memoKey = wantedSource;
+  const memo = _stationLatestExternalMemo.get(memoKey);
+  const now = performance.now();
+  if (
+    memo &&
+    memo.cachedRef === _cachedSessions &&
+    memo.metaSize === sessionMetadataById.size &&
+    now - memo.ts < 2000
+  ) {
+    return memo.value;
+  }
+  const value = _stationLatestConfigurableExternalSessionIdUncached(wantedSource);
+  _stationLatestExternalMemo.set(memoKey, {
+    cachedRef: _cachedSessions,
+    metaSize: sessionMetadataById.size,
+    ts: now,
+    value,
+  });
+  return value;
+}
+
+function _stationLatestConfigurableExternalSessionIdUncached(wantedSource) {
   const seen = new Set();
   const candidates = [];
   const pushCandidate = (id, session, meta = {}) => {
