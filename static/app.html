@@ -15521,8 +15521,12 @@ function stationBuildControlsSummary() {
     sessionContextArchive,
     sessionSandbox: sessionSource === 'codex' ? sessionConfigSandboxMode(sessionMeta) : '',
     sessionApprovalPolicy: sessionSource === 'codex' ? sessionConfigApprovalPolicy(sessionMeta) : '',
-    sessionConfigManaged: sessionConfigDraft?.managed || sessionManagedContext || '',
-    sessionConfigArchive: sessionConfigDraft?.archive || sessionContextArchive || '',
+    // Dock config-editor draft values — '' means "inherit the global
+    // default". Don't fall back to the effective sessionManagedContext /
+    // sessionContextArchive published above: that would surface (and on a
+    // dock save re-pin) a value the session never pinned.
+    sessionConfigManaged: sessionConfigDraft ? (sessionConfigDraft.managed || '') : '',
+    sessionConfigArchive: sessionConfigDraft ? (sessionConfigDraft.archive || '') : '',
     sessionConfigResult: sessionConfigResultActive ? (stationSessionConfigResult.text || '') : '',
     sessionConfigResultKind: sessionConfigResultActive ? (stationSessionConfigResult.kind || '') : '',
     sessionConfigHasDraft: sessionConfigHadDraft,
