@@ -4692,6 +4692,7 @@ async fn apply_external_context_rewind(
         action: "rewind_context".to_string(),
         success: true,
         message,
+        record_id: Some(record_id),
     });
     if let Err(e) = refresh_external_context_usage_snapshot(agent, config).await {
         slog(config.session_log, |l| {
@@ -4721,6 +4722,7 @@ fn emit_context_rewind_failure(
         action: "rewind_context".to_string(),
         success: false,
         message,
+        record_id: None,
     });
 }
 
@@ -6596,6 +6598,7 @@ async fn handle_external_thread_action(
         action: op.clone(),
         success,
         message: message.clone(),
+        record_id: None,
     });
 
     if success && op == "fast" {
@@ -6759,6 +6762,7 @@ async fn maybe_handle_codex_fast_slash_steer(
                 action: "fast".to_string(),
                 success: false,
                 message,
+                record_id: None,
             });
         }
     }
@@ -6876,6 +6880,7 @@ async fn handle_parent_undo_thread_action(
         action: "undo".to_string(),
         success,
         message,
+        record_id: None,
     });
 }
 
@@ -6965,6 +6970,7 @@ async fn handle_side_undo_thread_action(
         action: "undo".to_string(),
         success,
         message,
+        record_id: None,
     });
 }
 
@@ -8428,6 +8434,7 @@ async fn drain_external_agent_events(
                                 action,
                                 success: false,
                                 message,
+                                record_id: None,
                             });
                             continue;
                         }
@@ -8450,6 +8457,7 @@ async fn drain_external_agent_events(
                                             message:
                                                 "a context rewind is already scheduled for this turn"
                                                     .to_string(),
+                                            record_id: None,
                                         });
                                     } else {
                                         let thread_ids = active_context_rewind_thread_ids(config);
@@ -8466,6 +8474,7 @@ async fn drain_external_agent_events(
                                                 action,
                                                 success: false,
                                                 message,
+                                                record_id: None,
                                             });
                                             continue;
                                         }
@@ -8488,6 +8497,7 @@ async fn drain_external_agent_events(
                                                 action,
                                                 success: false,
                                                 message,
+                                                record_id: None,
                                             });
                                             continue;
                                         }
@@ -8532,6 +8542,7 @@ async fn drain_external_agent_events(
                                             action,
                                             success: true,
                                             message,
+                                            record_id: None,
                                         });
                                     }
                                 }
@@ -8541,6 +8552,7 @@ async fn drain_external_agent_events(
                                         action,
                                         success: false,
                                         message,
+                                        record_id: None,
                                     });
                                 }
                             }
@@ -22170,6 +22182,7 @@ async fn run_with_presence(
                                 action: op,
                                 success: false,
                                 message,
+                                record_id: None,
                             });
                             turn_bus_rx = bus.subscribe();
                             continue;
@@ -22181,6 +22194,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active agent — start a task first".to_string(),
+                            record_id: None,
                         });
                         turn_bus_rx = bus.subscribe();
                         continue;
@@ -22191,6 +22205,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active Codex thread — start a task first".to_string(),
+                            record_id: None,
                         });
                         turn_bus_rx = bus.subscribe();
                         continue;
@@ -22483,6 +22498,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active agent — start a task first".to_string(),
+                            record_id: None,
                         });
                         continue;
                     };
@@ -22509,6 +22525,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active agent — start a task first".to_string(),
+                            record_id: None,
                         });
                         continue;
                     };
@@ -22579,6 +22596,7 @@ async fn run_with_presence(
                     action: op.clone(),
                     success,
                     message: message.clone(),
+                    record_id: None,
                 });
                 if success && op == "fast" {
                     let service_tier = persistent_agent
@@ -24849,6 +24867,7 @@ async fn run_external_agent_mode(
                                                 action,
                                                 success: false,
                                                 message,
+                                                record_id: None,
                                             });
                                             continue;
                                         }
@@ -25500,6 +25519,7 @@ async fn run_external_agent_mode(
                             action: "managed-edit-branch".to_string(),
                             success: true,
                             message: message.clone(),
+                            record_id: None,
                         });
                         emit_follow_up_status(
                             &bus,

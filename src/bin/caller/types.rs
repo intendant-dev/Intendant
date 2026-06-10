@@ -348,6 +348,10 @@ pub enum OutboundEvent {
         action: String,
         success: bool,
         message: String,
+        /// Durable context-rewind record id for a successful
+        /// `rewind_context`; `None` for failures and other actions.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        record_id: Option<String>,
     },
     SessionRenameResult {
         session_id: String,

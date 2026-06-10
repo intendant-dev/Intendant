@@ -804,13 +804,24 @@ impl McpAppState {
         &mut self,
         session_id: Option<&str>,
         success: bool,
+        record_id: Option<&str>,
         message: &str,
     ) {
         let Some(key) = self.rewind_session_key(session_id) else {
             return;
         };
         if success {
-            if let Some(record_id) = context_rewind_record_id_from_message(message) {
+            // The structured `record_id` on `CodexThreadActionResult` is the
+            // primary source. Parsing the human-readable message is kept only
+            // as a fallback for results that predate the structured field
+            // (e.g. forwarded by an older daemon) — do not rely on it for new
+            // emit sites; set `record_id` at the emitter instead.
+            if let Some(record_id) = record_id
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+                .map(str::to_string)
+                .or_else(|| context_rewind_record_id_from_message(message))
+            {
                 for related in self.rewind_related_keys(&key) {
                     self.pending_rewind_pressure_checks
                         .insert(related, record_id.clone());
@@ -5323,11 +5334,13 @@ pub fn spawn_event_listener(
                         action,
                         success,
                         message,
+                        record_id,
                     } => {
                         if action == "rewind_context" {
                             s.note_context_rewind_result_for(
                                 session_id.as_deref(),
                                 success,
+                                record_id.as_deref(),
                                 &message,
                             );
                             resource_changed = Some("intendant://status");
@@ -6265,9 +6278,15 @@ fn apply_observed_event_to_mcp_state(s: &mut McpAppState, event: &AppEvent) -> b
             action,
             success,
             message,
+            record_id,
         } => {
             if action == "rewind_context" {
-                s.note_context_rewind_result_for(session_id.as_deref(), *success, message);
+                s.note_context_rewind_result_for(
+                    session_id.as_deref(),
+                    *success,
+                    record_id.as_deref(),
+                    message,
+                );
             }
             true
         }
@@ -7268,6 +7287,7 @@ impl IntendantServer {
                         action,
                         success,
                         message,
+                        ..
                     }) if action == op
                         && codex_thread_action_result_targets_session(
                             &session_id,
@@ -10699,6 +10719,7 @@ mod tests {
                             action: op,
                             success: true,
                             message: message.to_string(),
+                            record_id: None,
                         });
                         break;
                     }
@@ -10968,7 +10989,10 @@ mod tests {
                 session_id: Some("codex-thread".to_string()),
                 action: "rewind_context".to_string(),
                 success: true,
-                message: "Rewound Codex thread and saved record rewind-watch.".to_string(),
+                // No record id in the message on purpose: the structured
+                // `record_id` field must be the source of truth.
+                message: "Rewound Codex thread to item call-9 (before).".to_string(),
+                record_id: Some("rewind-watch".to_string()),
             },
         );
         apply_observed_event_to_mcp_state(
@@ -11023,6 +11047,7 @@ mod tests {
                 action: "execute_cu_actions".to_string(),
                 success: true,
                 message: "ok (781 bytes)".to_string(),
+                record_id: None,
             },
         );
         apply_observed_event_to_mcp_state(
@@ -11101,7 +11126,10 @@ mod tests {
                 session_id: Some("codex-thread".to_string()),
                 action: "rewind_context".to_string(),
                 success: true,
+                // Legacy result without the structured field: the record id
+                // must still be recovered from the message (fallback parse).
                 message: "Rewound Codex thread and saved record rewind-watch.".to_string(),
+                record_id: None,
             },
         );
         apply_observed_event_to_mcp_state(
@@ -12324,6 +12352,7 @@ mod tests {
                                 action: op,
                                 success: true,
                                 message: "context rewind scheduled".to_string(),
+                                record_id: None,
                             });
                             break event;
                         }
@@ -12394,6 +12423,7 @@ mod tests {
                                 message:
                                     "rollback anchor item_id `rewind_context-call_6` was not found; call list_rewind_anchors"
                                         .to_string(),
+                                record_id: None,
                             });
                             break;
                         }
@@ -13406,6 +13436,7 @@ mod tests {
                                 action: op,
                                 success: true,
                                 message: "{\"anchors\":[]}".to_string(),
+                                record_id: None,
                             });
                             break;
                         }
@@ -13478,6 +13509,7 @@ mod tests {
                                 action: op,
                                 success: true,
                                 message: "{\"anchors\":[],\"limit\":5}".to_string(),
+                                record_id: None,
                             });
                             break;
                         }
@@ -13562,6 +13594,7 @@ mod tests {
                                 action: op,
                                 success: true,
                                 message: "{\"anchors\":[{\"item_id\":\"call_density_0\",\"positions\":[\"after\"],\"position_hint\":\"after\"}],\"limit\":1}".to_string(),
+                                record_id: None,
                             });
                             break;
                         }
@@ -13623,6 +13656,7 @@ mod tests {
                                 action: op,
                                 success: true,
                                 message: "{\"anchor\":{\"item_id\":\"call-1\"}}".to_string(),
+                                record_id: None,
                             });
                             break;
                         }
@@ -13760,6 +13794,7 @@ mod tests {
                 success: true,
                 message: "Rewound Codex thread to item call-old and saved record rewind-high."
                     .to_string(),
+                record_id: Some("rewind-high".to_string()),
             },
         );
         apply_observed_event_to_mcp_state(
@@ -13837,6 +13872,7 @@ mod tests {
                 action: "rewind_context".to_string(),
                 success: true,
                 message: "Rewound Codex thread and saved record rewind-ok.".to_string(),
+                record_id: Some("rewind-ok".to_string()),
             },
         );
         apply_observed_event_to_mcp_state(
@@ -13903,6 +13939,7 @@ mod tests {
                 action: "rewind_context".to_string(),
                 success: true,
                 message: "Rewound Codex thread and saved record rewind-fresh.".to_string(),
+                record_id: Some("rewind-fresh".to_string()),
             },
         );
 
@@ -13995,6 +14032,7 @@ mod tests {
                 action: "rewind_context".to_string(),
                 success: true,
                 message: "Rewound Codex thread and saved record rewind-density.".to_string(),
+                record_id: Some("rewind-density".to_string()),
             },
         );
         apply_observed_event_to_mcp_state(
@@ -14067,10 +14105,13 @@ mod tests {
         s.session_codex_managed_context
             .insert("session-b".to_string(), true);
 
+        // The structured record id wins over a conflicting id embedded in the
+        // human-readable message.
         s.note_context_rewind_result_for(
             Some("session-b"),
             true,
-            "Rewound Codex thread and saved record rewind-b.",
+            Some("rewind-b"),
+            "Rewound Codex thread and saved record rewind-stale.",
         );
         s.session_usage.insert(
             "session-b".to_string(),
@@ -14135,9 +14176,12 @@ mod tests {
                 backend_session_id: "codex-thread".to_string(),
             },
         );
+        // Legacy shape: no structured record id, so it is recovered from the
+        // message (fallback parse).
         s.note_context_rewind_result_for(
             Some("wrapper-session"),
             true,
+            None,
             "Rewound Codex thread and saved record rewind-alias.",
         );
         s.session_usage.insert(
@@ -14197,6 +14241,7 @@ mod tests {
                 action: "rewind_context".to_string(),
                 success: true,
                 message: "Rewound Codex thread and saved record rewind-listener.".to_string(),
+                record_id: Some("rewind-listener".to_string()),
             });
             bus.send(AppEvent::UsageSnapshot {
                 session_id: Some("codex-thread".to_string()),
