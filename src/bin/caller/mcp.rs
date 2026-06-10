@@ -11375,6 +11375,41 @@ mod tests {
         })
     }
 
+    /// Like [`spawn_codex_thread_action_result`], but returns the dispatched
+    /// thread-action params so tests can assert the exact wire shape.
+    fn spawn_codex_thread_action_capture(
+        bus: EventBus,
+        expected_action: &'static str,
+        message: &'static str,
+    ) -> tokio::task::JoinHandle<serde_json::Value> {
+        let mut rx = bus.subscribe();
+        tokio::spawn(async move {
+            loop {
+                match rx.recv().await {
+                    Ok(AppEvent::ControlCommand(ControlMsg::CodexThreadAction {
+                        session_id,
+                        op,
+                        params,
+                        ..
+                    })) if op == expected_action => {
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id,
+                            action: op,
+                            success: true,
+                            message: message.to_string(),
+                            record_id: None,
+                        });
+                        return params;
+                    }
+                    Ok(_) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                        return serde_json::Value::Null;
+                    }
+                }
+            }
+        })
+    }
 
     #[test]
     fn mcp_state_initial_values() {
@@ -12025,6 +12060,15 @@ mod tests {
             assert!(s.rewind_only_gate_message("inspect_rewind_anchor").is_none());
             assert!(s.rewind_only_gate_message("rewind_context").is_none());
             assert!(s.rewind_only_gate_message("rewind_backout").is_none());
+            // Fission tools are deliberately absent from the rewind-only
+            // recovery list: under density-preservation pressure, forking new
+            // branches or importing their output is ordinary work and must be
+            // blocked like any other model-facing tool.
+            assert!(s.rewind_only_gate_message("fission_spawn").is_some());
+            assert!(s.rewind_only_gate_message("fission_control").is_some());
+            assert!(s
+                .rewind_only_gate_message("claim_fission_canonical")
+                .is_some());
         });
     }
 
@@ -12312,6 +12356,9 @@ mod tests {
             assert!(!vanilla_names.contains(&"spawn_live_audio"));
             assert!(!vanilla_names.contains(&"list_rewind_anchors"));
             assert!(!vanilla_names.contains(&"rewind_context"));
+            assert!(!vanilla_names.contains(&"fission_spawn"));
+            assert!(!vanilla_names.contains(&"fission_control"));
+            assert!(!vanilla_names.contains(&"claim_fission_canonical"));
 
             let managed = server
                 .list_tools_json_for_session(Some("managed-session"), None, Some("core"))
@@ -12326,6 +12373,9 @@ mod tests {
             assert!(managed_names.contains(&"inspect_rewind_anchor"));
             assert!(managed_names.contains(&"rewind_context"));
             assert!(managed_names.contains(&"rewind_backout"));
+            assert!(managed_names.contains(&"fission_spawn"));
+            assert!(managed_names.contains(&"fission_control"));
+            assert!(managed_names.contains(&"claim_fission_canonical"));
             assert!(managed_names.contains(&"list_displays"));
             assert!(managed_names.contains(&"grant_user_display"));
             assert!(managed_names.contains(&"revoke_user_display"));
@@ -16264,6 +16314,920 @@ mod tests {
                 value.pointer("/fission_ledger/groups/0/canonical_session_id"),
                 Some(&serde_json::Value::String("child".to_string()))
             );
+        });
+    }
+
+    /// Seed a one-branch fission group via the observation path and return its
+    /// group id.
+    fn seed_fission_group(
+        log_dir: &std::path::Path,
+        parent: &str,
+        anchor: &str,
+        branch: &str,
+        status: &str,
+    ) -> String {
+        crate::fission_ledger::record_fission_observation(
+            log_dir,
+            crate::fission_ledger::FissionObservation {
+                parent_session_id: parent.to_string(),
+                anchor_item_id: anchor.to_string(),
+                tool: "fission_spawn".to_string(),
+                status: status.to_string(),
+                prompt: Some("test objective".to_string()),
+                model: None,
+                reasoning_effort: None,
+                branches: vec![crate::fission_ledger::FissionBranchObservation {
+                    session_id: branch.to_string(),
+                    status: status.to_string(),
+                    summary: None,
+                }],
+            },
+        )
+        .unwrap();
+        crate::fission_ledger::group_id(parent, anchor)
+    }
+
+    fn test_fission_group(branch_status: &str) -> crate::fission_ledger::FissionGroup {
+        crate::fission_ledger::FissionGroup {
+            group_id: "fission-test-group".to_string(),
+            parent_session_id: "parent".to_string(),
+            anchor_item_id: "call-1".to_string(),
+            tool: "fission_spawn".to_string(),
+            objective: Some("test objective".to_string()),
+            prompt: None,
+            created_at: "2026-06-10T00:00:00Z".to_string(),
+            updated_at: "2026-06-10T00:00:00Z".to_string(),
+            canonical_session_id: None,
+            branches: vec![crate::fission_ledger::FissionBranch {
+                session_id: "branch-1".to_string(),
+                backend_session_id: None,
+                status: branch_status.to_string(),
+                summary: None,
+                task: None,
+                model: None,
+                reasoning_effort: None,
+                worktree_path: None,
+                raw_log: "session.jsonl#session_id=branch-1".to_string(),
+                ephemeral: false,
+                updated_at: "2026-06-10T00:00:00Z".to_string(),
+            }],
+        }
+    }
+
+    #[test]
+    fn fission_tool_profile_gating_matrix() {
+        for name in ["fission_spawn", "fission_control", "claim_fission_canonical"] {
+            // Hidden everywhere while managed context is off, including the
+            // permissive default/full/unknown profiles.
+            for profile in [None, Some("full"), Some("core"), Some("screen"), Some("managed")] {
+                assert!(
+                    !tool_allowed_for_profile(name, false, profile),
+                    "{name} must be hidden when unmanaged (profile {profile:?})"
+                );
+            }
+            // Present in every named profile arm once managed context is on —
+            // this is also the fix for claim_fission_canonical previously
+            // being invisible in all named profiles.
+            for profile in [
+                None,
+                Some("full"),
+                Some("core"),
+                Some("codex-core"),
+                Some("cli"),
+                Some("minimal"),
+                Some("screen"),
+                Some("display"),
+                Some("managed"),
+                Some("managed-context"),
+            ] {
+                assert!(
+                    tool_allowed_for_profile(name, true, profile),
+                    "{name} must be allowed under managed context (profile {profile:?})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fission_tools_listed_in_named_profiles_under_managed_context() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = IntendantServer::new(test_state(), EventBus::new());
+            for profile in ["core", "screen", "managed"] {
+                let listed = server
+                    .list_tools_json_for_session(None, Some(true), Some(profile))
+                    .await;
+                let names: Vec<_> = listed["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .collect();
+                for name in ["fission_spawn", "fission_control", "claim_fission_canonical"] {
+                    assert!(
+                        names.contains(&name),
+                        "{name} missing from managed `{profile}` profile listing"
+                    );
+                }
+
+                let unmanaged = server
+                    .list_tools_json_for_session(None, Some(false), Some(profile))
+                    .await;
+                let unmanaged_names: Vec<_> = unmanaged["tools"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter_map(|tool| tool["name"].as_str())
+                    .collect();
+                for name in ["fission_spawn", "fission_control", "claim_fission_canonical"] {
+                    assert!(
+                        !unmanaged_names.contains(&name),
+                        "{name} must be hidden from unmanaged `{profile}` profile listing"
+                    );
+                }
+            }
+
+            let spawn_description = server
+                .list_tools_json_for_session(None, Some(true), Some("core"))
+                .await["tools"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|tool| tool["name"] == "fission_spawn")
+                .and_then(|tool| tool["description"].as_str())
+                .map(str::to_string)
+                .expect("fission_spawn description");
+            assert!(spawn_description.contains("full-context sibling branches"));
+            assert!(spawn_description.contains("do not see the current turn"));
+        });
+    }
+
+    #[test]
+    fn call_tool_rejects_fission_tools_when_managed_context_is_disabled() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = IntendantServer::new(test_state(), EventBus::new());
+            for (name, args) in [
+                (
+                    "fission_spawn",
+                    serde_json::json!({ "branches": [{ "objective": "x" }] }),
+                ),
+                (
+                    "fission_control",
+                    serde_json::json!({ "group_id": "g", "op": "wait" }),
+                ),
+                (
+                    "claim_fission_canonical",
+                    serde_json::json!({ "group_id": "g", "branch_session_id": "b" }),
+                ),
+            ] {
+                let result = server.call_tool_by_name(name, args).await.unwrap();
+                assert!(result.is_error.unwrap_or(false), "{name} should be gated");
+                let rendered = format!("{result:?}");
+                assert!(rendered.contains("managed context is disabled"));
+                assert!(rendered.contains("fission_spawn/fission_control/claim_fission_canonical"));
+            }
+        });
+    }
+
+    #[test]
+    fn fission_spawn_validates_branch_params() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = IntendantServer::new(test_state(), EventBus::new());
+
+            let no_branches = server
+                .fission_spawn(Parameters(FissionSpawnParams {
+                    session_id: None,
+                    branches: vec![],
+                    use_worktree: None,
+                }))
+                .await;
+            assert!(no_branches.contains("requires between 1 and 4 branches"));
+
+            let too_many = server
+                .fission_spawn(Parameters(FissionSpawnParams {
+                    session_id: None,
+                    branches: (0..5)
+                        .map(|idx| FissionBranchSpec {
+                            objective: format!("objective {idx}"),
+                            write_scope: None,
+                            name: None,
+                        })
+                        .collect(),
+                    use_worktree: None,
+                }))
+                .await;
+            assert!(too_many.contains("requires between 1 and 4 branches"));
+            assert!(too_many.contains("got 5"));
+
+            let empty_objective = server
+                .fission_spawn(Parameters(FissionSpawnParams {
+                    session_id: None,
+                    branches: vec![
+                        FissionBranchSpec {
+                            objective: "real objective".to_string(),
+                            write_scope: None,
+                            name: None,
+                        },
+                        FissionBranchSpec {
+                            objective: "   ".to_string(),
+                            write_scope: None,
+                            name: None,
+                        },
+                    ],
+                    use_worktree: None,
+                }))
+                .await;
+            assert!(empty_objective.contains("branches[1] requires a non-empty"));
+        });
+    }
+
+    #[test]
+    fn fission_spawn_dispatches_thread_action_with_charters() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let server = IntendantServer::new(test_state(), bus.clone());
+            let capture = spawn_codex_thread_action_capture(
+                bus,
+                "fission_spawn",
+                "fission group fission-p-c spawned: 2 branches",
+            );
+
+            let result = server
+                .fission_spawn(Parameters(FissionSpawnParams {
+                    session_id: Some("parent-session".to_string()),
+                    branches: vec![
+                        FissionBranchSpec {
+                            objective: "  refactor parser  ".to_string(),
+                            write_scope: Some(vec!["src/parser.rs".to_string(), " ".to_string()]),
+                            name: Some("parser".to_string()),
+                        },
+                        FissionBranchSpec {
+                            objective: "survey docs".to_string(),
+                            write_scope: None,
+                            name: None,
+                        },
+                    ],
+                    use_worktree: Some(false),
+                }))
+                .await;
+            assert_eq!(result, "fission group fission-p-c spawned: 2 branches");
+
+            let params = capture.await.unwrap();
+            let branches = params["branches"].as_array().expect("branches array");
+            assert_eq!(branches.len(), 2);
+            assert_eq!(branches[0]["objective"], "refactor parser");
+            assert_eq!(branches[0]["write_scope"], serde_json::json!(["src/parser.rs"]));
+            assert_eq!(branches[0]["name"], "parser");
+            assert_eq!(branches[1]["objective"], "survey docs");
+            assert!(branches[1].get("write_scope").is_none());
+            assert!(branches[1].get("name").is_none());
+            assert_eq!(params["use_worktree"], serde_json::Value::Bool(false));
+        });
+    }
+
+    #[test]
+    fn fission_control_validates_params() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let server = IntendantServer::new(test_state(), EventBus::new());
+
+            let empty_group = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: "  ".to_string(),
+                    branch_session_id: None,
+                    op: "wait".to_string(),
+                    timeout_s: None,
+                }))
+                .await;
+            assert!(empty_group.contains("requires a non-empty group_id"));
+
+            let bad_op = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: "group-1".to_string(),
+                    branch_session_id: None,
+                    op: "pause".to_string(),
+                    timeout_s: None,
+                }))
+                .await;
+            assert!(bad_op.contains("op must be `wait`, `import`, `cancel`, or `detach`"));
+            assert!(bad_op.contains("`pause`"));
+
+            for op in ["import", "cancel", "detach"] {
+                let missing_branch = server
+                    .fission_control(Parameters(FissionControlParams {
+                        session_id: None,
+                        group_id: "group-1".to_string(),
+                        branch_session_id: None,
+                        op: op.to_string(),
+                        timeout_s: None,
+                    }))
+                    .await;
+                assert!(
+                    missing_branch.contains(&format!("op={op} requires branch_session_id")),
+                    "op={op} must require branch_session_id, got: {missing_branch}"
+                );
+            }
+        });
+    }
+
+    #[test]
+    fn fission_wait_timeout_clamping() {
+        assert_eq!(clamp_fission_wait_timeout_s(None), 60);
+        assert_eq!(clamp_fission_wait_timeout_s(Some(0)), 5);
+        assert_eq!(clamp_fission_wait_timeout_s(Some(4)), 5);
+        assert_eq!(clamp_fission_wait_timeout_s(Some(5)), 5);
+        assert_eq!(clamp_fission_wait_timeout_s(Some(120)), 120);
+        assert_eq!(clamp_fission_wait_timeout_s(Some(300)), 300);
+        assert_eq!(clamp_fission_wait_timeout_s(Some(100_000)), 300);
+    }
+
+    #[test]
+    fn render_fission_wait_outcome_variants() {
+        use crate::fission_lifecycle::WaitOutcome;
+
+        let terminal = render_fission_wait_outcome(
+            WaitOutcome::Terminal(test_fission_group("completed")),
+            "fission-test-group",
+            Some("branch-1"),
+            60,
+        );
+        let value: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+        assert_eq!(value["outcome"], "terminal");
+        assert_eq!(value["group"]["group_id"], "fission-test-group");
+        assert_eq!(value["group"]["branches"][0]["status"], "completed");
+
+        // still_running is a NORMAL result: valid JSON snapshot, not an error
+        // string.
+        let still_running = render_fission_wait_outcome(
+            WaitOutcome::StillRunning(test_fission_group("running")),
+            "fission-test-group",
+            None,
+            42,
+        );
+        assert!(!still_running.starts_with("fission_control wait failed"));
+        let value: serde_json::Value = serde_json::from_str(&still_running).unwrap();
+        assert_eq!(value["outcome"], "still_running");
+        assert_eq!(value["watched"], "any branch");
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("42s"));
+        assert!(message.contains("normal result"));
+
+        let detached = render_fission_wait_outcome(
+            WaitOutcome::Detached(test_fission_group("detached")),
+            "fission-test-group",
+            Some("branch-1"),
+            60,
+        );
+        let value: serde_json::Value = serde_json::from_str(&detached).unwrap();
+        assert_eq!(value["outcome"], "detached");
+        let message = value["message"].as_str().unwrap();
+        assert!(message.contains("rewind_backout"));
+        assert!(message.contains("raw_log"));
+
+        let missing_group = render_fission_wait_outcome(
+            WaitOutcome::GroupNotFound,
+            "fission-missing",
+            None,
+            60,
+        );
+        assert!(missing_group.starts_with("fission_control wait failed"));
+        assert!(missing_group.contains("`fission-missing` was not found"));
+
+        let missing_branch = render_fission_wait_outcome(
+            WaitOutcome::BranchNotFound(test_fission_group("running")),
+            "fission-test-group",
+            Some("branch-9"),
+            60,
+        );
+        assert!(missing_branch.starts_with("fission_control wait failed"));
+        assert!(missing_branch.contains("`branch-9` is not part of fission group"));
+        assert!(missing_branch.contains("branch-1"));
+    }
+
+    #[test]
+    fn fission_control_wait_renders_ledger_outcomes() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            let group_id =
+                seed_fission_group(dir.path(), "fsb-wait-parent", "call-1", "fsb-wait-child", "completed");
+            let detached_group_id = seed_fission_group(
+                dir.path(),
+                "fsb-wait-parent",
+                "call-2",
+                "fsb-wait-child-2",
+                "running",
+            );
+            crate::fission_ledger::detach_group(dir.path(), &detached_group_id, "test detach")
+                .unwrap();
+
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let terminal = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-wait-child".to_string()),
+                    op: "wait".to_string(),
+                    timeout_s: Some(5),
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&terminal).unwrap();
+            assert_eq!(value["outcome"], "terminal");
+            assert_eq!(value["group"]["group_id"], serde_json::json!(group_id));
+
+            let detached = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: detached_group_id.clone(),
+                    branch_session_id: None,
+                    op: "wait".to_string(),
+                    timeout_s: Some(5),
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&detached).unwrap();
+            assert_eq!(value["outcome"], "detached");
+
+            let missing_group = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: "fission-does-not-exist".to_string(),
+                    branch_session_id: None,
+                    op: "wait".to_string(),
+                    timeout_s: Some(5),
+                }))
+                .await;
+            assert!(missing_group.contains("was not found in any candidate ledger"));
+
+            let missing_branch = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-no-such-branch".to_string()),
+                    op: "wait".to_string(),
+                    timeout_s: Some(5),
+                }))
+                .await;
+            assert!(missing_branch.contains("is not part of fission group"));
+        });
+    }
+
+    #[test]
+    fn fission_control_wait_resolves_log_dir_via_branch_route() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ledger_dir = tempdir().unwrap();
+            let other_dir = tempdir().unwrap();
+            let group_id = seed_fission_group(
+                ledger_dir.path(),
+                "fsb-route-parent",
+                "call-1",
+                "fsb-route-child",
+                "completed",
+            );
+            // The ledger lives in a dir that is NOT the server's primary log
+            // dir; only the in-process branch route knows where it is.
+            crate::fission_lifecycle::register_branch(
+                "fsb-route-child",
+                &group_id,
+                ledger_dir.path(),
+            );
+
+            let state = test_state_with_log_dir(other_dir.path().to_path_buf());
+            let server = IntendantServer::new(state, EventBus::new());
+            let result = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-route-child".to_string()),
+                    op: "wait".to_string(),
+                    timeout_s: Some(5),
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(value["outcome"], "terminal");
+
+            crate::fission_lifecycle::drop_pending_deliveries(&[group_id]);
+        });
+    }
+
+    #[test]
+    fn fission_control_import_dispatches_thread_action() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let bus = EventBus::new();
+            let server = IntendantServer::new(test_state(), bus.clone());
+            let capture = spawn_codex_thread_action_capture(
+                bus,
+                "fission_import",
+                "branch outcome injected into parent context and marked imported",
+            );
+
+            let result = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: Some("parent-session".to_string()),
+                    group_id: "fission-group-7".to_string(),
+                    branch_session_id: Some("branch-7".to_string()),
+                    op: "import".to_string(),
+                    timeout_s: None,
+                }))
+                .await;
+            assert_eq!(
+                result,
+                "branch outcome injected into parent context and marked imported"
+            );
+
+            let params = capture.await.unwrap();
+            assert_eq!(
+                params,
+                serde_json::json!({
+                    "group_id": "fission-group-7",
+                    "branch_session_id": "branch-7",
+                })
+            );
+        });
+    }
+
+    #[test]
+    fn fission_control_cancel_stops_branch_and_marks_ledger() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            let group_id = seed_fission_group(
+                dir.path(),
+                "fsb-cancel-parent",
+                "call-1",
+                "fsb-cancel-child",
+                "running",
+            );
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-cancel-child".to_string()),
+                    op: "cancel".to_string(),
+                    timeout_s: None,
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(value["op"], "cancel");
+            assert!(value["stop"]
+                .as_str()
+                .unwrap()
+                .contains("stop requested for branch session `fsb-cancel-child`"));
+            assert_eq!(value["ledger"], "branch marked cancelled");
+            assert_eq!(value["group"]["branches"][0]["status"], "cancelled");
+
+            // The stop intent is the same ControlMsg the dashboard stop path
+            // sends.
+            let mut saw_stop = false;
+            while let Ok(Ok(event)) = timeout(Duration::from_secs(1), rx.recv()).await {
+                if let AppEvent::ControlCommand(ControlMsg::StopSession { session_id }) = event {
+                    assert_eq!(session_id, "fsb-cancel-child");
+                    saw_stop = true;
+                    break;
+                }
+            }
+            assert!(saw_stop, "expected ControlMsg::StopSession on the bus");
+
+            // Persisted: the branch carries the sticky cancelled status.
+            let document = crate::fission_ledger::read_fission_ledger_document(dir.path())
+                .unwrap()
+                .unwrap();
+            let branch_status = document
+                .groups
+                .iter()
+                .find(|group| group.group_id == group_id)
+                .and_then(|group| group.branches.first())
+                .map(|branch| branch.status.clone())
+                .unwrap();
+            assert_eq!(branch_status, "cancelled");
+
+            // Cancelling again reports the sticky status instead of stomping
+            // the ledger.
+            let again = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-cancel-child".to_string()),
+                    op: "cancel".to_string(),
+                    timeout_s: None,
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&again).unwrap();
+            assert!(value["ledger"]
+                .as_str()
+                .unwrap()
+                .contains("already has terminal status `cancelled`"));
+        });
+    }
+
+    #[test]
+    fn fission_control_cancel_leaves_completed_branch_untouched() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            let group_id = seed_fission_group(
+                dir.path(),
+                "fsb-cancel-done-parent",
+                "call-1",
+                "fsb-cancel-done-child",
+                "completed",
+            );
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            let server = IntendantServer::new(state, EventBus::new());
+
+            let result = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-cancel-done-child".to_string()),
+                    op: "cancel".to_string(),
+                    timeout_s: None,
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert!(value["ledger"]
+                .as_str()
+                .unwrap()
+                .contains("already has terminal status `completed`"));
+
+            let document = crate::fission_ledger::read_fission_ledger_document(dir.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                document
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id == group_id)
+                    .and_then(|group| group.branches.first())
+                    .map(|branch| branch.status.as_str()),
+                Some("completed"),
+                "a completed branch's recorded result must not be stomped by cancel"
+            );
+        });
+    }
+
+    #[test]
+    fn fission_control_detach_severs_group_and_emits_relationship() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            let group_id = seed_fission_group(
+                dir.path(),
+                "fsb-detach-parent",
+                "call-1",
+                "fsb-detach-child",
+                "running",
+            );
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            let bus = EventBus::new();
+            let mut rx = bus.subscribe();
+            let server = IntendantServer::new(state, bus);
+
+            let result = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-detach-child".to_string()),
+                    op: "detach".to_string(),
+                    timeout_s: None,
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&result).unwrap();
+            assert_eq!(value["op"], "detach");
+            assert_eq!(value["group"]["branches"][0]["status"], "detached");
+            assert!(value["message"]
+                .as_str()
+                .unwrap()
+                .contains("cannot be waited on or imported"));
+
+            let mut saw_relationship = false;
+            while let Ok(Ok(event)) = timeout(Duration::from_secs(1), rx.recv()).await {
+                if let AppEvent::SessionRelationship {
+                    parent_session_id,
+                    child_session_id,
+                    relationship,
+                    ephemeral,
+                } = event
+                {
+                    assert_eq!(parent_session_id, "fsb-detach-parent");
+                    assert_eq!(child_session_id, "fsb-detach-child");
+                    assert_eq!(relationship, "fission-detached");
+                    assert!(!ephemeral);
+                    saw_relationship = true;
+                    break;
+                }
+            }
+            assert!(saw_relationship, "expected fission-detached relationship");
+
+            let document = crate::fission_ledger::read_fission_ledger_document(dir.path())
+                .unwrap()
+                .unwrap();
+            assert!(document.group_is_detached(&group_id));
+
+            // The sticky detach refuses later waits.
+            let wait = server
+                .fission_control(Parameters(FissionControlParams {
+                    session_id: None,
+                    group_id: group_id.clone(),
+                    branch_session_id: Some("fsb-detach-child".to_string()),
+                    op: "wait".to_string(),
+                    timeout_s: Some(5),
+                }))
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&wait).unwrap();
+            assert_eq!(value["outcome"], "detached");
+        });
+    }
+
+    #[test]
+    fn claim_fission_canonical_refuses_detached_group() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let dir = tempdir().unwrap();
+            let group_id = seed_fission_group(
+                dir.path(),
+                "fsb-claim-parent",
+                "call-1",
+                "fsb-claim-child",
+                "completed",
+            );
+            crate::fission_ledger::detach_group(dir.path(), &group_id, "rewind crossed anchor")
+                .unwrap();
+
+            let state = test_state_with_log_dir(dir.path().to_path_buf());
+            let server = IntendantServer::new(state, EventBus::new());
+            let result = server
+                .claim_fission_canonical(Parameters(ClaimFissionCanonicalParams {
+                    group_id: group_id.clone(),
+                    branch_session_id: "fsb-claim-child".to_string(),
+                    expected_canonical_session_id: None,
+                }))
+                .await;
+            assert!(result.starts_with("claim_fission_canonical failed"));
+            assert!(result.contains("cannot be claimed at a detached anchor"));
+
+            // The refused claim must not have been persisted.
+            let document = crate::fission_ledger::read_fission_ledger_document(dir.path())
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                document
+                    .groups
+                    .iter()
+                    .find(|group| group.group_id == group_id)
+                    .and_then(|group| group.canonical_session_id.as_deref()),
+                None
+            );
+        });
+    }
+
+    #[test]
+    fn get_status_merges_fission_document_from_non_primary_log_dir() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let _guard = TEST_ENV_LOCK.lock().await;
+            let prior_home = std::env::var_os("HOME");
+            let prior_userprofile = std::env::var_os("USERPROFILE");
+            let home = tempdir().unwrap();
+            std::env::set_var("HOME", home.path());
+            std::env::set_var("USERPROFILE", home.path());
+
+            // A supervised parent logs under ~/.intendant/logs/<id>/, which is
+            // NOT the MCP server's primary log dir.
+            let parent_session_id = "0f5b3a52-9f51-4ad8-8a96-fsbstatus001";
+            let parent_dir = home
+                .path()
+                .join(".intendant")
+                .join("logs")
+                .join(parent_session_id);
+            std::fs::create_dir_all(&parent_dir).unwrap();
+            std::fs::write(
+                parent_dir.join("session_meta.json"),
+                serde_json::json!({ "session_id": parent_session_id }).to_string(),
+            )
+            .unwrap();
+            std::fs::write(
+                parent_dir.join("session.jsonl"),
+                format!(
+                    "{}\n",
+                    serde_json::json!({
+                        "event": "session_relationship",
+                        "data": {
+                            "parent_session_id": parent_session_id,
+                            "child_session_id": "fsb-status-branch",
+                            "relationship": "fission-branch",
+                            "ephemeral": false,
+                        }
+                    })
+                ),
+            )
+            .unwrap();
+            crate::fission_ledger::register_spawned_branch(
+                &parent_dir,
+                parent_session_id,
+                "call-77",
+                crate::fission_ledger::BranchCharter {
+                    objective: "explore the parser rewrite".to_string(),
+                    write_scope: Some("src/parser.rs".to_string()),
+                    worktree_requested: true,
+                },
+                crate::fission_ledger::NewSpawnedBranch {
+                    session_id: "fsb-status-branch".to_string(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+
+            let primary = tempdir().unwrap();
+            let state = test_state_with_log_dir(primary.path().to_path_buf());
+            let server = IntendantServer::new(state, EventBus::new());
+            let status = server
+                .get_status_for_session(Some(parent_session_id), None)
+                .await;
+            let value: serde_json::Value = serde_json::from_str(&status).unwrap();
+
+            // Fission ledger merged from the non-primary dir, including the
+            // document `ext` state (the spawn-time charter).
+            assert_eq!(
+                value.pointer("/fission_ledger/groups/0/branches/0/session_id"),
+                Some(&serde_json::Value::String(
+                    "fsb-status-branch".to_string()
+                ))
+            );
+            assert_eq!(
+                value.pointer("/fission_ledger/ext/groups/0/branches/0/charter/objective"),
+                Some(&serde_json::Value::String(
+                    "explore the parser rewrite".to_string()
+                ))
+            );
+            // Lineage ledger merged from the same non-primary dir.
+            assert_eq!(
+                value.pointer("/lineage_ledger/groups/0/branches/0/session_id"),
+                Some(&serde_json::Value::String(
+                    "fsb-status-branch".to_string()
+                ))
+            );
+
+            match prior_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match prior_userprofile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
         });
     }
 
