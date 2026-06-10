@@ -68,7 +68,16 @@ Keep the live transcript informationally dense:
 - Once one of those conditions makes a rewind necessary, use list_rewind_anchors to choose an exact current catalog item_id, inspect_rewind_anchor when the compact row is ambiguous, then call rewind_context with a dense carry-forward primer.
 - Do not use recovery_candidates_only=false to look for newer rewind targets. Non-recovery rows require include_non_recovery=true, are diagnostic-only, and must not be passed to rewind_context when recovery_eligible=false or the requested position is not present in the default row's positions.
 - The primer must preserve user constraints, current objective, completed work, changed files, important command results, remaining decisions, and the substance of any prior managed primer that would otherwise be overwritten.
-- Never synthesize anchor ids, never use anchors from failed examples, and never target managed-context maintenance calls unless explicitly auditing those internals."#;
+- Never synthesize anchor ids, never use anchors from failed examples, and never target managed-context maintenance calls unless explicitly auditing those internals.
+
+Fission (full-context branch spawning), when fission tools are available:
+- When a coherent subtask is separable or parallelizable, prefer `fission_spawn` with a self-contained charter over a deep in-context detour. Branches fork from the last completed turn and do not see the current turn, so each charter must carry every fact, path, and constraint the branch needs.
+- Favor breadth over depth, before pressure builds: fission is ex-ante, rewind is ex-post, and fission tools are unavailable under rewind-only pressure.
+- After spawning, continue your own non-overlapping work; do not idle behind a branch.
+- Use `fission_control(op="wait")` only when genuinely blocked on a branch result. A `still_running` result is normal — keep working and re-check later.
+- Import branch results you need via `fission_control(op="import")`; detach or ignore branches you don't.
+- The first branch back with the group's answer may claim canonical via `claim_fission_canonical`.
+- Consult the fission ledger in `get_status` before reading sibling raw logs."#;
 
 /// Per-project extension of `MANAGED_CONTEXT_DEVELOPER_INSTRUCTIONS`: when
 /// `<working_dir>/.intendant/codex-managed-instructions.md` exists, its
@@ -1834,6 +1843,12 @@ impl CodexAgent {
             args.push("model_auto_compact_token_limit=9223372036854775807".to_string());
             args.push("-c".to_string());
             args.push("model_auto_compact_token_limit_scope=\"body_after_prefix\"".to_string());
+            // A blocking `fission_control(op="wait")` can hold an Intendant
+            // MCP tool call open for up to 300s; raise Codex's per-tool
+            // client timeout (`mcp_servers.<name>.tool_timeout_sec`) well
+            // above that so long fission waits never trip it.
+            args.push("-c".to_string());
+            args.push("mcp_servers.intendant.tool_timeout_sec=600".to_string());
         }
         if self.web_search {
             args.push("-c".to_string());
@@ -11163,6 +11178,56 @@ error: build failed
     }
 
     #[test]
+    fn managed_context_instructions_include_fission_policy() {
+        let instructions = managed_context_developer_instructions(None);
+        for marker in [
+            "fission_spawn",
+            "fork from the last completed turn and do not see the current turn",
+            "fission is ex-ante, rewind is ex-post",
+            "unavailable under rewind-only pressure",
+            "continue your own non-overlapping work",
+            "fission_control(op=\"wait\")",
+            "`still_running` result is normal",
+            "fission_control(op=\"import\")",
+            "claim_fission_canonical",
+            "fission ledger in `get_status`",
+        ] {
+            assert!(
+                instructions.contains(marker),
+                "managed instructions missing fission policy marker {marker:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fission_policy_absent_when_managed_context_off() {
+        // With managed context off, no managed developer instructions are
+        // injected at all — so no fission policy reaches the model.
+        let mut agent = test_agent();
+        agent.managed_context = false;
+        assert!(agent
+            .effective_managed_context_developer_instructions()
+            .await
+            .is_none());
+        // The non-managed instruction surface (side conversations) must not
+        // advertise fission tools either.
+        assert!(!side_developer_instructions(None).contains("fission_spawn"));
+        assert!(!SIDE_BOUNDARY_PROMPT.contains("fission_spawn"));
+    }
+
+    #[tokio::test]
+    async fn fission_policy_present_in_effective_managed_instructions() {
+        let mut agent = test_agent();
+        agent.managed_context = true;
+        let instructions = agent
+            .effective_managed_context_developer_instructions()
+            .await
+            .expect("managed instructions when managed_context=true");
+        assert!(instructions.contains("fission_spawn"));
+        assert!(instructions.contains("claim_fission_canonical"));
+    }
+
+    #[test]
     fn managed_context_instructions_append_project_file_when_present() {
         let tmp = tempfile::tempdir().unwrap();
         let dir = tmp.path().join(MANAGED_CONTEXT_PROJECT_INSTRUCTIONS_DIR);
@@ -11418,6 +11483,27 @@ enabled = true
             &args,
             "mcp_servers.intendant.type=\"http\""
         ));
+    }
+
+    #[test]
+    fn app_server_args_managed_context_raise_intendant_mcp_tool_timeout() {
+        // A blocking fission_control(op="wait") can hold an Intendant MCP
+        // tool call open for up to 300s; managed launches raise Codex's
+        // per-tool client timeout above that.
+        let mut agent = test_agent();
+        agent.managed_context = true;
+        let args = agent.app_server_args(8765);
+        assert!(args_have_config_override(
+            &args,
+            "mcp_servers.intendant.tool_timeout_sec=600"
+        ));
+
+        // Vanilla launches keep Codex's default tool timeout.
+        let vanilla = test_agent();
+        let args = vanilla.app_server_args(8765);
+        assert!(!args
+            .iter()
+            .any(|arg| arg.starts_with("mcp_servers.intendant.tool_timeout_sec")));
     }
 
     #[test]
