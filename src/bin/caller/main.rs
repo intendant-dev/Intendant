@@ -24724,6 +24724,52 @@ async fn run_with_presence(
                     };
                     apply_context_rewind_backout_action(agent, &op, &action_params, &drain_config)
                         .await
+                } else if is_fission_spawn_action(&op) || is_fission_import_action(&op) {
+                    let Some(ref mut agent) = persistent_agent else {
+                        turn_bus_rx = bus.subscribe();
+                        bus.send(AppEvent::CodexThreadActionResult {
+                            session_id: session_id.clone().or_else(|| local_session_id.clone()),
+                            action: op,
+                            success: false,
+                            message: "no active agent — start a task first".to_string(),
+                            record_id: None,
+                        });
+                        continue;
+                    };
+                    let target_thread_id = session_id
+                        .as_deref()
+                        .filter(|id| Some(*id) != local_session_id.as_deref())
+                        .or_else(|| {
+                            persistent_thread
+                                .as_ref()
+                                .map(|thread| thread.thread_id.as_str())
+                        });
+                    action_params =
+                        thread_action_params_with_thread_id(&op, action_params, target_thread_id);
+                    let drain_config = DrainConfig {
+                        bus: &bus,
+                        web_port,
+                        session_id: session_log_id(&session_log),
+                        alias_session_id: persistent_thread
+                            .as_ref()
+                            .map(|thread| thread.thread_id.clone()),
+                        autonomy: autonomy.clone(),
+                        session_log: &session_log,
+                        project_root: &project.root,
+                        log_dir: &log_dir,
+                        approval_registry: &approval_registry,
+                        json_approval: None,
+                        agent_source: Some("Codex".to_string()),
+                        suppress_agent_started: true,
+                        persist_model_responses_inline: false,
+                        headless: false,
+                        context_injection: &context_injection,
+                    };
+                    if is_fission_spawn_action(&op) {
+                        apply_fission_spawn_action(agent, &action_params, &drain_config).await
+                    } else {
+                        apply_fission_import_action(agent, &action_params, &drain_config).await
+                    }
                 } else if let Some(ref mut agent) = persistent_agent {
                     let target_thread_id = session_id
                         .as_deref()
@@ -30600,6 +30646,24 @@ async fn main() -> Result<(), CallerError> {
             event::spawn_outbound_broadcaster(bus.subscribe(), outbound_tx.clone());
         let _session_log_writer =
             event::spawn_session_log_writer(bus.subscribe_session_log(), session_log.clone());
+        // Fission lifecycle: route branch session lifecycle/diff events into
+        // the durable fission ledger, and restore routes for branches that
+        // were still running when the previous daemon exited.
+        let _fission_lifecycle_watcher =
+            fission_lifecycle::spawn_fission_lifecycle_watcher(bus.subscribe());
+        if let Some(home) = dirs::home_dir() {
+            match fission_lifecycle::rehydrate_from_logs(&home.join(".intendant").join("logs")) {
+                Ok(0) => {}
+                Ok(count) => slog(&session_log, |l| {
+                    l.info(&format!(
+                        "Rehydrated {count} fission branch route(s) from persisted ledgers"
+                    ))
+                }),
+                Err(err) => slog(&session_log, |l| {
+                    l.warn(&format!("Fission branch route rehydration failed: {err}"))
+                }),
+            }
+        }
 
         let (shared_file_watcher, _watcher_handle, _round_snapshot_handle) = {
             let snapshot_dir = log_dir.join("file_snapshots");
