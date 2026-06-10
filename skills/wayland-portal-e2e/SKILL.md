@@ -313,3 +313,28 @@ ssh -J user@<jump-host> user@<wayland-vm> '
 ```
 
 Keep the app wrapper if repeated Wayland portal E2E testing is expected; delete `/Applications/IntendantFreeRDP.app` if the machine should be left pristine.
+
+## GPU Selection On Dual-GPU Hosts (Intel + NVIDIA)
+
+Chromium on a hybrid Wayland host defaults to Wayland-ozone on the Intel iGPU,
+and **Wayland-ozone is incompatible with Chromium's Vulkan path** (it logs
+exactly that). Forcing `--enable-features=Vulkan` in that state lands on the
+Intel Mesa device and crashes the GPU process ("Aw, Snap!", error code 4,
+`incompatible backing: CompoundImageBacking`) as soon as live WebRTC video
+plays next to a WebGPU canvas. PRIME offload env (`__NV_PRIME_RENDER_OFFLOAD`,
+`__GLX_VENDOR_LIBRARY_NAME`) breaks Chromium GPU init entirely and falls back
+to SwiftShader.
+
+The working hardware-WebGPU recipe for headed Station validation:
+
+```sh
+export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d/nvidia_icd.json
+export VK_DRIVER_FILES=/usr/share/vulkan/icd.d/nvidia_icd.json
+chromium --ozone-platform=x11 --enable-features=Vulkan --enable-unsafe-webgpu ...
+```
+
+Verify with `navigator.gpu.requestAdapter({powerPreference:'high-performance'})`
+— `adapter.info.vendor` must report `nvidia`, not `intel` or
+`google`/`swiftshader`. Import the graphical session env including
+`XAUTHORITY` (Chromium exits with "Authorization required" without it under
+ozone-x11).
