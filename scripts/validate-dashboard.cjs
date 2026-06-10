@@ -85,8 +85,10 @@ Checks:
   --selector CSS              Wait until document.querySelector(CSS) exists
   --wait-for-selector CSS     Alias for --selector
   --wait-for-function JS      Wait until a JS expression/function returns truthy
-  --station-probe NAME        Named Station probe: status, canvas, rendered, dock-hidden, webgpu
-                              (dock-hidden passes when the legacy #station-dock is absent or hidden)
+  --station-probe NAME        Named Station probe: status, canvas, rendered, dock-hidden, webgpu, fps
+                              (dock-hidden passes when the legacy #station-dock is absent or hidden;
+                              fps reads the renderer's trailing-2s presented-frame rate from debug_state)
+  --station-min-fps N         Minimum fps for the fps probe (default: 24)
 
 Options:
   --host HOST                 Host used with --port (default: 127.0.0.1)
@@ -147,6 +149,7 @@ function parseArgs(argv, env = process.env) {
     selectors: [],
     functions: [],
     stationProbes: [],
+    stationMinFps: 24,
     timeoutMs: DEFAULT_TIMEOUT_MS,
     cdpTimeoutMs: DEFAULT_CDP_TIMEOUT_MS,
     logLines: DEFAULT_LOG_LINES,
@@ -226,6 +229,10 @@ function parseArgs(argv, env = process.env) {
       opts.functions.push(readValue());
     } else if (arg.startsWith('--wait-for-function=')) {
       opts.functions.push(arg.slice('--wait-for-function='.length));
+    } else if (arg === '--station-min-fps') {
+      opts.stationMinFps = parsePositiveInt(readValue(), '--station-min-fps');
+    } else if (arg.startsWith('--station-min-fps=')) {
+      opts.stationMinFps = parsePositiveInt(arg.slice('--station-min-fps='.length), '--station-min-fps');
     } else if (arg === '--station-probe') {
       opts.stationProbes.push(normalizeStationProbeName(readValue()));
     } else if (arg.startsWith('--station-probe=')) {
@@ -340,9 +347,10 @@ function normalizeStationProbeName(raw) {
     ['canvas-rendered', 'rendered'],
     ['hidden-dock', 'dock-hidden'],
     ['gpu', 'webgpu'],
+    ['framerate', 'fps'],
   ]);
   const normalized = aliases.get(value) || value;
-  const allowed = new Set(['status', 'canvas', 'rendered', 'dock-hidden', 'webgpu']);
+  const allowed = new Set(['status', 'canvas', 'rendered', 'dock-hidden', 'webgpu', 'fps']);
   if (!allowed.has(normalized)) {
     throw new Error(`unknown Station probe '${raw}'; expected one of ${Array.from(allowed).join(', ')}`);
   }
@@ -1796,7 +1804,7 @@ class BrowserHarness {
   async waitForStationProbe(probe, timeoutMs) {
     let lastError = '';
     let lastValue = '';
-    const expression = stationProbeExpression(probe);
+    const expression = stationProbeExpression(probe, { minFps: opts.stationMinFps });
     await waitUntil(
       async () => {
         try {
@@ -2677,11 +2685,11 @@ function waitFunctionExpression(source) {
   })())`;
 }
 
-function stationProbeExpression(probe) {
+function stationProbeExpression(probe, options = {}) {
   const normalized = normalizeStationProbeName(probe);
   return `Promise.resolve((() => {
     const stationDiagnostics = (${stationDiagnosticsSource()})();
-    return (${stationProbeSource()})(${JSON.stringify(normalized)}, stationDiagnostics);
+    return (${stationProbeSource()})(${JSON.stringify(normalized)}, stationDiagnostics, ${JSON.stringify(options)});
   })())`;
 }
 
@@ -2890,7 +2898,7 @@ function stationDiagnosticsSource() {
 }
 
 function stationProbeSource() {
-  return function collectStationProbe(probe, diagnostics) {
+  return function collectStationProbe(probe, diagnostics, probeOptions) {
     const statusText = String(diagnostics && diagnostics.statusText ? diagnostics.statusText : '');
     const canvas = (diagnostics && diagnostics.canvas) || {};
     const pixels = (diagnostics && diagnostics.pixels) || {};
@@ -2950,7 +2958,7 @@ function stationProbeSource() {
         hidden: Boolean(dock && dock.classList && dock.classList.contains('hidden')),
       },
     };
-    const pass = () => ({ ...base, ok: true, reason: 'passed' });
+    const pass = (extra = {}) => ({ ...base, ...extra, ok: true, reason: 'passed' });
     const fail = (reason, failureKind = 'probe') => ({ ...base, reason, failureKind });
 
     if (probe === 'status') {
@@ -2982,6 +2990,22 @@ function stationProbeSource() {
         return pass();
       }
       return fail('Station dock is visible');
+    }
+    if (probe === 'fps') {
+      // Render-health eval: the WASM reports presented frames/sec over a
+      // trailing 2s window in debug_state ("fps=NN"). Catches the failure
+      // mode where state probes pass while the page is stalling (slow
+      // snapshot builds, GPU-process death, parked render loop).
+      const m = /\bfps=(\d+)\b/.exec(`${base.debugState} ${base.statusText}`);
+      if (!m) {
+        return fail('Station debug state reports no fps figure', 'renderer');
+      }
+      const fps = Number(m[1]);
+      const minFps = Number(probeOptions && probeOptions.minFps) || 24;
+      if (fps >= minFps) {
+        return pass({ fps, minFps });
+      }
+      return fail(`Station presenting at ${fps}fps (minimum ${minFps})`, 'renderer');
     }
     if (probe === 'webgpu') {
       const active = /^webgpu$/i.test(base.renderer)
@@ -4583,6 +4607,19 @@ async function runSelfTest() {
   assert.strictEqual(absentDockResult.dock.found, false);
   assert.strictEqual(stationProbe('rendered', stationProbeDiagnostics).ok, true);
   assert.strictEqual(stationProbe('webgpu', stationProbeDiagnostics).ok, true);
+  const fpsDiag = { ...stationProbeDiagnostics, statusText: 'station hosts=1 renderer=WebGPU gpu=true fps=58' };
+  const fpsPass = stationProbe('fps', fpsDiag, { minFps: 24 });
+  assert.strictEqual(fpsPass.ok, true);
+  assert.strictEqual(fpsPass.fps, 58);
+  const fpsSlow = stationProbe('fps', { ...stationProbeDiagnostics, statusText: 'station fps=9' }, { minFps: 24 });
+  assert.strictEqual(fpsSlow.ok, false);
+  assert.ok(/9fps/.test(fpsSlow.reason));
+  const fpsMissing = stationProbe('fps', stationProbeDiagnostics, { minFps: 24 });
+  assert.strictEqual(fpsMissing.ok, false);
+  assert.ok(/no fps figure/.test(fpsMissing.reason));
+  assert.strictEqual(stationProbe('fps', fpsDiag, undefined).ok, true);
+  assert.deepStrictEqual(parseArgs(['--station-probe', 'framerate'], {}).stationProbes, ['fps']);
+  assert.strictEqual(parseArgs(['--station-min-fps', '30'], {}).stationMinFps, 30);
   const hiddenDockProbe = vm.runInNewContext(`(${stationProbeSource()})`, {
     document: stationProbeDocumentFor({ classList: { contains: (name) => name === 'hidden' } }),
   });
