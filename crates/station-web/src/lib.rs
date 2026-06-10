@@ -174,7 +174,7 @@ impl StationWeb {
     pub fn debug_state(&self) -> String {
         let inner = self.inner.borrow();
         format!(
-            "station hosts={} agents={} events={} displays={} renderer={} gpu={}",
+            "station hosts={} agents={} events={} displays={} renderer={} gpu={} fps={}",
             inner.snapshot.hosts.len(),
             inner.snapshot.agents.len(),
             inner.snapshot.events.len(),
@@ -185,6 +185,7 @@ impl StationWeb {
                 "Canvas"
             },
             inner.gpu.is_some(),
+            inner.present_fps(),
         )
     }
 }
@@ -241,6 +242,9 @@ struct StationInner {
     /// accumulation (auto-orbit drift).
     last_tick_ms: f64,
     last_present_ms: f64,
+    /// Present timestamps within the trailing 2s, for the fps figure in
+    /// `debug_state` — the probe-visible render-health eval.
+    present_history: Vec<f64>,
 }
 
 impl StationInner {
@@ -310,6 +314,7 @@ impl StationInner {
             raf_pending: false,
             last_tick_ms: 0.0,
             last_present_ms: 0.0,
+            present_history: Vec::new(),
         };
         inner.rebuild_layout_cache();
         inner.resize();
@@ -403,30 +408,32 @@ impl StationInner {
         StationInner::schedule_frame(&inner);
     }
 
-    /// Frame-rate governor. Three tiers, because the full scene+HUD repaint
-    /// (and especially uploading live `<video>` frames into the 2D HUD canvas)
-    /// is the dominant GPU cost on weaker iGPUs:
-    ///   • within 150ms of real input  → render at display rate (fluid drags)
-    ///   • motion/particles/drag active → ~30fps (smooth ambient animation)
-    ///   • only video thumbnails live   → ~12fps (monitoring panes; the
-    ///     per-frame video texture upload is the expensive part, and small
-    ///     thumbnails don't need more)
-    /// Skipped ticks still re-arm, so nothing stalls.
+    /// Frame-rate governor. Within 150ms of real input everything renders at
+    /// display rate so drags, hovers, and slider scrubs stay fluid; ambient
+    /// frames (video thumbnails, WebGPU surface keepalive, slow orbit drift,
+    /// particles) are capped at ~30fps — they're 30fps sources or sub-pixel
+    /// motion anyway, and the full scene+HUD repaint is the dominant GPU cost
+    /// on weaker iGPUs. Skipped ticks still re-arm, so nothing stalls.
     fn frame_due(&mut self, time_ms: f64) -> bool {
-        if time_ms - self.last_input_ms < 150.0 {
+        let interactive = time_ms - self.last_input_ms < 150.0;
+        if interactive || time_ms - self.last_present_ms >= 31.0 {
             self.last_present_ms = time_ms;
-            return true;
-        }
-        let lively = self.motion > 0.0
-            || !self.particles.is_empty()
-            || self.pointer_down.is_some()
-            || self.pinch_zoom.is_some();
-        let min_interval = if lively { 31.0 } else { 82.0 };
-        if time_ms - self.last_present_ms >= min_interval {
-            self.last_present_ms = time_ms;
+            self.present_history.retain(|t| time_ms - *t < 2000.0);
+            self.present_history.push(time_ms);
             return true;
         }
         false
+    }
+
+    /// Presented frames per second over the trailing 2s window.
+    fn present_fps(&self) -> u32 {
+        let newest = self.present_history.last().copied().unwrap_or(0.0);
+        let live = self
+            .present_history
+            .iter()
+            .filter(|t| newest - **t < 2000.0)
+            .count();
+        (live as f64 / 2.0).round() as u32
     }
 
     /// Request one animation frame if the tab is active and none is pending.
