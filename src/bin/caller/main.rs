@@ -21,6 +21,7 @@ mod external_agent;
 mod external_wrapper_index;
 mod file_watcher;
 mod fission_ledger;
+mod fission_lifecycle;
 mod frames;
 mod frontend;
 mod knowledge;
