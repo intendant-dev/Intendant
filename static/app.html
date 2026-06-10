@@ -11150,7 +11150,10 @@ async function ensureStation() {
 function stationSetActive(active) {
   if (station) {
     station.set_active(active);
-    station.resize();
+    // Only resize while visible: on deactivation the pane is already
+    // hidden and client sizes read 0, which would collapse the canvases
+    // (and the WebGPU surface) to 1x1 on every tab switch away.
+    if (active) station.resize();
     if (active) {
       stationSyncHotspots();
       stationRefreshSharedCaches();
@@ -12554,7 +12557,9 @@ function stationDisplayRunwayPayload() {
     });
   }
   return {
-    generated_at: new Date().toISOString(),
+    // No wall-clock fields here: this payload is embedded in the Station
+    // snapshot, and the JSON dedupe that gates WASM update_snapshot calls
+    // must see identical bytes when nothing actually changed.
     selected_peer_id: selectedHostId || '',
     selected_peer_label: stationPeerDisplayName(selectedPeer),
     selected_display_id: Number(selectedDisplayId) || 0,
@@ -14229,7 +14234,8 @@ function stationBuildAttentionQueue(controls) {
   }
 
   return {
-    generated_at: new Date().toISOString(),
+    // No wall-clock fields: embedded in the snapshot, would defeat the
+    // JSON dedupe gate (see stationDisplayRunwayPayload).
     count: items.length,
     blocked: items.filter(item => item.level === 'blocked').length,
     warn: items.filter(item => item.level === 'warn').length,
@@ -15711,7 +15717,11 @@ function stationBuildSessionsSummary() {
       canRename: !!row.id,
       canAttach: !!row.attachId,
       canStop: !!row.stopId,
-      canInterrupt: !!row.target && !!controls.sessionCanInterrupt,
+      // Per-row capability: the prompt target with a live stop id can be
+      // interrupted. (A previous version referenced an undefined `controls`
+      // here, throwing whenever a prompt target existed and silently
+      // emptying externalTargets via the catch below.)
+      canInterrupt: !!row.target && !!row.stopId,
       canRestart: !!row.canConfig,
       canOpenLog: true,
       canFork: !!row.isCodex,
@@ -16636,7 +16646,9 @@ function stationRegisterVideoSource(sourceId, hostId, displayId, label, kind, vi
   try {
     station.register_display_source(String(sourceId), String(hostId), String(displayId), String(label), String(kind || 'video'), videoEl);
     stationRegisteredSources.add(String(sourceId));
-    stationUpdateSnapshot();
+    // Coalesced: tab activation re-registers every source in a loop, and a
+    // synchronous full rebuild per source multiplies the build cost.
+    stationScheduleUpdate();
   } catch (e) {
     console.warn('station display registration failed:', e);
   }

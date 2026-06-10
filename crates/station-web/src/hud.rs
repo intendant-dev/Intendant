@@ -531,7 +531,11 @@ impl StationInner {
 
         let mut ax = x + w - 18.0;
         let ay = y + h - 34.0;
-        for action in self.station_primary_actions().into_iter().rev().take(7) {
+        // Keep the FIRST seven actions (send / new session lead the vec) and
+        // lay them out right-to-left so the primaries sit nearest the corner;
+        // capability-driven extras (select shortcuts) get dropped under
+        // pressure — previously `.rev().take(7)` dropped the primaries.
+        for action in self.station_primary_actions().into_iter().take(7).rev() {
             ax -= action.width;
             if ax < x + w * 0.48 {
                 break;
@@ -677,6 +681,24 @@ impl StationInner {
             ),
             ("system:peers", cx - node_w * 0.72, cy - ring_scale - 86.0),
             ("system:view", cx - node_w * 0.5, cy + ring_scale + 34.0),
+            // Previously these three lived only in an invisible click matrix;
+            // they're real nodes now so every system target is visible,
+            // mouse-reachable, and exported through hotspot_rects.
+            (
+                "system:sessions",
+                cx + ring_scale * 0.52,
+                cy - ring_scale - 86.0,
+            ),
+            (
+                "system:changes",
+                cx - ring_scale - node_w - 26.0,
+                cy + ring_scale * 0.7,
+            ),
+            (
+                "system:worktrees",
+                cx + ring_scale + 26.0,
+                cy + ring_scale * 0.7,
+            ),
         ];
         for (id, nx, ny) in node_specs {
             if let Some(target) = targets.iter().find(|target| target.id == id) {
@@ -703,31 +725,12 @@ impl StationInner {
         }
 
         self.system_targets = targets;
-
-        let row_y = y + core_h - 118.0;
-        let matrix_ids = [
-            "system:activity",
-            "system:context",
-            "system:managed",
-            "system:sessions",
-            "system:peers",
-            "system:changes",
-            "system:worktrees",
-            "system:controls",
-            "system:view",
-        ];
-        let matrix_w = (w - 72.0) / 3.0;
-        for (idx, id) in matrix_ids.into_iter().enumerate() {
-            let col = idx % 3;
-            let row = idx / 3;
-            self.hit_zones.push(HitZone::new(
-                x + 30.0 + col as f32 * matrix_w,
-                row_y + 25.0 + row as f32 * 31.0,
-                matrix_w - 8.0,
-                25.0,
-                HitAction::Select(id.to_string()),
-            ));
-        }
+        // The legacy invisible 3x3 "matrix" of system-target hit zones is
+        // gone: it was never drawn, yet (being pushed last) it outranked the
+        // visible orbital nodes in reverse hit-testing — clicks on the lower
+        // half of visible nodes selected a different, invisible target. The
+        // orbital nodes carry the same Select actions, and the DOM hotspot
+        // overlay (positioned from hotspot_rects) covers keyboard access.
     }
 
     #[allow(clippy::too_many_arguments)]

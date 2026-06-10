@@ -355,6 +355,8 @@ struct StationInner {
     _events: Vec<Closure<dyn FnMut(Event)>>,
     raf_cb: Option<Closure<dyn FnMut(f64)>>,
     raf_pending: bool,
+    /// One-shot render latch set by external state changes; see `frame_due`.
+    needs_render: bool,
     /// Timestamp of the previously rendered frame, for frame-rate-independent
     /// accumulation (auto-orbit drift).
     last_tick_ms: f64,
@@ -433,6 +435,7 @@ impl StationInner {
             _events: Vec::new(),
             raf_cb: None,
             raf_pending: false,
+            needs_render: false,
             last_tick_ms: 0.0,
             last_present_ms: 0.0,
             present_history: Vec::new(),
@@ -522,7 +525,7 @@ impl StationInner {
                 }
             };
             if animating {
-                StationInner::schedule_frame(&loop_inner);
+                StationInner::arm_raf(&loop_inner);
             }
         }) as Box<dyn FnMut(f64)>);
 
@@ -538,7 +541,12 @@ impl StationInner {
     /// on weaker iGPUs. Skipped ticks still re-arm, so nothing stalls.
     fn frame_due(&mut self, time_ms: f64) -> bool {
         let interactive = time_ms - self.last_input_ms < 150.0;
-        if interactive || time_ms - self.last_present_ms >= 31.0 {
+        // `needs_render` latches external state changes (snapshot, selection,
+        // layout, resize, …). Without it, a one-shot frame landing inside the
+        // 31ms ambient window while the loop is parkable would be skipped and
+        // never re-armed — the change would silently never paint.
+        if self.needs_render || interactive || time_ms - self.last_present_ms >= 31.0 {
+            self.needs_render = false;
             self.last_present_ms = time_ms;
             self.present_history.retain(|t| time_ms - *t < 2000.0);
             self.present_history.push(time_ms);
@@ -547,19 +555,28 @@ impl StationInner {
         false
     }
 
-    /// Presented frames per second over the trailing 2s window.
+    /// Presented frames per second over the trailing 2s window, anchored at
+    /// the current time so a parked or inactive station decays to 0 instead
+    /// of reporting its last burst forever (the figure is probe-visible).
     fn present_fps(&self) -> u32 {
-        let newest = self.present_history.last().copied().unwrap_or(0.0);
+        let now = now_ms();
         let live = self
             .present_history
             .iter()
-            .filter(|t| newest - **t < 2000.0)
+            .filter(|t| now - **t < 2000.0)
             .count();
         (live as f64 / 2.0).round() as u32
     }
 
     /// Request one animation frame if the tab is active and none is pending.
     fn schedule_frame(inner: &Rc<RefCell<Self>>) {
+        inner.borrow_mut().needs_render = true;
+        Self::arm_raf(inner);
+    }
+
+    /// Arm the rAF without latching `needs_render` — the loop's own re-arm
+    /// path, so ambient ticks stay governable to ~30fps.
+    fn arm_raf(inner: &Rc<RefCell<Self>>) {
         let mut s = inner.borrow_mut();
         if !s.active || s.raf_pending {
             return;
@@ -641,9 +658,14 @@ impl StationInner {
         // Event ids are unique and the snapshot carries a rolling window, so
         // retaining only the current window's ids bounds the set while still
         // deduplicating every id that can reappear.
-        self.seen_events.clear();
-        self.seen_events
-            .extend(snapshot.events.iter().map(|event| event.id.clone()));
+        // An empty events array usually means a filter matched nothing;
+        // wiping the dedup set then would respawn a particle burst for every
+        // event the moment the filter clears.
+        if !snapshot.events.is_empty() {
+            self.seen_events.clear();
+            self.seen_events
+                .extend(snapshot.events.iter().map(|event| event.id.clone()));
+        }
         self.snapshot = snapshot;
         self.rebuild_layout_cache();
         self.targets_dirty = true;
