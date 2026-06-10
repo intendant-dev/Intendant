@@ -187,13 +187,21 @@ impl StationInner {
         }
     }
 
-    /// Thumbnail frame rect (CSS px) for a display source anchored at the
-    /// projected host position. Shared by the full HUD paint and the
-    /// video-only partial repaint so the two can never drift apart.
-    pub(crate) fn thumbnail_rect(css: Vec2, css_width: f32) -> (f32, f32, f32, f32) {
+    /// Thumbnail frame rect (CSS px) for the `index`-th of `count` display
+    /// sources anchored at the projected host position. Multi-display
+    /// hosts fan out horizontally around the anchor instead of stacking
+    /// every thumbnail on the same rect. Shared by the full HUD paint and
+    /// the video-only partial repaint so the two can never drift apart.
+    pub(crate) fn thumbnail_rect(
+        css: Vec2,
+        css_width: f32,
+        index: usize,
+        count: usize,
+    ) -> ThumbRect {
         let tw = 164.0_f32.min(css_width * 0.28).max(98.0);
         let th = tw * 0.5625;
-        let x = css.x - tw / 2.0;
+        let fan = (index as f32 - count.saturating_sub(1) as f32 * 0.5) * (tw + 10.0);
+        let x = css.x - tw / 2.0 + fan;
         let y = css.y - 118.0 - th * 0.2;
         (x, y, tw, th)
     }
@@ -215,6 +223,41 @@ impl StationInner {
         Vec2::new(center.x / self.dpr as f32, center.y / self.dpr as f32)
     }
 
+    /// Every display source with its placed thumbnail rect. Sources are
+    /// sorted by id (HashMap order would make multi-display fans jitter
+    /// between paints) and indexed per host for the fan-out.
+    fn placed_display_thumbnails(&self) -> Vec<(&crate::DisplaySource, ThumbRect)> {
+        if self.display_sources.is_empty() {
+            return Vec::new();
+        }
+        let by_host = self.host_nodes();
+        let mut sources: Vec<(&String, &crate::DisplaySource)> =
+            self.display_sources.iter().collect();
+        sources.sort_by(|a, b| a.0.cmp(b.0));
+        let mut per_host_count: HashMap<&str, usize> = HashMap::new();
+        for (_, source) in &sources {
+            *per_host_count.entry(source.host_id.as_str()).or_default() += 1;
+        }
+        let css_w = self.css_width();
+        let mut per_host_seen: HashMap<&str, usize> = HashMap::new();
+        let mut placed = Vec::with_capacity(sources.len());
+        for (_, source) in sources {
+            let Some(node) = by_host.get(source.host_id.as_str()) else {
+                continue;
+            };
+            let count = per_host_count
+                .get(source.host_id.as_str())
+                .copied()
+                .unwrap_or(1);
+            let seen = per_host_seen.entry(source.host_id.as_str()).or_default();
+            let index = *seen;
+            *seen += 1;
+            let css = self.node_css_center(node);
+            placed.push((source, Self::thumbnail_rect(css, css_w, index, count)));
+        }
+        placed
+    }
+
     /// Partial HUD repaint: refresh only the live video pixels inside the
     /// already-painted thumbnail frames. Valid whenever nothing else on
     /// the HUD changed since the last full paint (`render` guarantees the
@@ -230,18 +273,12 @@ impl StationInner {
             .ctx
             .set_transform(self.dpr, 0.0, 0.0, self.dpr, 0.0, 0.0)
             .ok();
-        let by_host = self.host_nodes();
-        for source in self.display_sources.values() {
-            let Some(node) = by_host.get(source.host_id.as_str()) else {
-                continue;
-            };
+        for (source, (x, y, tw, th)) in self.placed_display_thumbnails() {
             // Sources still waiting for pixels keep their painted
             // placeholder; the first ready frame simply draws over it.
             if source.video.video_width() == 0 || source.video.video_height() == 0 {
                 continue;
             }
-            let css = self.node_css_center(node);
-            let (x, y, tw, th) = Self::thumbnail_rect(css, self.css_width());
             let _ = self
                 .hud
                 .ctx
@@ -256,16 +293,7 @@ impl StationInner {
     }
 
     pub(crate) fn draw_display_thumbnails(&self) {
-        if self.display_sources.is_empty() {
-            return;
-        }
-        let by_host = self.host_nodes();
-        for source in self.display_sources.values() {
-            let Some(node) = by_host.get(source.host_id.as_str()) else {
-                continue;
-            };
-            let css = self.node_css_center(node);
-            let (x, y, tw, th) = Self::thumbnail_rect(css, self.css_width());
+        for (source, (x, y, tw, th)) in self.placed_display_thumbnails() {
             self.glass_panel(x, y, tw, th, 6.0, C_PEACH, 1.2, 1.15);
             let video_ready = source.video.video_width() > 0 && source.video.video_height() > 0;
             if video_ready {
@@ -604,19 +632,16 @@ impl StationInner {
         );
 
         let targets = std::mem::take(&mut self.system_targets);
+        let (count, pitch, tile_h) = compact_grid(self.density, panel_h);
         let tile_w = (panel_w - 44.0) * 0.5;
         let mut tx = x + 14.0;
         let mut ty = y + 66.0;
-        for (idx, target) in targets
-            .iter()
-            .take(compact_tile_count(self.density))
-            .enumerate()
-        {
+        for (idx, target) in targets.iter().take(count).enumerate() {
             if idx > 0 && idx % 2 == 0 {
                 tx = x + 14.0;
-                ty += 58.0;
+                ty += pitch;
             }
-            self.station_focus_button(tx, ty, tile_w, 48.0, target);
+            self.station_focus_button(tx, ty, tile_w, tile_h, target);
             tx += tile_w + 16.0;
         }
         self.system_targets = targets;
@@ -2250,6 +2275,9 @@ impl StationInner {
     }
 }
 
+/// Thumbnail placement rect in CSS px: `(x, y, w, h)`.
+pub(crate) type ThumbRect = (f32, f32, f32, f32);
+
 /// Activity-lane metrics for a density setting: `(rows, row_pitch,
 /// lane_height)`. Density meaningfully packs the HUD: 0.5 shows 2 event
 /// rows, 1.0 the classic 3, 1.8 up to 5 (with a tighter pitch). Short
@@ -2266,10 +2294,17 @@ pub(crate) fn lane_metrics(density: f32, h: f32) -> (usize, f32, f32) {
     (rows, pitch, base + (rows as f32 - 3.0) * pitch)
 }
 
-/// How many summary tiles the compact (narrow) surface shows; density
-/// scales it between 4 and all 9, with 8 (the legacy count) at 1.0.
-pub(crate) fn compact_tile_count(density: f32) -> usize {
-    ((8.0 * density).round() as i32).clamp(4, 9) as usize
+/// Compact (narrow) surface tile grid for a density setting and panel
+/// height: `(tile_count, row_pitch, tile_height)`. The strip previously
+/// hard-dropped the 9th system target; now all nine fit whenever the
+/// panel has the rows for them, wrapping two per row. Density shrinks the
+/// pitch (more rows fit) and scales how many tiles are wanted — sparse
+/// 0.5 shows ~5, the default 1.0 all nine at the legacy 58px pitch.
+pub(crate) fn compact_grid(density: f32, panel_h: f32) -> (usize, f32, f32) {
+    let pitch = (58.0 / density.max(0.5)).clamp(40.0, 72.0);
+    let rows = (((panel_h - 66.0) / pitch).floor() as i32).max(1) as usize;
+    let preferred = ((9.0 * density).round() as i32).clamp(4, 9) as usize;
+    (preferred.min(rows * 2), pitch, pitch - 10.0)
 }
 
 pub(crate) struct LaneAction {
@@ -2370,11 +2405,21 @@ mod tests {
     }
 
     #[test]
-    fn compact_tile_count_scales_and_clamps() {
-        assert_eq!(compact_tile_count(1.0), 8);
-        assert_eq!(compact_tile_count(0.5), 4);
-        assert_eq!(compact_tile_count(1.8), 9);
-        // There are only nine system targets to show.
-        assert!(compact_tile_count(5.0) <= 9);
+    fn compact_grid_fits_all_nine_targets_by_default() {
+        // Tall pane at default density: every system target is reachable,
+        // at the legacy 58px pitch / 48px tile.
+        let (count, pitch, tile_h) = compact_grid(1.0, 700.0);
+        assert_eq!((count, pitch, tile_h), (9, 58.0, 48.0));
+        // Sparse density prefers fewer tiles; dense packs tighter rows.
+        assert!(compact_grid(0.5, 700.0).0 < 9);
+        let (count, pitch, _) = compact_grid(1.8, 700.0);
+        assert_eq!(count, 9);
+        assert!(pitch < 58.0);
+        // Short panes cap at what actually fits instead of overflowing.
+        let (count, pitch, _) = compact_grid(1.0, 200.0);
+        assert!(count <= ((200.0 - 66.0) / pitch) as usize * 2);
+        assert!(count >= 2);
+        // Never more than the nine system targets.
+        assert!(compact_grid(5.0, 2000.0).0 <= 9);
     }
 }

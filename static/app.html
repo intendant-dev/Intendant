@@ -11141,7 +11141,11 @@ async function ensureStation() {
     return station;
   })().catch(err => {
     stationInitPromise = null;
-    stationWasmReady = false;
+    // stationWasmReady is deliberately NOT reset here: it only becomes
+    // true after stationInit resolves, and re-running wasm-bindgen init
+    // on an already-loaded module (because StationWeb construction or a
+    // later setup step threw) would double-initialize the module on
+    // retry. A load failure leaves it false on its own.
     throw err;
   });
   return stationInitPromise;
@@ -11222,6 +11226,8 @@ function stationScheduleUpdate(opts = {}) {
   }, STATION_SNAPSHOT_COALESCE_MS);
 }
 
+let stationLastSnapshotError = '';
+
 function stationUpdateSnapshot() {
   if (!station) return;
   if (!stationSnapshotVisible()) return;
@@ -11237,8 +11243,17 @@ function stationUpdateSnapshot() {
       stationSyncHotspots();
       stationUpdateHotspotAria(snapshot);
     }
+    stationLastSnapshotError = '';
     stationStatus(station.debug_state());
   } catch (e) {
+    // Surface rejections where the operator looks (#station-status) —
+    // once per distinct error, not per coalesced tick; success clears the
+    // latch so a recurrence shows again.
+    const message = e && e.message ? e.message : String(e || 'unknown error');
+    if (message !== stationLastSnapshotError) {
+      stationLastSnapshotError = message;
+      stationStatus(`snapshot rejected: ${message}`);
+    }
     console.warn('station snapshot failed:', e);
   }
 }
@@ -11644,16 +11659,25 @@ function stationHotspotBoxes(cssW, cssH) {
   }
   const g = STATION_HUD_GEOMETRY;
   if (cssW < g.renderedDesktopMin) {
+    // Mirrors hud.rs compact_grid: all nine targets wrap two per row when
+    // the panel has the rows, with a density-scaled pitch (58px / 9 tiles
+    // at the 1.0 default). The old slice(0, 8) dropped system:view.
     const tileW = ((cssW - 36) - 44) * 0.5;
-    STATION_SYSTEM_TARGETS.slice(0, 8).forEach(([name], idx) => {
+    const density = Number.isFinite(Number(stationViewDraft?.density)) ? Number(stationViewDraft.density) : 1;
+    const panelH = Math.max(180, cssH - 92);
+    const pitch = Math.min(72, Math.max(40, 58 / Math.max(0.5, density)));
+    const rows = Math.max(1, Math.floor((panelH - 66) / pitch));
+    const preferred = Math.min(9, Math.max(4, Math.round(9 * density)));
+    const count = Math.min(preferred, rows * 2);
+    STATION_SYSTEM_TARGETS.slice(0, count).forEach(([name], idx) => {
       const col = idx % 2;
       const row = Math.floor(idx / 2);
       add(
         name,
         g.compactX + 14 + col * (tileW + g.compactGapX),
-        g.compactY + row * g.compactGapY,
+        g.compactY + row * pitch,
         tileW,
-        g.compactTileH,
+        pitch - 10,
       );
     });
     return boxes;
@@ -14986,6 +15010,10 @@ function stationOpenDisplay(hostId, displayId = 0) {
     }
     return;
   }
+  // Unknown peer id (stale snapshot, peer removed mid-click): tell the
+  // operator instead of silently doing nothing.
+  showControlToast?.('error', `Unknown peer ${hostId}; cannot open its display`);
+  stationStatus(`Display open failed: unknown peer ${hostId}`);
 }
 
 function stationSnapshotForContext() {

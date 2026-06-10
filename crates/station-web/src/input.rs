@@ -236,6 +236,23 @@ impl StationInner {
             let Some(e) = event.dyn_ref::<KeyboardEvent>() else {
                 return;
             };
+            // This is a window-level listener on a page full of real form
+            // controls: never react to shortcuts (meta/ctrl/alt chords stay
+            // the browser's / dashboard's) or to typing in an editable
+            // element — "a" in the task composer must not orbit the camera.
+            if e.meta_key() || e.ctrl_key() || e.alt_key() {
+                return;
+            }
+            if event
+                .target()
+                .and_then(|t| t.dyn_into::<web_sys::HtmlElement>().ok())
+                .is_some_and(|el| {
+                    matches!(el.tag_name().as_str(), "INPUT" | "TEXTAREA" | "SELECT")
+                        || el.is_content_editable()
+                })
+            {
+                return;
+            }
             let used = {
                 let mut s = key_inner.borrow_mut();
                 if !s.active {
@@ -249,7 +266,17 @@ impl StationInner {
                     "ArrowDown" | "s" | "S" => s.pitch = (s.pitch + 0.06).clamp(-1.05, 1.05),
                     "+" | "=" => s.distance = (s.distance - 0.6).clamp(4.2, 25.0),
                     "-" | "_" => s.distance = (s.distance + 0.6).clamp(4.2, 25.0),
-                    "Escape" => s.selected_id = None,
+                    // Only consume Escape when it actually closes a
+                    // selection; otherwise leave it to the dashboard
+                    // (modal dismissal, etc.).
+                    "Escape" => {
+                        if s.selected_id.is_some() {
+                            s.selected_id = None;
+                            s.hud_dirty = true;
+                        } else {
+                            used = false;
+                        }
+                    }
                     "1" => s.set_layout(LayoutName::Orbital),
                     "2" => s.set_layout(LayoutName::Constellation),
                     _ => used = false,
