@@ -315,6 +315,131 @@ features they lack.
   inside the diff body; `parse_diff_file_paths()` recovers them from the unified
   diff when the explicit `files_changed` list is empty.
 
+#### Model-driven fission (managed Codex)
+
+Managed Codex sessions can fork themselves. Alongside the rewind tools, the
+managed-context gate exposes a fission surface (`fission_tool()` in `mcp.rs`)
+that lets the model split separable work into parallel **full-context sibling
+branches** and join the results back deliberately. The spawn/import mechanics
+live in `main.rs` (`apply_fission_spawn_action` / `apply_fission_import_action`),
+the runtime contract in `fission_lifecycle.rs`, and the durable state in
+`fission_ledger.rs`.
+
+The tools:
+
+- **`fission_spawn`** — `branches: [{objective, write_scope?: [paths], name?}]`
+  (1-4 entries), an optional `use_worktree: bool` override applying to all
+  branches, and the usual optional `session_id`. Each entry forks the parent
+  Codex thread (`thread/fork`) into a sibling that inherits the full
+  conversation context and runs as a real supervised session. Returns the
+  `group_id`, branch session/thread ids, and worktree paths.
+- **`fission_control`** — `{group_id, op: "wait" | "import" | "cancel" |
+  "detach", branch_session_id?, timeout_s?}`. `branch_session_id` is required
+  for `import`/`cancel`/`detach`; omitting it for `wait` waits for *any*
+  branch of the group to reach a terminal status.
+- **`claim_fission_canonical`** — `{group_id, branch_session_id,
+  expected_canonical_session_id?}`: claims the group's canonical outcome,
+  first-writer-wins; pass the current canonical id to deliberately
+  compare-and-swap. Refused for detached groups and for branches carrying a
+  sticky `detached`/`cancelled` status.
+
+**Charters are the whole context contract.** Branches fork from the **last
+completed turn** and do not see the spawning turn — the in-flight tool call
+(including the `fission_spawn` arguments) is invisible to the children — so
+every `objective` must be self-contained: each fact, path, and constraint the
+branch needs. The supervisor injects a `<fission_charter>` developer message
+into each fork (`fission_charter_message`, `main.rs`) carrying identity
+(group id + branch session id), the objective, the **owned write scope** (or
+"read-only"), the worktree if any, and the report-back contract: work only
+within your write scope; end the final turn with a concise outcome summary
+(it becomes the ledger summary); call `claim_fission_canonical` if the result
+should become the group's canonical outcome; prefer the fission ledger in
+`get_status` over reading sibling raw logs. The branch then starts with a
+"Begin your fission charter: …" kickoff task as its own session, inheriting
+the parent's launch config (binary, sandbox, approval policy, managed mode).
+
+**Worktree default.** A branch that declares a `write_scope` in a git project
+gets an isolated checkout by default: `git worktree add` of a
+`fission/<short-group-hash>-<ordinal>` branch from `HEAD` under
+`.intendant/worktrees/` (`fission_branch_uses_worktree`); the spawn-level
+`use_worktree` overrides in both directions. Because a linked worktree's git
+metadata lives under the *main* repository's `.git`, the fork passes a
+per-fork config override appending the main repo's common `.git` directory to
+`sandbox_workspace_write.writable_roots` (re-including launch-level roots,
+which a per-fork value would otherwise replace), so branch commits work under
+Codex's `workspace-write` sandbox (`fork_thread_with_options_params`,
+`codex.rs`). Any failed spawn step removes the worktree that branch created,
+and a fission fork leaves the parent thread untouched — its context-pressure
+floor persists.
+
+**The fission ledger** (`fission_ledger.json` in the session log dir) is the
+durable join surface. Groups are keyed by `(parent session, spawn anchor)`;
+the anchor is the very `fission_spawn` tool-call item of the active turn,
+falling back to the newest rollout anchor named for `fission_spawn` and then
+to the catalog head (recorded honestly as tool `fission_spawn:head`). A
+daemon bus watcher (`fission_lifecycle.rs`) feeds branch lifecycle into it:
+done/task-complete events → `completed` with the branch's outcome summary
+(capped at 240 chars); interruption → `cancelled`; error-shaped teardowns →
+`failed`, generic ones → `ended` (normalizes to `completed`); project
+file-change events accumulate per-branch `changed_files` (a deduplicated
+union capped at 200 entries — branches in isolated worktrees edit outside the
+watch root and accumulate nothing). Statuses normalize onto `running |
+blocked | completed | failed | detached | cancelled`; `detached` and
+`cancelled` are **sticky** — written only by explicit supervisor APIs and
+never overwritten by a passive observation, so a stray completion event from
+a detached branch's still-running child cannot resurrect it — and a terminal
+status is never downgraded by a later, coarser observation. Routes for
+still-running branches are rehydrated from persisted ledgers at daemon
+startup; detached groups are skipped.
+
+**Waiting.** `fission_control(op="wait")` polls the ledger (1 s cadence) with
+`timeout_s` clamped to **[5, 300] (default 60)** and returns a JSON group
+snapshot tagged `outcome: terminal | still_running | detached`.
+`still_running` is a **normal** result, not an error — re-issue the wait or
+keep working and check `get_status` later. A detached group refuses the wait
+and points at the salvage paths instead.
+
+**Importing.** `fission_control(op="import")` builds a compact
+`<fission_import>` payload from the ledger — objective, normalized status,
+summary, `changed_files`/`tests_run`, worktree, and the `raw_log` pointer —
+injects it as a developer message into the parent thread, and stamps the
+branch's `imported_at` marker (re-importing refreshes it). Import is
+artifact-level: it never changes the branch status. `op="cancel"` stops the
+branch session through the same control-plane intent as the dashboard stop
+button and flips the ledger status to the sticky `cancelled`; `op="detach"`
+severs the whole group *without* stopping its sessions.
+
+**Detach-on-rewind.** A managed rewind whose cut precedes a group's spawn
+anchor severs that group. Right after a successful rollback,
+`apply_external_context_rewind` detaches every group whose anchor was cut out
+of the effective history (decided against a pre-rewind snapshot of anchor
+line positions), flips its non-terminal branches to `detached`, clears the
+canonical claim if the canonical branch itself was detached, drops the
+branches' parent-facing delivery routes — a late completion cannot
+auto-deliver into the rewound parent — and records the severed ids as
+`detached_fission_group_ids` in the durable rewind record. Branches that had
+already reached a terminal status keep it: their recorded results stay real
+even though the join point is gone. Detached groups are sticky — they refuse
+`wait`/`import`/canonical claims and cannot host new branches; salvage a
+detached branch's results manually via its `raw_log` pointer, or revisit the
+parent's pre-rewind lineage with `rewind_backout` on the covering record.
+
+**Fission is ex-ante, rewind is ex-post.** The managed developer-instructions
+block carries a fission policy (`codex.rs`): prefer `fission_spawn` with a
+self-contained charter over a deep in-context detour when a subtask is
+separable, favor breadth before pressure builds, keep working after spawning
+instead of idling behind a branch, and wait only when genuinely blocked. The
+fission tools share the managed-context exposure gate but are deliberately
+**not** in the rewind-only allowlist: under rewind-only context pressure they
+are blocked like any other ordinary tool — fission is not a recovery tool.
+
+**Observability.** `get_status` embeds the session's merged `fission_ledger`
+document — groups plus per-branch charters, import/detach markers, and any
+canonical claim — and the dashboard reads the same merged view from
+`GET /api/managed-context/fission` (newest-first, capped at 50 groups of up
+to 50 branches), rendered as the Managed tab's fission panel (see
+[Web Dashboard](./web-dashboard.md)).
+
 ### Claude Code
 
 Spawned in non-interactive stream-json mode with `--permission-prompt-tool stdio`,

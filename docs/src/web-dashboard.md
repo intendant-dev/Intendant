@@ -135,12 +135,44 @@ the patched managed build.
   `/api/managed-context/records`; clicking one shows its JSON and fills the
   backout form, which runs `rewind_backout` in `inspect`, `restore`, `fork`,
   or `backout` mode with an optional fork name.
-- **Lineage and fission** — ledger groups from `get_status` with the canonical
-  session and its branches; fission branches offer a **Claim** canonical
-  action. **Copy status JSON** copies the raw status payload.
+- **Lineage and fission** — the ledger card. Lineage groups come from the live
+  `get_status` payload; fission groups come from
+  `GET /api/managed-context/fission`, the merged ledger + extension view that
+  works for historical sessions too (live-status `fission_ledger` groups are
+  only a fallback when the endpoint has nothing yet). A fission group row
+  shows the group id, its anchoring tool (`fission_spawn`, or
+  `fission_spawn:head` when the spawn fell back to the catalog head), the
+  spawn anchor item id, the canonical session (`--` when unclaimed), and — for
+  severed groups — a **detached** chip carrying the detach time and reason.
+  Each branch row carries a status chip colored by the ledger's canonical
+  status vocabulary (`running` / `blocked` / `completed` / `failed` /
+  `detached` / `cancelled`; legacy raw values fold the same way the ledger
+  normalizes them), a **canonical** chip on the claimed branch, an
+  **imported** chip once the branch result was imported, a changed-file
+  count, the branch charter (objective, write scope, worktree path), and its
+  latest summary. (For the fission model itself — charters, worktrees,
+  detach-on-rewind — see
+  [External-Agent Orchestration](./external-agent-orchestration.md).)
+- **Per-branch fission actions** — **Wait** / **Import** / **Cancel** /
+  **Detach** run `fission_control` against the selected session. Wait uses a
+  60 s window, and a `still_running` result is surfaced as an info toast, not
+  an error; import, cancel, and detach ask for confirmation first, with
+  cancel and detach styled as destructive. **Claim** calls
+  `claim_fission_canonical`, passing the group's current canonical id as the
+  compare-and-swap guard when one exists.
+- **Spawn fission branches** — the spawn form above the ledger list: one to
+  four branch rows (objective required; optional comma-separated write scope
+  and display name; **Add branch** adds rows, each row has a remove control,
+  and the last row is always kept) plus a tri-state worktree select —
+  `default` omits `use_worktree` so write-scoped branches in a git project
+  get isolated worktrees, while `on`/`off` force it either way — submitted as
+  a single `fission_spawn` call for the selected session.
+- **Copy status JSON** copies the raw status payload.
 
-Rewind, backout, and inspect stay disabled unless the selected session is live
-and effectively managed.
+Rewind, backout, inspect, and fission spawn stay disabled unless the selected
+session is live and effectively managed. The pane refreshes when the Managed
+subtab is opened and re-schedules itself (only while the subtab is active)
+after each pane action, thread-action result, session start, and usage update.
 
 ### Stats
 

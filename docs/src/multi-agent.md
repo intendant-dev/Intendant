@@ -225,6 +225,17 @@ implementation-2 ─► branch impl-2 ─┼─► orchestrator merges each (--n
 This lets several implementation agents develop independent slices of a change at
 once, then fold them back one branch at a time.
 
+> **Native sub-agent worktrees vs. managed-Codex fission branches.** The
+> worktrees above belong to Intendant's *native* orchestration: the orchestrator
+> spawns role-scoped Intendant workers and merges their branches back itself. A
+> managed **Codex** session has a separate, *model-driven* mechanism — the
+> `fission_spawn` MCP tool forks the Codex thread into full-context sibling
+> branches that run as supervised sessions, and a branch with an owned write
+> scope gets its own checkout under `.intendant/worktrees/fission/…` via the
+> same `worktree::create` helper. Joining is deliberate (fission ledger +
+> import / canonical claim) rather than an orchestrator merge. See
+> [External-Agent Orchestration](./external-agent-orchestration.md).
+
 ## Knowledge Routing Between Agents
 
 Agents share findings through the **knowledge store** — a tagged, pub/sub-capable
