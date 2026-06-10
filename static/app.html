@@ -28491,6 +28491,10 @@ class DisplaySlot {
     // Handle incoming video track
     this.pc.ontrack = (e) => {
       this.videoEl.srcObject = e.streams[0];
+      // The slot's element can already live in the offscreen Station
+      // endpoint container, where autoplay doesn't fire on attach; a
+      // paused element renders as a frozen black Station pane.
+      this.videoEl.play().catch(() => {});
       this.connected = true;
       const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
       this.statusEl.textContent = `Connected (view-only)${res}`;
