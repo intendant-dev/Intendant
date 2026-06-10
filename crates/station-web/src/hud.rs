@@ -10,10 +10,10 @@ use crate::input::{HitAction, HitZone, ViewSliderKey};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
-    css_rgba, fmt_compact, hex_color, level_color_css, nonempty, pct_label, percent,
-    phase_color_css, pressure_color, truncate, Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER,
-    C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS,
-    C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
+    attention_level_color_css, css_rgba, fmt_compact, hex_color, level_color_css, nonempty,
+    pct_label, percent, phase_color_css, pressure_color, tone_color_css, truncate, Color, C_BLUE,
+    C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS,
+    C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
 };
 use crate::StationInner;
 
@@ -343,6 +343,39 @@ impl StationInner {
             HitAction::Layout(LayoutName::Constellation),
         );
 
+        // Attention alert strip: the snapshot's attention queue surfaces in
+        // the header so blocked work is visible from any layout. Click
+        // selects system:controls, whose focus panel lists the items.
+        let mut status_x = 318.0;
+        let queue = &self.snapshot.attention_queue;
+        if queue.count > 0 {
+            let color = if queue.blocked > 0 {
+                C_RED_CSS
+            } else {
+                C_YELLOW_CSS
+            };
+            let top = queue
+                .items
+                .first()
+                .map(|item| truncate(&item.title, 22))
+                .unwrap_or_default();
+            let label = if top.is_empty() {
+                format!("{} attention", queue.count)
+            } else {
+                format!("{} attention / {top}", queue.count)
+            };
+            let pill_w = (label.chars().count() as f32 * 6.1 + 18.0).min(w * 0.34);
+            self.pill_at(status_x, 10.0, pill_w, 23.0, &label, color, true);
+            self.hit_zones.push(HitZone::new(
+                status_x,
+                10.0,
+                pill_w,
+                23.0,
+                HitAction::Select("system:controls".to_string()),
+            ));
+            status_x += pill_w + 12.0;
+        }
+
         let active_agents = self
             .snapshot
             .agents
@@ -367,8 +400,8 @@ impl StationInner {
             },
         );
         self.text(
-            &truncate(&right, ((w - 330.0) / 7.0).max(22.0) as usize),
-            318.0,
+            &truncate(&right, ((w - status_x - 12.0) / 7.0).max(22.0) as usize),
+            status_x,
             26.0,
             10.0,
             if pending > 0 {
@@ -986,29 +1019,197 @@ impl StationInner {
             self.draw_view_focus(x, panel_w, activity_lane_y);
             return;
         }
+        if id == "system:activity" {
+            // The activity runway below IS the detail surface for this one.
+            return;
+        }
         if id.starts_with("system:") {
+            let rows = self.system_focus_rows(id);
+            let Some((title, value, detail, color)) = self
+                .system_targets
+                .iter()
+                .find(|target| target.id == id)
+                .map(|target| {
+                    (
+                        target.title.to_string(),
+                        truncate(&target.value, 52),
+                        truncate(&target.detail, 58),
+                        target.color,
+                    )
+                })
+            else {
+                return;
+            };
+            let panel_h = 112.0 + rows.len() as f32 * 17.0;
+            let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+            self.focus_panel_frame(x, y, panel_w, panel_h, &title, color);
+            self.text(&value, x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
+            self.text(&detail, x + 16.0, y + 88.0, 10.0, C_SUBTEXT0_CSS, "normal");
+            let mut row_y = y + 110.0;
+            for (label, value, color) in &rows {
+                row_y = self.focus_row(x, row_y, panel_w, label, value, color);
+            }
             return;
         }
         let panel_h = 112.0;
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
-        let (title, value, detail, color) =
-            match self.system_targets.iter().find(|target| target.id == id) {
-                Some(target) => (
-                    target.title.to_string(),
-                    truncate(&target.value, 52),
-                    truncate(&target.detail, 58),
-                    target.color,
-                ),
-                None => (
-                    "Selection".to_string(),
-                    truncate(id, 42),
-                    "scene node selected".to_string(),
-                    C_BLUE_CSS,
-                ),
-            };
-        self.focus_panel_frame(x, y, panel_w, panel_h, &title, color);
-        self.text(&value, x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
-        self.text(&detail, x + 16.0, y + 88.0, 10.0, C_SUBTEXT0_CSS, "normal");
+        self.focus_panel_frame(x, y, panel_w, panel_h, "Selection", C_BLUE_CSS);
+        self.text(&truncate(id, 52), x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
+        self.text(
+            "scene node selected",
+            x + 16.0,
+            y + 88.0,
+            10.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+    }
+
+    /// Detail rows for a system target's focus panel — this is where the
+    /// snapshot's per-domain arrays (context items, managed records, recent
+    /// sessions/worktrees/changes, display lanes, attention items) become
+    /// visible pixels. Returns `(label, value, label_color)` triplets.
+    fn system_focus_rows(&self, id: &str) -> Vec<(String, String, &'static str)> {
+        let mut rows: Vec<(String, String, &'static str)> = Vec::new();
+        match id {
+            "system:context" => {
+                for cat in self.snapshot.context.top_categories.iter().take(3) {
+                    rows.push((
+                        cat.label.clone(),
+                        format!("{} tok / {} / {}", fmt_compact(cat.value), cat.count, cat.detail),
+                        C_BLUE_CSS,
+                    ));
+                }
+                for item in self.snapshot.context.top_items.iter().take(4) {
+                    rows.push((
+                        item.label.clone(),
+                        format!("{} / {}", item.value, item.detail),
+                        tone_color_css(&item.tone),
+                    ));
+                }
+            }
+            "system:managed" => {
+                for record in self.snapshot.managed.recent_records.iter().take(4) {
+                    rows.push((
+                        record.label.clone(),
+                        format!("{} / {}", record.value, record.detail),
+                        tone_color_css(&record.tone),
+                    ));
+                }
+                if rows.is_empty() {
+                    rows.push((
+                        "records".to_string(),
+                        "no managed rewind records yet".to_string(),
+                        C_OVERLAY1_CSS,
+                    ));
+                }
+            }
+            "system:sessions" => {
+                for session in self.snapshot.sessions.recent.iter().take(4) {
+                    rows.push((
+                        session.value.clone(),
+                        format!("{} / {}", session.label, session.detail),
+                        tone_color_css(&session.tone),
+                    ));
+                }
+            }
+            "system:worktrees" => {
+                for worktree in self.snapshot.sessions.recent_worktrees.iter().take(4) {
+                    rows.push((
+                        worktree.value.clone(),
+                        format!("{} / {}", worktree.label, worktree.detail),
+                        tone_color_css(&worktree.tone),
+                    ));
+                }
+            }
+            "system:changes" => {
+                for change in self.snapshot.changes.recent.iter().take(5) {
+                    rows.push((
+                        change.value.clone(),
+                        format!("{} / {}", change.label, change.detail),
+                        tone_color_css(&change.tone),
+                    ));
+                }
+            }
+            "system:peers" => {
+                let runway = &self.snapshot.display_runway;
+                rows.push((
+                    "peers".to_string(),
+                    format!(
+                        "{}/{} connected / {} display-capable",
+                        runway.connected_peers, runway.peer_count, runway.display_peers
+                    ),
+                    C_PEACH_CSS,
+                ));
+                rows.push((
+                    "streams".to_string(),
+                    format!(
+                        "{} local / {} remote",
+                        runway.local_streams, runway.remote_streams
+                    ),
+                    C_TEAL_CSS,
+                ));
+                if !runway.selected_peer_id.is_empty() {
+                    rows.push((
+                        "target".to_string(),
+                        format!(
+                            "{} :{}",
+                            nonempty(&runway.selected_peer_label, &runway.selected_peer_id),
+                            runway.selected_display_id
+                        ),
+                        C_BLUE_CSS,
+                    ));
+                }
+                if !runway.peer_status.trim().is_empty() {
+                    rows.push((
+                        "status".to_string(),
+                        runway.peer_status.trim().to_string(),
+                        C_OVERLAY1_CSS,
+                    ));
+                }
+                for lane in runway.lanes.iter().take(3) {
+                    let tag = match lane.kind.as_str() {
+                        "local_stream" => "local",
+                        "remote_stream" => "remote",
+                        "peer_target" => "target",
+                        "operator_target" => "operator",
+                        "shared_view" => "shared",
+                        other => other,
+                    };
+                    rows.push((
+                        tag.to_string(),
+                        format!("{} / {} / {}", lane.title, lane.meta, lane.detail),
+                        if lane.selected { C_BLUE_CSS } else { C_PEACH_CSS },
+                    ));
+                }
+            }
+            "system:controls" => {
+                let queue = &self.snapshot.attention_queue;
+                rows.push((
+                    "attention".to_string(),
+                    format!(
+                        "{} blocked / {} warn / {} ready",
+                        queue.blocked, queue.warn, queue.ready
+                    ),
+                    if queue.blocked > 0 {
+                        C_RED_CSS
+                    } else if queue.warn > 0 {
+                        C_YELLOW_CSS
+                    } else {
+                        C_GREEN_CSS
+                    },
+                ));
+                for item in queue.items.iter().take(4) {
+                    rows.push((
+                        item.level.clone(),
+                        format!("{} / {} / {}", item.title, item.meta, item.detail),
+                        attention_level_color_css(&item.level),
+                    ));
+                }
+            }
+            _ => {}
+        }
+        rows
     }
 
     /// Shared focus-panel chrome: glass body, FOCUS kicker, title, and the

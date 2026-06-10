@@ -108,6 +108,32 @@ pub(crate) fn level_color_css(level: &str) -> &'static str {
     }
 }
 
+/// Detail-row tone (the dashboard's snapshot `tone` strings) to an accent
+/// color for the focus-panel row label.
+pub(crate) fn tone_color_css(tone: &str) -> &'static str {
+    match tone {
+        "ok" => C_GREEN_CSS,
+        "red" => C_RED_CSS,
+        "warning" => C_YELLOW_CSS,
+        "context" => C_BLUE_CSS,
+        "managed" => C_MAUVE_CSS,
+        "peer" => C_PEACH_CSS,
+        "session" => C_TEAL_CSS,
+        "changes" => C_BLUE_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
+/// Attention-item level to its alert color (`blocked` is the hard stop).
+pub(crate) fn attention_level_color_css(level: &str) -> &'static str {
+    match level {
+        "blocked" => C_RED_CSS,
+        "warn" => C_YELLOW_CSS,
+        "ready" => C_GREEN_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
 pub(crate) fn css_rgba(color: [f32; 4]) -> String {
     format!(
         "rgba({:.0},{:.0},{:.0},{:.3})",
