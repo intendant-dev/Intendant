@@ -6446,6 +6446,101 @@ fn requested_session_log_dirs(
     dirs
 }
 
+/// Candidate session log dirs whose ledgers may describe `session_id`: the
+/// server's primary log dir first (preserving the pre-merge `get_status`
+/// behavior), then any dirs [`requested_session_log_dirs`] resolves for the
+/// session — supervised parents log under `~/.intendant/logs/<id>/`, which is
+/// not necessarily the MCP server's own log dir.
+fn status_ledger_candidate_dirs(
+    primary_log_dir: &std::path::Path,
+    session_id: &str,
+) -> Vec<std::path::PathBuf> {
+    let mut dirs = vec![primary_log_dir.to_path_buf()];
+    let session_id = session_id.trim();
+    if !session_id.is_empty() {
+        for dir in requested_session_log_dirs(primary_log_dir, session_id) {
+            if !dirs.contains(&dir) {
+                dirs.push(dir);
+            }
+        }
+    }
+    dirs
+}
+
+/// Merge the session's lineage ledger across candidate log dirs: the first
+/// dir with a ledger seeds the result and later dirs contribute only groups
+/// not already present (keyed by `group_id`), so the primary dir's view wins
+/// on conflict.
+fn merged_lineage_ledger_for_session(
+    dirs: &[std::path::PathBuf],
+    session_id: &str,
+) -> Option<crate::lineage_ledger::LineageLedger> {
+    let mut merged: Option<crate::lineage_ledger::LineageLedger> = None;
+    for dir in dirs {
+        let Ok(Some(ledger)) = crate::lineage_ledger::read_lineage_ledger(dir, session_id) else {
+            continue;
+        };
+        match merged.as_mut() {
+            None => merged = Some(ledger),
+            Some(merged) => {
+                for group in ledger.groups {
+                    if !merged
+                        .groups
+                        .iter()
+                        .any(|existing| existing.group_id == group.group_id)
+                    {
+                        merged.groups.push(group);
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
+/// Merge the session's fission ledger DOCUMENT (groups + extension state)
+/// across candidate log dirs, with the same first-dir-wins-per-group rule as
+/// [`merged_lineage_ledger_for_session`]. Uses the document reader so detach,
+/// import, and charter extension state is visible to status consumers.
+fn merged_fission_ledger_document_for_session(
+    dirs: &[std::path::PathBuf],
+    session_id: &str,
+) -> Option<crate::fission_ledger::FissionLedgerDocument> {
+    let mut merged: Option<crate::fission_ledger::FissionLedgerDocument> = None;
+    for dir in dirs {
+        let Ok(Some(document)) =
+            crate::fission_ledger::read_fission_ledger_document_for_session(dir, session_id)
+        else {
+            continue;
+        };
+        match merged.as_mut() {
+            None => merged = Some(document),
+            Some(merged) => {
+                for group in document.groups {
+                    if !merged
+                        .groups
+                        .iter()
+                        .any(|existing| existing.group_id == group.group_id)
+                    {
+                        merged.groups.push(group);
+                    }
+                }
+                for group_ext in document.ext.groups {
+                    if !merged
+                        .ext
+                        .groups
+                        .iter()
+                        .any(|existing| existing.group_id == group_ext.group_id)
+                    {
+                        merged.ext.groups.push(group_ext);
+                    }
+                }
+            }
+        }
+    }
+    merged
+}
+
 fn hydrate_requested_session_status_from_logs(s: &mut McpAppState, session_id: &str) -> bool {
     let session_id = session_id.trim();
     if session_id.is_empty() {
@@ -8059,7 +8154,7 @@ fn shared_view_user_display_id(
 #[tool_router]
 impl IntendantServer {
     #[tool(
-        description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens, and any compact lineage/fission ledger derived from the session log."
+        description = "Get current status: provider, model, turn, budget, phase, autonomy, verbosity, tokens, and any compact lineage/fission ledger derived from the session log. The fission_ledger section carries each fission branch's charter, live status, import/detach markers, and any canonical-continuation claim."
     )]
     async fn get_status(&self) -> String {
         self.get_status_for_session(None, None).await
@@ -8168,8 +8263,11 @@ impl IntendantServer {
                 s.context_pressure_snapshot_for(Some(&session_id), managed_context_override),
             );
         }
-        if let Ok(Some(ledger)) = crate::lineage_ledger::read_lineage_ledger(&log_dir, &session_id)
-        {
+        // Supervised parents log under `~/.intendant/logs/<id>/`, which is not
+        // necessarily this server's primary log dir, so merge the ledger reads
+        // across every candidate dir the requested session is known by.
+        let ledger_dirs = status_ledger_candidate_dirs(&log_dir, &session_id);
+        if let Some(ledger) = merged_lineage_ledger_for_session(&ledger_dirs, &session_id) {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "lineage_ledger".to_string(),
@@ -8177,13 +8275,16 @@ impl IntendantServer {
                 );
             }
         }
-        if let Ok(Some(ledger)) =
-            crate::fission_ledger::read_fission_ledger_for_session(&log_dir, &session_id)
+        // Read the full ledger DOCUMENT (groups + ext) so detach/import
+        // markers and branch charters are visible in the status payload; the
+        // wire shape stays back-compatible because `ext` serializes only when
+        // non-empty.
+        if let Some(document) = merged_fission_ledger_document_for_session(&ledger_dirs, &session_id)
         {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
                     "fission_ledger".to_string(),
-                    serde_json::to_value(ledger).unwrap_or_else(|_| serde_json::json!({})),
+                    serde_json::to_value(document).unwrap_or_else(|_| serde_json::json!({})),
                 );
             }
         }
