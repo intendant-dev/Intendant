@@ -11303,6 +11303,17 @@ window.stationProbe = Object.assign(window.stationProbe || {}, {
     station?.select_by_id?.(target ? String(target) : null);
     return station?.debug_state?.() || '';
   },
+  // Programmatic activation for automation: the WASM handle is
+  // module-scoped, so the validator's wasm-activate driver reaches
+  // activate()/debug_json() through this facade.
+  activate: (target) => {
+    if (!target) return false;
+    try {
+      return stationActivateTarget(String(target));
+    } catch (_) {
+      return false;
+    }
+  },
   update: (snapshot) => {
     if (!station || !snapshot) return '';
     station.update_snapshot(snapshot);

@@ -3147,8 +3147,16 @@ function stationDebugJsonProbeSource() {
       ? options.requiredKeys.map(String)
       : ['fps', 'renderer', 'hosts'];
     const fail = (reason) => ({ ok: false, probe: 'debug-json', supported: true, failureKind: 'probe', reason });
+    // The WASM handle is module-scoped in the dashboard; the supported
+    // access path is the window.stationProbe accessor facade. Try the
+    // facade first, then any global handle (older builds / tests).
+    const probeFacade = (typeof window !== 'undefined' && window.stationProbe) || null;
+    const facadeDebugJson = probeFacade && typeof probeFacade.debugJson === 'function'
+      ? () => probeFacade.debugJson()
+      : null;
     const handle = (typeof station !== 'undefined' && station)
       || (typeof window !== 'undefined' && window.station)
+      || (facadeDebugJson ? { debug_json: facadeDebugJson } : null)
       || null;
     if (!handle) {
       return { ok: false, probe: 'debug-json', supported: false, failureKind: 'probe', reason: 'Station WASM handle is unavailable' };
@@ -3274,9 +3282,21 @@ function compactStationDebugJsonReport(value) {
 function stationActivateWasmSource() {
   return function activateStationTargetViaWasm(target, settleBudgetMs) {
     const budget = Math.max(50, Number(settleBudgetMs) || 1000);
-    const handleFor = () => (typeof station !== 'undefined' && station)
-      || (typeof window !== 'undefined' && window.station)
-      || null;
+    const handleFor = () => {
+      const direct = (typeof station !== 'undefined' && station)
+        || (typeof window !== 'undefined' && window.station)
+        || null;
+      if (direct) return direct;
+      // Module-scoped handle: the dashboard exposes accessor facades on
+      // window.stationProbe (activate/debugJson) — adapt them to the
+      // handle shape this driver expects.
+      const facade = (typeof window !== 'undefined' && window.stationProbe) || null;
+      if (!facade) return null;
+      const adapted = {};
+      if (typeof facade.activate === 'function') adapted.activate = (name) => facade.activate(name);
+      if (typeof facade.debugJson === 'function') adapted.debug_json = () => facade.debugJson();
+      return (adapted.activate || adapted.debug_json) ? adapted : null;
+    };
     const readState = () => {
       const state = { selectedId: '', statusText: '' };
       const handle = handleFor();
