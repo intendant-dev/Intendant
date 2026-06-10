@@ -74,6 +74,16 @@ pub(crate) fn phase_color(phase: &str) -> Color {
     }
 }
 
+pub(crate) fn phase_color_css(phase: &str) -> &'static str {
+    match phase {
+        "thinking" => C_LAVENDER_CSS,
+        "running" => C_TEAL_CSS,
+        "waiting" => C_YELLOW_CSS,
+        "done" => C_GREEN_CSS,
+        _ => C_OVERLAY1_CSS,
+    }
+}
+
 pub(crate) fn level_color(level: &str) -> Color {
     match level {
         "error" => C_RED,
@@ -157,6 +167,22 @@ pub(crate) fn pressure_color(pct: f32) -> &'static str {
     }
 }
 
+/// Compact human number for HUD figures: 850, 12.5k, 1.2m.
+pub(crate) fn fmt_compact(value: f32) -> String {
+    let abs = value.abs();
+    if abs >= 10_000_000.0 {
+        format!("{:.0}m", value / 1_000_000.0)
+    } else if abs >= 1_000_000.0 {
+        format!("{:.1}m", value / 1_000_000.0)
+    } else if abs >= 10_000.0 {
+        format!("{:.0}k", value / 1_000.0)
+    } else if abs >= 1_000.0 {
+        format!("{:.1}k", value / 1_000.0)
+    } else {
+        format!("{}", value.round() as i64)
+    }
+}
+
 pub(crate) fn truncate(s: &str, max: usize) -> String {
     let mut out = String::new();
     for (idx, ch) in s.chars().enumerate() {
@@ -214,6 +240,16 @@ pub(crate) fn now_ms() -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fmt_compact_scales_units() {
+        assert_eq!(fmt_compact(0.0), "0");
+        assert_eq!(fmt_compact(850.0), "850");
+        assert_eq!(fmt_compact(12_600.0), "13k");
+        assert_eq!(fmt_compact(1_500.0), "1.5k");
+        assert_eq!(fmt_compact(1_200_000.0), "1.2m");
+        assert_eq!(fmt_compact(25_000_000.0), "25m");
+    }
 
     #[test]
     fn truncate_passes_short_strings_through() {

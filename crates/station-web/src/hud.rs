@@ -10,10 +10,10 @@ use crate::input::{HitAction, HitZone};
 use crate::model::activity_retained_count;
 use crate::scene::{ndc_to_screen, LayoutName, Mood, NodeKind, ProjectedNode, Vec2};
 use crate::util::{
-    css_rgba, hex_color, level_color_css, nonempty, pct_label, percent, pressure_color, truncate,
-    Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER, C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1,
-    C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS, C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS,
-    C_TEXT_CSS, C_YELLOW_CSS,
+    css_rgba, fmt_compact, hex_color, level_color_css, nonempty, pct_label, percent,
+    phase_color_css, pressure_color, truncate, Color, C_BLUE, C_BLUE_CSS, C_GREEN_CSS, C_LAVENDER,
+    C_LAVENDER_CSS, C_MAUVE_CSS, C_OVERLAY1, C_OVERLAY1_CSS, C_PEACH, C_PEACH_CSS, C_RED_CSS,
+    C_SUBTEXT0_CSS, C_TEAL, C_TEAL_CSS, C_TEXT_CSS, C_YELLOW_CSS,
 };
 use crate::StationInner;
 
@@ -966,62 +966,348 @@ impl StationInner {
     }
 
     pub(crate) fn draw_station_focus_detail(&mut self, id: &str, w: f32, h: f32) {
-        if id.starts_with("system:") {
-            return;
-        }
         let panel_w = 370.0_f32.min(w - 48.0).max(280.0);
-        let panel_h = 112.0;
         let x = (w - panel_w - 24.0).max(24.0);
         // Sit just above the activity lane, wherever density placed it.
         let activity_lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
+        if let Some(agent) = self.snapshot.agents.iter().find(|a| a.id == id).cloned() {
+            self.draw_agent_focus(&agent, x, panel_w, activity_lane_y);
+            return;
+        }
+        if let Some(host) = id
+            .strip_prefix("host:")
+            .and_then(|hid| self.snapshot.hosts.iter().find(|h| h.id == hid))
+            .cloned()
+        {
+            self.draw_host_focus(&host, x, panel_w, activity_lane_y);
+            return;
+        }
+        if id.starts_with("system:") {
+            return;
+        }
+        let panel_h = 112.0;
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         let (title, value, detail, color) =
             match self.system_targets.iter().find(|target| target.id == id) {
                 Some(target) => (
-                    target.title,
+                    target.title.to_string(),
                     truncate(&target.value, 52),
                     truncate(&target.detail, 58),
                     target.color,
                 ),
                 None => (
-                    "Selection",
+                    "Selection".to_string(),
                     truncate(id, 42),
                     "scene node selected".to_string(),
                     C_BLUE_CSS,
                 ),
             };
-        self.glass_panel(
-            x,
-            y,
-            panel_w,
-            panel_h,
-            10.0,
-            hex_color(color).unwrap_or(C_BLUE),
-            1.5,
-            1.1,
-        );
-        self.hit_zones
-            .push(HitZone::new(x, y, panel_w, panel_h, HitAction::Noop));
-        self.text("FOCUS", x + 16.0, y + 23.0, 10.0, C_OVERLAY1_CSS, "bold");
-        self.text(title, x + 16.0, y + 47.0, 14.0, color, "bold");
+        self.focus_panel_frame(x, y, panel_w, panel_h, &title, color);
         self.text(&value, x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
         self.text(&detail, x + 16.0, y + 88.0, 10.0, C_SUBTEXT0_CSS, "normal");
-        self.pill_at(
-            x + panel_w - 70.0,
-            y + 13.0,
-            50.0,
-            23.0,
-            "close",
-            C_OVERLAY1_CSS,
-            false,
-        );
+    }
+
+    /// Shared focus-panel chrome: glass body, FOCUS kicker, title, and the
+    /// close pill (with its hit zones). Body content is the caller's.
+    pub(crate) fn focus_panel_frame(
+        &mut self,
+        x: f32,
+        y: f32,
+        w: f32,
+        h: f32,
+        title: &str,
+        color: &str,
+    ) {
+        self.glass_panel(x, y, w, h, 10.0, hex_color(color).unwrap_or(C_BLUE), 1.5, 1.1);
+        self.hit_zones
+            .push(HitZone::new(x, y, w, h, HitAction::Noop));
+        self.text("FOCUS", x + 16.0, y + 23.0, 10.0, C_OVERLAY1_CSS, "bold");
+        self.text(&truncate(title, 34), x + 16.0, y + 47.0, 14.0, color, "bold");
+        self.pill_at(x + w - 70.0, y + 13.0, 50.0, 23.0, "close", C_OVERLAY1_CSS, false);
         self.hit_zones.push(HitZone::new(
-            x + panel_w - 70.0,
+            x + w - 70.0,
             y + 13.0,
             50.0,
             23.0,
             HitAction::ClosePanel,
         ));
+    }
+
+    /// One labeled row inside a focus panel: colored label column, value
+    /// text beside it. Returns the next row baseline.
+    fn focus_row(&self, x: f32, row_y: f32, w: f32, label: &str, value: &str, color: &str) -> f32 {
+        self.text(&truncate(label, 11), x + 16.0, row_y, 9.0, color, "bold");
+        self.text(
+            &truncate(value, ((w - 116.0) / 5.6).max(18.0) as usize),
+            x + 96.0,
+            row_y,
+            9.5,
+            C_TEXT_CSS,
+            "normal",
+        );
+        row_y + 17.0
+    }
+
+    /// Real detail panel for a selected agent node: identity, model, phase,
+    /// task, budget/usage, and — when an approval is pending — the approval
+    /// command plus actionable approve/deny pills.
+    fn draw_agent_focus(
+        &mut self,
+        agent: &crate::model::StationAgent,
+        x: f32,
+        panel_w: f32,
+        activity_lane_y: f32,
+    ) {
+        let approval = agent.needs_approval
+            && (agent.host_id == "local"
+                || self
+                    .snapshot
+                    .hosts
+                    .first()
+                    .is_some_and(|h| h.id == agent.host_id)
+                || agent.approval_id.as_deref().is_some_and(|id| !id.is_empty()));
+        let rows = 5
+            + usize::from(!agent.worktree.trim().is_empty())
+            + if approval { 2 } else { 0 };
+        let panel_h = 74.0 + rows as f32 * 17.0 + if approval { 30.0 } else { 6.0 };
+        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+        let phase = phase_color_css(&agent.phase);
+        self.focus_panel_frame(x, y, panel_w, panel_h, &agent.id, phase);
+        self.text(
+            &truncate(&format!("{} agent", nonempty(&agent.role, "agent")), 30),
+            x + 96.0,
+            y + 23.0,
+            9.0,
+            C_SUBTEXT0_CSS,
+            "normal",
+        );
+
+        let mut row_y = y + 70.0;
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "source",
+            &format!(
+                "{} / {}",
+                nonempty(&agent.provider, "provider"),
+                nonempty(&agent.model, "model")
+            ),
+            C_BLUE_CSS,
+        );
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "phase",
+            &format!(
+                "{} / {}{}",
+                nonempty(&agent.phase, "idle"),
+                nonempty(&agent.status, "idle"),
+                if agent.autonomy.trim().is_empty() {
+                    String::new()
+                } else {
+                    format!(" / {} autonomy", agent.autonomy.trim())
+                }
+            ),
+            phase,
+        );
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "task",
+            &nonempty(&agent.task, "idle"),
+            C_TEAL_CSS,
+        );
+        let budget_pct = percent(agent.tokens, agent.token_cap);
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "tokens",
+            &format!(
+                "{} / {} ({})",
+                fmt_compact(agent.tokens),
+                fmt_compact(agent.token_cap),
+                pct_label(budget_pct)
+            ),
+            pressure_color(budget_pct),
+        );
+        self.meter(
+            x + 96.0,
+            row_y - 12.0,
+            panel_w - 116.0,
+            budget_pct,
+            pressure_color(budget_pct),
+        );
+        row_y += 6.0;
+        let mut usage = format!(
+            "p {} / c {} / cached {}",
+            fmt_compact(agent.prompt),
+            fmt_compact(agent.completion),
+            fmt_compact(agent.cached)
+        );
+        if agent.cost > 0.0 {
+            usage.push_str(&format!(" / ${:.2}", agent.cost));
+        }
+        if agent.turn_cap > 0 {
+            usage.push_str(&format!(" / turn {}/{}", agent.turns, agent.turn_cap));
+        } else if agent.turns > 0 {
+            usage.push_str(&format!(" / turn {}", agent.turns));
+        }
+        row_y = self.focus_row(x, row_y, panel_w, "usage", &usage, C_LAVENDER_CSS);
+        if !agent.worktree.trim().is_empty() {
+            row_y = self.focus_row(x, row_y, panel_w, "worktree", agent.worktree.trim(), C_MAUVE_CSS);
+        }
+
+        if approval {
+            row_y = self.focus_row(
+                x,
+                row_y,
+                panel_w,
+                "approval",
+                &format!(
+                    "{}{}",
+                    nonempty(&agent.approval_command, "approval required"),
+                    if agent.approval_category.trim().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", agent.approval_category.trim())
+                    }
+                ),
+                C_YELLOW_CSS,
+            );
+            let host_id = agent.host_id.clone();
+            let approval_id = agent.approval_id.clone().unwrap_or_default();
+            let py = row_y - 6.0;
+            self.pill_at(x + 96.0, py, 78.0, 23.0, "approve", C_GREEN_CSS, false);
+            self.hit_zones.push(HitZone::new(
+                x + 96.0,
+                py,
+                78.0,
+                23.0,
+                HitAction::Approval {
+                    host_id: host_id.clone(),
+                    approval_id: approval_id.clone(),
+                    decision: "approve",
+                },
+            ));
+            self.pill_at(x + 182.0, py, 58.0, 23.0, "deny", C_RED_CSS, false);
+            self.hit_zones.push(HitZone::new(
+                x + 182.0,
+                py,
+                58.0,
+                23.0,
+                HitAction::Approval {
+                    host_id,
+                    approval_id,
+                    decision: "deny",
+                },
+            ));
+        }
+    }
+
+    /// Real detail panel for a selected host node: platform, link state,
+    /// load meters, and what is running / streaming on it.
+    fn draw_host_focus(
+        &mut self,
+        host: &crate::model::StationHost,
+        x: f32,
+        panel_w: f32,
+        activity_lane_y: f32,
+    ) {
+        let panel_h = 74.0 + 4.0 * 17.0 + 6.0;
+        let y = (activity_lane_y - panel_h - 12.0).max(58.0);
+        let color = if host.connected { C_PEACH_CSS } else { C_RED_CSS };
+        self.focus_panel_frame(x, y, panel_w, panel_h, &host.name, color);
+        self.text(
+            if host.connected { "connected" } else { "offline" },
+            x + 96.0,
+            y + 23.0,
+            9.0,
+            if host.connected { C_GREEN_CSS } else { C_RED_CSS },
+            "bold",
+        );
+        let mut row_y = y + 70.0;
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "platform",
+            &format!(
+                "{} / {}",
+                nonempty(&host.platform, "unknown"),
+                nonempty(&host.region, "local")
+            ),
+            C_BLUE_CSS,
+        );
+        let cpu_pct = (host.cpu / 100.0).clamp(0.0, 1.0);
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "cpu",
+            &pct_label(cpu_pct),
+            pressure_color(cpu_pct),
+        );
+        self.meter(
+            x + 156.0,
+            row_y - 12.0,
+            panel_w - 176.0,
+            cpu_pct,
+            pressure_color(cpu_pct),
+        );
+        let mem_pct = (host.mem / 100.0).clamp(0.0, 1.0);
+        row_y = self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "memory",
+            &pct_label(mem_pct),
+            pressure_color(mem_pct),
+        );
+        self.meter(
+            x + 156.0,
+            row_y - 12.0,
+            panel_w - 176.0,
+            mem_pct,
+            pressure_color(mem_pct),
+        );
+        let agents = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| a.host_id == host.id)
+            .count();
+        let waiting = self
+            .snapshot
+            .agents
+            .iter()
+            .filter(|a| a.host_id == host.id && a.needs_approval)
+            .count();
+        let streams = self
+            .display_sources
+            .values()
+            .filter(|s| s.host_id == host.id)
+            .count();
+        self.focus_row(
+            x,
+            row_y,
+            panel_w,
+            "running",
+            &format!(
+                "{agents} agent{} / {streams} stream{}{}",
+                if agents == 1 { "" } else { "s" },
+                if streams == 1 { "" } else { "s" },
+                if waiting > 0 {
+                    format!(" / {waiting} awaiting approval")
+                } else {
+                    String::new()
+                }
+            ),
+            C_TEAL_CSS,
+        );
     }
 
     pub(crate) fn station_focus_button(

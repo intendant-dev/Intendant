@@ -305,6 +305,16 @@ impl StationInner {
                     "type": "controls_action",
                     "action": action,
             })),
+            HitAction::Approval {
+                host_id,
+                approval_id,
+                decision,
+            } => Some(serde_json::json!({
+                    "type": "approval",
+                    "host_id": host_id,
+                    "approval_id": approval_id,
+                    "decision": decision,
+            })),
         }
     }
 
@@ -412,6 +422,15 @@ pub(crate) enum HitAction {
     ClosePanel,
     ActivityAction { action: String, id: String },
     ControlsAction { action: String },
+    /// Approve/deny pill in the agent focus panel. Emits the dashboard's
+    /// existing `{type:'approval', host_id, approval_id, decision}` action
+    /// (handleStationAction routes local approvals to `app.send_approval`
+    /// and peer approvals to `resolvePeerApproval`).
+    Approval {
+        host_id: String,
+        approval_id: String,
+        decision: &'static str,
+    },
 }
 
 /// Stable name for a hit zone, used by the agentic introspection API
@@ -431,6 +450,18 @@ pub(crate) fn zone_name(action: &HitAction) -> Option<String> {
             format!("activity:{action}:{id}")
         }),
         HitAction::ControlsAction { action } => Some(format!("controls:{action}")),
+        HitAction::Approval {
+            host_id,
+            approval_id,
+            decision,
+        } => Some(format!(
+            "approval:{decision}:{}",
+            if approval_id.is_empty() {
+                host_id
+            } else {
+                approval_id
+            }
+        )),
         HitAction::Noop => None,
     }
 }
@@ -443,6 +474,7 @@ pub(crate) fn zone_kind(action: &HitAction) -> &'static str {
         HitAction::ClosePanel => "close-panel",
         HitAction::ActivityAction { .. } => "activity",
         HitAction::ControlsAction { .. } => "controls",
+        HitAction::Approval { .. } => "approval",
         HitAction::Noop => "panel",
     }
 }
@@ -559,6 +591,31 @@ mod tests {
         assert_eq!(zone_kind(&HitAction::Noop), "panel");
         assert_eq!(zone_kind(&HitAction::Layout(LayoutName::Orbital)), "layout");
         assert_eq!(zone_kind(&HitAction::Select(String::new())), "select");
+    }
+
+    #[test]
+    fn approval_zones_name_by_approval_id_with_host_fallback() {
+        let with_id = HitAction::Approval {
+            host_id: "peer-1".into(),
+            approval_id: "ap-42".into(),
+            decision: "approve",
+        };
+        assert_eq!(zone_name(&with_id).as_deref(), Some("approval:approve:ap-42"));
+        assert_eq!(zone_kind(&with_id), "approval");
+        // Local primary approvals carry no id; the host disambiguates.
+        let local = HitAction::Approval {
+            host_id: "local".into(),
+            approval_id: String::new(),
+            decision: "deny",
+        };
+        assert_eq!(zone_name(&local).as_deref(), Some("approval:deny:local"));
+        // Approval pills are panel controls, not overlay hotspots.
+        let zones = vec![HitZone::new(0.0, 0.0, 10.0, 10.0, with_id)];
+        assert!(hotspot_rects_from_zones(&zones).is_empty());
+        assert!(matches!(
+            zone_action_by_name(&zones, "approval:approve:ap-42"),
+            Some(HitAction::Approval { decision: "approve", .. })
+        ));
     }
 
     #[test]
