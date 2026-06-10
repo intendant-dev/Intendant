@@ -44,6 +44,19 @@
   --session-window-header-bg: rgba(17, 17, 27, 0.64);
   --session-window-hover-bg: rgba(24, 24, 37, 0.80);
   --session-window-chip-bg: rgba(49, 50, 68, 0.64);
+
+  /* Liquid-glass chrome tokens. backdrop-filter is reserved for flow-layout
+     chrome that can never overlap the Station canvases (status bar, ticker,
+     task bar, tab bar, Station header band). Overlays that can sit on top of
+     the canvas area (toasts, pickers, #station-status) use the translucent
+     layered backgrounds WITHOUT blur so the WebGPU/canvas scene is never
+     forced into constant recomposite. */
+  --glass-bg: rgba(24, 24, 37, 0.58);
+  --glass-bg-deep: linear-gradient(180deg, rgba(30, 30, 46, 0.72), rgba(17, 17, 27, 0.62));
+  --glass-hairline: rgba(205, 214, 244, 0.09);
+  --glass-hairline-bright: rgba(205, 214, 244, 0.16);
+  --glass-highlight: inset 0 1px 0 rgba(205, 214, 244, 0.05);
+  --glass-blur: blur(14px) saturate(1.2);
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -56,6 +69,35 @@ html, body {
   font-size: 13px;
   overflow: hidden;
   -webkit-text-size-adjust: none;
+}
+
+/* ── Scrollbars (glass) ──
+   Thin translucent thumbs on a transparent track, app-wide. Firefox picks
+   up scrollbar-color from html (inherited); WebKit/Blink use the pseudo-
+   element rules. Component-specific rules (e.g. .shell-keybar) still win
+   on specificity. */
+html {
+  scrollbar-color: rgba(88, 91, 112, 0.55) transparent;
+}
+::-webkit-scrollbar {
+  width: 10px;
+  height: 10px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(88, 91, 112, 0.45);
+  border: 2px solid transparent;
+  border-radius: 8px;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(108, 112, 134, 0.65);
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* ── Layout ── */
@@ -71,8 +113,11 @@ html, body {
   align-items: center;
   gap: 12px;
   padding: 6px 12px;
-  background: var(--crust);
-  border-bottom: 1px solid var(--surface0);
+  background: var(--glass-bg-deep);
+  border-bottom: 1px solid var(--glass-hairline-bright);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-highlight), 0 1px 10px rgba(0, 0, 0, 0.2);
   flex-shrink: 0;
   flex-wrap: wrap;
   overflow-x: hidden;
@@ -152,13 +197,15 @@ html, body {
   top: calc(100% + 6px);
   left: 50%;
   transform: translateX(-50%);
-  background: var(--surface0);
-  border: 1px solid var(--surface2);
-  border-radius: 6px;
+  /* Translucent layered glass, deliberately blur-free: the open picker can
+     extend over tab content (including the Station canvases). */
+  background: linear-gradient(180deg, rgba(49, 50, 68, 0.94), rgba(30, 30, 46, 0.96));
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 10px;
   padding: 4px 0;
   z-index: 200;
   min-width: 200px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.4);
+  box-shadow: var(--glass-highlight), 0 10px 28px rgba(0, 0, 0, 0.45);
 }
 .display-picker.visible { display: block; }
 .display-picker-item {
@@ -248,8 +295,10 @@ html, body {
   align-items: flex-start;
   gap: 8px;
   padding: 3px 12px;
-  background: var(--mantle);
-  border-bottom: 1px solid var(--surface0);
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
   font-family: 'SF Mono', 'Menlo', 'Consolas', monospace;
   font-size: 11px;
   color: var(--subtext0);
@@ -267,8 +316,11 @@ html, body {
 /* ── Tab Bar ── */
 .tab-bar {
   display: flex;
-  background: var(--mantle);
-  border-bottom: 1px solid var(--surface0);
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline-bright);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-highlight);
   flex-shrink: 0;
   overflow-x: auto;
   -webkit-overflow-scrolling: touch;
@@ -279,15 +331,19 @@ html, body {
   background: none;
   border: none;
   border-bottom: 2px solid transparent;
+  border-radius: 9px 9px 0 0;
   color: var(--overlay1);
   font-family: inherit;
   font-size: 13px;
   cursor: pointer;
   white-space: nowrap;
-  transition: color 0.15s, border-color 0.15s;
+  transition: color 0.15s, border-color 0.15s, background 0.15s;
   position: relative;
 }
-.tab-btn:hover { color: var(--subtext1); }
+.tab-btn:hover {
+  color: var(--subtext1);
+  background: rgba(205, 214, 244, 0.045);
+}
 .tab-btn.active {
   color: var(--blue);
   border-bottom-color: var(--blue);
@@ -325,6 +381,69 @@ html, body {
 }
 
 /* ── Station Tab ── */
+/* Glass chip band above the canvas (own flex row inside #tab-station, so it
+   never overlaps the canvases — backdrop-filter is safe here). Hidden until
+   a display-capable peer exists. One chip per peer, wired to the same
+   openPeerDisplay flow as Settings → Network daemons "View display". */
+.station-peer-chips {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  flex-shrink: 0;
+  padding: 5px 12px;
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+}
+.station-peer-chips.hidden { display: none; }
+.station-peer-chips-label {
+  color: var(--overlay0);
+  font-size: 10px;
+  letter-spacing: 0.4px;
+  text-transform: uppercase;
+}
+.station-peer-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  max-width: 220px;
+  padding: 3px 10px;
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 999px;
+  background: rgba(49, 50, 68, 0.5);
+  color: var(--subtext1);
+  font-family: inherit;
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  cursor: pointer;
+  box-shadow: var(--glass-highlight);
+  transition: border-color 0.15s, background 0.15s, color 0.15s;
+}
+.station-peer-chip:hover:not(:disabled) {
+  border-color: rgba(137, 180, 250, 0.55);
+  background: rgba(137, 180, 250, 0.1);
+  color: var(--blue);
+}
+.station-peer-chip:focus-visible {
+  outline: 2px solid rgba(137, 180, 250, 0.72);
+  outline-offset: 1px;
+}
+.station-peer-chip:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+.station-peer-chip .chip-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--overlay0);
+  flex-shrink: 0;
+}
+.station-peer-chip .chip-dot.ok { background: var(--green); }
 .station-pane {
   position: relative;
   flex: 1;
@@ -378,25 +497,44 @@ html, body {
   outline: none;
   box-shadow: none;
 }
+/* Glass status chip pinned to the lower-left of the Station canvas. The
+   metrics span carries the always-on `renderer · fps · displays` readout;
+   the text span carries the transient status line the validator asserts on
+   (`Opening <kind>`, debug_state dumps, failures). Deliberately blur-free:
+   it overlays the canvases. */
 .station-status {
   position: absolute;
-  left: -10000px;
-  top: auto;
-  width: 1px;
-  height: 1px;
-  max-width: 1px;
+  left: 12px;
+  bottom: 12px;
   z-index: 4;
+  display: flex;
+  align-items: center;
+  max-width: min(560px, calc(100% - 24px));
   color: var(--overlay1);
   font-size: 10px;
   line-height: 1.35;
-  padding: 4px 7px;
-  border: 1px solid rgba(69, 71, 90, 0.72);
-  border-radius: 5px;
-  background: rgba(17, 17, 27, 0.72);
+  padding: 5px 9px;
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 9px;
+  background: linear-gradient(180deg, rgba(30, 30, 46, 0.78), rgba(17, 17, 27, 0.84));
+  box-shadow: var(--glass-highlight), 0 4px 14px rgba(0, 0, 0, 0.35);
+  overflow: hidden;
+  white-space: nowrap;
+  pointer-events: none;
+}
+.station-status-metrics {
+  flex-shrink: 0;
+  color: var(--subtext0);
+  padding-right: 7px;
+  margin-right: 7px;
+  border-right: 1px solid rgba(205, 214, 244, 0.16);
+}
+.station-status-metrics:empty { display: none; }
+.station-status-text {
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
-  pointer-events: none;
 }
 
 /* ── Settings ── */
@@ -1670,8 +1808,11 @@ body.context-focus-active {
   align-items: center;
   gap: 8px;
   padding: 6px 12px;
-  background: var(--mantle);
-  border-bottom: 1px solid var(--surface0);
+  background: var(--glass-bg);
+  border-bottom: 1px solid var(--glass-hairline);
+  -webkit-backdrop-filter: var(--glass-blur);
+  backdrop-filter: var(--glass-blur);
+  box-shadow: var(--glass-highlight);
   flex-shrink: 0;
 }
 .global-task-bar .phase-banner { min-width: 160px; }
@@ -1732,7 +1873,7 @@ body.context-focus-active {
   min-height: 28px;
   padding: 4px 10px;
   border: 1px solid rgba(137, 180, 250, 0.8);
-  border-radius: 4px;
+  border-radius: 9px;
   background: var(--blue);
   color: var(--crust);
   font-family: inherit;
@@ -1780,10 +1921,10 @@ body.context-focus-active {
 .global-task-input {
   flex: 1;
   min-width: 0;
-  padding: 4px 8px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
+  padding: 4px 10px;
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 9px;
+  background: rgba(49, 50, 68, 0.42);
   color: var(--text);
   font-family: inherit;
   font-size: 12px;
@@ -1793,8 +1934,14 @@ body.context-focus-active {
   box-sizing: border-box;
   resize: none;
   overflow-y: auto;
+  box-shadow: var(--glass-highlight);
+  transition: border-color 0.15s, box-shadow 0.15s;
 }
-.global-task-input:focus { outline: none; border-color: var(--blue); }
+.global-task-input:focus {
+  outline: none;
+  border-color: rgba(137, 180, 250, 0.65);
+  box-shadow: var(--glass-highlight), 0 0 0 2px rgba(137, 180, 250, 0.16);
+}
 .global-direct-toggle {
   display: flex;
   align-items: center;
@@ -1809,15 +1956,16 @@ body.context-focus-active {
   min-width: 32px;
   min-height: 32px;
   padding: 3px 8px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 9px;
+  background: rgba(49, 50, 68, 0.5);
   color: var(--text);
   cursor: pointer;
   font-size: 14px;
   line-height: 1;
+  box-shadow: var(--glass-highlight);
 }
-.global-attach-btn:hover { background: var(--surface1); }
+.global-attach-btn:hover { background: rgba(69, 71, 90, 0.7); }
 .global-attach-btn.drag-hover {
   border-color: var(--blue);
   background: rgba(137, 180, 250, 0.18);
@@ -1852,15 +2000,16 @@ body.context-focus-active {
   min-height: 32px;
   padding: 4px 12px;
   border: 1px solid var(--green);
-  border-radius: 4px;
-  background: transparent;
+  border-radius: 9px;
+  background: rgba(166, 227, 161, 0.06);
   color: var(--green);
   font-size: 12px;
   font-weight: 600;
   cursor: pointer;
   white-space: nowrap;
+  box-shadow: 0 0 0 1px rgba(166, 227, 161, 0.08), 0 0 12px rgba(166, 227, 161, 0.1);
 }
-.global-send-btn:hover { background: rgba(166, 227, 161, 0.1); }
+.global-send-btn:hover { background: rgba(166, 227, 161, 0.14); }
 /* Steer mode — when the agent is mid-turn, the Send button becomes a
    Steer button to signal the click will inject a mid-turn message
    instead of starting a new task. Peach (interjection) to distinguish
@@ -6209,12 +6358,16 @@ body.context-focus-active {
   bottom: 16px;
   right: 16px;
   padding: 8px 14px;
-  background: var(--surface1);
+  /* Layered glass without backdrop-filter: toasts float over tab content
+     (including the Station canvases) and must not force the scene canvas
+     into constant recomposite. */
+  background: linear-gradient(180deg, rgba(49, 50, 68, 0.92), rgba(30, 30, 46, 0.94));
+  border: 1px solid var(--glass-hairline-bright);
   border-left: 3px solid var(--blue);
-  border-radius: 4px;
+  border-radius: 10px;
   color: var(--text);
   font-size: 12px;
-  box-shadow: 0 4px 12px rgba(0,0,0,0.3);
+  box-shadow: var(--glass-highlight), 0 10px 28px rgba(0, 0, 0, 0.45);
   max-width: 420px;
   z-index: 200;
   animation: control-toast-in 140ms ease-out;
@@ -8451,14 +8604,14 @@ body.display-fullscreen-open {
 
   <!-- Tab Bar -->
   <nav class="tab-bar">
-    <button class="tab-btn active" data-tab="activity">Activity<span class="badge" id="badge-activity"></span></button>
-    <button class="tab-btn" data-tab="stats">Stats</button>
-    <button class="tab-btn" data-tab="terminal">Terminal</button>
-    <button class="tab-btn" data-tab="displays">Video</button>
-    <button class="tab-btn" data-tab="station">Station</button>
-    <button class="tab-btn" data-tab="sessions">Sessions</button>
-    <button class="tab-btn" data-tab="debug">Debug</button>
-    <button class="tab-btn" data-tab="settings">Settings</button>
+    <button class="tab-btn active" data-tab="activity" title="Live agent log plus context, managed-context, changes, and control sub-tabs">Activity<span class="badge" id="badge-activity"></span></button>
+    <button class="tab-btn" data-tab="stats" title="Token usage, cost, and provider statistics per host">Stats</button>
+    <button class="tab-btn" data-tab="terminal" title="Agent TUI mirror and an interactive shell">Terminal</button>
+    <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
+    <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
+    <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
+    <button class="tab-btn" data-tab="debug" title="Daemon diagnostics and raw event streams">Debug</button>
+    <button class="tab-btn" data-tab="settings" title="Account, agent, network daemons, and debug settings">Settings</button>
   </nav>
 
   <!-- Tab Content -->
@@ -8466,22 +8619,26 @@ body.display-fullscreen-open {
 
     <!-- Station Tab -->
     <div id="tab-station" class="tab-pane">
+      <div id="station-peer-chips" class="station-peer-chips hidden" role="group" aria-label="Peer display shortcuts"></div>
       <div class="station-pane">
         <canvas id="station-scene-canvas" class="station-canvas"></canvas>
         <canvas id="station-hud-canvas" class="station-canvas"></canvas>
-        <div id="station-status" class="station-status">Station initializing</div>
+        <div id="station-status" class="station-status">
+          <span id="station-status-metrics" class="station-status-metrics"></span>
+          <span id="station-status-text" class="station-status-text">Station initializing</span>
+        </div>
         <div id="station-hotspots" class="station-hotspots" aria-label="Station controls">
-          <button class="station-hotspot" type="button" data-station-hotspot="layout:orbital" title="Orbital layout"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="layout:constellation" title="Constellation layout"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:activity" title="Activity"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:context" title="Context"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:managed" title="Managed context"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:changes" title="Changes"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:sessions" title="Sessions"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:worktrees" title="Worktrees"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:peers" title="Peers and displays"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:controls" title="Control surfaces"></button>
-          <button class="station-hotspot" type="button" data-station-hotspot="system:view" title="Station view"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="layout:orbital" title="Orbital layout" aria-label="Orbital layout"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="layout:constellation" title="Constellation layout" aria-label="Constellation layout"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:activity" title="Activity" aria-label="Activity"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:context" title="Context" aria-label="Context"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:managed" title="Managed context" aria-label="Managed context"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:changes" title="Changes" aria-label="Changes"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:sessions" title="Sessions" aria-label="Sessions"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:worktrees" title="Worktrees" aria-label="Worktrees"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:peers" title="Peers and displays" aria-label="Peers and displays"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:controls" title="Control surfaces" aria-label="Control surfaces"></button>
+          <button class="station-hotspot" type="button" data-station-hotspot="system:view" title="Station view" aria-label="Station view"></button>
         </div>
         <div id="station-display-endpoints" aria-hidden="true" style="position:absolute;left:-10000px;top:-10000px;width:1px;height:1px;overflow:hidden"></div>
       </div>
@@ -10835,13 +10992,64 @@ let stationSessionsIndexError = '';
 let stationWebgpuUnavailable = false;
 
 function stationStatus(text) {
-  const el = document.getElementById('station-status');
+  // Transient status messages land in the text span; the sibling metrics
+  // span (renderer · fps · displays) is owned by stationUpdateMetricsChip.
+  const el = document.getElementById('station-status-text') || document.getElementById('station-status');
   if (!el) return;
   let value = String(text || '');
   if (stationWebgpuUnavailable && !value.includes('WebGPU unavailable')) {
     value = `${value ? `${value} — ` : ''}WebGPU unavailable; canvas renderer active. Trust the dashboard certificate (or use a WebGPU-capable browser) to enable WebGPU.`;
   }
   el.textContent = value;
+}
+
+// ── Station status metrics chip ──
+// Always-on `renderer · fps · displays` readout in #station-status-metrics.
+// Prefers the structured station.debug_json() export when the loaded WASM
+// build provides it; otherwise scrapes the debug_state() string. Polled at
+// 1 Hz (cheap string work, one textContent write only on change) and only
+// while the Station tab is visible — never per frame.
+let stationMetricsTimer = null;
+let stationMetricsLastText = '';
+
+function stationParsedMetrics() {
+  let renderer = '';
+  let fps = '';
+  let displays = '';
+  if (station && typeof station.debug_json === 'function') {
+    try {
+      const info = JSON.parse(String(station.debug_json() || '{}')) || {};
+      renderer = String(info.renderer || '');
+      if (Number.isFinite(Number(info.fps))) fps = String(Number(info.fps));
+      if (Number.isFinite(Number(info.displays))) displays = String(Number(info.displays));
+    } catch (_) { /* fall through to debug_state scraping */ }
+  }
+  const state = station?.debug_state?.() || '';
+  if (!renderer) renderer = (/renderer=(\S+)/.exec(state) || [])[1] || stationRendererLabel();
+  if (!fps) fps = (/fps=([0-9.]+)/.exec(state) || [])[1] || '';
+  if (!displays) displays = (/displays=(\d+)/.exec(state) || [])[1] || '';
+  return {
+    renderer: renderer || 'Canvas',
+    fps: fps ? String(Math.round(Number(fps))) : '',
+    displays: displays || '0',
+  };
+}
+
+function stationUpdateMetricsChip() {
+  if (!station || activeTab !== 'station') return;
+  const el = document.getElementById('station-status-metrics');
+  if (!el) return;
+  const m = stationParsedMetrics();
+  const text = `${m.renderer} · ${m.fps || '--'} fps · ${m.displays} display${m.displays === '1' ? '' : 's'}`;
+  if (text === stationMetricsLastText) return;
+  stationMetricsLastText = text;
+  el.textContent = text;
+}
+
+function stationEnsureMetricsTimer() {
+  if (stationMetricsTimer) return;
+  stationMetricsTimer = window.setInterval(stationUpdateMetricsChip, 1000);
+  stationUpdateMetricsChip();
 }
 
 function stationWebgpuRequested() {
@@ -10870,6 +11078,13 @@ function stationRendererLabel() {
   }
   return 'Canvas';
 }
+
+// This dashboard runs as a module script, so the validator's globalThis
+// lookups need explicit exposure. stationHotspotBoxes intentionally stays
+// module-scoped: the validator then measures the live overlay buttons,
+// which track the WASM hotspot_rects() truth instead of the legacy mirror.
+globalThis.stationRendererLabel = stationRendererLabel;
+globalThis.stationWebgpuStatusLabel = stationWebgpuStatusLabel;
 
 function stationRendererStateLabel() {
   return station?.debug_state?.() || 'not initialized';
@@ -10920,6 +11135,8 @@ async function ensureStation() {
     stationSyncHotspots();
     stationUpdateSnapshot();
     stationRegisterExistingSources();
+    stationRenderPeerChips();
+    stationEnsureMetricsTimer();
     if (active) stationRefreshSharedCaches();
     return station;
   })().catch(err => {
@@ -10939,6 +11156,7 @@ function stationSetActive(active) {
       stationRefreshSharedCaches();
       stationUpdateSnapshot();
       stationRegisterExistingSources();
+      stationUpdateMetricsChip();
     }
   } else if (active) {
     ensureStation().catch(err => {
@@ -11010,6 +11228,11 @@ function stationUpdateSnapshot() {
     if (snapshotJson !== stationLastSnapshotJson) {
       station.update_snapshot(snapshot);
       stationLastSnapshotJson = snapshotJson;
+      // A new snapshot can reflow the rendered HUD, so refresh the overlay
+      // geometry and the live aria-label counts here (≤ once per coalesced
+      // 300ms window), keeping both event-driven instead of per-frame.
+      stationSyncHotspots();
+      stationUpdateHotspotAria(snapshot);
     }
     stationStatus(station.debug_state());
   } catch (e) {
@@ -11023,7 +11246,7 @@ function stationRenderedPrimaryActive() {
 
 function stationRenderedSelectPanel(target, message = '') {
   if (!stationRenderedPrimaryActive()) return false;
-  if (target) station.select_by_id?.(target);
+  if (target && !stationActivateTarget(target)) station.select_by_id?.(target);
   stationStatus(message || (station.debug_state?.() || 'Station online'));
   stationScheduleUpdate({ immediate: true });
   return true;
@@ -11061,6 +11284,17 @@ function stationOpenPanel(target, message = '') {
 window.stationProbe = Object.assign(window.stationProbe || {}, {
   renderedPrimary: () => stationRenderedPrimaryActive(),
   state: () => station?.debug_state?.() || stationRendererStateLabel(),
+  debugJson: () => {
+    try {
+      return station && typeof station.debug_json === 'function' ? String(station.debug_json() || '') : '';
+    } catch (_) {
+      return '';
+    }
+  },
+  hotspots: () => {
+    const rect = stationHudRect();
+    return stationResolvedHotspotBoxes(rect.width || 1, rect.height || 1);
+  },
   snapshot: () => buildStationSnapshot(),
   select: (target) => {
     station?.select_by_id?.(target ? String(target) : null);
@@ -11257,10 +11491,6 @@ function stationForceRouteTo(tab, subtab, after) {
   }
 }
 
-let stationSessionDockFilter = '';
-let stationSessionDockSourceFilter = '';
-let stationSessionDockStatusFilter = '';
-let stationSessionDockProjectFilter = '';
 let stationActivityDockFilter = '';
 let stationActivityDockHost = activeHostFilter || '';
 let stationActivityDockLevel = '';
@@ -11376,9 +11606,11 @@ function stationHudRect() {
     || new DOMRect(0, 0, 1, 1);
 }
 
-// Mirrors crates/station-web/src/lib.rs StationInner::draw_station_* geometry.
-// Keep these constants byte-close to Rust so keyboard/QA hotspots activate
-// the same rendered control regions.
+// LEGACY FALLBACK geometry, hand-mirrored from crates/station-web/src/lib.rs
+// StationInner::draw_station_*. Only consulted when the loaded WASM build
+// does not export station.hotspot_rects() (see stationWasmHotspotBoxes) —
+// newer builds report the rendered control regions directly and this mirror
+// no longer needs to track Rust byte-for-byte.
 const STATION_HUD_GEOMETRY = Object.freeze({
   layoutButtons: Object.freeze([
     Object.freeze({ name: 'layout:orbital', x: 96, y: 10, w: 78, h: 23 }),
@@ -11439,11 +11671,50 @@ function stationHotspotBoxes(cssW, cssH) {
   return boxes;
 }
 
+// Live hotspot geometry from the WASM HUD when the build exports it.
+// Returns null (→ caller falls back to the legacy mirrored math) when the
+// export is missing, returns malformed data, or reports no usable boxes.
+function stationWasmHotspotBoxes() {
+  if (!station || typeof station.hotspot_rects !== 'function') return null;
+  try {
+    const raw = station.hotspot_rects();
+    const list = typeof raw === 'string' ? JSON.parse(raw) : raw;
+    if (!Array.isArray(list)) return null;
+    const boxes = [];
+    for (const entry of list) {
+      const name = String(entry?.name || '').trim();
+      const x = Number(entry?.x);
+      const y = Number(entry?.y);
+      const w = Number(entry?.w);
+      const h = Number(entry?.h);
+      if (!name || !Number.isFinite(x) || !Number.isFinite(y)) continue;
+      if (!(w > 0) || !(h > 0)) continue;
+      boxes.push({ name, x, y, w, h });
+    }
+    return boxes.length ? boxes : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+function stationResolvedHotspotBoxes(cssW, cssH) {
+  return stationWasmHotspotBoxes() || stationHotspotBoxes(cssW, cssH);
+}
+
+// Repositions the invisible hotspot buttons over the rendered HUD controls.
+// Event-driven only: snapshot updates (already coalesced to 300ms), resize,
+// and tab activation — never per frame. Diffed so unchanged geometry costs
+// one JSON.stringify of ≤11 tiny boxes and zero style writes.
+let stationLastHotspotBoxesJson = '';
+
 function stationSyncHotspots() {
   const layer = document.getElementById('station-hotspots');
   if (!layer) return;
   const rect = stationHudRect();
-  const boxes = stationHotspotBoxes(rect.width || 1, rect.height || 1);
+  const boxes = stationResolvedHotspotBoxes(rect.width || 1, rect.height || 1);
+  const boxesJson = JSON.stringify(boxes);
+  if (boxesJson === stationLastHotspotBoxesJson) return;
+  stationLastHotspotBoxesJson = boxesJson;
   for (const box of boxes) {
     const el = layer.querySelector(`[data-station-hotspot="${box.name}"]`);
     if (!el) continue;
@@ -11452,6 +11723,107 @@ function stationSyncHotspots() {
     el.style.width = `${box.w}px`;
     el.style.height = `${box.h}px`;
   }
+}
+
+// ── Hotspot accessibility ──
+// The hotspot buttons are invisible (the WASM canvas draws the visuals) but
+// stay in the tree for screen readers, keyboards, and automation. Refresh
+// their aria-labels with live counts from each applied snapshot; writes are
+// cached so an unchanged label costs one Map lookup.
+const stationHotspotAriaApplied = new Map();
+
+function stationSetHotspotLabel(name, label) {
+  if (stationHotspotAriaApplied.get(name) === label) return;
+  const el = document.querySelector(`[data-station-hotspot="${name}"]`);
+  if (!el) return;
+  el.setAttribute('aria-label', label);
+  stationHotspotAriaApplied.set(name, label);
+}
+
+function stationUpdateHotspotAria(snapshot) {
+  const s = snapshot || {};
+  const sessions = s.sessions || {};
+  const changes = s.changes || {};
+  const activity = s.activity || {};
+  const managed = s.managed || {};
+  const context = s.context || {};
+  const peerHosts = (Array.isArray(s.hosts) ? s.hosts : []).filter(h => h && h.region !== 'primary');
+  const peersConnected = peerHosts.filter(h => h.connected).length;
+  const attention = Array.isArray(s.attentionQueue) ? s.attentionQueue.length : 0;
+  const layout = stationViewDraft.layout === 'constellation' ? 'constellation' : 'orbital';
+  const n = stationNum;
+  stationSetHotspotLabel('layout:orbital', `Orbital layout${layout === 'orbital' ? ' (active)' : ''}`);
+  stationSetHotspotLabel('layout:constellation', `Constellation layout${layout === 'constellation' ? ' (active)' : ''}`);
+  stationSetHotspotLabel('system:activity', `Activity: ${n(activity.shownCount)} of ${n(activity.retainedCount)} events`);
+  stationSetHotspotLabel('system:context', context.available
+    ? `Context: ${stationCompactNumber(n(context.tokens))} tokens`
+    : 'Context: no live snapshot');
+  stationSetHotspotLabel('system:managed', `Managed context: ${managed.mode || 'vanilla'}, ${n(managed.records)} records, ${n(managed.anchors)} anchors`);
+  stationSetHotspotLabel('system:changes', `Changes: ${n(changes.count)} files (${n(changes.added)} added, ${n(changes.modified)} modified, ${n(changes.deleted)} deleted)`);
+  stationSetHotspotLabel('system:sessions', `Sessions: ${n(sessions.total)} total, ${n(sessions.active)} active, ${n(sessions.external)} external`);
+  stationSetHotspotLabel('system:worktrees', `Worktrees: ${n(sessions.worktrees)}`);
+  stationSetHotspotLabel('system:peers', `Peers and displays: ${peersConnected} of ${peerHosts.length} peer${peerHosts.length === 1 ? '' : 's'} connected, ${displaySlots.size + peerDisplayConnections.size} streams`);
+  stationSetHotspotLabel('system:controls', attention
+    ? `Control surfaces: ${attention} item${attention === 1 ? '' : 's'} awaiting attention`
+    : 'Control surfaces');
+  stationSetHotspotLabel('system:view', `Station view: ${layout} layout`);
+}
+
+// Prefer the WASM activate() export (full hotspot activation) when the
+// loaded station build provides it; callers fall back to select_by_id when
+// it is missing or declines the target.
+function stationActivateTarget(target) {
+  if (!station || typeof station.activate !== 'function') return false;
+  try {
+    return station.activate(String(target || '')) === true;
+  } catch (_) {
+    return false;
+  }
+}
+
+// ── Station header peer chips ──
+// One glass chip per display-capable peer, rendered in the band above the
+// canvas and wired to the same openPeerDisplay flow as the Settings →
+// Network daemons "View display" buttons. Re-rendered from
+// renderDaemonsList (peer add/remove/state push events) and station init —
+// not on any frame or snapshot path.
+function stationRenderPeerChips() {
+  const row = document.getElementById('station-peer-chips');
+  if (!row) return;
+  const peers = daemons.filter(d => peerCanShareDisplay(d));
+  if (!peers.length) {
+    row.replaceChildren();
+    row.classList.add('hidden');
+    return;
+  }
+  const frag = document.createDocumentFragment();
+  const label = document.createElement('span');
+  label.className = 'station-peer-chips-label';
+  label.textContent = 'peer displays';
+  frag.appendChild(label);
+  for (const d of peers) {
+    const hostId = String(d.host_id || '');
+    const name = compactSessionText(d.label || hostId) || hostId;
+    const displayId = stationPeerDisplayIdForHost(hostId);
+    const chip = document.createElement('button');
+    chip.type = 'button';
+    chip.className = 'station-peer-chip';
+    chip.disabled = !d.connected;
+    chip.title = d.connected
+      ? `Open a live view of display ${displayId} on ${name}`
+      : `${name} is disconnected`;
+    chip.setAttribute('aria-label', d.connected
+      ? `View display ${displayId} on ${name}`
+      : `${name} (disconnected)`);
+    const dot = document.createElement('span');
+    dot.className = d.connected ? 'chip-dot ok' : 'chip-dot';
+    chip.appendChild(dot);
+    chip.appendChild(document.createTextNode(`${name} · d${displayId}`));
+    chip.addEventListener('click', () => stationOpenDisplay(hostId, stationPeerDisplayIdForHost(hostId)));
+    frag.appendChild(chip);
+  }
+  row.replaceChildren(frag);
+  row.classList.remove('hidden');
 }
 
 function stationApplyViewSettings(showToast = false, persist = true) {
@@ -11490,7 +11862,7 @@ function stationHotspotAt(clientX, clientY) {
   const rect = stationHudRect();
   const x = clientX - rect.left;
   const y = clientY - rect.top;
-  const boxes = stationHotspotBoxes(rect.width || 1, rect.height || 1);
+  const boxes = stationResolvedHotspotBoxes(rect.width || 1, rect.height || 1);
   for (let i = boxes.length - 1; i >= 0; i -= 1) {
     const box = boxes[i];
     if (x >= box.x && x <= box.x + box.w && y >= box.y && y <= box.y + box.h) {
@@ -11522,7 +11894,7 @@ function stationLocalDisplayLabel(display) {
   return [name, size].filter(Boolean).join(' ');
 }
 
-async function stationLoadLocalDisplaysForDock(force = false) {
+async function stationLoadLocalDisplays(force = false) {
   if (stationLocalDisplaysLoading) return;
   if (!force && stationLocalDisplayRows().length) {
     stationScheduleUpdate();
@@ -11652,7 +12024,7 @@ function stationPeerDisplayStatusPayload() {
   };
 }
 
-async function stationCopyPeerDisplayStatusFromDock() {
+async function stationCopyPeerDisplayStatus() {
   await copyTextToClipboard(JSON.stringify(stationPeerDisplayStatusPayload(), null, 2));
   stationSetPeerStatus('Peer/display status JSON copied', 'ok');
   stationScheduleUpdate();
@@ -11682,7 +12054,7 @@ function stationSharedViewStatusPayload() {
   };
 }
 
-function stationFocusSharedViewDisplayFromDock() {
+function stationFocusSharedViewDisplay() {
   if (sharedViewState.displayId === null) {
     stationSetPeerStatus('No shared-view display is selected.', 'error');
     stationScheduleUpdate();
@@ -12231,7 +12603,7 @@ function stationHandleDisplayRunwayAction(action) {
       return;
     }
     if (lane.type === 'shared_view') {
-      stationFocusSharedViewDisplayFromDock();
+      stationFocusSharedViewDisplay();
       return;
     }
     if (lane.type === 'operator_target' && lane.session_id) {
@@ -12309,12 +12681,14 @@ function stationHandleHotspot(name) {
   const target = String(name || '');
   if (!target) return;
   if (target.startsWith('layout:')) {
+    // Layout keeps the legacy path unconditionally: stationViewSet also
+    // persists the draft to localStorage, which activate() would bypass.
     stationViewSet('layout', target.slice('layout:'.length));
     stationStatus(station?.debug_state?.() || 'Station online');
     return;
   }
   if (!target.startsWith('system:')) return;
-  station?.select_by_id?.(target);
+  if (!stationActivateTarget(target)) station?.select_by_id?.(target);
   stationStatus(`Opening ${target.replace('system:', '')}`);
 }
 
@@ -12811,7 +13185,7 @@ function stationManagedStatusExportPayload(managed, contextSummary) {
   };
 }
 
-async function stationCopyManagedStatusFromDock(managed, contextSummary) {
+async function stationCopyManagedStatus(managed, contextSummary) {
   const payload = stationManagedStatusExportPayload(managed, contextSummary);
   await copyTextToClipboard(JSON.stringify(payload, null, 2));
   showControlToast?.('success', 'Managed status JSON copied');
@@ -12899,7 +13273,7 @@ function stationManagedCurrentActionSession() {
   return stationManagedSessionCandidate();
 }
 
-async function stationInspectManagedAnchorFromDock() {
+async function stationInspectManagedAnchor() {
   const sessionId = stationManagedCurrentActionSession();
   const itemId = stationManagedFormValue('anchor', 'managed-context-anchor');
   if (!sessionId || !itemId) {
@@ -12921,7 +13295,7 @@ async function stationInspectManagedAnchorFromDock() {
   }
 }
 
-async function stationSubmitManagedRewindFromDock() {
+async function stationSubmitManagedRewind() {
   const sessionId = stationManagedCurrentActionSession();
   const itemId = stationManagedFormValue('anchor', 'managed-context-anchor');
   const reason = stationManagedFormValue('reason', 'managed-context-reason');
@@ -12955,7 +13329,7 @@ async function stationSubmitManagedRewindFromDock() {
   }
 }
 
-async function stationSubmitManagedBackoutFromDock(modeOverride = '') {
+async function stationSubmitManagedBackout(modeOverride = '') {
   const sessionId = stationManagedCurrentActionSession();
   const recordId = stationManagedFormValue('record', 'managed-context-record-id');
   if (!sessionId || !recordId) {
@@ -13016,12 +13390,12 @@ async function stationSelectChange(path) {
   stationScheduleUpdate();
 }
 
-function stationChangedPathsForDock() {
+function stationChangedPaths() {
   return [...changedFiles.keys()].sort((a, b) => a.localeCompare(b));
 }
 
-async function stationCopyChangedPathsFromDock() {
-  const paths = stationChangedPathsForDock();
+async function stationCopyChangedPaths() {
+  const paths = stationChangedPaths();
   if (!paths.length) {
     showControlToast?.('info', 'No changed files to copy');
     return;
@@ -13030,7 +13404,7 @@ async function stationCopyChangedPathsFromDock() {
   showControlToast?.('info', `Copied ${paths.length} changed file path${paths.length === 1 ? '' : 's'}`);
 }
 
-async function stationCopyChangeDiffFromDock(pathArg = '') {
+async function stationCopyChangeDiff(pathArg = '') {
   const path = String(pathArg || stationSelectedChangePath || activeChangesFile || '').trim();
   if (!path) {
     showControlToast?.('error', 'Select a changed file before copying a diff');
@@ -13050,7 +13424,7 @@ async function stationCopyChangeDiffFromDock(pathArg = '') {
   showControlToast?.('info', `Copied diff for ${path}`);
 }
 
-async function stationRefreshChangesHistoryForDock() {
+async function stationRefreshChangesHistory() {
   if (stationChangesHistoryLoading) return;
   stationChangesHistoryLoading = true;
   try {
@@ -13063,14 +13437,14 @@ async function stationRefreshChangesHistoryForDock() {
   }
 }
 
-async function stationRunChangesRedoFromDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
+async function stationRunChangesRedo(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
   if (typeof doRedo === 'function') await doRedo();
-  await stationRefreshChangesHistoryForDock(selectedPath);
+  await stationRefreshChangesHistory(selectedPath);
 }
 
-async function stationRunChangesPruneFromDock(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
+async function stationRunChangesPrune(selectedPath = stationSelectedChangePath || activeChangesFile || '') {
   if (typeof doPrune === 'function') await doPrune();
-  await stationRefreshChangesHistoryForDock(selectedPath);
+  await stationRefreshChangesHistory(selectedPath);
 }
 
 // Merging the session index, live windows, metadata, and the daemon session
@@ -13125,7 +13499,7 @@ function stationCollectSessionSet() {
   return stationSessionSetCache;
 }
 
-function stationSessionRowForDock(session, indexedIds = new Set()) {
+function stationSessionRow(session, indexedIds = new Set()) {
   const id = session?.session_id || session?.resume_id || session?.backend_session_id || '';
   const status = normalizeSessionPhase(session?.status || '') || String(session?.status || 'session').trim();
   const configMeta = sessionConfigMetadata(session);
@@ -13282,7 +13656,7 @@ function stationBuildLaunchReadiness() {
   };
 }
 
-async function stationStartSessionFromDock() {
+async function stationStartSession() {
   if (!String(stationLaunchDraft.task || '').trim()) {
     const activityDraft = document.getElementById('activity-task-input')?.value || '';
     if (activityDraft.trim()) stationLaunchDraft.task = activityDraft;
@@ -13537,7 +13911,7 @@ function stationSessionConfigPayload(editing, draft) {
   };
 }
 
-function stationSaveSessionConfigFromDock(sessionOrId, options = {}) {
+function stationSaveSessionConfig(sessionOrId, options = {}) {
   const editing = stationSessionConfigEditingFor(sessionOrId);
   if (!editing) {
     showControlToast?.('error', 'Station launch config is only available for external-agent sessions');
@@ -13602,16 +13976,7 @@ function stationSaveSessionConfigFromDock(sessionOrId, options = {}) {
   }
 }
 
-function stationSessionDockRowMatchesFilters(row, query, sourceFilter, statusFilter, projectFilter) {
-  const text = [row.id, row.label, row.value, row.detail, row.project].join(' ').toLowerCase();
-  if (query && !text.includes(query)) return false;
-  if (projectFilter && row.project !== projectFilter) return false;
-  if (sourceFilter && !sessionMatchesSourceFilter(row.source || '', sourceFilter)) return false;
-  if (statusFilter && !sessionMatchesStatusFilter(row.status || '', statusFilter)) return false;
-  return true;
-}
-
-async function stationLoadWorktreesForDock(forceScan = false) {
+async function stationLoadWorktrees(forceScan = false) {
   await loadWorktrees({ forceScan });
   stationScheduleUpdate();
 }
@@ -13651,7 +14016,7 @@ function stationComputerUseValue(id, fallback = '') {
   return document.getElementById(id)?.value || fallback;
 }
 
-function stationExternalTargetRowsForDock(limit = 6) {
+function stationExternalTargetRows(limit = 6) {
   const targetId = String(resolvePromptTargetSessionId() || '').trim();
   const rows = new Map();
   const addTarget = (sessionOrId) => {
@@ -13923,15 +14288,15 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'worktrees') {
-    stationLoadWorktreesForDock(false);
+    stationLoadWorktrees(false);
     return;
   }
   if (op === 'worktrees-scan') {
-    stationLoadWorktreesForDock(true);
+    stationLoadWorktrees(true);
     return;
   }
   if (op === 'worktrees-cache') {
-    stationLoadWorktreesForDock(false);
+    stationLoadWorktrees(false);
     return;
   }
   if (op === 'worktree-search') {
@@ -14042,11 +14407,11 @@ function stationHandleSessionAction(action) {
     return;
   }
   if (op === 'config-save') {
-    stationSaveSessionConfigFromDock(stationSessionId(session) || sessionId);
+    stationSaveSessionConfig(stationSessionId(session) || sessionId);
     return;
   }
   if (op === 'config-save-restart') {
-    stationSaveSessionConfigFromDock(stationSessionId(session) || sessionId, { restart: true });
+    stationSaveSessionConfig(stationSessionId(session) || sessionId, { restart: true });
     return;
   }
   if (op === 'restart') {
@@ -14109,7 +14474,7 @@ function stationHandleManagedAction(action) {
   }
   if (op === 'anchor-inspect') {
     stationApplyManagedAction('anchor', id, sessionId)
-      .then(() => stationInspectManagedAnchorFromDock())
+      .then(() => stationInspectManagedAnchor())
       .finally(() => {
         stationRenderedSelectPanel('system:managed', 'Managed anchor inspected');
       });
@@ -14131,7 +14496,7 @@ function stationHandleManagedAction(action) {
     stationApplyManagedAction('record', id, sessionId)
       .then(() => {
         stationRememberManagedDraftValue('backoutMode', mode);
-        return stationSubmitManagedBackoutFromDock(mode);
+        return stationSubmitManagedBackout(mode);
       })
       .finally(() => {
         stationRenderedSelectPanel('system:managed', `Managed record ${mode} requested`);
@@ -14140,7 +14505,7 @@ function stationHandleManagedAction(action) {
   }
   if (op === 'dispatch-rewind') {
     Promise.resolve(id ? stationApplyManagedAction('anchor', id, sessionId) : undefined)
-      .then(() => stationSubmitManagedRewindFromDock())
+      .then(() => stationSubmitManagedRewind())
       .finally(() => {
         stationRenderedSelectPanel('system:managed', 'Managed rewind dispatched from rendered Station');
       });
@@ -14148,7 +14513,7 @@ function stationHandleManagedAction(action) {
   }
   if (op === 'run-backout') {
     Promise.resolve(id ? stationApplyManagedAction('record', id, sessionId) : undefined)
-      .then(() => stationSubmitManagedBackoutFromDock())
+      .then(() => stationSubmitManagedBackout())
       .finally(() => {
         stationRenderedSelectPanel('system:managed', 'Managed backout requested from rendered Station');
       });
@@ -14161,7 +14526,7 @@ function stationHandleManagedAction(action) {
   }
   if (op === 'copy-status') {
     const context = stationBuildContextSummary();
-    stationCopyManagedStatusFromDock(stationBuildManagedSummary(context), context)
+    stationCopyManagedStatus(stationBuildManagedSummary(context), context)
       .catch(err => showControlToast?.('error', `Copy managed status failed: ${err?.message || err}`));
     return;
   }
@@ -14372,11 +14737,11 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op === 'display-list') {
-    stationLoadLocalDisplaysForDock(true);
+    stationLoadLocalDisplays(true);
     return;
   }
   if (op === 'peer-status-copy') {
-    stationCopyPeerDisplayStatusFromDock();
+    stationCopyPeerDisplayStatus();
     return;
   }
   if (op === 'peer-refresh') {
@@ -14418,7 +14783,7 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op === 'shared-view-focus') {
-    stationFocusSharedViewDisplayFromDock();
+    stationFocusSharedViewDisplay();
     return;
   }
   if (op === 'voice-active') {
@@ -14465,7 +14830,7 @@ function stationHandleControlsAction(action) {
     return;
   }
   if (op === 'start-session') {
-    stationStartSessionFromDock();
+    stationStartSession();
     return;
   }
   if (op === 'debug-screen') {
@@ -14537,24 +14902,24 @@ function stationHandleChangesAction(action) {
     return;
   }
   if (op === 'copy-paths') {
-    stationCopyChangedPathsFromDock();
+    stationCopyChangedPaths();
     return;
   }
   if (op === 'copy-diff') {
-    stationCopyChangeDiffFromDock(path || activeChangesFile || stationSelectedChangePath)
+    stationCopyChangeDiff(path || activeChangesFile || stationSelectedChangePath)
       .catch(err => showControlToast?.('error', `Copy diff failed: ${err?.message || err}`));
     return;
   }
   if (op === 'history') {
-    stationRefreshChangesHistoryForDock(path || activeChangesFile || stationSelectedChangePath);
+    stationRefreshChangesHistory(path || activeChangesFile || stationSelectedChangePath);
     return;
   }
   if (op === 'redo') {
-    stationRunChangesRedoFromDock(activeChangesFile || path);
+    stationRunChangesRedo(activeChangesFile || path);
     return;
   }
   if (op === 'prune') {
-    stationRunChangesPruneFromDock(activeChangesFile || path);
+    stationRunChangesPrune(activeChangesFile || path);
     return;
   }
   if (op !== 'file' || !path) {
@@ -15311,36 +15676,13 @@ function stationBuildSessionsSummary() {
     if (hasPendingActiveSessionWindow(sid) || isAgentActivePhase(win.phase)) active += 1;
   }
   if (!active && isAgentActivePhase(currentPhase)) active = 1;
-  const sessionQuery = stationSessionDockFilter.trim();
-  const hasSessionFilters = !!(
-    sessionQuery ||
-    stationSessionDockSourceFilter ||
-    stationSessionDockStatusFilter ||
-    stationSessionDockProjectFilter
-  );
   const latest = sortedSessions[0] || null;
-  let recent = [];
-  let filteredRows = [];
-  if (hasSessionFilters) {
-    const sessionRows = sortedSessions.map(session => stationSessionRowForDock(session, indexedIds));
-    filteredRows = sessionRows.filter(row =>
-      stationSessionDockRowMatchesFilters(
-        row,
-        sessionQuery,
-        stationSessionDockSourceFilter,
-        stationSessionDockStatusFilter,
-        stationSessionDockProjectFilter
-      )
-    );
-    recent = sessionRows.slice(0, 6);
-  } else {
-    recent = sortedSessions
-      .slice(0, 6)
-      .map(session => stationSessionRowForDock(session, indexedIds));
-  }
+  const recent = sortedSessions
+    .slice(0, 6)
+    .map(session => stationSessionRow(session, indexedIds));
   let externalTargets = [];
   try {
-    externalTargets = stationExternalTargetRowsForDock(5).map(row => ({
+    externalTargets = stationExternalTargetRows(5).map(row => ({
       id: row.id || '',
       sessionId: row.sid || row.id || '',
       action: 'focus',
@@ -15391,12 +15733,15 @@ function stationBuildSessionsSummary() {
     indexStatus: sessionsLoaded
       ? 'loaded'
       : (stationSessionsIndexLoading ? 'indexing' : (stationSessionsIndexError ? 'error' : 'cold')),
-    searchQuery: stationSessionDockFilter || sessionSearchQuery?.() || '',
-    sourceFilter: stationSessionDockSourceFilter || '',
-    statusFilter: stationSessionDockStatusFilter || '',
-    projectFilter: stationSessionDockProjectFilter || '',
-    filtered: hasSessionFilters ? filteredRows.length : sessions.length,
-    filteredSessions: hasSessionFilters ? filteredRows.slice(0, 8) : [],
+    // The dock-era station-local session filters are gone (nothing ever set
+    // them); these stay in the snapshot because the WASM model deserializes
+    // them. The legacy Sessions tab search box still feeds searchQuery.
+    searchQuery: sessionSearchQuery?.() || '',
+    sourceFilter: '',
+    statusFilter: '',
+    projectFilter: '',
+    filtered: sessions.length,
+    filteredSessions: [],
     externalTargets,
     recent,
     ...worktrees,
@@ -35205,6 +35550,10 @@ function renderDaemonsList() {
   // Reapply per-peer WebRTC display panes so live MediaStreams stay
   // attached to the freshly-rendered <video> elements after re-render.
   reapplyPeerDisplayPanes();
+
+  // Keep the Station header's peer-display chips in sync with the same
+  // peer add/remove/state events that re-render this list.
+  stationRenderPeerChips();
 
   // Toggle host-badge visibility in the Activity tab. Single-host
   // setups stay visually clean; multi-host setups see the badges.
