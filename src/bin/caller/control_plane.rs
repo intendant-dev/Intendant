@@ -346,6 +346,7 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
                     action: op.clone(),
                     success: false,
                     message: "Codex thread action requires a target session".to_string(),
+                    record_id: None,
                 });
                 return;
             }
@@ -1485,6 +1486,7 @@ mod tests {
                     action,
                     success,
                     message,
+                    ..
                 })) => {
                     assert!(session_id.is_none());
                     assert_eq!(action, "goal-clear");

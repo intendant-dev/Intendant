@@ -144,6 +144,68 @@ fn external_resume_session_for_startup_in_home(
     (!token.trim().is_empty()).then_some(token)
 }
 
+/// Rehydrate the persisted per-session agent config for a CLI startup resume
+/// (`--resume` / `--continue` with an external backend) and lay it over
+/// `project`, mirroring the precedence `SessionSupervisor::resume_session`
+/// applies on the daemon path:
+///
+///   explicit overrides > persisted per-session config > global/TOML project
+///
+/// Returns the effective per-session overrides so callers can forward the
+/// fields that don't live in the project (`codex_service_tier`,
+/// `codex_home`) to the agent, or `None` when there is nothing to apply
+/// (fresh startup, no resume token, or no persisted config).
+fn apply_startup_external_resume_config(
+    backend: &external_agent::AgentBackend,
+    project: &mut Project,
+    intendant_session_id: Option<&str>,
+    resume_session: Option<&str>,
+) -> Option<session_config::SessionAgentConfig> {
+    apply_startup_external_resume_config_in_home(
+        &platform::home_dir(),
+        backend,
+        project,
+        intendant_session_id,
+        resume_session,
+        // No per-field agent CLI flags exist today (only `--agent <BACKEND>`),
+        // so there are no explicit overrides to protect at startup. If such
+        // flags are added, build this from them (see `session_config::from_wire`)
+        // so they keep winning over the persisted per-session config.
+        session_config::SessionAgentConfig::default(),
+    )
+}
+
+fn apply_startup_external_resume_config_in_home(
+    home: &Path,
+    backend: &external_agent::AgentBackend,
+    project: &mut Project,
+    intendant_session_id: Option<&str>,
+    resume_session: Option<&str>,
+    explicit_overrides: session_config::SessionAgentConfig,
+) -> Option<session_config::SessionAgentConfig> {
+    let resume_token = resume_session
+        .map(str::trim)
+        .filter(|token| !token.is_empty())?;
+    let session_id = intendant_session_id
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .unwrap_or(resume_token);
+    let mut config = explicit_overrides;
+    if let Some(persisted) = session_config::load_for_resume(
+        home,
+        backend.as_short_str(),
+        session_id,
+        Some(resume_token),
+    ) {
+        config.merge_missing_from(persisted);
+    }
+    if config.is_empty() {
+        return None;
+    }
+    session_config::apply_to_project(project, backend, &config);
+    Some(config)
+}
+
 fn emit_external_session_identity(
     bus: &EventBus,
     session_id: Option<String>,
@@ -4630,6 +4692,7 @@ async fn apply_external_context_rewind(
         action: "rewind_context".to_string(),
         success: true,
         message,
+        record_id: Some(record_id),
     });
     if let Err(e) = refresh_external_context_usage_snapshot(agent, config).await {
         slog(config.session_log, |l| {
@@ -4659,6 +4722,7 @@ fn emit_context_rewind_failure(
         action: "rewind_context".to_string(),
         success: false,
         message,
+        record_id: None,
     });
 }
 
@@ -6534,6 +6598,7 @@ async fn handle_external_thread_action(
         action: op.clone(),
         success,
         message: message.clone(),
+        record_id: None,
     });
 
     if success && op == "fast" {
@@ -6697,6 +6762,7 @@ async fn maybe_handle_codex_fast_slash_steer(
                 action: "fast".to_string(),
                 success: false,
                 message,
+                record_id: None,
             });
         }
     }
@@ -6814,6 +6880,7 @@ async fn handle_parent_undo_thread_action(
         action: "undo".to_string(),
         success,
         message,
+        record_id: None,
     });
 }
 
@@ -6903,6 +6970,7 @@ async fn handle_side_undo_thread_action(
         action: "undo".to_string(),
         success,
         message,
+        record_id: None,
     });
 }
 
@@ -8366,6 +8434,7 @@ async fn drain_external_agent_events(
                                 action,
                                 success: false,
                                 message,
+                                record_id: None,
                             });
                             continue;
                         }
@@ -8388,6 +8457,7 @@ async fn drain_external_agent_events(
                                             message:
                                                 "a context rewind is already scheduled for this turn"
                                                     .to_string(),
+                                            record_id: None,
                                         });
                                     } else {
                                         let thread_ids = active_context_rewind_thread_ids(config);
@@ -8404,6 +8474,7 @@ async fn drain_external_agent_events(
                                                 action,
                                                 success: false,
                                                 message,
+                                                record_id: None,
                                             });
                                             continue;
                                         }
@@ -8426,6 +8497,7 @@ async fn drain_external_agent_events(
                                                 action,
                                                 success: false,
                                                 message,
+                                                record_id: None,
                                             });
                                             continue;
                                         }
@@ -8470,6 +8542,7 @@ async fn drain_external_agent_events(
                                             action,
                                             success: true,
                                             message,
+                                            record_id: None,
                                         });
                                     }
                                 }
@@ -8479,6 +8552,7 @@ async fn drain_external_agent_events(
                                         action,
                                         success: false,
                                         message,
+                                        record_id: None,
                                     });
                                 }
                             }
@@ -17743,6 +17817,176 @@ Also: {"source": "bare"}"#;
         assert_eq!(resume_session.as_deref(), Some(backend_session_id));
     }
 
+    fn default_codex_project() -> Project {
+        // A root without intendant.toml loads pure defaults — the stand-in for
+        // the "global/TOML" config a CLI startup builds before any resume.
+        let root = tempfile::tempdir().unwrap();
+        let project = Project::from_root(root.path().to_path_buf()).unwrap();
+        assert_eq!(project.config.agent.codex.managed_context, "vanilla");
+        project
+    }
+
+    #[test]
+    fn startup_resume_applies_persisted_session_config_over_global_default() {
+        let home = tempfile::tempdir().unwrap();
+        let mut project = default_codex_project();
+        let mut persisted = session_config::from_wire(
+            Some("codex"),
+            Some("/opt/codex-fork/codex"),
+            Some("danger-full-access"),
+            Some("never"),
+            Some("managed"),
+            Some("exact"),
+            Some("priority"),
+        );
+        persisted.codex_home = Some("/home/user/.codex-managed".to_string());
+        session_config::write_external_overlay(home.path(), "codex", "backend-thread", &persisted)
+            .unwrap();
+
+        let overrides = apply_startup_external_resume_config_in_home(
+            home.path(),
+            &external_agent::AgentBackend::Codex,
+            &mut project,
+            Some("wrapper-session"),
+            Some("backend-thread"),
+            session_config::SessionAgentConfig::default(),
+        )
+        .expect("persisted overlay should produce startup overrides");
+
+        let codex = &project.config.agent.codex;
+        assert_eq!(codex.managed_context, "managed");
+        assert_eq!(codex.command, "/opt/codex-fork/codex");
+        assert_eq!(codex.sandbox, "danger-full-access");
+        assert_eq!(codex.approval_policy, "never");
+        assert_eq!(codex.context_archive, "exact");
+        assert_eq!(overrides.codex_service_tier.as_deref(), Some("priority"));
+        assert_eq!(
+            overrides.codex_home.as_deref(),
+            Some("/home/user/.codex-managed")
+        );
+    }
+
+    #[test]
+    fn startup_resume_overlay_is_found_by_wrapper_session_id_too() {
+        let home = tempfile::tempdir().unwrap();
+        let mut project = default_codex_project();
+        let persisted = session_config::from_wire(
+            Some("codex"),
+            None,
+            None,
+            None,
+            Some("managed"),
+            None,
+            None,
+        );
+        // Overlay keyed by the wrapper/intendant session id, not the backend
+        // thread id — `load_for_resume` must check both.
+        session_config::write_external_overlay(home.path(), "codex", "wrapper-session", &persisted)
+            .unwrap();
+
+        apply_startup_external_resume_config_in_home(
+            home.path(),
+            &external_agent::AgentBackend::Codex,
+            &mut project,
+            Some("wrapper-session"),
+            Some("backend-thread"),
+            session_config::SessionAgentConfig::default(),
+        )
+        .expect("overlay keyed by wrapper id should produce startup overrides");
+
+        assert_eq!(project.config.agent.codex.managed_context, "managed");
+    }
+
+    #[test]
+    fn startup_resume_explicit_overrides_win_over_persisted_config() {
+        let home = tempfile::tempdir().unwrap();
+        let mut project = default_codex_project();
+        let persisted = session_config::from_wire(
+            Some("codex"),
+            Some("/opt/codex-fork/codex"),
+            None,
+            None,
+            Some("managed"),
+            None,
+            None,
+        );
+        session_config::write_external_overlay(home.path(), "codex", "backend-thread", &persisted)
+            .unwrap();
+
+        // An explicit (e.g. future CLI-flag) override must keep winning over
+        // the persisted per-session config, like the supervisor's wire fields.
+        let explicit = session_config::from_wire(
+            Some("codex"),
+            Some("/usr/local/bin/codex"),
+            None,
+            None,
+            Some("vanilla"),
+            None,
+            None,
+        );
+        apply_startup_external_resume_config_in_home(
+            home.path(),
+            &external_agent::AgentBackend::Codex,
+            &mut project,
+            Some("wrapper-session"),
+            Some("backend-thread"),
+            explicit,
+        )
+        .expect("explicit overrides should produce startup overrides");
+
+        assert_eq!(project.config.agent.codex.managed_context, "vanilla");
+        assert_eq!(project.config.agent.codex.command, "/usr/local/bin/codex");
+    }
+
+    #[test]
+    fn startup_resume_without_persisted_config_keeps_global_config() {
+        let home = tempfile::tempdir().unwrap();
+        let mut project = default_codex_project();
+        let default_command = project.config.agent.codex.command.clone();
+
+        let overrides = apply_startup_external_resume_config_in_home(
+            home.path(),
+            &external_agent::AgentBackend::Codex,
+            &mut project,
+            Some("wrapper-session"),
+            Some("backend-thread"),
+            session_config::SessionAgentConfig::default(),
+        );
+
+        assert!(overrides.is_none(), "no overlay should mean no overrides");
+        assert_eq!(project.config.agent.codex.managed_context, "vanilla");
+        assert_eq!(project.config.agent.codex.command, default_command);
+    }
+
+    #[test]
+    fn startup_without_resume_token_never_loads_persisted_config() {
+        let home = tempfile::tempdir().unwrap();
+        let mut project = default_codex_project();
+        let persisted = session_config::from_wire(
+            Some("codex"),
+            None,
+            None,
+            None,
+            Some("managed"),
+            None,
+            None,
+        );
+        session_config::write_external_overlay(home.path(), "codex", "wrapper-session", &persisted)
+            .unwrap();
+
+        let overrides = apply_startup_external_resume_config_in_home(
+            home.path(),
+            &external_agent::AgentBackend::Codex,
+            &mut project,
+            Some("wrapper-session"),
+            None,
+            session_config::SessionAgentConfig::default(),
+        );
+
+        assert!(overrides.is_none(), "fresh startups must stay untouched");
+        assert_eq!(project.config.agent.codex.managed_context, "vanilla");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn black_frame_detector_rejects_all_zero_rgb() {
@@ -21581,6 +21825,7 @@ async fn run_with_presence(
     shared_gemini_config: control_plane::SharedGeminiConfig,
     web_port: Option<u16>,
     resume_session: Option<String>,
+    resume_session_config: Option<session_config::SessionAgentConfig>,
 ) -> Result<LoopStats, CallerError> {
     // 1. Try to create presence provider. Degrade to silent mode on failure so
     //    an external-agent-only run (e.g. codex with no API keys configured)
@@ -21780,6 +22025,9 @@ async fn run_with_presence(
     > = std::collections::VecDeque::new();
     let mut persistent_managed_context_recovery_kickstarts_without_rewind = 0u8;
     let mut startup_resume_session = resume_session;
+    // Persisted per-session agent config for the startup resume, consumed by
+    // the same agent build that consumes `startup_resume_session`.
+    let mut startup_resume_session_config = resume_session_config;
     // Track which backend the persistent agent was created for, so we can reset
     // when the web UI changes the selection between tasks.
     let mut persistent_agent_backend: Option<external_agent::AgentBackend> = None;
@@ -21934,6 +22182,7 @@ async fn run_with_presence(
                                 action: op,
                                 success: false,
                                 message,
+                                record_id: None,
                             });
                             turn_bus_rx = bus.subscribe();
                             continue;
@@ -21945,6 +22194,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active agent — start a task first".to_string(),
+                            record_id: None,
                         });
                         turn_bus_rx = bus.subscribe();
                         continue;
@@ -21955,6 +22205,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active Codex thread — start a task first".to_string(),
+                            record_id: None,
                         });
                         turn_bus_rx = bus.subscribe();
                         continue;
@@ -22247,6 +22498,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active agent — start a task first".to_string(),
+                            record_id: None,
                         });
                         continue;
                     };
@@ -22273,6 +22525,7 @@ async fn run_with_presence(
                             action: op,
                             success: false,
                             message: "no active agent — start a task first".to_string(),
+                            record_id: None,
                         });
                         continue;
                     };
@@ -22343,6 +22596,7 @@ async fn run_with_presence(
                     action: op.clone(),
                     success,
                     message: message.clone(),
+                    record_id: None,
                 });
                 if success && op == "fast" {
                     let service_tier = persistent_agent
@@ -22842,15 +23096,38 @@ async fn run_with_presence(
                     gm.include_directories = current_gemini_config.include_directories.clone();
                     gm.debug = current_gemini_config.debug;
                 }
+                // The first agent build may be resuming a session from a
+                // startup `--resume`/`--continue`. That session's persisted
+                // per-session config (managed context, sandbox, …) overrides
+                // the shared runtime config applied above — but only for the
+                // build that consumes the startup resume token. Later rebuilds
+                // start fresh threads and use the live shared config.
+                let startup_resume = startup_resume_session.take();
+                let startup_overrides = if startup_resume.is_some() {
+                    startup_resume_session_config.take().filter(|config| {
+                        config.source.as_deref().is_none_or(|source| {
+                            source == backend.as_short_str()
+                        })
+                    })
+                } else {
+                    None
+                };
+                if let Some(config) = startup_overrides.as_ref() {
+                    session_config::apply_to_project(&mut proj, backend, config);
+                }
                 let (agent, thread, event_rx) = match create_external_agent(
                     backend,
                     &proj,
                     &session_log,
                     web_port,
-                    startup_resume_session.take(),
+                    startup_resume,
                     session_log_id(&session_log),
-                    None,
-                    None,
+                    startup_overrides
+                        .as_ref()
+                        .and_then(|config| config.codex_service_tier.clone()),
+                    startup_overrides
+                        .as_ref()
+                        .and_then(|config| config.codex_home.clone()),
                 )
                 .await
                 {
@@ -24590,6 +24867,7 @@ async fn run_external_agent_mode(
                                                 action,
                                                 success: false,
                                                 message,
+                                                record_id: None,
                                             });
                                             continue;
                                         }
@@ -25241,6 +25519,7 @@ async fn run_external_agent_mode(
                             action: "managed-edit-branch".to_string(),
                             success: true,
                             message: message.clone(),
+                            record_id: None,
                         });
                         emit_follow_up_status(
                             &bus,
@@ -29205,6 +29484,22 @@ async fn main() -> Result<(), CallerError> {
         } else {
             None
         };
+        // A startup `--resume`/`--continue` of an external session must run
+        // with that session's persisted per-session agent config (managed
+        // context, sandbox, approval policy, agent command, …), not the
+        // global defaults — same rehydration the daemon resume path does in
+        // `SessionSupervisor::resume_session`. Applied after the shared
+        // runtime configs were seeded above so per-session overrides don't
+        // leak into the dashboard's global Codex config.
+        let startup_external_resume_overrides = agent_backend.as_ref().and_then(|backend| {
+            apply_startup_external_resume_config(
+                backend,
+                &mut project,
+                session_log_id(&session_log).as_deref(),
+                startup_external_resume_session.as_deref(),
+            )
+        });
+
         let mut loop_handle = if use_presence {
             // Presence mode: the presence layer mediates between user and agent
             let presence_user_rx = presence_user_rx.unwrap();
@@ -29273,6 +29568,7 @@ async fn main() -> Result<(), CallerError> {
                     shared_gemini_config_for_presence,
                     if use_web { Some(web_port) } else { None },
                     startup_external_resume_session.clone(),
+                    startup_external_resume_overrides,
                 )
                 .await;
 
@@ -29338,8 +29634,12 @@ async fn main() -> Result<(), CallerError> {
                         web_port_for_agent,
                         UserAttachments::default(),
                         startup_external_resume_session.clone(),
-                        None,
-                        None,
+                        startup_external_resume_overrides
+                            .as_ref()
+                            .and_then(|config| config.codex_service_tier.clone()),
+                        startup_external_resume_overrides
+                            .as_ref()
+                            .and_then(|config| config.codex_home.clone()),
                         None,
                         false,
                         None,
@@ -29799,6 +30099,20 @@ async fn main() -> Result<(), CallerError> {
             },
         );
 
+        // Rehydrate the resumed session's persisted per-session agent config
+        // (managed context, sandbox, approval policy, agent command, …) for a
+        // startup `--resume`/`--continue`, mirroring the daemon resume path in
+        // `SessionSupervisor::resume_session`. Applied after the shared runtime
+        // configs were seeded above so per-session overrides stay per-session.
+        let startup_external_resume_overrides = agent_backend.as_ref().and_then(|backend| {
+            apply_startup_external_resume_config(
+                backend,
+                &mut project,
+                session_log_id(&session_log).as_deref(),
+                startup_external_resume_session.as_deref(),
+            )
+        });
+
         let result = if let Some(backend) = agent_backend {
             run_external_agent_mode(
                 backend,
@@ -29816,8 +30130,12 @@ async fn main() -> Result<(), CallerError> {
                 web_port_for_agent,
                 UserAttachments::default(),
                 startup_external_resume_session.clone(),
-                None,
-                None,
+                startup_external_resume_overrides
+                    .as_ref()
+                    .and_then(|config| config.codex_service_tier.clone()),
+                startup_external_resume_overrides
+                    .as_ref()
+                    .and_then(|config| config.codex_home.clone()),
                 None,
                 false,
                 None,

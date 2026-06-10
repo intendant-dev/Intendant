@@ -659,11 +659,17 @@ pub enum AppEvent {
     /// has been executed (or failed). `success=true` → message is an
     /// informational status line; `success=false` → message is the error
     /// surfaced to the caller. Dashboard consumes to flash a toast.
+    ///
+    /// `record_id` carries the durable context-rewind record id for a
+    /// successful `rewind_context` (and is `None` for failures and every
+    /// other action), so consumers like the MCP pressure tracker don't have
+    /// to parse it back out of the human-readable `message`.
     CodexThreadActionResult {
         session_id: Option<String>,
         action: String,
         success: bool,
         message: String,
+        record_id: Option<String>,
     },
 
     /// Emitted after a generic session rename is persisted or rejected.
@@ -2147,11 +2153,13 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             action,
             success,
             message,
+            record_id,
         } => Some(OutboundEvent::CodexThreadActionResult {
             session_id: session_id.clone(),
             action: action.clone(),
             success: *success,
             message: message.clone(),
+            record_id: record_id.clone(),
         }),
         AppEvent::SessionRenameResult {
             session_id,
@@ -4166,6 +4174,36 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"autonomy_changed\""));
         assert!(json.contains("\"autonomy\":\"High\""));
+    }
+
+    #[test]
+    fn outbound_codex_thread_action_result_preserves_record_id() {
+        let event = AppEvent::CodexThreadActionResult {
+            session_id: Some("codex-thread".to_string()),
+            action: "rewind_context".to_string(),
+            success: true,
+            message: "rewound to item call-3 (before)".to_string(),
+            record_id: Some("rewind-abc123".to_string()),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"codex_thread_action_result\""));
+        assert!(json.contains("\"record_id\":\"rewind-abc123\""));
+    }
+
+    #[test]
+    fn outbound_codex_thread_action_result_omits_absent_record_id() {
+        let event = AppEvent::CodexThreadActionResult {
+            session_id: None,
+            action: "rename".to_string(),
+            success: true,
+            message: "Codex thread renamed".to_string(),
+            record_id: None,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"codex_thread_action_result\""));
+        assert!(!json.contains("record_id"));
     }
 
     #[test]
