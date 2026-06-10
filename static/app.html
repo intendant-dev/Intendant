@@ -37610,6 +37610,44 @@ class PeerDisplayConnection {
     this._diagSampler = null;
     this.displayStatusText = 'Connecting...';
     this.displayStatusKind = '';
+    // No-track watchdog: a viewed display that never delivers a video
+    // track (peer dropped the offer — e.g. no capture grant — or ICE
+    // stalled) previously sat in 'Offer sent…' forever while the Station
+    // thumbnail showed 'linking display' indefinitely. Armed in
+    // connect(), cleared by ontrack and close(); a retry click opens a
+    // fresh connection, which arms a fresh watchdog.
+    this._noTrackTimer = null;
+  }
+
+  static NO_TRACK_TIMEOUT_MS = 10000;
+
+  _armNoTrackWatchdog() {
+    this._clearNoTrackWatchdog();
+    this._noTrackTimer = window.setTimeout(() => {
+      this._noTrackTimer = null;
+      if (this.stream) return;
+      const message = 'peer did not answer — its display may need a capture grant';
+      this._log('warn', `no video track within ${PeerDisplayConnection.NO_TRACK_TIMEOUT_MS}ms — ${message}`);
+      this.setStatus(message, 'error');
+      stationPublishActivityEvent({
+        id: `peer-display-timeout:${this.hostId}:${this.displayId}:${this.sessionId}`,
+        hostId: this.hostId,
+        level: 'warn',
+        source: 'display',
+        msg: `Display ${this.displayId} on ${stationHostLabel(this.hostId)} sent no video within ${Math.round(PeerDisplayConnection.NO_TRACK_TIMEOUT_MS / 1000)}s — ${message}`,
+      });
+      // Drop the Station source so the HUD stops drawing a 'linking
+      // display' thumbnail for a stream that will never arrive.
+      stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
+      stationScheduleUpdate();
+    }, PeerDisplayConnection.NO_TRACK_TIMEOUT_MS);
+  }
+
+  _clearNoTrackWatchdog() {
+    if (this._noTrackTimer !== null) {
+      window.clearTimeout(this._noTrackTimer);
+      this._noTrackTimer = null;
+    }
   }
 
   sessionKey() {
@@ -37950,6 +37988,7 @@ class PeerDisplayConnection {
     }
 
     this.pc.ontrack = (e) => {
+      this._clearNoTrackWatchdog();
       this.stream = e.streams[0];
       const preferStationEndpoint = stationPeerDisplayPrefersStationEndpoint();
       const container = (preferStationEndpoint && stationPeerDisplayContainer(this.hostId, true, true))
@@ -38109,6 +38148,7 @@ class PeerDisplayConnection {
       await this._sendSignal(offerSignal);
       this._log('info', `offer sent (sdp_len=${offerSignal.sdp.length})`);
       this.setStatus('Offer sent, awaiting answer…', '');
+      this._armNoTrackWatchdog();
     } catch (err) {
       this._log('error', `offer failed: ${err.message}`);
       this.setStatus(`Offer failed: ${err.message}`, 'error');
@@ -38604,6 +38644,7 @@ class PeerDisplayConnection {
   }
 
   async close() {
+    this._clearNoTrackWatchdog();
     stationUnregisterVideoSource(`peer:${this.hostId}:${this.displayId}:${this.sessionId}`);
     stationScheduleUpdate();
     // F-2: tear down input listeners FIRST. The `pc.close()` chain
