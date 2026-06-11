@@ -163,6 +163,44 @@ node scripts/validate-dashboard.cjs --port 8897 \
 For ad-hoc reads in an existing run, `--wait-for-function` can evaluate any expression on
 the page, e.g. `--wait-for-function "() => station && station.debug_json && station.debug_json().fps >= 24"`.
 
+## Operability Sweep (`--station-workflows`) And Real Dispatch (`--station-send`)
+
+`--station-workflows` proves the Station is usable purely from inside the canvas, via the
+same `window.stationProbe` facade agents use:
+
+1. composer round-trip — open (zone `composer:open-send`, facade fallback), the DOM
+   overlay `#station-composer-input` becomes visible and focused, accepts text, closes;
+2. sessions panel — opens with actionable `session:*` row zones (waits for the async
+   session index when `sessions.total > 0`);
+3. controls panel — autonomy / backend choice pills present (`controls:autonomy:*`,
+   `controls:backend:*`);
+4. transcript viewer — opens from a `session:station-log:<id>` row with rows > 0
+   (skipped with an explicit reason on dashboards with no sessions);
+5. scroll — a real CDP `mouseWheel` over a scrollable panel moves its `debug_json`
+   scroll offset (zone rects come from `debug_json().scroll`).
+
+It is read-mostly (opens/closes surfaces, dispatches nothing) and safe on any dashboard.
+`--station-send TEXT` is the MUTATING counterpart: it types TEXT into the composer and
+submits through the real dispatch path (steer / follow-up / `create_session`); the pass
+signal is the composer clearing, which only happens on a successful dispatch. Point it at
+disposable sessions only.
+
+The richer canvas state is all in `debug_json()`: `composer: {open, mode}`,
+`transcript: {sessionId, mode, rows, total}`, and `scroll: [{panel, offset, max, x, y,
+w, h}]` — assert on these the same way as `selectedId`.
+
+## Browser Health Note (Debian Chromium)
+
+A distro Chromium upgrade can silently break ALL page navigation (CDP `Page.navigate`
+never resolves, no error anywhere, browser may exit) while `curl` works — seen with the
+148→149 Debian upgrade on the GPU host (2026-06-11; 148 reinstalled from
+snapshot.debian.org and held with `apt-mark hold chromium chromium-common
+chromium-sandbox`). Two triage rules: always launch test browsers with the validator's
+flag set (notably `--disable-background-networking`) before suspecting the dashboard, and
+when navigation hangs in a fresh profile on a trivial `data:` URL vs an `http:` URL, it
+is the browser, not the page — check `dpkg.log` for a fresh chromium upgrade before
+debugging the app. Release the hold once a fixed Debian build lands.
+
 ## Portal-Grant Caveats (display streams)
 
 `displays` in `debug_json` and the "with displays" leg of the perf eval only exercise real
