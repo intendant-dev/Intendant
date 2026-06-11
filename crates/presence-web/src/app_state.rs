@@ -280,6 +280,10 @@ pub enum UiCommand {
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
+        managed_command: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        managed_command_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]
         approval_policy: Option<String>,
@@ -292,11 +296,19 @@ pub enum UiCommand {
         #[serde(default, skip_serializing_if = "std::ops::Not::not")]
         reasoning_effort_cleared: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
+        service_tier: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        service_tier_cleared: bool,
+        #[serde(skip_serializing_if = "Option::is_none")]
         web_search: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         network_access: Option<bool>,
         #[serde(skip_serializing_if = "Option::is_none")]
         writable_roots: Option<Vec<String>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        managed_context: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        context_archive: Option<String>,
     },
     /// Mirror of `CodexThreadActionResult` for Gemini's session actions.
     /// Currently only `"new"` is valid; shape matches for future growth.
@@ -1994,17 +2006,52 @@ impl AppState {
                                 .filter_map(|v| v.as_str().map(String::from))
                                 .collect()
                         });
+                // This translation used to enumerate a SUBSET of the wire
+                // fields, silently dropping managed_context /
+                // context_archive / service_tier — the dashboard's handler
+                // had arms for them that never fired. Forward everything
+                // the daemon's CodexConfigChanged carries.
+                let managed_command = msg
+                    .get("managed_command")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let managed_command_cleared = msg
+                    .get("managed_command_cleared")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let service_tier = msg
+                    .get("service_tier")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let service_tier_cleared = msg
+                    .get("service_tier_cleared")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let managed_context = msg
+                    .get("managed_context")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
+                let context_archive = msg
+                    .get("context_archive")
+                    .and_then(|v| v.as_str())
+                    .map(String::from);
                 cmds.push(UiCommand::CodexConfigChanged {
                     command,
+                    managed_command,
+                    managed_command_cleared,
                     sandbox,
                     approval_policy,
                     model,
                     model_cleared,
                     reasoning_effort,
                     reasoning_effort_cleared,
+                    service_tier,
+                    service_tier_cleared,
                     web_search,
                     network_access,
                     writable_roots,
+                    managed_context,
+                    context_archive,
                 });
             }
 
@@ -3773,13 +3820,17 @@ mod tests {
         let msg = json!({
             "event": "codex_config_changed",
             "command": "/opt/bin/codex",
+            "managed_command": "/opt/bin/codex-fork",
             "sandbox": "danger-full-access",
             "approval_policy": "never",
             "model": "gpt-5",
             "reasoning_effort": "high",
+            "service_tier": "priority",
             "web_search": true,
             "network_access": true,
-            "writable_roots": ["/tmp/extra"]
+            "writable_roots": ["/tmp/extra"],
+            "managed_context": "managed",
+            "context_archive": "exact"
         });
         let cmds = s.handle_message(&msg);
         let matched = cmds.iter().any(|c| {
@@ -3787,22 +3838,32 @@ mod tests {
                 c,
                 UiCommand::CodexConfigChanged {
                     command: Some(cmd),
+                    managed_command: Some(fork),
+                    managed_command_cleared: false,
                     sandbox: Some(sand),
                     approval_policy: Some(p),
                     model: Some(m),
                     model_cleared: false,
                     reasoning_effort: Some(re),
                     reasoning_effort_cleared: false,
+                    service_tier: Some(tier),
+                    service_tier_cleared: false,
                     web_search: Some(true),
                     network_access: Some(true),
                     writable_roots: Some(roots),
+                    managed_context: Some(mc),
+                    context_archive: Some(ca),
                 } if cmd == "/opt/bin/codex"
+                    && fork == "/opt/bin/codex-fork"
                     && sand == "danger-full-access"
                     && p == "never"
                     && m == "gpt-5"
                     && re == "high"
+                    && tier == "priority"
                     && roots.len() == 1
                     && roots[0] == "/tmp/extra"
+                    && mc == "managed"
+                    && ca == "exact"
             )
         });
         assert!(
@@ -3825,15 +3886,21 @@ mod tests {
                 c,
                 UiCommand::CodexConfigChanged {
                     command: None,
+                    managed_command: None,
+                    managed_command_cleared: false,
                     sandbox: None,
                     approval_policy: None,
                     model: None,
                     model_cleared: true,
                     reasoning_effort: None,
                     reasoning_effort_cleared: false,
+                    service_tier: None,
+                    service_tier_cleared: false,
                     web_search: None,
                     network_access: None,
                     writable_roots: None,
+                    managed_context: None,
+                    context_archive: None,
                 }
             )
         });
