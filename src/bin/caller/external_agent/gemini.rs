@@ -914,7 +914,8 @@ impl ExternalAgent for GeminiAgent {
             .current_dir(&config.working_dir)
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit());
+            .stderr(std::process::Stdio::piped());
+        crate::platform::die_with_parent(&mut command);
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);
         let mut child = command.spawn().map_err(|e| {
@@ -930,6 +931,7 @@ impl ExternalAgent for GeminiAgent {
             .stdout
             .take()
             .ok_or_else(|| CallerError::ExternalAgent("Failed to capture child stdout".into()))?;
+        let stderr = child.stderr.take();
 
         if let Some(pid) = child_pid {
             super::register_child_process(pid);
@@ -940,6 +942,9 @@ impl ExternalAgent for GeminiAgent {
 
         let (event_tx, event_rx) = mpsc::unbounded_channel();
         self.event_tx = Some(event_tx.clone());
+        if let Some(stderr) = stderr {
+            super::spawn_stderr_forwarder("gemini", stderr, event_tx.clone());
+        }
 
         // Spawn reader task (gets its own Arc to the shared writer for error responses)
         let pending_requests = Arc::clone(&self.pending_requests);

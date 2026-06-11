@@ -45,6 +45,61 @@ pub(crate) fn cleanup_spawned_child_processes_now() -> Vec<u32> {
     cleaned
 }
 
+/// Classify one external-agent stderr line for the activity log: transport
+/// and auth failures must be visible to the operator (the Codex websocket
+/// 401s after a revoked token were previously only readable in the daemon's
+/// own stderr — turns just silently never answered), while routine progress
+/// noise stays at detail verbosity.
+pub(crate) fn stderr_line_level(line: &str) -> &'static str {
+    let lowered = line.to_ascii_lowercase();
+    if lowered.contains("error")
+        || lowered.contains("panic")
+        || lowered.contains("unauthorized")
+        || lowered.contains("forbidden")
+        || lowered.contains("failed to connect")
+        || lowered.contains("connection refused")
+    {
+        "error"
+    } else if lowered.contains("warn") {
+        "warn"
+    } else {
+        "detail"
+    }
+}
+
+/// Forward a spawned agent's stderr into the session activity stream as
+/// `AgentEvent::Log` entries. Every external backend previously inherited
+/// stderr into the daemon's own stderr, where nobody supervising from a
+/// frontend could see it. Lines are length-capped and the task ends with
+/// the pipe.
+pub(crate) fn spawn_stderr_forwarder(
+    backend_label: &'static str,
+    stderr: tokio::process::ChildStderr,
+    event_tx: mpsc::UnboundedSender<AgentEvent>,
+) {
+    use tokio::io::AsyncBufReadExt;
+    tokio::spawn(async move {
+        let mut lines = tokio::io::BufReader::new(stderr).lines();
+        while let Ok(Some(line)) = lines.next_line().await {
+            let trimmed = line.trim();
+            if trimmed.is_empty() {
+                continue;
+            }
+            let capped: String = trimmed.chars().take(600).collect();
+            let level = stderr_line_level(&capped);
+            if event_tx
+                .send(AgentEvent::Log {
+                    level: level.to_string(),
+                    message: format!("[{backend_label} stderr] {capped}"),
+                })
+                .is_err()
+            {
+                break;
+            }
+        }
+    });
+}
+
 /// One image attachment passed alongside a user message.
 ///
 /// Some backends (Codex) prefer file paths to keep base64 out of the JSON-RPC

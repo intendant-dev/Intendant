@@ -305,6 +305,41 @@ pub fn terminate_unprotected_descendants_now(root_pid: u32, protected: &HashSet<
     targets
 }
 
+/// Ask the OS to deliver SIGTERM to the child when this (parent) process
+/// dies for ANY reason — including SIGKILL, where no userspace cleanup
+/// (Drop impls, shutdown hooks) ever runs. Used for spawned external-agent
+/// processes (codex/claude/gemini app-servers), which previously survived
+/// hard daemon deaths as orphans.
+///
+/// Linux-only (`PR_SET_PDEATHSIG`); macOS and Windows have no direct
+/// equivalent, so there the graceful paths (agent `Drop` kill +
+/// `cleanup_spawned_child_processes_now`) remain the only reaping and a
+/// hard-killed daemon can still orphan agents.
+pub fn die_with_parent(command: &mut tokio::process::Command) {
+    #[cfg(target_os = "linux")]
+    unsafe {
+        command.pre_exec(|| {
+            // SAFETY: runs post-fork/pre-exec where only async-signal-safe
+            // calls are permitted; prctl/getppid/raise are plain syscalls
+            // and qualify. PR_SET_PDEATHSIG only mutates this child's own
+            // process attributes — no pointers, no shared memory.
+            if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM) != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // The parent may already have died between fork and prctl —
+            // the death signal would never fire, so self-deliver it.
+            if libc::getppid() == 1 {
+                libc::raise(libc::SIGTERM);
+            }
+            Ok(())
+        });
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = command;
+    }
+}
+
 /// Best-effort synchronous cleanup for an owned child process and every
 /// visible descendant. Intended for shutdown paths that cannot await the async
 /// child handle cleanup, such as the controller's SIGINT/SIGTERM handler.
