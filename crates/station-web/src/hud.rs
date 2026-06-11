@@ -1227,14 +1227,18 @@ impl StationInner {
                     id: sid.clone(),
                 });
             }
+            // `stop` ends the session gracefully AFTER the current turn;
+            // `interrupt` aborts the turn itself. Mid-turn both intents
+            // matter, so offer both pills when both capabilities exist.
+            if session.can_interrupt {
+                row = row.pill("halt", C_YELLOW_CSS, HitAction::SessionAction {
+                    action: "interrupt".into(),
+                    id: sid.clone(),
+                });
+            }
             if session.can_stop {
                 row = row.pill("stop", C_RED_CSS, HitAction::SessionAction {
                     action: "stop".into(),
-                    id: sid.clone(),
-                });
-            } else if session.can_interrupt {
-                row = row.pill("stop", C_RED_CSS, HitAction::SessionAction {
-                    action: "interrupt".into(),
                     id: sid.clone(),
                 });
             } else if session.can_fork {

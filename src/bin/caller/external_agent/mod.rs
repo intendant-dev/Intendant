@@ -45,6 +45,29 @@ pub(crate) fn cleanup_spawned_child_processes_now() -> Vec<u32> {
     cleaned
 }
 
+/// Drop ANSI SGR/CSI escape sequences from a tracing-formatted stderr
+/// line so activity-log rows don't render `[31m` noise.
+pub(crate) fn strip_ansi_escapes(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch == '\u{1b}' {
+            if chars.peek() == Some(&'[') {
+                chars.next();
+                // CSI: consume through the final byte (0x40..=0x7e).
+                for c in chars.by_ref() {
+                    if ('\u{40}'..='\u{7e}').contains(&c) {
+                        break;
+                    }
+                }
+            }
+            continue;
+        }
+        out.push(ch);
+    }
+    out
+}
+
 /// Classify one external-agent stderr line for the activity log: transport
 /// and auth failures must be visible to the operator (the Codex websocket
 /// 401s after a revoked token were previously only readable in the daemon's
@@ -81,7 +104,8 @@ pub(crate) fn spawn_stderr_forwarder(
     tokio::spawn(async move {
         let mut lines = tokio::io::BufReader::new(stderr).lines();
         while let Ok(Some(line)) = lines.next_line().await {
-            let trimmed = line.trim();
+            let plain = strip_ansi_escapes(&line);
+            let trimmed = plain.trim();
             if trimmed.is_empty() {
                 continue;
             }
