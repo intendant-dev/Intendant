@@ -1756,6 +1756,23 @@ impl StationInner {
                     })
                     .collect(),
             ));
+            surface.rows.push(PanelRow::choices(
+                "managed ctx",
+                C_MAUVE_CSS,
+                ["vanilla", "managed"]
+                    .into_iter()
+                    .map(|mode| {
+                        (
+                            mode.to_string(),
+                            controls.managed_context == mode
+                                || (mode == "vanilla" && controls.managed_context.is_empty()),
+                            HitAction::ControlsAction {
+                                action: format!("codex-managed:{mode}"),
+                            },
+                        )
+                    })
+                    .collect(),
+            ));
         }
 
         // Voice / video / display sharing toggles.

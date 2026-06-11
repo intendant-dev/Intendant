@@ -14932,6 +14932,13 @@ function stationHandleControlsAction(action) {
     showControlToast?.('success', `Codex approval policy: ${policy}`);
     return;
   }
+  if (op.startsWith('codex-managed:')) {
+    const mode = op.slice('codex-managed:'.length).trim();
+    if (!['vanilla', 'managed'].includes(mode)) return;
+    dispatchControlMsg({ action: 'set_codex_managed_context', mode });
+    showControlToast?.('success', `Codex managed context: ${mode}`);
+    return;
+  }
   if (op.startsWith('launch-agent:')) {
     stationLaunchDraft.agent = op.slice('launch-agent:'.length).trim();
     stationScheduleUpdate({ immediate: true });
