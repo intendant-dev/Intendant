@@ -12986,6 +12986,10 @@ pub struct SettingsPayload {
     // the Activity → Control sub-tab can load in one fetch.
     #[serde(default)]
     pub codex_command: Option<String>,
+    /// Managed-capable (Intendant-aware fork) codex binary; managed
+    /// sessions spawn it instead of `codex_command`. Empty string clears.
+    #[serde(default)]
+    pub codex_managed_command: Option<String>,
     #[serde(default)]
     pub codex_sandbox: Option<String>,
     #[serde(default)]
@@ -13117,6 +13121,7 @@ fn settings_payload_from_config(config: &crate::project::ProjectConfig) -> Setti
         live_audio_timeout_secs: config.live_audio.default_timeout_secs,
         external_agent: config.agent.default_backend.clone(),
         codex_command: Some(config.agent.codex.command.clone()),
+        codex_managed_command: config.agent.codex.managed_command.clone(),
         codex_sandbox: Some(crate::project::normalize_sandbox_mode(
             &config.agent.codex.sandbox,
         )),
@@ -13211,6 +13216,16 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
         config.agent.codex.command =
             normalize_settings_codex_command(payload.codex_command.as_deref());
     }
+    if payload.codex_managed_command.is_some() {
+        // Empty clears the override (managed sessions fall back to
+        // `command`); anything else is the fork binary path.
+        config.agent.codex.managed_command = payload
+            .codex_managed_command
+            .as_deref()
+            .map(str::trim)
+            .filter(|cmd| !cmd.is_empty())
+            .map(str::to_string);
+    }
     if let Some(mode) = payload.codex_sandbox.as_deref() {
         config.agent.codex.sandbox = crate::project::normalize_sandbox_mode(mode);
     }
@@ -13302,6 +13317,13 @@ fn dispatch_codex_settings_control_msgs(bus: &EventBus, payload: &SettingsPayloa
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexCommand {
             command: payload.codex_command.clone(),
         }));
+    }
+    if payload.codex_managed_command.is_some() {
+        bus.send(AppEvent::ControlCommand(
+            ControlMsg::SetCodexManagedCommand {
+                command: payload.codex_managed_command.clone(),
+            },
+        ));
     }
     if let Some(mode) = payload.codex_sandbox.clone() {
         bus.send(AppEvent::ControlCommand(ControlMsg::SetCodexSandbox {

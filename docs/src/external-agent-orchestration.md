@@ -228,7 +228,13 @@ features they lack.
 
   `[agent.codex] managed_context = "vanilla"` is the default and is safe for
   upstream Codex or the original Codex fork. Set it to `"managed"` only when
-  launching the Intendant-aware Codex fork; that mode advertises
+  launching the Intendant-aware Codex fork — and configure that fork's binary
+  as `[agent.codex] managed_command`: managed sessions then spawn it
+  automatically while vanilla sessions keep using `command` (the upstream
+  CLI), so flipping the mode never points the wrong binary at a session.
+  Without `managed_command`, managed sessions fall back to `command`, which
+  then must itself be the fork (legacy setups); the dashboard and the Station
+  controls panel flag that ambiguity. Managed mode advertises
   `rewind_context` / `rewind_backout`, suppresses Codex auto-compaction, and
   uses same-thread rollback/restore to keep the active thread informationally
   dense. Rewinds are not just emergency context-limit recovery: they can also be

@@ -3131,6 +3131,7 @@ impl SessionSupervisor {
                 let current = self.config.shared_codex_config.read().await.clone();
                 let cfg = &mut project.config.agent.codex;
                 cfg.command = current.command;
+                cfg.managed_command = current.managed_command;
                 cfg.sandbox = current.sandbox;
                 cfg.approval_policy = current.approval_policy;
                 cfg.model = current.model;
@@ -4114,6 +4115,7 @@ mod tests {
             shared_codex_config: Arc::new(tokio::sync::RwLock::new(
                 control_plane::CodexRuntimeConfig {
                     command: "codex".to_string(),
+                    managed_command: None,
                     sandbox: "workspace-write".to_string(),
                     approval_policy: "on-request".to_string(),
                     model: None,

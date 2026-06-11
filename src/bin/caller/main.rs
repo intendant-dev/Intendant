@@ -916,6 +916,7 @@ fn codex_runtime_config_equal(
     b: &control_plane::CodexRuntimeConfig,
 ) -> bool {
     a.command == b.command
+        && a.managed_command == b.managed_command
         && a.sandbox == b.sandbox
         && a.approval_policy == b.approval_policy
         && a.model == b.model
@@ -1312,8 +1313,11 @@ async fn create_external_agent(
                 writable_roots: cfg.writable_roots.clone(),
                 managed_context: codex_managed_context,
             };
+            // Managed sessions spawn the Intendant-aware fork when one is
+            // configured (`codex.managed_command`); vanilla sessions and
+            // legacy configs use `codex.command`.
             let agent = Box::new(external_agent::codex::CodexAgent::with_options(
-                cfg.command.clone(),
+                cfg.effective_command(codex_managed_context),
                 cfg.model.clone(),
                 cfg.approval_policy.clone(),
                 sandbox_mode.clone(),
@@ -6009,7 +6013,11 @@ fn codex_external_session_capabilities(
         codex_context_archive: Some(project::normalize_codex_context_archive(
             &project.config.agent.codex.context_archive,
         )),
-        codex_command: Some(project.config.agent.codex.command.clone()),
+        // Report what this session actually spawns: managed sessions
+        // resolve to `managed_command` (the Intendant-aware fork) when set.
+        codex_command: Some(project.config.agent.codex.effective_command(
+            project::codex_managed_context_enabled(&project.config.agent.codex.managed_context),
+        )),
         codex_fast_mode: Some(codex_service_tier_is_fast(service_tier)),
         codex_service_tier: codex_service_tier_value(service_tier),
     }
@@ -30769,6 +30777,7 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(tokio::sync::RwLock::new(
                 control_plane::CodexRuntimeConfig {
                     command: cfg.command.clone(),
+                    managed_command: cfg.managed_command.clone(),
                     sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                     approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                     model: cfg.model.clone(),
@@ -31649,6 +31658,7 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(tokio::sync::RwLock::new(
                 control_plane::CodexRuntimeConfig {
                     command: cfg.command.clone(),
+                    managed_command: cfg.managed_command.clone(),
                     sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                     approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                     model: cfg.model.clone(),
@@ -32284,6 +32294,7 @@ async fn main() -> Result<(), CallerError> {
             Arc::new(tokio::sync::RwLock::new(
                 control_plane::CodexRuntimeConfig {
                     command: cfg.command.clone(),
+                    managed_command: cfg.managed_command.clone(),
                     sandbox: project::normalize_sandbox_mode(&cfg.sandbox),
                     approval_policy: project::normalize_approval_policy(&cfg.approval_policy),
                     model: cfg.model.clone(),

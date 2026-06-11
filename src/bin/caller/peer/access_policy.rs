@@ -149,6 +149,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         | ControlMsg::SetApprovalRule { .. }
         | ControlMsg::SetExternalAgent { .. }
         | ControlMsg::SetCodexCommand { .. }
+        | ControlMsg::SetCodexManagedCommand { .. }
         | ControlMsg::SetCodexSandbox { .. }
         | ControlMsg::SetCodexApprovalPolicy { .. }
         | ControlMsg::SetCodexModel { .. }

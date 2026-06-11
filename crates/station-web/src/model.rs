@@ -434,6 +434,9 @@ pub(crate) struct StationControlsSummary {
     pub(crate) reasoning_effort: String,
     pub(crate) service_tier: String,
     pub(crate) managed_context: String,
+    /// Managed-capable (Intendant-aware fork) codex binary; empty when no
+    /// dedicated fork is configured.
+    pub(crate) managed_command: String,
     pub(crate) context_archive: String,
     pub(crate) web_search: bool,
     pub(crate) network_access: bool,
@@ -566,6 +569,7 @@ impl Default for StationControlsSummary {
             reasoning_effort: String::new(),
             service_tier: String::new(),
             managed_context: String::new(),
+            managed_command: String::new(),
             context_archive: String::new(),
             web_search: false,
             network_access: false,

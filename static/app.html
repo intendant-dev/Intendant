@@ -9977,6 +9977,10 @@ body.display-fullscreen-open {
                 <input id="set-codex-command" type="text" placeholder="codex or /usr/local/bin/codex" autocomplete="off">
               </div>
               <div class="settings-row">
+                <label title="The Intendant-aware Codex fork. Managed-context sessions spawn this binary instead of the vanilla Codex binary above — managed mode only works with the fork. Leave empty to use the Codex binary for both modes.">Codex managed fork</label>
+                <input id="set-codex-managed-command" type="text" placeholder="path to the Intendant-aware codex fork (managed mode)" autocomplete="off">
+              </div>
+              <div class="settings-row">
                 <label>Claude binary</label>
                 <input id="set-claude-command" type="text" placeholder="claude or /usr/local/bin/claude" autocomplete="off">
               </div>
@@ -16407,6 +16411,7 @@ function stationBuildControlsSummary() {
     reasoningEffort: controlCodexConfig.reasoning_effort || '',
     serviceTier: controlCodexConfig.service_tier || '',
     managedContext: controlCodexConfig.managed_context || 'vanilla',
+    managedCommand: controlCodexConfig.managed_command || '',
     contextArchive: controlCodexConfig.context_archive || 'summary',
     webSearch: !!controlCodexConfig.web_search,
     networkAccess: !!controlCodexConfig.network_access,
@@ -19256,6 +19261,7 @@ window.doPrune = doPrune;
 
 let controlCodexConfig = {
   command: 'codex',
+  managed_command: '',
   sandbox: null,
   approval_policy: null,
   model: null,
@@ -19322,6 +19328,7 @@ async function refreshControlPane() {
     controlCurrentBackend = normalizeAgentId(d.external_agent);
     controlCodexConfig = {
       command: d.codex_command || 'codex',
+      managed_command: d.codex_managed_command || '',
       sandbox: normalizeCodexSandbox(d.codex_sandbox || 'workspace-write'),
       approval_policy: normalizeCodexApprovalPolicy(d.codex_approval_policy || 'on-request'),
       model: d.codex_model || '',
@@ -19674,6 +19681,15 @@ function applyCodexConfigChanged(evt) {
     const input = document.getElementById('set-codex-command');
     if (input) input.value = evt.command;
     renderNewSessionAgentControls();
+  }
+  if (evt.managed_command !== undefined && evt.managed_command !== null) {
+    controlCodexConfig.managed_command = evt.managed_command;
+  } else if (evt.managed_command_cleared) {
+    controlCodexConfig.managed_command = '';
+  }
+  if (evt.managed_command !== undefined || evt.managed_command_cleared) {
+    const input = document.getElementById('set-codex-managed-command');
+    if (input) input.value = controlCodexConfig.managed_command || '';
   }
   if (evt.sandbox) controlCodexConfig.sandbox = evt.sandbox;
   if (evt.approval_policy) controlCodexConfig.approval_policy = evt.approval_policy;
@@ -40334,6 +40350,7 @@ async function loadSettings() {
     document.getElementById('set-live-audio-enabled').checked = d.live_audio_enabled;
     document.getElementById('set-live-audio-timeout').value = d.live_audio_timeout_secs || 300;
     document.getElementById('set-codex-command').value = d.codex_command || 'codex';
+    document.getElementById('set-codex-managed-command').value = d.codex_managed_command || '';
     document.getElementById('set-claude-command').value = d.claude_command || 'claude';
     document.getElementById('set-gemini-command').value = d.gemini_command || 'gemini';
     document.getElementById('set-codex-service-tier').value = normalizeCodexServiceTier(d.codex_service_tier || '');
@@ -40414,6 +40431,8 @@ async function saveSettings() {
     // Persisted to intendant.toml so it survives daemon restart.
     external_agent: g('set-external-agent').value || null,
     codex_command: (g('set-codex-command').value || '').trim() || 'codex',
+    // Empty string is meaningful: it clears the managed-fork override.
+    codex_managed_command: (g('set-codex-managed-command').value || '').trim(),
     claude_command: selectedClaudeCommand,
     gemini_command: selectedGeminiCommand,
     codex_sandbox: controlCodexConfig.sandbox || 'workspace-write',
@@ -40473,6 +40492,10 @@ async function saveSettings() {
     app.send_server_action({
       action: 'set_codex_command',
       command: (g('set-codex-command').value || '').trim() || null,
+    });
+    app.send_server_action({
+      action: 'set_codex_managed_command',
+      command: (g('set-codex-managed-command').value || '').trim() || null,
     });
     app.send_server_action({
       action: 'set_codex_managed_context',

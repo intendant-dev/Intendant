@@ -133,6 +133,15 @@ pub struct CodexConfig {
     /// Path or command name for the codex binary.
     #[serde(default = "default_codex_command")]
     pub command: String,
+    /// Path or command name for the *managed-capable* codex binary (the
+    /// Intendant-aware Codex fork). `managed_context = "managed"` only
+    /// works against that fork, so when this is set, managed sessions
+    /// spawn it instead of `command`; vanilla sessions always use
+    /// `command`. Unset: managed sessions fall back to `command` (legacy
+    /// setups that point `command` itself at the fork keep working), but
+    /// the dashboard flags the ambiguity.
+    #[serde(default)]
+    pub managed_command: Option<String>,
     /// Model to use (e.g. "o4-mini", "codex-mini-latest").
     #[serde(default)]
     pub model: Option<String>,
@@ -188,6 +197,27 @@ pub struct CodexConfig {
 
 fn default_codex_command() -> String {
     "codex".to_string()
+}
+
+impl CodexConfig {
+    /// The binary a session with the given managed-context setting should
+    /// spawn: managed sessions prefer `managed_command` (the
+    /// Intendant-aware fork), everything else — including managed
+    /// sessions on legacy configs without a dedicated fork entry — uses
+    /// `command`.
+    pub fn effective_command(&self, managed_context_enabled: bool) -> String {
+        if managed_context_enabled {
+            if let Some(managed) = self
+                .managed_command
+                .as_deref()
+                .map(str::trim)
+                .filter(|cmd| !cmd.is_empty())
+            {
+                return managed.to_string();
+            }
+        }
+        self.command.clone()
+    }
 }
 
 fn default_codex_approval_policy() -> String {
@@ -359,6 +389,7 @@ impl Default for CodexConfig {
     fn default() -> Self {
         Self {
             command: default_codex_command(),
+            managed_command: None,
             model: None,
             approval_policy: default_codex_approval_policy(),
             sandbox: default_codex_sandbox(),
@@ -1154,6 +1185,21 @@ fn detect_project_root() -> Result<PathBuf, CallerError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codex_effective_command_prefers_the_fork_only_for_managed_sessions() {
+        let mut cfg = CodexConfig::default();
+        // No fork configured: both modes use the vanilla command.
+        assert_eq!(cfg.effective_command(false), "codex");
+        assert_eq!(cfg.effective_command(true), "codex");
+        // Fork configured: only managed sessions spawn it.
+        cfg.managed_command = Some("/opt/codex-fork/codex".to_string());
+        assert_eq!(cfg.effective_command(false), "codex");
+        assert_eq!(cfg.effective_command(true), "/opt/codex-fork/codex");
+        // Whitespace-only entries behave like unset.
+        cfg.managed_command = Some("   ".to_string());
+        assert_eq!(cfg.effective_command(true), "codex");
+    }
 
     #[test]
     fn default_project_config() {

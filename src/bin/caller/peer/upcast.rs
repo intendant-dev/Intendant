@@ -1003,6 +1003,8 @@ impl AppEventUpcaster {
 
             AppEvent::CodexConfigChanged {
                 command,
+                managed_command,
+                managed_command_cleared,
                 sandbox,
                 approval_policy,
                 model,
@@ -1020,6 +1022,11 @@ impl AppEventUpcaster {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = command {
                     parts.push(format!("command={v}"));
+                }
+                if let Some(v) = managed_command {
+                    parts.push(format!("managed_command={v}"));
+                } else if *managed_command_cleared {
+                    parts.push("managed_command=<vanilla fallback>".to_string());
                 }
                 if let Some(v) = sandbox {
                     parts.push(format!("sandbox={v}"));
@@ -2061,6 +2068,8 @@ impl WireEventUpcaster {
 
             OutboundEvent::CodexConfigChanged {
                 command,
+                managed_command,
+                managed_command_cleared,
                 sandbox,
                 approval_policy,
                 model,
@@ -2078,6 +2087,11 @@ impl WireEventUpcaster {
                 let mut parts: Vec<String> = Vec::new();
                 if let Some(v) = command {
                     parts.push(format!("command={v}"));
+                }
+                if let Some(v) = managed_command {
+                    parts.push(format!("managed_command={v}"));
+                } else if *managed_command_cleared {
+                    parts.push("managed_command=<vanilla fallback>".to_string());
                 }
                 if let Some(v) = sandbox {
                     parts.push(format!("sandbox={v}"));

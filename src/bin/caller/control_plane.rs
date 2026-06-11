@@ -24,6 +24,9 @@ use crate::external_agent;
 #[derive(Debug, Clone)]
 pub struct CodexRuntimeConfig {
     pub command: String,
+    /// Managed-capable (Intendant-aware fork) binary; managed-context
+    /// sessions spawn it instead of `command`.
+    pub managed_command: Option<String>,
     pub sandbox: String,
     pub approval_policy: String,
     pub model: Option<String>,
@@ -176,6 +179,33 @@ async fn handle_control_msg(msg: &ControlMsg, state: &ControlPlaneState) {
             }
             state.bus.send(codex_config_changed_event(CodexConfigDelta {
                 command: Some(normalized),
+                ..Default::default()
+            }));
+        }
+        ControlMsg::SetCodexManagedCommand { command } => {
+            // Empty / missing clears the override: managed sessions then
+            // fall back to `command` (legacy fork-as-command setups).
+            let normalized = command
+                .as_deref()
+                .map(str::trim)
+                .filter(|cmd| !cmd.is_empty())
+                .map(str::to_string);
+            {
+                let mut guard = state.codex_config.write().await;
+                guard.managed_command = normalized.clone();
+            }
+            if let Some(ref root) = state.project_root {
+                if let Err(e) = persist_codex_field(root, |cfg| {
+                    cfg.managed_command = normalized.clone();
+                }) {
+                    eprintln!(
+                        "[control_plane] failed to persist codex.managed_command to intendant.toml: {e}"
+                    );
+                }
+            }
+            state.bus.send(codex_config_changed_event(CodexConfigDelta {
+                managed_command: normalized.clone(),
+                managed_command_cleared: normalized.is_none(),
                 ..Default::default()
             }));
         }
@@ -798,6 +828,8 @@ fn normalize_writable_roots(raw: &[String]) -> Vec<String> {
 #[derive(Debug, Default)]
 struct CodexConfigDelta {
     command: Option<String>,
+    managed_command: Option<String>,
+    managed_command_cleared: bool,
     sandbox: Option<String>,
     approval_policy: Option<String>,
     model: Option<String>,
@@ -816,6 +848,8 @@ struct CodexConfigDelta {
 fn codex_config_changed_event(delta: CodexConfigDelta) -> AppEvent {
     AppEvent::CodexConfigChanged {
         command: delta.command,
+        managed_command: delta.managed_command,
+        managed_command_cleared: delta.managed_command_cleared,
         sandbox: delta.sandbox,
         approval_policy: delta.approval_policy,
         model: delta.model,
@@ -931,6 +965,7 @@ mod tests {
     fn test_codex_config() -> SharedCodexConfig {
         Arc::new(RwLock::new(CodexRuntimeConfig {
             command: "codex".to_string(),
+            managed_command: None,
             sandbox: "workspace-write".to_string(),
             approval_policy: "on-request".to_string(),
             model: None,

@@ -377,6 +377,12 @@ pub enum OutboundEvent {
     CodexConfigChanged {
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<String>,
+        /// Managed-capable (Intendant-aware fork) codex binary; spawned
+        /// by managed-context sessions instead of `command`.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        managed_command: Option<String>,
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        managed_command_cleared: bool,
         #[serde(skip_serializing_if = "Option::is_none")]
         sandbox: Option<String>,
         #[serde(skip_serializing_if = "Option::is_none")]

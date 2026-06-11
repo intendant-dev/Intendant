@@ -485,6 +485,9 @@ default_backend = "codex"
 
 [agent.codex]
 command = "codex"
+# Intendant-aware Codex fork; spawned instead of `command` when
+# managed_context = "managed" (managed mode only works with the fork).
+# managed_command = "/path/to/intendant-aware-codex"
 model = "gpt-5.5"
 approval_policy = "on-request"
 sandbox = "workspace-write"

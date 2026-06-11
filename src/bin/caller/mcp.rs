@@ -3998,6 +3998,16 @@ async fn handle_control_command_mcp(
             );
             Some(RESOURCE_STATUS_URI)
         }
+        ControlMsg::SetCodexManagedCommand { command } => {
+            let message = match command.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                Some(cmd) => format!(
+                    "Codex managed-fork command set to {cmd} (managed-context sessions spawn it on next task)"
+                ),
+                None => "Codex managed-fork command cleared (managed sessions fall back to the vanilla command)".to_string(),
+            };
+            emit_control_result(control_tx, "set_codex_managed_command", true, message, None);
+            Some(RESOURCE_STATUS_URI)
+        }
         ControlMsg::SetCodexSandbox { mode } => {
             // Shared state + persistence is handled by the control plane;
             // MCP only surfaces acknowledgement to the caller.
@@ -14400,6 +14410,8 @@ mod tests {
             &mut s,
             &AppEvent::CodexConfigChanged {
                 command: None,
+                managed_command: None,
+                managed_command_cleared: false,
                 sandbox: None,
                 approval_policy: None,
                 model: None,
@@ -14432,6 +14444,8 @@ mod tests {
             &mut s,
             &AppEvent::CodexConfigChanged {
                 command: None,
+                managed_command: None,
+                managed_command_cleared: false,
                 sandbox: None,
                 approval_policy: None,
                 model: None,

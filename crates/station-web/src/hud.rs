@@ -1773,6 +1773,28 @@ impl StationInner {
                     })
                     .collect(),
             ));
+            // Managed mode only works with the Intendant-aware Codex
+            // fork: show which binary managed sessions will spawn, and
+            // flag the ambiguous legacy setup (managed selected, no
+            // dedicated fork configured → falls back to `command`).
+            if controls.managed_context == "managed" {
+                if controls.managed_command.trim().is_empty() {
+                    surface.rows.push(PanelRow::new(
+                        "fork".to_string(),
+                        format!(
+                            "no managed fork set — using {} (must be the Intendant-aware fork)",
+                            nonempty(&controls.command, "codex")
+                        ),
+                        C_YELLOW_CSS,
+                    ));
+                } else {
+                    surface.rows.push(PanelRow::new(
+                        "fork".to_string(),
+                        format!("managed sessions spawn {}", controls.managed_command.trim()),
+                        C_GREEN_CSS,
+                    ));
+                }
+            }
         }
 
         // Voice / video / display sharing toggles.

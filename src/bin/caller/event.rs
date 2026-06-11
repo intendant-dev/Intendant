@@ -705,6 +705,8 @@ pub enum AppEvent {
     /// but doesn't round-trip through our JSON as obviously.
     CodexConfigChanged {
         command: Option<String>,
+        managed_command: Option<String>,
+        managed_command_cleared: bool,
         sandbox: Option<String>,
         approval_policy: Option<String>,
         model: Option<String>,
@@ -1010,6 +1012,14 @@ pub enum ControlMsg {
     /// an empty string falls back to `codex` on PATH. Applies to the NEXT
     /// task because changing this requires respawning the Codex process.
     SetCodexCommand {
+        #[serde(default)]
+        command: Option<String>,
+    },
+    /// Set the managed-capable Codex executable (the Intendant-aware
+    /// fork). Managed-context sessions spawn this instead of the vanilla
+    /// `command`; `None`/empty clears it (managed sessions then fall back
+    /// to `command`). Applies to the NEXT task.
+    SetCodexManagedCommand {
         #[serde(default)]
         command: Option<String>,
     },
@@ -2197,6 +2207,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::ExternalFollowUpRequested { .. } => None,
         AppEvent::CodexConfigChanged {
             command,
+            managed_command,
+            managed_command_cleared,
             sandbox,
             approval_policy,
             model,
@@ -2212,6 +2224,8 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             context_archive,
         } => Some(OutboundEvent::CodexConfigChanged {
             command: command.clone(),
+            managed_command: managed_command.clone(),
+            managed_command_cleared: *managed_command_cleared,
             sandbox: sandbox.clone(),
             approval_policy: approval_policy.clone(),
             model: model.clone(),

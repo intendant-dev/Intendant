@@ -1216,6 +1216,16 @@ impl App {
                     format!("Codex command → {} (applies on next task)", label),
                 );
             }
+            ControlMsg::SetCodexManagedCommand { ref command } => {
+                let label = command
+                    .as_deref()
+                    .filter(|s| !s.trim().is_empty())
+                    .unwrap_or("(cleared — managed falls back to vanilla command)");
+                self.log(
+                    LogLevel::Info,
+                    format!("Codex managed-fork command → {} (applies on next task)", label),
+                );
+            }
             ControlMsg::SetCodexSandbox { ref mode } => {
                 self.log(
                     LogLevel::Info,
