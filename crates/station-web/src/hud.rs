@@ -1080,10 +1080,9 @@ impl StationInner {
             self.draw_view_focus(x, panel_w, activity_lane_y);
             return;
         }
-        if id == "system:activity" {
-            // The activity runway below IS the detail surface for this one.
-            return;
-        }
+        // system:activity gets the full scrollable event panel like every
+        // other system target (the runway below stays as the live ticker;
+        // the panel adds history, filters, and per-event actions).
         if id.starts_with("system:") {
             let Some((title, value, detail, color)) = self
                 .system_targets
@@ -1728,7 +1727,11 @@ impl StationInner {
             .map(|(label, id)| {
                 (
                     label.to_string(),
-                    controls.backend == id || (id == "internal" && controls.backend.is_empty()),
+                    // The dashboard reports the no-external-agent state as
+                    // "", "none", or "internal" depending on the source.
+                    controls.backend == id
+                        || (id == "internal"
+                            && matches!(controls.backend.as_str(), "" | "none" | "internal")),
                     HitAction::ControlsAction {
                         action: format!("backend:{id}"),
                     },

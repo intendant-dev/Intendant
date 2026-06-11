@@ -2187,10 +2187,14 @@ class BrowserHarness {
       steps.push({ name: 'composer', via: open.via || '', latencyMs: Date.now() - started });
     }
 
-    // 2. Sessions panel: actionable row zones (and remember a transcript row).
+    // 2. Sessions panel: actionable row zones (and remember a transcript
+    // row). The session index loads asynchronously after activation, so
+    // when the dashboard reports sessions exist, wait for their rows to
+    // materialize instead of sampling once.
     {
       const started = Date.now();
       let rowZones = 0;
+      let sessionsTotal = 0;
       await this.stationWorkflowOp('activate', { name: 'system:sessions' });
       try {
         await waitUntil(async () => {
@@ -2200,12 +2204,16 @@ class BrowserHarness {
           rowZones = hit.filter((zone) => String(zone.name || '').startsWith('session:')).length;
           const log = hit.find((zone) => String(zone.name || '').startsWith('session:station-log:'));
           sessionLogZone = log ? String(log.name) : sessionLogZone;
-          return debug.data.selectedId === 'system:sessions';
-        }, opts.timeoutMs, 'sessions panel did not open');
+          if (debug.data.selectedId !== 'system:sessions') return false;
+          sessionsTotal = await this.evaluate(
+            'Number((window.stationProbe && stationProbe.snapshot().sessions.total) || 0)',
+          ).catch(() => 0);
+          return sessionsTotal === 0 || rowZones > 0;
+        }, opts.timeoutMs, 'sessions panel did not open with its rows');
       } catch (error) {
         failures.push(error.message || String(error));
       }
-      steps.push({ name: 'sessions-panel', rowZones, latencyMs: Date.now() - started });
+      steps.push({ name: 'sessions-panel', rowZones, sessionsTotal, latencyMs: Date.now() - started });
     }
 
     // 3. Controls panel: autonomy/backend choice pills present.
