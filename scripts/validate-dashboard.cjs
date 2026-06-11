@@ -2247,12 +2247,22 @@ class BrowserHarness {
       const started = Date.now();
       let transcript = null;
       let opened = false;
-      const debugNow = await this.stationWorkflowOp('debug');
-      const logZones = debugNow.ok
-        ? debugNow.data.hitZones
+      // Re-open the sessions panel: row zones only exist while their
+      // panel is the selected surface (step 3 selected controls).
+      await this.stationWorkflowOp('activate', { name: 'system:sessions' });
+      let logZones = [];
+      try {
+        await waitUntil(async () => {
+          const debug = await this.stationWorkflowOp('debug');
+          if (!debug.ok) return false;
+          logZones = debug.data.hitZones
             .map((zone) => String(zone.name || ''))
-            .filter((name) => name.startsWith('session:station-log:'))
-        : [sessionLogZone];
+            .filter((name) => name.startsWith('session:station-log:'));
+          return logZones.length > 0;
+        }, Math.min(opts.timeoutMs, 15000), 'session rows did not reappear for the transcript step');
+      } catch (_) {
+        logZones = [sessionLogZone];
+      }
       for (const zone of logZones.slice(0, 3)) {
         await this.stationWorkflowOp('activate', { name: zone });
         try {
