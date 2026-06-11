@@ -19691,8 +19691,19 @@ function applyCodexConfigChanged(evt) {
     const input = document.getElementById('set-codex-managed-command');
     if (input) input.value = controlCodexConfig.managed_command || '';
   }
-  if (evt.sandbox) controlCodexConfig.sandbox = evt.sandbox;
-  if (evt.approval_policy) controlCodexConfig.approval_policy = evt.approval_policy;
+  // Keep the per-launch defaults in lockstep: stationStartSession / the
+  // New Session pane send these as explicit per-session overrides, so a
+  // stale value here silently defeats a just-changed global policy (the
+  // managed_context/context_archive arms below already did this).
+  if (evt.sandbox) {
+    controlCodexConfig.sandbox = evt.sandbox;
+    newSessionCodexSandbox = normalizeCodexSandbox(evt.sandbox) || newSessionCodexSandbox;
+  }
+  if (evt.approval_policy) {
+    controlCodexConfig.approval_policy = evt.approval_policy;
+    newSessionCodexApprovalPolicy =
+      normalizeCodexApprovalPolicy(evt.approval_policy) || newSessionCodexApprovalPolicy;
+  }
   if (evt.model !== undefined && evt.model !== null) {
     controlCodexConfig.model = evt.model;
   } else if (evt.model_cleared) {
