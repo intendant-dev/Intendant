@@ -4849,6 +4849,98 @@ fn push_json_string_id(item: &serde_json::Value, ids: &mut Vec<String>, key: &st
     }
 }
 
+/// Latest backend `token_count` report in a rollout, in file order. Rollouts
+/// are append-only, so the chronologically last report is the backend's
+/// freshest usage measurement at read time. It can still be stale: when no
+/// model turn ran since an immediately preceding rollback it measured the
+/// pre-rollback context — recorded as-is, because nothing fresher exists
+/// locally and querying the backend would add an RPC to the rewind path.
+fn latest_context_rewind_backend_usage_in_rollout(
+    source_rollout_path: &Path,
+) -> io::Result<Option<ContextRewindBackendUsageAtLine>> {
+    let file = std::fs::File::open(source_rollout_path)?;
+    let reader = io::BufReader::new(file);
+    let mut latest = None;
+    for (line_index, line) in reader.lines().enumerate() {
+        let line = line?;
+        let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line) else {
+            continue;
+        };
+        if let Some(usage) =
+            context_rewind_backend_usage_from_rollout_entry(line_index.saturating_add(1), &entry)
+        {
+            latest = Some(usage);
+        }
+    }
+    Ok(latest)
+}
+
+/// Pressure band for a usage measurement against the effective context
+/// window, mirroring the live managed-context gates: `watch` starts at the
+/// `MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT` share of the window (via
+/// [`managed_context_density_recommended_limit`], the density-handoff gate),
+/// `high` at the window (the rewind-only/recovery gate), and `critical` at
+/// the hard window when the snapshot knew it.
+fn context_rewind_pressure_band(
+    used_tokens: u64,
+    context_window: u64,
+    hard_context_window: Option<u64>,
+) -> &'static str {
+    if hard_context_window.is_some_and(|hard| hard > 0 && used_tokens >= hard) {
+        return "critical";
+    }
+    if used_tokens >= context_window {
+        return "high";
+    }
+    if used_tokens >= managed_context_density_recommended_limit(context_window) {
+        return "watch";
+    }
+    "ok"
+}
+
+/// Context pressure observed at context-rewind record creation, derived
+/// without any new backend RPC: the chronologically last backend
+/// `token_count` report in the pre-rewind rollout, falling back to the
+/// latest persisted session-log context snapshot (the same source the
+/// managed-context preflight falls back to). Returns `(used_tokens,
+/// context_window, pressure_band)`; each is `None` when that piece is
+/// unavailable — e.g. all three for a rollout without usage reports and no
+/// logged snapshot, or the band when the log snapshot lacks either number.
+fn context_rewind_pressure_at_record_creation(
+    source_rollout_path: &Path,
+    config: &DrainConfig<'_>,
+) -> (Option<u64>, Option<u64>, Option<String>) {
+    match latest_context_rewind_backend_usage_in_rollout(source_rollout_path) {
+        Ok(Some(usage)) => {
+            let band =
+                context_rewind_pressure_band(usage.used_tokens, usage.rewind_only_limit, None);
+            return (
+                Some(usage.used_tokens),
+                Some(usage.rewind_only_limit),
+                Some(band.to_string()),
+            );
+        }
+        Ok(None) => {}
+        Err(err) => slog(config.session_log, |log| {
+            log.warn(&format!(
+                "Could not read rollout usage for context-rewind pressure instrumentation: {err}"
+            ))
+        }),
+    }
+    let Some(snapshot) = latest_external_context_snapshot_from_log(config) else {
+        return (None, None, None);
+    };
+    let used_tokens = external_context_snapshot_backend_token_count(&snapshot);
+    let context_window = snapshot.context_window.filter(|window| *window > 0);
+    let band = match (used_tokens, context_window) {
+        (Some(used), Some(window)) => Some(
+            context_rewind_pressure_band(used, window, snapshot.hard_context_window).to_string(),
+        ),
+        _ => None,
+    };
+    (used_tokens, context_window, band)
+}
+
 async fn apply_external_context_rewind(
     agent: &mut Box<dyn external_agent::ExternalAgent>,
     thread_id: &str,
@@ -4955,6 +5047,13 @@ async fn apply_external_context_rewind(
                 None
             }
         };
+    // Freshest locally available usage at record creation, for offline
+    // pressure-at-rewind analysis (no backend RPC): the pre-rewind rollout's
+    // last `token_count` report — typically written moments before this
+    // rewind by the turn that requested it — else the latest session-log
+    // context snapshot, else `None`s.
+    let (used_tokens_at_rewind, context_window_at_rewind, pressure_band_at_rewind) =
+        context_rewind_pressure_at_record_creation(&source_rollout_path, config);
 
     let mut record = context_rewind::ContextRewindRecord {
         record_id: record_id.clone(),
@@ -4978,6 +5077,9 @@ async fn apply_external_context_rewind(
         lineage_ledger,
         fission_ledger,
         detached_fission_group_ids: Vec::new(),
+        used_tokens_at_rewind,
+        context_window_at_rewind,
+        pressure_band_at_rewind,
     };
     // Perform the rollback BEFORE persisting the durable record. The recovery
     // rollout was copied above (copy-before-mutation), but the record itself is
@@ -17958,6 +18060,9 @@ mod tests {
                 lineage_ledger: None,
                 fission_ledger: None,
                 detached_fission_group_ids: Vec::new(),
+                used_tokens_at_rewind: None,
+                context_window_at_rewind: None,
+                pressure_band_at_rewind: None,
             },
         )
         .unwrap();
@@ -22508,6 +22613,136 @@ Also: {"source": "bare"}"#;
         assert!(err.contains("is not part of fission group"), "error: {err}");
     }
 
+    #[test]
+    fn context_rewind_pressure_band_mirrors_managed_context_gates() {
+        // `watch` starts at the MANAGED_CONTEXT_DENSITY_THRESHOLD_PCT share
+        // of the window (85% of 38_000 = 32_300), `high` at the window,
+        // `critical` at the hard window when known.
+        assert_eq!(context_rewind_pressure_band(0, 38_000, None), "ok");
+        assert_eq!(context_rewind_pressure_band(32_299, 38_000, None), "ok");
+        assert_eq!(context_rewind_pressure_band(32_300, 38_000, None), "watch");
+        assert_eq!(context_rewind_pressure_band(37_999, 38_000, None), "watch");
+        assert_eq!(context_rewind_pressure_band(38_000, 38_000, None), "high");
+        assert_eq!(
+            context_rewind_pressure_band(39_000, 38_000, Some(40_000)),
+            "high"
+        );
+        assert_eq!(
+            context_rewind_pressure_band(41_772, 38_000, Some(40_000)),
+            "critical"
+        );
+        // An unknown or zero hard window never reports critical.
+        assert_eq!(
+            context_rewind_pressure_band(1_000_000, 38_000, Some(0)),
+            "high"
+        );
+        // The watch threshold tracks the shared density constant, not a copy.
+        let recommended = managed_context_density_recommended_limit(38_000);
+        assert_eq!(
+            context_rewind_pressure_band(recommended, 38_000, None),
+            "watch"
+        );
+        assert_eq!(
+            context_rewind_pressure_band(recommended - 1, 38_000, None),
+            "ok"
+        );
+    }
+
+    /// Append a Codex-shaped `token_count` event_msg line to a rollout file.
+    fn append_test_rollout_token_count(path: &Path, used_tokens: u64, context_window: u64) {
+        let mut contents = std::fs::read_to_string(path).unwrap();
+        contents.push_str(
+            &serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "model_context_window": context_window,
+                        "last_token_usage": { "total_tokens": used_tokens },
+                    }
+                }
+            })
+            .to_string(),
+        );
+        contents.push('\n');
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn latest_context_rewind_backend_usage_in_rollout_returns_last_report() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+
+        // No token_count entries at all.
+        write_fission_test_rollout(&rollout, &[("call_a", "shell")]);
+        assert!(latest_context_rewind_backend_usage_in_rollout(&rollout)
+            .unwrap()
+            .is_none());
+
+        // With several reports, the chronologically last one wins.
+        append_test_rollout_token_count(&rollout, 14_492, 38_000);
+        append_test_rollout_token_count(&rollout, 27_900, 38_000);
+        let usage = latest_context_rewind_backend_usage_in_rollout(&rollout)
+            .unwrap()
+            .expect("usage");
+        assert_eq!(usage.used_tokens, 27_900);
+        assert_eq!(usage.rewind_only_limit, 38_000);
+    }
+
+    #[tokio::test]
+    async fn apply_external_context_rewind_records_pressure_from_rollout() {
+        let dir = tempfile::tempdir().unwrap();
+        let log_dir = dir.path().join("logs");
+        std::fs::create_dir_all(&log_dir).unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        write_fission_test_rollout(&rollout, &[("call_mid", "shell"), ("call_late", "shell")]);
+        // Freshest backend usage report in the pre-rewind rollout. Low
+        // enough to keep recovery headroom (the rewind must be accepted),
+        // and below the density threshold, so the band is `ok`.
+        append_test_rollout_token_count(&rollout, 13_993, 38_000);
+
+        let bus = EventBus::new();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(log_dir.clone()).unwrap(),
+        ));
+        let approval_registry: event::ApprovalRegistry = Arc::new(Mutex::new(HashMap::new()));
+        let context_injection: event::ContextInjectionQueue = Arc::new(Mutex::new(Vec::new()));
+        let config = fission_test_drain_config(
+            &bus,
+            &session_log,
+            &approval_registry,
+            &context_injection,
+            dir.path(),
+            &log_dir,
+            "rewind-pressure-thread",
+        );
+
+        let test_agent = FissionTestAgent::new(Some(rollout.clone()), "rewindP-unused");
+        let mut agent: Box<dyn external_agent::ExternalAgent> = Box::new(test_agent);
+        let request = ExternalContextRewindRequest {
+            session_id: Some("rewind-pressure-thread".to_string()),
+            item_id: "call_mid".to_string(),
+            position: external_agent::RollbackAnchorPosition::After,
+            reason: Some("trim the tail".to_string()),
+            primer: None,
+            preserve: Vec::new(),
+            discard: Vec::new(),
+            artifacts: Vec::new(),
+            next_steps: Vec::new(),
+            auto_resume: false,
+            require_density_improvement: false,
+        };
+        apply_external_context_rewind(&mut agent, "rewind-pressure-thread", &request, &config)
+            .await
+            .expect("rewind succeeds");
+
+        let records = context_rewind::list_records(&log_dir).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].used_tokens_at_rewind, Some(13_993));
+        assert_eq!(records[0].context_window_at_rewind, Some(38_000));
+        assert_eq!(records[0].pressure_band_at_rewind.as_deref(), Some("ok"));
+    }
+
     #[tokio::test]
     async fn apply_external_context_rewind_detaches_groups_cut_by_the_rewind() {
         let dir = tempfile::tempdir().unwrap();
@@ -22625,13 +22860,18 @@ Also: {"source": "bare"}"#;
             .unwrap();
         assert_eq!(doomed_branch.status, "detached");
 
-        // Rewind record carries the detached group ids.
+        // Rewind record carries the detached group ids. The synthetic
+        // rollout has no token_count reports and the test session log has no
+        // context snapshots, so the pressure-at-rewind fields stay `None`.
         let records = context_rewind::list_records(&log_dir).unwrap();
         assert_eq!(records.len(), 1);
         assert_eq!(
             records[0].detached_fission_group_ids,
             vec![doomed_group.clone()]
         );
+        assert!(records[0].used_tokens_at_rewind.is_none());
+        assert!(records[0].context_window_at_rewind.is_none());
+        assert!(records[0].pressure_band_at_rewind.is_none());
 
         // Pending deliveries dropped for the detached group only.
         assert!(fission_lifecycle::branch_route("rewindA-child-late").is_none());

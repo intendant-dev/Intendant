@@ -31,6 +31,28 @@ pub struct ContextRewindRecord {
     /// the field existed deserialize as empty.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub detached_fission_group_ids: Vec<String>,
+    /// Backend-reported tokens in the context when this record was created,
+    /// from the freshest usage snapshot locally available at that moment (no
+    /// extra backend RPC): the pre-rewind rollout's last `token_count`
+    /// report, else the latest persisted session-log context snapshot.
+    /// `None` when neither carried a backend-reported count. Backward
+    /// compatible: records written before the field existed deserialize as
+    /// `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub used_tokens_at_rewind: Option<u64>,
+    /// Effective context window (the rewind-only limit) paired with
+    /// `used_tokens_at_rewind`, from the same snapshot. Backward compatible:
+    /// `None` on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window_at_rewind: Option<u64>,
+    /// Pressure band at record creation: `"ok"`, `"watch"` (at or above the
+    /// managed-context density threshold share of the window), `"high"` (at
+    /// or above the window), or `"critical"` (at or above the hard window,
+    /// when the snapshot knew it). Derived from the two fields above by the
+    /// record writer — thresholds mirror the live managed-context gates.
+    /// Backward compatible: `None` on older records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pressure_band_at_rewind: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -237,6 +259,9 @@ mod tests {
             lineage_ledger: None,
             fission_ledger: None,
             detached_fission_group_ids: Vec::new(),
+            used_tokens_at_rewind: None,
+            context_window_at_rewind: None,
+            pressure_band_at_rewind: None,
         }
     }
 
@@ -317,6 +342,9 @@ mod tests {
                 }],
             }),
             detached_fission_group_ids: vec!["fission-thread-1-call-1".to_string()],
+            used_tokens_at_rewind: Some(36_500),
+            context_window_at_rewind: Some(38_000),
+            pressure_band_at_rewind: Some("watch".to_string()),
         };
 
         persist_record(dir.path(), &record).unwrap();
@@ -327,7 +355,8 @@ mod tests {
     fn record_without_detached_fission_groups_round_trips_compactly() {
         // Old records (and new records that detached nothing) carry no
         // `detached_fission_group_ids` key at all; they must deserialize as
-        // an empty list and serialize back without the key.
+        // an empty list and serialize back without the key. The same compact
+        // contract holds for the optional pressure-at-rewind fields.
         let dir = tempdir().unwrap();
         let record = minimal_record("rewind-2", "2026-05-25T00:00:00Z", None, "thread-2");
         assert!(record.detached_fission_group_ids.is_empty());
@@ -335,16 +364,39 @@ mod tests {
         persist_record(dir.path(), &record).unwrap();
         let raw = fs::read_to_string(record_path(dir.path(), "rewind-2")).unwrap();
         assert!(!raw.contains("detached_fission_group_ids"));
+        assert!(!raw.contains("used_tokens_at_rewind"));
+        assert!(!raw.contains("context_window_at_rewind"));
+        assert!(!raw.contains("pressure_band_at_rewind"));
 
         let read = read_record(dir.path(), "rewind-2").unwrap();
         assert_eq!(read, record);
         assert!(read.detached_fission_group_ids.is_empty());
+        assert!(read.used_tokens_at_rewind.is_none());
+        assert!(read.context_window_at_rewind.is_none());
+        assert!(read.pressure_band_at_rewind.is_none());
+    }
+
+    #[test]
+    fn record_with_pressure_at_rewind_round_trips() {
+        let dir = tempdir().unwrap();
+        let mut record = minimal_record("rewind-3", "2026-06-12T00:00:00Z", None, "thread-3");
+        record.used_tokens_at_rewind = Some(41_772);
+        record.context_window_at_rewind = Some(38_000);
+        record.pressure_band_at_rewind = Some("high".to_string());
+
+        persist_record(dir.path(), &record).unwrap();
+        let raw = fs::read_to_string(record_path(dir.path(), "rewind-3")).unwrap();
+        assert!(raw.contains("used_tokens_at_rewind"));
+        assert!(raw.contains("context_window_at_rewind"));
+        assert!(raw.contains("pressure_band_at_rewind"));
+        assert_eq!(read_record(dir.path(), "rewind-3").unwrap(), record);
     }
 
     #[test]
     fn legacy_record_json_without_detach_field_deserializes() {
         // A record persisted by a pre-fission build: no
-        // `detached_fission_group_ids` key anywhere.
+        // `detached_fission_group_ids` (and no pressure-at-rewind) key
+        // anywhere.
         let legacy = serde_json::json!({
             "record_id": "rewind-legacy",
             "created_at": "2026-05-25T00:00:00Z",
@@ -363,6 +415,41 @@ mod tests {
         });
         let record: ContextRewindRecord = serde_json::from_value(legacy).unwrap();
         assert!(record.detached_fission_group_ids.is_empty());
+        assert!(record.used_tokens_at_rewind.is_none());
+        assert!(record.context_window_at_rewind.is_none());
+        assert!(record.pressure_band_at_rewind.is_none());
+    }
+
+    #[test]
+    fn legacy_record_json_without_pressure_fields_deserializes() {
+        // A record persisted by a post-fission but pre-pressure build (e.g.
+        // the 2026-06-12 constrained-window bench pilot): it may carry
+        // `detached_fission_group_ids` but none of the pressure fields.
+        let legacy = serde_json::json!({
+            "record_id": "rewind-legacy-2",
+            "created_at": "2026-06-12T06:11:01.415500873+00:00",
+            "session_id": "intendant",
+            "thread_id": "thread-1",
+            "item_id": "call-1",
+            "position": "after",
+            "reason": "trim noisy output",
+            "primer": "keep this",
+            "preserve": ["fact"],
+            "discard": ["noise"],
+            "artifacts": [],
+            "next_steps": [],
+            "source_rollout_path": "/tmp/source.jsonl",
+            "recovery_rollout_path": "/tmp/recovery.jsonl",
+            "detached_fission_group_ids": ["fission-thread-1-call-1"],
+        });
+        let record: ContextRewindRecord = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            record.detached_fission_group_ids,
+            vec!["fission-thread-1-call-1".to_string()]
+        );
+        assert!(record.used_tokens_at_rewind.is_none());
+        assert!(record.context_window_at_rewind.is_none());
+        assert!(record.pressure_band_at_rewind.is_none());
     }
 
     #[test]

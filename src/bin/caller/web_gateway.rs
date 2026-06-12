@@ -22226,6 +22226,9 @@ mod tests {
             lineage_ledger: None,
             fission_ledger: None,
             detached_fission_group_ids: Vec::new(),
+            used_tokens_at_rewind: None,
+            context_window_at_rewind: None,
+            pressure_band_at_rewind: None,
         }
     }
 
