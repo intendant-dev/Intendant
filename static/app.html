@@ -21285,6 +21285,15 @@ function managedContextPressureBandChipClass(band) {
   }
 }
 
+function managedContextTokensCompact(value) {
+  // One decimal even above 10k ("26.0k/23.8k"): pressure-at-rewind pairs sit
+  // close to each other, and whole-k rounding can collapse used and limit
+  // into the same number.
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '--';
+  return n >= 1000 ? `${(n / 1000).toFixed(1)}k` : Math.round(n).toString();
+}
+
 function managedContextRecordBadgesHtml(record) {
   const badges = [];
   if (record.surgical === true) {
@@ -21297,7 +21306,7 @@ function managedContextRecordBadgesHtml(record) {
     const used = record.used_tokens_at_rewind;
     const windowAt = record.context_window_at_rewind;
     const counts = used != null && windowAt != null
-      ? ` · ${stationCompactNumber(used)}/${stationCompactNumber(windowAt)}`
+      ? ` · ${managedContextTokensCompact(used)}/${managedContextTokensCompact(windowAt)}`
       : '';
     badges.push(
       `<span class="managed-context-status-chip${managedContextPressureBandChipClass(band)}"` +
