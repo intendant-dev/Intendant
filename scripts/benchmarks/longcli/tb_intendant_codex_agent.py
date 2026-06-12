@@ -341,11 +341,16 @@ class IntendantCodex(AbstractInstalledAgent):
                 f'echo "$intendant_pid" > {PID_FILE}',
                 "completed=0",
                 f"for _ in $(seq 1 {poll_sec}); do",
-                # task_complete in a PARENT rollout only: fission branch
-                # rollouts always carry the <fission_charter> developer
-                # message — a completed branch must not end the task.
+                # task_complete in a PARENT rollout only. A fission BRANCH
+                # rollout carries the <fission_charter> as a developer
+                # message response_item; checking raw bytes is wrong — a
+                # parent rollout can quote the marker inside a tool output
+                # (observed live 2026-06-12: terminal scrollback echoed into
+                # a function_call_output false-excluded the parent and the
+                # poll hung to command timeout). Parse line-typed JSON.
                 f'  for f in $(grep -Rl \'"type":"task_complete"\' "{CODEX_HOME}/sessions" 2>/dev/null); do',
-                "    if ! grep -q '<fission_charter>' \"$f\"; then",
+                "    if python3 - \"$f\" << 'PARENTCHECK'\nimport json, sys\nhas_tc = False\nis_branch = False\nfor line in open(sys.argv[1], errors='replace'):\n    if 'task_complete' in line:\n        try:\n            o = json.loads(line)\n        except ValueError:\n            continue\n        p = o.get('payload') or {}\n        if o.get('type') == 'event_msg' and p.get('type') == 'task_complete':\n            has_tc = True\n    elif '<fission_charter>' in line:\n        try:\n            o = json.loads(line)\n        except ValueError:\n            continue\n        p = o.get('payload') or {}\n        if (o.get('type') == 'response_item' and p.get('type') == 'message'\n                and (p.get('role') or '') == 'developer'):\n            is_branch = True\nsys.exit(0 if (has_tc and not is_branch) else 1)\nPARENTCHECK",
+                "    then",
                 "      completed=1",
                 "      break",
                 "    fi",
