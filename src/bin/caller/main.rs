@@ -3480,6 +3480,22 @@ struct ContextRewindAnchorCompactCatalog {
     recovery_candidates_only: bool,
     density_candidates_only: bool,
     pruning_estimates_included: bool,
+    /// True when this is a re-listing of the default page inside one
+    /// managed-context stall: the rows are unchanged, so the model should
+    /// commit instead of listing again.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    repeat_listing: Option<bool>,
+    /// True when the eligible catalog itself is empty: no anchor remains
+    /// that a rewind could legally target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    no_eligible_anchors: Option<bool>,
+    /// Set with an empty page to say why it is empty
+    /// (`no_eligible_anchors`, `query_unmatched`, `offset_past_end`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    empty_page_reason: Option<&'static str>,
+    /// Plain-language direction for the repeat/empty cases above.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    notice: Option<String>,
     anchors: Vec<ContextRewindAnchorCompactEntry>,
 }
 
@@ -3614,10 +3630,21 @@ fn list_context_rewind_anchors_from_rollout(
             source_rollout_path.display()
         )
     })?;
-    let total = anchors.len();
+    let scanned_total = anchors.len();
+    let trailing_listing_calls = context_rewind_trailing_listing_calls(&anchors);
     if !include_management_tools {
         anchors.retain(|anchor| !context_rewind_anchor_is_management_tool(anchor));
     }
+    // Model-visible accounting must be idempotent across listing-only growth:
+    // when management calls are hidden from rows they are excluded from
+    // `total` too, so a recovery stall (where listings/status polls are the
+    // only thread growth) re-lists with stable counts instead of a catalog
+    // that grows by one per listing call.
+    let total = if include_management_tools {
+        scanned_total
+    } else {
+        anchors.len()
+    };
     if recovery_candidates_only {
         anchors.retain(|anchor| anchor.recovery_eligible != Some(false));
         for anchor in &mut anchors {
@@ -3671,7 +3698,7 @@ fn list_context_rewind_anchors_from_rollout(
             .collect::<Vec<_>>();
         let next_offset = (offset.saturating_add(page.len()) < filtered_total)
             .then_some(offset.saturating_add(page.len()));
-        let compact = ContextRewindAnchorCompactCatalog {
+        let mut compact = ContextRewindAnchorCompactCatalog {
             catalog_format: "compact_page",
             total,
             filtered_total,
@@ -3686,8 +3713,13 @@ fn list_context_rewind_anchors_from_rollout(
             recovery_candidates_only,
             density_candidates_only,
             pruning_estimates_included: include_pruning_estimates,
+            repeat_listing: None,
+            no_eligible_anchors: None,
+            empty_page_reason: None,
+            notice: None,
             anchors: page,
         };
+        annotate_compact_catalog_repeats_and_dead_ends(&mut compact, trailing_listing_calls, reverse);
         return serialize_context_rewind_anchor_compact_catalog(compact, filtered_total);
     }
     let mut page = anchors
@@ -3743,6 +3775,62 @@ fn context_rewind_anchor_use_compact_catalog(
         return true;
     }
     true
+}
+
+/// Annotates a compact catalog page with anti-stall guidance, addressing the
+/// two protocol dead-ends measured in the 2026-06-12 w40 bench (7 of 20
+/// managed misses ended re-listing offset 0 until the recovery step limit;
+/// 1 ended on a page with nothing valid to rewind to):
+/// - `repeat_listing`: the default page was re-requested inside one
+///   management-only stall, so the rows are unchanged and the model should
+///   commit to `rewind_context` instead of listing again.
+/// - empty pages say *why* they are empty and what to do instead of leaving
+///   a bare page that invites another listing: an exhausted eligible catalog
+///   fails loudly toward the supervisor's manual recovery path (or, for a
+///   density-only listing, says to skip maintenance and continue the task).
+fn annotate_compact_catalog_repeats_and_dead_ends(
+    compact: &mut ContextRewindAnchorCompactCatalog,
+    trailing_listing_calls: usize,
+    reverse: bool,
+) {
+    let default_page_view = compact.offset == 0 && compact.query.is_none() && !reverse;
+    // The scan normally already contains the in-flight listing call, so two
+    // or more trailing listings mean at least one completed prior listing.
+    let prior_listings = trailing_listing_calls.saturating_sub(1);
+    if default_page_view && prior_listings >= 1 && !compact.anchors.is_empty() {
+        compact.repeat_listing = Some(true);
+        compact.notice = Some(format!(
+            "repeat listing: this default page was already returned {prior_listings} time(s) in the current managed-context stall and is unchanged (management/status calls are excluded from rows and counts, so re-listing cannot surface new anchors). Do not call list_rewind_anchors again: choose one exact item_id from the rows above and call rewind_context now, or page exactly once with offset=next_offset if every visible row is unusable."
+        ));
+    }
+    if !compact.anchors.is_empty() {
+        return;
+    }
+    if compact.filtered_total == 0 {
+        if compact.query.is_some() {
+            compact.empty_page_reason = Some("query_unmatched");
+            compact.notice = Some(
+                "no eligible anchors match this query. Do not repeat the query: re-list once without a query to see the eligible catalog (an empty unqueried page means nothing is left to rewind to)."
+                    .to_string(),
+            );
+        } else {
+            compact.no_eligible_anchors = Some(true);
+            compact.empty_page_reason = Some("no_eligible_anchors");
+            compact.notice = Some(if compact.density_candidates_only {
+                "no eligible density anchors remain: every remaining thread item is managed-context management/status activity or has no density-valid position. There is nothing to prune — do not call list_rewind_anchors again and do not end the session over this; skip density maintenance and continue the task normally."
+                    .to_string()
+            } else {
+                "no eligible rewind anchors remain: every remaining thread item is managed-context management/status activity or is known to leave backend pressure at/above the rewind-only limit. Re-listing cannot surface new anchors — do not call list_rewind_anchors again. State plainly that managed-context recovery has no valid anchor and end the turn with a brief status message so the supervisor can take a manual recovery path (rewind_backout, thread restore, or operator intervention). include_non_recovery=true remains available for read-only diagnostics only."
+                    .to_string()
+            });
+        }
+    } else {
+        compact.empty_page_reason = Some("offset_past_end");
+        compact.notice = Some(format!(
+            "offset {} is past the end of the eligible catalog ({} anchors). Every eligible row has already been returned. Do not keep paging: choose an item_id from rows already in view and call rewind_context, or re-list from offset 0 only if those rows are no longer visible.",
+            compact.offset, compact.filtered_total
+        ));
+    }
 }
 
 fn serialize_context_rewind_anchor_compact_catalog(
@@ -4523,6 +4611,14 @@ fn context_rewind_anchor_matches_query(
         || anchor.last_line.to_string() == needle
 }
 
+/// Managed-context machinery and supervisor status/observability calls.
+/// These thread items are protocol churn, not substantive task milestones:
+/// they are hidden from the default anchor catalog and excluded from its
+/// accounting so a recovery stall (whose only thread growth is these calls)
+/// re-lists byte-identically instead of presenting a "growing" catalog, and
+/// so a status poll can never be the last "eligible" rewind candidate (the
+/// 2026-06-12 bench dead-end: a density handoff whose only returned row was a
+/// `get_status` anchor the handoff itself disallowed).
 fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
     anchor.names.iter().any(|name| {
         matches!(
@@ -4535,8 +4631,35 @@ fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogE
                 | "context_rewind_anchor_inspect"
                 | "context_rewind"
                 | "context_rewind_backout"
+                | "get_status"
+                | "get_logs"
+                | "get_pending_approval"
+                | "get_pending_input"
+                | "get_restart_status"
         )
     })
+}
+
+/// True when `anchor` is a `list_rewind_anchors` (or legacy alias) call.
+fn context_rewind_anchor_is_listing_call(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
+    anchor
+        .names
+        .iter()
+        .any(|name| matches!(name.as_str(), "list_rewind_anchors" | "context_rewind_anchors"))
+}
+
+/// Number of `list_rewind_anchors` calls in the trailing management-only run
+/// of the catalog scan — i.e. in the current managed-context stall, since
+/// under rewind-only/density gating management tools are the only items the
+/// model can append. Includes the in-flight listing call when the backend has
+/// already persisted it.
+fn context_rewind_trailing_listing_calls(anchors: &[ContextRewindAnchorCatalogEntry]) -> usize {
+    anchors
+        .iter()
+        .rev()
+        .take_while(|anchor| context_rewind_anchor_is_management_tool(anchor))
+        .filter(|anchor| context_rewind_anchor_is_listing_call(anchor))
+        .count()
 }
 
 fn response_item_is_managed_context_recovery_kickstart(item: &serde_json::Value) -> bool {
@@ -16832,7 +16955,7 @@ mod tests {
                     "type": "response_item",
                     "payload": {
                         "type": "function_call",
-                        "name": "get_status",
+                        "name": "view_image",
                         "call_id": "call_near_soft",
                         "arguments": "{}"
                     }
@@ -17931,6 +18054,285 @@ mod tests {
             ids,
             (0..12).map(|idx| format!("call_{idx}")).collect::<Vec<_>>()
         );
+    }
+
+    fn rollout_call_lines(name: &str, call_id: &str, with_output: bool) -> Vec<String> {
+        let mut lines = vec![
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": name,
+                    "call_id": call_id,
+                    "arguments": "{}"
+                }
+            })
+            .to_string(),
+        ];
+        if with_output {
+            lines.push(
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": format!("{name} output")
+                    }
+                })
+                .to_string(),
+            );
+        }
+        lines
+    }
+
+    /// Idempotence across listing-only growth: a recovery stall appends only
+    /// management calls (listings, status polls), and those must not change
+    /// the model-visible catalog accounting between two identical listings.
+    #[test]
+    fn context_rewind_anchor_catalog_is_idempotent_across_listing_churn() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        for idx in 0..6 {
+            lines.extend(rollout_call_lines(
+                "exec_command",
+                &format!("call_sub_{idx}"),
+                true,
+            ));
+        }
+        // First listing call of the stall (persisted before its output, like
+        // the live backend does for the in-flight call).
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let first_raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("first listing");
+        let first: serde_json::Value = serde_json::from_str(&first_raw).unwrap();
+
+        // The stall grows by the first listing's output, a status poll, and
+        // the second in-flight listing call — management churn only.
+        let mut lines = std::fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(str::to_string)
+            .collect::<Vec<_>>();
+        lines.push(
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": "call_list_1",
+                    "output": first_raw.clone()
+                }
+            })
+            .to_string(),
+        );
+        lines.extend(rollout_call_lines("get_status", "call_status_1", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let second_raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("second listing");
+        let second: serde_json::Value = serde_json::from_str(&second_raw).unwrap();
+
+        assert_eq!(first["total"], second["total"], "total must not count management churn");
+        assert_eq!(second["total"].as_u64(), Some(6));
+        assert_eq!(first["filtered_total"], second["filtered_total"]);
+        assert_eq!(first["anchors"], second["anchors"], "page rows must be identical");
+        let ordinals = |catalog: &serde_json::Value| {
+            catalog["anchors"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|anchor| anchor["ordinal"].as_u64().unwrap())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ordinals(&first), ordinals(&second));
+        // The second listing is a repeat of an unchanged page and says so.
+        assert!(first.get("repeat_listing").is_none());
+        assert_eq!(second["repeat_listing"].as_bool(), Some(true));
+        let notice = second["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("Do not call list_rewind_anchors again"), "got: {notice}");
+        assert!(notice.contains("rewind_context"), "got: {notice}");
+    }
+
+    #[test]
+    fn supervisor_status_calls_are_management_anchors() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = rollout_call_lines("exec_command", "call_sub", true);
+        lines.extend(rollout_call_lines("get_status", "call_status", true));
+        lines.extend(rollout_call_lines("get_logs", "call_logs", true));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("default listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["total"].as_u64(), Some(1));
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(1));
+        let ids = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|anchor| anchor["item_id"].as_str().unwrap())
+            .collect::<Vec<_>>();
+        assert_eq!(ids, vec!["call_sub"]);
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "include_management_tools": true, "detail": true }),
+        )
+        .expect("management listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["total"].as_u64(), Some(3));
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(3));
+    }
+
+    #[test]
+    fn paging_and_queries_are_not_flagged_as_repeat_listings() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        for idx in 0..8 {
+            lines.extend(rollout_call_lines(
+                "exec_command",
+                &format!("call_sub_{idx}"),
+                true,
+            ));
+        }
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        // Paging to the next offset is deliberate progress, not a repeat.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 5, "limit": 5 }),
+        )
+        .expect("paged listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+        assert!(catalog.get("notice").is_none(), "got: {catalog}");
+
+        // A focused query is a different view, not a repeat.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "query": "call_sub_3" }),
+        )
+        .expect("query listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+
+        // A reverse listing is a different view, not a repeat.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "reverse": true }),
+        )
+        .expect("reverse listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+
+        // The bare default view is the loop signature and is flagged.
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("repeat listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["repeat_listing"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn substantive_progress_clears_repeat_listing_detection() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        lines.extend(rollout_call_lines("exec_command", "call_sub_0", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", true));
+        // Substantive work after the earlier listing ends the stall.
+        lines.extend(rollout_call_lines("exec_command", "call_sub_1", true));
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("listing after progress");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert!(catalog.get("repeat_listing").is_none(), "got: {catalog}");
+    }
+
+    /// The type-B dead-end from the 2026-06-12 bench: a thread whose only
+    /// remaining items are management/status calls must say plainly that
+    /// nothing is left to rewind to instead of returning a bare empty page.
+    #[test]
+    fn empty_eligible_catalog_reports_dead_end_plainly() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = rollout_call_lines("get_status", "call_status", true);
+        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", false));
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
+            .expect("empty listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["filtered_total"].as_u64(), Some(0));
+        assert_eq!(catalog["anchors"].as_array().map(Vec::len), Some(0));
+        assert_eq!(catalog["no_eligible_anchors"].as_bool(), Some(true));
+        assert_eq!(
+            catalog["empty_page_reason"].as_str(),
+            Some("no_eligible_anchors")
+        );
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("no eligible rewind anchors remain"), "got: {notice}");
+        assert!(notice.contains("manual recovery path"), "got: {notice}");
+        assert!(notice.contains("do not call list_rewind_anchors again"), "got: {notice}");
+
+        // A density-only listing in the same state directs continuing the
+        // task instead of ending the session.
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "density_candidates_only": true, "limit": 1 }),
+        )
+        .expect("empty density listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["no_eligible_anchors"].as_bool(), Some(true));
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("skip density maintenance"), "got: {notice}");
+        assert!(notice.contains("continue the task"), "got: {notice}");
+    }
+
+    #[test]
+    fn empty_pages_distinguish_query_and_offset_dead_ends() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let mut lines = Vec::new();
+        for idx in 0..3 {
+            lines.extend(rollout_call_lines(
+                "exec_command",
+                &format!("call_sub_{idx}"),
+                true,
+            ));
+        }
+        std::fs::write(&path, lines.join("\n")).unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "query": "no_such_item" }),
+        )
+        .expect("query listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["empty_page_reason"].as_str(), Some("query_unmatched"));
+        assert!(catalog.get("no_eligible_anchors").is_none());
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("re-list once without a query"), "got: {notice}");
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({ "offset": 13 }),
+        )
+        .expect("past-end listing");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        assert_eq!(catalog["empty_page_reason"].as_str(), Some("offset_past_end"));
+        assert!(catalog.get("no_eligible_anchors").is_none());
+        let notice = catalog["notice"].as_str().unwrap_or_default();
+        assert!(notice.contains("past the end"), "got: {notice}");
+        assert!(notice.contains("Do not keep paging"), "got: {notice}");
     }
 
     #[test]

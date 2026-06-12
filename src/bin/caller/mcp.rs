@@ -6770,8 +6770,11 @@ pub struct ListRewindAnchorsParams {
     /// Return detailed paged rows instead of the default bounded compact rows.
     #[serde(default)]
     pub detail: bool,
-    /// Include managed-context maintenance calls such as list_rewind_anchors or rewind_context.
-    /// Omit this during ordinary recovery so discovery does not target its own tool calls.
+    /// Include managed-context maintenance and supervisor status calls such as
+    /// list_rewind_anchors, rewind_context, or get_status. When omitted these are
+    /// hidden from rows and excluded from the catalog's totals, so repeated
+    /// listings during one recovery stall stay identical. Omit this during
+    /// ordinary recovery so discovery does not target its own tool calls.
     #[serde(default, alias = "includeManagementTools")]
     pub include_management_tools: bool,
     /// Deprecated bypass flag. Normal model-facing listings keep this enabled unless
