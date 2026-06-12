@@ -12,7 +12,9 @@ lower managed cost — but Terminal-Bench never touched the context machinery
 (zero compactions, zero rewinds in 44 trials). This run constrains the model
 context window to 40k tokens specifically to force engagement, and it did:
 33/40 managed trials produced rewind records (53 total) and 37/40 vanilla
-trials auto-compacted (114 events).
+trials auto-compacted (114 events). A second tier at 28k (§Deep Tier) then
+pushed both lanes to an artificial floor where engagement is universal; it
+confirmed the w40 failure modes are structural, not threshold artifacts.
 
 **The headline is a real negative result for cliff-edge managed mode.**
 Vanilla Codex beat Intendant-managed Codex on both reward (25/40 vs 20/40)
