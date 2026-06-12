@@ -3903,13 +3903,26 @@ fn scan_context_rewind_anchor_catalog(
     let mut latest_rewind_outcomes = HashMap::<String, ContextRewindBackendUsageAtLine>::new();
     let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
     let mut prefix_estimated_tokens = 0_u64;
-    let mut managed_context_recovery_start_line = None::<usize>;
     // Where the latest model response began (first model-emitted item of the
     // current model-item run). Token reports cover input strictly before this
     // line; see `context_rewind_usage_covers_anchor`.
     let mut current_model_response_start = None::<usize>;
     let mut previous_response_item_was_model = false;
     let mut reports_in_current_run = 0usize;
+    // Effective-history replay of `thread_rolled_back` markers. Rollouts are
+    // append-only, so items dropped by a prior anchored rollback remain in
+    // the file; offering them as anchors would make the fork's rollback
+    // (which resolves against *effective* history) fail with "anchor not
+    // found in thread history". Track every response_item line, per-id
+    // occurrence lines, and per-line token estimates; replay each rollback
+    // marker into a dead line span; post-filter the catalog to live lines.
+    // Anchor-less markers (plain N-turn `/undo` rollbacks) and
+    // `thread/restore` checkpoints are not replayed — both are conservative
+    // (the catalog stays as permissive as before for those paths).
+    let mut dead_line_spans: Vec<(usize, usize)> = Vec::new();
+    let mut id_occurrence_lines = HashMap::<String, Vec<usize>>::new();
+    let mut item_tokens_by_line: Vec<(usize, u64)> = Vec::new();
+    let mut managed_context_recovery_kickstart_lines: Vec<usize> = Vec::new();
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -3944,16 +3957,40 @@ fn scan_context_rewind_anchor_catalog(
                     .filter(|usage| line_number.saturating_sub(usage.line) <= 3),
             });
         }
+        if let Some((anchor_id, position)) = context_rewind_rollback_cut_from_rollout_entry(&entry)
+        {
+            // Resolve the cut against the occurrences that are still live at
+            // this marker (chained rollbacks accumulate spans in order).
+            let live_lines: Vec<usize> = id_occurrence_lines
+                .get(&anchor_id)
+                .map(|lines| {
+                    lines
+                        .iter()
+                        .copied()
+                        .filter(|line| !context_rewind_line_is_dead(*line, &dead_line_spans))
+                        .collect()
+                })
+                .unwrap_or_default();
+            if let (Some(&group_first), Some(&group_last)) =
+                (live_lines.first(), live_lines.last())
+            {
+                let cut_start = match position {
+                    external_agent::RollbackAnchorPosition::Before => group_first,
+                    external_agent::RollbackAnchorPosition::After => group_last.saturating_add(1),
+                };
+                if cut_start <= line_number {
+                    dead_line_spans.push((cut_start, line_number));
+                }
+            }
+        }
         if entry.get("type").and_then(|value| value.as_str()) != Some("response_item") {
             continue;
         }
         let Some(payload) = entry.get("payload") else {
             continue;
         };
-        if managed_context_recovery_start_line.is_none()
-            && response_item_is_managed_context_recovery_kickstart(payload)
-        {
-            managed_context_recovery_start_line = Some(line_number);
+        if response_item_is_managed_context_recovery_kickstart(payload) {
+            managed_context_recovery_kickstart_lines.push(line_number);
         }
         let item_is_model_emitted = response_item_is_model_emitted(payload);
         if item_is_model_emitted && !previous_response_item_was_model {
@@ -3961,10 +3998,11 @@ fn scan_context_rewind_anchor_catalog(
             reports_in_current_run = 0;
         }
         previous_response_item_was_model = item_is_model_emitted;
+        let item_estimated_tokens = context_rewind_estimated_tokens(payload);
         let prefix_before_item = prefix_estimated_tokens;
-        prefix_estimated_tokens =
-            prefix_estimated_tokens.saturating_add(context_rewind_estimated_tokens(payload));
+        prefix_estimated_tokens = prefix_estimated_tokens.saturating_add(item_estimated_tokens);
         let prefix_after_item = prefix_estimated_tokens;
+        item_tokens_by_line.push((line_number, item_estimated_tokens));
         let item_type = payload
             .get("type")
             .and_then(|value| value.as_str())
@@ -3974,6 +4012,10 @@ fn scan_context_rewind_anchor_catalog(
         let roles = context_rewind_anchor_roles(payload);
         let summary = context_rewind_anchor_summary(payload);
         for item_id in response_item_anchor_ids(payload) {
+            id_occurrence_lines
+                .entry(item_id.clone())
+                .or_default()
+                .push(line_number);
             if let Some(index) = by_item_id.get(&item_id).copied() {
                 let anchor = &mut anchors[index];
                 anchor.last_line = line_number;
@@ -4034,7 +4076,81 @@ fn scan_context_rewind_anchor_catalog(
         }
     }
 
-    let total_prefix_estimated_tokens = prefix_estimated_tokens;
+    if !dead_line_spans.is_empty() {
+        // Drop anchors whose every occurrence was cut by a prior rollback —
+        // they no longer exist in effective history and the fork would
+        // reject them. Anchors that re-appear after the cut stay, rebased to
+        // their live occurrence lines.
+        anchors.retain(|anchor| {
+            id_occurrence_lines
+                .get(&anchor.item_id)
+                .is_some_and(|lines| {
+                    lines
+                        .iter()
+                        .any(|line| !context_rewind_line_is_dead(*line, &dead_line_spans))
+                })
+        });
+        for (ordinal, anchor) in anchors.iter_mut().enumerate() {
+            anchor.ordinal = ordinal;
+            if let Some(lines) = id_occurrence_lines.get(&anchor.item_id) {
+                let mut live = lines
+                    .iter()
+                    .copied()
+                    .filter(|line| !context_rewind_line_is_dead(*line, &dead_line_spans));
+                if let Some(first) = live.next() {
+                    anchor.first_line = first;
+                    anchor.last_line = live.last().unwrap_or(first);
+                }
+            }
+        }
+        // A usage report is poisoned only if its measured prefix contained
+        // an item that a *later* rollback dropped: some dead item line sits
+        // before the report while the marker that killed it sits at/after
+        // the report. Reports measuring a purely-live prefix (e.g. taken
+        // between the cut point and the marker with no dead items in
+        // between, or after the rollback applied) stay valid.
+        let mut dead_item_lines: Vec<(usize, usize)> = Vec::new(); // (item_line, marker_line)
+        for (line, _tokens) in &item_tokens_by_line {
+            if let Some((_, marker_line)) = dead_line_spans
+                .iter()
+                .find(|(start, end)| line >= start && line <= end)
+            {
+                dead_item_lines.push((*line, *marker_line));
+            }
+        }
+        backend_usage.retain(|usage| {
+            !dead_item_lines.iter().any(|(item_line, marker_line)| {
+                *item_line < usage.line && *marker_line >= usage.line
+            })
+        });
+    }
+    // Recompute prefix estimates over the live item sequence so pruning
+    // estimates do not count items a prior rollback already dropped.
+    let mut live_running_total = 0_u64;
+    let mut live_prefix_before_by_line = HashMap::<usize, u64>::new();
+    let mut live_prefix_after_by_line = HashMap::<usize, u64>::new();
+    for (line, tokens) in &item_tokens_by_line {
+        if context_rewind_line_is_dead(*line, &dead_line_spans) {
+            continue;
+        }
+        live_prefix_before_by_line.insert(*line, live_running_total);
+        live_running_total = live_running_total.saturating_add(*tokens);
+        live_prefix_after_by_line.insert(*line, live_running_total);
+    }
+    for anchor in &mut anchors {
+        if let Some(prefix) = live_prefix_before_by_line.get(&anchor.first_line) {
+            anchor.prefix_estimated_tokens_before_anchor = Some(*prefix);
+        }
+        if let Some(prefix) = live_prefix_after_by_line.get(&anchor.last_line) {
+            anchor.prefix_estimated_tokens_after_anchor = Some(*prefix);
+        }
+    }
+    let managed_context_recovery_start_line = managed_context_recovery_kickstart_lines
+        .iter()
+        .copied()
+        .find(|line| !context_rewind_line_is_dead(*line, &dead_line_spans));
+
+    let total_prefix_estimated_tokens = live_running_total;
     for anchor in &mut anchors {
         anchor.approx_pruned_tokens_before = anchor
             .prefix_estimated_tokens_before_anchor
@@ -4319,6 +4435,45 @@ fn context_rewind_backend_usage_from_rollout_entry(
         response_start_line: line,
         measures_prefix_exactly: false,
     })
+}
+
+/// Whether a rollout line sits inside a span that a prior `thread_rolled_back`
+/// marker removed from effective history.
+fn context_rewind_line_is_dead(line: usize, dead_line_spans: &[(usize, usize)]) -> bool {
+    dead_line_spans
+        .iter()
+        .any(|(start, end)| line >= *start && line <= *end)
+}
+
+/// Parse a `thread_rolled_back` marker into the anchored cut it applied:
+/// the anchor item id plus the cut position. Markers without an anchor
+/// (plain N-turn rollbacks) return `None` — the catalog replay treats those
+/// conservatively (no dead span).
+fn context_rewind_rollback_cut_from_rollout_entry(
+    entry: &serde_json::Value,
+) -> Option<(String, external_agent::RollbackAnchorPosition)> {
+    if entry.get("type").and_then(|value| value.as_str()) != Some("event_msg") {
+        return None;
+    }
+    let payload = entry.get("payload")?;
+    if payload.get("type").and_then(|value| value.as_str()) != Some("thread_rolled_back") {
+        return None;
+    }
+    let anchor = payload.get("anchor")?;
+    let item_id = anchor
+        .get("itemId")
+        .or_else(|| anchor.get("item_id"))?
+        .as_str()?
+        .trim();
+    if item_id.is_empty() {
+        return None;
+    }
+    let position = anchor
+        .get("position")
+        .and_then(|value| value.as_str())
+        .and_then(external_agent::RollbackAnchorPosition::from_str)
+        .unwrap_or(external_agent::RollbackAnchorPosition::After);
+    Some((item_id.to_string(), position))
 }
 
 fn context_rewind_rollback_anchor_outcome_key_from_rollout_entry(
@@ -5896,6 +6051,20 @@ fn managed_context_drop_original_for_recovery(
 }
 
 const MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND: u8 = 2;
+
+/// Interrupt reason recorded when the managed-context density tool gate
+/// blocks a broad ordinary tool mid-turn. The external-agent loop keys on
+/// this exact reason to continue autonomously (density handoff / recovery
+/// kickstart) instead of waiting for a user follow-up that headless
+/// sessions never receive.
+const MANAGED_CONTEXT_DENSITY_BLOCK_INTERRUPT_REASON: &str =
+    "managed-context density watch blocked broad ordinary tool";
+
+/// Upper bound on consecutive density-gate interrupts answered with an
+/// automatic maintenance handoff while pressure never leaves the density
+/// band. Past this, recovery did not converge and the loop fails loudly
+/// instead of ping-ponging until the task timeout.
+const MANAGED_CONTEXT_DENSITY_BLOCK_MAX_HANDOFFS_WITHOUT_RELIEF: u8 = 4;
 
 fn managed_context_recovery_kickstart_text(
     pressure: ManagedContextRewindOnlyPressure,
@@ -10265,7 +10434,7 @@ async fn drain_external_agent_events(
                     if !interrupt_pending {
                         interrupt_pending = true;
                         interrupt_reason =
-                            "managed-context density watch blocked broad ordinary tool".to_string();
+                            MANAGED_CONTEXT_DENSITY_BLOCK_INTERRUPT_REASON.to_string();
                         if let Err(e) = agent.interrupt_turn().await {
                             let content = format!(
                                 "Managed-context density tool-gate interrupt failed: {}",
@@ -21332,6 +21501,175 @@ Also: {"source": "bare"}"#;
         assert!(fission_spawn_anchor_from_catalog(&[]).is_none());
     }
 
+    fn write_rollback_test_rollout(path: &Path, lines: &[serde_json::Value]) {
+        std::fs::write(
+            path,
+            lines
+                .iter()
+                .map(|value| value.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+    }
+
+    fn rollback_test_call(call_id: &str) -> [serde_json::Value; 2] {
+        [
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call",
+                    "name": "exec_command",
+                    "arguments": "{\"cmd\":\"echo hi\"}",
+                    "call_id": call_id
+                }
+            }),
+            serde_json::json!({
+                "type": "response_item",
+                "payload": {
+                    "type": "function_call_output",
+                    "call_id": call_id,
+                    "output": "hi"
+                }
+            }),
+        ]
+    }
+
+    fn rollback_test_marker(item_id: &str, position: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_rolled_back",
+                "num_turns": 1,
+                "anchor": { "itemId": item_id, "position": position }
+            }
+        })
+    }
+
+    fn catalog_item_ids(anchors: &[ContextRewindAnchorCatalogEntry]) -> Vec<String> {
+        anchors.iter().map(|anchor| anchor.item_id.clone()).collect()
+    }
+
+    #[test]
+    fn catalog_drops_anchors_cut_by_prior_rollback_position_before() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        let [a_call, a_out] = rollback_test_call("call_a");
+        let [b_call, b_out] = rollback_test_call("call_b");
+        let [c_call, c_out] = rollback_test_call("call_c");
+        let [d_call, d_out] = rollback_test_call("call_d");
+        write_rollback_test_rollout(
+            &rollout,
+            &[
+                a_call,
+                a_out,
+                b_call,
+                b_out,
+                c_call,
+                c_out,
+                // Rollback to *before* call_b: call_b and call_c leave
+                // effective history; the fork would reject them as anchors.
+                rollback_test_marker("call_b", "before"),
+                d_call,
+                d_out,
+            ],
+        );
+        let anchors = scan_context_rewind_anchor_catalog(&rollout).unwrap();
+        assert_eq!(catalog_item_ids(&anchors), vec!["call_a", "call_d"]);
+        // Ordinals re-assigned after the filter; lines reflect live spans.
+        assert_eq!(anchors[0].ordinal, 0);
+        assert_eq!(anchors[1].ordinal, 1);
+        assert_eq!(anchors[0].first_line, 1);
+        assert_eq!(anchors[0].last_line, 2);
+        assert_eq!(anchors[1].first_line, 8);
+        assert_eq!(anchors[1].last_line, 9);
+    }
+
+    #[test]
+    fn catalog_keeps_anchor_group_on_position_after_rollback() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        let [a_call, a_out] = rollback_test_call("call_a");
+        let [b_call, b_out] = rollback_test_call("call_b");
+        let [c_call, c_out] = rollback_test_call("call_c");
+        let [d_call, d_out] = rollback_test_call("call_d");
+        write_rollback_test_rollout(
+            &rollout,
+            &[
+                a_call,
+                a_out,
+                b_call,
+                b_out,
+                c_call,
+                c_out,
+                // Rollback to *after* call_b keeps the call/output group;
+                // only call_c is cut.
+                rollback_test_marker("call_b", "after"),
+                d_call,
+                d_out,
+            ],
+        );
+        let anchors = scan_context_rewind_anchor_catalog(&rollout).unwrap();
+        assert_eq!(
+            catalog_item_ids(&anchors),
+            vec!["call_a", "call_b", "call_d"]
+        );
+    }
+
+    #[test]
+    fn catalog_replays_chained_rollbacks_in_order() {
+        let dir = tempfile::tempdir().unwrap();
+        let rollout = dir.path().join("rollout.jsonl");
+        let [a_call, a_out] = rollback_test_call("call_a");
+        let [b_call, b_out] = rollback_test_call("call_b");
+        let [c_call, c_out] = rollback_test_call("call_c");
+        let [d_call, d_out] = rollback_test_call("call_d");
+        write_rollback_test_rollout(
+            &rollout,
+            &[
+                a_call,
+                a_out,
+                b_call,
+                b_out,
+                c_call,
+                c_out,
+                // First cut: before call_c (drops call_c only).
+                rollback_test_marker("call_c", "before"),
+                d_call,
+                d_out,
+                // Second cut: after call_a (drops call_b and call_d; the
+                // already-dead call_c span stays dead).
+                rollback_test_marker("call_a", "after"),
+            ],
+        );
+        let anchors = scan_context_rewind_anchor_catalog(&rollout).unwrap();
+        assert_eq!(catalog_item_ids(&anchors), vec!["call_a"]);
+    }
+
+    #[test]
+    fn catalog_rollback_cut_parses_marker_variants() {
+        // itemId (wire form) and item_id (serde form) both parse; position
+        // defaults to `after` when missing.
+        let entry = serde_json::json!({
+            "type": "event_msg",
+            "payload": {
+                "type": "thread_rolled_back",
+                "num_turns": 2,
+                "anchor": { "item_id": "call_x" }
+            }
+        });
+        let (item_id, position) =
+            context_rewind_rollback_cut_from_rollout_entry(&entry).expect("anchor cut");
+        assert_eq!(item_id, "call_x");
+        assert_eq!(position, external_agent::RollbackAnchorPosition::After);
+        // Anchor-less plain N-turn rollbacks are conservatively ignored.
+        let plain = serde_json::json!({
+            "type": "event_msg",
+            "payload": { "type": "thread_rolled_back", "num_turns": 3 }
+        });
+        assert!(context_rewind_rollback_cut_from_rollout_entry(&plain).is_none());
+    }
+
     #[test]
     fn fission_detach_predicate_math_on_synthetic_rollout() {
         let dir = tempfile::tempdir().unwrap();
@@ -27184,6 +27522,7 @@ async fn run_external_agent_mode(
     let mut pending_managed_context_replays: std::collections::VecDeque<FollowUpMessage> =
         std::collections::VecDeque::new();
     let mut managed_context_recovery_kickstarts_without_rewind = 0u8;
+    let mut managed_context_density_block_handoffs_without_relief = 0u8;
     let mut next_turn = if task.trim().is_empty() {
         None
     } else {
@@ -28651,6 +28990,7 @@ async fn run_external_agent_mode(
                                 }
                             } else {
                                 managed_context_recovery_kickstarts_without_rewind = 0;
+                                managed_context_density_block_handoffs_without_relief = 0;
                                 if managed_context_recovery_without_rewind_blocks_held_replay(
                                     managed_context_recovery_kickstart,
                                     &pending_managed_context_replays,
@@ -28843,6 +29183,7 @@ async fn run_external_agent_mode(
                 turn_stop_status,
             } => {
                 managed_context_recovery_kickstarts_without_rewind = 0;
+                managed_context_density_block_handoffs_without_relief = 0;
                 stats.rounds = round;
                 match apply_external_context_rewind(
                     &mut agent,
@@ -29039,10 +29380,15 @@ async fn run_external_agent_mode(
                 break;
             }
             DrainOutcome::Interrupted { reason } => {
-                // User-requested interrupt. Emit RoundComplete so the
-                // dashboard updates, log it, and wait for the next
-                // follow-up or channel close — the interrupt *is* the
-                // terminal event for this round.
+                // Emit RoundComplete so the dashboard updates and log the
+                // interrupt. For a *user-requested* interrupt the round ends
+                // here and the loop waits for the next follow-up. When the
+                // managed-context density tool gate generated the interrupt,
+                // there may be no user at all (headless `--task-file` runs),
+                // so the supervisor must continue the loop itself with the
+                // density maintenance handoff (managed.md: density gating
+                // inserts a maintenance handoff) or a recovery kickstart if
+                // pressure escalated past the rewind-only threshold.
                 stats.rounds = round;
                 slog(&session_log, |l| {
                     l.info(&format!("External agent interrupted: {}", reason))
@@ -29059,6 +29405,119 @@ async fn run_external_agent_mode(
                     turns_in_round: stats.turns,
                     native_message_count: None,
                 });
+                if codex_managed_context_enabled
+                    && reason == MANAGED_CONTEXT_DENSITY_BLOCK_INTERRUPT_REASON
+                {
+                    match refresh_external_context_usage_snapshot(&mut agent, &drain_config).await {
+                        Ok(Some(snapshot)) => {
+                            if let Some(pressure) = managed_context_rewind_only_pressure(&snapshot)
+                            {
+                                managed_context_recovery_kickstarts_without_rewind =
+                                    managed_context_recovery_kickstarts_without_rewind
+                                        .saturating_add(1);
+                                if managed_context_recovery_kickstarts_without_rewind
+                                    < MANAGED_CONTEXT_RECOVERY_MAX_KICKSTARTS_WITHOUT_REWIND
+                                {
+                                    let held_user_input =
+                                        !pending_managed_context_replays.is_empty();
+                                    let recovery_text = managed_context_recovery_kickstart_text(
+                                        pressure,
+                                        held_user_input,
+                                    );
+                                    slog(&session_log, |l| {
+                                        l.warn(&format!(
+                                            "Managed-context density tool gate interrupted the turn while pressure escalated to rewind-only ({}/{} tokens); sending recovery kickstart",
+                                            pressure.used_tokens,
+                                            pressure.rewind_only_limit
+                                        ))
+                                    });
+                                    next_turn = Some(
+                                        FollowUpMessage::text(recovery_text)
+                                            .managed_context_recovery_kickstart(),
+                                    );
+                                    continue 'outer;
+                                }
+                                let message = format!(
+                                    "Managed-context density tool gate kept interrupting while context stayed above the rewind-only threshold ({}/{} tokens); refusing to continue without a rewind.",
+                                    pressure.used_tokens, pressure.rewind_only_limit
+                                );
+                                slog(&session_log, |l| l.warn(&message));
+                                bus.send(AppEvent::LoopError(message));
+                                stats.terminal_outcome = Some(
+                                    "managed Codex context pressure unresolved".to_string(),
+                                );
+                                break;
+                            }
+                            if let Some(pressure) = managed_context_density_pressure(&snapshot) {
+                                managed_context_density_block_handoffs_without_relief =
+                                    managed_context_density_block_handoffs_without_relief
+                                        .saturating_add(1);
+                                if managed_context_density_block_handoffs_without_relief
+                                    < MANAGED_CONTEXT_DENSITY_BLOCK_MAX_HANDOFFS_WITHOUT_RELIEF
+                                {
+                                    let handoff_text =
+                                        managed_context_density_handoff_text(pressure);
+                                    slog(&session_log, |l| {
+                                        l.info(&format!(
+                                            "Managed-context density tool gate interrupted the turn ({}/{} tokens, threshold {}); sending density maintenance handoff",
+                                            pressure.used_tokens,
+                                            pressure.rewind_only_limit,
+                                            pressure.recommended_rewind_limit
+                                        ))
+                                    });
+                                    next_turn = Some(
+                                        FollowUpMessage::text(handoff_text)
+                                            .managed_context_density_handoff(),
+                                    );
+                                    continue 'outer;
+                                }
+                                let message = format!(
+                                    "Managed-context density maintenance did not converge after {} handoffs ({}/{} tokens, threshold {}); refusing to ping-pong until the task timeout.",
+                                    managed_context_density_block_handoffs_without_relief,
+                                    pressure.used_tokens,
+                                    pressure.rewind_only_limit,
+                                    pressure.recommended_rewind_limit
+                                );
+                                slog(&session_log, |l| l.warn(&message));
+                                bus.send(AppEvent::LoopError(message));
+                                stats.terminal_outcome = Some(
+                                    "managed Codex density maintenance unresolved".to_string(),
+                                );
+                                break;
+                            }
+                            // Pressure dropped below the density threshold
+                            // between the block and this re-read (a fresher
+                            // backend report landed); the steer is stale —
+                            // resume the interrupted task.
+                            managed_context_density_block_handoffs_without_relief = 0;
+                            slog(&session_log, |l| {
+                                l.info(
+                                    "Managed-context density tool gate interrupted the turn, but a fresher backend report is below the density threshold; resuming the task",
+                                )
+                            });
+                            next_turn = Some(FollowUpMessage::text(
+                                "The previous turn was interrupted by a managed-context density gate, but the latest backend report now shows context pressure below the recommended density threshold, so that steer is stale. Continue the task from where it was interrupted."
+                                    .to_string(),
+                            ));
+                            continue 'outer;
+                        }
+                        Ok(None) => {
+                            slog(&session_log, |l| {
+                                l.warn(
+                                    "Managed-context density tool gate interrupted the turn, but no backend context report is available; waiting for a follow-up",
+                                )
+                            });
+                        }
+                        Err(e) => {
+                            slog(&session_log, |l| {
+                                l.warn(&format!(
+                                    "Managed-context density tool gate interrupted the turn, but context pressure could not be re-read: {}; waiting for a follow-up",
+                                    e
+                                ))
+                            });
+                        }
+                    }
+                }
             }
             DrainOutcome::Terminated { reason, exit_code } => {
                 stats.rounds = round;
