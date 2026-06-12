@@ -21266,11 +21266,46 @@ function renderManagedContextRecords() {
       `<div class="managed-context-record-meta">` +
       `<span>${escapeHtml(record.created_at || '')}</span>` +
       `<span>${escapeHtml(record.position || 'after')} ${escapeHtml(record.item_id || '')}</span>` +
+      managedContextRecordBadgesHtml(record) +
       `</div>` +
       `<div class="managed-context-muted">${escapeHtml(compactSessionText(record.reason) || 'no reason')}</div>`;
     row.addEventListener('click', () => selectManagedContextRecord(record));
     host.appendChild(row);
   }
+}
+
+function managedContextPressureBandChipClass(band) {
+  // Mirrors the pressure-fill tones: red at/above the rewind-only limit,
+  // yellow in the density-watch band, green below the threshold.
+  switch (band) {
+    case 'critical': case 'high': return ' failed';
+    case 'watch': return ' blocked';
+    case 'ok': return ' completed';
+    default: return '';
+  }
+}
+
+function managedContextRecordBadgesHtml(record) {
+  const badges = [];
+  if (record.surgical === true) {
+    badges.push(
+      '<span class="managed-context-status-chip failed" title="Supervisor backstop: Intendant chose the anchor and authored a synthetic primer after the model exhausted its recovery steps without rewinding">SURGICAL</span>'
+    );
+  }
+  const band = String(record.pressure_band_at_rewind || '').trim();
+  if (band) {
+    const used = record.used_tokens_at_rewind;
+    const windowAt = record.context_window_at_rewind;
+    const counts = used != null && windowAt != null
+      ? ` · ${stationCompactNumber(used)}/${stationCompactNumber(windowAt)}`
+      : '';
+    badges.push(
+      `<span class="managed-context-status-chip${managedContextPressureBandChipClass(band)}"` +
+      ` title="Backend-reported context pressure when this record was created (used/rewind-only limit)">` +
+      `${escapeHtml(band)}${counts}</span>`
+    );
+  }
+  return badges.join('');
 }
 
 function selectManagedContextRecord(record) {
