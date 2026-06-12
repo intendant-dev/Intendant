@@ -6086,8 +6086,34 @@ fn managed_context_rewind_only_tool_allowed(tool_name: &str, preview: &str) -> b
             .is_some_and(|(_, name)| allowed_name(name))
 }
 
+/// Tools allowed to start while the managed-context density steer is active
+/// (watch band: at or above the recommended density threshold, below the
+/// rewind-only limit). Everything the rewind-only gate allows, plus the
+/// fission tools: spawning a branch at watch pressure is itself a density
+/// action — the work and its context noise land in the branch while the
+/// parent only carries the spawn call and an eventual import. Under
+/// rewind-only pressure the stricter
+/// [`managed_context_rewind_only_tool_allowed`] gate applies instead and
+/// fission stays blocked: the parent must shrink first.
 fn managed_context_density_tool_allowed(tool_name: &str, preview: &str) -> bool {
-    managed_context_rewind_only_tool_allowed(tool_name, preview)
+    fn fission_name(name: &str) -> bool {
+        matches!(
+            name.trim(),
+            "fission_spawn" | "fission_control" | "claim_fission_canonical"
+        )
+    }
+
+    if managed_context_rewind_only_tool_allowed(tool_name, preview) || fission_name(tool_name) {
+        return true;
+    }
+    if tool_name != "mcp" {
+        return false;
+    }
+    let preview = preview.trim();
+    fission_name(preview)
+        || preview
+            .rsplit_once(':')
+            .is_some_and(|(_, name)| fission_name(name))
 }
 
 fn shellish_command_tokens(command: &str) -> Vec<String> {
@@ -6326,7 +6352,7 @@ fn managed_context_density_handoff_text(pressure: ManagedContextDensityPressure)
         .map(|hard| format!(" hard_limit={hard}"))
         .unwrap_or_default();
     format!(
-        "<managed_context_density_handoff>\nwatch {used}/{limit}; recommended_density_threshold={recommended}{hard}. Maintenance only. For a useful density rewind, call list_rewind_anchors with density_candidates_only=true, include_pruning_estimates=true, limit=1; inspect only if that row is ambiguous; then call rewind_context with one exact returned item_id, a returned position, and a dense primer. Density rows hide anchors without a density-valid position and narrow positions to choices expected below the threshold. If no exact anchor is clearly worthwhile, reply with a concise no-rewind handoff covering durable facts, changed files, verification, constraints, remaining decisions, and state that you are leaving context unchanged. Do not do broad ordinary-tool work. Do not use auto anchors, N-turn rewinds, synthesized ids, failed-example ids, or management-tool anchors.\n</managed_context_density_handoff>",
+        "<managed_context_density_handoff>\nwatch {used}/{limit}; recommended_density_threshold={recommended}{hard}. Maintenance only. For a useful density rewind, call list_rewind_anchors with density_candidates_only=true, include_pruning_estimates=true, limit=1; inspect only if that row is ambiguous; then call rewind_context with one exact returned item_id, a returned position, and a dense primer. Density rows hide anchors without a density-valid position and narrow positions to choices expected below the threshold. If no exact anchor is clearly worthwhile, reply with a concise no-rewind handoff covering durable facts, changed files, verification, constraints, remaining decisions, and state that you are leaving context unchanged. Do not do broad ordinary-tool work. Fission stays allowed: delegating separable work to a branch via fission_spawn is a valid density action. Do not use auto anchors, N-turn rewinds, synthesized ids, failed-example ids, or management-tool anchors.\n</managed_context_density_handoff>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -6348,7 +6374,7 @@ fn managed_context_density_active_steer_text(
         "Allow the currently in-flight narrow validation/build/tool to finish and preserve its durable result, but do not start another broad build, QA, exploration, or implementation loop before density maintenance."
     };
     format!(
-        "<managed_context_density_steer>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). This steer is freshness-bound to the latest backend-reported context status; if a later status reports below recommended_density_threshold, this steer is stale and must be ignored. {in_flight} Normal tools are still allowed below rewind_only, but before broad follow-up work do exact-anchor density maintenance if a current catalog anchor can materially reduce pressure below the recommended density threshold, or give a concise no-rewind density handoff that crystallizes durable facts, changed files, validation results, constraints, and remaining decisions. Use list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, and inspect_rewind_anchor only as needed; if rewinding, call rewind_context with one exact returned item_id, a valid returned position, and a dense carry-forward primer. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_steer>",
+        "<managed_context_density_steer>\nBackend-reported Codex context pressure is watch ({used}/{limit} tokens, recommended_density_threshold={recommended}{hard}). This steer is freshness-bound to the latest backend-reported context status; if a later status reports below recommended_density_threshold, this steer is stale and must be ignored. {in_flight} Normal tools are still allowed below rewind_only, but before broad follow-up work do exact-anchor density maintenance if a current catalog anchor can materially reduce pressure below the recommended density threshold, or give a concise no-rewind density handoff that crystallizes durable facts, changed files, validation results, constraints, and remaining decisions. Fission tools stay allowed at watch: delegating separable work to a fission branch is itself a valid density action. Use list_rewind_anchors with density_candidates_only=true and include_pruning_estimates=true, and inspect_rewind_anchor only as needed; if rewinding, call rewind_context with one exact returned item_id, a valid returned position, and a dense carry-forward primer. Do not use auto anchors, N-turn rewinds, synthesized item ids, anchors from failed examples, or managed-context maintenance calls as rewind targets.\n</managed_context_density_steer>",
         used = pressure.used_tokens,
         limit = pressure.rewind_only_limit,
         recommended = pressure.recommended_rewind_limit,
@@ -14184,6 +14210,64 @@ mod tests {
     }
 
     #[test]
+    fn managed_context_density_tool_classifier_allows_fission_at_watch_only() {
+        // Watch band (density steer): fission tools may start — delegating
+        // separable work to a branch is itself a density action.
+        assert!(managed_context_density_tool_allowed("fission_spawn", ""));
+        assert!(managed_context_density_tool_allowed("fission_control", ""));
+        assert!(managed_context_density_tool_allowed(
+            "claim_fission_canonical",
+            ""
+        ));
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:fission_spawn"
+        ));
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "fission_control"
+        ));
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:claim_fission_canonical"
+        ));
+        // Everything the rewind-only gate allows stays allowed at watch...
+        assert!(managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:rewind_context"
+        ));
+        assert!(managed_context_density_tool_allowed("get_status", ""));
+        // ...while broad ordinary tools stay blocked at watch.
+        assert!(!managed_context_density_tool_allowed(
+            "command",
+            "cargo build"
+        ));
+        assert!(!managed_context_density_tool_allowed(
+            "mcp",
+            "intendant:execute_cu_actions"
+        ));
+        // Rewind-only stays stricter: fission is blocked there with every
+        // other ordinary tool — the parent must shrink first.
+        assert!(!managed_context_rewind_only_tool_allowed("fission_spawn", ""));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "fission_control",
+            ""
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "claim_fission_canonical",
+            ""
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:fission_spawn"
+        ));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "mcp",
+            "intendant:claim_fission_canonical"
+        ));
+    }
+
+    #[test]
     fn managed_codex_dashboard_command_classifier_flags_foreground_launch() {
         assert!(managed_codex_foreground_dashboard_command(
             "command",
@@ -14347,6 +14431,21 @@ mod tests {
                 status: external_agent::ToolCompletionStatus::Success,
             })
             .unwrap();
+        // Fission tools are allowed at density watch but must STILL be
+        // blocked under rewind-only pressure: the parent must shrink first.
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "fission-1".to_string(),
+                tool_name: "mcp".to_string(),
+                preview: "intendant:fission_spawn".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "fission-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            })
+            .unwrap();
         event_tx
             .send(external_agent::AgentEvent::TurnCompleted { message: None })
             .unwrap();
@@ -14392,12 +14491,12 @@ mod tests {
         assert_eq!(interrupts.load(std::sync::atomic::Ordering::SeqCst), 1);
         assert!(steers.lock().unwrap().is_empty());
 
-        let mut saw_block_log = false;
+        let mut blocked_logs = Vec::new();
         loop {
             match observed.try_recv() {
                 Ok(AppEvent::LogEntry { content, .. }) => {
                     if content.contains("Blocked Codex tool") {
-                        saw_block_log = true;
+                        blocked_logs.push(content.clone());
                     }
                     assert!(
                         !content.contains("git status output that must not leak"),
@@ -14418,7 +14517,17 @@ mod tests {
                 Err(tokio::sync::broadcast::error::TryRecvError::Closed) => break,
             }
         }
-        assert!(saw_block_log);
+        assert_eq!(
+            blocked_logs.len(),
+            2,
+            "expected the broad command AND the fission tool blocked: {blocked_logs:?}"
+        );
+        assert!(
+            blocked_logs
+                .iter()
+                .any(|content| content.contains("fission_spawn")),
+            "fission_spawn must stay blocked under rewind-only: {blocked_logs:?}"
+        );
     }
 
     #[tokio::test]
@@ -14790,6 +14899,22 @@ mod tests {
                 status: external_agent::ToolCompletionStatus::Success,
             })
             .unwrap();
+        // Fission tools are NOT broad ordinary work at watch pressure:
+        // spawning a branch is itself a density action, so the density gate
+        // must let it start even while the steer is active.
+        event_tx
+            .send(external_agent::AgentEvent::ToolStarted {
+                item_id: "fission-1".to_string(),
+                tool_name: "mcp".to_string(),
+                preview: "intendant:fission_spawn".to_string(),
+            })
+            .unwrap();
+        event_tx
+            .send(external_agent::AgentEvent::ToolCompleted {
+                item_id: "fission-1".to_string(),
+                status: external_agent::ToolCompletionStatus::Success,
+            })
+            .unwrap();
         event_tx
             .send(external_agent::AgentEvent::TurnCompleted { message: None })
             .unwrap();
@@ -14837,14 +14962,20 @@ mod tests {
         assert_eq!(steers.len(), 1);
         assert!(steers[0].contains("context pressure is watch"));
         assert!(steers[0].contains("No command/tool was active"));
+        assert!(steers[0].contains("Fission tools stay allowed at watch"));
 
         let mut blocked_count = 0usize;
         let mut saw_density_interrupt = false;
+        let mut saw_fission_started = false;
         loop {
             match observed.try_recv() {
                 Ok(AppEvent::LogEntry { content, .. }) => {
                     if content.contains("while managed context is in density watch") {
                         blocked_count += 1;
+                        assert!(
+                            !content.contains("fission_spawn"),
+                            "fission tool was blocked by the density gate: {content}"
+                        );
                     }
                     assert!(
                         !content.contains("sed output that must not leak")
@@ -14864,6 +14995,11 @@ mod tests {
                         "blocked density-watch command emitted AgentStarted: {commands_preview}"
                     );
                 }
+                Ok(AppEvent::AgentStarted {
+                    commands_preview, ..
+                }) if commands_preview.contains("fission_spawn") => {
+                    saw_fission_started = true;
+                }
                 Ok(AppEvent::AgentOutput { stdout, .. }) => {
                     panic!("blocked density-watch command output leaked: {stdout}");
                 }
@@ -14875,6 +15011,10 @@ mod tests {
         }
         assert_eq!(blocked_count, 2);
         assert!(saw_density_interrupt);
+        assert!(
+            saw_fission_started,
+            "fission_spawn should start under density watch"
+        );
     }
 
     #[tokio::test]
@@ -15423,12 +15563,14 @@ mod tests {
         assert!(text.contains("narrow positions"));
         assert!(text.contains("concise no-rewind handoff"));
         assert!(text.contains("leaving context unchanged"));
+        assert!(text.contains("Fission stays allowed"));
+        assert!(text.contains("fission_spawn"));
         assert!(text.contains("Do not use auto anchors"));
         assert!(text.contains("N-turn rewinds"));
         assert!(!text.contains("call_"));
         assert!(!text.contains("rewind N"));
         assert!(
-            text.len() < 1_000,
+            text.len() < 1_100,
             "density maintenance prompt should stay tiny: {} bytes",
             text.len()
         );

@@ -73,7 +73,7 @@ Keep the live transcript informationally dense:
 
 Fission (full-context branch spawning), when fission tools are available:
 - When a coherent subtask is separable or parallelizable, prefer `fission_spawn` with a self-contained charter over a deep in-context detour. Branches fork from the last completed turn and do not see the current turn, so each charter must carry every fact, path, and constraint the branch needs.
-- Favor breadth over depth, before pressure builds: fission is ex-ante, rewind is ex-post, and fission tools are unavailable under rewind-only pressure.
+- Favor breadth over depth, before pressure builds: fission is ex-ante, rewind is ex-post. Fission tools stay available at `watch` pressure — delegating separable work to a branch is itself a valid density action, since the branch absorbs the work's context noise — but they are unavailable under rewind-only pressure.
 - After spawning, continue your own non-overlapping work; do not idle behind a branch.
 - Use `fission_control(op="wait")` only when genuinely blocked on a branch result. A `still_running` result is normal — keep working and re-check later.
 - Import branch results you need via `fission_control(op="import")`; detach or ignore branches you don't.
@@ -11377,6 +11377,8 @@ error: build failed
             "fission_spawn",
             "fork from the last completed turn and do not see the current turn",
             "fission is ex-ante, rewind is ex-post",
+            "stay available at `watch` pressure",
+            "valid density action",
             "unavailable under rewind-only pressure",
             "continue your own non-overlapping work",
             "fission_control(op=\"wait\")",

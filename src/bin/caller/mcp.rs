@@ -1100,7 +1100,7 @@ impl McpAppState {
             "Managed context is above the recommended density threshold but below the rewind-only limit. A successful managed-context rewind already satisfied the current density handoff; continue the concrete follow-up work, and only repeat density maintenance after the round completes or if pressure reaches rewind-only."
         } else if density_pressure {
             if managed_context {
-                "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff."
+                "Managed context is above the recommended density threshold but below the rewind-only limit. Normal tools remain allowed for status/anchor inspection and one narrow in-flight validation or build to finish, but before broad follow-up work perform exact-anchor density maintenance when it materially improves density, or produce a concise no-rewind density handoff. Fission tools stay allowed at watch: delegating separable work to a fission branch is itself a valid density action."
             } else {
                 "Context is above the recommended density threshold but below the rewind-only limit. Normal tools are allowed; at handoff or before broad follow-up work, exact-anchor density maintenance is optional only if it materially improves density."
             }
@@ -1342,7 +1342,12 @@ fn managed_context_tool(name: &str) -> bool {
 /// only make sense for a managed Codex session, so they share the
 /// managed-context exposure gate — but they are deliberately NOT part of
 /// [`rewind_only_allowed_tool`]: under rewind-only context pressure the
-/// recovery gate must block fission work like any other ordinary tool.
+/// recovery gate must block fission work like any other ordinary tool (the
+/// parent must shrink first). At density-watch pressure (below rewind-only)
+/// they deliberately stay allowed: this gate only fires at rewind-only, and
+/// the supervisor's density gate (`managed_context_density_tool_allowed` in
+/// main.rs) lets fission through, because delegating separable work to a
+/// branch sheds the work's context noise into the branch.
 fn fission_tool(name: &str) -> bool {
     matches!(
         name,
@@ -12079,14 +12084,64 @@ mod tests {
             assert!(s.rewind_only_gate_message("rewind_context").is_none());
             assert!(s.rewind_only_gate_message("rewind_backout").is_none());
             // Fission tools are deliberately absent from the rewind-only
-            // recovery list: under density-preservation pressure, forking new
-            // branches or importing their output is ordinary work and must be
-            // blocked like any other model-facing tool.
+            // recovery list: under rewind-only pressure, forking new branches
+            // or importing their output is ordinary work and must be blocked
+            // like any other model-facing tool — the parent must shrink
+            // first. (At density watch, below rewind-only, they stay allowed;
+            // see density_watch_does_not_gate_fission_tools.)
             assert!(s.rewind_only_gate_message("fission_spawn").is_some());
             assert!(s.rewind_only_gate_message("fission_control").is_some());
             assert!(s
                 .rewind_only_gate_message("claim_fission_canonical")
                 .is_some());
+        });
+    }
+
+    #[test]
+    fn density_watch_does_not_gate_fission_tools() {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let state = test_state();
+            let mut s = state.write().await;
+            s.active_session_source = Some("codex".to_string());
+            s.codex_managed_context = true;
+            // 90k/100k: at or above the 85% recommended density threshold,
+            // below the rewind-only limit — the density-watch band.
+            s.apply_main_usage_snapshot(frontend::ModelUsageSnapshot {
+                provider: "openai".to_string(),
+                model: "gpt-5.2-codex".to_string(),
+                tokens_used: 90_000,
+                context_window: 100_000,
+                hard_context_window: Some(120_000),
+                usage_pct: 90.0,
+                prompt_tokens: 70_000,
+                completion_tokens: 20_000,
+                cached_tokens: 0,
+            });
+
+            assert!(
+                s.context_pressure_density_watch_for(None, None),
+                "test premise: usage must sit in the density-watch band"
+            );
+            // The MCP-side gate only fires at rewind-only pressure: fission
+            // calls pass at watch band, where spawning a branch is itself a
+            // valid density action.
+            assert!(s.rewind_only_gate_message("fission_spawn").is_none());
+            assert!(s.rewind_only_gate_message("fission_control").is_none());
+            assert!(s
+                .rewind_only_gate_message("claim_fission_canonical")
+                .is_none());
+            // The watch-band status message advertises fission delegation as
+            // a density action.
+            let pressure = s.context_pressure_snapshot();
+            assert_eq!(pressure["status"], "watch");
+            assert!(pressure["message"]
+                .as_str()
+                .unwrap()
+                .contains("Fission tools stay allowed at watch"));
         });
     }
 
