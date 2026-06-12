@@ -253,10 +253,15 @@ features they lack.
   `rewind_context` still validates the exact `item_id` against the current
   rollout before mutating the Codex thread.
   When backend-reported pressure is at or above the rewind-only threshold,
-  `list_rewind_anchors` defaults to recovery candidates: anchors whose nearest
-  following backend token report is below that threshold with enough normal-tool
-  resume headroom. The default recovery catalog narrows `positions` to accepted
-  `rewind_context` values. `include_pruning_estimates=true` adds approximate
+  `list_rewind_anchors` defaults to recovery candidates: anchors where the best
+  available usage evidence for the cut — for `after`, the first backend token
+  report that actually measured the anchor's content (a report persisted
+  between a tool call and its output never measured that output); for
+  `before`, the nearest prefix-measuring backend report or the labeled prefix
+  estimate, whichever is higher — stays below that threshold with enough
+  normal-tool resume headroom. An anchor whose prior rewind proved
+  insufficient is not re-offered at either position. The default recovery
+  catalog narrows `positions` to accepted `rewind_context` values. `include_pruning_estimates=true` adds approximate
   discard sizes to compact rows, while `detail=true` requests diagnostic
   detailed pages. Passing `include_non_recovery=true` is an
   audit escape hatch, not the normal recovery path. Anchors inside the active

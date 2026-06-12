@@ -32,9 +32,34 @@ from typing import Any
 ROOT = Path(__file__).resolve().parents[1]
 DEFAULT_VANILLA_CODEX = Path("/opt/homebrew/bin/codex")
 DEFAULT_PATCHED_CODEX = Path(
-    "/Users/vm/projects/codex/.worktrees/minimal-lineage-upstream/codex-rs/target/debug/codex"
+    "/Users/vm/projects/codex-minimal-lineage/codex-rs/target/debug/codex"
 )
 DEFAULT_INTENDANT = ROOT / "target/debug/intendant"
+
+# Rewind-only gate evidence. The 2026-06 stack reworked enforcement: instead
+# of one pre-June message ("Only get_status, rewind_context, and
+# rewind_backout..."), the gate now shows up as any of:
+#   - the fork's dedicated recovery turn announcement / dispatch-layer tool
+#     rejection / Intendant's MCP dispatch rejection, all of which name the
+#     five-tool allowlist;
+#   - the supervisor's mid-turn ToolStarted block ("Blocked ... while managed
+#     context is rewind-only ...");
+#   - the supervisor's recovery kickstart that replaces a held user follow-up
+#     (and the fork's ephemeral recovery instruction), both tagged
+#     <managed_context_recovery>.
+# The legacy three-tool message is kept so the harness can still pass against
+# a pre-June fork build.
+GATE_MESSAGE_PATTERNS = (
+    "get_status, list_rewind_anchors, inspect_rewind_anchor, rewind_context, and rewind_backout",
+    "while managed context is rewind-only",
+    "<managed_context_recovery>",
+    "only get_status, rewind_context, and rewind_backout",
+)
+
+
+def text_has_gate_message(text: str) -> bool:
+    lowered = text.lower()
+    return any(pattern in lowered for pattern in GATE_MESSAGE_PATTERNS)
 
 
 def now_ms() -> int:
@@ -80,8 +105,36 @@ def write_codex_config(home: Path, *, model: str, reasoning_effort: str, context
     )
 
 
+def path_is_inside_git_repo(path: Path) -> bool:
+    try:
+        probe = subprocess.run(
+            ["git", "-C", str(path), "rev-parse", "--is-inside-work-tree"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return False
+    return probe.returncode == 0 and probe.stdout.strip() == "true"
+
+
 def make_workspace(root: Path, line_count: int) -> Path:
+    # The workspace must NOT live inside a git repository. Since 2026-06 the
+    # managed session resolves its project root via git discovery, so a
+    # repo-nested workspace (a) makes Codex run `python3 emit_context.py`
+    # from the enclosing repo root, where the script does not exist, and
+    # (b) pulls the repo's AGENTS.md and project docs into the baseline
+    # prompt, polluting the context-pressure benchmark.
     workspace = root / "workspace"
+    if path_is_inside_git_repo(root):
+        fallback = Path(tempfile.gettempdir()) / "intendant-codex-context-e2e-ws"
+        workspace = fallback / root.name
+        print(
+            f"output root {root} is inside a git repository; "
+            f"placing the benchmark workspace at {workspace} instead",
+            flush=True,
+        )
     workspace.mkdir(parents=True, exist_ok=True)
     write_text(
         workspace / "emit_context.py",
@@ -218,9 +271,7 @@ def rollout_metrics(codex_home: Path) -> dict[str, Any]:
     for path in paths:
         with path.open("r", encoding="utf-8", errors="replace") as handle:
             lines = handle.readlines()
-        gate_messages += sum(
-            "Only get_status, rewind_context, and rewind_backout" in line for line in lines
-        )
+        gate_messages += sum(text_has_gate_message(line) for line in lines)
         for line in lines:
             item = load_json_line(line)
             if item is None:
@@ -306,10 +357,60 @@ def extract_get_status_pressure(payload: dict[str, Any]) -> dict[str, Any] | Non
 
 
 def find_call_id(metrics: dict[str, Any], *, name: str, argument_substring: str) -> str | None:
+    # Prefer the most recent match: an early failed attempt (wrong cwd, typo)
+    # would otherwise shadow the call that actually produced the long output.
+    found: str | None = None
     for call in metrics.get("function_calls", []):
         if call.get("name") == name and argument_substring in call.get("arguments", ""):
-            return call.get("call_id")
-    return None
+            found = call.get("call_id")
+    return found
+
+
+def load_rewind_records(log_dir: Path, codex_home: Path) -> list[dict[str, Any]]:
+    """Durable rewind records for this run's managed Codex session.
+
+    `apply_external_context_rewind` persists one JSON file per successful
+    rewind (only after the anchored rollback succeeded), so these are the
+    ground truth that a model-driven `rewind_context` actually applied —
+    the `codex_thread_action_result` success event only proves scheduling.
+
+    Records live under the per-session daemon log dir
+    (`~/.intendant/logs/<session>/context_rewinds/`), not under the harness's
+    `--log-file` directory, so scan both and scope to this run via the
+    record's `source_rollout_path`, which points into the run's CODEX_HOME.
+    """
+    records: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    roots = [log_dir, Path.home() / ".intendant" / "logs"]
+    for root in roots:
+        for path in sorted(root.glob("*/context_rewinds/*.json")) + sorted(
+            root.glob("context_rewinds/*.json")
+        ):
+            try:
+                value = json.loads(path.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if not isinstance(value, dict):
+                continue
+            source = str(value.get("source_rollout_path") or "")
+            if not source.startswith(str(codex_home)):
+                continue
+            record_id = str(value.get("record_id") or path.stem)
+            if record_id in seen:
+                continue
+            seen.add(record_id)
+            records.append(
+                {
+                    "path": str(path),
+                    "record_id": value.get("record_id"),
+                    "thread_id": value.get("thread_id"),
+                    "item_id": value.get("item_id"),
+                    "position": value.get("position"),
+                    "reason": value.get("reason"),
+                    "primer_chars": len(value.get("primer") or ""),
+                }
+            )
+    return records
 
 
 @dataclasses.dataclass
@@ -511,7 +612,7 @@ def event_summary(events: list[WsEvent]) -> dict[str, Any]:
             if isinstance(backend, str) and backend:
                 backend_ids.add(backend)
         text = json.dumps(event, ensure_ascii=False)
-        if "Only get_status, rewind_context, and rewind_backout" in text:
+        if text_has_gate_message(text):
             gate_messages += 1
     usage = []
     for wrapper in events:
@@ -675,6 +776,12 @@ def run_managed(args: argparse.Namespace, root: Path, workspace: Path) -> dict[s
         str(args.intendant_bin),
         "--web",
         str(port),
+        # The dashboard defaults to mTLS since 2026-06; this harness's raw
+        # WebSocket client speaks cleartext, so use the documented local
+        # automation escape: loopback bind + --no-tls.
+        "--bind",
+        "127.0.0.1",
+        "--no-tls",
         "--no-tui",
         "--no-presence",
         "--agent",
@@ -744,42 +851,21 @@ def run_managed(args: argparse.Namespace, root: Path, workspace: Path) -> dict[s
         backend_ids = event_summary(all_events)["backend_session_ids"]
         backend_session_id = backend_ids[-1] if backend_ids else None
 
-        if backend_session_id:
-            pressure_prompt = (
-                "Context-pressure probe. Call Intendant MCP `get_status` exactly once. "
-                "Do not run shell commands. Reply with `MANAGED_PRESSURE_PROBE_DONE` and the reported context_pressure status."
-            )
-            started = time.monotonic()
-            ws.send_json(
-                {
-                    "action": "resume_session",
-                    "source": "codex",
-                    "session_id": backend_session_id,
-                    "resume_id": backend_session_id,
-                    "project_root": str(workspace),
-                    "task": pressure_prompt,
-                    "direct": True,
-                }
-            )
-            turn_pressure = collect_until_idle(
-                ws,
-                idle_seconds=args.managed_idle_seconds,
-                max_seconds=args.turn_timeout,
-            )
-            all_events.extend(turn_pressure)
-            turn_summaries.append(
-                {
-                    "name": "pressure_probe",
-                    "elapsed_seconds": time.monotonic() - started,
-                    "summary": event_summary(turn_pressure),
-                }
-            )
-
+        # 2026-06 flow change: under rewind-only pressure the supervisor no
+        # longer delivers user follow-ups. It holds them, replaces them with a
+        # <managed_context_recovery> kickstart, the fork runs a dedicated
+        # recovery turn where only the five recovery tools are visible, and
+        # the model chooses its own exact anchor from list_rewind_anchors. A
+        # harness turn that prescribes an anchor can therefore never reach the
+        # model while the gate is active; instead we submit ordinary work and
+        # assert that (a) gate messages fired, (b) a model-driven
+        # rewind_context applied (durable record), and (c) the held ordinary
+        # work ran only after the rewind.
         if backend_session_id:
             gate_prompt = (
-                "Context-pressure gate test. Try to run exactly `pwd` as an ordinary shell command. "
-                "Do not call get_status before trying the command. "
-                "After that, reply with `MANAGED_GATE_TEST_DONE` and state whether the ordinary command was blocked."
+                "Context-pressure gate test. Run exactly `pwd` as an ordinary shell command "
+                "in this workspace, then reply with `MANAGED_GATE_TEST_DONE` and the reported "
+                "directory. Do not call get_status before running the command."
             )
             started = time.monotonic()
             ws.send_json(
@@ -801,46 +887,9 @@ def run_managed(args: argparse.Namespace, root: Path, workspace: Path) -> dict[s
             all_events.extend(turn_gate)
             turn_summaries.append(
                 {
-                    "name": "rewind_only_gate",
+                    "name": "gate_and_recovery",
                     "elapsed_seconds": time.monotonic() - started,
                     "summary": event_summary(turn_gate),
-                }
-            )
-
-        if backend_session_id and emit_call_id:
-            rewind_prompt = (
-                "Now reduce context pressure using the Intendant MCP `rewind_context` tool. "
-                f"Use anchor.item_id `{emit_call_id}` and anchor.position `before`. "
-                "Use reason `prune deterministic long-output benchmark`. "
-                "Use a primer that preserves: the command `python3 emit_context.py "
-                f"{args.line_count}` ran, it emitted CTX_PROBE_LINE_00000 through {last_marker}, "
-                "the workspace was not modified, the bulky tool call/output should be discarded, "
-                "and the next step is to call get_status. "
-                "After calling rewind_context, do not call any other tools."
-            )
-            started = time.monotonic()
-            ws.send_json(
-                {
-                    "action": "resume_session",
-                    "source": "codex",
-                    "session_id": backend_session_id,
-                    "resume_id": backend_session_id,
-                    "project_root": str(workspace),
-                    "task": rewind_prompt,
-                    "direct": True,
-                }
-            )
-            turn_rewind = collect_until_idle(
-                ws,
-                idle_seconds=args.managed_idle_seconds,
-                max_seconds=args.turn_timeout,
-            )
-            all_events.extend(turn_rewind)
-            turn_summaries.append(
-                {
-                    "name": "model_rewind_context",
-                    "elapsed_seconds": time.monotonic() - started,
-                    "summary": event_summary(turn_rewind),
                 }
             )
 
@@ -883,6 +932,10 @@ def run_managed(args: argparse.Namespace, root: Path, workspace: Path) -> dict[s
             "backend_session_id": event_summary(all_events)["backend_session_ids"][-1:]
             or None,
             "emit_call_id": emit_call_id,
+            "initial_marker_seen": any(
+                last_marker in json.dumps(e.data, ensure_ascii=False) for e in all_events
+            ),
+            "rewind_records": load_rewind_records(log_dir, home),
             "turns": turn_summaries,
             "events": event_summary(all_events),
             "rollout": rollout_metrics(home),
@@ -918,7 +971,15 @@ def summarize_pass_fail(summary: dict[str, Any]) -> dict[str, Any]:
         for a in ((turn.get("summary") or {}).get("codex_thread_actions") or [])
         if a.get("action") == "rewind_context"
     ]
-    rewind_success = any(a.get("success") for a in rewind_actions)
+    # The codex_thread_action_result success only proves the rewind was
+    # scheduled; the durable record (written after the anchored rollback
+    # succeeded) proves it applied to an exact item anchor.
+    rewind_records = [
+        record
+        for record in (managed.get("rewind_records") or [])
+        if record.get("item_id") and record.get("position") in ("before", "after")
+    ]
+    rewind_success = any(a.get("success") for a in rewind_actions) and bool(rewind_records)
     pressure_reports = (managed.get("rollout") or {}).get("pressure_reports") or []
     post_rewind_pressure_ok = any(
         "Post-rewind status check" in str(report.get("task", ""))
@@ -953,7 +1014,16 @@ def main() -> int:
     parser.add_argument("--model", default="gpt-5.5")
     parser.add_argument("--reasoning-effort", default="low")
     parser.add_argument("--context-window", type=int, default=30000)
-    parser.add_argument("--managed-context-window", type=int, default=20500)
+    # Tuned 2026-06-11. The managed baseline (instructions + tool surface,
+    # measured outside any git repo) is ~13.8k tokens and the recorded long
+    # output ~10.6k, so 25000 puts the post-output usage (~24.4k) between the
+    # effective window (0.95 * 25000 = 23750 -> rewind-only) and the hard
+    # window (25000), while the post-rewind baseline (~14.4k) stays below the
+    # density-watch threshold (0.85 * 23750 = 20187 -> status ok) and leaves
+    # the >= 8000-token anchor-eligibility headroom (23750 - 13.8k). The old
+    # 20500 default predates the June tool-surface growth and now starves the
+    # anchor catalog (19475 - 13.8k < 8000) on this workload.
+    parser.add_argument("--managed-context-window", type=int, default=25000)
     parser.add_argument("--vanilla-compact-limit", type=int, default=5000)
     parser.add_argument("--vanilla-resume-turns", type=int, default=2)
     parser.add_argument("--line-count", type=int, default=3000)
