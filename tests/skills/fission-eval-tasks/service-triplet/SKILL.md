@@ -2,14 +2,14 @@
 name: service-triplet-fission-eval
 description: >
   Fission-shaped evaluation runner. Launches a managed Codex session on the
-  jobline service trio (a REST API job store, a worker, and a CLI client — all
-  Python stdlib, in disjoint directories), then scores the result behaviorally
-  with verify.sh (per-component partial credit + a live-trio integration bonus)
-  and records whether the model spontaneously used model-driven fission. The
-  three components own disjoint write scopes and share only the HTTP protocol,
-  so fission into chartered worktree branches is a genuine win — but it is
-  never required and never mentioned to the agent. Whether it fissions is the
-  measurement.
+  jobline service quartet (a REST API job store, a worker, a CLI client, and a
+  read-only metrics service — all Python stdlib, in disjoint directories),
+  then scores the result behaviorally with verify.sh (per-component partial
+  credit + a live integration bonus, max 5.0) and records whether the model
+  spontaneously used model-driven fission. The four components own disjoint
+  write scopes and share only the HTTP protocol, so fission into chartered
+  worktree branches is a genuine win — but it is never required and never
+  mentioned to the agent. Whether it fissions is the measurement.
 compatibility: >
   Requires OpenAI Codex auth in ~/.codex/auth.json, the patched Codex fork at
   /Users/vm/projects/codex-minimal-lineage, a managed-build intendant binary,
@@ -24,20 +24,23 @@ disable-model-invocation: false
 ## Purpose
 
 Same measurement goal as the polyglot-pipeline runner, with an all-Python
-(no-toolchain) trio: hand a managed Codex agent a three-service repo whose
-components own disjoint write scopes (`api/`, `worker/`, `cli/`) and see
-whether it **chooses** model-driven fission (`fission_spawn` into chartered
-worktree branches) — scoring the work behaviorally either way. Fission is
-never required and never mentioned.
+(no-toolchain) quartet: hand a managed Codex agent a four-service repo whose
+components own disjoint write scopes (`api/`, `worker/`, `cli/`, `metrics/`)
+and see whether it **chooses** model-driven fission (`fission_spawn` into
+chartered worktree branches) — scoring the work behaviorally either way.
+Fission is never required and never mentioned. Sized for ~30-60 min of serial
+work.
 
 ## What it measures
 
 - **Behavioral score** (`verify.sh` → JSON): `component_scores` for `api`
-  (driven over raw HTTP, job lifecycle checked), `worker` (pure `compute` vs an
-  independent oracle), and `cli` (run against a conforming reference server),
-  plus an `integration` bonus that starts the agent's API + worker on random
-  ports and drives generated jobs end-to-end through the agent's CLI. `total`
-  is out of 4.0; partial credit per component.
+  (driven over raw HTTP: lifecycle, requeue/delete, listing/pagination, bulk
+  perf), `worker` (pure `compute` vs an independent oracle across 13 ops,
+  incl. perf budgets), `cli` (run against a conforming reference server), and
+  `metrics` (against the reference server, incl. freshness + API-down
+  checks), plus an `integration` bonus that starts the agent's API + worker +
+  metrics on random ports and drives generated jobs end-to-end through the
+  agent's CLI. `total` is out of 5.0; partial credit per component.
 - **Did it fission?** Presence/shape of a group in the parent's
   `fission_ledger.json` (branch count, charters, write scopes, terminal
   status, import/claim). Zero fission is valid data.
@@ -85,8 +88,9 @@ cd "$REPO"
   --web $PORT --no-tls --bind 127.0.0.1 "$(cat TASK.md)"
 ```
 
-A competent serial agent finishes in ~30-60 min. Do not steer toward or away
-from fission. Stop earlier for a cheap smoke and score partial progress.
+A competent serial agent finishes in ~30-60 min (resized after the v1 smoke
+finished in ~4.5 min). Do not steer toward or away from fission. Stop earlier
+for a cheap smoke and score partial progress.
 
 ## Score
 
@@ -94,7 +98,7 @@ from fission. Stop earlier for a cheap smoke and score partial progress.
 
 ```bash
 "$SKILL_DIR"/verify.sh "$REPO" | tee "$REPO/score.json"
-# {task, seed, component_scores:{api,worker,cli}, integration, total, max_total, details}
+# {task, seed, component_scores:{api,worker,cli,metrics}, integration, total, max_total, details}
 SEED=$(jq -r .seed "$REPO/score.json")
 "$SKILL_DIR"/verify.sh "$REPO" --seed "$SEED" >/dev/null && echo reproducible OK
 
@@ -123,17 +127,17 @@ echo "artifacts in $OUT"
 ```
 
 Record: did a fission group appear? branch write scopes (`api/`, `worker/`,
-`cli/` are the natural disjoint scopes)? terminal/imported status? final
-`total` and wall-clock.
+`cli/`, `metrics/` are the natural disjoint scopes)? terminal/imported
+status? final `total` and wall-clock.
 
 ## Expected outcomes (all valid data)
 
-- **No fission, serial solve:** one session does all three; ledger absent/empty.
-- **Fission, parallel solve:** a 2-3 branch group keyed to the disjoint dirs;
+- **No fission, serial solve:** one session does all four; ledger absent/empty.
+- **Fission, parallel solve:** a 2-4 branch group keyed to the disjoint dirs;
   branches build/test their component; parent imports + claims canonical and
   proves the end-to-end flow. Capture per-branch scores + wall-clock advantage.
 - **Partial:** some components done — partial credit per component; integration
-  needs all three live together. Common cheap-smoke cutoff outcome.
+  needs the quartet live together. Common cheap-smoke cutoff outcome.
 
 ## Cleanup
 
@@ -144,9 +148,9 @@ pattern-kill). `rm -rf "$REPO"`. Logs persist under `~/.intendant/logs/`.
 
 - Real model calls; a fissioning run fans out 3+ live sessions. Never on the
   shared default port 8765 or in CI.
-- `verify.sh` needs only `python3` (it starts the trio itself on random ports
-  with generated payloads) and grades a scratch copy, so the agent's tree is
-  untouched. The integration wait phase is bounded (~15s) so a broken worker
-  can't stall grading.
+- `verify.sh` needs only `python3` (it starts the services itself on random
+  ports with generated payloads) and grades a scratch copy, so the agent's
+  tree is untouched. The integration wait phase is bounded (~25s) so a broken
+  worker can't stall grading.
 - The agent must only ever see `skeleton/` + `TASK.md`. `verify/` and
   `reference/` stay out of `$REPO`.

@@ -3,21 +3,24 @@
 Excluded from agent visibility by the SKILL runner."""
 import argparse
 import json
+import re
 import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs
 
-JOBS = {}
+JOBS = {}           # id -> job (dict preserves creation order; deletes drop out)
 LOCK = threading.Lock()
 COUNTER = [0]
+_UINT = re.compile(r"^[0-9]+$")
 
 
 def new_job(op, value):
     with LOCK:
         COUNTER[0] += 1
         jid = "j%d" % COUNTER[0]
-        job = {"id": jid, "op": op, "input": value, "status": "queued", "result": None}
+        job = {"id": jid, "op": op, "input": value, "status": "queued",
+               "result": None, "attempts": 0}
         JOBS[jid] = job
         return dict(job)
 
@@ -44,10 +47,23 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/healthz":
             return self._send(200, {"ok": True})
         if u.path == "/jobs":
-            status = parse_qs(u.query).get("status", [None])[0]
+            q = parse_qs(u.query)
+            status = q.get("status", [None])[0]
+            op = q.get("op", [None])[0]
+            offset_raw = q.get("offset", [None])[0]
+            limit_raw = q.get("limit", [None])[0]
+            for raw in (offset_raw, limit_raw):
+                if raw is not None and not _UINT.match(raw):
+                    return self._send(400, {"error": "limit/offset must be non-negative integers"})
+            offset = int(offset_raw) if offset_raw is not None else 0
+            limit = int(limit_raw) if limit_raw is not None else None
             with LOCK:
                 jobs = [dict(j) for j in JOBS.values()
-                        if status is None or j["status"] == status]
+                        if (status is None or j["status"] == status)
+                        and (op is None or j["op"] == op)]
+            jobs = jobs[offset:]
+            if limit is not None:
+                jobs = jobs[:limit]
             return self._send(200, {"jobs": jobs})
         if u.path.startswith("/jobs/"):
             jid = u.path[len("/jobs/"):]
@@ -65,8 +81,9 @@ class Handler(BaseHTTPRequestHandler):
                 body = self._body()
             except json.JSONDecodeError:
                 return self._send(400, {"error": "invalid json"})
-            if not isinstance(body, dict) or not isinstance(body.get("op"), str) or "input" not in body:
-                return self._send(400, {"error": "op (string) and input are required"})
+            if not isinstance(body, dict) or not isinstance(body.get("op"), str) \
+                    or body["op"] == "" or "input" not in body:
+                return self._send(400, {"error": "op (non-empty string) and input are required"})
             return self._send(201, new_job(body["op"], body["input"]))
         if path.startswith("/jobs/") and path.endswith("/claim"):
             jid = path[len("/jobs/"):-len("/claim")]
@@ -77,6 +94,7 @@ class Handler(BaseHTTPRequestHandler):
                 if job["status"] != "queued":
                     return self._send(409, {"error": "not queued"})
                 job["status"] = "running"
+                job["attempts"] += 1
                 snap = dict(job)
             return self._send(200, snap)
         if path.startswith("/jobs/") and path.endswith("/result"):
@@ -95,6 +113,32 @@ class Handler(BaseHTTPRequestHandler):
                 job["result"] = body.get("result")
                 snap = dict(job)
             return self._send(200, snap)
+        if path.startswith("/jobs/") and path.endswith("/requeue"):
+            jid = path[len("/jobs/"):-len("/requeue")]
+            with LOCK:
+                job = JOBS.get(jid)
+                if job is None:
+                    return self._send(404, {"error": "unknown job"})
+                if job["status"] != "error":
+                    return self._send(409, {"error": "only error jobs can be requeued"})
+                job["status"] = "queued"
+                job["result"] = None
+                snap = dict(job)
+            return self._send(200, snap)
+        return self._send(404, {"error": "not found"})
+
+    def do_DELETE(self):
+        u = urlparse(self.path)
+        if u.path.startswith("/jobs/"):
+            jid = u.path[len("/jobs/"):]
+            with LOCK:
+                job = JOBS.get(jid)
+                if job is None:
+                    return self._send(404, {"error": "unknown job"})
+                if job["status"] not in ("done", "error"):
+                    return self._send(409, {"error": "only terminal jobs are deletable"})
+                del JOBS[jid]
+            return self._send(200, {"deleted": True, "id": jid})
         return self._send(404, {"error": "not found"})
 
 

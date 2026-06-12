@@ -4,8 +4,9 @@
 #   verify.sh <workdir> [--seed N]
 #
 # Grades a scratch COPY of <workdir> (never mutated). stdout is exactly one JSON
-# object: {task, seed, component_scores, integration, total, max_total,
-# details}. All other output goes to stderr. See README.md for the contract.
+# object: {task, seed, component_scores:{api,worker,cli,metrics}, integration,
+# total, max_total:5.0, details}. All other output goes to stderr. See
+# README.md for the contract.
 set -uo pipefail
 HERE=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
