@@ -1,5 +1,17 @@
 # Live smoke — one managed-Codex run on service-triplet
 
+> **Post-smoke note (2026-06-12, later the same day):** this smoke measured
+> the **v1** tasks and is kept verbatim as the record that motivated the
+> resize. Its headline finding — a fully-correct serial solve in **~4.5
+> minutes** — showed v1 was far below the 30–60-min serial design target, so
+> fission was never rational. Both tasks were then resized (v2): a fourth
+> disjoint component each (`quarantine/`, `metrics/`), substantially deeper
+> per-component specs, larger held-back batteries, per-component performance
+> budgets, and `max_total` rescaled to 5.0. The v1 numbers below (4.0/4.0,
+> battery sizes, timings) do **not** describe the current tasks; the
+> post-resize validation lives in `README.md` ("Validation status") and each
+> task's `HARDENING.md` (Pass 3).
+
 One cheap live run (2026-06-12) to confirm a task boots under a real managed
 Codex session, that the agent makes sensible progress, and to observe whether
 it **spontaneously** fissions (it was never prompted to). The agent's output at
