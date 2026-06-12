@@ -170,15 +170,29 @@ def tool_calls(path: Path, after_line: int = 0, before_line: int | None = None) 
             break
         if line.type != "response_item":
             continue
-        if line.payload.get("type") != "function_call":
-            continue
-        out.append(
-            ToolCall(
-                lineno=line.lineno,
-                name=str(line.payload.get("name", "")),
-                arguments=str(line.payload.get("arguments", "")),
+        kind = line.payload.get("type")
+        if kind == "function_call":
+            out.append(
+                ToolCall(
+                    lineno=line.lineno,
+                    name=str(line.payload.get("name", "")),
+                    arguments=str(line.payload.get("arguments", "")),
+                )
             )
-        )
+        elif kind in ("custom_tool_call", "local_shell_call"):
+            # The codex fork emits apply_patch (and shell on some revisions)
+            # as custom tool calls; their payload field is `input`/`action`.
+            out.append(
+                ToolCall(
+                    lineno=line.lineno,
+                    name=str(line.payload.get("name", "")),
+                    arguments=str(
+                        line.payload.get("input")
+                        or line.payload.get("action")
+                        or line.payload.get("arguments", "")
+                    ),
+                )
+            )
     return out
 
 
