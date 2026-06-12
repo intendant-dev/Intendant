@@ -1,0 +1,30 @@
+{
+  "task_id": "61810_lock",
+  "authored_from": "pilot3 3-lane early rollouts (first 30%), facts verified EARLY in all three lanes 2026-06-12",
+  "probes": [
+    {
+      "id": "p1",
+      "fact_class": "first_failing_test",
+      "question": "Which test program did you run first to measure allocator lock contention?",
+      "ground_truth": "kalloctest"
+    },
+    {
+      "id": "p2",
+      "fact_class": "early_numeric_value",
+      "question": "Which kernel lock did the initial contention measurements identify as the hot one for the memory allocator (the lock name printed by the test)?",
+      "ground_truth": "kmem"
+    },
+    {
+      "id": "p3",
+      "fact_class": "first_edited_file",
+      "question": "For the allocator half of the lab, which kernel source file did you modify first?",
+      "ground_truth": "kalloc.c"
+    },
+    {
+      "id": "p4",
+      "fact_class": "early_numeric_value",
+      "question": "How many hash buckets did you use for the buffer cache in your bcache redesign?",
+      "ground_truth_pattern": "(?:NBUCKETS?|BUCKETS?|NBUCKET)[^0-9]{0,10}(\\d+)"
+    }
+  ]
+}

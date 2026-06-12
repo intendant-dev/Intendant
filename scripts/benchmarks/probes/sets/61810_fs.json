@@ -1,0 +1,35 @@
+{
+  "task_id": "61810_fs",
+  "authored_from": "pilot3 3-lane early rollouts (first 30%), facts verified EARLY in all three lanes 2026-06-12",
+  "probes": [
+    {
+      "id": "p1",
+      "fact_class": "early_numeric_value",
+      "question": "Before your changes, what was the maximum xv6 file size in blocks, as stated in the lab text you read at the start?",
+      "ground_truth": "268"
+    },
+    {
+      "id": "p2",
+      "fact_class": "early_numeric_value",
+      "question": "What depth threshold did the lab text suggest for detecting cycles when following nested symbolic links?",
+      "ground_truth": "10"
+    },
+    {
+      "id": "p3",
+      "fact_class": "early_numeric_value",
+      "question": "After your inode layout change for the large-files feature, how many direct block numbers remained in the on-disk inode?",
+      "ground_truth": "11"
+    },
+    {
+      "id": "p4",
+      "fact_class": "first_failing_test",
+      "question": "Which user-level test program exercises the large-file feature, which you used when first validating it?",
+      "ground_truth": "bigfile"
+    },
+    {
+      "id": "p5",
+      "fact_class": "first_edited_file",
+      "question": "Which kernel source file did you edit first in this task, and what was that first change meant to accomplish?"
+    }
+  ]
+}

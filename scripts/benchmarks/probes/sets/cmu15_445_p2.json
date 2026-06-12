@@ -1,0 +1,28 @@
+{
+  "task_id": "cmu15_445_p2",
+  "authored_from": "pilot3 3-lane early rollouts (first 30%), facts verified EARLY in all three lanes 2026-06-12",
+  "probes": [
+    {
+      "id": "p1",
+      "fact_class": "first_failing_test",
+      "question": "Which B+Tree gtest target did the project tutorial instruct you to build and run first?",
+      "ground_truth": "b_plus_tree_insert_test"
+    },
+    {
+      "id": "p2",
+      "fact_class": "early_numeric_value",
+      "question": "Which markdown file under project-tutorial did you read at the start to get the Project 2 requirements (file name)?",
+      "ground_truth": "project2.md"
+    },
+    {
+      "id": "p3",
+      "fact_class": "first_edited_file",
+      "question": "Which C++ source file did you edit first in this task, and was it part of the B+Tree work or a repair to the provided Project-1 layer?"
+    },
+    {
+      "id": "p4",
+      "fact_class": "early_error_string",
+      "question": "Early on, did you find the provided Project-1 (buffer pool) implementation complete and correct, and if not, what was the first defect you identified in it?"
+    }
+  ]
+}

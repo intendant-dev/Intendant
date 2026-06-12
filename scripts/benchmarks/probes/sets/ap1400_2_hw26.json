@@ -1,0 +1,29 @@
+{
+  "task_id": "ap1400_2_hw26",
+  "authored_from": "pilot3 3-lane early rollouts (first 30%), facts verified EARLY in all three lanes 2026-06-12",
+  "probes": [
+    {
+      "id": "p1",
+      "fact_class": "early_numeric_value",
+      "question": "According to the task instructions you read first, how many tests were in the HW2 suite?",
+      "ground_truth": "15"
+    },
+    {
+      "id": "p2",
+      "fact_class": "early_error_string",
+      "question": "Quote the exact error message thrown for a badly formed transaction string in the HW2 server/crypto code you read early on.",
+      "ground_truth": "invalid transaction format"
+    },
+    {
+      "id": "p3",
+      "fact_class": "early_numeric_value",
+      "question": "Which CSV dataset file shipped with HW6 did you inspect early (file name)?",
+      "ground_truth": "lung_cancer.csv"
+    },
+    {
+      "id": "p4",
+      "fact_class": "first_edited_file",
+      "question": "Which source file did you edit first in this task, and for which of the two homeworks was it?"
+    }
+  ]
+}

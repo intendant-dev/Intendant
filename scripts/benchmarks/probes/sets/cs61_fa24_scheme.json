@@ -1,0 +1,23 @@
+{
+  "task_id": "cs61_fa24_scheme",
+  "authored_from": "pilot3 3-lane early rollouts (first 30%), facts verified EARLY in all three lanes 2026-06-12",
+  "probes": [
+    {
+      "id": "p1",
+      "fact_class": "first_edited_file",
+      "question": "Which Python source file did you edit first when starting the interpreter problems?"
+    },
+    {
+      "id": "p2",
+      "fact_class": "early_error_string",
+      "question": "Quote the error message text the evaluator raises for a malformed list, which you saw while first reading the interpreter sources.",
+      "ground_truth": "malformed list"
+    },
+    {
+      "id": "p3",
+      "fact_class": "early_numeric_value",
+      "question": "The first problems you implemented were methods of which class (in scheme_classes.py)?",
+      "ground_truth": "Frame"
+    }
+  ]
+}
