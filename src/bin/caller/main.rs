@@ -15348,6 +15348,64 @@ mod tests {
         }
     }
 
+    /// Cache-prefix contract (supervisor side): the recovery-kickstart flow
+    /// is append-only. Holding a user follow-up and sending a kickstart
+    /// instead must (a) preserve the held text byte-for-byte for the later
+    /// replay and (b) produce a kickstart that is a plain new user message —
+    /// never a user-turn edit (which rewrites earlier request content) and
+    /// never a mutation of anything already sent.
+    #[test]
+    fn managed_context_recovery_kickstart_flow_is_append_only() {
+        let snapshot = external_agent::AgentContextSnapshot {
+            source: "codex".to_string(),
+            label: "Codex resolved request payload".to_string(),
+            request_id: Some("req-1".to_string()),
+            request_index: Some(1),
+            rollout_path: None,
+            format: "openai.responses.resolved_request.v1".to_string(),
+            token_count: Some(258_400),
+            token_count_kind: Some(external_agent::AgentContextTokenCountKind::BackendReported),
+            context_window: Some(258_400),
+            hard_context_window: Some(272_000),
+            item_count: Some(458),
+            raw: serde_json::json!({}),
+        };
+        let original_text = "Implement the next milestone and run the tests.".to_string();
+        let followup = FollowUpMessage::text(original_text.clone());
+
+        let decision =
+            managed_context_preflight_decision(true, &followup, &snapshot).expect("decision");
+        let ManagedContextPreflightDecision::Recovery {
+            recovery_followup,
+            held_followup,
+            ..
+        } = decision
+        else {
+            panic!("expected recovery kickstart");
+        };
+
+        // Held replay text is byte-identical to what the user sent.
+        let held = held_followup.expect("non-trivial follow-up is held");
+        assert_eq!(held.text, original_text);
+
+        // The kickstart is a fresh appended user message: no user-turn edit
+        // (edits rewrite an earlier request message) and no reuse of the
+        // held follow-up's identity.
+        assert!(recovery_followup.managed_context_recovery_kickstart);
+        assert!(recovery_followup.edit_user_turn_index.is_none());
+        assert!(recovery_followup.edit_user_turn_revision.is_none());
+        assert!(recovery_followup.steer_id.is_none());
+        assert!(recovery_followup.attachments.is_empty());
+
+        // The eventual replay wraps the held text without altering it.
+        let replay = managed_context_sanitize_queued_followup_replay(held);
+        assert!(replay.text.contains(&original_text));
+        assert_eq!(
+            managed_context_canonical_followup_replay_text(&replay.text),
+            original_text
+        );
+    }
+
     #[test]
     fn managed_context_density_handoff_text_preserves_exact_anchor_policy() {
         let text = managed_context_density_handoff_text(ManagedContextDensityPressure {
