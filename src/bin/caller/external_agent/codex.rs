@@ -5808,12 +5808,22 @@ fn translate_notification_with_scope(
                 }
                 "mcpToolCall" => {
                     // Codex is calling an MCP tool (e.g. spawn_live_audio, take_screenshot).
+                    // `/item/tool` is the current app-server v2 wire field; the
+                    // others cover older payload shapes. Getting the real name
+                    // matters beyond cosmetics: the managed-context rewind-only
+                    // and density tool gates match the preview against the
+                    // recovery-tool allowlist, and an anonymous "mcp_tool"
+                    // fallback would block-and-interrupt the very recovery
+                    // tools (get_status, list_rewind_anchors, rewind_context,
+                    // ...) the model needs under pressure.
                     let tool_name = params
-                        .pointer("/item/name")
+                        .pointer("/item/tool")
+                        .or_else(|| params.pointer("/item/name"))
                         .or_else(|| params.pointer("/item/toolName"))
                         .or_else(|| params.pointer("/item/serverLabel"))
                         .or_else(|| params.pointer("/item/arguments/name"))
                         .and_then(|v| v.as_str())
+                        .filter(|s| !s.trim().is_empty())
                         .unwrap_or("mcp_tool")
                         .to_string();
                     let server = params
@@ -6198,7 +6208,30 @@ fn translate_notification_with_scope(
             );
         }
 
+        // Warnings carry user-relevant state (e.g. the managed-context
+        // recovery turn announcement and its step-limit bailout). Surface
+        // them as warn-level logs instead of dropping them as unknown.
+        "warning" => {
+            let message = params
+                .get("message")
+                .and_then(|v| v.as_str())
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .unwrap_or("<empty warning>");
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::Log {
+                    level: "warn".to_string(),
+                    message: format!("Codex warning: {message}"),
+                },
+            );
+        }
+
         // Informational Codex v2 notifications — no action needed.
+        // `serverRequest/resolved` is bookkeeping for server-initiated
+        // requests the app server answered itself.
         "turn/started"
         | "thread/started"
         | "thread/closed"
@@ -6206,6 +6239,7 @@ fn translate_notification_with_scope(
         | "account/rateLimits/updated"
         | "item/commandExecution/terminalInteraction"
         | "configWarning"
+        | "serverRequest/resolved"
         | "remoteControl/status/changed" => {}
 
         "thread/settings/updated" => {

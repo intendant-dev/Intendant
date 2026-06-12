@@ -2829,6 +2829,15 @@ fn context_rewind_anchor_restore_usage_for_headroom(
         }
     }
     let prefix_tokens = context_rewind_anchor_prefix_estimate(anchor, position)?;
+    // A backend report that measured a strict prefix of the cut is a real
+    // lower bound on the post-rewind context. Char-based prefix estimates
+    // cannot see instructions or tool specs, so when the backend floor is
+    // higher it is the honest eligibility input — otherwise an optimistic
+    // estimate offers cuts that keep far more than the threshold allows.
+    let backend_floor = anchor.backend_usage_before_anchor.unwrap_or(0);
+    if backend_floor > prefix_tokens {
+        return Some(("backend-reported", backend_floor, rewind_only_limit));
+    }
     Some(("estimated", prefix_tokens, rewind_only_limit))
 }
 
@@ -2899,27 +2908,44 @@ fn validate_context_rewind_anchor_restore_headroom(
         return Ok(());
     };
     if context_rewind_anchor_has_recovery_headroom(used_tokens, rewind_only_limit) {
-        if let Some(outcome) = latest_context_rewind_outcome_for_anchor(
-            source_rollout_path,
-            requested_item_id,
+        // Prior-outcome veto is anchor-level (managed.md: an anchor that
+        // already proved insufficient is not re-offered), so a failed rewind
+        // at either position blocks both positions of the same anchor.
+        for outcome_position in [
             position,
-        )
-        .map_err(|err| {
-            format!(
-                "failed to inspect prior rewind outcomes in {}: {err}",
-                source_rollout_path.display()
+            match position {
+                external_agent::RollbackAnchorPosition::Before => {
+                    external_agent::RollbackAnchorPosition::After
+                }
+                external_agent::RollbackAnchorPosition::After => {
+                    external_agent::RollbackAnchorPosition::Before
+                }
+            },
+        ] {
+            let Some(outcome) = latest_context_rewind_outcome_for_anchor(
+                source_rollout_path,
+                requested_item_id,
+                outcome_position,
             )
-        })? {
+            .map_err(|err| {
+                format!(
+                    "failed to inspect prior rewind outcomes in {}: {err}",
+                    source_rollout_path.display()
+                )
+            })?
+            else {
+                continue;
+            };
             if context_rewind_anchor_has_recovery_headroom(
                 outcome.used_tokens,
                 outcome.rewind_only_limit,
             ) {
-                return Ok(());
+                continue;
             }
             return Err(format!(
                 "rewind anchor item_id `{requested_item_id}` is not a valid recovery target for position `{}`: a prior rewind to {} item was followed by {} tokens against the {} token rewind-only limit. Rows returned only with include_non_recovery=true are diagnostic and must not be passed to rewind_context. Call list_rewind_anchors again without include_non_recovery and choose an anchor whose positions includes the requested position; audit rows may expose recovery_eligible_positions.",
                 position.as_str(),
-                position.as_str(),
+                outcome_position.as_str(),
                 outcome.used_tokens,
                 outcome.rewind_only_limit
             ));
@@ -3340,6 +3366,13 @@ struct ContextRewindAnchorCatalogEntry {
     last_line: usize,
     first_item_type: String,
     last_item_type: String,
+    /// Whether the anchor's last item was emitted by the model (assistant
+    /// message, reasoning, tool *call*) rather than appended by the runtime
+    /// (tool *output*, user/developer message). Model-emitted items are
+    /// covered by their own response's token report; runtime-appended items
+    /// are only covered by a report from a *later* model response.
+    #[serde(skip_serializing)]
+    last_item_is_model: bool,
     positions: Vec<&'static str>,
     position_hint: &'static str,
     #[serde(skip_serializing_if = "Vec::is_empty")]
@@ -3349,6 +3382,13 @@ struct ContextRewindAnchorCatalogEntry {
     summary: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     backend_usage_at_or_after_anchor: Option<u64>,
+    /// Last backend report that measured a strict prefix of this anchor
+    /// (its response began at or before the anchor's first line). Real
+    /// lower bound for what any cut keeping this anchor's prefix retains;
+    /// char-based prefix estimates understate because they cannot see
+    /// instructions or tool specs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    backend_usage_before_anchor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     rewind_only_limit_at_or_after_anchor: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3472,6 +3512,21 @@ struct ContextRewindBackendUsageAtLine {
     line: usize,
     used_tokens: u64,
     rewind_only_limit: u64,
+    /// First rollout line of the model response this report measured. The
+    /// report's request input only covered items *strictly before* this
+    /// line; anything at or after it (e.g. a `function_call_output` that is
+    /// appended before the response's `token_count` is persisted) was not in
+    /// the measured context. Defaults to `line` (covers everything before
+    /// itself) when the response boundary is unknown.
+    ///
+    /// Consecutive model responses with no interleaved runtime item merge
+    /// into one run, so this is an *under*-approximation: safe for "did this
+    /// report consume item X" checks, unsafe as a prefix floor on its own.
+    response_start_line: usize,
+    /// True only for the first report after a model run began: that report
+    /// measured exactly the context preceding `response_start_line`. Later
+    /// reports in a merged run measured more than the run-start prefix.
+    measures_prefix_exactly: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -3840,6 +3895,12 @@ fn scan_context_rewind_anchor_catalog(
     let mut latest_backend_usage = None::<ContextRewindBackendUsageAtLine>;
     let mut prefix_estimated_tokens = 0_u64;
     let mut managed_context_recovery_start_line = None::<usize>;
+    // Where the latest model response began (first model-emitted item of the
+    // current model-item run). Token reports cover input strictly before this
+    // line; see `context_rewind_usage_covers_anchor`.
+    let mut current_model_response_start = None::<usize>;
+    let mut previous_response_item_was_model = false;
+    let mut reports_in_current_run = 0usize;
 
     for (line_index, line) in reader.lines().enumerate() {
         let line = line?;
@@ -3847,7 +3908,12 @@ fn scan_context_rewind_anchor_catalog(
             continue;
         };
         let line_number = line_index.saturating_add(1);
-        if let Some(usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry) {
+        if let Some(mut usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry)
+        {
+            usage.response_start_line = current_model_response_start.unwrap_or(line_number);
+            usage.measures_prefix_exactly =
+                current_model_response_start.is_some() && reports_in_current_run == 0;
+            reports_in_current_run = reports_in_current_run.saturating_add(1);
             if let Some(pending) = pending_rewind_outcome.take() {
                 latest_rewind_outcomes.insert(
                     pending.key,
@@ -3880,6 +3946,12 @@ fn scan_context_rewind_anchor_catalog(
         {
             managed_context_recovery_start_line = Some(line_number);
         }
+        let item_is_model_emitted = response_item_is_model_emitted(payload);
+        if item_is_model_emitted && !previous_response_item_was_model {
+            current_model_response_start = Some(line_number);
+            reports_in_current_run = 0;
+        }
+        previous_response_item_was_model = item_is_model_emitted;
         let prefix_before_item = prefix_estimated_tokens;
         prefix_estimated_tokens =
             prefix_estimated_tokens.saturating_add(context_rewind_estimated_tokens(payload));
@@ -3897,6 +3969,7 @@ fn scan_context_rewind_anchor_catalog(
                 let anchor = &mut anchors[index];
                 anchor.last_line = line_number;
                 anchor.last_item_type = item_type.clone();
+                anchor.last_item_is_model = item_is_model_emitted;
                 anchor.prefix_estimated_tokens_after_anchor = Some(prefix_after_item);
                 merge_string_set(&mut anchor.names, names.iter().cloned());
                 merge_string_set(&mut anchor.roles, roles.iter().cloned());
@@ -3921,12 +3994,14 @@ fn scan_context_rewind_anchor_catalog(
                 last_line: line_number,
                 first_item_type: item_type.clone(),
                 last_item_type: item_type.clone(),
+                last_item_is_model: item_is_model_emitted,
                 positions: vec!["before", "after"],
                 position_hint: "after",
                 names: names.clone(),
                 roles: roles.clone(),
                 summary: summary.clone(),
                 backend_usage_at_or_after_anchor: None,
+                backend_usage_before_anchor: None,
                 rewind_only_limit_at_or_after_anchor: None,
                 recommended_rewind_limit_at_or_after_anchor: None,
                 prefix_estimated_tokens_before_anchor: Some(prefix_before_item),
@@ -3965,9 +4040,23 @@ fn scan_context_rewind_anchor_catalog(
             anchor.recovery_eligible = Some(false);
             anchor.recovery_eligible_positions = None;
         }
+        // Latest report that measured a strict prefix of this anchor: either
+        // it physically precedes the anchor item, or it is the exact first
+        // report of a model run that began at/before the anchor. Reports
+        // deeper in a merged run measured more than the run-start prefix and
+        // must not be used as a prefix floor.
+        anchor.backend_usage_before_anchor = backend_usage
+            .iter()
+            .rev()
+            .find(|usage| {
+                usage.line <= anchor.first_line
+                    || (usage.measures_prefix_exactly
+                        && usage.response_start_line <= anchor.first_line)
+            })
+            .map(|usage| usage.used_tokens);
         let Some(usage) = backend_usage
             .iter()
-            .find(|usage| usage.line >= anchor.last_line)
+            .find(|usage| context_rewind_usage_covers_anchor(usage, anchor))
             .copied()
         else {
             continue;
@@ -4016,6 +4105,15 @@ fn scan_context_rewind_anchor_catalog(
                 external_agent::RollbackAnchorPosition::Before,
             ))
             .copied();
+        // An anchor that already proved insufficient is not re-offered for
+        // recovery — the veto is anchor-level (managed.md), not per-position:
+        // recovery should move to a different anchor instead of retrying the
+        // same cut point one notch harder.
+        let anchor_rewind_outcome = match (latest_rewind_before_outcome, latest_rewind_after_outcome)
+        {
+            (Some(before), Some(after)) => Some(context_rewind_worse_usage(Some(before), after)),
+            (before, after) => before.or(after),
+        };
         let after_density_eligible = context_rewind_anchor_position_density_eligible(
             anchor,
             external_agent::RollbackAnchorPosition::After,
@@ -4041,17 +4139,23 @@ fn scan_context_rewind_anchor_catalog(
         let after_recovery_eligible = context_rewind_anchor_position_recovery_eligible(
             anchor,
             external_agent::RollbackAnchorPosition::After,
-            latest_rewind_after_outcome,
+            anchor_rewind_outcome,
         )
         .unwrap_or(false);
+        // Offer `before` whenever `after` is not eligible by the best
+        // available source. `context_rewind_anchor_position_recovery_eligible`
+        // already prefers the backend-reported usage and falls back to the
+        // prefix estimate, so re-checking the raw `after` estimate here would
+        // let an optimistic estimate (estimates can't see instructions/tool
+        // specs) overrule a backend report that says the `after` cut keeps
+        // too much — suppressing the only position that can actually recover.
         let before_recovery_eligible = context_rewind_anchor_position_recovery_eligible(
             anchor,
             external_agent::RollbackAnchorPosition::Before,
-            latest_rewind_before_outcome,
+            anchor_rewind_outcome,
         )
         .unwrap_or(false)
-            && !after_recovery_eligible
-            && !restore_prefix_after_has_headroom;
+            && !after_recovery_eligible;
         anchor.position_hint = if after_recovery_eligible {
             "after"
         } else if before_recovery_eligible {
@@ -4203,6 +4307,8 @@ fn context_rewind_backend_usage_from_rollout_entry(
         line,
         used_tokens,
         rewind_only_limit,
+        response_start_line: line,
+        measures_prefix_exactly: false,
     })
 }
 
@@ -4277,6 +4383,53 @@ fn response_item_is_managed_context_recovery_kickstart(item: &serde_json::Value)
         return false;
     }
     response_item_content_text(item).any(|text| text.contains("<managed_context_recovery>"))
+}
+
+/// Whether a rollout `response_item` was emitted by the model (assistant
+/// message, reasoning, tool *calls*) as opposed to appended by the runtime
+/// afterwards (tool *outputs*, user/developer messages). Used to track where
+/// each model response begins inside the rollout line stream.
+fn response_item_is_model_emitted(item: &serde_json::Value) -> bool {
+    match item.get("type").and_then(|value| value.as_str()) {
+        Some("message") => item
+            .get("role")
+            .and_then(|value| value.as_str())
+            .is_some_and(|role| role.eq_ignore_ascii_case("assistant")),
+        Some("reasoning")
+        | Some("function_call")
+        | Some("local_shell_call")
+        | Some("custom_tool_call")
+        | Some("tool_search_call")
+        | Some("web_search_call")
+        | Some("image_generation_call") => true,
+        _ => false,
+    }
+}
+
+/// Whether a backend token report actually measured the anchor's content.
+///
+/// A `token_count` event reports the request that produced the latest model
+/// response: its input covered items strictly before that response's first
+/// item, plus the response's own output (the model-emitted items). Codex
+/// persists a tool's `function_call_output` *before* the corresponding
+/// `token_count` line, so the report that lands right after an output never
+/// measured it. Attributing such a report to the call/output group made
+/// `position="after"` rewinds look like they pruned the very output they
+/// keep, and suppressed the `before` position that would actually recover
+/// (observed live in the context-stress harness, 2026-06-11).
+fn context_rewind_usage_covers_anchor(
+    usage: &ContextRewindBackendUsageAtLine,
+    anchor: &ContextRewindAnchorCatalogEntry,
+) -> bool {
+    if anchor.last_item_is_model {
+        // The item was part of a model response; the report for that very
+        // response (the first one at/after the item) includes it.
+        usage.line >= anchor.last_line
+    } else {
+        // Runtime-appended item (tool output, user message): only a report
+        // for a *later* model response consumed it as input.
+        usage.response_start_line > anchor.last_line
+    }
 }
 
 fn context_rewind_anchor_names(item: &serde_json::Value) -> Vec<String> {
@@ -16326,6 +16479,21 @@ mod tests {
                         }
                     }
                 }),
+                // Bulky filler that physically accounts for the usage growth
+                // between the reports, so prefix estimates and backend floors
+                // agree that cuts above it cannot recover. (No `id`, so it is
+                // not itself an anchor.)
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{
+                            "type": "output_text",
+                            "text": "bulky filler ".repeat(3_000)
+                        }]
+                    }
+                }),
                 serde_json::json!({
                     "type": "response_item",
                     "payload": {
@@ -16484,6 +16652,169 @@ mod tests {
         assert_eq!(catalog["anchors"].as_array().unwrap().len(), 3);
         assert_eq!(catalog["include_non_recovery"].as_bool(), Some(true));
         assert_eq!(catalog["recovery_candidates_only"].as_bool(), Some(false));
+    }
+
+    /// Regression test for the live 2026-06-11 context-stress failure: codex
+    /// persists a tool's `function_call_output` *before* the `token_count` of
+    /// the response that emitted the call, so that report never measured the
+    /// output. Attributing it to the call/output group made `after` (which
+    /// keeps the bulky output) look recovery-eligible and suppressed `before`
+    /// (the only cut that actually recovers).
+    #[test]
+    fn context_rewind_anchor_catalog_attributes_usage_after_tool_output_to_later_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("rollout.jsonl");
+        let bulky_output = "y".repeat(30_000);
+        let token_count = |total: u64| {
+            serde_json::json!({
+                "type": "event_msg",
+                "payload": {
+                    "type": "token_count",
+                    "info": {
+                        "last_token_usage": {
+                            "input_tokens": total,
+                            "cached_input_tokens": 0,
+                            "output_tokens": 0,
+                            "total_tokens": total
+                        },
+                        "model_context_window": 10000
+                    }
+                }
+            })
+        };
+        std::fs::write(
+            &path,
+            [
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg_user_task",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "run the bulky benchmark command"}]
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call",
+                        "name": "exec_command",
+                        "call_id": "call_bulky_emit",
+                        "arguments": "{\"cmd\":\"python3 emit_context.py 3000\"}"
+                    }
+                }),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_bulky_emit",
+                        "output": bulky_output
+                    }
+                }),
+                // Report for the response that EMITTED the call: persisted
+                // after the output line but measured a context without it.
+                token_count(1500),
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg_marker_reply",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "MANAGED_INITIAL_OUTPUT_SEEN"}]
+                    }
+                }),
+                // Report for the next response, which did consume the output.
+                token_count(9800),
+            ]
+            .into_iter()
+            .map(|value| value.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({
+                "offset": 0,
+                "limit": 10,
+                "include_non_recovery": true,
+            }),
+        )
+        .expect("audit catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let anchors = catalog["anchors"].as_array().unwrap();
+        let emit = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "call_bulky_emit")
+            .expect("bulky emit anchor");
+        // The first report that covers the call/output group is the later
+        // response's 9800, not the stale 1500 written between call and output.
+        assert_eq!(
+            emit["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(9800)
+        );
+        assert_eq!(emit["recovery_eligible"].as_bool(), Some(true));
+        assert_eq!(
+            emit["recovery_eligible_positions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["before"],
+            "after keeps the bulky output and must not be offered; before must not be suppressed"
+        );
+        let user = anchors
+            .iter()
+            .find(|anchor| anchor["item_id"] == "msg_user_task")
+            .expect("user message anchor");
+        // The user message was measured by the call-emitting response (1500),
+        // so cutting after it has genuine recovery headroom.
+        assert_eq!(
+            user["backend_usage_at_or_after_anchor"].as_u64(),
+            Some(1500)
+        );
+        assert_eq!(
+            user["recovery_eligible_positions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|value| value.as_str())
+                .collect::<Vec<_>>(),
+            vec!["after"]
+        );
+
+        let raw = list_context_rewind_anchors_from_rollout(
+            &path,
+            &serde_json::json!({"offset": 0, "limit": 10}),
+        )
+        .expect("recovery catalog");
+        let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let by_id: Vec<(&str, Vec<&str>)> = catalog["anchors"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|anchor| {
+                (
+                    anchor["item_id"].as_str().unwrap(),
+                    anchor["positions"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter_map(|value| value.as_str())
+                        .collect(),
+                )
+            })
+            .collect();
+        assert!(
+            by_id.contains(&("call_bulky_emit", vec!["before"])),
+            "recovery catalog must offer the bulky group with position before: {by_id:?}"
+        );
+        assert!(
+            by_id.contains(&("msg_user_task", vec!["after"])),
+            "recovery catalog must offer the pre-bulk user message with position after: {by_id:?}"
+        );
     }
 
     #[test]
@@ -16655,6 +16986,18 @@ mod tests {
                         "type": "function_call_output",
                         "call_id": "call_noisy_build",
                         "output": warning_output
+                    }
+                }),
+                // Real rollouts persist the call-output before the next model
+                // response; the report that measured the output only arrives
+                // after that later response's own items.
+                serde_json::json!({
+                    "type": "response_item",
+                    "payload": {
+                        "type": "message",
+                        "id": "msg_noisy_build_summary",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "build finished with warnings"}]
                     }
                 }),
                 serde_json::json!({
