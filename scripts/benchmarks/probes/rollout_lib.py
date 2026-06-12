@@ -89,10 +89,31 @@ def find_rollouts(codex_home: Path) -> list[Path]:
 
 
 def is_branch_rollout(path: Path) -> bool:
+    """True only when the charter is a *developer message* response_item.
+
+    A parent rollout can quote the marker inside a tool output (observed
+    live 2026-06-12: terminal scrollback echoed into a function_call_output)
+    — a raw byte scan would misclassify the parent as a branch, which both
+    hid completions from the lane poll and broke parent-rollout selection
+    here. Parse the line before believing the marker.
+    """
     try:
         with path.open("r", errors="replace") as handle:
             for raw in handle:
-                if FISSION_CHARTER_MARK in raw:
+                if FISSION_CHARTER_MARK not in raw:
+                    continue
+                try:
+                    obj = json.loads(raw)
+                except ValueError:
+                    continue
+                if not isinstance(obj, dict):
+                    continue
+                payload = obj.get("payload") or {}
+                if (
+                    obj.get("type") == "response_item"
+                    and payload.get("type") == "message"
+                    and (payload.get("role") or "") == "developer"
+                ):
                     return True
     except OSError:
         pass
