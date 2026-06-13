@@ -1,3 +1,5 @@
+# Benchmark agent definition — revision 2026-06-11 (constrained-window lanes).
+# Previous revision: 2026-05-27 (expanded-22 suite).
 import shlex
 from pathlib import Path
 
@@ -20,15 +22,33 @@ class PersistentAuthCodex(Codex):
     If `binary_path` is supplied, the wrapper uploads that Codex binary instead
     of installing the official npm package. That gives us a fair bare-patched
     baseline while keeping the run path otherwise equivalent to vanilla Codex.
+
+    2026-06 revision notes:
+    - Optional `context_window` kwarg: appends
+      `-c model_context_window=<N> -c model_auto_compact_token_limit=<0.9*N>`
+      to the `codex exec` invocation. The explicit auto-compact limit is
+      required because vanilla Codex derives its compaction threshold from
+      model-info, not from the `model_context_window` override — without it a
+      constrained window would never trigger compaction at the right point.
     """
 
     @staticmethod
     def name() -> str:
         return "persistent-auth-codex"
 
-    def __init__(self, *args, binary_path: str | None = None, **kwargs):
+    def __init__(
+        self,
+        *args,
+        binary_path: str | None = None,
+        context_window: int | None = None,
+        **kwargs,
+    ):
         super().__init__(*args, **kwargs)
         self._binary_path = Path(binary_path).expanduser() if binary_path else None
+        # Harbor passes --ak values through as strings; coerce explicitly.
+        self._context_window = int(context_window) if context_window is not None else None
+        if self._context_window is not None and self._context_window <= 0:
+            raise ValueError(f"context_window must be positive: {context_window}")
         if self._binary_path is not None and not self._binary_path.is_file():
             raise ValueError(f"binary_path does not exist: {self._binary_path}")
 
@@ -78,6 +98,17 @@ class PersistentAuthCodex(Codex):
         model = self.model_name.split("/")[-1]
         cli_flags = self.build_cli_flags()
         cli_flags_arg = (cli_flags + " ") if cli_flags else ""
+
+        # Constrained-window lane: pin the window AND the auto-compact
+        # threshold (vanilla derives the latter from model-info, so the
+        # window override alone would not move the compaction point).
+        context_window_flags = ""
+        if self._context_window is not None:
+            auto_compact_limit = int(0.9 * self._context_window)
+            context_window_flags = (
+                f"-c model_context_window={self._context_window} "
+                f"-c model_auto_compact_token_limit={auto_compact_limit} "
+            )
 
         auth_json_path = self._resolve_auth_json_path()
         remote_codex_home = self._REMOTE_CODEX_HOME.as_posix()
@@ -152,6 +183,7 @@ class PersistentAuthCodex(Codex):
                     "--json "
                     "--enable unified_exec "
                     f"{cli_flags_arg}"
+                    f"{context_window_flags}"
                     "-- "
                     f"{escaped_instruction} "
                     f"2>&1 </dev/null | tee {shlex.quote((EnvironmentPaths.agent_dir / self._OUTPUT_FILENAME).as_posix())}"

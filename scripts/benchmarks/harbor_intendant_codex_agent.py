@@ -1,3 +1,5 @@
+# Benchmark agent definition — revision 2026-06-11 (constrained-window lanes).
+# Previous revision: 2026-05-27 (expanded-22 suite).
 import json
 import shlex
 from pathlib import Path
@@ -15,6 +17,19 @@ class IntendantCodex(Codex):
     This intentionally differs from Harbor's stock Codex agent: the task command
     launches `intendant --agent codex --web ...`, and Intendant then launches the
     prebuilt Codex app-server with its MCP integration enabled.
+
+    2026-06 revision notes:
+    - `[agent.codex] managed_context = "managed"` is now written explicitly:
+      since 2026-05 the intendant config default flipped to "vanilla"
+      (`default_codex_managed_context` in project.rs), so omitting the key
+      would silently run this lane with the vanilla protocol. `command` and
+      `managed_command` are both pinned to the uploaded fork binary
+      (managed sessions spawn `managed_command`; `command` is the fallback).
+    - Optional `context_window` kwarg: writes `model_context_window = <N>`
+      into the task container's `$CODEX_HOME/config.toml` before intendant
+      launches. The managed Codex fork reads it; intendant itself forces
+      `-c model_auto_compact_token_limit=i64::MAX` for managed sessions, so
+      there is no compaction conflict with the constrained window.
     """
 
     @staticmethod
@@ -28,6 +43,7 @@ class IntendantCodex(Codex):
         intendant_path: str,
         reasoning_effort: str = "xhigh",
         web_port: int = 8765,
+        context_window: int | None = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
@@ -35,6 +51,10 @@ class IntendantCodex(Codex):
         self._intendant_path = Path(intendant_path).expanduser()
         self._intendant_reasoning_effort = reasoning_effort
         self._web_port = int(web_port)
+        # Harbor passes --ak values through as strings; coerce explicitly.
+        self._context_window = int(context_window) if context_window is not None else None
+        if self._context_window is not None and self._context_window <= 0:
+            raise ValueError(f"context_window must be positive: {context_window}")
         if not self._binary_path.is_file():
             raise ValueError(f"binary_path does not exist: {self._binary_path}")
         if not self._intendant_path.is_file():
@@ -89,7 +109,15 @@ class IntendantCodex(Codex):
             'default_backend = "codex"',
             "",
             "[agent.codex]",
+            # Keys verified against project.rs `CodexConfig` (2026-06-11):
+            # `managed_context` defaults to "vanilla" since 2026-05, so it MUST
+            # be pinned here or this lane silently loses the managed protocol.
+            # Managed sessions spawn `managed_command` (`effective_command()`);
+            # `command` stays pinned as the vanilla/fallback path. Both point
+            # at the uploaded fork binary.
             'command = "/usr/local/bin/codex"',
+            'managed_command = "/usr/local/bin/codex"',
+            'managed_context = "managed"',
             f"model = {json.dumps(model)}",
             'approval_policy = "never"',
             'sandbox = "danger-full-access"',
@@ -185,6 +213,19 @@ class IntendantCodex(Codex):
                 "TOML\n"
             )
 
+        if self._context_window is not None:
+            # Constrained-window lane: the managed Codex fork reads
+            # model_context_window from $CODEX_HOME/config.toml. Written here so
+            # it is in place BEFORE intendant launches the app-server. Intendant
+            # already forces -c model_auto_compact_token_limit=i64::MAX for
+            # managed sessions (codex.rs), and CLI -c overrides only that key,
+            # so this config value stays effective.
+            setup_command += (
+                '\ncat >>"$CODEX_HOME/config.toml" <<TOML\n'
+                f"model_context_window = {self._context_window}\n"
+                "TOML\n"
+            )
+
         skills_command = self._build_register_skills_command()
         if skills_command:
             setup_command += f"\n{skills_command}"
@@ -251,6 +292,16 @@ class IntendantCodex(Codex):
                 env=env,
             )
         finally:
+            # Persistence note (verified 2026-06-11): intendant writes its
+            # session log dir IN PLACE at intendant_log_dir (= agent_dir/
+            # intendant) via --log-file, and both managed-context artifacts the
+            # metric extraction depends on are anchored at that same log dir:
+            #   - context_rewind.rs records_dir(log_dir) = <log_dir>/context_rewinds/
+            #   - fission_ledger.rs  ledger_path(log_dir) = <log_dir>/fission_ledger.json
+            # so per-session rewind records and the fission ledger are already
+            # inside the trial's persisted agent/ dir — no extra copy needed.
+            # Codex-side rollouts (incl. fission branch sessions) live in
+            # $CODEX_HOME/sessions and are copied below.
             try:
                 await self.exec_as_agent(
                     environment,
