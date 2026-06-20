@@ -23956,6 +23956,21 @@ function sessionWindowTranscriptSignaturesFromParts(parts, options = {}) {
       signatures.push(['text', ...textParts].join('\u001f'));
     }
     if (parts.ts) signatures.push(['exact', parts.ts, ...textParts].join('\u001f'));
+    if (isUserMessage && options.includeUserNearTime) {
+      const timeBucket = sessionWindowTranscriptTimeBucket(parts.ts);
+      if (timeBucket) {
+        signatures.push([
+          'user-near-time-text',
+          parts.sessionId,
+          parts.level,
+          parts.source,
+          parts.kind,
+          parts.replacementTurnIndex,
+          timeBucket,
+          content,
+        ].join('\u001f'));
+      }
+    }
   }
   return signatures;
 }
@@ -24042,6 +24057,12 @@ function sessionWindowTranscriptTimestampForHistoryItem(item) {
   return sessionWindowTranscriptTimestampMs(record?.ts || record?.timestamp || '');
 }
 
+function sessionWindowTranscriptTimeBucket(value) {
+  const ms = sessionWindowTranscriptTimestampMs(value);
+  if (ms === null) return '';
+  return String(Math.floor(ms / 5000));
+}
+
 function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
   if (!win || !Array.isArray(records) || records.length === 0) return;
   deduplicateSessionWindowHistory(win, shouldFollow);
@@ -24069,6 +24090,7 @@ function insertSessionWindowHistoryRecords(win, records, shouldFollow) {
     inserted += 1;
   }
   if (inserted === 0) return;
+  deduplicateSessionWindowHistory(win, shouldFollow);
   if (shouldFollow || wasRenderingTail) {
     renderSessionWindowTail(win);
   } else {
@@ -25871,9 +25893,9 @@ function appendSessionWindowRenderedTailItems(win, items, startIndex, historyLen
   return true;
 }
 
-function addSessionWindowHistorySignatures(set, item, fallbackSessionId = '') {
+function addSessionWindowHistorySignatures(set, item, fallbackSessionId = '', options = {}) {
   if (!set) return;
-  for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId)) {
+  for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId, options)) {
     set.add(signature);
   }
 }
@@ -25892,21 +25914,50 @@ function sessionWindowHistoryHasMatchingSignature(signatures, item, fallbackSess
   return itemSignatures.length > 0 && itemSignatures.some(signature => signatures.has(signature));
 }
 
+function sessionWindowHistoryItemPriority(item) {
+  const record = sessionWindowHistoryRecord(item);
+  const node = sessionWindowHistoryNode(item);
+  let score = record ? 4 : 0;
+  const ts = String(record?.ts || record?.timestamp || node?.querySelector?.('.log-ts')?.title || '');
+  if (/\d{4}-\d{2}-\d{2}T/.test(ts) || /\([^()]*\d{4}-\d{2}-\d{2}T/.test(ts)) score += 2;
+  const source = String(record?.source || node?.querySelector?.('.log-level')?.textContent || '').trim();
+  if (source && source === source.toLowerCase()) score += 1;
+  return score;
+}
+
 function deduplicateSessionWindowHistory(win, shouldFollow = null) {
   if (!win) return 0;
   const history = ensureSessionWindowHistory(win);
   if (history.length < 2) return 0;
   const wasRenderingTail = sessionWindowIsRenderingTail(win, history.length);
-  const signatures = new Set();
   const kept = [];
+  let signatureToIndex = new Map();
   let removed = 0;
+  const rebuildIndex = () => {
+    signatureToIndex = new Map();
+    kept.forEach((item, index) => {
+      for (const signature of sessionWindowTranscriptSignaturesForHistoryItem(item, win.sessionId, { includeUserNearTime: true })) {
+        if (!signatureToIndex.has(signature)) signatureToIndex.set(signature, index);
+      }
+    });
+  };
   for (const item of history) {
-    if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) {
+    const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(item, win.sessionId, { includeUserNearTime: true });
+    const existingIndex = itemSignatures
+      .map(signature => signatureToIndex.get(signature))
+      .find(index => index !== undefined);
+    if (existingIndex !== undefined) {
+      if (sessionWindowHistoryItemPriority(item) > sessionWindowHistoryItemPriority(kept[existingIndex])) {
+        kept[existingIndex] = item;
+        rebuildIndex();
+      }
       removed += 1;
       continue;
     }
     kept.push(item);
-    addSessionWindowHistorySignatures(signatures, item, win.sessionId);
+    for (const signature of itemSignatures) {
+      if (!signatureToIndex.has(signature)) signatureToIndex.set(signature, kept.length - 1);
+    }
   }
   if (removed === 0) return 0;
   history.splice(0, history.length, ...kept);
