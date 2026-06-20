@@ -4793,7 +4793,8 @@ fn codex_function_call_output(payload: &serde_json::Value) -> Option<(Option<Str
     if payload.get("type").and_then(|v| v.as_str()) != Some("function_call_output") {
         return None;
     }
-    let output = value_str(payload, "output")?;
+    let raw_output = value_str(payload, "output")?;
+    let output = crate::external_agent::codex::strip_codex_tool_output_envelope(&raw_output);
     if output.trim().is_empty() {
         return None;
     }
@@ -7587,7 +7588,18 @@ fn external_session_activity_replay_from_home_with_attach(
             entries.push(event);
             continue;
         }
-        let content = entry.get("content").and_then(|v| v.as_str()).unwrap_or("");
+        let content = entry
+            .get("content")
+            .and_then(|v| v.as_str())
+            .filter(|content| !content.is_empty())
+            .or_else(|| {
+                if entry.get("kind").and_then(|v| v.as_str()) == Some("agent_output") {
+                    entry.get("stdout").and_then(|v| v.as_str())
+                } else {
+                    None
+                }
+            })
+            .unwrap_or("");
         if content.is_empty() {
             continue;
         }
@@ -7621,6 +7633,7 @@ fn external_session_activity_replay_from_home_with_attach(
                 .get("superseded_reason")
                 .and_then(|v| v.as_str()),
             "kind": entry.get("kind").and_then(|v| v.as_str()),
+            "output_id": entry.get("output_id").and_then(|v| v.as_str()),
             "rollback_turns": entry.get("rollback_turns").and_then(|v| v.as_u64()),
             "rollback_anchor_item_id": entry
                 .get("rollback_anchor_item_id")
@@ -26077,7 +26090,7 @@ mod tests {
                     "payload": {
                         "type": "function_call_output",
                         "call_id": "call_output",
-                        "output": "Chunk ID: abc123\nOutput:\nactual command output\n"
+                        "output": "Chunk ID: abc123\nWall time: 0.0001 seconds\nProcess exited with code 0\nOriginal token count: 8\nOutput:\nTotal output lines: 1\n\nactual command output\n"
                     }
                 }),
             ]
@@ -26100,10 +26113,20 @@ mod tests {
         assert_eq!(outputs[0]["source"], "codex");
         assert_eq!(outputs[0]["kind"], "agent_output");
         assert_eq!(outputs[0]["output_id"], "call_output");
-        assert_eq!(
-            outputs[0]["stdout"],
-            "Chunk ID: abc123\nOutput:\nactual command output\n"
-        );
+        assert_eq!(outputs[0]["stdout"], "actual command output\n");
+
+        let replay =
+            external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
+                .expect("codex session should replay");
+        let replay: serde_json::Value = serde_json::from_str(&replay).unwrap();
+        let replay_output = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["kind"] == "agent_output")
+            .expect("command output should replay as a log entry");
+        assert_eq!(replay_output["content"], "actual command output\n");
+        assert_eq!(replay_output["output_id"], "call_output");
     }
 
     #[test]

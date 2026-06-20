@@ -25580,10 +25580,60 @@ function retargetSessionWindowHistoryItem(item, sessionId) {
   return item;
 }
 
+function isSessionWindowCommandOutputRecord(c) {
+  return !!c && (c.kind === 'agent_output' || !!c.output_id);
+}
+
+function buildSessionWindowCommandOutputEntry(c) {
+  const content = String(c?.content || '');
+  const { entry } = createLogScaffold(c, 'command-output-group finalized');
+  const wrap = document.createElement('span');
+  wrap.className = 'log-content command-output-wrap';
+  const summary = document.createElement('span');
+  summary.className = 'command-output-summary';
+  const body = document.createElement('span');
+  body.className = 'command-output-body';
+  wrap.appendChild(summary);
+  wrap.appendChild(body);
+  const stats = commandOutputStats(content);
+  summary.innerHTML = commandOutputSummaryHtml({
+    chunks: 1,
+    lines: stats.lines,
+    bytes: stats.bytes,
+    warns: String(c?.level || '').toLowerCase() === 'warn' ? 1 : 0,
+  });
+  if (content) appendCommandOutputText(body, content);
+  const toggle = document.createElement('span');
+  toggle.className = 'collapse-toggle';
+  toggle.innerHTML = '<span class="arrow">\u25B8 output</span><span class="arrow-up">\u25BE hide</span>';
+  entry.appendChild(wrap);
+  entry.appendChild(toggle);
+  appendCopyLogEntryButton(entry, content);
+  entry.addEventListener('click', (event) => {
+    if (event.target?.closest?.('a, button')) return;
+    entry.classList.toggle('expanded');
+  });
+  return entry;
+}
+
+function makeSessionWindowLogEntryCollapsible(entry, cnt, expanded = false) {
+  if (!entry || !cnt) return;
+  entry.classList.add('collapsible');
+  entry.classList.toggle('expanded', !!expanded);
+  const toggle = document.createElement('span');
+  toggle.className = 'collapse-toggle';
+  toggle.innerHTML = '<span class="arrow">\u25B8 more</span><span class="arrow-up">\u25BE less</span>';
+  entry.appendChild(toggle);
+  wireCollapsibleLogEntry(entry, cnt);
+}
+
 function buildSessionWindowLogEntry(c) {
   if (!c || !c.session_id) return null;
   const content = c.content || '';
   if (!content && c.kind !== 'rollback_marker') return null;
+  if (isSessionWindowCommandOutputRecord(c)) {
+    return buildSessionWindowCommandOutputEntry(c);
+  }
   if (isDiffLog(c)) {
     const diffText = diffLogContent(c);
     const parsed = parseUnifiedDiff(diffText);
@@ -25616,6 +25666,9 @@ function buildSessionWindowLogEntry(c) {
   entry.appendChild(cnt);
   appendCopyLogEntryButton(entry, c.content ?? '');
   appendEditUserMessageButton(entry, c);
+  if (c.collapsible || content.split('\n').length > 3 || content.length > 300) {
+    makeSessionWindowLogEntryCollapsible(entry, cnt);
+  }
   return entry;
 }
 
@@ -27988,6 +28041,9 @@ function createLogScaffold(c, extraClass) {
   }
   if (c.item_id) {
     entry.dataset.itemId = c.item_id;
+  }
+  if (c.output_id) {
+    entry.dataset.outputId = c.output_id;
   }
 
   const lvl = document.createElement('span');

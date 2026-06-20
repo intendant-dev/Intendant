@@ -30,6 +30,8 @@ pub struct FormattedOutput {
 /// - `{"type":"status",...}` — skipped.
 /// - Anything else — passed through verbatim.
 pub fn format_agent_output(raw: &str) -> FormattedOutput {
+    let normalized = strip_codex_tool_output_envelope(raw);
+    let raw = normalized.as_ref();
     let mut parts: Vec<String> = Vec::new();
     let mut images: Vec<String> = Vec::new();
     let mut parsed_any_result = false;
@@ -155,6 +157,81 @@ pub fn format_agent_output(raw: &str) -> FormattedOutput {
         parts.join("\n")
     };
     FormattedOutput { text, images }
+}
+
+fn strip_codex_tool_output_envelope(raw: &str) -> std::borrow::Cow<'_, str> {
+    let Some(first_end) = next_line_end(raw, 0) else {
+        return std::borrow::Cow::Borrowed(raw);
+    };
+    let first = trim_line_ending(&raw[..first_end]);
+    if !first.starts_with("Chunk ID:") {
+        return std::borrow::Cow::Borrowed(raw);
+    }
+
+    let mut pos = first_end;
+    let mut saw_metadata = false;
+    while let Some(end) = next_line_end(raw, pos) {
+        let line = trim_line_ending(&raw[pos..end]);
+        if line == "Output:" {
+            pos = end;
+            return std::borrow::Cow::Borrowed(strip_codex_tool_output_body_preamble(&raw[pos..]));
+        }
+        if is_codex_tool_output_envelope_metadata_line(line) {
+            saw_metadata = true;
+            pos = end;
+            continue;
+        }
+        break;
+    }
+
+    if saw_metadata && raw[pos..].trim().is_empty() {
+        std::borrow::Cow::Borrowed("")
+    } else {
+        std::borrow::Cow::Borrowed(raw)
+    }
+}
+
+fn next_line_end(text: &str, start: usize) -> Option<usize> {
+    if start >= text.len() {
+        return None;
+    }
+    text[start..]
+        .find('\n')
+        .map(|idx| start + idx + 1)
+        .or(Some(text.len()))
+}
+
+fn trim_line_ending(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn is_codex_tool_output_envelope_metadata_line(line: &str) -> bool {
+    line.starts_with("Wall time:")
+        || line.starts_with("Process running with session ID")
+        || line.starts_with("Process exited with code")
+        || line.starts_with("Process killed")
+        || line.starts_with("Process timed out")
+        || line.starts_with("Original token count:")
+}
+
+fn strip_codex_tool_output_body_preamble(mut body: &str) -> &str {
+    if let Some(end) = next_line_end(body, 0) {
+        let line = trim_line_ending(&body[..end]);
+        if line.starts_with("Total output lines:")
+            && line["Total output lines:".len()..]
+                .trim()
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+        {
+            body = &body[end..];
+            if let Some(blank_end) = next_line_end(body, 0) {
+                if trim_line_ending(&body[..blank_end]).trim().is_empty() {
+                    body = &body[blank_end..];
+                }
+            }
+        }
+    }
+    body
 }
 
 /// Extract top-level JSON objects from a string that may contain multiple
@@ -356,6 +433,18 @@ mod tests {
     fn format_agent_output_skips_status_lines() {
         let raw = "{\"type\":\"status\",\"nonce\":1,\"state\":\"running\"}\n{\"type\":\"result\",\"data\":\"{\\\"exit_code\\\":0,\\\"stdout_tail\\\":\\\"ok\\\",\\\"stderr_tail\\\":\\\"\\\"}\"}";
         assert_eq!(format_agent_output(raw).text, "ok");
+    }
+
+    #[test]
+    fn format_agent_output_strips_codex_tool_envelope() {
+        let raw = "Chunk ID: abc123\nWall time: 0.0001 seconds\nProcess exited with code 0\nOriginal token count: 8\nOutput:\nTotal output lines: 1\n\nactual output\n";
+        assert_eq!(format_agent_output(raw).text, "actual output");
+    }
+
+    #[test]
+    fn format_agent_output_suppresses_codex_metadata_only_envelope() {
+        let raw = "Chunk ID: abc123\nWall time: 0.0001 seconds\nProcess exited with code 0\n";
+        assert_eq!(format_agent_output(raw).text, "");
     }
 
     #[test]

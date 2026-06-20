@@ -5447,12 +5447,13 @@ fn filter_codex_command_output(
     text: &str,
     flush: bool,
 ) -> Option<String> {
+    let normalized = strip_codex_tool_output_envelope(text);
     let key = codex_command_output_hygiene_key(item_id);
     state
         .command_output_hygiene
         .entry(key)
         .or_default()
-        .filter(text, flush)
+        .filter(&normalized, flush)
 }
 
 fn observe_codex_command_output_command(
@@ -5475,6 +5476,81 @@ fn finish_codex_command_output(
     let key = codex_command_output_hygiene_key(item_id);
     let mut hygiene = state.command_output_hygiene.remove(&key)?;
     hygiene.filter("", true)
+}
+
+pub(crate) fn strip_codex_tool_output_envelope(text: &str) -> String {
+    let Some(first_end) = next_line_end(text, 0) else {
+        return text.to_string();
+    };
+    let first = trim_line_ending(&text[..first_end]);
+    if !first.starts_with("Chunk ID:") {
+        return text.to_string();
+    }
+
+    let mut pos = first_end;
+    let mut saw_metadata = false;
+    while let Some(end) = next_line_end(text, pos) {
+        let line = trim_line_ending(&text[pos..end]);
+        if line == "Output:" {
+            pos = end;
+            return strip_codex_tool_output_body_preamble(&text[pos..]).to_string();
+        }
+        if is_codex_tool_output_envelope_metadata_line(line) {
+            saw_metadata = true;
+            pos = end;
+            continue;
+        }
+        break;
+    }
+
+    if saw_metadata && text[pos..].trim().is_empty() {
+        String::new()
+    } else {
+        text.to_string()
+    }
+}
+
+fn next_line_end(text: &str, start: usize) -> Option<usize> {
+    if start >= text.len() {
+        return None;
+    }
+    text[start..]
+        .find('\n')
+        .map(|idx| start + idx + 1)
+        .or(Some(text.len()))
+}
+
+fn trim_line_ending(line: &str) -> &str {
+    line.trim_end_matches(['\r', '\n'])
+}
+
+fn is_codex_tool_output_envelope_metadata_line(line: &str) -> bool {
+    line.starts_with("Wall time:")
+        || line.starts_with("Process running with session ID")
+        || line.starts_with("Process exited with code")
+        || line.starts_with("Process killed")
+        || line.starts_with("Process timed out")
+        || line.starts_with("Original token count:")
+}
+
+fn strip_codex_tool_output_body_preamble(mut body: &str) -> &str {
+    if let Some(end) = next_line_end(body, 0) {
+        let line = trim_line_ending(&body[..end]);
+        if line.starts_with("Total output lines:")
+            && line["Total output lines:".len()..]
+                .trim()
+                .chars()
+                .all(|ch| ch.is_ascii_digit())
+        {
+            body = &body[end..];
+            if let Some(blank_end) = next_line_end(body, 0) {
+                if trim_line_ending(&body[..blank_end]).trim().is_empty() {
+                    body = &body[blank_end..];
+                }
+            }
+        }
+    }
+    body
 }
 
 fn is_codex_warning_diagnostic_start(line: &str) -> bool {
@@ -9501,7 +9577,7 @@ error: build failed
             "item": {
                 "type": "function_call_output",
                 "call_id": "call_CP7ok6SOm9fbU9zYp8Ok1IL3",
-                "output": "Chunk ID: d1ff8c\nWall time: 30.0011 seconds\nProcess running with session ID 1404\n"
+                "output": "Chunk ID: d1ff8c\nWall time: 30.0011 seconds\nProcess exited with code 0\nOriginal token count: 12\nOutput:\nactual command output\n"
             }
         });
 
@@ -9510,7 +9586,9 @@ error: build failed
         match rx.try_recv().unwrap() {
             AgentEvent::ToolOutputDelta { item_id, text } => {
                 assert_eq!(item_id, "call_CP7ok6SOm9fbU9zYp8Ok1IL3");
-                assert!(text.contains("Process running with session ID 1404"));
+                assert_eq!(text, "actual command output\n");
+                assert!(!text.contains("Chunk ID:"));
+                assert!(!text.contains("Wall time:"));
             }
             other => panic!("expected ToolOutputDelta, got {:?}", other),
         }
@@ -9536,13 +9614,6 @@ error: build failed
 
         translate_notification("item/completed", &params, &tx);
 
-        match rx.try_recv().unwrap() {
-            AgentEvent::ToolOutputDelta { item_id, text } => {
-                assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
-                assert!(text.contains("Process exited with code 0"));
-            }
-            other => panic!("expected ToolOutputDelta, got {:?}", other),
-        }
         match rx.try_recv().unwrap() {
             AgentEvent::ToolCompleted { item_id, status } => {
                 assert_eq!(item_id, "call_IXwDrmqUWzOZ8mBwjyG3rJqd");
