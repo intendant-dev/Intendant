@@ -6655,8 +6655,8 @@ fn list_codex_index_skeleton_sessions_with_limit(
                 0,
                 None,
                 None,
-                Some(index_path.to_string_lossy().to_string()),
-                file_size(&index_path),
+                None,
+                0,
             ),
         );
     }
@@ -24949,6 +24949,8 @@ mod tests {
             value_str(&rows[0], "session_id").as_deref(),
             Some(backend_id)
         );
+        assert_eq!(rows[0]["total_bytes"].as_u64(), Some(0));
+        assert!(value_str(&rows[0], "path").is_none());
     }
 
     #[test]

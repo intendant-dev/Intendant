@@ -4801,6 +4801,91 @@ body.context-focus-active {
   opacity: 0.65;
   cursor: progress;
 }
+.sessions-hydration-status {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr) 132px;
+  align-items: center;
+  gap: 10px;
+  min-height: 36px;
+  margin: -2px 0 10px;
+  padding: 7px 10px;
+  border: 1px solid rgba(137, 180, 250, 0.24);
+  border-left: 3px solid var(--blue);
+  border-radius: 6px;
+  background: color-mix(in srgb, var(--blue) 8%, var(--surface0));
+  color: var(--text);
+  box-sizing: border-box;
+}
+.sessions-hydration-status.hidden {
+  display: none;
+}
+.sessions-hydration-status.done {
+  border-color: rgba(166, 227, 161, 0.26);
+  border-left-color: var(--green);
+  background: color-mix(in srgb, var(--green) 7%, var(--surface0));
+}
+.sessions-hydration-status.error {
+  border-color: rgba(243, 139, 168, 0.28);
+  border-left-color: var(--red);
+  background: color-mix(in srgb, var(--red) 8%, var(--surface0));
+}
+.sessions-hydration-spinner {
+  width: 13px;
+  height: 13px;
+  border: 2px solid var(--surface2);
+  border-top-color: var(--blue);
+  border-radius: 50%;
+  animation: sessions-spawn-spin 850ms linear infinite;
+}
+.sessions-hydration-status.done .sessions-hydration-spinner {
+  animation: none;
+  border-color: var(--green);
+}
+.sessions-hydration-status.error .sessions-hydration-spinner {
+  animation: none;
+  border-color: var(--red);
+}
+.sessions-hydration-copy {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+}
+.sessions-hydration-title {
+  font-size: 12px;
+  font-weight: 700;
+  line-height: 1.2;
+}
+.sessions-hydration-detail {
+  color: var(--overlay1);
+  font-size: 11px;
+  line-height: 1.25;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.sessions-hydration-meter {
+  height: 3px;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--surface2) 72%, transparent);
+  overflow: hidden;
+}
+.sessions-hydration-status.done .sessions-hydration-meter,
+.sessions-hydration-status.error .sessions-hydration-meter {
+  display: none;
+}
+.sessions-hydration-meter span {
+  display: block;
+  width: 42%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--blue), var(--teal));
+  animation: sessions-hydration-sweep 1.25s ease-in-out infinite;
+}
+@keyframes sessions-hydration-sweep {
+  0% { transform: translateX(-120%); }
+  100% { transform: translateX(260%); }
+}
 .sessions-aggregate {
   display: grid;
   grid-template-columns: repeat(6, minmax(0, 1fr));
@@ -4828,6 +4913,13 @@ body.context-focus-active {
   color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
+}
+.sessions-aggregate .agg-card.loading {
+  border-color: rgba(137, 180, 250, 0.22);
+  background: color-mix(in srgb, var(--blue) 6%, var(--surface0));
+}
+.sessions-aggregate .agg-card.loading .agg-value {
+  color: var(--overlay1);
 }
 .sessions-list {
   display: flex;
@@ -5294,6 +5386,12 @@ body.context-focus-active {
   border-color: var(--blue);
   background: color-mix(in srgb, var(--blue) 8%, var(--surface0));
 }
+.session-card.partial {
+  border-color: rgba(137, 180, 250, 0.22);
+  background:
+    linear-gradient(90deg, rgba(137, 180, 250, 0.055), transparent 36%),
+    var(--surface0);
+}
 .session-card .sc-top {
   display: flex;
   align-items: center;
@@ -5410,6 +5508,10 @@ body.context-focus-active {
   background: color-mix(in srgb, var(--green) 12%, transparent);
   color: var(--green);
 }
+.session-card .sc-loading-chip {
+  background: color-mix(in srgb, var(--blue) 13%, transparent);
+  color: var(--blue);
+}
 .session-card .sc-current-badge {
   flex: 0 0 auto;
   font-size: 9px;
@@ -5483,6 +5585,9 @@ body.context-focus-active {
 }
 .session-card .sc-meta .provider-val { color: var(--blue); }
 .session-card .sc-meta .model-val { color: var(--green); }
+.session-card .sc-meta .sc-loading-meta .value {
+  color: var(--blue);
+}
 .session-card .sc-meta.sc-media {
   padding-top: 1px;
   border-top: none;
@@ -5497,26 +5602,6 @@ body.context-focus-active {
   position: absolute;
   right: 12px;
   top: 34px;
-}
-.sessions-load-more {
-  display: flex;
-  justify-content: center;
-  padding: 8px 0 2px;
-}
-.sessions-load-more button {
-  min-height: 28px;
-  border: 1px solid var(--surface1);
-  background: var(--surface0);
-  color: var(--subtext1);
-  border-radius: 4px;
-  padding: 4px 12px;
-  font-family: inherit;
-  font-size: 12px;
-  cursor: pointer;
-}
-.sessions-load-more button:hover {
-  border-color: var(--blue);
-  color: var(--blue);
 }
 .sc-delete-btn,
 .sc-rename-btn {
@@ -8522,6 +8607,8 @@ body.display-fullscreen-open {
   .sessions-project-browse, .sessions-project-create-label { flex: 0 0 auto; }
   .sessions-start-btn { width: 100%; }
   .sessions-filter, .sessions-sort { margin-left: 0; }
+  .sessions-hydration-status { grid-template-columns: auto minmax(0, 1fr); }
+  .sessions-hydration-meter { grid-column: 1 / -1; width: 100%; }
   .sessions-aggregate { grid-template-columns: 1fr 1fr; }
   .sessions-aggregate .agg-card { min-width: unset; }
   .session-card { padding: 10px; }
@@ -9726,6 +9813,7 @@ body.display-fullscreen-open {
               </div>
             </div>
             <div class="sessions-aggregate" id="sessions-aggregate"></div>
+            <div class="sessions-hydration-status hidden" id="sessions-hydration-status" aria-live="polite"></div>
             <div class="sessions-list" id="sessions-list">
               <div class="empty-state">Loading sessions...</div>
             </div>
@@ -11077,9 +11165,9 @@ const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
 // the lower dashboard sections finish registering their helpers.
 const sessionsListCache = new Map();
 const sessionsListInflight = new Map();
-const SESSION_LIST_INITIAL_LIMIT = 200;
 const SESSION_LIST_RECENT_LIMIT = 600;
-let sessionsRecentLimit = SESSION_LIST_INITIAL_LIMIT;
+const SESSION_HYDRATION_DONE_HIDE_MS = 900;
+let sessionsRecentLimit = SESSION_LIST_RECENT_LIMIT;
 
 function sessionListRequestLimit(options = {}) {
   if (options.limit === 'all' || options.limit === 'full' || options.full === true) return 'all';
@@ -44038,6 +44126,119 @@ let _sessionDeepSearch = {
   truncatedFiles: 0,
   results: new Map(),
 };
+let _sessionsHydrationHideTimer = null;
+let _sessionsHydrationState = {
+  active: false,
+  done: false,
+  error: '',
+  phase: 'idle',
+  received: 0,
+  limit: SESSION_LIST_RECENT_LIMIT,
+};
+
+function sessionListLimitLabel(limit) {
+  if (limit === 'all') return 'full history';
+  const n = Number(limit);
+  return Number.isFinite(n) && n > 0
+    ? `${Math.floor(n).toLocaleString()}-session recent window`
+    : `${SESSION_LIST_RECENT_LIMIT.toLocaleString()}-session recent window`;
+}
+
+function updateSessionsHydrationNotice() {
+  const el = document.getElementById('sessions-hydration-status');
+  if (!el) return;
+  const state = _sessionsHydrationState;
+  const visible = !!(state.active || state.done || state.error);
+  el.classList.toggle('hidden', !visible);
+  el.classList.toggle('done', !!state.done && !state.error);
+  el.classList.toggle('error', !!state.error);
+  if (!visible) {
+    el.textContent = '';
+    return;
+  }
+
+  el.textContent = '';
+  const spinner = document.createElement('span');
+  spinner.className = 'sessions-hydration-spinner';
+  el.appendChild(spinner);
+
+  const copy = document.createElement('div');
+  copy.className = 'sessions-hydration-copy';
+  const title = document.createElement('div');
+  title.className = 'sessions-hydration-title';
+  const detail = document.createElement('div');
+  detail.className = 'sessions-hydration-detail';
+  const received = Number(state.received || 0);
+  const receivedText = received > 0
+    ? `${received.toLocaleString()} session${received === 1 ? '' : 's'} visible`
+    : 'Preparing visible rows';
+  if (state.error) {
+    title.textContent = 'Session details did not finish loading';
+    detail.textContent = state.error;
+  } else if (state.done) {
+    title.textContent = 'Session details loaded';
+    detail.textContent = `${receivedText}; tokens, costs, lineage, and sizes are current.`;
+  } else if (state.phase === 'receiving') {
+    title.textContent = 'Loading recent sessions';
+    detail.textContent = `${receivedText}; details are still hydrating from the ${sessionListLimitLabel(state.limit)}.`;
+  } else {
+    title.textContent = 'Hydrating session details';
+    detail.textContent = `${receivedText}; tokens, costs, lineage, and disk sizes are still loading.`;
+  }
+  copy.appendChild(title);
+  copy.appendChild(detail);
+  el.appendChild(copy);
+
+  const meter = document.createElement('div');
+  meter.className = 'sessions-hydration-meter';
+  const fill = document.createElement('span');
+  meter.appendChild(fill);
+  el.appendChild(meter);
+}
+
+function setSessionsHydrationState(patch = {}) {
+  if (_sessionsHydrationHideTimer) {
+    clearTimeout(_sessionsHydrationHideTimer);
+    _sessionsHydrationHideTimer = null;
+  }
+  _sessionsHydrationState = {
+    ..._sessionsHydrationState,
+    ...patch,
+  };
+  updateSessionsHydrationNotice();
+}
+
+function finishSessionsHydration(received, limit) {
+  setSessionsHydrationState({
+    active: false,
+    done: true,
+    error: '',
+    phase: 'done',
+    received,
+    limit,
+  });
+  _sessionsHydrationHideTimer = setTimeout(() => {
+    if (!_sessionsHydrationState.active && _sessionsHydrationState.done) {
+      _sessionsHydrationState = {
+        ..._sessionsHydrationState,
+        done: false,
+        phase: 'idle',
+      };
+      updateSessionsHydrationNotice();
+    }
+  }, SESSION_HYDRATION_DONE_HIDE_MS);
+}
+
+function failSessionsHydration(message, received, limit) {
+  setSessionsHydrationState({
+    active: false,
+    done: false,
+    error: message || 'Unknown session loading error',
+    phase: 'error',
+    received,
+    limit,
+  });
+}
 
 function applyLoadedSessions(sessions, aggEl) {
   sessionsLoaded = true;
@@ -44068,6 +44269,15 @@ function loadSessions(options = {}) {
   }
 
   const token = ++_sessionsLoadToken;
+  let streamedRowCount = 0;
+  setSessionsHydrationState({
+    active: true,
+    done: false,
+    error: '',
+    phase: cached ? 'refreshing' : 'starting',
+    received: Array.isArray(cached) ? cached.length : 0,
+    limit: requestedLimit,
+  });
   if (_sessionsStreamAbort) _sessionsStreamAbort.abort();
   const controller = new AbortController();
   _sessionsStreamAbort = controller;
@@ -44100,6 +44310,7 @@ function loadSessions(options = {}) {
       if (requestedLimit !== 'all') {
         sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
       }
+      finishSessionsHydration(Array.isArray(sessions) ? sessions.length : 0, requestedLimit);
       applyLoadedSessions(sessions, aggEl);
       return sessions;
     });
@@ -44110,6 +44321,15 @@ function loadSessions(options = {}) {
   }, {
     sessions(rows) {
       if (token !== _sessionsLoadToken) return;
+      streamedRowCount += rows.length;
+      setSessionsHydrationState({
+        active: true,
+        done: false,
+        error: '',
+        phase: 'receiving',
+        received: streamedRowCount,
+        limit: requestedLimit,
+      });
       pendingRows.push(...rows);
       if (pendingRows.length >= 50) {
         if (flushTimer) {
@@ -44123,6 +44343,17 @@ function loadSessions(options = {}) {
         scheduleFlush();
       }
     },
+    phase(phase) {
+      if (token !== _sessionsLoadToken) return;
+      setSessionsHydrationState({
+        active: true,
+        done: false,
+        error: '',
+        phase: phase || 'hydrating',
+        received: Math.max(streamedRowCount, Array.isArray(_cachedSessions) ? _cachedSessions.length : 0),
+        limit: requestedLimit,
+      });
+    },
     replace(sessions) {
       if (token !== _sessionsLoadToken) return;
       clearPendingFlush();
@@ -44130,18 +44361,32 @@ function loadSessions(options = {}) {
       if (requestedLimit !== 'all') {
         sessionsRecentLimit = Math.max(sessionsRecentLimit, sessionListRequestLimit({ limit: requestedLimit }));
       }
+      finishSessionsHydration(Array.isArray(sessions) ? sessions.length : 0, requestedLimit);
       applyLoadedSessions(sessions, aggEl);
     },
   })
     .then(sessions => {
       if (_sessionsStreamAbort === controller) _sessionsStreamAbort = null;
+      if (token === _sessionsLoadToken && Array.isArray(sessions) && _sessionsHydrationState.active) {
+        finishSessionsHydration(sessions.length, requestedLimit);
+      }
       return sessions || _cachedSessions;
     })
     .catch(err => {
       if (_sessionsStreamAbort === controller) _sessionsStreamAbort = null;
-      if (err?.name === 'AbortError') return;
+      if (err?.name === 'AbortError') {
+        if (token === _sessionsLoadToken) {
+          setSessionsHydrationState({ active: false, done: false, error: '', phase: 'idle' });
+        }
+        return;
+      }
       clearPendingFlush();
       return loadJsonFallback().catch(() => {
+        failSessionsHydration(
+          'The compatibility session list request failed.',
+          Array.isArray(_cachedSessions) ? _cachedSessions.length : 0,
+          requestedLimit,
+        );
         if (!cached && listEl) {
           listEl.innerHTML = '<div class="empty-state">Failed to load sessions</div>';
         }
@@ -44451,8 +44696,6 @@ function renderSessionsViews() {
       sortValue: document.getElementById('sort-sessions')?.value || 'updated-desc',
       deepSearchOnly: false,
       hideSubagents: !sessionsShowSubagents(),
-      canLoadMore: sessionsRecentLimit < SESSION_LIST_RECENT_LIMIT,
-      nextLimit: SESSION_LIST_RECENT_LIMIT,
     });
   } else if (activeSessionsSubtab === 'deep') {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-deep-list'), {
@@ -45230,8 +45473,10 @@ function sessionMatchesSearch(session, query, displayStatus, source, shortId, is
 }
 
 function renderSessionsAggregate(sessions, el) {
+  if (!el) return;
   const totalSessions = sessions.length;
   const externalSessions = sessions.filter(s => (s.source || 'intendant') !== 'intendant').length;
+  const detailsLoading = sessions.some(s => s && s.partial === true);
   const totalTokens = sessions.reduce((sum, s) => sum + (s.total_tokens || 0), 0);
   const totalInput = sessions.reduce((sum, s) => sum + (s.prompt_tokens || 0), 0);
   const totalOutput = sessions.reduce((sum, s) => sum + (s.completion_tokens || 0), 0);
@@ -45241,19 +45486,20 @@ function renderSessionsAggregate(sessions, el) {
   el.innerHTML = '';
 
   const totalDiskBytes = sessions.reduce((sum, s) => sum + (s.total_bytes || 0), 0);
+  const loadingValue = 'Loading';
 
   const cards = [
-    { label: 'Sessions', value: totalSessions.toLocaleString() + (externalSessions > 0 ? ` (${externalSessions} external)` : '') + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
-    { label: 'Total Tokens', value: totalTokens.toLocaleString() },
-    { label: 'Input', value: totalInput.toLocaleString() },
-    { label: 'Cached', value: totalCached.toLocaleString() },
-    { label: 'Output', value: totalOutput.toLocaleString() },
-    { label: 'Disk', value: _fmtBytes(totalDiskBytes) },
+    { label: 'Sessions', value: totalSessions.toLocaleString() + (detailsLoading ? ' visible' : '') + (externalSessions > 0 ? ` (${externalSessions} external)` : '') + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
+    { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
+    { label: 'Input', value: detailsLoading ? loadingValue : totalInput.toLocaleString(), loading: detailsLoading },
+    { label: 'Cached', value: detailsLoading ? loadingValue : totalCached.toLocaleString(), loading: detailsLoading },
+    { label: 'Output', value: detailsLoading ? loadingValue : totalOutput.toLocaleString(), loading: detailsLoading },
+    { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading },
   ];
 
   for (const c of cards) {
     const card = document.createElement('div');
-    card.className = 'agg-card';
+    card.className = 'agg-card' + (c.loading ? ' loading' : '');
     const labelEl = document.createElement('div');
     labelEl.className = 'agg-label';
     labelEl.textContent = c.label;
@@ -45385,10 +45631,12 @@ function renderSessionsList(sessions, el, options = {}) {
     if (renderedCount >= SESSION_CARD_RENDER_LIMIT) continue;
     renderedCount += 1;
 
+    const rowIsPartial = s.partial === true;
     const card = document.createElement('div');
     card.className = 'session-card';
     if (isCurrent) card.classList.add('current');
     if (displayStatus === 'abandoned') card.classList.add('dimmed');
+    if (rowIsPartial) card.classList.add('partial');
 
     const sessionName = compactSessionText(s.name);
     const taskText = compactSessionText(s.task);
@@ -45443,6 +45691,14 @@ function renderSessionsList(sessions, el, options = {}) {
       sourceEl.title = `${prettyAgentName(backendSource) || backendSource} backend`;
     }
     top.appendChild(sourceEl);
+
+    if (rowIsPartial) {
+      const loadingEl = document.createElement('span');
+      loadingEl.className = 'sc-role sc-loading-chip';
+      loadingEl.textContent = 'loading details';
+      loadingEl.title = 'Tokens, costs, lineage, and disk sizes are still hydrating';
+      top.appendChild(loadingEl);
+    }
 
     if (s.role) {
       const roleEl = document.createElement('span');
@@ -45566,6 +45822,20 @@ function renderSessionsList(sessions, el, options = {}) {
       meta.appendChild(ts);
     }
 
+    if (rowIsPartial) {
+      const loading = document.createElement('span');
+      loading.className = 'sc-loading-meta';
+      const loadingLabel = document.createElement('span');
+      loadingLabel.className = 'label';
+      loadingLabel.textContent = 'details';
+      const loadingVal = document.createElement('span');
+      loadingVal.className = 'value';
+      loadingVal.textContent = 'tokens, cost, lineage, size';
+      loading.appendChild(loadingLabel);
+      loading.appendChild(loadingVal);
+      meta.appendChild(loading);
+    }
+
     if (s.provider) {
       const prov = document.createElement('span');
       const provLabel = document.createElement('span');
@@ -45605,7 +45875,7 @@ function renderSessionsList(sessions, el, options = {}) {
       meta.appendChild(turns);
     }
 
-    if (s.total_tokens > 0) {
+    if (!rowIsPartial && s.total_tokens > 0) {
       const addTokField = (label, value, color) => {
         const span = document.createElement('span');
         const l = document.createElement('span');
@@ -45624,7 +45894,7 @@ function renderSessionsList(sessions, el, options = {}) {
       addTokField('out', s.completion_tokens || 0);
     }
 
-    if (s.estimated_cost > 0) {
+    if (!rowIsPartial && s.estimated_cost > 0) {
       const cost = document.createElement('span');
       const costLabel = document.createElement('span');
       costLabel.className = 'label';
@@ -45640,7 +45910,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
     // Media stats row (recordings, annotations, clips) + total session size
     const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
-    if (hasMedia || s.total_bytes > 0) {
+    if (!rowIsPartial && (hasMedia || s.total_bytes > 0)) {
       const mediaMeta = document.createElement('div');
       mediaMeta.className = 'sc-meta sc-media';
       const addMediaField = (label, value, color) => {
@@ -45795,19 +46065,6 @@ function renderSessionsList(sessions, el, options = {}) {
     }
   }
 
-  if (!deepSearchOnly && options.canLoadMore && sessions.length >= SESSION_LIST_INITIAL_LIMIT) {
-    const row = document.createElement('div');
-    row.className = 'sessions-load-more';
-    const btn = document.createElement('button');
-    btn.type = 'button';
-    btn.textContent = `Load ${Number(options.nextLimit || SESSION_LIST_RECENT_LIMIT).toLocaleString()} recent sessions`;
-    btn.addEventListener('click', () => {
-      sessionsRecentLimit = Number(options.nextLimit || SESSION_LIST_RECENT_LIMIT);
-      loadSessions({ force: true, limit: sessionsRecentLimit });
-    });
-    row.appendChild(btn);
-    el.appendChild(row);
-  }
 }
 
 function _refilterWorktrees() {
