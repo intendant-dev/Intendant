@@ -11095,7 +11095,14 @@ let activeStatsHost = '';
 // (the daemon serving app.html) isn't in this list — it's implicit
 // and always rendered first in the UI.
 const DAEMONS_KEY = 'intendant_daemons';
+const DASHBOARD_TRANSPORT_KEY = 'intendant_dashboard_transport';
 let daemons = [];
+let dashboardControlTransport = null;
+let dashboardTransport = null;
+let dashboardServerMessageDispatcher = null;
+let dashboardControlEventsActive = false;
+const DASHBOARD_EVENT_DEDUPE_MS = 2000;
+const dashboardRecentServerMessageKeys = new Map();
 
 // Tracks which peer rows have their per-peer controls panel expanded.
 // Lives outside renderDaemonsList because the list re-renders on every
@@ -12288,10 +12295,8 @@ async function stationLoadLocalDisplays(force = false) {
   stationSetPeerStatus('Listing local displays...', '');
   stationScheduleUpdate();
   try {
-    const resp = await authedFetch('/api/displays');
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
-    stationLocalDisplays = Array.isArray(data.displays) ? data.displays : [];
+    const data = await fetchLocalDisplaysPayload();
+    stationLocalDisplays = normalizeDisplaysPayload(data);
     cachedDisplays = stationLocalDisplays;
     stationSetPeerStatus(stationLocalDisplays.length
       ? `Found ${stationLocalDisplays.length} local display${stationLocalDisplays.length === 1 ? '' : 's'}`
@@ -15559,8 +15564,7 @@ async function stationOpenTranscript(sessionId, opts = {}) {
   if (!opts.refresh) stationStatus(`Loading transcript ${shortSessionId(sid)}`);
   let payload;
   try {
-    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(source)}&limit=300`);
-    const data = await resp.json();
+    const data = await fetchSessionDetailPayload(sid, { source, limit: 300 });
     if (data.error) {
       payload = { sessionId: sid, source, label, mode: 'log', refresh: !!opts.refresh, error: String(data.error), total: 0, rows: [] };
     } else {
@@ -17936,12 +17940,15 @@ async function main() {
   await init({ module_or_path: '/wasm-web/presence_web_bg.wasm' });
   app = new PresenceWeb();
 
-  // Intercept all server messages for AppState routing
-  app.set_on_raw_message((msg) => {
+  // Intercept all server messages for AppState routing.
+  // The WebRTC dashboard-control dev path reuses this same dispatcher for
+  // DataChannel event frames so both transports exercise identical UI code.
+  dashboardServerMessageDispatcher = (msg) => {
     // Handle annotation responses before WASM.
     // msg is a JS object (from WASM serde), not a raw string.
     try {
       const d = typeof msg === 'string' ? JSON.parse(msg) : msg;
+      if (dashboardShouldDropDuplicateServerMessage(d)) return;
       if (d.event === 'context_snapshot') {
         const contextSid = sessionWindowTargetForLogSession(d.session_id);
         if (contextSid) markSessionWindowPendingActive(contextSid);
@@ -18073,6 +18080,22 @@ async function main() {
         if (s) s.handleIceCandidate(d.candidate);
         return;
       }
+      if (d.t === 'dashboard_control_answer') {
+        if (dashboardControlTransport) {
+          dashboardControlTransport
+            .handleAnswer(d)
+            .catch(err => dashboardControlTransport.handleError(err?.message || String(err)));
+        }
+        return;
+      }
+      if (d.t === 'dashboard_control_ice') {
+        if (dashboardControlTransport) dashboardControlTransport.handleIceCandidate(d.candidate);
+        return;
+      }
+      if (d.t === 'dashboard_control_error') {
+        if (dashboardControlTransport) dashboardControlTransport.handleError(d.error || 'unknown');
+        return;
+      }
       // Standalone shell fallback for older WASM bundles. Current bundles
       // dispatch these through set_on_terminal_output/exited below so they
       // don't take the generic raw-message bridge.
@@ -18163,6 +18186,9 @@ async function main() {
     } catch(_) {}
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
+  };
+  app.set_on_raw_message((msg) => {
+    if (dashboardServerMessageDispatcher) dashboardServerMessageDispatcher(msg);
   });
 
   // Apply deep links as soon as the WASM app exists. Peer/settings/session
@@ -18474,6 +18500,8 @@ async function main() {
       selfGitSha = card.git_sha || '';
     }
   } catch {}
+
+  maybeStartDashboardControlTransport();
 
   // Initialize multi-host state now that self-label is resolved and the
   // WASM app is ready. Hydrates the peer list from the server-side
@@ -19581,9 +19609,7 @@ const NEW_SESSION_LAUNCH_FAILURE_GRACE_MS = 15000;
 
 async function refreshControlPane() {
   try {
-    const resp = await fetch('/api/settings');
-    if (!resp.ok) throw new Error(resp.statusText);
-    const d = await resp.json();
+    const d = await fetchDashboardSettings();
     controlCurrentBackend = normalizeAgentId(d.external_agent);
     controlCodexConfig = {
       command: d.codex_command || 'codex',
@@ -24389,20 +24415,18 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     let lastError = null;
     const sources = record.source === 'intendant' ? [record.source] : [record.source, 'intendant'];
     for (const source of sources) {
-      const url = `/api/session/${encodeURIComponent(record.sessionId)}?source=${encodeURIComponent(source)}&limit=${SESSION_WINDOW_RESTORE_LOG_LIMIT}`;
-      const resp = await fetch(url, { signal: controller.signal, cache: 'no-store' });
-      let candidate = {};
-      try {
-        candidate = await resp.json();
-      } catch {
-        candidate = {};
-      }
-      if (resp.ok && !candidate.error) {
+      const candidate = await fetchSessionDetailPayload(record.sessionId, {
+        source,
+        limit: SESSION_WINDOW_RESTORE_LOG_LIMIT,
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+      if (!candidate.error) {
         data = candidate;
         break;
       }
-      lastError = new Error(candidate.error || resp.statusText || 'session detail fetch failed');
-      if (resp.status !== 404) break;
+      lastError = new Error(candidate.error || 'session detail fetch failed');
+      if (!sessionDetailErrorIsMissing(candidate)) break;
     }
     if (!data) throw lastError || new Error('session detail fetch failed');
     const entries = Array.isArray(data.entries) ? data.entries : [];
@@ -24444,20 +24468,18 @@ async function hydrateRestoredSessionWindow(win, record) {
     let data = null;
     const sources = source === 'intendant' ? [source] : [source, 'intendant'];
     for (const candidateSource of sources) {
-      const url = `/api/session/${encodeURIComponent(sid)}?source=${encodeURIComponent(candidateSource)}&limit=${SESSION_WINDOW_RESTORE_LOG_LIMIT}`;
-      const resp = await fetch(url, { signal: controller.signal, cache: 'no-store' });
-      let candidate = {};
-      try {
-        candidate = await resp.json();
-      } catch {
-        candidate = {};
-      }
-      if (resp.ok && !candidate.error) {
+      const candidate = await fetchSessionDetailPayload(sid, {
+        source: candidateSource,
+        limit: SESSION_WINDOW_RESTORE_LOG_LIMIT,
+        signal: controller.signal,
+        cache: 'no-store',
+      });
+      if (!candidate.error) {
         data = candidate;
         break;
       }
-      lastError = new Error(candidate.error || resp.statusText || 'session detail fetch failed');
-      if (resp.status !== 404) break;
+      lastError = new Error(candidate.error || 'session detail fetch failed');
+      if (!sessionDetailErrorIsMissing(candidate)) break;
     }
     if (!data) throw lastError || new Error('session detail fetch failed');
     const entries = Array.isArray(data.entries) ? data.entries : [];
@@ -24561,9 +24583,21 @@ function refreshSessionWindowMetadata(delay = 0, options = {}) {
   const run = () => {
     if (!options.force && !shouldPollSessionWindowMetadata()) return null;
     if (sessionMetadataRefreshInFlight) return sessionMetadataRefreshInFlight;
+    const ids = sessionWindowMetadataRequestIds();
     const url = sessionWindowMetadataUrl();
-    sessionMetadataRefreshInFlight = authedFetch(url)
-      .then(r => r.ok ? r.json() : Promise.reject(new Error(`${url} returned ${r.status}`)))
+    const loadMetadata = async () => {
+      if (dashboardTransport?.canUseRpc()) {
+        try {
+          return await dashboardTransport.request('api_sessions', ids.length ? { ids } : { limit: 'all' });
+        } catch (err) {
+          console.warn('[dashboard-control] api_sessions metadata RPC failed, falling back to HTTP', err);
+        }
+      }
+      const r = await authedFetch(url);
+      if (!r.ok) throw new Error(`${url} returned ${r.status}`);
+      return r.json();
+    };
+    sessionMetadataRefreshInFlight = loadMetadata()
       .then(sessions => cacheSessionWindowMetadata(sessions))
       .catch(() => {})
       .finally(() => {
@@ -36315,6 +36349,659 @@ function hasTurnInIceServers(iceServers) {
   return false;
 }
 
+function dashboardShouldDropDuplicateServerMessage(message) {
+  if (!dashboardControlEventsActive) return false;
+  if (!message || typeof message !== 'object') return false;
+  if (String(message.t || '').startsWith('dashboard_control_')) return false;
+  const key = dashboardServerMessageDedupeKey(message);
+  if (!key) return false;
+  const now = Date.now();
+  for (const [recentKey, seenAt] of dashboardRecentServerMessageKeys) {
+    if (now - seenAt > DASHBOARD_EVENT_DEDUPE_MS) {
+      dashboardRecentServerMessageKeys.delete(recentKey);
+    }
+  }
+  if (dashboardRecentServerMessageKeys.has(key)) return true;
+  dashboardRecentServerMessageKeys.set(key, now);
+  return false;
+}
+
+function dashboardServerMessageDedupeKey(message) {
+  try {
+    return JSON.stringify(message);
+  } catch {
+    return '';
+  }
+}
+
+function dashboardControlTransportEnabled() {
+  try {
+    return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
+  } catch {
+    return false;
+  }
+}
+
+class DashboardTransport {
+  enabled() {
+    return dashboardControlTransportEnabled();
+  }
+
+  startControl() {
+    if (!this.enabled()) return;
+    if (!app || !app.send_server_action || !window.RTCPeerConnection) return;
+    if (dashboardControlTransport) return;
+    dashboardControlTransport = new DashboardControlTransport();
+    dashboardControlTransport.connect().catch(err => {
+      console.warn('[dashboard-control] connect failed', err);
+      dashboardControlTransport = null;
+    });
+  }
+
+  enableControl() {
+    localStorage.setItem(DASHBOARD_TRANSPORT_KEY, 'webrtc-control');
+    location.reload();
+  }
+
+  disableControl() {
+    localStorage.removeItem(DASHBOARD_TRANSPORT_KEY);
+    dashboardControlTransport?.close();
+    dashboardControlTransport = null;
+    location.reload();
+  }
+
+  status() {
+    return dashboardControlTransport?.debugStatus() || {
+      enabled: this.enabled(),
+      connected: false,
+    };
+  }
+
+  canUseRpc() {
+    return Boolean(dashboardControlTransport?.canUseRpc());
+  }
+
+  request(method, params = {}, options = {}) {
+    if (!this.canUseRpc()) {
+      return Promise.reject(new Error('dashboard control RPC is not connected'));
+    }
+    return dashboardControlTransport.request(method, params, options);
+  }
+
+  async rpcOrHttp(method, params, fallback, label = method, options = {}) {
+    if (this.canUseRpc()) {
+      try {
+        return await dashboardControlTransport.request(
+          method,
+          params || {},
+          { signal: options.signal }
+        );
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err;
+        console.warn(`[dashboard-control] ${label} RPC failed, falling back to HTTP`, err);
+      }
+    }
+    return fallback();
+  }
+
+  async jsonFetch(method, params, fallback, label = method, options = {}) {
+    if (this.canUseRpc()) {
+      try {
+        const payload = await dashboardControlTransport.request(
+          method,
+          params || {},
+          { signal: options.signal }
+        );
+        return this.responseFromPayload(payload);
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err;
+        if (options.fallbackAfterRpcFailure === false) throw err;
+        console.warn(`[dashboard-control] ${label} RPC failed, falling back to HTTP`, err);
+      }
+    }
+    return fallback();
+  }
+
+  responseFromPayload(payload) {
+    const rawStatus = Number(payload?._httpStatus);
+    const status = Number.isFinite(rawStatus) && rawStatus >= 100 && rawStatus <= 599
+      ? rawStatus
+      : 200;
+    const ok = typeof payload?._httpOk === 'boolean'
+      ? payload._httpOk
+      : status >= 200 && status < 300;
+    let body = payload;
+    if (body && typeof body === 'object' && !Array.isArray(body)) {
+      body = { ...body };
+      delete body._httpStatus;
+      delete body._httpOk;
+    }
+    return {
+      ok,
+      status,
+      statusText: ok ? 'OK' : 'Error',
+      headers: typeof Headers === 'function'
+        ? new Headers({ 'content-type': 'application/json' })
+        : null,
+      dashboardControl: true,
+      json: async () => body,
+      text: async () => {
+        try { return JSON.stringify(body); } catch { return ''; }
+      },
+    };
+  }
+}
+
+dashboardTransport = new DashboardTransport();
+
+function maybeStartDashboardControlTransport() {
+  dashboardTransport.startControl();
+}
+
+window.intendantDashboardControl = {
+  enable() {
+    dashboardTransport.enableControl();
+  },
+  disable() {
+    dashboardTransport.disableControl();
+  },
+  status() {
+    return dashboardTransport.status();
+  },
+  request(method, params = {}, options = {}) {
+    return dashboardTransport.request(method, params, options);
+  },
+  peers() {
+    return dashboardTransport.request('api_peers');
+  },
+  sessions(params = {}) {
+    return dashboardTransport.request('api_sessions', params);
+  },
+  sessionDetail(sessionId, params = {}) {
+    return dashboardTransport.request('api_session_detail', { session_id: sessionId, ...params });
+  },
+  sessionSearch(params = {}, options = {}) {
+    return dashboardTransport.request('api_sessions_search', params, options);
+  },
+  settings() {
+    return dashboardTransport.request('api_settings');
+  },
+  apiKeyStatus() {
+    return dashboardTransport.request('api_key_status');
+  },
+  projectRoot() {
+    return dashboardTransport.request('api_project_root');
+  },
+  displays() {
+    return dashboardTransport.request('api_displays');
+  },
+};
+
+class DashboardControlTransport {
+  constructor() {
+    this.pc = null;
+    this.channel = null;
+    this.sessionId = '';
+    this.binding = null;
+    this.verifiedBinding = null;
+    this.localOfferSdp = '';
+    this.lastStatus = null;
+    this.pendingIce = [];
+    this.pending = new Map();
+    this.seq = 0;
+  }
+
+  async connect() {
+    const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
+    this.pc = new RTCPeerConnection({ iceServers });
+    this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
+    this.channel.onopen = () => this.handleOpen();
+    this.channel.onmessage = ev => this.handleMessage(ev.data);
+    this.channel.onclose = () => console.info('[dashboard-control] channel closed');
+    this.pc.onicecandidate = ev => {
+      if (!ev.candidate) return;
+      const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
+      if (!this.sessionId) {
+        this.pendingIce.push(candidate);
+        return;
+      }
+      this.sendSignal({ t: 'dashboard_control_ice', session_id: this.sessionId, candidate });
+    };
+    this.pc.onconnectionstatechange = () => {
+      console.info('[dashboard-control] pc state', this.pc.connectionState);
+    };
+    const offer = await this.pc.createOffer();
+    await this.pc.setLocalDescription(offer);
+    this.localOfferSdp = offer.sdp || '';
+    this.sendSignal({ t: 'dashboard_control_offer', sdp: offer.sdp });
+  }
+
+  async handleAnswer(answer) {
+    this.sessionId = String(answer.session_id || '');
+    this.binding = answer.binding || null;
+    const verification = await verifyDashboardControlBinding(
+      this.binding,
+      this.sessionId,
+      this.localOfferSdp,
+      answer.sdp || ''
+    );
+    if (!verification.ok) {
+      this.close();
+      throw new Error(`dashboard control binding rejected: ${verification.error || 'unknown'}`);
+    }
+    this.verifiedBinding = verification;
+    await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
+    for (const candidate of this.pendingIce.splice(0)) {
+      this.sendSignal({ t: 'dashboard_control_ice', session_id: this.sessionId, candidate });
+    }
+  }
+
+  async handleIceCandidate(candidate) {
+    if (!this.pc || !candidate) return;
+    try {
+      await this.pc.addIceCandidate(candidate);
+    } catch (err) {
+      console.warn('[dashboard-control] addIceCandidate failed', err);
+    }
+  }
+
+  handleError(error) {
+    console.warn('[dashboard-control] signaling error', error);
+    this.close();
+  }
+
+  handleOpen() {
+    this.sendFrame({ t: 'hello', id: this.nextId() });
+    this.ping().catch(() => {});
+    this.request('status').then(status => {
+      if (status && typeof status === 'object') {
+        this.lastStatus = status;
+        console.info('[dashboard-control] status RPC ok', status.session_id || '');
+      }
+    }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
+    this.request('config').then(config => {
+      if (config && typeof config === 'object') {
+        console.info('[dashboard-control] config RPC ok', config.provider || '(provider unset)');
+      }
+    }).catch(err => console.warn('[dashboard-control] config RPC failed', err));
+    this.request('subscribe_events').then(result => {
+      if (result?.subscribed) {
+        dashboardControlEventsActive = true;
+        dashboardRecentServerMessageKeys.clear();
+        console.info('[dashboard-control] event stream subscribed');
+      }
+    }).catch(err => console.warn('[dashboard-control] event subscribe failed', err));
+  }
+
+  handleMessage(data) {
+    let msg;
+    try {
+      msg = JSON.parse(String(data));
+    } catch {
+      return;
+    }
+    if (msg.t === 'hello_ack') {
+      console.info('[dashboard-control] hello_ack', msg.session_id || '');
+      return;
+    }
+    if (msg.t === 'event') {
+      const payload = msg.payload || {};
+      if (dashboardServerMessageDispatcher) {
+        dashboardServerMessageDispatcher(payload);
+      } else {
+        console.debug('[dashboard-control] event', payload.event || payload.t || '', payload);
+      }
+      return;
+    }
+    if (msg.t === 'event_gap') {
+      console.warn('[dashboard-control] event gap', msg.skipped || 0);
+      return;
+    }
+    if (msg.t === 'pong' || msg.t === 'response') {
+      const pending = this.pending.get(msg.id);
+      if (!pending) return;
+      this.pending.delete(msg.id);
+      if (msg.cancelled) {
+        pending.reject(dashboardControlAbortError(msg.error || 'dashboard control request cancelled'));
+        return;
+      }
+      if (msg.t === 'response' && msg.ok === false) {
+        pending.reject(new Error(msg.error || 'dashboard control request failed'));
+      } else {
+        pending.resolve(msg.t === 'pong' ? msg : msg.result);
+      }
+    }
+  }
+
+  ping() {
+    const id = this.nextId();
+    const promise = this.waitFor(id);
+    this.sendFrame({ t: 'ping', id });
+    return promise;
+  }
+
+  request(method, params = {}, options = {}) {
+    if (options.signal?.aborted) {
+      return Promise.reject(dashboardControlAbortError());
+    }
+    const id = this.nextId();
+    const promise = this.waitFor(id, dashboardControlRequestTimeoutMs(method), options);
+    this.sendFrame({ t: 'request', id, method, params });
+    return promise;
+  }
+
+  canUseRpc() {
+    return Boolean(
+      this.verifiedBinding &&
+      this.pc?.connectionState === 'connected' &&
+      this.channel?.readyState === 'open'
+    );
+  }
+
+  waitFor(id, timeoutMs = 5000, options = {}) {
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      const signal = options.signal || null;
+      const fail = (err, sendCancel = false) => {
+        if (settled) return;
+        settled = true;
+        clearTimeout(timer);
+        if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+        this.pending.delete(id);
+        if (sendCancel) this.sendFrame({ t: 'cancel', id });
+        reject(err);
+      };
+      const abortHandler = signal ? () => fail(dashboardControlAbortError(), true) : null;
+      const timer = setTimeout(() => {
+        fail(new Error('dashboard control request timed out'), true);
+      }, timeoutMs);
+      if (signal && abortHandler) {
+        signal.addEventListener('abort', abortHandler, { once: true });
+      }
+      this.pending.set(id, {
+        resolve: value => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+          resolve(value);
+        },
+        reject: err => {
+          if (settled) return;
+          settled = true;
+          clearTimeout(timer);
+          if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+          reject(err);
+        },
+      });
+    });
+  }
+
+  sendFrame(frame) {
+    if (!this.channel || this.channel.readyState !== 'open') return;
+    this.channel.send(JSON.stringify(frame));
+  }
+
+  sendSignal(frame) {
+    if (app && app.send_server_action) app.send_server_action(frame);
+  }
+
+  close() {
+    for (const pending of this.pending.values()) {
+      pending.reject(new Error('dashboard control transport closed'));
+    }
+    this.pending.clear();
+    if (this.sessionId) {
+      this.sendSignal({ t: 'dashboard_control_close', session_id: this.sessionId });
+    }
+    dashboardControlEventsActive = false;
+    dashboardRecentServerMessageKeys.clear();
+    try { this.channel?.close(); } catch {}
+    try { this.pc?.close(); } catch {}
+  }
+
+  debugStatus() {
+    return {
+      enabled: dashboardControlTransportEnabled(),
+      connected: this.pc?.connectionState === 'connected',
+      pcState: this.pc?.connectionState || '',
+      channelState: this.channel?.readyState || '',
+      sessionId: this.sessionId,
+      verifiedBinding: this.verifiedBinding,
+      eventsActive: dashboardControlEventsActive,
+      apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
+      apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
+      apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
+      apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
+      apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
+      apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
+      apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
+      apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
+      pendingRequests: this.pending.size,
+    };
+  }
+
+  nextId() {
+    this.seq += 1;
+    return `dc-${Date.now()}-${this.seq}`;
+  }
+}
+
+function dashboardControlAbortError(message = 'dashboard control request aborted') {
+  try {
+    return new DOMException(message, 'AbortError');
+  } catch {
+    const err = new Error(message);
+    err.name = 'AbortError';
+    return err;
+  }
+}
+
+function dashboardControlRequestTimeoutMs(method) {
+  switch (method) {
+    case 'api_sessions_search':
+      return 120000;
+    case 'api_session_detail':
+      return 15000;
+    default:
+      return 5000;
+  }
+}
+
+async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answerSdp) {
+  if (!binding || typeof binding !== 'object') {
+    return { ok: false, error: 'missing binding' };
+  }
+  if (binding.protocol !== 'intendant-dashboard-control-v1') {
+    return { ok: false, error: 'unexpected protocol' };
+  }
+  if (String(binding.session_id || '') !== String(sessionId || '')) {
+    return { ok: false, error: 'session mismatch' };
+  }
+  if (!window.crypto?.subtle) {
+    return { ok: false, error: 'WebCrypto unavailable' };
+  }
+  const offerHash = await dashboardSha256B64u(offerSdp || '');
+  if (binding.offer_sha256 !== offerHash) {
+    return { ok: false, error: 'offer hash mismatch' };
+  }
+  const answerHash = await dashboardSha256B64u(answerSdp || '');
+  if (binding.answer_sha256 !== answerHash) {
+    return { ok: false, error: 'answer hash mismatch' };
+  }
+
+  let verified = false;
+  try {
+    verified = await dashboardVerifyEd25519(
+      dashboardBase64UrlToBytes(binding.daemon_public_key || ''),
+      dashboardBase64UrlToBytes(binding.signature || ''),
+      new TextEncoder().encode(dashboardControlBindingPayload(binding))
+    );
+  } catch (err) {
+    return { ok: false, error: err?.message || 'signature verification unavailable' };
+  }
+  if (!verified) {
+    return { ok: false, error: 'signature invalid' };
+  }
+  return {
+    ok: true,
+    daemonPublicKey: binding.daemon_public_key,
+    createdUnixMs: Number(binding.created_unix_ms || 0),
+  };
+}
+
+function sessionDetailErrorIsMissing(data) {
+  return String(data?.error || '').trim().toLowerCase() === 'session not found';
+}
+
+async function fetchSessionDetailPayload(sessionId, options = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) throw new Error('missing session id');
+  const source = String(options.source || 'intendant').trim() || 'intendant';
+  const params = { session_id: sid, source };
+  if (options.limit !== undefined && options.limit !== null) {
+    params.limit = options.limit;
+  }
+  return dashboardTransport.rpcOrHttp('api_session_detail', params, async () => {
+    const query = new URLSearchParams();
+    query.set('source', source);
+    if (options.limit !== undefined && options.limit !== null) {
+      query.set('limit', String(options.limit));
+    }
+    const fetchOptions = {};
+    if (options.signal) fetchOptions.signal = options.signal;
+    if (options.cache) fetchOptions.cache = options.cache;
+    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}?${query.toString()}`, fetchOptions);
+    let data = {};
+    try {
+      data = await resp.json();
+    } catch {
+      data = {};
+    }
+    if (!resp.ok && !data.error) {
+      data.error = resp.statusText || `HTTP ${resp.status}`;
+    }
+    data._httpStatus = resp.status;
+    return data;
+  }, 'api_session_detail', { signal: options.signal });
+}
+
+async function fetchSessionsSearchPayload(options = {}) {
+  if (options.signal?.aborted) {
+    throw new DOMException('Aborted', 'AbortError');
+  }
+  const query = String(options.query || options.q || '').trim();
+  const source = String(options.source || 'all').trim() || 'all';
+  const mode = String(options.mode || '').trim();
+  const projects = Array.isArray(options.projects)
+    ? options.projects.map(value => String(value || '').trim()).filter(Boolean)
+    : [];
+  return dashboardTransport.rpcOrHttp('api_sessions_search', {
+    q: query,
+    source,
+    mode,
+    projects,
+  }, async () => {
+    const params = new URLSearchParams({ q: query, source, mode });
+    if (projects.length > 0) {
+      params.set('projects', JSON.stringify(projects));
+    }
+    const resp = await authedFetch(`/api/sessions/search?${params.toString()}`, {
+      signal: options.signal,
+    });
+    if (!resp.ok) throw new Error(`/api/sessions/search returned ${resp.status}`);
+    return resp.json();
+  }, 'api_sessions_search', { signal: options.signal });
+}
+
+async function fetchDashboardSettings() {
+  return dashboardTransport.rpcOrHttp('api_settings', {}, async () => {
+    const resp = await fetch('/api/settings');
+    if (!resp.ok) throw new Error(`/api/settings returned ${resp.status}`);
+    return resp.json();
+  }, 'api_settings');
+}
+
+async function fetchApiKeyStatus() {
+  return dashboardTransport.rpcOrHttp('api_key_status', {}, async () => {
+    const resp = await fetch('/api/api-key-status');
+    if (!resp.ok) throw new Error(`/api/api-key-status returned ${resp.status}`);
+    return resp.json();
+  }, 'api_key_status');
+}
+
+async function fetchProjectRoot() {
+  return dashboardTransport.rpcOrHttp('api_project_root', {}, async () => {
+    const resp = await fetch('/api/project-root');
+    if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
+    return resp.json();
+  }, 'api_project_root');
+}
+
+function normalizeDisplaysPayload(payload) {
+  if (Array.isArray(payload)) return payload;
+  if (Array.isArray(payload?.displays)) return payload.displays;
+  return [];
+}
+
+async function fetchLocalDisplaysPayload() {
+  return dashboardTransport.rpcOrHttp('api_displays', {}, async () => {
+    const resp = await authedFetch('/api/displays');
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data.error || `HTTP ${resp.status}`);
+    return data;
+  }, 'api_displays');
+}
+
+function dashboardControlBindingPayload(binding) {
+  return [
+    binding.protocol || '',
+    binding.session_id || '',
+    binding.daemon_public_key || '',
+    String(binding.created_unix_ms || ''),
+    binding.offer_sha256 || '',
+    binding.answer_sha256 || '',
+  ].join('\n');
+}
+
+async function dashboardSha256B64u(text) {
+  const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
+  return dashboardBytesToBase64Url(new Uint8Array(digest));
+}
+
+async function dashboardVerifyEd25519(publicKeyBytes, signatureBytes, payloadBytes) {
+  let key;
+  try {
+    key = await crypto.subtle.importKey('raw', publicKeyBytes, { name: 'Ed25519' }, false, ['verify']);
+  } catch (firstErr) {
+    try {
+      key = await crypto.subtle.importKey('raw', publicKeyBytes, 'Ed25519', false, ['verify']);
+    } catch {
+      throw firstErr;
+    }
+  }
+  try {
+    return await crypto.subtle.verify({ name: 'Ed25519' }, key, signatureBytes, payloadBytes);
+  } catch {
+    return await crypto.subtle.verify('Ed25519', key, signatureBytes, payloadBytes);
+  }
+}
+
+function dashboardBase64UrlToBytes(value) {
+  const normalized = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = normalized + '='.repeat((4 - normalized.length % 4) % 4);
+  const binary = atob(padded);
+  const bytes = new Uint8Array(binary.length);
+  for (let i = 0; i < binary.length; i += 1) bytes[i] = binary.charCodeAt(i);
+  return bytes;
+}
+
+function dashboardBytesToBase64Url(bytes) {
+  let binary = '';
+  for (const byte of bytes) binary += String.fromCharCode(byte);
+  return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
 // True when `url`'s hostname is loopback (127.0.0.1 / ::1 / localhost).
 // Used to filter out loopback URLs before handing them to WebRTC as
 // advertise_tcp_via_url: browsers silently drop remote loopback ICE
@@ -36599,9 +37286,19 @@ function removeDaemonById(id) {
 
 async function refreshPeersFromApi() {
   try {
-    const resp = await authedFetch('/api/peers');
-    if (!resp.ok) return;
-    const data = await resp.json();
+    let data = null;
+    if (dashboardTransport?.canUseRpc()) {
+      try {
+        data = await dashboardTransport.request('api_peers');
+      } catch (err) {
+        console.warn('[dashboard-control] api_peers RPC failed, falling back to HTTP', err);
+      }
+    }
+    if (!data) {
+      const resp = await authedFetch('/api/peers');
+      if (!resp.ok) return;
+      data = await resp.json();
+    }
     if (!data.peers || !Array.isArray(data.peers)) return;
 
     // Build the new daemon entries from the API response via the
@@ -37056,11 +37753,15 @@ async function resolvePeerApproval(hostId, approvalId, decision) {
     : null;
   if (row) row.querySelectorAll('button').forEach(b => b.disabled = true);
   try {
-    const resp = await authedFetch(`/api/peers/${hostId}/approval`, {
+    const resp = await dashboardTransport.jsonFetch('api_peer_approval', {
+      peer_id: hostId,
+      request_id: approvalId,
+      decision,
+    }, () => authedFetch(`/api/peers/${hostId}/approval`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ request_id: approvalId, decision }),
-    });
+    }), 'api_peer_approval', { fallbackAfterRpcFailure: false });
     if (resp.ok) {
       // Optimistic removal. The peer will eventually emit
       // `approval_resolved` over the secondary stream which would
@@ -37119,12 +37820,16 @@ async function submitPeerInput(hostId, kind) {
   const body = kind === 'task'
     ? JSON.stringify({ instructions: text })
     : JSON.stringify({ text });
+  const rpcMethod = kind === 'task' ? 'api_peer_task' : 'api_peer_message';
+  const rpcParams = kind === 'task'
+    ? { peer_id: hostId, instructions: text }
+    : { peer_id: hostId, text };
   try {
-    const resp = await authedFetch(url, {
+    const resp = await dashboardTransport.jsonFetch(rpcMethod, rpcParams, () => authedFetch(url, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body,
-    });
+    }), rpcMethod, { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       if (statusEl) {
@@ -40079,11 +40784,11 @@ async function createDaemonInvite() {
   btn.disabled = true;
   setDaemonPairingStatus('daemon-invite-status', 'Creating...', '');
   try {
-    const resp = await authedFetch('/api/peers/pairing/invite', {
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_invite', body, () => authedFetch('/api/peers/pairing/invite', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }), 'api_peer_pairing_invite', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-invite-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40134,11 +40839,11 @@ async function joinDaemonInvite() {
   if (btn) btn.disabled = true;
   setDaemonPairingStatus('daemon-join-status', 'Joining...', '');
   try {
-    const resp = await authedFetch('/api/peers/pairing/join', {
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_join', body, () => authedFetch('/api/peers/pairing/join', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }), 'api_peer_pairing_join', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-join-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40185,11 +40890,11 @@ async function requestDaemonAccess() {
   if (codeEl) codeEl.textContent = '';
   setDaemonPairingStatus('daemon-request-status', 'Requesting...', '');
   try {
-    const resp = await authedFetch('/api/peers/pairing/request-access', {
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_access', body, () => authedFetch('/api/peers/pairing/request-access', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }), 'api_peer_pairing_request_access', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40217,15 +40922,16 @@ async function completeDaemonAccessRequest() {
 
   if (btn) btn.disabled = true;
   setDaemonPairingStatus('daemon-request-status', 'Checking approval...', '');
+  const body = {
+    request_id: requestId,
+    ...(labelInput && labelInput.value.trim() ? { label: labelInput.value.trim() } : {}),
+  };
   try {
-    const resp = await authedFetch('/api/peers/pairing/request-access/poll', {
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_access_poll', body, () => authedFetch('/api/peers/pairing/request-access/poll', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        request_id: requestId,
-        ...(labelInput && labelInput.value.trim() ? { label: labelInput.value.trim() } : {}),
-      }),
-    });
+      body: JSON.stringify(body),
+    }), 'api_peer_pairing_request_access_poll', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-request-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40260,7 +40966,7 @@ async function loadPeerAccessRequests() {
   if (!list) return;
   setDaemonPairingStatus('daemon-access-requests-status', 'Loading...', '');
   try {
-    const resp = await authedFetch('/api/peers/pairing/requests');
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_requests', {}, () => authedFetch('/api/peers/pairing/requests'), 'api_peer_pairing_requests');
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40340,11 +41046,15 @@ async function decidePeerAccessRequest(requestId, op) {
       const profileSelect = document.querySelector(`[data-access-request-profile="${CSS.escape(requestId)}"]`);
       if (profileSelect && profileSelect.value) body.profile = profileSelect.value;
     }
-    const resp = await authedFetch(`/api/peers/pairing/requests/${encodeURIComponent(requestId)}/${op}`, {
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_request_decision', {
+      request_id: requestId,
+      op,
+      ...body,
+    }, () => authedFetch(`/api/peers/pairing/requests/${encodeURIComponent(requestId)}/${op}`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }), 'api_peer_pairing_request_decision', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-access-requests-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40367,7 +41077,7 @@ async function loadPeerIdentities() {
   if (!list) return;
   setDaemonPairingStatus('daemon-peer-identities-status', 'Loading...', '');
   try {
-    const resp = await authedFetch('/api/peers/pairing/identities');
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_identities', {}, () => authedFetch('/api/peers/pairing/identities'), 'api_peer_pairing_identities');
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40423,11 +41133,11 @@ async function revokePeerIdentity(identity) {
   if (!value) return;
   setDaemonPairingStatus('daemon-peer-identities-status', 'Revoking...', '');
   try {
-    const resp = await authedFetch('/api/peers/pairing/identities/revoke', {
+    const resp = await dashboardTransport.jsonFetch('api_peer_pairing_identity_revoke', { identity: value }, () => authedFetch('/api/peers/pairing/identities/revoke', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ identity: value }),
-    });
+    }), 'api_peer_pairing_identity_revoke', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       setDaemonPairingStatus('daemon-peer-identities-status', `Failed: ${result.error || resp.status}`, 'error');
@@ -40496,11 +41206,11 @@ async function addDaemon() {
   if (viaUrls.length > 0) body.via_urls = viaUrls;
   if (browserTcpViaUrl) body.browser_tcp_via_url = browserTcpViaUrl;
   try {
-    const resp = await authedFetch('/api/peers', {
+    const resp = await dashboardTransport.jsonFetch('api_peer_add', body, () => authedFetch('/api/peers', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }), 'api_peer_add', { fallbackAfterRpcFailure: false });
     const result = await resp.json();
     if (!resp.ok) {
       const errorText = result.error || String(resp.status);
@@ -40538,11 +41248,11 @@ async function removeDaemon(hostId) {
   // explicit disconnect on the peer's actor (Disconnecting →
   // Disconnected state machine).
   try {
-    await authedFetch('/api/peers', {
+    await dashboardTransport.jsonFetch('api_peer_remove', { peer_id: hostId }, () => authedFetch('/api/peers', {
       method: 'DELETE',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ peer_id: hostId }),
-    });
+    }), 'api_peer_remove', { fallbackAfterRpcFailure: false });
   } catch { /* best-effort */ }
   await refreshPeersFromApi();
   setDaemonsStatus(`Removed ${hostId}`, '');
@@ -40581,7 +41291,7 @@ async function findEligiblePeers() {
   out.className = 'coord-result';
   const query = caps.map(c => `capability=${encodeURIComponent(c)}`).join('&');
   try {
-    const resp = await authedFetch(`/api/peers/eligible?${query}`);
+    const resp = await dashboardTransport.jsonFetch('api_peer_eligible', { capabilities: caps }, () => authedFetch(`/api/peers/eligible?${query}`), 'api_peer_eligible');
     const result = await resp.json().catch(() => ({}));
     if (!resp.ok) {
       const msg = result.error || `HTTP ${resp.status}`;
@@ -40642,14 +41352,15 @@ async function routeTask() {
   out.textContent = 'Routing…';
   out.className = 'coord-result';
   try {
-    const resp = await authedFetch('/api/coordinator/route', {
+    const payload = {
+      required_capabilities: caps,
+      task: { instructions },
+    };
+    const resp = await dashboardTransport.jsonFetch('api_coordinator_route', payload, () => authedFetch('/api/coordinator/route', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        required_capabilities: caps,
-        task: { instructions },
-      }),
-    });
+      body: JSON.stringify(payload),
+    }), 'api_coordinator_route', { fallbackAfterRpcFailure: false });
     const result = await resp.json().catch(() => ({}));
     if (resp.ok) {
       out.className = 'coord-result ok';
@@ -40991,8 +41702,7 @@ let settingsLoaded = false;
 
 async function loadSettings() {
   try {
-    const resp = await fetch('/api/settings');
-    const d = await resp.json();
+    const d = await fetchDashboardSettings();
     if (d.error) { console.warn('Settings load error:', d.error); return; }
     document.getElementById('set-cu-provider').value = d.cu_provider || '';
     document.getElementById('set-cu-model').value = d.cu_model || '';
@@ -41126,11 +41836,11 @@ async function saveSettings() {
     gemini_debug: !!controlGeminiConfig.debug,
   };
   try {
-    const resp = await fetch('/api/settings', {
+    const resp = await dashboardTransport.jsonFetch('api_settings_save', payload, () => fetch('/api/settings', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(payload),
-    });
+    }), 'api_settings_save', { fallbackAfterRpcFailure: false });
     const data = await resp.json();
     const status = g('settings-status');
     if (data.ok) {
@@ -41194,8 +41904,7 @@ let apiKeyStatusLoaded = false;
 
 async function loadApiKeyStatus() {
   try {
-    const resp = await fetch('/api/api-key-status');
-    const d = await resp.json();
+    const d = await fetchApiKeyStatus();
     if (d.error) { console.warn('API key status error:', d.error); return; }
     for (const [key, configured] of Object.entries(d)) {
       const el = document.getElementById('key-status-' + key);
@@ -41228,11 +41937,11 @@ async function saveApiKeys() {
   }
 
   try {
-    const resp = await fetch('/api/api-keys', {
+    const resp = await dashboardTransport.jsonFetch('api_api_keys_save', { keys }, () => fetch('/api/api-keys', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ keys }),
-    });
+    }), 'api_api_keys_save', { fallbackAfterRpcFailure: false });
     const data = await resp.json();
     const status = document.getElementById('settings-keys-status');
     if (data.ok) {
@@ -41284,14 +41993,19 @@ function fetchSessionsForHost(hostId, options = {}) {
 
   const limit = sessionListRequestLimit(options);
   const url = sessionListUrl(baseUrl, limit);
-  const request = hostId === selfPeerId
-    ? authedFetch(url)
-    : fetch(url);
-  const promise = request
-    .then(r => {
-      if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
-      return r.json();
-    })
+  const loadSessions = async () => {
+    if (hostId === selfPeerId && dashboardTransport?.canUseRpc()) {
+      try {
+        return await dashboardTransport.request('api_sessions', { limit });
+      } catch (err) {
+        console.warn('[dashboard-control] api_sessions RPC failed, falling back to HTTP', err);
+      }
+    }
+    const r = await (hostId === selfPeerId ? authedFetch(url) : fetch(url));
+    if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
+    return r.json();
+  };
+  const promise = loadSessions()
     .then(sessions => {
       if (!Array.isArray(sessions)) {
         throw new Error('/api/sessions returned a non-array payload');
@@ -43920,9 +44634,8 @@ function maybeFailNewSessionSpawnFromLog(c) {
 
 async function loadNewSessionProjectRoot() {
   try {
-    const resp = await fetch('/api/project-root');
-    const d = await resp.json();
-    if (resp.ok) setNewSessionProjectRoot(d.project_root || '');
+    const d = await fetchProjectRoot();
+    setNewSessionProjectRoot(d.project_root || '');
   } catch (e) {
     console.warn('Failed to load project root:', e);
   }
@@ -45328,15 +46041,15 @@ function runSessionDeepSearch() {
   updateSessionsSearchStatus();
   _refilterSessions();
 
-  const params = new URLSearchParams({ q: query, source: 'all', mode });
-  if (projectFilter.length > 0) {
-    params.set('projects', JSON.stringify(projectFilter));
-  }
-  const url = `/api/sessions/search?${params.toString()}`;
   const retryDelay = attempt => Math.min(500 + attempt * 250, 2000);
   const executeSearch = (attempt = 0) => {
-    authedFetch(url, { signal: controller.signal })
-    .then(r => r.ok ? r.json() : Promise.reject(new Error(`/api/sessions/search returned ${r.status}`)))
+    fetchSessionsSearchPayload({
+      query,
+      source: 'all',
+      mode,
+      projects: projectFilter,
+      signal: controller.signal,
+    })
     .then(data => {
       if (token !== _sessionDeepSearchToken) return;
       if (data.busy) {
@@ -46925,8 +47638,7 @@ function openSessionDetail(sessionOrId, taskArg) {
 
   const detailSessionId = sessionId;
   const detailSource = source;
-  fetch('/api/session/' + encodeURIComponent(detailSessionId) + '?source=' + encodeURIComponent(detailSource))
-    .then(r => r.json())
+  fetchSessionDetailPayload(detailSessionId, { source: detailSource })
     .then(data => {
       if (data.error) {
         logsEl.innerHTML = '<div class="empty-state">' + data.error + '</div>';
@@ -47904,8 +48616,8 @@ window.toggleUserDisplay = function() {
     applyDisplayList(cachedDisplays);
     return;
   }
-  fetch('/api/displays')
-    .then(r => r.json())
+  fetchLocalDisplaysPayload()
+    .then(normalizeDisplaysPayload)
     .then(applyDisplayList)
     .catch(() => {
       // Fetch failed: fall back to granting default display

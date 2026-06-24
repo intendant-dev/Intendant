@@ -3865,6 +3865,30 @@ fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
     get_session_detail_from_home_with_limit(home, session_id, None)
 }
 
+pub(crate) fn session_detail_response_body(
+    session_id: &str,
+    source: &str,
+    limit: Option<usize>,
+) -> String {
+    let session_id = session_id.trim();
+    if !session_lookup_id_is_safe(session_id) {
+        return serde_json::json!({"error": "invalid session id"}).to_string();
+    }
+    let source = source.trim();
+    let source = if source.is_empty() {
+        "intendant"
+    } else {
+        source
+    };
+    let home = crate::platform::home_dir();
+    if source == "intendant" {
+        get_session_detail_from_home_with_limit(&home, session_id, limit)
+    } else {
+        external_session_detail_from_home_with_limit(&home, source, session_id, limit)
+            .unwrap_or_else(|| serde_json::json!({"error": "session not found"}).to_string())
+    }
+}
+
 fn get_session_detail_from_home_with_limit(
     home: &Path,
     session_id: &str,
@@ -4145,19 +4169,57 @@ fn get_session_context_snapshot_from_home(
     )
 }
 
-fn session_log_search_from_request(request_line: &str) -> String {
-    let home_path = crate::platform::home_dir();
-    let query = query_param(request_line, "q").unwrap_or_default();
-    let source_filter = query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
-    let mode = query_param(request_line, "mode").unwrap_or_default();
-    let project_filter = session_project_filter_from_request(request_line);
-    session_log_search_from_home_with_projects(
-        &home_path,
-        &query,
-        &source_filter,
-        &mode,
-        &project_filter,
+pub(crate) async fn sessions_search_response_body(
+    query: String,
+    source_filter: String,
+    mode: String,
+    project_filter: Vec<String>,
+) -> String {
+    sessions_search_response_body_with_cancel(
+        query,
+        source_filter,
+        mode,
+        project_filter,
+        tokio_util::sync::CancellationToken::new(),
     )
+    .await
+}
+
+pub(crate) async fn sessions_search_response_body_with_cancel(
+    query: String,
+    source_filter: String,
+    mode: String,
+    project_filter: Vec<String>,
+    cancel: tokio_util::sync::CancellationToken,
+) -> String {
+    if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
+        return serde_json::json!({
+            "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
+            "busy": true,
+        })
+        .to_string();
+    }
+    let body = match tokio::task::spawn_blocking(move || {
+        let home_path = crate::platform::home_dir();
+        session_log_search_from_home_with_projects_cancel(
+            &home_path,
+            &query,
+            &source_filter,
+            &mode,
+            &project_filter,
+            &cancel,
+        )
+    })
+    .await
+    {
+        Ok(body) => body,
+        Err(e) => serde_json::json!({
+            "error": format!("session search task failed: {e}")
+        })
+        .to_string(),
+    };
+    SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
+    body
 }
 
 fn session_log_search_from_home(
@@ -4175,6 +4237,24 @@ fn session_log_search_from_home_with_projects(
     source_filter: &str,
     mode: &str,
     project_filter: &[String],
+) -> String {
+    session_log_search_from_home_with_projects_cancel(
+        home,
+        query,
+        source_filter,
+        mode,
+        project_filter,
+        &tokio_util::sync::CancellationToken::new(),
+    )
+}
+
+fn session_log_search_from_home_with_projects_cancel(
+    home: &Path,
+    query: &str,
+    source_filter: &str,
+    mode: &str,
+    project_filter: &[String],
+    cancel: &tokio_util::sync::CancellationToken,
 ) -> String {
     let mode = SessionLogSearchMode::from_query(mode);
     let terms = session_log_search_terms(query);
@@ -4202,6 +4282,20 @@ fn session_log_search_from_home_with_projects(
     let mut searched = 0usize;
 
     for session in sessions {
+        if cancel.is_cancelled() {
+            return serde_json::json!({
+                "query": query,
+                "mode": mode.as_str(),
+                "source_filter": source_filter,
+                "searched": searched,
+                "truncated": false,
+                "exhaustive": false,
+                "cancelled": true,
+                "truncated_files": 0,
+                "results": results,
+            })
+            .to_string();
+        }
         let source = session
             .get("source")
             .and_then(|v| v.as_str())
@@ -8425,6 +8519,16 @@ fn cached_list_sessions_for_ids(ids: &[String]) -> String {
         return "[]".to_string();
     }
     cached_list_sessions_for_ids_from_home(&crate::platform::home_dir(), ids)
+}
+
+pub(crate) fn sessions_list_response_body(limit: Option<usize>, ids: &[String]) -> String {
+    if !ids.is_empty() {
+        cached_list_sessions_for_ids(ids)
+    } else if let Some(limit) = limit {
+        cached_list_sessions_with_limit(limit)
+    } else {
+        cached_list_sessions()
+    }
 }
 
 fn push_unique_session_row_for_ids(
@@ -13604,6 +13708,23 @@ async fn settings_payload_with_runtime_overrides(
     payload
 }
 
+pub(crate) async fn settings_get_response_body(
+    project_root: Option<&Path>,
+    runtime_settings: &RuntimeSettingsState,
+) -> String {
+    match project_root {
+        Some(root) => match crate::project::Project::from_root(root.to_path_buf()) {
+            Ok(proj) => {
+                let payload =
+                    settings_payload_with_runtime_overrides(&proj.config, runtime_settings).await;
+                serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+            }
+            Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
+        },
+        None => serde_json::json!({"error": "No project root"}).to_string(),
+    }
+}
+
 fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &SettingsPayload) {
     config.computer_use.provider = payload.cu_provider.clone();
     config.computer_use.model = payload.cu_model.clone();
@@ -13671,7 +13792,7 @@ fn apply_settings_payload(config: &mut crate::project::ProjectConfig, payload: &
     }
 }
 
-fn settings_post_result(
+pub(crate) fn settings_post_result(
     body_text: &str,
     project_root: Option<&Path>,
     bus: &EventBus,
@@ -13790,6 +13911,24 @@ fn get_api_key_status_json() -> String {
     .to_string()
 }
 
+pub(crate) fn api_key_status_response_body() -> String {
+    get_api_key_status_json()
+}
+
+pub(crate) fn project_root_response_body(project_root: Option<&Path>) -> String {
+    serde_json::json!({
+        "project_root": project_root.map(|root| root.to_string_lossy().to_string())
+    })
+    .to_string()
+}
+
+pub(crate) async fn displays_response_body(
+    session_registry: &Option<crate::display::SharedSessionRegistry>,
+) -> String {
+    let displays = crate::display::enumerate_displays_with_sessions(session_registry).await;
+    serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string())
+}
+
 /// Payload for POST /api/api-keys.
 #[derive(serde::Deserialize)]
 struct SetApiKeysPayload {
@@ -13798,7 +13937,7 @@ struct SetApiKeysPayload {
 
 /// Handle POST /api/api-keys: persist keys to ~/.config/intendant/.env and
 /// set them in the current process.
-fn handle_set_api_keys(body: &str) -> String {
+pub(crate) fn handle_set_api_keys(body: &str) -> String {
     let payload: SetApiKeysPayload = match serde_json::from_str(body) {
         Ok(p) => p,
         Err(e) => {
@@ -14135,6 +14274,14 @@ pub fn spawn_web_gateway(
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
+    let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
+        config.clone(),
+        broadcast_tx.clone(),
+        bus.clone(),
+        peer_registry.clone(),
+        shared_session.clone(),
+        project_root.clone(),
+    ));
 
     // Build the local Agent Card from live runtime state so
     // `/.well-known/agent-card.json` can serve it. The transport URLs
@@ -14538,6 +14685,7 @@ pub fn spawn_web_gateway(
             let agent_card_json = agent_card_json.clone();
             let peer_access_request_config = peer_access_request_config.clone();
             let peer_registry = peer_registry.clone();
+            let dashboard_control = Arc::clone(&dashboard_control);
             let ice_config = ice_config.clone();
             let tcp_peer_registry = Arc::clone(&tcp_peer_registry);
             let tcp_relay_registry = Arc::clone(&tcp_relay_registry);
@@ -15231,6 +15379,7 @@ pub fn spawn_web_gateway(
                     let session_registry_inbound = session_registry.clone();
                     let task_tx_inbound = task_tx.clone();
                     let terminal_registry_inbound = terminal_registry.clone();
+                    let dashboard_control_inbound = Arc::clone(&dashboard_control);
                     let peer_profile_inbound = peer_profile_for_ws.clone();
                     let peer_label_inbound = peer_label_for_ws.clone();
                     let inbound = tokio::spawn(async move {
@@ -15261,6 +15410,7 @@ pub fn spawn_web_gateway(
                         // Display IDs this peer has WebRTC connections to,
                         // used for cleanup when the WebSocket disconnects.
                         let mut peer_display_ids: Vec<u32> = Vec::new();
+                        let mut dashboard_control_session_ids: Vec<String> = Vec::new();
 
                         // Per-connection audio transcription buffer.
                         // PCM16 bytes are accumulated and drained every ~3s.
@@ -16681,6 +16831,74 @@ pub fn spawn_web_gateway(
                                                 }
                                             });
                                         }
+                                        Some("dashboard_control_offer") => {
+                                            let sdp =
+                                                json["sdp"].as_str().unwrap_or("").to_string();
+                                            if sdp.is_empty() {
+                                                let msg = serde_json::json!({
+                                                    "t": "dashboard_control_error",
+                                                    "error": "missing sdp",
+                                                });
+                                                let _ = direct_tx_inbound.send(msg.to_string());
+                                                continue;
+                                            }
+                                            match dashboard_control_inbound.answer_offer(sdp).await
+                                            {
+                                                Ok(answer) => {
+                                                    dashboard_control_session_ids
+                                                        .push(answer.session_id.clone());
+                                                    let msg = serde_json::json!({
+                                                        "t": "dashboard_control_answer",
+                                                        "session_id": answer.session_id,
+                                                        "sdp": answer.sdp,
+                                                        "binding": answer.binding,
+                                                    });
+                                                    let _ = direct_tx_inbound.send(msg.to_string());
+                                                }
+                                                Err(e) => {
+                                                    let msg = serde_json::json!({
+                                                        "t": "dashboard_control_error",
+                                                        "error": e,
+                                                    });
+                                                    let _ = direct_tx_inbound.send(msg.to_string());
+                                                }
+                                            }
+                                        }
+                                        Some("dashboard_control_ice") => {
+                                            let session_id = json["session_id"]
+                                                .as_str()
+                                                .unwrap_or("")
+                                                .to_string();
+                                            let candidate = json
+                                                .get("candidate")
+                                                .cloned()
+                                                .unwrap_or_else(|| serde_json::json!({}));
+                                            if session_id.is_empty() {
+                                                continue;
+                                            }
+                                            let registry = Arc::clone(&dashboard_control_inbound);
+                                            tokio::spawn(async move {
+                                                if let Err(e) = registry
+                                                    .add_ice_candidate(&session_id, &candidate)
+                                                    .await
+                                                {
+                                                    eprintln!(
+                                                        "[dashboard/control] add ICE failed: {e}"
+                                                    );
+                                                }
+                                            });
+                                        }
+                                        Some("dashboard_control_close") => {
+                                            let session_id = json["session_id"]
+                                                .as_str()
+                                                .unwrap_or("")
+                                                .to_string();
+                                            if !session_id.is_empty() {
+                                                dashboard_control_inbound.close(&session_id).await;
+                                                dashboard_control_session_ids
+                                                    .retain(|s| s != &session_id);
+                                            }
+                                        }
                                         Some("terminal_open") => {
                                             // {"t":"terminal_open","host_id":"local","terminal_id":"shell-0","cols":80,"rows":24}
                                             let host_id = json["host_id"]
@@ -17241,6 +17459,9 @@ pub fn spawn_web_gateway(
                                 }
                             }
                         }
+                        for session_id in dashboard_control_session_ids {
+                            dashboard_control_inbound.close(&session_id).await;
+                        }
                         // Unregister from WebTui
                         if let Some(ref tx) = web_tui_tx_inbound {
                             let _ = tx.send(crate::tui::web::WebTuiCommand::RemoveConnection {
@@ -17559,12 +17780,7 @@ pub fn spawn_web_gateway(
                         }
                     } else if request_line.contains("/api/project-root") {
                         use tokio::io::AsyncWriteExt;
-                        let body = serde_json::json!({
-                            "project_root": project_root
-                                .as_ref()
-                                .map(|root| root.to_string_lossy().to_string())
-                        })
-                        .to_string();
+                        let body = project_root_response_body(project_root.as_deref());
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -17732,21 +17948,9 @@ pub fn spawn_web_gateway(
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/settings") {
                         use tokio::io::AsyncWriteExt;
-                        let body = match &project_root {
-                            Some(root) => match crate::project::Project::from_root(root.clone()) {
-                                Ok(proj) => {
-                                    let payload = settings_payload_with_runtime_overrides(
-                                        &proj.config,
-                                        &runtime_settings,
-                                    )
-                                    .await;
-                                    serde_json::to_string(&payload)
-                                        .unwrap_or_else(|_| "{}".to_string())
-                                }
-                                Err(e) => serde_json::json!({"error": e.to_string()}).to_string(),
-                            },
-                            None => serde_json::json!({"error": "No project root"}).to_string(),
-                        };
+                        let body =
+                            settings_get_response_body(project_root.as_deref(), &runtime_settings)
+                                .await;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -17800,7 +18004,7 @@ pub fn spawn_web_gateway(
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains("/api/api-key-status") {
                         use tokio::io::AsyncWriteExt;
-                        let body = get_api_key_status_json();
+                        let body = api_key_status_response_body();
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -19092,11 +19296,7 @@ pub fn spawn_web_gateway(
                     } else if request_line.contains("/api/displays") {
                         // Display enumeration endpoint
                         use tokio::io::AsyncWriteExt;
-                        let displays =
-                            crate::display::enumerate_displays_with_sessions(&session_registry)
-                                .await;
-                        let body =
-                            serde_json::to_string(&displays).unwrap_or_else(|_| "[]".to_string());
+                        let body = displays_response_body(&session_registry).await;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -19493,28 +19693,18 @@ pub fn spawn_web_gateway(
                         }
                         let _ = stream_task.await;
                     } else if request_line.contains("/api/sessions/search") {
-                        let body = if SESSION_SEARCH_IN_FLIGHT.swap(true, Ordering::SeqCst) {
-                            serde_json::json!({
-                                "error": "Another deep session search is already running. Wait for it to finish before starting a new one.",
-                                "busy": true,
-                            })
-                            .to_string()
-                        } else {
-                            let request_line_for_search = request_line.to_string();
-                            let body = match tokio::task::spawn_blocking(move || {
-                                session_log_search_from_request(&request_line_for_search)
-                            })
-                            .await
-                            {
-                                Ok(body) => body,
-                                Err(e) => serde_json::json!({
-                                    "error": format!("session search task failed: {e}")
-                                })
-                                .to_string(),
-                            };
-                            SESSION_SEARCH_IN_FLIGHT.store(false, Ordering::SeqCst);
-                            body
-                        };
+                        let query = query_param(request_line, "q").unwrap_or_default();
+                        let source_filter =
+                            query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
+                        let mode = query_param(request_line, "mode").unwrap_or_default();
+                        let project_filter = session_project_filter_from_request(request_line);
+                        let body = sessions_search_response_body(
+                            query,
+                            source_filter,
+                            mode,
+                            project_filter,
+                        )
+                        .await;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -19984,7 +20174,7 @@ struct RemovePeerRequest {
 /// Each snapshot is built via [`crate::peer::PeerHandle::snapshot`], the
 /// same constructor used by the registry's push event stream. The
 /// dashboard applies an API entry and a pushed snapshot identically.
-fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
+pub(crate) fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
     let handles = registry.list();
     let peers: Vec<crate::peer::PeerSnapshot> = handles.iter().map(|h| h.snapshot()).collect();
     serde_json::to_string(&PeerListResponse { peers })
@@ -19994,7 +20184,7 @@ fn peers_list_response_body(registry: &crate::peer::PeerRegistry) -> String {
 /// Handle a `POST /api/peers` body: parse, call `PeerRegistry::add_peer`,
 /// optionally persist the peer in `intendant.toml`, and return
 /// `(status_code, body_json)`.
-async fn peers_add(
+pub(crate) async fn peers_add(
     registry: &crate::peer::PeerRegistry,
     project_root: Option<&Path>,
     body_text: &str,
@@ -20111,7 +20301,7 @@ fn persist_manual_peer(
 /// Handle `POST /api/peers/pairing/invite`: issue a peer-scoped mTLS
 /// client identity from this daemon's access CA and return the same
 /// encoded invite string as `intendant peer invite`.
-fn peers_pairing_invite(body_text: &str) -> (u16, String) {
+pub(crate) fn peers_pairing_invite(body_text: &str) -> (u16, String) {
     let req: PairingInviteRequest = if body_text.trim().is_empty() {
         PairingInviteRequest::default()
     } else {
@@ -20265,7 +20455,7 @@ fn target_card_url_from_request(header_text: &str, is_tls: bool) -> Option<Strin
     ))
 }
 
-async fn peers_pairing_request_access(body_text: &str) -> (u16, String) {
+pub(crate) async fn peers_pairing_request_access(body_text: &str) -> (u16, String) {
     let req: PairingAccessRequestStart = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
@@ -20312,7 +20502,7 @@ async fn peers_pairing_request_access(body_text: &str) -> (u16, String) {
     }
 }
 
-async fn peers_pairing_request_access_poll(
+pub(crate) async fn peers_pairing_request_access_poll(
     registry: Option<&crate::peer::PeerRegistry>,
     project_root: Option<&Path>,
     body_text: &str,
@@ -20416,7 +20606,7 @@ async fn peers_pairing_request_access_poll(
     }
 }
 
-fn peers_pairing_requests_list() -> (u16, String) {
+pub(crate) fn peers_pairing_requests_list() -> (u16, String) {
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     match crate::peer::access_request::list_requests(&cert_dir) {
         Ok(requests) => {
@@ -20433,7 +20623,11 @@ fn peers_pairing_requests_list() -> (u16, String) {
     }
 }
 
-fn peers_pairing_request_decision(code_or_id: &str, op: &str, body_text: &str) -> (u16, String) {
+pub(crate) fn peers_pairing_request_decision(
+    code_or_id: &str,
+    op: &str,
+    body_text: &str,
+) -> (u16, String) {
     let body: PairingAccessRequestDecision = if body_text.trim().is_empty() {
         PairingAccessRequestDecision::default()
     } else {
@@ -20471,7 +20665,7 @@ fn peers_pairing_request_decision(code_or_id: &str, op: &str, body_text: &str) -
     }
 }
 
-fn peers_pairing_identities_list() -> (u16, String) {
+pub(crate) fn peers_pairing_identities_list() -> (u16, String) {
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     peers_pairing_identities_list_from_cert_dir(&cert_dir)
 }
@@ -20493,7 +20687,7 @@ fn peers_pairing_identities_list_from_cert_dir(cert_dir: &Path) -> (u16, String)
     }
 }
 
-fn peers_pairing_identity_revoke(body_text: &str) -> (u16, String) {
+pub(crate) fn peers_pairing_identity_revoke(body_text: &str) -> (u16, String) {
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     peers_pairing_identity_revoke_from_cert_dir(&cert_dir, body_text)
 }
@@ -20560,7 +20754,7 @@ fn identity_summary_json(
 /// Handle `POST /api/peers/pairing/join`: import an encoded invite,
 /// write/update the local `[[peer]]` config, store the peer-issued
 /// client identity on disk, and queue live registry registration.
-async fn peers_pairing_join(
+pub(crate) async fn peers_pairing_join(
     registry: &crate::peer::PeerRegistry,
     project_root: Option<&Path>,
     body_text: &str,
@@ -20661,7 +20855,10 @@ async fn peers_pairing_join(
 
 /// Handle a `DELETE /api/peers` body: parse, call
 /// `PeerRegistry::remove_peer`, return `(status_code, body_json)`.
-async fn peers_remove(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u16, String) {
+pub(crate) async fn peers_remove(
+    registry: &crate::peer::PeerRegistry,
+    body_text: &str,
+) -> (u16, String) {
     let req: RemovePeerRequest = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {
@@ -21683,7 +21880,7 @@ async fn handle_federated_webrtc_signal(
 }
 
 /// Handle `POST /api/peers/{id}/message`.
-async fn peers_send_message(
+pub(crate) async fn peers_send_message(
     registry: &crate::peer::PeerRegistry,
     id: &str,
     body_text: &str,
@@ -21717,7 +21914,7 @@ async fn peers_send_message(
 }
 
 /// Handle `POST /api/peers/{id}/task`.
-async fn peers_delegate_task(
+pub(crate) async fn peers_delegate_task(
     registry: &crate::peer::PeerRegistry,
     id: &str,
     body_text: &str,
@@ -21747,7 +21944,7 @@ async fn peers_delegate_task(
 }
 
 /// Handle `POST /api/peers/{id}/approval`.
-async fn peers_resolve_approval(
+pub(crate) async fn peers_resolve_approval(
     registry: &crate::peer::PeerRegistry,
     id: &str,
     body_text: &str,
@@ -21802,7 +21999,10 @@ fn parse_capability_query(query: &str) -> (Vec<crate::peer::Capability>, Vec<Str
 /// connected peers whose Agent Card advertises every requested
 /// capability. Each entry is a [`crate::peer::PeerSnapshot`] —
 /// same shape as `/api/peers` so the dashboard can reuse rendering.
-fn peers_eligible(registry: &crate::peer::PeerRegistry, query_str: &str) -> (u16, String) {
+pub(crate) fn peers_eligible(
+    registry: &crate::peer::PeerRegistry,
+    query_str: &str,
+) -> (u16, String) {
     let (caps, unknown) = parse_capability_query(query_str);
     if !unknown.is_empty() {
         return (
@@ -21860,7 +22060,10 @@ struct CoordinatorRouteTask {
 /// connected peer that satisfies all required capabilities,
 /// returning the assigned task id on success or a structured error
 /// on no-route / delegation failure.
-async fn coordinator_route(registry: &crate::peer::PeerRegistry, body_text: &str) -> (u16, String) {
+pub(crate) async fn coordinator_route(
+    registry: &crate::peer::PeerRegistry,
+    body_text: &str,
+) -> (u16, String) {
     let req: CoordinatorRouteRequest = match serde_json::from_str(body_text) {
         Ok(r) => r,
         Err(e) => {

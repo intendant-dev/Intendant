@@ -5124,7 +5124,7 @@ fn serialize_clipboard(content: &ClipboardContent) -> String {
 ///   `candidate:<foundation> <component> <proto> <priority> <addr> <port> typ <kind> ...`
 /// We split on whitespace, the connection-address is field index 4 (counting
 /// from the `candidate:` prefix as 0).
-async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
+pub(crate) async fn resolve_mdns_in_candidate(candidate: &str) -> Result<String, String> {
     let mut fields: Vec<&str> = candidate.split_whitespace().collect();
     if fields.len() < 6 {
         return Ok(candidate.to_string());

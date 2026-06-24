@@ -426,6 +426,126 @@ per-user access CA/server/client certs and run strict enrollment. See
 [Peer Federation](./peer-federation.md). For the daemon posture and remote
 control surface, see [Control Plane & Daemon](./control-plane-and-daemon.md).
 
+### WebRTC Dashboard Control Tunnel
+
+Intendant also has an experimental daemon-scoped WebRTC DataChannel transport
+for dashboard control traffic. It is not a replacement for dashboard
+authentication yet: today the browser still bootstraps from the normal dashboard
+origin and sends the WebRTC offer over the existing WebSocket. The point is to
+prove the future "public HTTPS bootstrap + direct local daemon data path" shape
+without weakening the current mTLS default.
+
+The handshake is bound to the daemon identity:
+
+- the browser creates a `intendant-dashboard-control` DataChannel and sends an
+  SDP offer over `/ws`;
+- the daemon answers with SDP plus a signed binding over the offer hash, answer
+  hash, session id, timestamp, and daemon Ed25519 public key;
+- the browser verifies that binding with WebCrypto before using the channel.
+
+When enabled with
+`localStorage.intendant_dashboard_transport = "webrtc-control"` (or
+`window.intendantDashboardControl.enable()`), dashboard JSON reads prefer the
+DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
+boundary. Current tunneled reads include sessions, session detail, deep session
+search, settings, API-key status, project root, display enumeration, and peer
+state. Current tunneled mutations include settings save, API-key save, peer
+add/remove, peer access-request pairing, peer message/task/approval actions,
+eligible-peer lookup, and coordinator routing.
+Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
+fails after it may have reached the daemon, the dashboard surfaces the error
+instead of repeating the write over HTTP.
+
+The tunnel mirrors HTTP JSON response semantics. Application errors travel as
+successful transport frames with `_httpStatus`/`_httpOk` metadata so existing UI
+code can render the same error message it would render for an HTTP response.
+Transport failures, unknown RPC methods, and aborted requests still reject the
+browser-side promise.
+
+Several paths intentionally stay outside this JSON tunnel:
+
+- static assets and WASM bundles;
+- frames, recordings, and file uploads;
+- MCP-over-HTTP;
+- diagnostics NDJSON uploads;
+- display WebRTC media/control channels and peer-display signaling;
+- daemon-to-daemon federation authentication.
+
+Peer mTLS remains a separate trust boundary. The dashboard tunnel authenticates
+the browser-to-this-daemon control path; it does not grant or replace a
+daemon's peer-scoped client certificate for federation.
+
+### Public Bootstrap and Signaling Design
+
+The intended next shape is a public Intendant HTTPS origin that bootstraps the
+browser experience while keeping the high-trust control path daemon-scoped:
+
+1. The browser loads a public, CA-trusted Intendant dashboard shell.
+2. The public origin handles account, passkey, device, and daemon-picker UX.
+3. The public origin provides WebRTC signaling rendezvous for a chosen daemon.
+4. The browser opens a daemon-scoped WebRTC DataChannel directly to that daemon
+   when ICE can find a path.
+5. The dashboard RPC/event stream runs over that verified DataChannel.
+6. TURN or an Intendant relay is used only when direct connectivity fails, and
+   the UI shows that degraded path explicitly.
+
+This is different from serving public TLS directly from every daemon address.
+Private IPs, `.local` names, changing VM addresses, and ACME validation do not
+fit normal browser public-trust rules. The public origin solves browser trust
+for the shell and user/device UX; the daemon identity binding solves trust for
+the direct control channel.
+
+The public service should own only bootstrap responsibilities:
+
+- account and passkey sign-in;
+- device registration and recovery UX;
+- a daemon registry containing user-facing labels, last-seen state, and pinned
+  daemon public keys;
+- short-lived signaling sessions for offer, answer, and ICE exchange;
+- TURN credentials or relay allocation when direct WebRTC cannot connect;
+- coarse tunnel health and relay-status reporting.
+
+It must not become the federation trust root. Peer daemon-to-daemon mTLS remains
+separate, with its own certs, roles, and approval state. The public service also
+must not receive peer private keys, browser client-cert private keys, daemon
+identity private keys, API keys, or session-log contents unless a later feature
+explicitly designs and documents that upload path.
+
+Daemon enrollment should be explicit and auditable. A practical first version
+can pair a daemon to the public account from an already trusted local dashboard
+or from a one-time enrollment code shown in the daemon logs/CLI. Enrollment
+records the daemon's stable Ed25519 public key, a human label, capabilities,
+network hints, and the user's account/device authorization. Subsequent WebRTC
+answers are accepted only when the answer includes a fresh signed binding from
+the pinned daemon key over both SDP hashes, the WebRTC control session id, and a
+timestamp.
+
+The browser stores enough state to make daemon identity visible and
+understandable: label, pinned daemon key fingerprint, last verified time,
+transport path, and whether the session is direct or relayed. A daemon key
+change is a security event, not a silent refresh; the user should see a clear
+re-enrollment or key-rotation flow.
+
+The first implementation slice should stay narrow:
+
+- keep the current mTLS dashboard as the default and keep WebRTC dashboard
+  control opt-in;
+- host a public static dashboard shell with a placeholder sign-in/device model;
+- add a signaling rendezvous API keyed by browser session and daemon id;
+- let a locally running daemon register/poll that rendezvous while it is online;
+- reuse the existing daemon binding and DataChannel RPC frame format;
+- add a visible transport indicator: disconnected, mTLS HTTP fallback,
+  WebRTC direct, WebRTC relayed, or failed verification.
+
+Non-goals for this path:
+
+- no loopback or same-host bypass of dashboard authentication;
+- no native host app requirement for the general web dashboard;
+- no passkeys as daemon-to-daemon federation credentials;
+- no silent downgrade from verified direct WebRTC to opaque relay;
+- no attempt to obtain public certificates for private VM IPs or `.local`
+  names.
+
 ## HTTP endpoints
 
 | Endpoint | Description |
