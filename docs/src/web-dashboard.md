@@ -475,67 +475,186 @@ Peer mTLS remains a separate trust boundary. The dashboard tunnel authenticates
 the browser-to-this-daemon control path; it does not grant or replace a
 daemon's peer-scoped client certificate for federation.
 
-### Public Bootstrap and Signaling Design
+### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
-The intended next shape is a public Intendant HTTPS origin that bootstraps the
-browser experience while keeping the high-trust control path daemon-scoped:
+The current dashboard access model is certificate-first: a remote browser
+reaches the daemon over HTTPS/WSS, usually with mTLS. That keeps the
+implementation simple and gives the browser a secure context, but it also means
+private host names, changing VM addresses, and locally generated server
+certificates leak into the user experience.
 
-1. The browser loads a public, CA-trusted Intendant dashboard shell.
-2. The public origin handles account, passkey, device, and daemon-picker UX.
-3. The public origin provides WebRTC signaling rendezvous for a chosen daemon.
-4. The browser opens a daemon-scoped WebRTC DataChannel directly to that daemon
-   when ICE can find a path.
-5. The dashboard RPC/event stream runs over that verified DataChannel.
-6. TURN or an Intendant relay is used only when direct connectivity fails, and
-   the UI shows that degraded path explicitly.
+The product problem is specifically **browser server trust**. Passkeys can prove
+that the user approved a login, but they do not make
+`https://192.168.x.y:8765` or `https://daemon.local:8765` a browser-trusted
+origin. Public Web PKI also cannot directly cover VM-local names, `.local`
+names, or changing private IP addresses. Pointing public DNS at private IPs is
+fragile because DNS rebinding defenses, cache lifetimes, and per-network address
+choices all become visible to users.
 
-This is different from serving public TLS directly from every daemon address.
-Private IPs, `.local` names, changing VM addresses, and ACME validation do not
-fit normal browser public-trust rules. The public origin solves browser trust
-for the shell and user/device UX; the daemon identity binding solves trust for
-the direct control channel.
+A plausible future direction is a **public-trusted bootstrap with a direct data
+path**:
 
-The public service should own only bootstrap responsibilities:
+1. The browser loads an Intendant-owned public HTTPS origin with an ordinary
+   publicly trusted certificate.
+2. That origin handles account, passkey, device, and daemon-claim UX.
+3. The daemon maintains an outbound signaling connection to Intendant Connect.
+4. The browser and daemon establish a daemon-scoped WebRTC DataChannel directly
+   where possible.
+5. TURN/WebRTC relay remains available when a direct path cannot form.
+6. Dashboard RPC, the main event stream, and display signaling move over that
+   encrypted browser-to-daemon DataChannel.
 
-- account and passkey sign-in;
-- device registration and recovery UX;
-- a daemon registry containing user-facing labels, last-seen state, and pinned
-  daemon public keys;
-- short-lived signaling sessions for offer, answer, and ICE exchange;
-- TURN credentials or relay allocation when direct WebRTC cannot connect;
-- coarse tunnel health and relay-status reporting.
+This avoids asking the browser to trust private LAN HTTPS names: public TLS
+secures the bootstrap page, while WebRTC supplies a private encrypted transport
+to the daemon. It also fits Intendant's existing shape better than trying to make
+public Web PKI cover VM-local or LAN-only daemon addresses. The codebase already
+has browser-offer WebRTC, data channels, ICE-TCP multiplexing, relay fallback
+for display/federation paths, and now an opt-in daemon-scoped dashboard control
+tunnel with a browser-side `DashboardTransport` boundary.
 
-It must not become the federation trust root. Peer daemon-to-daemon mTLS remains
-separate, with its own certs, roles, and approval state. The public service also
-must not receive peer private keys, browser client-cert private keys, daemon
-identity private keys, API keys, or session-log contents unless a later feature
-explicitly designs and documents that upload path.
+#### Trust Model
 
-Daemon enrollment should be explicit and auditable. A practical first version
-can pair a daemon to the public account from an already trusted local dashboard
-or from a one-time enrollment code shown in the daemon logs/CLI. Enrollment
-records the daemon's stable Ed25519 public key, a human label, capabilities,
-network hints, and the user's account/device authorization. Subsequent WebRTC
-answers are accepted only when the answer includes a fresh signed binding from
-the pinned daemon key over both SDP hashes, the WebRTC control session id, and a
-timestamp.
+WebRTC encryption is not the same thing as daemon identity. The DataChannel is
+encrypted with DTLS, but the browser learns the DTLS fingerprint through
+signaling. Therefore the signaling path must be authenticated and bound to the
+daemon the user intended to reach.
 
-The browser stores enough state to make daemon identity visible and
-understandable: label, pinned daemon key fingerprint, last verified time,
-transport path, and whether the session is direct or relayed. A daemon key
-change is a security event, not a silent refresh; the user should see a clear
-re-enrollment or key-rotation flow.
+The minimal trust model is:
 
-The first implementation slice should stay narrow:
+- **Intendant Connect** is trusted for public HTTPS, account/passkey login,
+  daemon claiming, dashboard JavaScript delivery, and WebRTC signaling.
+- **The daemon** has a persistent daemon identity key, separate from both the
+  ephemeral WebRTC DTLS certificate and peer mTLS client certificates.
+- **The browser** accepts a dashboard tunnel only when it receives a fresh
+  daemon-signed session statement bound to the claimed daemon identity, the
+  current user/device, the Connect-issued grant, the WebRTC session material, an
+  expiry, and a nonce.
+- **The daemon** accepts dashboard control only after verifying a fresh
+  Connect-issued session grant and applying local policy before exposing
+  control-plane APIs over the DataChannel.
 
-- keep the current mTLS dashboard as the default and keep WebRTC dashboard
-  control opt-in;
-- host a public static dashboard shell with a placeholder sign-in/device model;
-- add a signaling rendezvous API keyed by browser session and daemon id;
-- let a locally running daemon register/poll that rendezvous while it is online;
-- reuse the existing daemon binding and DataChannel RPC frame format;
-- add a visible transport indicator: disconnected, mTLS HTTP fallback,
-  WebRTC direct, WebRTC relayed, or failed verification.
+The current experimental tunnel implements the daemon-signed binding locally: the
+daemon signs the SDP offer hash, SDP answer hash, WebRTC control session id,
+timestamp, and daemon Ed25519 public key, and the browser verifies the signature
+with WebCrypto before using the channel. A public bootstrap service should keep
+that daemon identity binding and add account/device grants around it.
+
+This makes the security boundary explicit: Intendant Connect is in the trusted
+computing base for consumer dashboard access. A compromised Connect service or
+compromised served JavaScript can mislead the browser unless a later design adds
+out-of-band daemon key verification or an independently pinned web app. That is
+an acceptable product tradeoff only if it is documented as the consumer
+cloud-assisted mode, not as a local/offline replacement for mTLS.
+
+#### Claim and Login Flow
+
+A concrete flow should look like this:
+
+1. The daemon generates or loads a persistent daemon identity key.
+2. The daemon opens an outbound TLS connection to Intendant Connect and publishes
+   a short-lived claim code or QR URL.
+3. The user opens the public Intendant Connect URL and signs in with a passkey.
+4. The user claims the daemon by entering the code or scanning the QR code.
+5. Connect records the daemon identity public key, owner account, device label,
+   and any local policy metadata the daemon chooses to expose.
+6. On later visits, the browser signs in with a passkey and selects the daemon.
+7. Connect issues a short-lived dashboard session grant to the daemon and
+   brokers WebRTC signaling between browser and daemon.
+8. The daemon signs the WebRTC session binding with its daemon identity key
+   before it accepts dashboard RPC over the DataChannel.
+
+Passkey step-up can then protect high-impact actions such as approving a peer
+access request, changing autonomy policy, exposing display control, or minting
+long-lived credentials.
+
+#### Direct Path and Relay Fallback
+
+There are two different fallback concepts, and they should not be conflated:
+
+- **TURN/WebRTC relay fallback** keeps the browser-to-daemon DataChannel
+  encrypted end-to-end at the WebRTC layer. The relay forwards packets but does
+  not see dashboard RPC plaintext.
+- **Application RPC relay fallback** would terminate or proxy dashboard messages
+  at Intendant Connect unless an additional application-layer encryption scheme
+  is added. That is a materially different trust posture and should be an
+  explicit product mode, not the default fallback implied by "relay."
+
+The preferred consumer path is direct WebRTC first, TURN/WebRTC relay second,
+and no plaintext dashboard RPC through the public service by default. If an
+operator deliberately enables an application relay for locked-down networks, the
+UI should label it as "proxied through Intendant Connect" rather than "direct."
+
+#### Dashboard Transport Contract
+
+This is not a drop-in replacement for mTLS today. The dashboard mostly still
+assumes ordinary HTTP endpoints plus a main WebSocket, while existing display
+WebRTC sessions remain display-scoped. The current `DashboardTransport` boundary
+is the first browser-side split: when the opt-in DataChannel is connected,
+selected JSON reads and conservative mutations can use WebRTC and fall back to
+HTTP where safe.
+
+A production version still needs two explicit transport implementations:
+
+- `HttpDashboardTransport`: current HTTPS/WSS REST plus main WebSocket.
+- `WebRtcDashboardTransport`: request/response RPC, streaming events, and
+  cancellation over a reliable ordered DataChannel.
+
+The DataChannel protocol should stay explicitly framed rather than ad hoc JSON
+messages. The first useful envelope set is:
+
+| Frame | Direction | Purpose |
+|-------|-----------|---------|
+| `hello` / `hello_ack` | both | Version negotiation, daemon identity, session id, role, feature flags |
+| `request` | browser -> daemon | HTTP-like method/body call with a request id |
+| `response` | daemon -> browser | Status, metadata, body, or application error for a request id |
+| `event` | daemon -> browser | Control-plane event stream entry |
+| `cancel` | browser -> daemon | Cancel an in-flight request or stream |
+| `credit` | both | Backpressure for large responses or long streams |
+| `ping` / `pong` | both | Liveness, latency, and reconnect diagnostics |
+
+The first production APIs should be small and high value: `/config`, the main
+event stream, peer access-request list/approve/deny, and a basic health
+endpoint. Uploads, downloads, recordings, terminal streams, and file transfer
+should move later after chunking, flow control, and resume semantics are settled.
+
+#### Relationship to Existing Auth Modes
+
+This design should not remove local/offline mTLS. It gives the product two clear
+dashboard access modes:
+
+- **Consumer cloud-assisted mode:** public Intendant Connect origin, passkey
+  login, daemon-scoped WebRTC dashboard tunnel.
+- **Local/offline/power-user mode:** direct daemon HTTPS/WSS with browser mTLS
+  enrollment, as implemented today.
+
+Peer daemon-to-daemon trust remains separate. Humans may use passkeys to approve
+a peer access request, but the resulting daemon-to-daemon connection should
+still use Intendant-issued peer-scoped mTLS certificates unless the federation
+trust model is deliberately redesigned. In user-facing copy, that should appear
+as "grant access to this daemon" and "revoke access," not as manual certificate
+management.
+
+#### Staged Rollout
+
+Treat this as a staged target, not current behavior:
+
+1. Keep the current mTLS dashboard as the default and keep WebRTC dashboard
+   control opt-in.
+2. Define daemon identity keys, claim codes, Connect account binding, and
+   revocation semantics.
+3. Host a public static dashboard shell with a placeholder sign-in/device model.
+4. Add daemon outbound signaling to Intendant Connect.
+5. Add a signaling rendezvous API keyed by browser session and daemon id.
+6. Let a locally running daemon register/poll that rendezvous while it is online.
+7. Reuse the existing daemon binding and DataChannel RPC frame format.
+8. Add visible transport status: disconnected, mTLS HTTP fallback, WebRTC direct,
+   WebRTC relayed, failed verification, or application-proxied.
+9. Carry peer access-request approve/deny over the DataChannel with passkey
+   step-up in the public UI.
+10. Gradually migrate larger API surfaces such as uploads, downloads,
+    recordings, terminals, and file transfer.
+11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
+    throughout.
 
 Non-goals for this path:
 
@@ -545,6 +664,23 @@ Non-goals for this path:
 - no silent downgrade from verified direct WebRTC to opaque relay;
 - no attempt to obtain public certificates for private VM IPs or `.local`
   names.
+
+Open design questions before implementation:
+
+- Is Intendant Connect allowed to serve all dashboard JavaScript, or do we want
+  an additional app-integrity story such as signed static assets or a pinned web
+  bundle?
+- How are daemon identity keys backed up, rotated, revoked, and recovered after
+  VM cloning or disk restore?
+- What local policy does the daemon enforce when Connect says a signed-in user
+  wants access?
+- Do browser WebRTC privacy policies, enterprise restrictions, or future Private
+  Network Access rules constrain direct DataChannels from a public origin to
+  LAN/VM candidates?
+- What is the visible product distinction between "direct," "TURN-relayed," and
+  "application-proxied" dashboard transport?
+- What audit log should exist for passkey logins, daemon claims, step-up
+  approvals, and peer certificate issuance?
 
 ## HTTP endpoints
 
