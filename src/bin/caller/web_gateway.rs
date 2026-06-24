@@ -1498,6 +1498,10 @@ pub struct WebGatewayConfig {
     /// not browser config, so `/config` intentionally omits it.
     #[serde(skip)]
     pub peer_access_requests: crate::project::PeerAccessRequestConfig,
+    /// Experimental Connect rendezvous client config. This is daemon runtime
+    /// state, not browser config, so `/config` intentionally omits it.
+    #[serde(skip)]
+    pub connect: crate::project::ConnectConfig,
 }
 
 impl Default for WebGatewayConfig {
@@ -1513,6 +1517,7 @@ impl Default for WebGatewayConfig {
             ice_servers: Vec::new(),
             federation_allow_h264: false,
             peer_access_requests: crate::project::PeerAccessRequestConfig::default(),
+            connect: crate::project::ConnectConfig::default(),
         }
     }
 }
@@ -14641,6 +14646,10 @@ pub fn spawn_web_gateway(
         shared_session.clone(),
         project_root.clone(),
     ));
+    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
+        config.connect.clone(),
+        dashboard_control.clone(),
+    );
 
     // Build the local Agent Card from live runtime state so
     // `/.well-known/agent-card.json` can serve it. The transport URLs

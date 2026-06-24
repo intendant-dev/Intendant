@@ -305,6 +305,44 @@ ICE servers for the WebRTC display transport (see
 Each `ice_servers` entry: `urls` (array, required), optional `username`,
 optional `credential`.
 
+### `[connect]`
+
+Experimental Intendant Connect rendezvous client for public-origin dashboard
+bootstrap work. This is disabled by default and does **not** replace dashboard
+mTLS. When enabled, the daemon opens outbound requests to a rendezvous service
+that brokers WebRTC dashboard-control signaling; the browser still verifies the
+daemon-signed DataChannel binding before sending dashboard RPC.
+
+| Key | Type | Default | Description |
+|-----|------|---------|-------------|
+| `enabled` | bool | `false` | Enable outbound Connect rendezvous polling |
+| `rendezvous_url` | string | unset | Base URL of the Connect/rendezvous service |
+| `daemon_id` | string | daemon identity public key | Public daemon id at the rendezvous service |
+| `auth_token` | string | unset | Optional bearer token for service authentication; not dashboard authorization |
+| `poll_timeout_ms` | integer | `15000` | Long-poll timeout per daemon `/next` request |
+| `retry_delay_ms` | integer | `1000` | Delay after transient rendezvous errors |
+
+For local E2E without editing `intendant.toml`, the daemon also accepts
+environment overrides:
+
+```bash
+INTENDANT_CONNECT_RENDEZVOUS_URL=http://127.0.0.1:9876 \
+INTENDANT_CONNECT_DAEMON_ID=connect-e2e-daemon \
+  ./target/release/intendant --no-tui --web 8876
+```
+
+The committed validator starts that local rendezvous emulator itself:
+
+```bash
+PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
+  node scripts/validate-connect-rendezvous.cjs
+```
+
+The emulator intentionally has no account, passkey, claim-code, or durable
+device registry. It exists to prove the browser-public-origin → rendezvous →
+daemon-outbound-signaling → direct WebRTC DataChannel path while keeping the
+normal dashboard mTLS default in place.
+
 ### `[server]` (daemon and federation)
 
 What this daemon advertises to peers and requires of inbound connections. Most

@@ -6,6 +6,7 @@ mod audio_routing;
 mod autonomy;
 mod browser_workspace;
 mod computer_use;
+mod connect_rendezvous;
 mod context_rewind;
 mod control;
 mod control_plane;
@@ -33275,6 +33276,7 @@ async fn main() -> Result<(), CallerError> {
             project.config.webrtc.federation_allow_h264,
         );
         web_config.peer_access_requests = project.config.server.peer_access_requests.clone();
+        web_config.connect = project.config.connect.clone().effective_with_env();
         web_config.presence_enabled = runtime_presence_enabled;
         web_config.external_agent = initial_agent_backend
             .as_ref()
@@ -33514,6 +33516,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.federation_allow_h264,
             );
             config.peer_access_requests = project.config.server.peer_access_requests.clone();
+            config.connect = project.config.connect.clone().effective_with_env();
             config.presence_enabled = runtime_presence_enabled;
             config.external_agent = initial_agent_backend
                 .as_ref()
@@ -34124,6 +34127,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.federation_allow_h264,
             );
             config.peer_access_requests = project.config.server.peer_access_requests.clone();
+            config.connect = project.config.connect.clone().effective_with_env();
             config.presence_enabled = runtime_presence_enabled;
             config.external_agent = initial_agent_backend
                 .as_ref()
@@ -34676,6 +34680,7 @@ async fn main() -> Result<(), CallerError> {
                 project.config.webrtc.federation_allow_h264,
             );
             config.peer_access_requests = project.config.server.peer_access_requests.clone();
+            config.connect = project.config.connect.clone().effective_with_env();
             config.presence_enabled = runtime_presence_enabled;
             config.external_agent = initial_agent_backend
                 .as_ref()

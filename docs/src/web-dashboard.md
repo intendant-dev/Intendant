@@ -512,6 +512,40 @@ does not implement account login, passkeys, daemon claiming, or a durable daemon
 registry. Its job is to make the signaling boundary concrete and testable before
 moving the real SPA and hosted account UX onto that boundary.
 
+### Local Rendezvous Emulator Slice
+
+The next experimental slice moves signaling off the daemon-served page. A daemon
+can opt into an outbound rendezvous client with `[connect]` or the
+`INTENDANT_CONNECT_RENDEZVOUS_URL` environment variable. In that mode:
+
+1. The daemon registers a daemon id and daemon identity public key with a
+   rendezvous endpoint.
+2. The daemon long-polls the rendezvous endpoint for dashboard-control offers,
+   ICE candidates, and close requests.
+3. A browser loads a separate public-origin emulator page instead of a daemon
+   page.
+4. The emulator brokers SDP/ICE only; the browser and daemon still establish a
+   direct WebRTC DataChannel when ICE succeeds.
+5. The browser verifies the same daemon-signed binding before issuing RPC over
+   the channel.
+
+Run the end-to-end validator with:
+
+```bash
+PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
+  node scripts/validate-connect-rendezvous.cjs
+```
+
+That script starts a local rendezvous HTTP origin, launches a fresh daemon child
+with Connect env vars, verifies that `https://127.0.0.1:<daemon-port>/config`
+still rejects a certless request with `401`, then loads the browser from the
+rendezvous origin and drives `status`, `config`, `api_sessions`, and application
+error RPCs over the verified DataChannel.
+
+This still is not consumer Connect. It has no account, passkey, daemon claim,
+grant issuance, revocation, audit log, or hosted public HTTPS. It is the
+smallest complete signaling proof for the future hosted service boundary.
+
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
 The current dashboard access model is certificate-first: a remote browser
@@ -680,10 +714,14 @@ Treat this as a staged target, not current behavior:
 2. Define daemon identity keys, claim codes, Connect account binding, and
    revocation semantics.
 3. Host a public static dashboard shell with a placeholder sign-in/device model.
-4. Add daemon outbound signaling to Intendant Connect.
-5. Add a signaling rendezvous API keyed by browser session and daemon id.
+4. Add daemon outbound signaling to Intendant Connect. The local emulator now
+   exercises this shape without hosted auth.
+5. Add a signaling rendezvous API keyed by browser session and daemon id. The
+   local emulator implements the minimal offer/answer/ICE/close subset.
 6. Let a locally running daemon register/poll that rendezvous while it is online.
-7. Reuse the existing daemon binding and DataChannel RPC frame format.
+   The daemon now has a disabled-by-default outbound polling client.
+7. Reuse the existing daemon binding and DataChannel RPC frame format. This is
+   shared by the direct local bootstrap and rendezvous-emulator slices.
 8. Add visible transport status: disconnected, mTLS HTTP fallback, WebRTC direct,
    WebRTC relayed, failed verification, or application-proxied.
 9. Carry peer access-request approve/deny over the DataChannel with passkey

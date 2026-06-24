@@ -546,6 +546,10 @@ pub struct ProjectConfig {
     pub live_audio: LiveAudioConfig,
     #[serde(default)]
     pub webrtc: WebRtcConfig,
+    /// Experimental public-origin dashboard bootstrap/rendezvous client.
+    /// Disabled by default; see [`ConnectConfig`].
+    #[serde(default)]
+    pub connect: ConnectConfig,
     /// `[server]` section in intendant.toml — daemon-level settings
     /// for what this Intendant advertises to peers. See [`ServerConfig`].
     #[serde(default)]
@@ -562,6 +566,92 @@ pub struct ProjectConfig {
     /// not written back to `intendant.toml` automatically.
     #[serde(default, rename = "peer")]
     pub peers: Vec<PeerConfig>,
+}
+
+/// Experimental Intendant Connect rendezvous client configuration.
+///
+/// This does not replace mTLS dashboard access. When enabled, the daemon opens
+/// outbound HTTP(S) requests to a rendezvous service that brokers WebRTC
+/// dashboard-control signaling. The browser still has to verify the
+/// daemon-signed WebRTC binding before using the DataChannel.
+///
+/// Example:
+/// ```toml
+/// [connect]
+/// enabled = true
+/// rendezvous_url = "https://connect.intendant.dev"
+/// daemon_id = "my-laptop"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectConfig {
+    /// Master switch. Environment variable
+    /// `INTENDANT_CONNECT_RENDEZVOUS_URL` also enables the client for local
+    /// E2E runs without editing `intendant.toml`.
+    #[serde(default)]
+    pub enabled: bool,
+    /// Base URL for the rendezvous service.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rendezvous_url: Option<String>,
+    /// Public, path/query-safe daemon id at the rendezvous service. When unset,
+    /// the daemon identity public key is used.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub daemon_id: Option<String>,
+    /// Optional bearer token for the rendezvous service. This is only a service
+    /// authentication hook; it is not dashboard authorization.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auth_token: Option<String>,
+    /// Long-poll timeout per `/next` request.
+    #[serde(default = "default_connect_poll_timeout_ms")]
+    pub poll_timeout_ms: u64,
+    /// Delay after transient rendezvous errors.
+    #[serde(default = "default_connect_retry_delay_ms")]
+    pub retry_delay_ms: u64,
+}
+
+impl ConnectConfig {
+    pub fn effective_with_env(mut self) -> Self {
+        if let Ok(url) = std::env::var("INTENDANT_CONNECT_RENDEZVOUS_URL") {
+            let url = url.trim().to_string();
+            if !url.is_empty() {
+                self.enabled = true;
+                self.rendezvous_url = Some(url);
+            }
+        }
+        if let Ok(id) = std::env::var("INTENDANT_CONNECT_DAEMON_ID") {
+            let id = id.trim().to_string();
+            if !id.is_empty() {
+                self.daemon_id = Some(id);
+            }
+        }
+        if let Ok(token) = std::env::var("INTENDANT_CONNECT_TOKEN") {
+            let token = token.trim().to_string();
+            if !token.is_empty() {
+                self.auth_token = Some(token);
+            }
+        }
+        self
+    }
+}
+
+impl Default for ConnectConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            rendezvous_url: None,
+            daemon_id: None,
+            auth_token: None,
+            poll_timeout_ms: default_connect_poll_timeout_ms(),
+            retry_delay_ms: default_connect_retry_delay_ms(),
+        }
+    }
+}
+
+fn default_connect_poll_timeout_ms() -> u64 {
+    15_000
+}
+
+fn default_connect_retry_delay_ms() -> u64 {
+    1_000
 }
 
 /// Daemon-level settings for what this Intendant advertises to peers
