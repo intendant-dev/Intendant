@@ -4238,7 +4238,7 @@ body.context-focus-active {
 }
 .sessions-toolbar {
   display: grid;
-  grid-template-columns: minmax(220px, 1fr) auto auto auto minmax(210px, auto);
+  grid-template-columns: minmax(220px, 1fr) auto auto auto auto minmax(210px, auto);
   align-items: end;
   gap: 8px;
 }
@@ -4277,6 +4277,11 @@ body.context-focus-active {
 }
 .sessions-project-filter {
   min-width: 180px;
+}
+.sessions-subagent-toggle {
+  min-width: 124px;
+  height: 28px;
+  align-self: end;
 }
 .sessions-multi-filter-btn {
   height: 28px;
@@ -9610,6 +9615,10 @@ body.display-fullscreen-open {
                     <label><input type="checkbox" value="interrupted"> Interrupted</label>
                   </div>
                 </div>
+                <label class="sessions-control sessions-toggle sessions-subagent-toggle" title="Include child agent sessions in Recent">
+                  <input type="checkbox" id="sessions-show-subagents">
+                  <span>Show subagents</span>
+                </label>
                 <label class="sessions-sort">Sort
                   <select id="sort-sessions">
                     <option value="updated-desc" selected>Date changed (newest)</option>
@@ -10863,6 +10872,7 @@ const HOST_FILTER_KEY = 'intendant_host_filter';
 const SESSIONS_FILTER_PROJECT_KEY = 'intendant_sessions_filter_project';
 const SESSIONS_FILTER_SOURCE_KEY = 'intendant_sessions_filter_source';
 const SESSIONS_FILTER_STATUS_KEY = 'intendant_sessions_filter_status';
+const SESSIONS_SHOW_SUBAGENTS_KEY = 'intendant_sessions_show_subagents';
 const SESSIONS_DEEP_FILTER_PROJECT_KEY = 'intendant_sessions_deep_filter_project';
 const SESSIONS_DEEP_FILTER_SOURCE_KEY = 'intendant_sessions_deep_filter_source';
 const SESSIONS_DEEP_FILTER_STATUS_KEY = 'intendant_sessions_deep_filter_status';
@@ -23318,6 +23328,10 @@ function normalizeSessionWindowMeta(meta = {}) {
   if (parentId) out.parentId = parentId;
   const relationshipRaw = meta.relationship_kind || meta.relationshipKind || meta.relationship;
   if (relationshipRaw) out.relationshipKind = normalizeSessionRelationshipKind(relationshipRaw);
+  const threadSource = compactSessionText(meta.thread_source || meta.threadSource);
+  if (threadSource) out.threadSource = threadSource.toLowerCase().replace(/_/g, '-');
+  const agentNickname = compactSessionText(meta.agent_nickname || meta.agentNickname);
+  if (agentNickname) out.agentNickname = agentNickname;
   const relationshipEphemeral = meta.relationship_ephemeral ?? meta.relationshipEphemeral ?? meta.ephemeral;
   if (relationshipEphemeral !== undefined) out.relationshipEphemeral = !!relationshipEphemeral;
   if (meta.phase) out.phase = meta.phase;
@@ -23351,6 +23365,8 @@ function sessionWindowMetadataSignature(meta = {}) {
     sessionGoalSignature(meta.goal),
     meta.parentId || '',
     meta.relationshipKind || '',
+    meta.threadSource || '',
+    meta.agentNickname || '',
     meta.relationshipEphemeral === undefined ? '' : (meta.relationshipEphemeral ? '1' : '0'),
     meta.phase || '',
     meta.ended === undefined ? '' : (meta.ended ? '1' : '0'),
@@ -23515,6 +23531,10 @@ function sessionWindowMetaFromSession(session) {
     codex_managed_context: session.codex_managed_context,
     codex_context_archive: session.codex_context_archive,
     capabilities: session.capabilities,
+    parent_session_id: session.parent_session_id || session.parent_id,
+    relationship_kind: session.relationship_kind || session.relationship,
+    thread_source: session.thread_source,
+    agent_nickname: session.agent_nickname,
   };
   if (
     Object.prototype.hasOwnProperty.call(session, 'goal') ||
@@ -26408,7 +26428,8 @@ function updateSessionWindowActionMenuVisibility(sessionId) {
 }
 
 function normalizeSessionRelationshipKind(value) {
-  const kind = String(value || '').trim().toLowerCase();
+  const kind = String(value || '').trim().toLowerCase().replace(/_/g, '-');
+  if (kind === 'sub-agent') return 'subagent';
   return SESSION_RELATIONSHIP_KINDS.has(kind) ? kind : 'fork';
 }
 
@@ -35956,6 +35977,10 @@ function restoreClientToggles() {
   restoreSessionMultiFilter('status');
   restoreSessionMultiFilter('deep-source');
   restoreSessionMultiFilter('deep-status');
+  const showSubagentsToggle = document.getElementById('sessions-show-subagents');
+  if (showSubagentsToggle) {
+    showSubagentsToggle.checked = localStorage.getItem(SESSIONS_SHOW_SUBAGENTS_KEY) === 'true';
+  }
 
   // Host filter (Activity tab). The dropdown's option list is built
   // later by refreshHostFilterOptions() — that function reads from
@@ -43912,6 +43937,36 @@ function eventRefreshesSessionMetadata(eventName) {
   }
 }
 
+function sessionsShowSubagents() {
+  return document.getElementById('sessions-show-subagents')?.checked === true;
+}
+
+function normalizeSessionThreadSourceValue(value) {
+  return String(value || '').trim().toLowerCase().replace(/_/g, '-');
+}
+
+function sessionRelationshipKindForRow(session, meta = null) {
+  const rowMeta = meta || sessionConfigMetadata(session);
+  const relationshipRaw =
+    rowMeta.relationshipKind ||
+    rowMeta.relationship_kind ||
+    session?.relationship_kind ||
+    session?.relationshipKind ||
+    session?.relationship ||
+    '';
+  if (relationshipRaw) return normalizeSessionRelationshipKind(relationshipRaw);
+  const threadSource = normalizeSessionThreadSourceValue(
+    rowMeta.threadSource ||
+    rowMeta.thread_source ||
+    session?.thread_source ||
+    session?.threadSource ||
+    ''
+  );
+  if (threadSource === 'subagent' || threadSource === 'sub-agent') return 'subagent';
+  if (threadSource === 'side' || threadSource === 'fork') return threadSource;
+  return '';
+}
+
 function renderSessionsViews() {
   if (activeSessionsSubtab === 'recent') {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-list'), {
@@ -43922,6 +43977,7 @@ function renderSessionsViews() {
       statusFilter: sessionStatusFilterValue(),
       sortValue: document.getElementById('sort-sessions')?.value || 'updated-desc',
       deepSearchOnly: false,
+      hideSubagents: !sessionsShowSubagents(),
     });
   } else if (activeSessionsSubtab === 'deep') {
     renderSessionsList(_cachedSessions, document.getElementById('sessions-deep-list'), {
@@ -44211,6 +44267,10 @@ document.addEventListener('keydown', (ev) => {
 });
 document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
+document.getElementById('sessions-show-subagents')?.addEventListener('change', (ev) => {
+  localStorage.setItem(SESSIONS_SHOW_SUBAGENTS_KEY, String(!!ev.target.checked));
+  _refilterSessions();
+});
 document.getElementById('sort-sessions-deep')?.addEventListener('change', _refilterSessions);
 document.getElementById('sessions-deep-result-search')?.addEventListener('input', _refilterSessions);
 document.getElementById('sessions-deep-search-run')?.addEventListener('click', () => runSessionDeepSearch());
@@ -44659,6 +44719,10 @@ function sessionSearchText(session, displayStatus, source, shortId, isCurrent) {
     session.source_label,
     prettyAgentName(source),
     session.role,
+    session.relationship_kind,
+    session.relationship,
+    session.thread_source,
+    session.agent_nickname,
     isCurrent ? 'current' : '',
     session.provider,
     session.model,
@@ -44785,6 +44849,8 @@ function renderSessionsList(sessions, el, options = {}) {
   const statusFilter = options.statusFilter || [];
   const hasProjectFilter = Array.isArray(projectFilter) ? projectFilter.length > 0 : !!projectFilter;
   const deepSearchActive = deepSearchOnly && _sessionDeepSearch.active;
+  const hideSubagents = !!options.hideSubagents;
+  let hiddenSubagentCount = 0;
   let matchedCount = 0;
   let renderedCount = 0;
   const fragment = document.createDocumentFragment();
@@ -44792,6 +44858,7 @@ function renderSessionsList(sessions, el, options = {}) {
   for (const s of sorted) {
     const configMeta = sessionConfigMetadata(s);
     const configSource = sessionConfigSource(configMeta);
+    const relationshipKind = sessionRelationshipKindForRow(s, configMeta);
     const rawSource = normalizeAgentId(s.source || '') || 'intendant';
     const backendSource = normalizeAgentId(
       s.backend_source ||
@@ -44831,6 +44898,10 @@ function renderSessionsList(sessions, el, options = {}) {
     if (!summaryMatch) continue;
     const logHit = deepSearchOnly ? sessionDeepSearchHit(s, source) : null;
     if (deepSearchActive && !logHit) continue;
+    if (hideSubagents && relationshipKind === 'subagent') {
+      hiddenSubagentCount += 1;
+      continue;
+    }
 
     matchedCount += 1;
     if (renderedCount >= SESSION_CARD_RENDER_LIMIT) continue;
@@ -44900,6 +44971,17 @@ function renderSessionsList(sessions, el, options = {}) {
       roleEl.className = 'sc-role';
       roleEl.textContent = s.role;
       top.appendChild(roleEl);
+    }
+
+    if (relationshipKind) {
+      const relationEl = document.createElement('span');
+      relationEl.className = 'sc-role';
+      relationEl.textContent = relationshipKind === 'subagent' ? 'subagent' : relationshipKind;
+      const nickname = compactSessionText(configMeta.agentNickname || s.agent_nickname || s.agentNickname);
+      relationEl.title = nickname
+        ? `${relationEl.textContent} ${nickname}`
+        : `${relationEl.textContent} session`;
+      top.appendChild(relationEl);
     }
 
     if (isCurrent) {
@@ -45197,6 +45279,8 @@ function renderSessionsList(sessions, el, options = {}) {
       ? 'No sessions match your search'
       : hasProjectFilter
       ? 'No sessions match the selected projects'
+      : hiddenSubagentCount > 0
+      ? 'No main sessions found. Subagent sessions are hidden from Recent.'
       : 'No sessions match the active filters';
     el.appendChild(empty);
   } else {

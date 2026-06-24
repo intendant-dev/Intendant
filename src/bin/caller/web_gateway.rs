@@ -164,6 +164,69 @@ struct SessionListRowCacheEntry {
     row: serde_json::Value,
 }
 
+#[derive(Clone, Debug, Default)]
+struct SessionLineageMetadata {
+    parent_id: Option<String>,
+    relationship: Option<String>,
+    thread_source: Option<String>,
+    agent_nickname: Option<String>,
+}
+
+impl SessionLineageMetadata {
+    fn merge_missing_from(&mut self, other: SessionLineageMetadata) {
+        if self.parent_id.is_none() {
+            self.parent_id = other.parent_id;
+        }
+        if self.relationship.is_none() {
+            self.relationship = other.relationship;
+        }
+        if self.thread_source.is_none() {
+            self.thread_source = other.thread_source;
+        }
+        if self.agent_nickname.is_none() {
+            self.agent_nickname = other.agent_nickname;
+        }
+    }
+
+    fn apply_to_session_json(&self, session: &mut serde_json::Value) {
+        let Some(obj) = session.as_object_mut() else {
+            return;
+        };
+        if let Some(parent_id) = self.parent_id.as_deref().filter(|s| !s.is_empty()) {
+            obj.insert(
+                "parent_session_id".to_string(),
+                serde_json::Value::String(parent_id.to_string()),
+            );
+            obj.insert(
+                "parent_id".to_string(),
+                serde_json::Value::String(parent_id.to_string()),
+            );
+        }
+        if let Some(relationship) = self.relationship.as_deref().filter(|s| !s.is_empty()) {
+            obj.insert(
+                "relationship_kind".to_string(),
+                serde_json::Value::String(relationship.to_string()),
+            );
+            obj.insert(
+                "relationship".to_string(),
+                serde_json::Value::String(relationship.to_string()),
+            );
+        }
+        if let Some(thread_source) = self.thread_source.as_deref().filter(|s| !s.is_empty()) {
+            obj.insert(
+                "thread_source".to_string(),
+                serde_json::Value::String(thread_source.to_string()),
+            );
+        }
+        if let Some(agent_nickname) = self.agent_nickname.as_deref().filter(|s| !s.is_empty()) {
+            obj.insert(
+                "agent_nickname".to_string(),
+                serde_json::Value::String(agent_nickname.to_string()),
+            );
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 struct CodexSessionListSummary {
     id: String,
@@ -171,7 +234,7 @@ struct CodexSessionListSummary {
     session_cwd: Option<String>,
     effective_cwd: Option<String>,
     model: Option<String>,
-    parent_id: Option<String>,
+    lineage: SessionLineageMetadata,
     provider: Option<String>,
     usage: SessionUsage,
     usage_events: Vec<CodexUsageEvent>,
@@ -4919,6 +4982,73 @@ fn codex_thread_display_name(value: Option<String>) -> Option<String> {
         .map(|s| compact_text(&s, 180))
 }
 
+fn normalize_session_thread_source(value: &str) -> Option<String> {
+    let normalized = value.trim().to_lowercase().replace('_', "-");
+    if normalized.is_empty() {
+        None
+    } else {
+        Some(normalized)
+    }
+}
+
+fn normalize_session_relationship_kind(value: &str) -> Option<String> {
+    match value.trim().to_lowercase().replace('_', "-").as_str() {
+        "side" => Some("side".to_string()),
+        "fork" => Some("fork".to_string()),
+        "subagent" | "sub-agent" => Some("subagent".to_string()),
+        _ => None,
+    }
+}
+
+fn relationship_from_thread_source(
+    thread_source: Option<&str>,
+    parent_id: Option<&str>,
+) -> Option<String> {
+    let source = thread_source.and_then(normalize_session_thread_source)?;
+    match source.as_str() {
+        "subagent" => Some("subagent".to_string()),
+        "side" => Some("side".to_string()),
+        "fork" => Some("fork".to_string()),
+        _ if parent_id.is_some_and(|id| !id.trim().is_empty()) => Some("fork".to_string()),
+        _ => None,
+    }
+}
+
+fn codex_thread_source_from_payload(payload: &serde_json::Value) -> Option<String> {
+    if let Some(source) =
+        value_str(payload, "thread_source").and_then(|s| normalize_session_thread_source(&s))
+    {
+        return Some(source);
+    }
+    if payload.pointer("/source/subagent").is_some() {
+        return Some("subagent".to_string());
+    }
+    None
+}
+
+fn session_lineage_from_codex_payload(payload: &serde_json::Value) -> SessionLineageMetadata {
+    let subagent_spawn = payload.pointer("/source/subagent/thread_spawn");
+    let parent_id = value_str(payload, "forked_from_id")
+        .or_else(|| value_str(payload, "parent_thread_id"))
+        .or_else(|| subagent_spawn.and_then(|spawn| value_str(spawn, "parent_thread_id")))
+        .or_else(|| subagent_spawn.and_then(|spawn| value_str(spawn, "parent_session_id")))
+        .or_else(|| subagent_spawn.and_then(|spawn| value_str(spawn, "parent_id")));
+    let thread_source = codex_thread_source_from_payload(payload);
+    let relationship = value_str(payload, "relationship")
+        .or_else(|| value_str(payload, "relationship_kind"))
+        .and_then(|value| normalize_session_relationship_kind(&value))
+        .or_else(|| {
+            relationship_from_thread_source(thread_source.as_deref(), parent_id.as_deref())
+        });
+    SessionLineageMetadata {
+        parent_id,
+        relationship,
+        thread_source,
+        agent_nickname: value_str(payload, "agent_nickname")
+            .or_else(|| subagent_spawn.and_then(|spawn| value_str(spawn, "agent_nickname"))),
+    }
+}
+
 fn push_external_transcript_entry(
     entries: &mut Vec<serde_json::Value>,
     provider_source: &str,
@@ -6140,7 +6270,7 @@ fn codex_parent_baseline_for_summary(
     usage_events_by_id: &HashMap<String, Vec<CodexUsageEvent>>,
     exact_parent_baselines: &HashMap<(String, i64), Option<SessionUsage>>,
 ) -> Option<SessionUsage> {
-    let Some(parent_id) = summary.parent_id.as_deref() else {
+    let Some(parent_id) = summary.lineage.parent_id.as_deref() else {
         return None;
     };
 
@@ -6203,7 +6333,7 @@ struct CodexSessionListAccumulator {
     turn_cwd: Option<String>,
     command_cwd: Option<String>,
     model: Option<String>,
-    forked_from_id: Option<String>,
+    lineage: SessionLineageMetadata,
     provider: Option<String>,
     usage: SessionUsage,
     usage_events: Vec<CodexUsageEvent>,
@@ -6235,10 +6365,8 @@ impl CodexSessionListAccumulator {
             "session_meta" => {
                 if let Some(payload) = obj.get("payload") {
                     self.id = self.id.take().or_else(|| value_str(payload, "id"));
-                    self.forked_from_id = self
-                        .forked_from_id
-                        .take()
-                        .or_else(|| value_str(payload, "forked_from_id"));
+                    self.lineage
+                        .merge_missing_from(session_lineage_from_codex_payload(payload));
                     self.created_at = self
                         .created_at
                         .take()
@@ -6372,7 +6500,7 @@ impl CodexSessionListAccumulator {
             session_cwd: self.session_cwd,
             effective_cwd,
             model: self.model,
-            parent_id: self.forked_from_id,
+            lineage: self.lineage,
             provider: self.provider,
             usage: self.usage,
             usage_events: self.usage_events,
@@ -6544,7 +6672,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
         if let Some(model) = summary.model.clone() {
             model_by_id.insert(id.clone(), model);
         }
-        if let Some(parent_id) = summary.parent_id.clone() {
+        if let Some(parent_id) = summary.lineage.parent_id.clone() {
             parent_by_id.insert(id.clone(), parent_id);
         }
         usage_events_by_id.insert(id, summary.usage_events.clone());
@@ -6554,7 +6682,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
 
     let mut parent_cutoffs_by_id: HashMap<String, Vec<i64>> = HashMap::new();
     for (_, summary) in &summaries {
-        let Some(parent_id) = summary.parent_id.as_ref() else {
+        let Some(parent_id) = summary.lineage.parent_id.as_ref() else {
             continue;
         };
         let Some(parent_path) = path_by_id.get(parent_id) else {
@@ -6643,6 +6771,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             Some(path.to_string_lossy().to_string()),
             summary.bytes,
         );
+        summary.lineage.apply_to_session_json(&mut session);
         let parent_baseline = codex_parent_baseline_for_summary(
             &summary,
             &usage_events_by_id,
@@ -6652,7 +6781,7 @@ fn list_codex_sessions_with_limit(home: &Path, scan_limit: usize) -> Vec<serde_j
             .map(|baseline| summary.usage.saturating_sub(baseline))
             .unwrap_or(summary.usage);
         apply_session_usage(&mut session, usage, summary.model.as_deref());
-        let daily_usage = if summary.parent_id.is_some() {
+        let daily_usage = if summary.lineage.parent_id.is_some() {
             codex_daily_usage_from_events(&summary, parent_baseline)
         } else {
             summary.daily_usage.clone()
@@ -24418,6 +24547,78 @@ mod tests {
         assert_eq!(
             session.get("task").and_then(|v| v.as_str()),
             Some("Fix activity replay")
+        );
+    }
+
+    #[test]
+    fn list_codex_sessions_marks_subagent_lineage() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
+        let home = tempfile::tempdir().unwrap();
+        let sessions_dir = home
+            .path()
+            .join(".codex")
+            .join("sessions")
+            .join("2026")
+            .join("06")
+            .join("24");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let parent_id = "019ef734-parent-thread";
+        let child_id = "019ef734-child-thread";
+        let lines = [
+            serde_json::json!({
+                "timestamp": "2026-06-24T01:18:11Z",
+                "type": "session_meta",
+                "payload": {
+                    "id": child_id,
+                    "timestamp": "2026-06-24T01:18:09Z",
+                    "cwd": "/repo",
+                    "source": {
+                        "subagent": {
+                            "thread_spawn": {
+                                "parent_thread_id": parent_id,
+                                "agent_nickname": "Zeno"
+                            }
+                        }
+                    }
+                }
+            }),
+            serde_json::json!({
+                "timestamp": "2026-06-24T01:18:12Z",
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": "Run child lane"}
+            }),
+        ];
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-06-24T01-18-09-{child_id}.jsonl")),
+            lines
+                .iter()
+                .map(serde_json::Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let sessions = list_codex_sessions(home.path());
+        let session = sessions
+            .iter()
+            .find(|s| s.get("session_id").and_then(|v| v.as_str()) == Some(child_id))
+            .expect("codex subagent session should be listed");
+        assert_eq!(
+            session.get("parent_session_id").and_then(|v| v.as_str()),
+            Some(parent_id)
+        );
+        assert_eq!(
+            session.get("relationship_kind").and_then(|v| v.as_str()),
+            Some("subagent")
+        );
+        assert_eq!(
+            session.get("thread_source").and_then(|v| v.as_str()),
+            Some("subagent")
+        );
+        assert_eq!(
+            session.get("agent_nickname").and_then(|v| v.as_str()),
+            Some("Zeno")
         );
     }
 
