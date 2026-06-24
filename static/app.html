@@ -157,6 +157,7 @@ html {
 .status-bar .provider,
 .status-bar .model,
 .status-bar .session,
+.status-bar #sb-dashboard-transport-label,
 .status-bar #sb-voice-label {
   overflow: hidden;
   text-overflow: ellipsis;
@@ -178,6 +179,13 @@ html {
 .status-bar #sb-voice-label {
   display: inline-block;
   max-width: 96px;
+  vertical-align: bottom;
+}
+.status-bar #sb-dashboard-transport-label {
+  display: inline-block;
+  color: var(--overlay0);
+  font-size: 11px;
+  max-width: 68px;
   vertical-align: bottom;
 }
 .status-bar .autonomy { font-weight: 600; }
@@ -245,6 +253,7 @@ html {
   flex-shrink: 0;
 }
 .conn-dot.ok { background: var(--green); }
+.conn-dot.warn { background: var(--yellow); }
 .conn-dot.err { background: var(--red); }
 
 /* Group wrapper for status-bar dot + label pairs. Each group is an
@@ -8769,6 +8778,11 @@ body.display-fullscreen-open {
       <span class="field-label">ws</span>
       <span class="conn-dot err" id="sb-conn"></span>
     </span>
+    <span class="sb-dot-group" id="sb-dashboard-transport" title="Dashboard control transport">
+      <span class="field-label">dashboard</span>
+      <span class="conn-dot ok" id="sb-dashboard-transport-dot"></span>
+      <span id="sb-dashboard-transport-label">mTLS</span>
+    </span>
     <span class="sb-dot-group" title="Live model connection (voice + video — Gemini Live / OpenAI Realtime)">
       <span class="field-label">live</span>
       <span class="voice-dot" id="sb-voice"></span>
@@ -11101,6 +11115,7 @@ let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
 let dashboardControlEventsActive = false;
+let dashboardControlLastError = '';
 const DASHBOARD_EVENT_DEDUPE_MS = 2000;
 const dashboardRecentServerMessageKeys = new Map();
 
@@ -18216,6 +18231,7 @@ async function main() {
   // Connection state indicator
   app.set_on_server_state((connected) => {
     document.getElementById('sb-conn').className = connected ? 'conn-dot ok' : 'conn-dot err';
+    dashboardUpdateTransportStatus();
     if (connected) {
       clearServerWebSocketErrorStatus();
       // Fresh WS sessions start unsubscribed on the server. Reassert
@@ -36382,6 +36398,69 @@ function dashboardControlTransportEnabled() {
   }
 }
 
+function dashboardSetControlLastError(message = '') {
+  dashboardControlLastError = String(message || '').trim();
+}
+
+function dashboardUpdateTransportStatus() {
+  const group = document.getElementById('sb-dashboard-transport');
+  const dot = document.getElementById('sb-dashboard-transport-dot');
+  const label = document.getElementById('sb-dashboard-transport-label');
+  if (!group || !dot || !label) return;
+  const status = dashboardTransport?.status
+    ? dashboardTransport.status()
+    : { enabled: dashboardControlTransportEnabled(), connected: false };
+  const summary = dashboardTransportStatusSummary(status);
+  dot.className = `conn-dot ${summary.kind}`;
+  label.textContent = summary.label;
+  group.title = summary.title;
+}
+
+function dashboardTransportStatusSummary(status = {}) {
+  if (!status.enabled) {
+    const directMode = location.protocol === 'https:' ? 'mTLS' : 'HTTP';
+    return {
+      kind: 'ok',
+      label: directMode,
+      title: `Dashboard control uses direct ${directMode} REST/WebSocket transport. WebRTC control is disabled.`,
+    };
+  }
+
+  const pcState = String(status.pcState || '').toLowerCase();
+  const channelState = String(status.channelState || '').toLowerCase();
+  const lastError = String(status.lastError || status.error || '').trim();
+  if (lastError || pcState === 'failed' || pcState === 'closed' || channelState === 'closed') {
+    return {
+      kind: 'err',
+      label: 'failed',
+      title: `Dashboard WebRTC control failed${lastError ? `: ${lastError}` : ''}. HTTP/mTLS fallback remains available for supported calls.`,
+    };
+  }
+
+  if (status.connected && status.verifiedBinding?.ok && channelState === 'open') {
+    const route = String(status.iceRoute || status.route || '').toLowerCase();
+    const relayed = route === 'relay';
+    const routeLabel = relayed ? 'relay' : 'WebRTC';
+    const routeDetail = route
+      ? `ICE route: ${route}${status.iceCandidatePair ? ` (${status.iceCandidatePair})` : ''}.`
+      : 'ICE route not reported by browser stats.';
+    return {
+      kind: relayed ? 'warn' : 'ok',
+      label: routeLabel,
+      title: `Dashboard RPC uses verified ${relayed ? 'TURN-relayed' : 'direct'} WebRTC DataChannel. ${routeDetail} Events ${status.eventsActive ? 'active' : 'not active'}.`,
+    };
+  }
+
+  const phase = status.verifiedBinding?.ok
+    ? 'verified; waiting for WebRTC connection'
+    : (status.sessionId ? 'answer received; verifying binding' : 'signaling');
+  return {
+    kind: 'warn',
+    label: 'checking',
+    title: `Dashboard WebRTC control is ${phase}. Current state: pc=${pcState || 'new'}, channel=${channelState || 'new'}.`,
+  };
+}
+
 class DashboardTransport {
   enabled() {
     return dashboardControlTransportEnabled();
@@ -36392,21 +36471,31 @@ class DashboardTransport {
     if (!app || !app.send_server_action || !window.RTCPeerConnection) return;
     if (dashboardControlTransport) return;
     dashboardControlTransport = new DashboardControlTransport();
+    dashboardSetControlLastError('');
+    dashboardUpdateTransportStatus();
     dashboardControlTransport.connect().catch(err => {
       console.warn('[dashboard-control] connect failed', err);
+      dashboardSetControlLastError(err?.message || String(err));
+      if (dashboardControlTransport) {
+        dashboardControlTransport.lastError = dashboardControlLastError;
+      }
+      dashboardUpdateTransportStatus();
       dashboardControlTransport = null;
     });
   }
 
   enableControl() {
+    dashboardSetControlLastError('');
     localStorage.setItem(DASHBOARD_TRANSPORT_KEY, 'webrtc-control');
     location.reload();
   }
 
   disableControl() {
+    dashboardSetControlLastError('');
     localStorage.removeItem(DASHBOARD_TRANSPORT_KEY);
     dashboardControlTransport?.close();
     dashboardControlTransport = null;
+    dashboardUpdateTransportStatus();
     location.reload();
   }
 
@@ -36414,6 +36503,7 @@ class DashboardTransport {
     return dashboardControlTransport?.debugStatus() || {
       enabled: this.enabled(),
       connected: false,
+      lastError: dashboardControlLastError,
     };
   }
 
@@ -36493,6 +36583,7 @@ class DashboardTransport {
 }
 
 dashboardTransport = new DashboardTransport();
+dashboardUpdateTransportStatus();
 
 function maybeStartDashboardControlTransport() {
   dashboardTransport.startControl();
@@ -36546,18 +36637,32 @@ class DashboardControlTransport {
     this.verifiedBinding = null;
     this.localOfferSdp = '';
     this.lastStatus = null;
+    this.lastError = '';
+    this.iceRoute = '';
+    this.iceCandidatePair = '';
     this.pendingIce = [];
     this.pending = new Map();
     this.seq = 0;
   }
 
   async connect() {
+    this.lastError = '';
+    dashboardSetControlLastError('');
+    dashboardUpdateTransportStatus();
     const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
     this.pc = new RTCPeerConnection({ iceServers });
     this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
     this.channel.onopen = () => this.handleOpen();
     this.channel.onmessage = ev => this.handleMessage(ev.data);
-    this.channel.onclose = () => console.info('[dashboard-control] channel closed');
+    this.channel.onclose = () => {
+      console.info('[dashboard-control] channel closed');
+      dashboardUpdateTransportStatus();
+    };
+    this.channel.onerror = () => {
+      this.lastError = 'DataChannel error';
+      dashboardSetControlLastError(this.lastError);
+      dashboardUpdateTransportStatus();
+    };
     this.pc.onicecandidate = ev => {
       if (!ev.candidate) return;
       const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
@@ -36569,10 +36674,17 @@ class DashboardControlTransport {
     };
     this.pc.onconnectionstatechange = () => {
       console.info('[dashboard-control] pc state', this.pc.connectionState);
+      this.refreshIceRoute().catch(err => console.debug('[dashboard-control] route stats failed', err));
+      dashboardUpdateTransportStatus();
+    };
+    this.pc.oniceconnectionstatechange = () => {
+      this.refreshIceRoute().catch(err => console.debug('[dashboard-control] ICE route stats failed', err));
+      dashboardUpdateTransportStatus();
     };
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
     this.localOfferSdp = offer.sdp || '';
+    dashboardUpdateTransportStatus();
     this.sendSignal({ t: 'dashboard_control_offer', sdp: offer.sdp });
   }
 
@@ -36586,6 +36698,9 @@ class DashboardControlTransport {
       answer.sdp || ''
     );
     if (!verification.ok) {
+      this.lastError = verification.error || 'binding verification failed';
+      dashboardSetControlLastError(this.lastError);
+      dashboardUpdateTransportStatus();
       this.close();
       throw new Error(`dashboard control binding rejected: ${verification.error || 'unknown'}`);
     }
@@ -36594,6 +36709,8 @@ class DashboardControlTransport {
     for (const candidate of this.pendingIce.splice(0)) {
       this.sendSignal({ t: 'dashboard_control_ice', session_id: this.sessionId, candidate });
     }
+    this.refreshIceRoute().catch(() => {});
+    dashboardUpdateTransportStatus();
   }
 
   async handleIceCandidate(candidate) {
@@ -36607,16 +36724,24 @@ class DashboardControlTransport {
 
   handleError(error) {
     console.warn('[dashboard-control] signaling error', error);
+    this.lastError = String(error || 'signaling error');
+    dashboardSetControlLastError(this.lastError);
+    dashboardUpdateTransportStatus();
     this.close();
   }
 
   handleOpen() {
+    this.lastError = '';
+    dashboardSetControlLastError('');
+    this.refreshIceRoute().catch(() => {});
+    dashboardUpdateTransportStatus();
     this.sendFrame({ t: 'hello', id: this.nextId() });
     this.ping().catch(() => {});
     this.request('status').then(status => {
       if (status && typeof status === 'object') {
         this.lastStatus = status;
         console.info('[dashboard-control] status RPC ok', status.session_id || '');
+        dashboardUpdateTransportStatus();
       }
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
@@ -36629,6 +36754,7 @@ class DashboardControlTransport {
         dashboardControlEventsActive = true;
         dashboardRecentServerMessageKeys.clear();
         console.info('[dashboard-control] event stream subscribed');
+        dashboardUpdateTransportStatus();
       }
     }).catch(err => console.warn('[dashboard-control] event subscribe failed', err));
   }
@@ -36655,6 +36781,7 @@ class DashboardControlTransport {
     }
     if (msg.t === 'event_gap') {
       console.warn('[dashboard-control] event gap', msg.skipped || 0);
+      dashboardUpdateTransportStatus();
       return;
     }
     if (msg.t === 'pong' || msg.t === 'response') {
@@ -36746,6 +36873,37 @@ class DashboardControlTransport {
     if (app && app.send_server_action) app.send_server_action(frame);
   }
 
+  async refreshIceRoute() {
+    if (!this.pc || this.pc.connectionState !== 'connected') return;
+    const stats = await this.pc.getStats();
+    let selectedPair = null;
+    stats.forEach(report => {
+      if (report.type === 'transport' && report.selectedCandidatePairId) {
+        selectedPair = stats.get(report.selectedCandidatePairId) || selectedPair;
+      }
+    });
+    if (!selectedPair) {
+      stats.forEach(report => {
+        if (
+          report.type === 'candidate-pair' &&
+          (report.selected || report.nominated) &&
+          (!report.state || report.state === 'succeeded')
+        ) {
+          selectedPair = report;
+        }
+      });
+    }
+    if (!selectedPair) return;
+    const local = stats.get(selectedPair.localCandidateId);
+    const remote = stats.get(selectedPair.remoteCandidateId);
+    const localType = String(local?.candidateType || '').toLowerCase();
+    const remoteType = String(remote?.candidateType || '').toLowerCase();
+    const pair = [localType, remoteType].filter(Boolean).join(' -> ');
+    this.iceCandidatePair = pair;
+    this.iceRoute = localType === 'relay' || remoteType === 'relay' ? 'relay' : 'direct';
+    dashboardUpdateTransportStatus();
+  }
+
   close() {
     for (const pending of this.pending.values()) {
       pending.reject(new Error('dashboard control transport closed'));
@@ -36758,16 +36916,22 @@ class DashboardControlTransport {
     dashboardRecentServerMessageKeys.clear();
     try { this.channel?.close(); } catch {}
     try { this.pc?.close(); } catch {}
+    dashboardUpdateTransportStatus();
   }
 
   debugStatus() {
+    const connected = this.pc?.connectionState === 'connected';
     return {
       enabled: dashboardControlTransportEnabled(),
-      connected: this.pc?.connectionState === 'connected',
+      mode: connected && this.verifiedBinding ? 'webrtc-control' : 'checking',
+      connected,
       pcState: this.pc?.connectionState || '',
       channelState: this.channel?.readyState || '',
       sessionId: this.sessionId,
       verifiedBinding: this.verifiedBinding,
+      iceRoute: this.iceRoute,
+      iceCandidatePair: this.iceCandidatePair,
+      lastError: this.lastError,
       eventsActive: dashboardControlEventsActive,
       apiPeersAvailable: this.lastStatus?.api_peers_available ?? null,
       apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,

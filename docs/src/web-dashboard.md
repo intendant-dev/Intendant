@@ -688,6 +688,13 @@ event stream, peer access-request list/approve/deny, and a basic health
 endpoint. Uploads, downloads, recordings, terminal streams, and file transfer
 should move later after chunking, flow control, and resume semantics are settled.
 
+The dashboard status bar now exposes the selected control transport. Direct
+dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
+shows `checking`, verified `WebRTC`, `relay` when browser ICE stats report a
+TURN-relayed candidate pair, or `failed` when signaling or daemon-binding
+verification fails. The tooltip carries the detailed state that is also exposed
+through `window.intendantDashboardControl.status()`.
+
 #### Relationship to Existing Auth Modes
 
 This design should not remove local/offline mTLS. It gives the product two clear
@@ -723,7 +730,9 @@ Treat this as a staged target, not current behavior:
 7. Reuse the existing daemon binding and DataChannel RPC frame format. This is
    shared by the direct local bootstrap and rendezvous-emulator slices.
 8. Add visible transport status: disconnected, mTLS HTTP fallback, WebRTC direct,
-   WebRTC relayed, failed verification, or application-proxied.
+   WebRTC relayed, failed verification, or application-proxied. The dashboard
+   now shows mTLS/HTTP, checking, verified WebRTC, TURN-relay, and failed states
+   for the current control transport.
 9. Carry peer access-request approve/deny over the DataChannel with passkey
    step-up in the public UI.
 10. Gradually migrate larger API surfaces such as uploads, downloads,
