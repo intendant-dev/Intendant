@@ -50,6 +50,9 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_api_keys_save",
     "api_project_root",
     "api_displays",
+    "api_managed_context_records",
+    "api_managed_context_anchors",
+    "api_managed_context_fission",
     "api_peer_add",
     "api_peer_remove",
     "api_peer_eligible",
@@ -685,6 +688,7 @@ fn control_frame_response(
                         "api_api_keys_save_available": true,
                         "api_project_root_available": true,
                         "api_displays_available": true,
+                        "api_managed_context_available": true,
                         "api_peer_mutations_available": runtime.peer_registry.is_some(),
                         "api_peer_pairing_available": true,
                         "api_coordinator_available": runtime.peer_registry.is_some(),
@@ -747,6 +751,9 @@ fn control_frame_response(
                 | "api_api_keys_save"
                 | "api_project_root"
                 | "api_displays"
+                | "api_managed_context_records"
+                | "api_managed_context_anchors"
+                | "api_managed_context_fission"
                 | "api_peer_add"
                 | "api_peer_remove"
                 | "api_peer_eligible"
@@ -846,6 +853,15 @@ async fn control_request_response(
             "project root",
         ),
         "api_displays" => api_displays_response(id, &runtime).await,
+        "api_managed_context_records" => {
+            api_managed_context_response(id, "records", params.as_ref(), &runtime).await
+        }
+        "api_managed_context_anchors" => {
+            api_managed_context_response(id, "anchors", params.as_ref(), &runtime).await
+        }
+        "api_managed_context_fission" => {
+            api_managed_context_response(id, "fission", params.as_ref(), &runtime).await
+        }
         "api_peer_add" => api_peer_add_response(id, params.as_ref(), &runtime).await,
         "api_peer_remove" => api_peer_remove_response(id, params.as_ref(), &runtime).await,
         "api_peer_eligible" => api_peer_eligible_response(id, params.as_ref(), &runtime).await,
@@ -987,6 +1003,65 @@ async fn api_displays_response(id: String, runtime: &ControlRuntime) -> serde_js
         crate::web_gateway::displays_response_body(&session_registry).await,
         "displays",
     )
+}
+
+async fn api_managed_context_response(
+    id: String,
+    kind: &'static str,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(request_line) = managed_context_request_line(kind, &params) else {
+        return missing_param_response(id, "query");
+    };
+    let active_log_dir = match active_session_log_dir(runtime).await {
+        Ok(dir) => dir,
+        Err(error) => {
+            return http_body_response(
+                id,
+                500,
+                serde_json::json!({ "error": error }).to_string(),
+                "managed context",
+            );
+        }
+    };
+    let home = crate::platform::home_dir();
+    let response = tokio::task::spawn_blocking(move || match kind {
+        "records" => crate::web_gateway::managed_context_records_response_from_home(
+            &request_line,
+            active_log_dir.as_deref(),
+            &home,
+        ),
+        "anchors" => crate::web_gateway::managed_context_anchors_response_from_home(
+            &request_line,
+            active_log_dir.as_deref(),
+            &home,
+        ),
+        "fission" => crate::web_gateway::managed_context_fission_response_from_home(
+            &request_line,
+            active_log_dir.as_deref(),
+            &home,
+        ),
+        _ => crate::web_gateway::managed_context_records_response_from_home(
+            &request_line,
+            active_log_dir.as_deref(),
+            &home,
+        ),
+    })
+    .await;
+    let response = match response {
+        Ok(response) => response,
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("managed context task failed: {e}"),
+            });
+        }
+    };
+    http_wire_response(id, response, "managed context")
 }
 
 async fn api_settings_save_response(
@@ -1261,6 +1336,23 @@ fn http_body_response(id: String, status: u16, body: String, label: &str) -> ser
     }
 }
 
+fn http_wire_response(id: String, response: String, label: &str) -> serde_json::Value {
+    let (status, body) = split_http_response(&response);
+    http_body_response(id, status, body.to_string(), label)
+}
+
+fn split_http_response(response: &str) -> (u16, &str) {
+    let (head, body) = response.split_once("\r\n\r\n").unwrap_or(("", response));
+    let status = head
+        .lines()
+        .next()
+        .and_then(|line| line.strip_prefix("HTTP/1.1 "))
+        .and_then(|line| line.split_whitespace().next())
+        .and_then(|code| code.parse::<u16>().ok())
+        .unwrap_or(200);
+    (status, body)
+}
+
 fn status_line_code(status_line: &str) -> u16 {
     status_line
         .split_whitespace()
@@ -1450,6 +1542,64 @@ fn control_capability_query(params: &serde_json::Value) -> String {
         .map(|cap| format!("capability={cap}"))
         .collect::<Vec<_>>()
         .join("&")
+}
+
+fn managed_context_request_line(kind: &str, params: &serde_json::Value) -> Option<String> {
+    let raw_query = string_param(params, &["query", "search"]);
+    let query = if raw_query.trim().is_empty() {
+        managed_context_query_from_params(params)
+    } else {
+        raw_query.trim().trim_start_matches('?').to_string()
+    };
+    if query.is_empty() {
+        return None;
+    }
+    Some(format!("GET /api/managed-context/{kind}?{query} HTTP/1.1"))
+}
+
+fn managed_context_query_from_params(params: &serde_json::Value) -> String {
+    let mut pairs = Vec::new();
+    for name in [
+        "session_id",
+        "session",
+        "backend_session_id",
+        "intendant_session_id",
+        "wrapper_session_id",
+    ] {
+        let value = string_param(params, &[name]);
+        if !value.is_empty() {
+            pairs.push(format!("{name}={}", percent_encode_query_value(&value)));
+        }
+    }
+    pairs.join("&")
+}
+
+fn percent_encode_query_value(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            b' ' => out.push('+'),
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+async fn active_session_log_dir(runtime: &ControlRuntime) -> Result<Option<PathBuf>, String> {
+    let session_log = {
+        let session = runtime.shared_session.read().await;
+        session.session_log.clone()
+    };
+    let Some(session_log) = session_log else {
+        return Ok(None);
+    };
+    session_log
+        .lock()
+        .map(|log| Some(log.dir().to_path_buf()))
+        .map_err(|_| "session log lock poisoned".to_string())
 }
 
 fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
@@ -1714,5 +1864,41 @@ mod tests {
             ),
             "capability=display&capability=custom:gpu"
         );
+    }
+
+    #[test]
+    fn managed_context_rpc_params_build_request_lines() {
+        assert_eq!(
+            managed_context_request_line(
+                "records",
+                &serde_json::json!({"query": "session_id=wrapper&backend_session_id=thread"})
+            )
+            .unwrap(),
+            "GET /api/managed-context/records?session_id=wrapper&backend_session_id=thread HTTP/1.1"
+        );
+        assert_eq!(
+            managed_context_request_line(
+                "anchors",
+                &serde_json::json!({
+                    "session_id": "wrapper id",
+                    "backend_session_id": "thread/1",
+                    "intendant_session_id": "daemon+session"
+                })
+            )
+            .unwrap(),
+            "GET /api/managed-context/anchors?session_id=wrapper+id&backend_session_id=thread%2F1&intendant_session_id=daemon%2Bsession HTTP/1.1"
+        );
+        assert!(managed_context_request_line("fission", &serde_json::json!({})).is_none());
+    }
+
+    #[test]
+    fn http_wire_response_preserves_http_status_metadata() {
+        let response = "HTTP/1.1 404 Not Found\r\nContent-Type: application/json\r\n\r\n{\"error\":\"missing\"}";
+        let frame = http_wire_response("m1".into(), response.into(), "managed context");
+        assert_eq!(frame["t"], "response");
+        assert_eq!(frame["ok"], true);
+        assert_eq!(frame["result"]["error"], "missing");
+        assert_eq!(frame["result"]["_httpStatus"], 404);
+        assert_eq!(frame["result"]["_httpOk"], false);
     }
 }

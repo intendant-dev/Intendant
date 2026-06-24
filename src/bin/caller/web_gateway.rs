@@ -12051,7 +12051,7 @@ fn append_managed_context_anchors_from_dir(
     Ok(())
 }
 
-fn managed_context_anchors_response_from_home(
+pub(crate) fn managed_context_anchors_response_from_home(
     request_line: &str,
     active_log_dir: Option<&Path>,
     home: &Path,
@@ -12124,7 +12124,7 @@ fn managed_context_anchors_response(request_line: &str, log_dir: &Path) -> Strin
     )
 }
 
-fn managed_context_records_response_from_home(
+pub(crate) fn managed_context_records_response_from_home(
     request_line: &str,
     active_log_dir: Option<&Path>,
     home: &Path,
@@ -12352,7 +12352,7 @@ fn append_managed_context_fission_groups_from_dir(
     Ok(())
 }
 
-fn managed_context_fission_response_from_home(
+pub(crate) fn managed_context_fission_response_from_home(
     request_line: &str,
     active_log_dir: Option<&Path>,
     home: &Path,

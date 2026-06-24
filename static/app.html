@@ -21369,28 +21369,32 @@ async function fetchManagedContextStatus() {
 async function fetchManagedContextRecords() {
   const query = managedContextHistoryQueryString();
   if (!query) return [];
-  const resp = await authedFetch(`/api/managed-context/records?${query}`);
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error || `records HTTP ${resp.status}`);
+  const payload = await fetchManagedContextHistoryJson('records', query);
   return Array.isArray(payload.records) ? payload.records : [];
 }
 
 async function fetchManagedContextAnchors() {
   const query = managedContextHistoryQueryString();
   if (!query) return [];
-  const resp = await authedFetch(`/api/managed-context/anchors?${query}`);
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error || `anchors HTTP ${resp.status}`);
+  const payload = await fetchManagedContextHistoryJson('anchors', query);
   return Array.isArray(payload.anchors) ? payload.anchors : [];
 }
 
 async function fetchManagedContextFission() {
   const query = managedContextHistoryQueryString();
   if (!query) return [];
-  const resp = await authedFetch(`/api/managed-context/fission?${query}`);
-  const payload = await resp.json().catch(() => ({}));
-  if (!resp.ok) throw new Error(payload.error || `fission HTTP ${resp.status}`);
+  const payload = await fetchManagedContextHistoryJson('fission', query);
   return Array.isArray(payload.groups) ? payload.groups : [];
+}
+
+async function fetchManagedContextHistoryJson(kind, query) {
+  const method = `api_managed_context_${kind}`;
+  const resp = await dashboardTransport.jsonFetch(method, { query }, () => (
+    authedFetch(`/api/managed-context/${kind}?${query}`)
+  ), method);
+  const payload = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(payload.error || `${kind} HTTP ${resp.status}`);
+  return payload;
 }
 
 function settleManagedContextPromise(promise) {
@@ -36626,6 +36630,15 @@ window.intendantDashboardControl = {
   displays() {
     return dashboardTransport.request('api_displays');
   },
+  managedContextRecords(query) {
+    return dashboardTransport.request('api_managed_context_records', { query });
+  },
+  managedContextAnchors(query) {
+    return dashboardTransport.request('api_managed_context_anchors', { query });
+  },
+  managedContextFission(query) {
+    return dashboardTransport.request('api_managed_context_fission', { query });
+  },
 };
 
 class DashboardControlTransport {
@@ -36941,6 +36954,7 @@ class DashboardControlTransport {
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
       apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
+      apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
       pendingRequests: this.pending.size,
     };
   }
@@ -36964,6 +36978,9 @@ function dashboardControlAbortError(message = 'dashboard control request aborted
 function dashboardControlRequestTimeoutMs(method) {
   switch (method) {
     case 'api_sessions_search':
+    case 'api_managed_context_records':
+    case 'api_managed_context_anchors':
+    case 'api_managed_context_fission':
       return 120000;
     case 'api_session_detail':
       return 15000;

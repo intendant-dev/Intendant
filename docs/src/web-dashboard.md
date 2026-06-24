@@ -449,9 +449,10 @@ When enabled with
 DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
 boundary. Current tunneled reads include sessions, session detail, deep session
 search, settings, API-key status, project root, display enumeration, and peer
-state. Current tunneled mutations include settings save, API-key save, peer
-add/remove, peer access-request pairing, peer message/task/approval actions,
-eligible-peer lookup, and coordinator routing.
+state. Managed-context history reads for records, anchors, and fission groups
+also use the tunnel. Current tunneled mutations include settings save, API-key
+save, peer add/remove, peer access-request pairing, peer message/task/approval
+actions, eligible-peer lookup, and coordinator routing.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -735,8 +736,9 @@ Treat this as a staged target, not current behavior:
    for the current control transport.
 9. Carry peer access-request approve/deny over the DataChannel with passkey
    step-up in the public UI.
-10. Gradually migrate larger API surfaces such as uploads, downloads,
-    recordings, terminals, and file transfer.
+10. Gradually migrate larger API surfaces. Managed-context history reads now use
+    the tunnel; uploads, downloads, recordings, terminals, and file transfer
+    still wait for chunking, flow control, and resume semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 
