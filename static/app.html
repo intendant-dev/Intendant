@@ -37835,6 +37835,7 @@ class DashboardControlTransport {
     this.binding = null;
     this.verifiedBinding = null;
     this.claimedDaemonPublicKey = '';
+    this.sessionGrantSha256 = '';
     this.localOfferSdp = '';
     this.lastStatus = null;
     this.lastError = '';
@@ -37907,11 +37908,20 @@ class DashboardControlTransport {
       this.close();
       throw new Error('dashboard control binding rejected: Connect answer missing daemon public key');
     }
+    const sessionGrant = String(answer.session_grant || '');
+    if (this.signalingMode === 'connect-rendezvous' && !sessionGrant) {
+      this.lastError = 'Connect answer missing session grant';
+      dashboardSetControlLastError(this.lastError);
+      dashboardUpdateTransportStatus();
+      this.close();
+      throw new Error('dashboard control binding rejected: Connect answer missing session grant');
+    }
     const verification = await verifyDashboardControlBinding(
       this.binding,
       this.sessionId,
       this.localOfferSdp,
-      answer.sdp || ''
+      answer.sdp || '',
+      sessionGrant
     );
     if (!verification.ok) {
       this.lastError = verification.error || 'binding verification failed';
@@ -37929,6 +37939,7 @@ class DashboardControlTransport {
     }
     this.verifiedBinding = verification;
     this.claimedDaemonPublicKey = claimedDaemonPublicKey || String(verification.daemonPublicKey || '');
+    this.sessionGrantSha256 = verification.sessionGrantSha256 || '';
     await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
     for (const candidate of this.pendingIce.splice(0)) {
       this.sendIce(candidate).catch(err => console.warn('[dashboard-control] queued ICE signal failed', err));
@@ -38801,6 +38812,7 @@ class DashboardControlTransport {
       sessionId: this.sessionId,
       verifiedBinding: this.verifiedBinding,
       claimedDaemonPublicKey: this.claimedDaemonPublicKey,
+      sessionGrantSha256: this.sessionGrantSha256,
       signalingMode: this.signalingMode,
       iceRoute: this.iceRoute,
       iceCandidatePair: this.iceCandidatePair,
@@ -38942,7 +38954,7 @@ function dashboardControlRequestTimeoutMs(method) {
   }
 }
 
-async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answerSdp) {
+async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answerSdp, sessionGrant = '') {
   if (!binding || typeof binding !== 'object') {
     return { ok: false, error: 'missing binding' };
   }
@@ -38963,6 +38975,15 @@ async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answe
   if (binding.answer_sha256 !== answerHash) {
     return { ok: false, error: 'answer hash mismatch' };
   }
+  const grant = String(sessionGrant || '');
+  if (grant) {
+    const grantHash = await dashboardSha256B64u(grant);
+    if (binding.session_grant_sha256 !== grantHash) {
+      return { ok: false, error: 'session grant hash mismatch' };
+    }
+  } else if (binding.session_grant_sha256) {
+    return { ok: false, error: 'unexpected session grant binding' };
+  }
 
   let verified = false;
   try {
@@ -38981,6 +39002,7 @@ async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answe
     ok: true,
     daemonPublicKey: binding.daemon_public_key,
     createdUnixMs: Number(binding.created_unix_ms || 0),
+    sessionGrantSha256: binding.session_grant_sha256 || '',
   };
 }
 
@@ -39161,14 +39183,16 @@ async function fetchLocalDisplaysPayload() {
 }
 
 function dashboardControlBindingPayload(binding) {
-  return [
+  const parts = [
     binding.protocol || '',
     binding.session_id || '',
     binding.daemon_public_key || '',
     String(binding.created_unix_ms || ''),
     binding.offer_sha256 || '',
     binding.answer_sha256 || '',
-  ].join('\n');
+  ];
+  if (binding.session_grant_sha256) parts.push(binding.session_grant_sha256);
+  return parts.join('\n');
 }
 
 async function dashboardSha256B64u(text) {

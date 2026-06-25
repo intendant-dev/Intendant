@@ -649,10 +649,16 @@ then performs these browser passes:
    The SPA must reject the tunnel before it stores a verified binding, report a
    failed Connect transport, and still avoid daemon REST/media/WebSocket
    fallbacks.
+5. It opens the real dashboard with the same registered daemon id while the
+   emulator deliberately tampers with the browser-visible session grant. The
+   daemon signs the grant hash it received in the offer event, so the SPA must
+   reject the answer before it stores a verified binding or grant hash.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
-grant issuance, revocation, audit log, or hosted public HTTPS. It is the
-smallest complete signaling proof for the future hosted service boundary.
+authorization grant issuance, revocation, audit log, or hosted public HTTPS. The
+emulator's grant is only an opaque per-offer session value used to prove that a
+future Connect-issued grant can be carried through signaling and bound into the
+daemon-signed WebRTC session statement.
 
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
@@ -714,17 +720,21 @@ The minimal trust model is:
 
 The current experimental tunnel implements the daemon-signed binding locally: the
 daemon signs the SDP offer hash, SDP answer hash, WebRTC control session id,
-timestamp, and daemon Ed25519 public key, and the browser verifies the signature
-with WebCrypto before using the channel. A public bootstrap service should keep
-that daemon identity binding and add account/device grants around it.
+timestamp, daemon Ed25519 public key, and, when rendezvous signaling supplies
+one, a Connect session-grant hash. The browser verifies the signature with
+WebCrypto and checks that the visible grant hashes to the signed grant hash
+before using the channel. A public bootstrap service should keep that daemon
+identity binding and add account/device grants around it.
 
 The local Connect-rendezvous emulator now also models the registry side of that
 identity check: the daemon registers its public key for a daemon id, the browser
 offer answer carries that registered key, and the public-origin dashboard accepts
-the DataChannel only when the signed binding key matches the registered key. This
-does not solve account ownership, grant issuance, revocation, or clone recovery;
-it only prevents the browser from treating an arbitrary valid daemon signature as
-the claimed daemon.
+the DataChannel only when the signed binding key matches the registered key. It
+also models grant binding with an opaque per-offer value: the browser accepts the
+answer only when that visible grant hashes to the daemon-signed grant hash. This
+does not solve account ownership, authorization-grant issuance, revocation, or
+clone recovery; it prevents the browser from treating an arbitrary valid daemon
+signature or mismatched grant as the claimed session.
 
 This makes the security boundary explicit: Intendant Connect is in the trusted
 computing base for consumer dashboard access. A compromised Connect service or
@@ -1084,7 +1094,8 @@ Treat this as a staged target, not current behavior:
 7. Reuse the existing daemon binding and DataChannel RPC frame format. This is
    shared by the direct local bootstrap and rendezvous-emulator slices; the
    rendezvous browser path now rejects answers whose signed binding key does not
-   match the rendezvous-advertised daemon key.
+   match the rendezvous-advertised daemon key or whose visible session grant
+   does not hash to the daemon-signed grant hash.
 8. Add visible transport status: disconnected, mTLS HTTP fallback, WebRTC direct,
    WebRTC relayed, failed verification, or application-proxied. The dashboard
    now shows mTLS/HTTP, checking, verified WebRTC, TURN-relay, and failed states

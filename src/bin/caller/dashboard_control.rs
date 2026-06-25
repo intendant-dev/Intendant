@@ -263,12 +263,17 @@ impl DashboardControlRegistry {
         }
     }
 
-    pub async fn answer_offer(&self, offer_sdp: String) -> Result<DashboardControlAnswer, String> {
+    pub async fn answer_offer(
+        &self,
+        offer_sdp: String,
+        session_grant: Option<String>,
+    ) -> Result<DashboardControlAnswer, String> {
         let identity = self.identity().await?;
         let session_id = uuid::Uuid::new_v4().to_string();
         let (peer, answer_sdp, binding) = DashboardControlPeer::answer_offer(
             session_id.clone(),
             offer_sdp,
+            session_grant,
             &self.config,
             self.broadcast_tx.clone(),
             self.bus.clone(),
@@ -342,6 +347,8 @@ pub struct DashboardControlBinding {
     pub created_unix_ms: i64,
     pub offer_sha256: String,
     pub answer_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub session_grant_sha256: Option<String>,
     pub signature: String,
 }
 
@@ -351,11 +358,16 @@ impl DashboardControlBinding {
         session_id: String,
         offer_sdp: &str,
         answer_sdp: &str,
+        session_grant: Option<&str>,
     ) -> Self {
         let daemon_public_key = identity.public_key_b64u();
         let created_unix_ms = chrono::Utc::now().timestamp_millis();
         let offer_sha256 = sha256_b64u(offer_sdp.as_bytes());
         let answer_sha256 = sha256_b64u(answer_sdp.as_bytes());
+        let session_grant_sha256 = session_grant
+            .map(str::trim)
+            .filter(|grant| !grant.is_empty())
+            .map(|grant| sha256_b64u(grant.as_bytes()));
         let mut binding = Self {
             protocol: CONTROL_SIGNATURE_CONTEXT,
             session_id,
@@ -363,6 +375,7 @@ impl DashboardControlBinding {
             created_unix_ms,
             offer_sha256,
             answer_sha256,
+            session_grant_sha256,
             signature: String::new(),
         };
         let payload = binding.signing_payload();
@@ -371,7 +384,7 @@ impl DashboardControlBinding {
     }
 
     pub fn signing_payload(&self) -> String {
-        format!(
+        let mut payload = format!(
             "{}\n{}\n{}\n{}\n{}\n{}",
             self.protocol,
             self.session_id,
@@ -379,7 +392,12 @@ impl DashboardControlBinding {
             self.created_unix_ms,
             self.offer_sha256,
             self.answer_sha256,
-        )
+        );
+        if let Some(session_grant_sha256) = &self.session_grant_sha256 {
+            payload.push('\n');
+            payload.push_str(session_grant_sha256);
+        }
+        payload
     }
 }
 
@@ -392,6 +410,7 @@ impl DashboardControlPeer {
     async fn answer_offer(
         session_id: String,
         offer_sdp: String,
+        session_grant: Option<String>,
         config: &crate::web_gateway::WebGatewayConfig,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
         bus: crate::event::EventBus,
@@ -460,8 +479,13 @@ impl DashboardControlPeer {
             .map_err(|e| CallerError::WebRtc(format!("set control local answer: {e}")))?;
 
         let answer_sdp = answer.sdp;
-        let binding =
-            DashboardControlBinding::new(&identity, session_id.clone(), &offer_sdp, &answer_sdp);
+        let binding = DashboardControlBinding::new(
+            &identity,
+            session_id.clone(),
+            &offer_sdp,
+            &answer_sdp,
+            session_grant.as_deref(),
+        );
         let runtime = ControlRuntime {
             session_id,
             daemon_public_key: identity.public_key_b64u(),
@@ -7019,7 +7043,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let identity = DaemonIdentity::load_or_create(dir.path().join("identity.pk8")).unwrap();
         let binding =
-            DashboardControlBinding::new(&identity, "session-1".into(), "offer", "answer");
+            DashboardControlBinding::new(&identity, "session-1".into(), "offer", "answer", None);
         assert!(crate::daemon_identity::verify_b64u(
             &binding.daemon_public_key,
             binding.signing_payload().as_bytes(),
@@ -7028,6 +7052,31 @@ mod tests {
         assert_eq!(binding.protocol, CONTROL_SIGNATURE_CONTEXT);
         assert_eq!(binding.offer_sha256, sha256_b64u(b"offer"));
         assert_eq!(binding.answer_sha256, sha256_b64u(b"answer"));
+        assert_eq!(binding.session_grant_sha256, None);
+
+        let granted = DashboardControlBinding::new(
+            &identity,
+            "session-2".into(),
+            "offer-2",
+            "answer-2",
+            Some("connect-session-grant"),
+        );
+        let expected_grant_hash = sha256_b64u(b"connect-session-grant");
+        assert_eq!(
+            granted.session_grant_sha256.as_deref(),
+            Some(expected_grant_hash.as_str())
+        );
+        assert!(granted.signing_payload().ends_with(
+            granted
+                .session_grant_sha256
+                .as_deref()
+                .expect("grant hash should be present")
+        ));
+        assert!(crate::daemon_identity::verify_b64u(
+            &granted.daemon_public_key,
+            granted.signing_payload().as_bytes(),
+            &granted.signature,
+        ));
     }
 
     #[tokio::test]

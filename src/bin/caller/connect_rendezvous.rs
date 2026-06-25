@@ -1,9 +1,9 @@
 //! Outbound Intendant Connect rendezvous client for dashboard-control signaling.
 //!
-//! This module intentionally implements only signaling. It does not authorize a
-//! browser, issue grants, or replace mTLS dashboard access. A production Connect
-//! service must wrap this with account/passkey/device policy; this client is the
-//! daemon-side transport substrate and local E2E hook.
+//! This module intentionally implements only signaling plus opaque session-grant
+//! binding. It does not authorize a browser or replace mTLS dashboard access. A
+//! production Connect service must wrap this with account/passkey/device policy;
+//! this client is the daemon-side transport substrate and local E2E hook.
 
 use crate::daemon_identity::DaemonIdentity;
 use crate::dashboard_control::DashboardControlRegistry;
@@ -30,6 +30,8 @@ struct RendezvousEvent {
     session_id: Option<String>,
     #[serde(default)]
     candidate: Option<serde_json::Value>,
+    #[serde(default)]
+    session_grant: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -225,7 +227,16 @@ async fn handle_event(
                 .await;
                 return;
             };
-            match dashboard_control.answer_offer(sdp.to_string()).await {
+            let session_grant = event
+                .session_grant
+                .as_deref()
+                .map(str::trim)
+                .filter(|grant| !grant.is_empty())
+                .map(str::to_string);
+            match dashboard_control
+                .answer_offer(sdp.to_string(), session_grant)
+                .await
+            {
                 Ok(answer) => {
                     let body = AnswerRequest {
                         protocol: "intendant-connect-rendezvous-v1",

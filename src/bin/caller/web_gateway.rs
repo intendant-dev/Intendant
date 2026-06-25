@@ -11720,7 +11720,7 @@ async fn connect_dashboard_offer_response(
     if sdp.trim().is_empty() {
         return json_error("400 Bad Request", "missing sdp");
     }
-    match dashboard_control.answer_offer(sdp.to_string()).await {
+    match dashboard_control.answer_offer(sdp.to_string(), None).await {
         Ok(answer) => json_ok(serde_json::json!({
             "ok": true,
             "signaling": "connect-bootstrap-local",
@@ -11857,14 +11857,16 @@ fn connect_bootstrap_html() -> String {
   }
 
   function bindingPayload(binding) {
-    return [
+    const parts = [
       binding.protocol || '',
       binding.session_id || '',
       binding.daemon_public_key || '',
       String(binding.created_unix_ms || ''),
       binding.offer_sha256 || '',
       binding.answer_sha256 || '',
-    ].join('\n');
+    ];
+    if (binding.session_grant_sha256) parts.push(binding.session_grant_sha256);
+    return parts.join('\n');
   }
 
   async function verifyEd25519(publicKeyBytes, signatureBytes, payloadBytes) {
@@ -18118,7 +18120,9 @@ pub fn spawn_web_gateway(
                                                 let _ = direct_tx_inbound.send(msg.to_string());
                                                 continue;
                                             }
-                                            match dashboard_control_inbound.answer_offer(sdp).await
+                                            match dashboard_control_inbound
+                                                .answer_offer(sdp, None)
+                                                .await
                                             {
                                                 Ok(answer) => {
                                                     dashboard_control_session_ids

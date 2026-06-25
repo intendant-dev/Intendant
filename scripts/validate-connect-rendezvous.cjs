@@ -17,6 +17,7 @@ const DEFAULT_CONNECT_TOKEN = 'connect-e2e-token';
 const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
 const TAMPERED_DAEMON_PUBLIC_KEY = 'tampered-daemon-public-key';
+const TAMPERED_SESSION_GRANT = 'tampered-connect-session-grant';
 const FRAME_FIXTURE_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 
 function parseArgs(argv) {
@@ -240,12 +241,16 @@ function createRendezvousServer(staticRoot, options = {}) {
         const advertisedDaemonPublicKey = offer.tamperRegisteredKey
           ? TAMPERED_DAEMON_PUBLIC_KEY
           : daemon.daemonPublicKey;
+        const advertisedSessionGrant = offer.tamperSessionGrant
+          ? TAMPERED_SESSION_GRANT
+          : offer.sessionGrant;
         sendJson(offer.res, 200, {
           ok: true,
           session_id: body.session_id,
           sdp: body.sdp,
           binding: body.binding,
           daemon_public_key: advertisedDaemonPublicKey,
+          session_grant: advertisedSessionGrant,
         });
         return sendJson(res, 200, { ok: true });
       }
@@ -269,19 +274,30 @@ function createRendezvousServer(staticRoot, options = {}) {
         const sdp = String(body.sdp || '');
         if (!daemonId || !sdp.trim()) return sendJson(res, 400, { error: 'missing daemon_id or sdp' });
         if (!daemons.has(daemonId)) return sendJson(res, 404, { error: 'daemon not registered' });
-        const tamperRegisteredKey = requestRefererSearchParams(req).get('tamper_registered_key') === '1';
+        const refererParams = requestRefererSearchParams(req);
+        const tamperRegisteredKey = refererParams.get('tamper_registered_key') === '1';
+        const tamperSessionGrant = refererParams.get('tamper_session_grant') === '1';
         const id = crypto.randomUUID();
+        const sessionGrant = `connect-session-grant-${crypto.randomUUID()}`;
         const timer = setTimeout(() => {
           if (!pendingOffers.has(id)) return;
           pendingOffers.delete(id);
           sendJson(res, 504, { error: 'timed out waiting for daemon answer' });
         }, CONNECT_TIMEOUT_MS);
-        pendingOffers.set(id, { id, daemonId, res, timer, tamperRegisteredKey });
+        pendingOffers.set(id, {
+          id,
+          daemonId,
+          res,
+          timer,
+          tamperRegisteredKey,
+          tamperSessionGrant,
+          sessionGrant,
+        });
         res.on('close', () => {
           clearTimeout(timer);
           pendingOffers.delete(id);
         });
-        enqueueEvent(daemonId, { id, kind: 'offer', sdp });
+        enqueueEvent(daemonId, { id, kind: 'offer', sdp, session_grant: sessionGrant });
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/browser/ice') {
@@ -388,14 +404,16 @@ function publicBootstrapHtml() {
     return bytesToBase64Url(new Uint8Array(digest));
   }
   function bindingPayload(binding) {
-    return [
+    const parts = [
       binding.protocol || '',
       binding.session_id || '',
       binding.daemon_public_key || '',
       String(binding.created_unix_ms || ''),
       binding.offer_sha256 || '',
       binding.answer_sha256 || '',
-    ].join('\\n');
+    ];
+    if (binding.session_grant_sha256) parts.push(binding.session_grant_sha256);
+    return parts.join('\\n');
   }
   async function verifyEd25519(publicKeyBytes, signatureBytes, payloadBytes) {
     let key;
@@ -410,19 +428,31 @@ function publicBootstrapHtml() {
     }
     return crypto.subtle.verify({ name: 'Ed25519' }, key, signatureBytes, payloadBytes);
   }
-  async function verifyBinding(binding, sessionId, offerSdp, answerSdp) {
+  async function verifyBinding(binding, sessionId, offerSdp, answerSdp, sessionGrant = '') {
     if (!binding || typeof binding !== 'object') return { ok: false, error: 'missing binding' };
     if (binding.protocol !== 'intendant-dashboard-control-v1') return { ok: false, error: 'unexpected protocol' };
     if (String(binding.session_id || '') !== String(sessionId || '')) return { ok: false, error: 'session mismatch' };
     if (binding.offer_sha256 !== await sha256B64u(offerSdp || '')) return { ok: false, error: 'offer hash mismatch' };
     if (binding.answer_sha256 !== await sha256B64u(answerSdp || '')) return { ok: false, error: 'answer hash mismatch' };
+    const grant = String(sessionGrant || '');
+    if (grant) {
+      const grantHash = await sha256B64u(grant);
+      if (binding.session_grant_sha256 !== grantHash) return { ok: false, error: 'session grant hash mismatch' };
+    } else if (binding.session_grant_sha256) {
+      return { ok: false, error: 'unexpected session grant binding' };
+    }
     const verified = await verifyEd25519(
       base64UrlToBytes(binding.daemon_public_key || ''),
       base64UrlToBytes(binding.signature || ''),
       new TextEncoder().encode(bindingPayload(binding))
     );
     if (!verified) return { ok: false, error: 'signature invalid' };
-    return { ok: true, daemonPublicKey: binding.daemon_public_key, createdUnixMs: Number(binding.created_unix_ms || 0) };
+    return {
+      ok: true,
+      daemonPublicKey: binding.daemon_public_key,
+      createdUnixMs: Number(binding.created_unix_ms || 0),
+      sessionGrantSha256: binding.session_grant_sha256 || '',
+    };
   }
   function abortError(message = 'dashboard control request aborted') {
     try { return new DOMException(message, 'AbortError'); } catch {
@@ -437,6 +467,7 @@ function publicBootstrapHtml() {
     sessionId: '',
     verifiedBinding: null,
     claimedDaemonPublicKey: '',
+    sessionGrantSha256: '',
     pendingIce: [],
     pending: new Map(),
     chunkedResponses: new Map(),
@@ -477,13 +508,18 @@ function publicBootstrapHtml() {
       if (!claimedDaemonPublicKey) {
         throw new Error('rendezvous answer missing daemon_public_key');
       }
-      const verified = await verifyBinding(answer.binding, this.sessionId, offerSdp, answer.sdp || '');
+      const sessionGrant = String(answer.session_grant || '');
+      if (!sessionGrant) {
+        throw new Error('rendezvous answer missing session_grant');
+      }
+      const verified = await verifyBinding(answer.binding, this.sessionId, offerSdp, answer.sdp || '', sessionGrant);
       if (!verified.ok) throw new Error('binding rejected: ' + (verified.error || 'unknown'));
       if (String(verified.daemonPublicKey || '') !== claimedDaemonPublicKey) {
         throw new Error('binding rejected: daemon public key mismatch');
       }
       this.verifiedBinding = verified;
       this.claimedDaemonPublicKey = claimedDaemonPublicKey;
+      this.sessionGrantSha256 = verified.sessionGrantSha256 || '';
       await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
       for (const candidate of this.pendingIce.splice(0)) await this.sendIce(candidate);
       paint(this.status());
@@ -1007,6 +1043,7 @@ function publicBootstrapHtml() {
         sessionId: this.sessionId,
         verifiedBinding: this.verifiedBinding,
         claimedDaemonPublicKey: this.claimedDaemonPublicKey,
+        sessionGrantSha256: this.sessionGrantSha256,
         pendingRequests: this.pending.size,
         pendingChunkedResponses: this.chunkedResponses.size,
         pendingByteStreams: this.byteStreams.size,
@@ -1271,6 +1308,11 @@ async function main() {
       connected.verifiedBinding.daemonPublicKey,
       registeredStatus.daemon_public_key,
       `public bootstrap binding did not match registered daemon key: ${JSON.stringify(connected)}`
+    );
+    assert(
+      connected.sessionGrantSha256 &&
+        connected.sessionGrantSha256 === connected.verifiedBinding.sessionGrantSha256,
+      `public bootstrap did not verify Connect session grant binding: ${JSON.stringify(connected)}`
     );
 
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
@@ -2806,6 +2848,16 @@ async function main() {
       registeredStatus.daemon_public_key,
       `real SPA binding did not match registered daemon key: ${JSON.stringify(appConnected)}`
     );
+    assert(
+      appConnected.sessionGrantSha256 &&
+        appConnected.sessionGrantSha256 === appConnected.verifiedBinding.sessionGrantSha256,
+      `real SPA did not verify Connect session grant binding: ${JSON.stringify(appConnected)}`
+    );
+    assert.strictEqual(
+      appResult.status.sessionGrantSha256,
+      appConnected.sessionGrantSha256,
+      `real SPA debug status did not expose verified session grant hash: ${JSON.stringify(appResult.status)}`
+    );
     assert.strictEqual(
       appResult.status.claimedDaemonPublicKey,
       registeredStatus.daemon_public_key,
@@ -3027,6 +3079,91 @@ async function main() {
         serverClass: mismatchAppResult.serverClass,
         unexpectedPublicRequests: mismatchGuards.unexpectedPublicRequests,
         unexpectedPublicWebSockets: mismatchGuards.unexpectedPublicWebSockets,
+      },
+    }, null, 2));
+
+    const grantMismatchAppPage = await browser.newPage();
+    const grantMismatchGuards = installPublicAppGuards(grantMismatchAppPage, 'app-grant-mismatch-browser');
+    const grantMismatchAppResponse = await grantMismatchAppPage.goto(
+      `${publicOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}&tamper_session_grant=1`,
+      {
+        waitUntil: 'domcontentloaded',
+        timeout: CONNECT_TIMEOUT_MS,
+      }
+    );
+    assert(grantMismatchAppResponse, 'grant-mismatch public app produced no response');
+    assert.strictEqual(
+      grantMismatchAppResponse.status(),
+      200,
+      `grant-mismatch public app returned ${grantMismatchAppResponse.status()}`
+    );
+    await grantMismatchAppPage.waitForFunction(() => {
+      const status = window.intendantDashboardControl?.status?.();
+      return Boolean(status?.lastError);
+    }, undefined, { timeout: CONNECT_TIMEOUT_MS });
+    const grantMismatchAppResult = await grantMismatchAppPage.evaluate(() => {
+      const status = window.intendantDashboardControl.status();
+      return {
+        lastError: status.lastError || '',
+        connected: Boolean(status.connected),
+        verifiedBinding: status.verifiedBinding || null,
+        sessionGrantSha256: status.sessionGrantSha256 || '',
+        transportLabel: document.getElementById('sb-dashboard-transport-label')?.textContent || '',
+        serverLabel: document.getElementById('sb-conn-label')?.textContent || '',
+        serverClass: document.getElementById('sb-conn')?.className || '',
+      };
+    });
+    assert(
+      /session grant hash mismatch/i.test(grantMismatchAppResult.lastError),
+      `real SPA Connect grant mismatch did not fail closed: ${JSON.stringify(grantMismatchAppResult)}`
+    );
+    assert.strictEqual(grantMismatchAppResult.connected, false, 'grant-mismatch real SPA reported connected transport');
+    assert.strictEqual(
+      grantMismatchAppResult.verifiedBinding,
+      null,
+      `grant-mismatch real SPA kept a verified binding: ${JSON.stringify(grantMismatchAppResult)}`
+    );
+    assert.strictEqual(
+      grantMismatchAppResult.sessionGrantSha256,
+      '',
+      `grant-mismatch real SPA kept a verified grant hash: ${JSON.stringify(grantMismatchAppResult)}`
+    );
+    assert.strictEqual(
+      grantMismatchAppResult.transportLabel,
+      'failed',
+      'grant-mismatch real SPA did not show failed Connect transport'
+    );
+    assert.strictEqual(grantMismatchAppResult.serverLabel, 'events', 'grant-mismatch real SPA did not keep events label');
+    assert(
+      String(grantMismatchAppResult.serverClass || '').includes('err'),
+      `grant-mismatch real SPA did not mark event tunnel failed: ${JSON.stringify(grantMismatchAppResult)}`
+    );
+    assert.deepStrictEqual(
+      [...new Set(grantMismatchGuards.unexpectedPublicRequests)],
+      [],
+      'grant-mismatch real SPA attempted public-origin daemon REST/media fallback requests'
+    );
+    assert.deepStrictEqual(
+      [...new Set(grantMismatchGuards.unexpectedPublicWebSockets)],
+      [],
+      'grant-mismatch real SPA attempted public-origin WebSocket fallback requests'
+    );
+    assert.deepStrictEqual(
+      grantMismatchGuards.consoleErrors,
+      [],
+      'grant-mismatch real SPA emitted browser console errors'
+    );
+
+    console.log(JSON.stringify({
+      publicAppGrantMismatch: {
+        lastError: grantMismatchAppResult.lastError,
+        verifiedBinding: grantMismatchAppResult.verifiedBinding,
+        sessionGrantSha256: grantMismatchAppResult.sessionGrantSha256,
+        transportLabel: grantMismatchAppResult.transportLabel,
+        serverLabel: grantMismatchAppResult.serverLabel,
+        serverClass: grantMismatchAppResult.serverClass,
+        unexpectedPublicRequests: grantMismatchGuards.unexpectedPublicRequests,
+        unexpectedPublicWebSockets: grantMismatchGuards.unexpectedPublicWebSockets,
       },
     }, null, 2));
 
