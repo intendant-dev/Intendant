@@ -52,6 +52,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_sessions",
     "api_sessions_stream",
     "api_session_detail",
+    "api_session_current_agent_output",
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
@@ -1057,6 +1058,7 @@ fn control_frame_response(
                         "api_sessions_available": true,
                         "api_sessions_stream_available": true,
                         "api_session_detail_available": true,
+                        "api_session_current_agent_output_available": true,
                         "api_sessions_search_available": true,
                         "api_settings_available": true,
                         "api_settings_save_available": runtime.project_root.is_some(),
@@ -1130,6 +1132,7 @@ fn control_frame_response(
                 }
                 "api_sessions"
                 | "api_session_detail"
+                | "api_session_current_agent_output"
                 | "api_sessions_search"
                 | "api_settings"
                 | "api_settings_save"
@@ -1278,6 +1281,9 @@ async fn control_request_response(
     match method.as_str() {
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
+        "api_session_current_agent_output" => {
+            api_session_current_agent_output_response(id, params.as_ref(), &runtime).await
+        }
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
@@ -1548,6 +1554,33 @@ async fn api_session_detail_response(
         }
     };
     json_body_response(id, body, "session detail")
+}
+
+async fn api_session_current_agent_output_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    match active_session_log_dir(runtime).await {
+        Ok(Some(log_dir)) => http_wire_response(
+            id,
+            crate::web_gateway::current_agent_output_post_response(&body_text, &log_dir),
+            "agent output",
+        ),
+        Ok(None) => http_body_response(
+            id,
+            404,
+            serde_json::json!({"error": "no active session log"}).to_string(),
+            "agent output",
+        ),
+        Err(error) => http_body_response(
+            id,
+            500,
+            serde_json::json!({"error": error}).to_string(),
+            "agent output",
+        ),
+    }
 }
 
 async fn api_sessions_search_response(
@@ -2352,6 +2385,10 @@ mod tests {
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
+        assert_eq!(
+            status["result"]["api_session_current_agent_output_available"],
+            true
+        );
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
@@ -2427,6 +2464,34 @@ mod tests {
         assert_eq!(cancelled["ok"], false);
         assert_eq!(cancelled["cancelled"], true);
         assert!(pending.get("q1").is_none());
+    }
+
+    #[tokio::test]
+    async fn current_agent_output_without_active_log_preserves_http_status() {
+        let mut rt = runtime();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        let queued = control_frame_response(
+            r#"{"t":"request","id":"out1","method":"api_session_current_agent_output","params":{"ids":["missing-output"]}}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(queued.is_none());
+        assert!(pending.contains_key("out1"));
+
+        let response = rx.recv().await.unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.id, "out1");
+        assert!(response.done);
+        assert_eq!(response.frame["t"], "response");
+        assert_eq!(response.frame["ok"], true);
+        assert_eq!(response.frame["result"]["error"], "no active session log");
+        assert_eq!(response.frame["result"]["_httpStatus"], 404);
+        assert_eq!(response.frame["result"]["_httpOk"], false);
     }
 
     #[tokio::test]

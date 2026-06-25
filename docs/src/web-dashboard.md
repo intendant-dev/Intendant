@@ -447,10 +447,11 @@ When enabled with
 `localStorage.intendant_dashboard_transport = "webrtc-control"` (or
 `window.intendantDashboardControl.enable()`), dashboard JSON reads prefer the
 DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
-boundary. Current tunneled reads include sessions, session detail, deep session
-search, settings, API-key status, project root, display enumeration, and peer
-state. Managed-context history reads for records, anchors, and fission groups
-also use the tunnel. Current tunneled mutations include settings save, API-key
+boundary. Current tunneled reads include sessions, session detail, lazy
+command-output loads for the active session, deep session search, settings,
+API-key status, project root, display enumeration, and peer state.
+Managed-context history reads for records, anchors, and fission groups also use
+the tunnel. Current tunneled mutations include settings save, API-key
 save, peer add/remove, peer access-request pairing, peer message/task/approval
 actions, eligible-peer lookup, and coordinator routing.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
@@ -547,8 +548,9 @@ child with Connect env vars, verifies that
 `https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
 `401`, then loads the browser from the rendezvous origin and drives `status`,
 `config`, `api_sessions`, streamed `api_sessions_stream` hydration, a chunked
-large `api_sessions_stream` event, a chunked large `api_sessions` response, and
-application error RPCs over the verified DataChannel.
+large `api_sessions_stream` event, a chunked large `api_sessions` response,
+active-session command-output lookup, and application error RPCs over the
+verified DataChannel.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the
@@ -712,6 +714,9 @@ the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
 `session`, `phase`, final `replace`, `done`). When the verified DataChannel is
 connected, local dashboard session hydration uses that stream and falls back to
 the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
+Lazy command-output expansion for finalized log command groups uses
+`api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
+metadata as the existing HTTP endpoint.
 
 The first production APIs should be small and high value: `/config`, the main
 event stream, local session list hydration, peer access-request
@@ -776,10 +781,11 @@ Treat this as a staged target, not current behavior:
    now routes peer access-request list/decision and related pairing APIs through
    the DataChannel transport boundary; hosted passkey step-up still belongs to
    the future public Connect UI.
-10. Gradually migrate larger API surfaces. Managed-context history reads and
-    local session hydration now use the tunnel, oversized JSON responses now use
-    credit-windowed chunked response framing, and the sessions stream uses
-    explicit `stream_start`/`stream_event`/`stream_end` frames.
+10. Gradually migrate larger API surfaces. Managed-context history reads,
+    active-session command-output loads, and local session hydration now use the
+    tunnel, oversized JSON responses now use credit-windowed chunked response
+    framing, and the sessions stream uses explicit
+    `stream_start`/`stream_event`/`stream_end` frames.
     Uploads, downloads, recordings, terminals, and file transfer still wait for
     resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working

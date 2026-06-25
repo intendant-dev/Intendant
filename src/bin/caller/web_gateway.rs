@@ -2646,7 +2646,7 @@ fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>, String> {
     Ok(ids)
 }
 
-fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
+pub(crate) fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
     match agent_output_ids_from_json_body(body) {
         Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
         Err(e) => upload_error_response("400 Bad Request", &e),

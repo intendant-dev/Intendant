@@ -28857,13 +28857,13 @@ async function loadCommandOutputIntoBody(group, body) {
     body.textContent = 'Output is not available for lazy loading.';
     return;
   }
-  const resp = await authedFetch('/api/session/current/agent-output', {
+  const payload = { ids: group.outputIds };
+  const resp = await dashboardTransport.jsonFetch('api_session_current_agent_output', payload, () => authedFetch('/api/session/current/agent-output', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ ids: group.outputIds }),
-  });
-  const text = await resp.text();
-  const json = text ? JSON.parse(text) : {};
+    body: JSON.stringify(payload),
+  }), 'api_session_current_agent_output');
+  const json = await resp.json();
   if (!resp.ok) throw new Error(json.error || resp.statusText || `HTTP ${resp.status}`);
   body.innerHTML = '';
   for (const out of (json.outputs || [])) {
@@ -36626,6 +36626,9 @@ window.intendantDashboardControl = {
   sessionDetail(sessionId, params = {}) {
     return dashboardTransport.request('api_session_detail', { session_id: sessionId, ...params });
   },
+  currentAgentOutput(ids = [], options = {}) {
+    return dashboardTransport.request('api_session_current_agent_output', { ids }, options);
+  },
   sessionSearch(params = {}, options = {}) {
     return dashboardTransport.request('api_sessions_search', params, options);
   },
@@ -37197,6 +37200,7 @@ class DashboardControlTransport {
       apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
+      apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,

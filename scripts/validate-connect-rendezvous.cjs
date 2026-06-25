@@ -835,6 +835,7 @@ async function main() {
           jsonBytes: new TextEncoder().encode(largeSessionsJson).length,
           completedChunkedResponsesBefore: beforeChunks,
         },
+        agentOutput: await ctl.request('api_session_current_agent_output', { ids: ['missing-output'] }),
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
       };
@@ -877,6 +878,18 @@ async function main() {
       result.largeSessions.jsonBytes > 65536,
       `large api_sessions did not cross chunk threshold: ${result.largeSessions.jsonBytes}`
     );
+    assert.strictEqual(
+      result.status.api_session_current_agent_output_available,
+      true,
+      'dashboard control status did not advertise current agent output'
+    );
+    assert(
+      result.agentOutput && (
+        result.agentOutput._httpStatus === 404 ||
+        Array.isArray(result.agentOutput.missing)
+      ),
+      'agent output RPC did not preserve endpoint result metadata'
+    );
     assert(result.appError && result.appError._httpStatus === 400, 'application error metadata was not preserved');
     assert(
       result.finalStatus.completedChunkedResponses > result.largeSessions.completedChunkedResponsesBefore,
@@ -907,6 +920,7 @@ async function main() {
         largeSessionCount: result.largeSessions.length,
         largeSessionBytes: result.largeSessions.jsonBytes,
         completedChunkedResponses: result.finalStatus.completedChunkedResponses,
+        agentOutputStatus: result.agentOutput?._httpStatus || 200,
         appErrorStatus: result.appError._httpStatus,
         pendingRequests: result.finalStatus.pendingRequests,
         pendingChunkedResponses: result.finalStatus.pendingChunkedResponses,
