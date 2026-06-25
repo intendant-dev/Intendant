@@ -856,6 +856,12 @@ The task attachment upload path uses `api_session_current_upload` over
 back to `POST /api/session/current/uploads` only when the tunnel feature is not
 available. Failed tunneled uploads are not replayed over HTTP, to avoid creating
 duplicate attachments after an ambiguous partial transfer.
+Current-upload raw reads use `api_session_current_upload_raw` over
+`byte_stream_*` frames. The request names an uploaded attachment id and may
+include `offset`/`length`; the response carries `range_start`, `range_end`,
+`total_size`, and `resumable: true` metadata with the returned bytes. This is a
+bounded ranged-read primitive for previews/tests and future resumable transfer
+work, not yet a general media/download adapter.
 Worktree cached inventory reads, explicit scans, and guarded removals use
 `api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
 the same no-replay fallback rule as other writes.
@@ -866,9 +872,9 @@ Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
 large raw request payloads out of ordinary session-detail hydration while still
 allowing the Context pane to fetch a single archived snapshot on demand.
 Staged upload deletion uses `api_session_current_upload_delete` so removing a
-pending attachment can travel over the verified control channel; raw upload
-preview/download bytes remain on HTTP until the tunnel has resumable byte-stream
-semantics.
+pending attachment can travel over the verified control channel; browser image
+chips still render through HTTP URLs, while bounded raw upload bytes are
+available to clients over `api_session_current_upload_raw`.
 OpenAI browser live-audio token minting uses `api_voice_session`; it preserves
 the existing `/session` behavior and error envelope while avoiding a direct
 dashboard HTTPS POST when the verified control channel is available.

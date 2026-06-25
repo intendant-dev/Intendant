@@ -11558,7 +11558,7 @@ fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
         .ok_or_else(|| "incomplete HTTP headers".to_string())
 }
 
-fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
     project_root.join(".intendant").join("pending_uploads")
 }
 

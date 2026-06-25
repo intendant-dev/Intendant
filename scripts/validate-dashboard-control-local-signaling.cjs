@@ -162,6 +162,26 @@ async function main() {
           mime: 'text/plain',
         }, bytes, { timeoutMs: 60000 }));
       };
+      const uploadRaw = async uploadResult => {
+        const raw = await labeled('api_session_current_upload_raw', ctl.requestBytes('api_session_current_upload_raw', {
+          id: uploadResult.id,
+          offset: 10,
+          length: 6,
+        }, { timeoutMs: 60000 }));
+        if (raw?.bytes instanceof Uint8Array) {
+          const { bytes, ...rest } = raw;
+          return {
+            ...rest,
+            byteLength: bytes.byteLength,
+            text: new TextDecoder().decode(bytes),
+          };
+        }
+        return {
+          ...(raw || {}),
+          byteLength: raw?.data_base64 ? atob(String(raw.data_base64)).length : 0,
+          text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
+        };
+      };
       const terminal = async () => {
         const terminalId = `dashboard-terminal-local-${Date.now()}`;
         const token = 'dashboard_terminal_e2e_local';
@@ -218,6 +238,7 @@ async function main() {
           window.removeEventListener('intendant-dashboard-terminal-frame', handler);
         }
       };
+      const uploaded = await upload();
       return {
         status: await ctl.request('status', {}, { timeoutMs: 60000 }),
         agentCard: await ctl.agentCard({ timeoutMs: 60000 }),
@@ -231,7 +252,8 @@ async function main() {
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         sessionReport: await sessionReport(),
-        upload: await upload(),
+        upload: uploaded,
+        uploadRaw: await uploadRaw(uploaded),
         terminal: await terminal(),
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
@@ -346,11 +368,19 @@ async function main() {
     assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
     assert.strictEqual(result.finalStatus.terminalFramesAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
     assert.strictEqual(result.upload?._httpStatus, 200);
     assert.strictEqual(result.upload?._httpOk, true);
     assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
     assert.strictEqual(result.upload?.mime, 'text/plain');
     assert.strictEqual(result.upload?.size, 'dashboard upload e2e local'.length);
+    assert.strictEqual(result.uploadRaw?.ok, true);
+    assert.strictEqual(result.uploadRaw?.byteLength, 6);
+    assert.strictEqual(result.uploadRaw?.text, 'upload');
+    assert.strictEqual(result.uploadRaw?.total_size, 'dashboard upload e2e local'.length);
+    assert.strictEqual(result.uploadRaw?.range_start, 10);
+    assert.strictEqual(result.uploadRaw?.range_end, 16);
+    assert.strictEqual(result.uploadRaw?.resumable, true);
     assert.strictEqual(result.terminal?.opened, true);
     assert.strictEqual(result.terminal?.sawToken, true);
     if (result.sessionReport?.ok === true) {
@@ -419,8 +449,11 @@ async function main() {
         uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
         terminalFramesAvailable: result.finalStatus.terminalFramesAvailable,
         apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
+        apiSessionCurrentUploadRawAvailable: result.finalStatus.apiSessionCurrentUploadRawAvailable,
         uploadStatus: result.upload._httpStatus,
         uploadSize: result.upload.size,
+        uploadRawBytes: result.uploadRaw.byteLength,
+        uploadRawText: result.uploadRaw.text,
         terminalOutputBytes: result.terminal.outputBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,

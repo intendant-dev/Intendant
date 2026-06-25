@@ -25,7 +25,7 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
-use std::io::Write as _;
+use std::io::{Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -65,6 +65,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "byte_streams",
     "upload_frames",
     "terminal_frames",
+    "api_session_current_upload_raw",
     "api_peers",
     "api_sessions",
     "api_sessions_stream",
@@ -1520,6 +1521,7 @@ fn control_frame_response(
                 | "api_session_current_prune"
                 | "api_session_current_changes"
                 | "api_session_context_snapshot"
+                | "api_session_current_upload_raw"
                 | "api_session_current_upload_delete"
                 | "api_fs_stat"
                 | "api_fs_list"
@@ -2173,6 +2175,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_current_changes_available", true),
         ("api_session_context_snapshot_available", true),
         ("api_session_current_upload_available", true),
+        ("api_session_current_upload_raw_available", true),
         ("api_session_current_upload_delete_available", true),
         ("api_fs_stat_available", true),
         ("api_fs_list_available", true),
@@ -2228,15 +2231,23 @@ fn spawn_control_request(
     let cancel = CancellationToken::new();
     pending_requests.insert(id.clone(), cancel.clone());
     tokio::spawn(async move {
-        let response = if method == "api_session_report" {
-            api_session_report_task_response(id.clone(), params.as_ref(), &runtime).await
-        } else {
-            let frame = control_request_response(id.clone(), method, params, runtime, cancel).await;
-            ControlTaskResponse {
-                id,
-                frame,
-                byte_stream: None,
-                done: true,
+        let response = match method.as_str() {
+            "api_session_report" => {
+                api_session_report_task_response(id.clone(), params.as_ref(), &runtime).await
+            }
+            "api_session_current_upload_raw" => {
+                api_session_current_upload_raw_task_response(id.clone(), params.as_ref(), &runtime)
+                    .await
+            }
+            _ => {
+                let frame =
+                    control_request_response(id.clone(), method, params, runtime, cancel).await;
+                ControlTaskResponse {
+                    id,
+                    frame,
+                    byte_stream: None,
+                    done: true,
+                }
             }
         };
         let _ = task_tx.send(response).await;
@@ -2707,6 +2718,227 @@ async fn api_session_report_task_response(
                 "content_type": content_type,
                 "size": size,
             }),
+        }),
+        done: true,
+    }
+}
+
+async fn api_session_current_upload_raw_task_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> ControlTaskResponse {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let Some(upload_id) = optional_string_param(&params, &["id", "upload_id", "uploadId"]) else {
+        return ControlTaskResponse {
+            id: id.clone(),
+            frame: http_body_response(
+                id,
+                400,
+                serde_json::json!({ "ok": false, "error": "missing upload id" }).to_string(),
+                "upload raw",
+            ),
+            byte_stream: None,
+            done: true,
+        };
+    };
+    let offset = match optional_u64_param(&params, &["offset", "start"]) {
+        Ok(offset) => offset.unwrap_or(0),
+        Err(error) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: http_body_response(
+                    id,
+                    400,
+                    serde_json::json!({ "ok": false, "error": error }).to_string(),
+                    "upload raw",
+                ),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let length = match optional_u64_param(&params, &["length", "limit"]) {
+        Ok(length) => length,
+        Err(error) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: http_body_response(
+                    id,
+                    400,
+                    serde_json::json!({ "ok": false, "error": error }).to_string(),
+                    "upload raw",
+                ),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let Some(root) = runtime.project_root.clone() else {
+        return ControlTaskResponse {
+            id: id.clone(),
+            frame: http_body_response(
+                id,
+                404,
+                serde_json::json!({ "ok": false, "error": "no project root" }).to_string(),
+                "upload raw",
+            ),
+            byte_stream: None,
+            done: true,
+        };
+    };
+    let session_log = {
+        let session = runtime.shared_session.read().await;
+        session.session_log.clone()
+    };
+    let session_dir_result = match session_log {
+        Some(ref slog) => slog
+            .lock()
+            .map(|log| log.dir().to_path_buf())
+            .map_err(|_| "session log lock poisoned".to_string()),
+        None => Ok(crate::web_gateway::pending_upload_session_dir(&root)),
+    };
+    let session_dir = match session_dir_result {
+        Ok(session_dir) => session_dir,
+        Err(error) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: http_body_response(
+                    id,
+                    500,
+                    serde_json::json!({ "ok": false, "error": error }).to_string(),
+                    "upload raw",
+                ),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let upload_id_for_stream = upload_id.clone();
+    let read_result = tokio::task::spawn_blocking(move || {
+        let Some(descriptor) = crate::upload_store::find_upload(&upload_id, &session_dir, &root)
+        else {
+            return Err((
+                404,
+                serde_json::json!({ "ok": false, "error": "upload not found" }),
+            ));
+        };
+        let metadata = std::fs::metadata(&descriptor.path).map_err(|e| {
+            (
+                500,
+                serde_json::json!({ "ok": false, "error": format!("stat upload: {e}") }),
+            )
+        })?;
+        let total_size = metadata.len();
+        if offset > total_size {
+            return Err((
+                416,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "range start beyond upload size",
+                    "total_size": total_size,
+                }),
+            ));
+        }
+        let available = total_size.saturating_sub(offset);
+        let requested = length.unwrap_or(available).min(available);
+        if requested > crate::web_gateway::UPLOAD_MAX_BYTES as u64 {
+            return Err((
+                413,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!(
+                        "range too large: {} bytes (cap is {})",
+                        requested,
+                        crate::web_gateway::UPLOAD_MAX_BYTES
+                    ),
+                }),
+            ));
+        }
+        let transfer_len = usize::try_from(requested).map_err(|_| {
+            (
+                413,
+                serde_json::json!({ "ok": false, "error": "range too large for this platform" }),
+            )
+        })?;
+        let mut file = std::fs::File::open(&descriptor.path).map_err(|e| {
+            (
+                500,
+                serde_json::json!({ "ok": false, "error": format!("open upload: {e}") }),
+            )
+        })?;
+        file.seek(std::io::SeekFrom::Start(offset)).map_err(|e| {
+            (
+                500,
+                serde_json::json!({ "ok": false, "error": format!("seek upload: {e}") }),
+            )
+        })?;
+        let mut bytes = vec![0u8; transfer_len];
+        file.read_exact(&mut bytes).map_err(|e| {
+            (
+                500,
+                serde_json::json!({ "ok": false, "error": format!("read upload: {e}") }),
+            )
+        })?;
+        let end = offset.saturating_add(requested);
+        let descriptor_id = descriptor.id.clone();
+        let descriptor_name = descriptor.name.clone();
+        let descriptor_mime = descriptor.mime.clone();
+        Ok((
+            descriptor_name.clone(),
+            descriptor_mime.clone(),
+            bytes,
+            serde_json::json!({
+                "ok": true,
+                "id": descriptor_id,
+                "name": descriptor_name,
+                "filename": descriptor_name,
+                "mime": descriptor_mime,
+                "content_type": descriptor_mime,
+                "size": requested,
+                "total_size": total_size,
+                "offset": offset,
+                "range_start": offset,
+                "range_end": end,
+                "resumable": true,
+            }),
+        ))
+    })
+    .await;
+    let (filename, content_type, bytes, result) = match read_result {
+        Ok(Ok(value)) => value,
+        Ok(Err((status, body))) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: http_body_response(id, status, body.to_string(), "upload raw"),
+                byte_stream: None,
+                done: true,
+            };
+        }
+        Err(e) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("upload raw task failed: {e}"),
+                }),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: serde_json::Value::Null,
+        byte_stream: Some(ControlByteStream {
+            id: id.clone(),
+            stream_id: format!("{id}:upload:{upload_id_for_stream}"),
+            content_type,
+            filename: Some(filename),
+            bytes,
+            result,
         }),
         done: true,
     }
@@ -5047,6 +5279,10 @@ mod tests {
             true
         );
         assert_eq!(
+            status["result"]["api_session_current_upload_raw_available"],
+            true
+        );
+        assert_eq!(
             status["result"]["api_session_current_upload_delete_available"],
             true
         );
@@ -5730,6 +5966,84 @@ mod tests {
         assert_eq!(missing_id["result"]["error"], "missing upload id");
         assert_eq!(missing_id["result"]["_httpStatus"], 400);
         assert_eq!(missing_id["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn current_upload_raw_streams_requested_range() {
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project.path().to_path_buf());
+        let bytes = b"dashboard raw upload bytes";
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            Some(project.path()),
+            None,
+            Some(rt.session_id.as_str()),
+            "raw.txt",
+            "text/plain",
+            crate::upload_store::UploadDestination::Task,
+            tmp,
+            bytes.len(),
+            &rt.bus,
+        );
+        assert_eq!(status, "200 OK");
+        let descriptor: crate::upload_store::UploadDescriptor =
+            serde_json::from_str(&body).unwrap();
+
+        let response = api_session_current_upload_raw_task_response(
+            "raw1".to_string(),
+            Some(&serde_json::json!({
+                "id": descriptor.id,
+                "offset": 10,
+                "length": 6,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(response.done);
+        assert_eq!(response.id, "raw1");
+        assert!(response.byte_stream.is_some());
+        let stream = response.byte_stream.unwrap();
+        assert_eq!(stream.id, "raw1");
+        assert_eq!(stream.stream_id, format!("raw1:upload:{}", descriptor.id));
+        assert_eq!(stream.content_type, "text/plain");
+        assert_eq!(stream.filename.as_deref(), Some("raw.txt"));
+        assert_eq!(stream.bytes, &bytes[10..16]);
+        assert_eq!(stream.result["ok"], true);
+        assert_eq!(stream.result["id"], descriptor.id);
+        assert_eq!(stream.result["name"], "raw.txt");
+        assert_eq!(stream.result["filename"], "raw.txt");
+        assert_eq!(stream.result["mime"], "text/plain");
+        assert_eq!(stream.result["content_type"], "text/plain");
+        assert_eq!(stream.result["size"], 6);
+        assert_eq!(stream.result["total_size"], bytes.len());
+        assert_eq!(stream.result["offset"], 10);
+        assert_eq!(stream.result["range_start"], 10);
+        assert_eq!(stream.result["range_end"], 16);
+        assert_eq!(stream.result["resumable"], true);
+
+        let invalid = api_session_current_upload_raw_task_response(
+            "raw2".to_string(),
+            Some(&serde_json::json!({
+                "id": descriptor.id,
+                "offset": bytes.len() + 1,
+                "length": 1,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(invalid.done);
+        assert!(invalid.byte_stream.is_none());
+        assert_eq!(invalid.frame["t"], "response");
+        assert_eq!(invalid.frame["ok"], true);
+        assert_eq!(invalid.frame["result"]["_httpStatus"], 416);
+        assert_eq!(invalid.frame["result"]["_httpOk"], false);
+        assert_eq!(
+            invalid.frame["result"]["error"],
+            "range start beyond upload size"
+        );
     }
 
     #[tokio::test]
