@@ -30042,6 +30042,14 @@ function sendRawMessage(obj) {
   else if (app.send_server_action) { app.send_server_action(obj); }
 }
 
+// Annotation and clip editing still use the legacy WebSocket message path on
+// purpose. These are ordered, multi-frame media writes with large base64
+// payloads; they need a dedicated idempotent media-transfer protocol before
+// they should move onto the dashboard-control DataChannel.
+function sendLegacyMediaEditorMessage(obj) {
+  if (app && app.send_server_action) app.send_server_action(obj);
+}
+
 function sendShellMessage(obj) {
   if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame(obj)) {
     return;
@@ -30692,7 +30700,7 @@ class DisplaySlot {
       data: b64,
       note: '',
     };
-    if (app) app.send_server_action(payload);
+    sendLegacyMediaEditorMessage(payload);
     if (typeof addPendingAttachment === 'function') {
       addPendingAttachment({
         frameId,
@@ -33867,7 +33875,7 @@ async function submitAnnotation(action) {
       data: b64,
       note: note,
     };
-    if (app) app.send_server_action(payload);
+    sendLegacyMediaEditorMessage(payload);
     addPendingAttachment({ frameId, stream, note, dataUrl: 'data:image/jpeg;base64,' + b64 });
   } else {
     // save / send: existing annotation_submit handler. inject=true for 'send'.
@@ -33879,7 +33887,7 @@ async function submitAnnotation(action) {
       note: note,
       inject: action === 'send',
     };
-    if (app) app.send_server_action(payload);
+    sendLegacyMediaEditorMessage(payload);
     addAnnotationRef(frameId, action === 'send');
   }
 
@@ -34781,20 +34789,18 @@ async function submitClip(action) {
   const stream = activeRecordingStream || 'recording';
 
   // Send clip_start
-  if (app) {
-    app.send_server_action({
-      t: 'clip_start',
-      clip_id: clipId,
-      stream: stream,
-      in_secs: clipInSecs,
-      out_secs: clipOutSecs,
-      fps: fps,
-      total_frames: timestamps.length,
-      note: note,
-      inject: inject,
-      annotation_layer_count: clipAnnotationLayers.length,
-    });
-  }
+  sendLegacyMediaEditorMessage({
+    t: 'clip_start',
+    clip_id: clipId,
+    stream: stream,
+    in_secs: clipInSecs,
+    out_secs: clipOutSecs,
+    fps: fps,
+    total_frames: timestamps.length,
+    note: note,
+    inject: inject,
+    annotation_layer_count: clipAnnotationLayers.length,
+  });
 
   // Extract and send frames. Track frame IDs so 'attach' can queue them.
   const gen = extractClipFrames(recPlayer, clipInSecs, clipOutSecs, fps,
@@ -34809,18 +34815,16 @@ async function submitClip(action) {
     progressText.textContent = `Extracting ${frame.index + 1}/${frame.total}...`;
 
     const frameId = `${clipId}-f${String(frame.index).padStart(3, '0')}`;
-    if (app) {
-      app.send_server_action({
-        t: 'clip_frame',
-        clip_id: clipId,
-        frame_id: frameId,
-        frame_index: frame.index,
-        timestamp_secs: frame.t,
-        is_keyframe: frame.isKeyframe,
-        annotated: frame.annotated,
-        data: frame.b64,
-      });
-    }
+    sendLegacyMediaEditorMessage({
+      t: 'clip_frame',
+      clip_id: clipId,
+      frame_id: frameId,
+      frame_index: frame.index,
+      timestamp_secs: frame.t,
+      is_keyframe: frame.isKeyframe,
+      annotated: frame.annotated,
+      data: frame.b64,
+    });
     if (action === 'attach') {
       sentFrames.push({ frameId, b64: frame.b64 });
     }
@@ -34840,13 +34844,11 @@ async function submitClip(action) {
 
   // Send clip_end
   progressText.textContent = 'Finalizing...';
-  if (app) {
-    app.send_server_action({
-      t: 'clip_end',
-      clip_id: clipId,
-      frames_sent: frameIndex,
-    });
-  }
+  sendLegacyMediaEditorMessage({
+    t: 'clip_end',
+    clip_id: clipId,
+    frames_sent: frameIndex,
+  });
 
   // Add to pending attachments (after the server has registered them)
   if (action === 'attach') {

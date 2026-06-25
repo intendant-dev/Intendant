@@ -509,6 +509,7 @@ Several paths intentionally stay outside this JSON tunnel:
 - static assets and WASM bundles;
 - native media fallback URLs and broad file-transfer bytes;
 - general filesystem mutations and broad/resumable file transfer;
+- annotation/clip media-editor write sequences;
 - generic MCP-over-HTTP for external clients;
 - non-allowlisted `ControlMsg` mutations;
 - display WebRTC media channels;
@@ -782,6 +783,14 @@ same upload store as `POST /api/session/current/uploads`, including the
 resume token. Resumable/range semantics are still required before moving generic
 downloads, native media playback, or broad file transfer.
 
+Dashboard media/editor writes are intentionally outside this generic control
+tunnel for now. Annotation attach/save/send and clip creation currently send
+ordered `annotation_*` and `clip_*` WebSocket messages that may carry many large
+base64 frames and have multi-step commit semantics. Moving them into WebRTC
+should be a dedicated media-transfer protocol with operation ids, ordered frame
+chunks, commit/cancel, cleanup, and no-replay rules; they should not be added to
+the generic `api_dashboard_action_msg` or `api_control_msg` allowlists.
+
 The standalone **Terminal -> Shell** subtab uses `terminal_*` frames when the
 verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
 the same PTY registry used by the WebSocket path, so scrollback and reconnect
@@ -953,8 +962,9 @@ the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
 generic downloads, native media fallback URLs, broader/resumable file transfer,
-and remaining non-allowlisted control mutations should move only after resumable
-stream/file-transfer semantics and per-action no-replay rules are settled.
+dashboard media/editor writes, and remaining non-allowlisted control mutations
+should move only after resumable stream/file-transfer semantics, dedicated
+media-transfer commit semantics, and per-action no-replay rules are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -1042,8 +1052,10 @@ Treat this as a staged target, not current behavior:
     tunnel is unavailable. HLS `.ts` playback now builds a blob playlist from
     tunneled recording bytes and falls back to the native daemon URL if rejected.
     Generic downloads, native media fallback URLs,
-    remaining non-allowlisted control commands, and broad/resumable file
-    transfer still wait for resumable stream/file-transfer semantics.
+    annotation/clip media-editor writes, remaining non-allowlisted control
+    commands, and broad/resumable file transfer still wait for resumable
+    stream/file-transfer semantics plus a dedicated idempotent media-transfer
+    protocol.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 
