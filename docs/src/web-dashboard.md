@@ -465,6 +465,11 @@ active-session rollback/redo/prune, session-data deletion, staged upload
 deletion, settings save, API-key save, peer add/remove, peer access-request
 pairing, peer message/task/approval actions, eligible-peer lookup, worktree
 scan/remove, dashboard managed-context MCP tool calls, and coordinator routing.
+Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
+external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
+the DataChannel when it is verified. Session lifecycle, steering, approval,
+display/input authority, and other high-impact `ControlMsg`s stay on the main
+WebSocket/control-plane path for now.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -482,6 +487,8 @@ Several paths intentionally stay outside this JSON tunnel:
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
 - diagnostics NDJSON uploads;
+- session lifecycle, steering, approval, display/input authority, and other
+  non-allowlisted `ControlMsg` mutations;
 - display WebRTC media/control channels and peer-display signaling;
 - daemon-to-daemon federation authentication.
 
@@ -849,9 +856,10 @@ Treat this as a staged target, not current behavior:
     filesystem picker stat/list/mkdir operations, and local session hydration now
     use the tunnel, oversized JSON responses now use credit-windowed chunked
     response framing, and the sessions stream uses explicit
-    `stream_start`/`stream_event`/`stream_end` frames. Uploads, downloads,
-    recording media, terminals, and file transfer still wait for resumable
-    stream/file-transfer semantics.
+    `stream_start`/`stream_event`/`stream_end` frames. Allowlisted settings
+    `ControlMsg` dispatch now uses the tunnel when verified. Uploads, downloads,
+    recording media, terminals, non-allowlisted control commands, and file
+    transfer still wait for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

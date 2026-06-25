@@ -7,6 +7,7 @@
 
 use crate::daemon_identity::{b64u, DaemonIdentity};
 use crate::error::CallerError;
+use crate::event::{AppEvent, ControlMsg};
 use base64::Engine as _;
 use bytes::BytesMut;
 use rtc::peer_connection::configuration::setting_engine::SettingEngine;
@@ -67,6 +68,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
+    "api_control_msg",
     "api_key_status",
     "api_api_keys_save",
     "api_voice_session",
@@ -1148,6 +1150,7 @@ fn control_frame_response(
                 | "api_sessions_search"
                 | "api_settings"
                 | "api_settings_save"
+                | "api_control_msg"
                 | "api_key_status"
                 | "api_api_keys_save"
                 | "api_voice_session"
@@ -1271,6 +1274,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_sessions_search_available", true),
         ("api_settings_available", true),
         ("api_settings_save_available", runtime.project_root.is_some()),
+        ("api_control_msg_available", true),
         ("api_key_status_available", true),
         ("api_api_keys_save_available", true),
         ("api_voice_session_available", true),
@@ -1398,6 +1402,7 @@ async fn control_request_response(
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
+        "api_control_msg" => api_control_msg_response(id, params.as_ref(), &runtime).await,
         "api_key_status" => json_body_response(
             id,
             crate::web_gateway::api_key_status_response_body(),
@@ -2326,6 +2331,179 @@ async fn api_settings_save_response(
     http_body_response(id, status_line_code(status_line), body, "settings save")
 }
 
+async fn api_control_msg_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(params) = params else {
+        return missing_param_response(id, "message");
+    };
+    let message = params
+        .get("message")
+        .or_else(|| params.get("control_msg"))
+        .or_else(|| params.get("controlMsg"))
+        .cloned()
+        .unwrap_or_else(|| params.clone());
+    let ctrl = match serde_json::from_value::<ControlMsg>(message) {
+        Ok(ctrl) => ctrl,
+        Err(e) => {
+            return http_body_response(
+                id,
+                400,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid control message: {e}"),
+                })
+                .to_string(),
+                "control message",
+            )
+        }
+    };
+    if !dashboard_control_msg_allowed(&ctrl) {
+        return http_body_response(
+            id,
+            400,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "control action not available over dashboard WebRTC: {}",
+                    dashboard_control_msg_action(&ctrl)
+                ),
+            })
+            .to_string(),
+            "control message",
+        );
+    }
+    let action = dashboard_control_msg_action(&ctrl);
+    runtime.bus.send(AppEvent::PresenceLog {
+        message: format!("[dashboard-control] ControlMsg: {action}"),
+        level: Some(crate::types::LogLevel::Debug),
+        turn: None,
+    });
+    runtime.bus.send(AppEvent::ControlCommand(ctrl));
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": true,
+            "action": action,
+        },
+    })
+}
+
+fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
+    matches!(
+        ctrl,
+        ControlMsg::SetAutonomy { .. }
+            | ControlMsg::SetApprovalRule { .. }
+            | ControlMsg::SetExternalAgent { .. }
+            | ControlMsg::SetCodexCommand { .. }
+            | ControlMsg::SetCodexManagedCommand { .. }
+            | ControlMsg::SetCodexSandbox { .. }
+            | ControlMsg::SetCodexApprovalPolicy { .. }
+            | ControlMsg::SetCodexModel { .. }
+            | ControlMsg::SetCodexReasoningEffort { .. }
+            | ControlMsg::SetCodexServiceTier { .. }
+            | ControlMsg::SetCodexWebSearch { .. }
+            | ControlMsg::SetCodexNetworkAccess { .. }
+            | ControlMsg::SetCodexWritableRoots { .. }
+            | ControlMsg::SetCodexManagedContext { .. }
+            | ControlMsg::SetCodexContextArchive { .. }
+            | ControlMsg::SetGeminiModel { .. }
+            | ControlMsg::SetGeminiApprovalMode { .. }
+            | ControlMsg::SetGeminiSandbox { .. }
+            | ControlMsg::SetGeminiExtensions { .. }
+            | ControlMsg::SetGeminiAllowedMcpServers { .. }
+            | ControlMsg::SetGeminiIncludeDirectories { .. }
+            | ControlMsg::SetGeminiDebug { .. }
+            | ControlMsg::SetVerbosity { .. }
+    )
+}
+
+fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
+    match ctrl {
+        ControlMsg::Status { .. } => "status",
+        ControlMsg::Usage => "usage",
+        ControlMsg::Approve { .. } => "approve",
+        ControlMsg::Deny { .. } => "deny",
+        ControlMsg::Skip { .. } => "skip",
+        ControlMsg::ApproveAll { .. } => "approve_all",
+        ControlMsg::Input { .. } => "input",
+        ControlMsg::SetAutonomy { .. } => "set_autonomy",
+        ControlMsg::SetApprovalRule { .. } => "set_approval_rule",
+        ControlMsg::SetExternalAgent { .. } => "set_external_agent",
+        ControlMsg::SetCodexCommand { .. } => "set_codex_command",
+        ControlMsg::SetCodexManagedCommand { .. } => "set_codex_managed_command",
+        ControlMsg::SetCodexSandbox { .. } => "set_codex_sandbox",
+        ControlMsg::SetCodexApprovalPolicy { .. } => "set_codex_approval_policy",
+        ControlMsg::SetCodexModel { .. } => "set_codex_model",
+        ControlMsg::SetCodexReasoningEffort { .. } => "set_codex_reasoning_effort",
+        ControlMsg::SetCodexServiceTier { .. } => "set_codex_service_tier",
+        ControlMsg::SetCodexWebSearch { .. } => "set_codex_web_search",
+        ControlMsg::SetCodexNetworkAccess { .. } => "set_codex_network_access",
+        ControlMsg::SetCodexWritableRoots { .. } => "set_codex_writable_roots",
+        ControlMsg::SetCodexManagedContext { .. } => "set_codex_managed_context",
+        ControlMsg::SetCodexContextArchive { .. } => "set_codex_context_archive",
+        ControlMsg::CodexThreadAction { .. } => "codex_thread_action",
+        ControlMsg::RenameSession { .. } => "rename_session",
+        ControlMsg::ConfigureSessionAgent { .. } => "configure_session_agent",
+        ControlMsg::StopSession { .. } => "stop_session",
+        ControlMsg::RestartSession { .. } => "restart_session",
+        ControlMsg::ResumeSession { .. } => "resume_session",
+        ControlMsg::SetGeminiModel { .. } => "set_gemini_model",
+        ControlMsg::SetGeminiApprovalMode { .. } => "set_gemini_approval_mode",
+        ControlMsg::SetGeminiSandbox { .. } => "set_gemini_sandbox",
+        ControlMsg::SetGeminiExtensions { .. } => "set_gemini_extensions",
+        ControlMsg::SetGeminiAllowedMcpServers { .. } => "set_gemini_allowed_mcp_servers",
+        ControlMsg::SetGeminiIncludeDirectories { .. } => "set_gemini_include_directories",
+        ControlMsg::SetGeminiDebug { .. } => "set_gemini_debug",
+        ControlMsg::GeminiThreadAction { .. } => "gemini_thread_action",
+        ControlMsg::SetVerbosity { .. } => "set_verbosity",
+        ControlMsg::ScheduleControllerRestart { .. } => "schedule_controller_restart",
+        ControlMsg::ControllerTurnComplete { .. } => "controller_turn_complete",
+        ControlMsg::GetRestartStatus => "get_restart_status",
+        ControlMsg::CancelControllerRestart { .. } => "cancel_controller_restart",
+        ControlMsg::RequestControllerLoopHalt { .. } => "request_controller_loop_halt",
+        ControlMsg::ClearControllerLoopHalt => "clear_controller_loop_halt",
+        ControlMsg::InterveneControllerLoop { .. } => "intervene_controller_loop",
+        ControlMsg::GetControllerLoopStatus => "get_controller_loop_status",
+        ControlMsg::CreateSession { .. } => "create_session",
+        ControlMsg::StartTask { .. } => "start_task",
+        ControlMsg::FollowUp { .. } => "follow_up",
+        ControlMsg::CancelFollowUp { .. } => "cancel_follow_up",
+        ControlMsg::EditUserMessage { .. } => "edit_user_message",
+        ControlMsg::QueryDetail { .. } => "query_detail",
+        ControlMsg::RecallMemory { .. } => "recall_memory",
+        ControlMsg::TakeDisplay { .. } => "take_display",
+        ControlMsg::ReleaseDisplay { .. } => "release_display",
+        ControlMsg::GrantUserDisplay { .. } => "grant_user_display",
+        ControlMsg::RevokeUserDisplay { .. } => "revoke_user_display",
+        ControlMsg::CreateBrowserWorkspace { .. } => "create_browser_workspace",
+        ControlMsg::CloseBrowserWorkspace { .. } => "close_browser_workspace",
+        ControlMsg::AcquireBrowserWorkspace { .. } => "acquire_browser_workspace",
+        ControlMsg::ReleaseBrowserWorkspace { .. } => "release_browser_workspace",
+        ControlMsg::ListDisplays => "list_displays",
+        ControlMsg::InvokeSkill { .. } => "invoke_skill",
+        ControlMsg::Quit => "quit",
+        ControlMsg::SetupDebugScreen => "setup_debug_screen",
+        ControlMsg::TeardownDebugScreen => "teardown_debug_screen",
+        ControlMsg::StartDebugRecording => "start_debug_recording",
+        ControlMsg::StopDebugRecording => "stop_debug_recording",
+        ControlMsg::StartRecording { .. } => "start_recording",
+        ControlMsg::StopRecording { .. } => "stop_recording",
+        ControlMsg::DeleteRecording { .. } => "delete_recording",
+        ControlMsg::Interrupt { .. } => "interrupt",
+        ControlMsg::Steer { .. } => "steer",
+        ControlMsg::CancelSteer { .. } => "cancel_steer",
+        ControlMsg::WebRtcSignal { .. } => "webrtc_signal",
+        ControlMsg::RequestDisplayInputAuthority { .. } => "request_display_input_authority",
+        ControlMsg::ReleaseDisplayInputAuthority { .. } => "release_display_input_authority",
+        ControlMsg::SetDiagnosticsVisualMarker { .. } => "set_diagnostics_visual_marker",
+    }
+}
+
 async fn api_api_keys_save_response(
     id: String,
     params: Option<&serde_json::Value>,
@@ -3167,6 +3345,7 @@ mod tests {
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
+        assert_eq!(status["result"]["api_control_msg_available"], true);
         assert_eq!(status["result"]["api_key_status_available"], true);
         assert_eq!(status["result"]["api_api_keys_save_available"], true);
         assert_eq!(status["result"]["api_voice_session_available"], true);
@@ -3290,6 +3469,63 @@ mod tests {
         assert_eq!(
             response["result"]["error"]["message"],
             "MCP server not available"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_control_msg_dispatches_allowlisted_settings_actions_only() {
+        let rt = runtime();
+        let mut events = rt.bus.subscribe();
+        let response = api_control_msg_response(
+            "ctrl1".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "set_codex_sandbox",
+                    "mode": "workspace-write",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["ok"], true);
+        assert_eq!(response["result"]["action"], "set_codex_sandbox");
+
+        let mut saw_control = false;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let AppEvent::ControlCommand(ControlMsg::SetCodexSandbox { mode }) = event {
+                assert_eq!(mode, "workspace-write");
+                saw_control = true;
+                break;
+            }
+        }
+        assert!(saw_control, "allowed control message did not reach the bus");
+
+        let rejected = api_control_msg_response(
+            "ctrl2".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "create_session",
+                    "task": "do something",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(rejected["t"], "response");
+        assert_eq!(rejected["ok"], true);
+        assert_eq!(rejected["result"]["ok"], false);
+        assert_eq!(rejected["result"]["_httpStatus"], 400);
+        assert!(
+            rejected["result"]["error"]
+                .as_str()
+                .unwrap_or("")
+                .contains("not available over dashboard WebRTC")
         );
     }
 

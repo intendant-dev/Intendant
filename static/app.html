@@ -11119,6 +11119,31 @@ let dashboardControlLastError = '';
 const DASHBOARD_EVENT_DEDUPE_MS = 2000;
 const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const dashboardRecentServerMessageKeys = new Map();
+const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
+  'set_autonomy',
+  'set_approval_rule',
+  'set_external_agent',
+  'set_codex_command',
+  'set_codex_managed_command',
+  'set_codex_sandbox',
+  'set_codex_approval_policy',
+  'set_codex_model',
+  'set_codex_reasoning_effort',
+  'set_codex_service_tier',
+  'set_codex_web_search',
+  'set_codex_network_access',
+  'set_codex_writable_roots',
+  'set_codex_managed_context',
+  'set_codex_context_archive',
+  'set_gemini_model',
+  'set_gemini_approval_mode',
+  'set_gemini_sandbox',
+  'set_gemini_extensions',
+  'set_gemini_allowed_mcp_servers',
+  'set_gemini_include_directories',
+  'set_gemini_debug',
+  'set_verbosity',
+]);
 
 function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
   if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
@@ -15204,7 +15229,7 @@ function stationHandleControlsAction(action) {
     const level = op.slice('autonomy:'.length).trim().toLowerCase();
     if (!['low', 'medium', 'high', 'full'].includes(level)) return;
     updateStatusBar({ autonomy: level.charAt(0).toUpperCase() + level.slice(1) });
-    sendRawMessage({ action: 'set_autonomy', level });
+    dispatchControlMsg({ action: 'set_autonomy', level });
     showControlToast?.('success', `Autonomy: ${level}`);
     return;
   }
@@ -15212,7 +15237,7 @@ function stationHandleControlsAction(action) {
     const agent = op.slice('backend:'.length).trim();
     const value = agent === 'internal' ? null : agent;
     if (value && !['codex', 'claude-code', 'gemini'].includes(value)) return;
-    if (app) app.send_server_action({ action: 'set_external_agent', agent: value });
+    dispatchControlMsg({ action: 'set_external_agent', agent: value });
     showControlToast?.('success', `Backend: ${value || 'intendant'}`);
     return;
   }
@@ -19785,6 +19810,22 @@ function updateControlAppliesNote() {
 }
 
 function dispatchControlMsg(payload) {
+  const action = String(payload?.action || '').trim();
+  if (
+    action &&
+    DASHBOARD_CONTROL_MSG_RPC_ACTIONS.has(action) &&
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc()
+  ) {
+    dashboardTransport.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
+      .catch(err => {
+        console.warn(`[dashboard-control] ${action} ControlMsg RPC failed, falling back to /ws`, err);
+        if (app && app.send_server_action) app.send_server_action(payload);
+        else console.warn('control pane: no app connection, dropped', payload);
+      });
+    return;
+  }
   if (app && app.send_server_action) {
     app.send_server_action(payload);
   } else {
@@ -37362,6 +37403,7 @@ class DashboardControlTransport {
       apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
+      apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
       apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
@@ -42482,29 +42524,27 @@ async function saveSettings() {
   // list complete so the dashboard never depends on that, and cover
   // every codex field with a live control-plane setter.
   const agentVal = g('set-external-agent').value || null;
-  if (app) {
-    app.send_server_action({ action: 'set_external_agent', agent: agentVal });
-    app.send_server_action({
-      action: 'set_codex_command',
-      command: (g('set-codex-command').value || '').trim() || null,
-    });
-    app.send_server_action({
-      action: 'set_codex_managed_command',
-      command: (g('set-codex-managed-command').value || '').trim() || null,
-    });
-    app.send_server_action({
-      action: 'set_codex_managed_context',
-      mode: controlCodexConfig.managed_context || 'vanilla',
-    });
-    app.send_server_action({
-      action: 'set_codex_context_archive',
-      mode: controlCodexConfig.context_archive || 'summary',
-    });
-    app.send_server_action({
-      action: 'set_codex_service_tier',
-      service_tier: selectedCodexServiceTier || null,
-    });
-  }
+  dispatchControlMsg({ action: 'set_external_agent', agent: agentVal });
+  dispatchControlMsg({
+    action: 'set_codex_command',
+    command: (g('set-codex-command').value || '').trim() || null,
+  });
+  dispatchControlMsg({
+    action: 'set_codex_managed_command',
+    command: (g('set-codex-managed-command').value || '').trim() || null,
+  });
+  dispatchControlMsg({
+    action: 'set_codex_managed_context',
+    mode: controlCodexConfig.managed_context || 'vanilla',
+  });
+  dispatchControlMsg({
+    action: 'set_codex_context_archive',
+    mode: controlCodexConfig.context_archive || 'summary',
+  });
+  dispatchControlMsg({
+    action: 'set_codex_service_tier',
+    service_tier: selectedCodexServiceTier || null,
+  });
 }
 
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
@@ -49230,7 +49270,7 @@ window.cycleAutonomy = function() {
   const idx = levels.indexOf(current);
   const next = levels[(idx + 1) % levels.length];
   updateStatusBar({ autonomy: next });
-  sendRawMessage({ action: 'set_autonomy', level: next.toLowerCase() });
+  dispatchControlMsg({ action: 'set_autonomy', level: next.toLowerCase() });
 };
 
 window.toggleUserDisplay = function() {

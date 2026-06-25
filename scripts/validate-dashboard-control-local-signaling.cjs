@@ -133,6 +133,9 @@ async function main() {
       return {
         status: await ctl.request('status', {}, { timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
+        rejectedControlMsg: await ctl.request('api_control_msg', {
+          message: { action: 'create_session', task: 'noop' },
+        }, { timeoutMs: 60000 }),
         finalStatus: ctl.status(),
       };
     });
@@ -140,6 +143,13 @@ async function main() {
     assert(result.status && result.status.session_id, 'status RPC did not return a session id');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert.strictEqual(result.finalStatus.signalingMode, 'local-http');
+    assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
+    assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
+    assert.strictEqual(result.rejectedControlMsg?._httpOk, false);
+    assert(
+      String(result.rejectedControlMsg?.error || '').includes('not available over dashboard WebRTC'),
+      `unexpected control-message rejection: ${JSON.stringify(result.rejectedControlMsg)}`
+    );
     assert.strictEqual(result.finalStatus.pendingRequests, 0, 'request map was not drained');
 
     console.log(JSON.stringify({
@@ -148,6 +158,8 @@ async function main() {
       rpc: {
         controlSessionId: result.status.session_id,
         sessionCount: result.sessions.length,
+        apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
+        rejectedControlStatus: result.rejectedControlMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,
         pendingRequests: result.finalStatus.pendingRequests,
       },
