@@ -158,6 +158,12 @@ async function main() {
         rejectedSessionControlMsg: await labeled('api_session_control_msg rejected set_codex_sandbox', ctl.request('api_session_control_msg', {
           message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
         }, { timeoutMs: 60000 })),
+        dashboardActionMsg: await labeled('api_dashboard_action_msg close_browser_workspace', ctl.request('api_dashboard_action_msg', {
+          message: { action: 'close_browser_workspace', workspace_id: `validator-workspace-${Date.now()}` },
+        }, { timeoutMs: 60000 })),
+        rejectedDashboardActionMsg: await labeled('api_dashboard_action_msg rejected set_codex_sandbox', ctl.request('api_dashboard_action_msg', {
+          message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
+        }, { timeoutMs: 60000 })),
         finalStatus: ctl.status(),
       };
     });
@@ -250,6 +256,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiDashboardBootstrapAvailable, true);
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionControlMsgAvailable, true);
+    assert.strictEqual(result.finalStatus.apiDashboardActionMsgAvailable, true);
     assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedControlMsg?._httpOk, false);
     assert(
@@ -263,6 +270,14 @@ async function main() {
     assert(
       String(result.rejectedSessionControlMsg?.error || '').includes('not available over dashboard session WebRTC'),
       `unexpected session-control rejection: ${JSON.stringify(result.rejectedSessionControlMsg)}`
+    );
+    assert.strictEqual(result.dashboardActionMsg?.ok, true);
+    assert.strictEqual(result.dashboardActionMsg?.action, 'close_browser_workspace');
+    assert.strictEqual(result.rejectedDashboardActionMsg?._httpStatus, 400);
+    assert.strictEqual(result.rejectedDashboardActionMsg?._httpOk, false);
+    assert(
+      String(result.rejectedDashboardActionMsg?.error || '').includes('not available over dashboard action WebRTC'),
+      `unexpected dashboard-action rejection: ${JSON.stringify(result.rejectedDashboardActionMsg)}`
     );
     assert.strictEqual(result.finalStatus.pendingRequests, 0, 'request map was not drained');
 
@@ -292,9 +307,12 @@ async function main() {
         apiDashboardBootstrapAvailable: result.finalStatus.apiDashboardBootstrapAvailable,
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
         apiSessionControlMsgAvailable: result.finalStatus.apiSessionControlMsgAvailable,
+        apiDashboardActionMsgAvailable: result.finalStatus.apiDashboardActionMsgAvailable,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,
         sessionControlAction: result.sessionControlMsg.action,
         rejectedSessionControlStatus: result.rejectedSessionControlMsg._httpStatus,
+        dashboardActionAction: result.dashboardActionMsg.action,
+        rejectedDashboardActionStatus: result.rejectedDashboardActionMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,
         pendingRequests: result.finalStatus.pendingRequests,
       },

@@ -837,6 +837,14 @@ async function main() {
           message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
         })),
       };
+      const dashboardAction = {
+        closeWorkspace: await labeled('api_dashboard_action_msg close_browser_workspace', ctl.request('api_dashboard_action_msg', {
+          message: { action: 'close_browser_workspace', workspace_id: `validator-workspace-${Date.now()}` },
+        })),
+        rejectedSettingsAction: await labeled('api_dashboard_action_msg rejected set_codex_sandbox', ctl.request('api_dashboard_action_msg', {
+          message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
+        })),
+      };
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
@@ -854,6 +862,7 @@ async function main() {
         sessionsByIdTarget: firstSessionId,
         sessionDelete,
         sessionControl,
+        dashboardAction,
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -939,6 +948,11 @@ async function main() {
       result.status.api_session_control_msg_available,
       true,
       'dashboard control status did not advertise session control messages'
+    );
+    assert.strictEqual(
+      result.status.api_dashboard_action_msg_available,
+      true,
+      'dashboard control status did not advertise dashboard action messages'
     );
     assert.strictEqual(
       result.status.api_agent_card_available,
@@ -1112,6 +1126,17 @@ async function main() {
     assert(
       String(result.sessionControl?.rejectedSettingsAction?.error || '').includes('not available over dashboard session WebRTC'),
       `unexpected session-control rejection: ${JSON.stringify(result.sessionControl?.rejectedSettingsAction)}`
+    );
+    assert.strictEqual(result.dashboardAction?.closeWorkspace?.ok, true);
+    assert.strictEqual(result.dashboardAction?.closeWorkspace?.action, 'close_browser_workspace');
+    assert.strictEqual(
+      result.dashboardAction?.rejectedSettingsAction?._httpStatus,
+      400,
+      'dashboard action allowlist rejection did not preserve endpoint status'
+    );
+    assert(
+      String(result.dashboardAction?.rejectedSettingsAction?.error || '').includes('not available over dashboard action WebRTC'),
+      `unexpected dashboard-action rejection: ${JSON.stringify(result.dashboardAction?.rejectedSettingsAction)}`
     );
     assert.strictEqual(
       result.status.api_session_current_history_available,
@@ -1337,6 +1362,9 @@ async function main() {
         sessionDeleteInvalidOk: result.sessionDelete.invalidSession?.ok,
         sessionControlAction: result.sessionControl.interrupt?.action,
         rejectedSessionControlStatus: result.sessionControl.rejectedSettingsAction?._httpStatus,
+        apiDashboardActionMsgAvailable: result.status.api_dashboard_action_msg_available,
+        dashboardActionAction: result.dashboardAction.closeWorkspace?.action,
+        rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
         streamEventCount: result.sessionsStream.eventCount,
         streamReplaceCount: result.sessionsStream.replaceCount,
         largeStreamEventCount: result.largeSessionsStream.eventCount,

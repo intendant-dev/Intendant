@@ -81,6 +81,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_settings_save",
     "api_control_msg",
     "api_session_control_msg",
+    "api_dashboard_action_msg",
     "api_key_status",
     "api_api_keys_save",
     "api_voice_session",
@@ -1318,6 +1319,7 @@ fn control_frame_response(
                 | "api_settings_save"
                 | "api_control_msg"
                 | "api_session_control_msg"
+                | "api_dashboard_action_msg"
                 | "api_key_status"
                 | "api_api_keys_save"
                 | "api_voice_session"
@@ -1596,6 +1598,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ),
         ("api_control_msg_available", true),
         ("api_session_control_msg_available", true),
+        ("api_dashboard_action_msg_available", true),
         ("api_key_status_available", true),
         ("api_api_keys_save_available", true),
         ("api_voice_session_available", true),
@@ -1726,6 +1729,9 @@ async fn control_request_response(
         "api_control_msg" => api_control_msg_response(id, params.as_ref(), &runtime).await,
         "api_session_control_msg" => {
             api_session_control_msg_response(id, params.as_ref(), &runtime).await
+        }
+        "api_dashboard_action_msg" => {
+            api_dashboard_action_msg_response(id, params.as_ref(), &runtime).await
         }
         "api_key_status" => json_body_response(
             id,
@@ -3148,6 +3154,43 @@ async fn api_session_control_msg_response(
     })
 }
 
+async fn api_dashboard_action_msg_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
+        Ok(ctrl) => ctrl,
+        Err(response) => return response,
+    };
+    if !dashboard_action_msg_allowed(&ctrl) {
+        return http_body_response(
+            id,
+            400,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "control action not available over dashboard action WebRTC: {}",
+                    dashboard_control_msg_action(&ctrl)
+                ),
+            })
+            .to_string(),
+            "dashboard action message",
+        );
+    }
+    let action = dashboard_control_msg_action(&ctrl);
+    dispatch_dashboard_control_msg(&runtime.bus, ctrl, "dashboard-action");
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": true,
+            "action": action,
+        },
+    })
+}
+
 fn dashboard_control_msg_from_params(
     id: String,
     params: Option<&serde_json::Value>,
@@ -3234,6 +3277,29 @@ fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::Interrupt { .. }
             | ControlMsg::Steer { .. }
             | ControlMsg::CancelSteer { .. }
+    )
+}
+
+fn dashboard_action_msg_allowed(ctrl: &ControlMsg) -> bool {
+    matches!(
+        ctrl,
+        ControlMsg::CodexThreadAction { .. }
+            | ControlMsg::GeminiThreadAction { .. }
+            | ControlMsg::TakeDisplay { .. }
+            | ControlMsg::ReleaseDisplay { .. }
+            | ControlMsg::GrantUserDisplay { .. }
+            | ControlMsg::RevokeUserDisplay { .. }
+            | ControlMsg::CreateBrowserWorkspace { .. }
+            | ControlMsg::CloseBrowserWorkspace { .. }
+            | ControlMsg::AcquireBrowserWorkspace { .. }
+            | ControlMsg::ReleaseBrowserWorkspace { .. }
+            | ControlMsg::SetupDebugScreen
+            | ControlMsg::TeardownDebugScreen
+            | ControlMsg::StartDebugRecording
+            | ControlMsg::StopDebugRecording
+            | ControlMsg::StartRecording { .. }
+            | ControlMsg::StopRecording { .. }
+            | ControlMsg::DeleteRecording { .. }
     )
 }
 
@@ -4220,6 +4286,7 @@ mod tests {
         assert_eq!(status["result"]["api_settings_save_available"], false);
         assert_eq!(status["result"]["api_control_msg_available"], true);
         assert_eq!(status["result"]["api_session_control_msg_available"], true);
+        assert_eq!(status["result"]["api_dashboard_action_msg_available"], true);
         assert_eq!(status["result"]["api_key_status_available"], true);
         assert_eq!(status["result"]["api_api_keys_save_available"], true);
         assert_eq!(status["result"]["api_voice_session_available"], true);
@@ -4473,6 +4540,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn api_dashboard_action_msg_dispatches_small_dashboard_actions_only() {
+        let rt = runtime();
+        let mut events = rt.bus.subscribe();
+        let response = api_dashboard_action_msg_response(
+            "dash-action1".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "close_browser_workspace",
+                    "workspace_id": "workspace-a",
+                    "reason": "test",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["ok"], true);
+        assert_eq!(response["result"]["action"], "close_browser_workspace");
+
+        let mut saw_control = false;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let AppEvent::ControlCommand(ControlMsg::CloseBrowserWorkspace {
+                workspace_id,
+                ..
+            }) = event
+            {
+                assert_eq!(workspace_id, "workspace-a");
+                saw_control = true;
+                break;
+            }
+        }
+        assert!(
+            saw_control,
+            "dashboard action message did not reach the bus"
+        );
+
+        let accepted_thread = api_dashboard_action_msg_response(
+            "dash-action2".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "codex_thread_action",
+                    "session_id": "session-a",
+                    "op": "new",
+                    "params": {},
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(accepted_thread["t"], "response");
+        assert_eq!(accepted_thread["ok"], true);
+        assert_eq!(accepted_thread["result"]["action"], "codex_thread_action");
+
+        let rejected_settings = api_dashboard_action_msg_response(
+            "dash-action3".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "set_codex_sandbox",
+                    "mode": "workspace-write",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(rejected_settings["t"], "response");
+        assert_eq!(rejected_settings["ok"], true);
+        assert_eq!(rejected_settings["result"]["ok"], false);
+        assert_eq!(rejected_settings["result"]["_httpStatus"], 400);
+        assert!(rejected_settings["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not available over dashboard action WebRTC"));
+    }
+
+    #[tokio::test]
     async fn control_frame_routes_session_control_msg_requests() {
         let mut rt = runtime();
         let mut events = rt.bus.subscribe();
@@ -4513,6 +4660,54 @@ mod tests {
         assert!(
             saw_control,
             "frame-routed session control did not reach bus"
+        );
+    }
+
+    #[tokio::test]
+    async fn control_frame_routes_dashboard_action_msg_requests() {
+        let mut rt = runtime();
+        let mut events = rt.bus.subscribe();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let immediate = control_frame_response(
+            r#"{"t":"request","id":"dash-action-frame","method":"api_dashboard_action_msg","params":{"message":{"action":"close_browser_workspace","workspace_id":"workspace-frame"}}}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(immediate.is_none(), "dashboard action request should spawn");
+
+        let task = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, "dash-action-frame");
+        assert!(task.done);
+        assert_eq!(task.frame["t"], "response");
+        assert_eq!(task.frame["ok"], true);
+        assert_eq!(task.frame["result"]["action"], "close_browser_workspace");
+
+        let mut saw_control = false;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let AppEvent::ControlCommand(ControlMsg::CloseBrowserWorkspace {
+                workspace_id,
+                ..
+            }) = event
+            {
+                assert_eq!(workspace_id, "workspace-frame");
+                saw_control = true;
+                break;
+            }
+        }
+        assert!(
+            saw_control,
+            "frame-routed dashboard action did not reach bus"
         );
     }
 

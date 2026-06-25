@@ -469,7 +469,7 @@ active-session rollback/redo/prune, session-data deletion, staged upload
 deletion, settings save, API-key save, peer add/remove, peer access-request
 pairing, peer message/task/approval actions, eligible-peer lookup, worktree
 scan/remove, dashboard managed-context MCP tool calls, coordinator routing, and
-dashboard session-control actions.
+dashboard session-control and dashboard-action controls.
 Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
 external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
 the DataChannel when it is verified. Display input authority uses dedicated
@@ -477,7 +477,11 @@ DataChannel RPCs and a `display_input` frame rather than the generic
 `ControlMsg` allowlist. Session lifecycle, steering, approvals, interrupt,
 resume, stop/restart, rename, and launch-config changes use a separate
 `api_session_control_msg` RPC with its own allowlist instead of broadening the
-generic settings-style `api_control_msg`.
+generic settings-style `api_control_msg`. Smaller dashboard action controls use
+`api_dashboard_action_msg`; this includes Codex/Gemini thread actions, display
+take/release/grant/revoke, recording and debug toggles, and browser workspace
+create/acquire/close/release. It has its own allowlist and the same no-replay
+fallback rule as the other mutation RPCs.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -851,11 +855,18 @@ session rename, and per-session launch-config persistence. The browser only
 falls back to the WebSocket before it has attempted the RPC; once a verified
 DataChannel write is sent, an error is surfaced to the operator instead of
 replaying a potentially duplicated action.
+Small dashboard action controls use `api_dashboard_action_msg`. This covers
+Codex/Gemini attached-thread actions, local display authority toggles, recording
+and debug screen controls, and browser workspace create/acquire/close/release.
+The browser applies the same no-replay fallback rule: use the WebSocket only
+before a verified DataChannel request is attempted, then surface RPC failures
+instead of duplicating a potentially state-changing action.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
 uploads, downloads, recording media, terminal streams, broader file transfer,
-and non-allowlisted control mutations should move only after resumable
-stream/file-transfer semantics and no-replay mutation rules are settled.
+and remaining non-allowlisted control mutations should move only after
+resumable stream/file-transfer semantics and per-action no-replay rules are
+settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -926,9 +937,12 @@ Treat this as a staged target, not current behavior:
     local display input frames now use the tunnel when verified. Dedicated
     session-control `ControlMsg` dispatch now covers lifecycle, steering,
     approvals, interrupt, resume/stop/restart, rename, and launch-config writes
-    with no-replay fallback. Uploads, downloads, recording media, terminals,
-    remaining non-allowlisted control commands, and file transfer still wait for
-    resumable stream/file-transfer semantics.
+    with no-replay fallback. Dedicated dashboard-action `ControlMsg` dispatch
+    now covers Codex/Gemini thread actions, display take/release/grant/revoke,
+    recording/debug toggles, and browser workspace create/acquire/close/release.
+    Uploads, downloads, recording media, terminals, remaining non-allowlisted
+    control commands, and file transfer still wait for resumable
+    stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

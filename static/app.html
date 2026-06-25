@@ -11163,6 +11163,25 @@ const DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS = new Set([
   'steer',
   'cancel_steer',
 ]);
+const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
+  'codex_thread_action',
+  'gemini_thread_action',
+  'take_display',
+  'release_display',
+  'grant_user_display',
+  'revoke_user_display',
+  'create_browser_workspace',
+  'close_browser_workspace',
+  'acquire_browser_workspace',
+  'release_browser_workspace',
+  'setup_debug_screen',
+  'teardown_debug_screen',
+  'start_debug_recording',
+  'stop_debug_recording',
+  'start_recording',
+  'stop_recording',
+  'delete_recording',
+]);
 
 function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
   if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
@@ -11196,6 +11215,38 @@ function dispatchSessionControlMsg(payload, options = {}) {
         options.onError(err);
       } else if (typeof showControlToast === 'function') {
         showControlToast('error', err?.message || 'Dashboard control request failed');
+      }
+    });
+    return true;
+  }
+  return fallback();
+}
+
+function dispatchDashboardActionMsg(payload, options = {}) {
+  const action = String(payload?.action || '').trim();
+  const fallback = () => {
+    if (app && app.send_server_action) {
+      app.send_server_action(payload);
+      return true;
+    }
+    console.warn('dashboard action: no app connection, dropped', payload);
+    return false;
+  };
+  if (!DASHBOARD_ACTION_MSG_RPC_ACTIONS.has(action)) return fallback();
+  if (
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardTransport.lastStatus?.api_dashboard_action_msg_available === true
+  ) {
+    dashboardTransport.request('api_dashboard_action_msg', { message: payload }, {
+      timeoutMs: options.timeoutMs || 15000,
+    }).catch(err => {
+      console.warn(`[dashboard-control] ${action} dashboard action RPC failed; not replaying over /ws`, err);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err?.message || 'Dashboard action failed');
       }
     });
     return true;
@@ -12604,7 +12655,7 @@ function stationOperateBrowserWorkspace(op) {
   }
   if (op === 'create') {
     const draft = stationBrowserWorkspaceDraftPayload();
-    app?.send_server_action({
+    dispatchDashboardActionMsg({
       action: 'create_browser_workspace',
       url: draft.url || undefined,
       provider: draft.provider || 'auto',
@@ -19867,6 +19918,10 @@ function dispatchControlMsg(payload) {
   const action = String(payload?.action || '').trim();
   if (DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS.has(action)) {
     dispatchSessionControlMsg(payload);
+    return;
+  }
+  if (DASHBOARD_ACTION_MSG_RPC_ACTIONS.has(action)) {
+    dispatchDashboardActionMsg(payload);
     return;
   }
   if (
@@ -30485,11 +30540,7 @@ class DisplaySlot {
 
   closeDisplay() {
     const displayId = Number(this.displayId);
-    if (app && typeof app.revoke_user_display_with_id === 'function') {
-      app.revoke_user_display_with_id(displayId);
-    } else if (app && app.send_server_action) {
-      app.send_server_action({ action: 'revoke_user_display', display_id: displayId });
-    }
+    dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: displayId });
     removeDisplaySlot(displayId);
     if (Number(grantedDisplayId) === displayId) {
       setUserDisplayState(false);
@@ -30843,7 +30894,7 @@ class DisplaySlot {
     const res = this.width > 0 ? ` ${this.width}x${this.height}` : '';
     this.statusEl.textContent = `Interactive${res}`;
     this.statusEl.className = 'display-status connected';
-    if (app) app.take_display(BigInt(this.displayId));
+    dispatchDashboardActionMsg({ action: 'take_display', display_id: Number(this.displayId) || 0 });
     // _renderAuthority handles take/release button visibility from the
     // authority state (so we don't duplicate the toggle here).
     this._renderAuthority();
@@ -31093,8 +31144,10 @@ class DisplaySlot {
     // authority, re-render to clear any toolbar state that the interactive
     // mode set (note input shown, etc.).
     this._renderAuthority();
-    if (userInitiated && app) {
-      app.release_display(BigInt(this.displayId), note);
+    if (userInitiated) {
+      const msg = { action: 'release_display', display_id: Number(this.displayId) || 0 };
+      if (note) msg.note = note;
+      dispatchDashboardActionMsg(msg);
     }
   }
 
@@ -31247,13 +31300,13 @@ class DisplaySlot {
     const baseStream = 'display_' + this.displayId;
     const stream = this.recordingStreamName || baseStream;
     if (this.recording) {
-      app.send_server_action({ action: 'stop_recording', stream_name: stream });
+      dispatchDashboardActionMsg({ action: 'stop_recording', stream_name: stream });
       this.recording = false;
       this.recordBtn.innerHTML = '&#x23FA; Record';
       this.recordBtn.classList.remove('active');
       this.deleteRecBtn.style.display = '';
     } else {
-      app.send_server_action({ action: 'start_recording', stream_name: baseStream });
+      dispatchDashboardActionMsg({ action: 'start_recording', stream_name: baseStream });
       this.recordingStreamName = baseStream;
       this.recording = true;
       this.recordBtn.innerHTML = '&#x23F9; Stop';
@@ -31271,7 +31324,7 @@ class DisplaySlot {
       confirmLabel: 'Delete',
     });
     if (!ok) return;
-    app.send_server_action({ action: 'delete_recording', stream_name: stream });
+    dispatchDashboardActionMsg({ action: 'delete_recording', stream_name: stream });
     this.deleteRecBtn.style.display = 'none';
     this.recordingStreamName = null;
   }
@@ -37623,6 +37676,7 @@ class DashboardControlTransport {
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
       apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
       apiSessionControlMsgAvailable: this.lastStatus?.api_session_control_msg_available ?? null,
+      apiDashboardActionMsgAvailable: this.lastStatus?.api_dashboard_action_msg_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
       apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
@@ -45658,17 +45712,17 @@ const browserWorkspaces = new Map();
 
 function toggleDebugScreen() {
   if (debugScreenActive) {
-    if (app) app.send_server_action({ action: 'teardown_debug_screen' });
+    dispatchDashboardActionMsg({ action: 'teardown_debug_screen' });
   } else {
-    if (app) app.send_server_action({ action: 'setup_debug_screen' });
+    dispatchDashboardActionMsg({ action: 'setup_debug_screen' });
   }
 }
 
 function toggleDebugRecording() {
   if (debugRecording) {
-    if (app) app.send_server_action({ action: 'stop_debug_recording' });
+    dispatchDashboardActionMsg({ action: 'stop_debug_recording' });
   } else {
-    if (app) app.send_server_action({ action: 'start_debug_recording' });
+    dispatchDashboardActionMsg({ action: 'start_debug_recording' });
   }
 }
 window.toggleDebugScreen = toggleDebugScreen;
@@ -45741,7 +45795,7 @@ function handleBrowserWorkspaceMessage(d) {
 function createBrowserWorkspaceFromDebug() {
   if (!app) return;
   const g = id => document.getElementById(id);
-  app.send_server_action({
+  dispatchDashboardActionMsg({
     action: 'create_browser_workspace',
     url: (g('browser-workspace-url')?.value || '').trim() || undefined,
     provider: g('browser-workspace-provider')?.value || 'auto',
@@ -45752,7 +45806,7 @@ function createBrowserWorkspaceFromDebug() {
 
 function acquireBrowserWorkspace(workspaceId, force = false) {
   if (!app || !workspaceId) return;
-  app.send_server_action({
+  dispatchDashboardActionMsg({
     action: 'acquire_browser_workspace',
     workspace_id: workspaceId,
     holder_id: currentSessionId || ((typeof connectionId !== 'undefined' && connectionId) ? connectionId : 'dashboard'),
@@ -45763,7 +45817,7 @@ function acquireBrowserWorkspace(workspaceId, force = false) {
 
 function closeBrowserWorkspace(workspaceId) {
   if (!app || !workspaceId) return;
-  app.send_server_action({
+  dispatchDashboardActionMsg({
     action: 'close_browser_workspace',
     workspace_id: workspaceId,
     reason: 'closed from dashboard',
@@ -49475,7 +49529,7 @@ function showDisplayPicker(displays) {
       e.stopPropagation();
       hideDisplayPicker();
       if (!app) return;
-      app.grant_user_display_with_id(d.id);
+      dispatchDashboardActionMsg({ action: 'grant_user_display', display_id: d.id });
       grantedDisplayId = d.id;
       setUserDisplayState(true);
     });
@@ -49511,7 +49565,7 @@ window.toggleUserDisplay = function() {
     // on the UI response. removeDisplaySlot is idempotent — if the
     // broadcast does arrive later, re-running it is a no-op.
     removeDisplaySlot(Number(grantedDisplayId));
-    app.revoke_user_display_with_id(grantedDisplayId);
+    dispatchDashboardActionMsg({ action: 'revoke_user_display', display_id: Number(grantedDisplayId) || 0 });
     setUserDisplayState(false);
     return;
   }
@@ -49530,7 +49584,7 @@ window.toggleUserDisplay = function() {
   const applyDisplayList = (displays) => {
     cachedDisplays = displays;
     if (!displays || displays.length <= 1) {
-      app.grant_user_display();
+      dispatchDashboardActionMsg({ action: 'grant_user_display' });
       grantedDisplayId = 0;
       setUserDisplayState(true);
     } else {
@@ -49546,7 +49600,7 @@ window.toggleUserDisplay = function() {
     .then(applyDisplayList)
     .catch(() => {
       // Fetch failed: fall back to granting default display
-      app.grant_user_display();
+      dispatchDashboardActionMsg({ action: 'grant_user_display' });
       grantedDisplayId = 0;
       setUserDisplayState(true);
     });
