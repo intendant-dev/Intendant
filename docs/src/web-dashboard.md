@@ -630,6 +630,11 @@ child with Connect env vars, verifies that
    REST/media/WebSocket fallback paths such as `/config`,
    `/.well-known/agent-card.json`, `/api/...`, `/recordings`,
    `/connect/dashboard/...`, or `/ws`.
+3. It opens the same real dashboard with an unregistered daemon id and asserts
+   that the UI reports a Connect failure while still avoiding those public-origin
+   REST/media/WebSocket fallbacks. This page must also stop daemon-dependent
+   startup hydrators such as settings, project-root, and recording refreshes so
+   the initial rendezvous failure does not cascade into unrelated errors.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the

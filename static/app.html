@@ -18695,12 +18695,14 @@ async function main() {
   // Store app globally for reconnect/debug hooks.
   window.__presenceWeb = app;
 
+  let connectBootstrapReady = !dashboardConnectModeEnabled();
   if (dashboardConnectModeEnabled()) {
     setConnectEventStatus('warn', 'Connecting dashboard events over the Connect WebRTC tunnel');
     try {
       await maybeStartDashboardControlTransport();
       await waitForDashboardControlReady(30000);
       await hydrateDashboardFromControl();
+      connectBootstrapReady = true;
       setConnectEventStatus('ok', 'Dashboard events are arriving over the verified Connect WebRTC tunnel; no same-origin WebSocket is used');
     } catch (err) {
       console.warn('[dashboard-control] Connect dashboard bootstrap failed', err);
@@ -18741,8 +18743,10 @@ async function main() {
   // agent) reflects the persisted value without waiting for the user
   // to open the Settings tab. Idempotent — visiting Settings after
   // this won't refetch.
-  loadSettings();
-  loadNewSessionProjectRoot();
+  if (connectBootstrapReady) {
+    loadSettings();
+    loadNewSessionProjectRoot();
+  }
 
   // Restore pure-client toggles from localStorage. These are UI
   // preferences that don't belong in intendant.toml but also shouldn't
@@ -18756,7 +18760,9 @@ async function main() {
   applyCurrentRoute();
 
   // Check for existing recordings (late-connecting browser)
-  reconcileRecordingStreams();
+  if (connectBootstrapReady) {
+    reconcileRecordingStreams();
+  }
 
   // Passive mode from localStorage or ?passive=1 URL param
   const urlPassive = new URLSearchParams(window.location.search).get('passive') === '1';

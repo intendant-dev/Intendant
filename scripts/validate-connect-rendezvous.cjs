@@ -2626,17 +2626,14 @@ async function main() {
     }, null, 2));
 
     const appPage = await browser.newPage();
-    const appConsoleErrors = [];
-    const appUnexpectedPublicRequests = [];
-    const appUnexpectedPublicWebSockets = [];
     const allowedAppSignalPaths = new Set([
       '/api/browser/offer',
       '/api/browser/ice',
       '/api/browser/close',
     ]);
-    const shouldAllowPublicAppRequest = req => {
+    const shouldAllowPublicAppRequest = (req, origin) => {
       const parsed = new URL(req.url());
-      if (parsed.origin !== publicOrigin) return true;
+      if (parsed.origin !== origin) return true;
       const method = req.method();
       const pathname = parsed.pathname;
       if (method === 'POST' && allowedAppSignalPaths.has(pathname)) return true;
@@ -2650,31 +2647,38 @@ async function main() {
       if (pathname.startsWith('/recordings')) return false;
       return true;
     };
-    appPage.on('request', req => {
-      try {
-        if (shouldAllowPublicAppRequest(req)) return;
-        const parsed = new URL(req.url());
-        appUnexpectedPublicRequests.push(`${req.method()} ${parsed.pathname}`);
-      } catch (err) {
-        appUnexpectedPublicRequests.push(`${req.method()} ${req.url()}`);
-      }
-    });
-    appPage.on('websocket', ws => {
-      try {
-        const parsed = new URL(ws.url());
-        if (parsed.origin.replace(/^http/, 'ws') === publicOrigin.replace(/^http/, 'ws')) {
-          appUnexpectedPublicWebSockets.push(parsed.pathname);
+    const installPublicAppGuards = (page, label) => {
+      const consoleErrors = [];
+      const unexpectedPublicRequests = [];
+      const unexpectedPublicWebSockets = [];
+      page.on('request', req => {
+        try {
+          if (shouldAllowPublicAppRequest(req, publicOrigin)) return;
+          const parsed = new URL(req.url());
+          unexpectedPublicRequests.push(`${req.method()} ${parsed.pathname}`);
+        } catch (err) {
+          unexpectedPublicRequests.push(`${req.method()} ${req.url()}`);
         }
-      } catch {
-        appUnexpectedPublicWebSockets.push(ws.url());
-      }
-    });
-    appPage.on('console', msg => {
-      const type = msg.type();
-      const text = msg.text();
-      console.log(`[app-browser:${type}] ${text}`);
-      if (type === 'error') appConsoleErrors.push(text);
-    });
+      });
+      page.on('websocket', ws => {
+        try {
+          const parsed = new URL(ws.url());
+          if (parsed.origin.replace(/^http/, 'ws') === publicOrigin.replace(/^http/, 'ws')) {
+            unexpectedPublicWebSockets.push(parsed.pathname);
+          }
+        } catch {
+          unexpectedPublicWebSockets.push(ws.url());
+        }
+      });
+      page.on('console', msg => {
+        const type = msg.type();
+        const text = msg.text();
+        console.log(`[${label}:${type}] ${text}`);
+        if (type === 'error') consoleErrors.push(text);
+      });
+      return { consoleErrors, unexpectedPublicRequests, unexpectedPublicWebSockets };
+    };
+    const appGuards = installPublicAppGuards(appPage, 'app-browser');
     const appResponse = await appPage.goto(
       `${publicOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}`,
       {
@@ -2742,14 +2746,14 @@ async function main() {
       String(appResult.serverClass || '').includes('ok'),
       `real SPA did not mark primary events healthy in Connect mode: ${JSON.stringify(appResult)}`
     );
-    assert.deepStrictEqual(appConsoleErrors, [], 'real SPA emitted browser console errors');
+    assert.deepStrictEqual(appGuards.consoleErrors, [], 'real SPA emitted browser console errors');
     assert.deepStrictEqual(
-      [...new Set(appUnexpectedPublicRequests)],
+      [...new Set(appGuards.unexpectedPublicRequests)],
       [],
       'real SPA attempted public-origin daemon REST/media fallback requests'
     );
     assert.deepStrictEqual(
-      [...new Set(appUnexpectedPublicWebSockets)],
+      [...new Set(appGuards.unexpectedPublicWebSockets)],
       [],
       'real SPA attempted public-origin WebSocket fallback requests'
     );
@@ -2763,8 +2767,77 @@ async function main() {
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,
-        unexpectedPublicRequests: appUnexpectedPublicRequests,
-        unexpectedPublicWebSockets: appUnexpectedPublicWebSockets,
+        unexpectedPublicRequests: appGuards.unexpectedPublicRequests,
+        unexpectedPublicWebSockets: appGuards.unexpectedPublicWebSockets,
+      },
+    }, null, 2));
+
+    const failedAppPage = await browser.newPage();
+    const failedGuards = installPublicAppGuards(failedAppPage, 'app-failure-browser');
+    const missingDaemonId = `${options.daemonId}-missing`;
+    const failedAppResponse = await failedAppPage.goto(
+      `${publicOrigin}/app?connect=1&daemon_id=${encodeURIComponent(missingDaemonId)}`,
+      {
+        waitUntil: 'domcontentloaded',
+        timeout: CONNECT_TIMEOUT_MS,
+      }
+    );
+    assert(failedAppResponse, 'failed public app produced no response');
+    assert.strictEqual(failedAppResponse.status(), 200, `failed public app returned ${failedAppResponse.status()}`);
+    await failedAppPage.waitForFunction(() => {
+      const status = window.intendantDashboardControl?.status?.();
+      return Boolean(status?.lastError);
+    }, undefined, { timeout: CONNECT_TIMEOUT_MS });
+    const failedAppResult = await failedAppPage.evaluate(() => {
+      const status = window.intendantDashboardControl.status();
+      return {
+        lastError: status.lastError || '',
+        connected: Boolean(status.connected),
+        transportLabel: document.getElementById('sb-dashboard-transport-label')?.textContent || '',
+        serverLabel: document.getElementById('sb-conn-label')?.textContent || '',
+        serverClass: document.getElementById('sb-conn')?.className || '',
+      };
+    });
+    assert(
+      /daemon not registered/i.test(failedAppResult.lastError),
+      `real SPA Connect failure did not expose rendezvous error: ${JSON.stringify(failedAppResult)}`
+    );
+    assert.strictEqual(failedAppResult.connected, false, 'failed real SPA reported connected transport');
+    assert.strictEqual(failedAppResult.transportLabel, 'failed', 'failed real SPA did not show failed Connect transport');
+    assert.strictEqual(failedAppResult.serverLabel, 'events', 'failed real SPA did not keep events label');
+    assert(
+      String(failedAppResult.serverClass || '').includes('err'),
+      `failed real SPA did not mark event tunnel failed: ${JSON.stringify(failedAppResult)}`
+    );
+    assert.deepStrictEqual(
+      [...new Set(failedGuards.unexpectedPublicRequests)],
+      [],
+      'failed real SPA attempted public-origin daemon REST/media fallback requests'
+    );
+    assert.deepStrictEqual(
+      [...new Set(failedGuards.unexpectedPublicWebSockets)],
+      [],
+      'failed real SPA attempted public-origin WebSocket fallback requests'
+    );
+    const failedUnexpectedConsoleErrors = failedGuards.consoleErrors.filter(text => (
+      !/Failed to load resource: the server responded with a status of 404/i.test(text)
+    ));
+    assert.deepStrictEqual(
+      failedUnexpectedConsoleErrors,
+      [],
+      'failed real SPA emitted unexpected browser console errors'
+    );
+
+    console.log(JSON.stringify({
+      publicAppFailure: {
+        missingDaemonId,
+        lastError: failedAppResult.lastError,
+        transportLabel: failedAppResult.transportLabel,
+        serverLabel: failedAppResult.serverLabel,
+        serverClass: failedAppResult.serverClass,
+        consoleErrors: failedGuards.consoleErrors,
+        unexpectedPublicRequests: failedGuards.unexpectedPublicRequests,
+        unexpectedPublicWebSockets: failedGuards.unexpectedPublicWebSockets,
       },
     }, null, 2));
 
