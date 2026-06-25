@@ -130,6 +130,13 @@ async function main() {
     const connected = await waitForDashboardControl(page);
     const result = await page.evaluate(async () => {
       const ctl = window.intendantDashboardControl;
+      const labeled = async (label, promise) => {
+        try {
+          return await promise;
+        } catch (err) {
+          throw new Error(`${label}: ${err?.message || err}`);
+        }
+      };
       return {
         status: await ctl.request('status', {}, { timeoutMs: 60000 }),
         agentCard: await ctl.agentCard({ timeoutMs: 60000 }),
@@ -142,9 +149,15 @@ async function main() {
         externalSessionActivityReplay: await ctl.externalSessionActivityReplay({ timeoutMs: 60000 }),
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
-        rejectedControlMsg: await ctl.request('api_control_msg', {
+        rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
-        }, { timeoutMs: 60000 }),
+        }, { timeoutMs: 60000 })),
+        sessionControlMsg: await labeled('api_session_control_msg interrupt', ctl.request('api_session_control_msg', {
+          message: { action: 'interrupt' },
+        }, { timeoutMs: 60000 })),
+        rejectedSessionControlMsg: await labeled('api_session_control_msg rejected set_codex_sandbox', ctl.request('api_session_control_msg', {
+          message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
+        }, { timeoutMs: 60000 })),
         finalStatus: ctl.status(),
       };
     });
@@ -236,11 +249,20 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiExternalSessionActivityReplayAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardBootstrapAvailable, true);
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionControlMsgAvailable, true);
     assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedControlMsg?._httpOk, false);
     assert(
       String(result.rejectedControlMsg?.error || '').includes('not available over dashboard WebRTC'),
       `unexpected control-message rejection: ${JSON.stringify(result.rejectedControlMsg)}`
+    );
+    assert.strictEqual(result.sessionControlMsg?.ok, true);
+    assert.strictEqual(result.sessionControlMsg?.action, 'interrupt');
+    assert.strictEqual(result.rejectedSessionControlMsg?._httpStatus, 400);
+    assert.strictEqual(result.rejectedSessionControlMsg?._httpOk, false);
+    assert(
+      String(result.rejectedSessionControlMsg?.error || '').includes('not available over dashboard session WebRTC'),
+      `unexpected session-control rejection: ${JSON.stringify(result.rejectedSessionControlMsg)}`
     );
     assert.strictEqual(result.finalStatus.pendingRequests, 0, 'request map was not drained');
 
@@ -269,7 +291,10 @@ async function main() {
         apiExternalSessionActivityReplayAvailable: result.finalStatus.apiExternalSessionActivityReplayAvailable,
         apiDashboardBootstrapAvailable: result.finalStatus.apiDashboardBootstrapAvailable,
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
+        apiSessionControlMsgAvailable: result.finalStatus.apiSessionControlMsgAvailable,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,
+        sessionControlAction: result.sessionControlMsg.action,
+        rejectedSessionControlStatus: result.rejectedSessionControlMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,
         pendingRequests: result.finalStatus.pendingRequests,
       },

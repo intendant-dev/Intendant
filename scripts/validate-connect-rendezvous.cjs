@@ -779,6 +779,13 @@ async function main() {
 
     const result = await page.evaluate(async () => {
       const ctl = window.intendantPublicConnectDashboard;
+      const labeled = async (label, promise) => {
+        try {
+          return await promise;
+        } catch (err) {
+          throw new Error(`${label}: ${err?.message || err}`);
+        }
+      };
       const beforeChunks = ctl.status().completedChunkedResponses || 0;
       const largeSessions = await ctl.request('api_sessions', { limit: 'all' }, { timeoutMs: 60000 });
       const largeSessionsJson = JSON.stringify(largeSessions);
@@ -822,6 +829,14 @@ async function main() {
       const sessionDelete = {
         invalidSession: await ctl.request('api_session_delete', { session_id: '../bad' }),
       };
+      const sessionControl = {
+        interrupt: await labeled('api_session_control_msg interrupt', ctl.request('api_session_control_msg', {
+          message: { action: 'interrupt' },
+        })),
+        rejectedSettingsAction: await labeled('api_session_control_msg rejected set_codex_sandbox', ctl.request('api_session_control_msg', {
+          message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
+        })),
+      };
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
@@ -838,6 +853,7 @@ async function main() {
         sessionsById,
         sessionsByIdTarget: firstSessionId,
         sessionDelete,
+        sessionControl,
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -918,6 +934,11 @@ async function main() {
       result.status.api_sessions_stream_available,
       true,
       'dashboard control status did not advertise sessions streaming'
+    );
+    assert.strictEqual(
+      result.status.api_session_control_msg_available,
+      true,
+      'dashboard control status did not advertise session control messages'
     );
     assert.strictEqual(
       result.status.api_agent_card_available,
@@ -1080,6 +1101,17 @@ async function main() {
       result.sessionDelete?.invalidSession?.ok === false &&
         result.sessionDelete.invalidSession.error === 'invalid session id',
       'session delete RPC did not preserve invalid session body'
+    );
+    assert.strictEqual(result.sessionControl?.interrupt?.ok, true);
+    assert.strictEqual(result.sessionControl?.interrupt?.action, 'interrupt');
+    assert.strictEqual(
+      result.sessionControl?.rejectedSettingsAction?._httpStatus,
+      400,
+      'session control allowlist rejection did not preserve endpoint status'
+    );
+    assert(
+      String(result.sessionControl?.rejectedSettingsAction?.error || '').includes('not available over dashboard session WebRTC'),
+      `unexpected session-control rejection: ${JSON.stringify(result.sessionControl?.rejectedSettingsAction)}`
     );
     assert.strictEqual(
       result.status.api_session_current_history_available,
@@ -1303,6 +1335,8 @@ async function main() {
         sessionCount: result.sessions.length,
         sessionByIdCount: result.sessionsById.length,
         sessionDeleteInvalidOk: result.sessionDelete.invalidSession?.ok,
+        sessionControlAction: result.sessionControl.interrupt?.action,
+        rejectedSessionControlStatus: result.sessionControl.rejectedSettingsAction?._httpStatus,
         streamEventCount: result.sessionsStream.eventCount,
         streamReplaceCount: result.sessionsStream.replaceCount,
         largeStreamEventCount: result.largeSessionsStream.eventCount,

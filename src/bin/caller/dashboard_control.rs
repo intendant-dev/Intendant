@@ -80,6 +80,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_settings",
     "api_settings_save",
     "api_control_msg",
+    "api_session_control_msg",
     "api_key_status",
     "api_api_keys_save",
     "api_voice_session",
@@ -1316,6 +1317,7 @@ fn control_frame_response(
                 | "api_settings"
                 | "api_settings_save"
                 | "api_control_msg"
+                | "api_session_control_msg"
                 | "api_key_status"
                 | "api_api_keys_save"
                 | "api_voice_session"
@@ -1593,6 +1595,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             runtime.project_root.is_some(),
         ),
         ("api_control_msg_available", true),
+        ("api_session_control_msg_available", true),
         ("api_key_status_available", true),
         ("api_api_keys_save_available", true),
         ("api_voice_session_available", true),
@@ -1721,6 +1724,9 @@ async fn control_request_response(
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
         "api_control_msg" => api_control_msg_response(id, params.as_ref(), &runtime).await,
+        "api_session_control_msg" => {
+            api_session_control_msg_response(id, params.as_ref(), &runtime).await
+        }
         "api_key_status" => json_body_response(
             id,
             crate::web_gateway::api_key_status_response_body(),
@@ -3068,29 +3074,9 @@ async fn api_control_msg_response(
     params: Option<&serde_json::Value>,
     runtime: &ControlRuntime,
 ) -> serde_json::Value {
-    let Some(params) = params else {
-        return missing_param_response(id, "message");
-    };
-    let message = params
-        .get("message")
-        .or_else(|| params.get("control_msg"))
-        .or_else(|| params.get("controlMsg"))
-        .cloned()
-        .unwrap_or_else(|| params.clone());
-    let ctrl = match serde_json::from_value::<ControlMsg>(message) {
+    let ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
         Ok(ctrl) => ctrl,
-        Err(e) => {
-            return http_body_response(
-                id,
-                400,
-                serde_json::json!({
-                    "ok": false,
-                    "error": format!("invalid control message: {e}"),
-                })
-                .to_string(),
-                "control message",
-            )
-        }
+        Err(response) => return response,
     };
     if !dashboard_control_msg_allowed(&ctrl) {
         return http_body_response(
@@ -3125,6 +3111,80 @@ async fn api_control_msg_response(
     })
 }
 
+async fn api_session_control_msg_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let ctrl = match dashboard_control_msg_from_params(id.clone(), params) {
+        Ok(ctrl) => ctrl,
+        Err(response) => return response,
+    };
+    if !dashboard_session_control_msg_allowed(&ctrl) {
+        return http_body_response(
+            id,
+            400,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "control action not available over dashboard session WebRTC: {}",
+                    dashboard_control_msg_action(&ctrl)
+                ),
+            })
+            .to_string(),
+            "session control message",
+        );
+    }
+    let action = dashboard_control_msg_action(&ctrl);
+    dispatch_dashboard_control_msg(&runtime.bus, ctrl, "session-control");
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": true,
+            "action": action,
+        },
+    })
+}
+
+fn dashboard_control_msg_from_params(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> Result<ControlMsg, serde_json::Value> {
+    let Some(params) = params else {
+        return Err(missing_param_response(id, "message"));
+    };
+    let message = params
+        .get("message")
+        .or_else(|| params.get("control_msg"))
+        .or_else(|| params.get("controlMsg"))
+        .cloned()
+        .unwrap_or_else(|| params.clone());
+    serde_json::from_value::<ControlMsg>(message).map_err(|e| {
+        http_body_response(
+            id,
+            400,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("invalid control message: {e}"),
+            })
+            .to_string(),
+            "control message",
+        )
+    })
+}
+
+fn dispatch_dashboard_control_msg(bus: &crate::event::EventBus, ctrl: ControlMsg, scope: &str) {
+    let action = dashboard_control_msg_action(&ctrl);
+    bus.send(AppEvent::PresenceLog {
+        message: format!("[dashboard-control:{scope}] ControlMsg: {action}"),
+        level: Some(crate::types::LogLevel::Debug),
+        turn: None,
+    });
+    bus.send(AppEvent::ControlCommand(ctrl));
+}
+
 fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
     matches!(
         ctrl,
@@ -3151,6 +3211,29 @@ fn dashboard_control_msg_allowed(ctrl: &ControlMsg) -> bool {
             | ControlMsg::SetGeminiIncludeDirectories { .. }
             | ControlMsg::SetGeminiDebug { .. }
             | ControlMsg::SetVerbosity { .. }
+    )
+}
+
+fn dashboard_session_control_msg_allowed(ctrl: &ControlMsg) -> bool {
+    matches!(
+        ctrl,
+        ControlMsg::Approve { .. }
+            | ControlMsg::Deny { .. }
+            | ControlMsg::Skip { .. }
+            | ControlMsg::ApproveAll { .. }
+            | ControlMsg::RenameSession { .. }
+            | ControlMsg::ConfigureSessionAgent { .. }
+            | ControlMsg::StopSession { .. }
+            | ControlMsg::RestartSession { .. }
+            | ControlMsg::CreateSession { .. }
+            | ControlMsg::StartTask { .. }
+            | ControlMsg::ResumeSession { .. }
+            | ControlMsg::FollowUp { .. }
+            | ControlMsg::CancelFollowUp { .. }
+            | ControlMsg::EditUserMessage { .. }
+            | ControlMsg::Interrupt { .. }
+            | ControlMsg::Steer { .. }
+            | ControlMsg::CancelSteer { .. }
     )
 }
 
@@ -4136,6 +4219,7 @@ mod tests {
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
         assert_eq!(status["result"]["api_control_msg_available"], true);
+        assert_eq!(status["result"]["api_session_control_msg_available"], true);
         assert_eq!(status["result"]["api_key_status_available"], true);
         assert_eq!(status["result"]["api_api_keys_save_available"], true);
         assert_eq!(status["result"]["api_voice_session_available"], true);
@@ -4315,6 +4399,121 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("not available over dashboard WebRTC"));
+    }
+
+    #[tokio::test]
+    async fn api_session_control_msg_dispatches_lifecycle_actions_only() {
+        let rt = runtime();
+        let mut events = rt.bus.subscribe();
+        let response = api_session_control_msg_response(
+            "session-ctrl1".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "interrupt",
+                    "session_id": "session-a",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["ok"], true);
+        assert_eq!(response["result"]["action"], "interrupt");
+
+        let mut saw_control = false;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let AppEvent::ControlCommand(ControlMsg::Interrupt { session_id, .. }) = event {
+                assert_eq!(session_id.as_deref(), Some("session-a"));
+                saw_control = true;
+                break;
+            }
+        }
+        assert!(saw_control, "session control message did not reach the bus");
+
+        let accepted_create = api_session_control_msg_response(
+            "session-ctrl2".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "create_session",
+                    "task": "noop",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(accepted_create["t"], "response");
+        assert_eq!(accepted_create["ok"], true);
+        assert_eq!(accepted_create["result"]["ok"], true);
+        assert_eq!(accepted_create["result"]["action"], "create_session");
+
+        let rejected_settings = api_session_control_msg_response(
+            "session-ctrl3".to_string(),
+            Some(&serde_json::json!({
+                "message": {
+                    "action": "set_codex_sandbox",
+                    "mode": "workspace-write",
+                }
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(rejected_settings["t"], "response");
+        assert_eq!(rejected_settings["ok"], true);
+        assert_eq!(rejected_settings["result"]["ok"], false);
+        assert_eq!(rejected_settings["result"]["_httpStatus"], 400);
+        assert!(rejected_settings["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not available over dashboard session WebRTC"));
+    }
+
+    #[tokio::test]
+    async fn control_frame_routes_session_control_msg_requests() {
+        let mut rt = runtime();
+        let mut events = rt.bus.subscribe();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let immediate = control_frame_response(
+            r#"{"t":"request","id":"session-ctrl-frame","method":"api_session_control_msg","params":{"message":{"action":"interrupt","session_id":"session-frame"}}}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(immediate.is_none(), "session control request should spawn");
+
+        let task = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(task.id, "session-ctrl-frame");
+        assert!(task.done);
+        assert_eq!(task.frame["t"], "response");
+        assert_eq!(task.frame["ok"], true);
+        assert_eq!(task.frame["result"]["action"], "interrupt");
+
+        let mut saw_control = false;
+        for _ in 0..4 {
+            let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+                .await
+                .unwrap()
+                .unwrap();
+            if let AppEvent::ControlCommand(ControlMsg::Interrupt { session_id, .. }) = event {
+                assert_eq!(session_id.as_deref(), Some("session-frame"));
+                saw_control = true;
+                break;
+            }
+        }
+        assert!(
+            saw_control,
+            "frame-routed session control did not reach bus"
+        );
     }
 
     #[tokio::test]

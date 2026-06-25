@@ -468,13 +468,16 @@ Current tunneled mutations include
 active-session rollback/redo/prune, session-data deletion, staged upload
 deletion, settings save, API-key save, peer add/remove, peer access-request
 pairing, peer message/task/approval actions, eligible-peer lookup, worktree
-scan/remove, dashboard managed-context MCP tool calls, and coordinator routing.
+scan/remove, dashboard managed-context MCP tool calls, coordinator routing, and
+dashboard session-control actions.
 Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
 external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
 the DataChannel when it is verified. Display input authority uses dedicated
 DataChannel RPCs and a `display_input` frame rather than the generic
-`ControlMsg` allowlist. Session lifecycle, steering, approval, and other
-high-impact `ControlMsg`s stay on the main WebSocket/control-plane path for now.
+`ControlMsg` allowlist. Session lifecycle, steering, approvals, interrupt,
+resume, stop/restart, rename, and launch-config changes use a separate
+`api_session_control_msg` RPC with its own allowlist instead of broadening the
+generic settings-style `api_control_msg`.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -492,8 +495,7 @@ Several paths intentionally stay outside this JSON tunnel:
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
 - diagnostics NDJSON uploads;
-- session lifecycle, steering, approval, and other non-allowlisted `ControlMsg`
-  mutations;
+- non-allowlisted `ControlMsg` mutations;
 - display WebRTC media channels and peer-display signaling;
 - daemon-to-daemon federation authentication.
 
@@ -842,10 +844,17 @@ state.
 Confirmed session-data deletion uses `api_session_delete` with the same
 no-replay fallback rule as other writes; the dashboard still requires the
 existing confirmation modal before issuing the RPC.
+Dashboard session-control actions use `api_session_control_msg`. This includes
+create/start/resume/stop/restart session, targeted follow-up, mid-turn steer,
+cancel queued steer/follow-up, edit user message, interrupt, approvals,
+session rename, and per-session launch-config persistence. The browser only
+falls back to the WebSocket before it has attempted the RPC; once a verified
+DataChannel write is sent, an error is surfaced to the operator instead of
+replaying a potentially duplicated action.
 
-The remaining migration work is mostly byte-stream and lifecycle heavy:
+The remaining migration work is mostly byte-stream and file-transfer heavy:
 uploads, downloads, recording media, terminal streams, broader file transfer,
-session lifecycle, steering, and approval should move only after resumable
+and non-allowlisted control mutations should move only after resumable
 stream/file-transfer semantics and no-replay mutation rules are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
@@ -914,9 +923,12 @@ Treat this as a staged target, not current behavior:
     credit-windowed chunked response framing, and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames. Allowlisted settings
     `ControlMsg` dispatch, display input authority request/release/snapshot, and
-    local display input frames now use the tunnel when verified. Uploads,
-    downloads, recording media, terminals, non-allowlisted control commands, and
-    file transfer still wait for resumable stream/file-transfer semantics.
+    local display input frames now use the tunnel when verified. Dedicated
+    session-control `ControlMsg` dispatch now covers lifecycle, steering,
+    approvals, interrupt, resume/stop/restart, rename, and launch-config writes
+    with no-replay fallback. Uploads, downloads, recording media, terminals,
+    remaining non-allowlisted control commands, and file transfer still wait for
+    resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

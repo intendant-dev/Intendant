@@ -11144,10 +11144,61 @@ const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_gemini_debug',
   'set_verbosity',
 ]);
+const DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS = new Set([
+  'approve',
+  'deny',
+  'skip',
+  'approve_all',
+  'rename_session',
+  'configure_session_agent',
+  'stop_session',
+  'restart_session',
+  'create_session',
+  'start_task',
+  'resume_session',
+  'follow_up',
+  'cancel_follow_up',
+  'edit_user_message',
+  'interrupt',
+  'steer',
+  'cancel_steer',
+]);
 
 function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
   if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
     return dashboardTransport.jsonFetch(method, params, fallback, label, options);
+  }
+  return fallback();
+}
+
+function dispatchSessionControlMsg(payload, options = {}) {
+  const action = String(payload?.action || '').trim();
+  const fallback = () => {
+    if (app && app.send_server_action) {
+      app.send_server_action(payload);
+      return true;
+    }
+    console.warn('session control: no app connection, dropped', payload);
+    return false;
+  };
+  if (!DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS.has(action)) return fallback();
+  if (
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardTransport.lastStatus?.api_session_control_msg_available === true
+  ) {
+    dashboardTransport.request('api_session_control_msg', { message: payload }, {
+      timeoutMs: options.timeoutMs || 15000,
+    }).catch(err => {
+      console.warn(`[dashboard-control] ${action} session ControlMsg RPC failed; not replaying over /ws`, err);
+      if (typeof options.onError === 'function') {
+        options.onError(err);
+      } else if (typeof showControlToast === 'function') {
+        showControlToast('error', err?.message || 'Dashboard control request failed');
+      }
+    });
+    return true;
   }
   return fallback();
 }
@@ -14184,7 +14235,10 @@ async function stationStartSession() {
     msg.attachments = pendingAttachments.map(a => a.frameId).filter(Boolean);
   }
   try {
-    app.send_server_action(msg);
+    const sent = dispatchSessionControlMsg(msg, {
+      onError: err => failNewSessionSpawnNotice(err?.message || 'Failed to send new-session request.'),
+    });
+    if (!sent) throw new Error('Dashboard is not connected to the server.');
   } catch (e) {
     failNewSessionSpawnNotice(e?.message || 'Failed to send new-session request.');
     return;
@@ -19811,6 +19865,10 @@ function updateControlAppliesNote() {
 
 function dispatchControlMsg(payload) {
   const action = String(payload?.action || '').trim();
+  if (DASHBOARD_SESSION_CONTROL_MSG_RPC_ACTIONS.has(action)) {
+    dispatchSessionControlMsg(payload);
+    return;
+  }
   if (
     action &&
     DASHBOARD_CONTROL_MSG_RPC_ACTIONS.has(action) &&
@@ -20745,8 +20803,7 @@ async function runCodexThreadActionFromUi(op, opts = {}, sessionId = '') {
   // return an error if it doesn't recognise it.
   if (op === 'init') {
     const task = 'Create or update AGENTS.md at the project root with a concise project description, directory structure, important commands, and coding conventions. Base it on the existing repository files.';
-    if (app && app.send_server_action) {
-      app.send_server_action({ action: 'start_task', task, direct: true });
+    if (dispatchSessionControlMsg({ action: 'start_task', task, direct: true })) {
       showControlToast('success', '/init: dispatched AGENTS.md task');
     }
     return;
@@ -37565,6 +37622,7 @@ class DashboardControlTransport {
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
       apiControlMsgAvailable: this.lastStatus?.api_control_msg_available ?? null,
+      apiSessionControlMsgAvailable: this.lastStatus?.api_session_control_msg_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
       apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
@@ -44250,7 +44308,7 @@ function submitEditedUserMessage(input, text) {
   };
   if (resumeContext) Object.assign(msg, resumeContext);
   if (attachments.length > 0) msg.attachments = attachments;
-  app.send_server_action(msg);
+  if (!dispatchSessionControlMsg(msg)) return false;
   markSessionWindowPendingActive(targetSessionId);
   if (attachments.length > 0) {
     renderAttachmentReceipt(text, attachmentReceipt, 'Edited', targetSessionId);
@@ -44423,7 +44481,7 @@ function dispatchTaskText(text, options = {}) {
   }
   if (direct) msg.direct = true;
   if (attachments.length > 0) msg.attachments = attachments;
-  app.send_server_action(msg);
+  if (!dispatchSessionControlMsg(msg)) return false;
   if (targetSessionId) markSessionWindowPendingActive(targetSessionId);
   if (attachments.length > 0) {
     renderAttachmentReceipt(text, attachmentReceipt, 'Sent', targetSessionId);
@@ -44472,7 +44530,7 @@ function submitComposedText(text) {
     const attachmentReceipt = pendingAttachments.slice();
     const msg = { action: 'steer', text, id, session_id: targetSessionId };
     if (attachments.length > 0) msg.attachments = attachments;
-    app.send_server_action(msg);
+    dispatchSessionControlMsg(msg);
     onSteerStatusUpdate(
       id,
       attachments.length > 0 ? `${text} (${attachments.length} attachment${attachments.length === 1 ? '' : 's'})` : text,
@@ -44604,11 +44662,11 @@ function cancelSteerRow(id) {
   if (isSteer && app) {
     const msg = { action: 'cancel_steer', id: key, reason: 'cleared by user' };
     if (sessionId) msg.session_id = sessionId;
-    app.send_server_action(msg);
+    dispatchSessionControlMsg(msg);
   } else if (app) {
     const msg = { action: 'cancel_follow_up', id: key, reason: 'cleared by user' };
     if (sessionId) msg.session_id = sessionId;
-    app.send_server_action(msg);
+    dispatchSessionControlMsg(msg);
     forgetPendingFollowUp(key);
   } else {
     forgetPendingFollowUp(key);
@@ -45573,7 +45631,10 @@ async function startNewSession() {
   if (attachments.length > 0) msg.attachments = attachments;
 
   try {
-    app.send_server_action(msg);
+    const sent = dispatchSessionControlMsg(msg, {
+      onError: err => failNewSessionSpawnNotice(err?.message || 'Failed to send new-session request.'),
+    });
+    if (!sent) throw new Error('Dashboard is not connected to the server.');
   } catch (e) {
     failNewSessionSpawnNotice(e?.message || 'Failed to send new-session request.');
     return;
@@ -48250,7 +48311,7 @@ function resumeSession(s) {
   if (source !== 'intendant') setSessionWindowDetached(sid, true, 'resume requested');
   focusSessionWindow(sid);
   const overrides = sessionLaunchOverridesForSession(s);
-  app.send_server_action({
+  dispatchSessionControlMsg({
     action: 'resume_session',
     source,
     session_id: sid,
@@ -49262,7 +49323,7 @@ window.sendApproval = function(action) {
   }
   const msg = { action, id: pendingApprovalId };
   if (pendingApprovalSessionId) msg.session_id = pendingApprovalSessionId;
-  app.send_server_action(msg);
+  dispatchSessionControlMsg(msg);
   approvalSessionIds.delete(String(pendingApprovalId));
   clearPendingApproval();
   hidePanel('approval-panel');
@@ -49294,7 +49355,7 @@ window.sendInterrupt = function() {
   }
   const msg = { action: 'interrupt' };
   if (targetSessionId) msg.session_id = targetSessionId;
-  app.send_server_action(msg);
+  dispatchSessionControlMsg(msg);
 };
 
 // Show/hide the Stop button based on phase.
