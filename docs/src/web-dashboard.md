@@ -769,18 +769,25 @@ currently receives the WebSocket bootstrap message.
 `api_state_snapshot` returns the existing `state_snapshot` message shape with
 the current `AgentStateSnapshot`, dashboard config, daemon session id when known,
 and a DataChannel-scoped `connection_id`. The connection id is the WebRTC
-control session id, not the legacy WebSocket connection id; display authority
-still needs its own DataChannel-aware identity handling before display bootstrap
-can move off the primary WebSocket.
+control session id, not the legacy WebSocket connection id.
+`api_display_bootstrap` returns a DataChannel-safe display bootstrap envelope
+whose `frames` array contains `display_ready` events for every active display
+session known to the daemon. Those frames use the same event shape as the
+WebSocket bootstrap (`event`, `display_id`, `width`, `height`), so browser code
+can feed them through the existing display-slot path. It intentionally omits
+`display_input_authority_state`: authority is still tied to the legacy
+WebSocket connection holder identity and needs a DataChannel-aware holder model
+before keyboard/mouse control chips can be bootstrapped over this channel.
 `api_session_log_replay` returns the existing capped `log_replay` message shape
 used by late WebSocket joiners. When no active session log exists it returns an
 empty replay with `available: false`; external attached-session transcript replay
 is still separate and has not moved onto this RPC.
 `api_dashboard_bootstrap` composes the DataChannel-safe bootstrap pieces into an
 ordered `frames` array: state snapshot, cached dashboard events, browser
-workspace snapshot, and capped session log replay. It explicitly omits display
-ready/authority frames and external attached-session transcript replay until
-those paths have DataChannel-aware identity and stream handling.
+workspace snapshot, active display `display_ready` frames, and capped session
+log replay. It explicitly omits display authority frames and external
+attached-session transcript replay until those paths have DataChannel-aware
+identity and stream handling.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.

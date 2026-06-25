@@ -136,6 +136,7 @@ async function main() {
         cachedBootstrapEvents: await ctl.cachedBootstrapEvents({ timeoutMs: 60000 }),
         browserWorkspaceSnapshot: await ctl.browserWorkspaceSnapshot({ timeoutMs: 60000 }),
         stateSnapshot: await ctl.stateSnapshot({ timeoutMs: 60000 }),
+        displayBootstrap: await ctl.displayBootstrap({ timeoutMs: 60000 }),
         sessionLogReplay: await ctl.sessionLogReplay({ timeoutMs: 60000 }),
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
@@ -168,6 +169,12 @@ async function main() {
       'state snapshot connection id did not match control session id'
     );
     assert(result.stateSnapshot.state && typeof result.stateSnapshot.state === 'object', 'state snapshot did not return state');
+    assert(Array.isArray(result.displayBootstrap?.frames), 'display bootstrap did not return frames');
+    assert.strictEqual(
+      result.displayBootstrap.frame_count,
+      result.displayBootstrap.frames.length,
+      'display bootstrap frame count did not match'
+    );
     assert.strictEqual(result.sessionLogReplay?.t, 'log_replay', 'session log replay RPC did not return the event shape');
     assert(Array.isArray(result.sessionLogReplay.entries), 'session log replay did not return entries');
     assert(Array.isArray(result.dashboardBootstrap?.frames), 'dashboard bootstrap did not return frames');
@@ -177,12 +184,21 @@ async function main() {
       'dashboard bootstrap frame count did not match'
     );
     assert.strictEqual(result.dashboardBootstrap.frames[0]?.t, 'state_snapshot', 'dashboard bootstrap did not start with state snapshot');
+    assert(
+      !result.dashboardBootstrap.omitted?.includes('display_ready'),
+      'dashboard bootstrap still marked display_ready as omitted'
+    );
+    assert(
+      result.dashboardBootstrap.omitted?.includes('display_input_authority_state'),
+      'dashboard bootstrap did not mark authority state as omitted'
+    );
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert.strictEqual(result.finalStatus.signalingMode, 'local-http');
     assert.strictEqual(result.finalStatus.apiAgentCardAvailable, true);
     assert.strictEqual(result.finalStatus.apiCachedBootstrapEventsAvailable, true);
     assert.strictEqual(result.finalStatus.apiBrowserWorkspaceSnapshotAvailable, true);
     assert.strictEqual(result.finalStatus.apiStateSnapshotAvailable, true);
+    assert.strictEqual(result.finalStatus.apiDisplayBootstrapAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionLogReplayAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardBootstrapAvailable, true);
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
@@ -203,6 +219,7 @@ async function main() {
         cachedBootstrapEventCount: result.cachedBootstrapEvents.event_count,
         browserWorkspaceCount: result.browserWorkspaceSnapshot.workspaces.length,
         stateSnapshotConnectionId: result.stateSnapshot.connection_id,
+        displayBootstrapFrameCount: result.displayBootstrap.frame_count,
         sessionLogReplayEntryCount: result.sessionLogReplay.entries.length,
         dashboardBootstrapFrameCount: result.dashboardBootstrap.frame_count,
         sessionCount: result.sessions.length,
@@ -210,6 +227,7 @@ async function main() {
         apiCachedBootstrapEventsAvailable: result.finalStatus.apiCachedBootstrapEventsAvailable,
         apiBrowserWorkspaceSnapshotAvailable: result.finalStatus.apiBrowserWorkspaceSnapshotAvailable,
         apiStateSnapshotAvailable: result.finalStatus.apiStateSnapshotAvailable,
+        apiDisplayBootstrapAvailable: result.finalStatus.apiDisplayBootstrapAvailable,
         apiSessionLogReplayAvailable: result.finalStatus.apiSessionLogReplayAvailable,
         apiDashboardBootstrapAvailable: result.finalStatus.apiDashboardBootstrapAvailable,
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
@@ -219,7 +237,10 @@ async function main() {
       },
     }, null, 2));
 
-    await page.evaluate(() => window.intendantDashboardControl.disable());
+    await Promise.race([
+      page.evaluate(() => window.intendantDashboardControl.disable()),
+      wait(1000),
+    ]).catch(() => {});
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (!daemon.killed) daemon.kill('SIGINT');
