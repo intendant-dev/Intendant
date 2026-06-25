@@ -1149,10 +1149,10 @@ Treat this as a staged target, not current behavior:
     same no-replay fallback rule.
     Standalone Shell terminal frames and WebTui frames also use the tunnel when
     verified and advertised by the daemon. Visual-freshness diagnostics NDJSON
-    appends use the tunnel when verified and fall back to HTTP only when the
-    tunnel is unavailable. HLS `.ts` playback now builds a blob playlist from
-    tunneled recording bytes and falls back to the native daemon URL only on a
-    daemon-origin dashboard page.
+    appends use the tunnel when verified and fall back to HTTP only on
+    daemon-origin dashboard pages when the tunnel is unavailable. HLS `.ts`
+    playback now builds a blob playlist from tunneled recording bytes and falls
+    back to the native daemon URL only on a daemon-origin dashboard page.
     Annotation/clip media-editor writes now use a dedicated media protocol with
     operation ids, ordered frame uploads, commit/cancel, and no replay after a
     tunneled write attempt. Generic downloads, native media fallback URLs,

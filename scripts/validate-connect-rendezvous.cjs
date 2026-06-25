@@ -2950,6 +2950,7 @@ async function main() {
       ]);
       const genericControlNoReplay = await ctl._debugProbeControlNoReplay();
       const mediaConnectNoLegacy = await ctl._debugProbeMediaConnectNoLegacy();
+      const diagnosticsConnectNoHttp = await ctl._debugProbeDiagnosticsConnectNoHttp();
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
       const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
@@ -2961,6 +2962,7 @@ async function main() {
         bootstrapFrameCount: bootstrap?.frame_count ?? (Array.isArray(bootstrap?.frames) ? bootstrap.frames.length : null),
         genericControlNoReplay,
         mediaConnectNoLegacy,
+        diagnosticsConnectNoHttp,
         transportLabel,
         serverLabel,
         serverClass,
@@ -3055,6 +3057,25 @@ async function main() {
       0,
       `real SPA Connect media fallback replayed over /ws: ${JSON.stringify(appResult.mediaConnectNoLegacy)}`
     );
+    assert.strictEqual(
+      appResult.diagnosticsConnectNoHttp.skipped,
+      false,
+      `real SPA could not exercise Connect diagnostics no-HTTP path: ${JSON.stringify(appResult.diagnosticsConnectNoHttp)}`
+    );
+    assert.strictEqual(
+      appResult.diagnosticsConnectNoHttp.threw,
+      true,
+      `real SPA Connect diagnostics fallback did not fail visibly: ${JSON.stringify(appResult.diagnosticsConnectNoHttp)}`
+    );
+    assert(
+      String(appResult.diagnosticsConnectNoHttp.error || '').includes('Connect visual freshness tunnel is not available'),
+      `real SPA Connect diagnostics fallback had unexpected error: ${JSON.stringify(appResult.diagnosticsConnectNoHttp)}`
+    );
+    assert.strictEqual(
+      appResult.diagnosticsConnectNoHttp.httpFallbackCount,
+      0,
+      `real SPA Connect diagnostics attempted HTTP fallback: ${JSON.stringify(appResult.diagnosticsConnectNoHttp)}`
+    );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
       Number(appResult.sessionCount) >= 1,
@@ -3098,6 +3119,7 @@ async function main() {
         dashboardBootstrapFrameCount: appResult.bootstrapFrameCount,
         genericControlNoReplay: appResult.genericControlNoReplay,
         mediaConnectNoLegacy: appResult.mediaConnectNoLegacy,
+        diagnosticsConnectNoHttp: appResult.diagnosticsConnectNoHttp,
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,

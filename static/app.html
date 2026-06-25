@@ -37771,6 +37771,48 @@ window.intendantDashboardControl = {
     }
     return { skipped: false, threw, error, wsReplayCount };
   },
+  async _debugProbeDiagnosticsConnectNoHttp() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof postVisualFreshnessDiagnostics !== 'function' ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        postType: typeof postVisualFreshnessDiagnostics,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        threw: false,
+        httpFallbackCount: 0,
+      };
+    }
+    const previousStatus = dashboardControlTransport.lastStatus;
+    const previousFetch = window.fetch;
+    let httpFallbackCount = 0;
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      api_diagnostics_visual_freshness_available: false,
+    };
+    window.fetch = function(input, init) {
+      const url = typeof input === 'string' ? input : (input?.url || '');
+      if (String(url).includes('/api/diagnostics/visual-freshness')) {
+        httpFallbackCount += 1;
+      }
+      return previousFetch.call(this, input, init);
+    };
+    let threw = false;
+    let error = '';
+    try {
+      await postVisualFreshnessDiagnostics('debug-visual-freshness', '{"ok":true}\n');
+    } catch (err) {
+      threw = true;
+      error = err?.message || String(err);
+    } finally {
+      dashboardControlTransport.lastStatus = previousStatus;
+      window.fetch = previousFetch;
+    }
+    return { skipped: false, threw, error, httpFallbackCount };
+  },
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);
   },
@@ -40298,6 +40340,9 @@ async function postVisualFreshnessDiagnostics(sessionId, ndjson) {
       throw new Error(result?.error || `diagnostics upload failed (${result?._httpStatus || 'error'})`);
     }
     return result;
+  }
+  if (dashboardConnectModeEnabled()) {
+    throw new Error('dashboard Connect visual freshness tunnel is not available');
   }
   const url = `/api/diagnostics/visual-freshness?session_id=${encodeURIComponent(sessionId)}`;
   const resp = await authedFetch(url, {
