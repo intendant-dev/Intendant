@@ -30023,6 +30023,13 @@ function sendRawMessage(obj) {
   else if (app.send_server_action) { app.send_server_action(obj); }
 }
 
+function sendShellMessage(obj) {
+  if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame(obj)) {
+    return;
+  }
+  sendRawMessage(obj);
+}
+
 function initTerminal() {
   if (termInitialized) return;
   termInitialized = true;
@@ -30117,7 +30124,7 @@ function initShell() {
     });
 
     shellTerm.onResize(({ cols, rows }) => {
-      sendRawMessage({
+      sendShellMessage({
         t: 'terminal_resize',
         host_id: SHELL_HOST_ID,
         terminal_id: SHELL_TERMINAL_ID,
@@ -30134,7 +30141,7 @@ function initShell() {
     // Ask the server to open (or reattach to) the session. The server
     // replays scrollback automatically on attach.
     const dims = { cols: shellTerm.cols, rows: shellTerm.rows };
-    sendRawMessage({
+    sendShellMessage({
       t: 'terminal_open',
       host_id: SHELL_HOST_ID,
       terminal_id: SHELL_TERMINAL_ID,
@@ -30220,7 +30227,7 @@ function updateTermSubscription() {
 //   being sent. One-shot: the modifier clears after one transform.
 
 function sendShellBytes(bytes) {
-  sendRawMessage({
+  sendShellMessage({
     t: 'terminal_input',
     host_id: SHELL_HOST_ID,
     terminal_id: SHELL_TERMINAL_ID,
@@ -33041,8 +33048,9 @@ function clearPendingAttachments(options = {}) {
 // ── File upload ───────────────────────────────────────────────────────
 //
 // Flow: user clicks Attach (or drops files on the task input) → we stream
-// each file to POST /api/session/current/uploads → the server replies
-// with an UploadDescriptor and also broadcasts UploadReady. Only the POSTing
+// each file over the verified dashboard control tunnel when available, falling
+// back to POST /api/session/current/uploads otherwise. The server replies
+// with an UploadDescriptor and also broadcasts UploadReady. Only the initiating
 // browser queues a pending chip; broadcasts are informational so parallel
 // dashboards do not accidentally attach each other's uploads. Submitting a
 // task maps the chip's `frameId` (of the form "upload:<id>") directly into
@@ -33070,6 +33078,15 @@ function dashboardUploadRpcAvailable() {
     dashboardTransport.canUseRpc() &&
     dashboardControlTransport?.lastStatus?.upload_frames_available === true &&
     dashboardControlTransport?.lastStatus?.api_session_current_upload_available === true
+  );
+}
+
+function dashboardTerminalFramesAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.terminal_frames_available === true
   );
 }
 
@@ -36830,6 +36847,11 @@ class DashboardTransport {
     return dashboardControlTransport.uploadBytes(method, params, bytes, options);
   }
 
+  terminalFrame(frame) {
+    if (!this.canUseRpc()) return false;
+    return dashboardControlTransport.terminalFrame(frame);
+  }
+
   displayInput(displayId, event) {
     if (!this.canUseDisplayInputAuthority()) return false;
     return dashboardControlTransport.displayInput(displayId, event);
@@ -36964,6 +36986,9 @@ window.intendantDashboardControl = {
   },
   uploadBytes(method, params = {}, bytes, options = {}) {
     return dashboardTransport.uploadBytes(method, params, bytes, options);
+  },
+  terminalFrame(frame) {
+    return dashboardTransport.terminalFrame(frame);
   },
   agentCard(options = {}) {
     return dashboardTransport.request('api_agent_card', {}, options);
@@ -37194,7 +37219,7 @@ class DashboardControlTransport {
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
-    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams'] });
+    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'terminal_frames'] });
     this.ping().catch(() => {});
     this.request('status').then(status => {
       if (status && typeof status === 'object') {
@@ -37231,6 +37256,19 @@ class DashboardControlTransport {
   handleFrame(msg) {
     if (msg.t === 'hello_ack') {
       console.info('[dashboard-control] hello_ack', msg.session_id || '');
+      return;
+    }
+    if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error') {
+      try {
+        window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
+      } catch (_) {}
+      if (dashboardServerMessageDispatcher) {
+        dashboardServerMessageDispatcher(JSON.stringify(msg));
+      } else if (msg.t === 'terminal_output' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
+        handleShellOutput(msg.data);
+      } else if (msg.t === 'terminal_exited' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
+        handleShellExited(msg.status);
+      }
       return;
     }
     if (msg.t === 'event') {
@@ -37708,6 +37746,12 @@ class DashboardControlTransport {
     return true;
   }
 
+  terminalFrame(frame) {
+    if (!this.canUseRpc()) return false;
+    this.sendFrame(frame);
+    return true;
+  }
+
   stream(method, params = {}, options = {}, onEvent = {}) {
     if (options.signal?.aborted) {
       return Promise.reject(dashboardControlAbortError());
@@ -37953,6 +37997,7 @@ class DashboardControlTransport {
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
       byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
       uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
+      terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
       apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,

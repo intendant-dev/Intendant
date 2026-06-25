@@ -162,6 +162,62 @@ async function main() {
           mime: 'text/plain',
         }, bytes, { timeoutMs: 60000 }));
       };
+      const terminal = async () => {
+        const terminalId = `dashboard-terminal-local-${Date.now()}`;
+        const token = 'dashboard_terminal_e2e_local';
+        const frames = [];
+        const handler = event => frames.push(event.detail || {});
+        const waitFor = (predicate, label) => new Promise((resolve, reject) => {
+          const started = Date.now();
+          const tick = () => {
+            const found = frames.find(predicate);
+            if (found) {
+              resolve(found);
+              return;
+            }
+            if (Date.now() - started > 60000) {
+              reject(new Error(`terminal ${label} timed out`));
+              return;
+            }
+            setTimeout(tick, 25);
+          };
+          tick();
+        });
+        window.addEventListener('intendant-dashboard-terminal-frame', handler);
+        try {
+          ctl.terminalFrame({
+            t: 'terminal_open',
+            host_id: 'local',
+            terminal_id: terminalId,
+            cols: 80,
+            rows: 24,
+          });
+          await waitFor(frame => frame.t === 'terminal_opened' && frame.terminal_id === terminalId, 'open');
+          ctl.terminalFrame({
+            t: 'terminal_input',
+            host_id: 'local',
+            terminal_id: terminalId,
+            data: btoa(`printf '${token}\\n'\\r`),
+          });
+          const output = await waitFor(frame => {
+            if (frame.t !== 'terminal_output' || frame.terminal_id !== terminalId) return false;
+            return atob(String(frame.data || '')).includes(token);
+          }, 'output');
+          ctl.terminalFrame({
+            t: 'terminal_close',
+            host_id: 'local',
+            terminal_id: terminalId,
+          });
+          return {
+            opened: true,
+            sawToken: true,
+            terminalId,
+            outputBytes: atob(String(output.data || '')).length,
+          };
+        } finally {
+          window.removeEventListener('intendant-dashboard-terminal-frame', handler);
+        }
+      };
       return {
         status: await ctl.request('status', {}, { timeoutMs: 60000 }),
         agentCard: await ctl.agentCard({ timeoutMs: 60000 }),
@@ -176,6 +232,7 @@ async function main() {
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         sessionReport: await sessionReport(),
         upload: await upload(),
+        terminal: await terminal(),
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
         }, { timeoutMs: 60000 })),
@@ -287,12 +344,15 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionReportAvailable, true);
     assert.strictEqual(result.finalStatus.byteStreamsAvailable, true);
     assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
+    assert.strictEqual(result.finalStatus.terminalFramesAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
     assert.strictEqual(result.upload?._httpStatus, 200);
     assert.strictEqual(result.upload?._httpOk, true);
     assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
     assert.strictEqual(result.upload?.mime, 'text/plain');
     assert.strictEqual(result.upload?.size, 'dashboard upload e2e local'.length);
+    assert.strictEqual(result.terminal?.opened, true);
+    assert.strictEqual(result.terminal?.sawToken, true);
     if (result.sessionReport?.ok === true) {
       assert.strictEqual(result.sessionReport.content_type, 'application/zip');
       assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
@@ -357,9 +417,11 @@ async function main() {
         apiSessionReportAvailable: result.finalStatus.apiSessionReportAvailable,
         byteStreamsAvailable: result.finalStatus.byteStreamsAvailable,
         uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
+        terminalFramesAvailable: result.finalStatus.terminalFramesAvailable,
         apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
         uploadStatus: result.upload._httpStatus,
         uploadSize: result.upload.size,
+        terminalOutputBytes: result.terminal.outputBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,

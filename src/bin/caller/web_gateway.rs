@@ -15415,6 +15415,17 @@ pub fn spawn_web_gateway(
         )
     };
 
+    // Process-wide registry of standalone shell PTY sessions, keyed by
+    // (host_id, terminal_id). Lives as long as the web gateway task and
+    // is cloned into each per-connection handler so reconnects reattach
+    // to existing shells. Keyed on host_id even though there's only one
+    // host today so multi-host phase 1 can add siblings without refactor.
+    let terminal_registry: Arc<crate::terminal::TerminalRegistry> = Arc::new(
+        crate::terminal::TerminalRegistry::new(project_root.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        })),
+    );
+
     let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
         config.clone(),
         broadcast_tx.clone(),
@@ -15424,6 +15435,7 @@ pub fn spawn_web_gateway(
         shared_session.clone(),
         project_root.clone(),
         worktree_inventory_cache.clone(),
+        terminal_registry.clone(),
         agent_card_value,
         bootstrap_caches.clone(),
         Some(dashboard_display_authority),
@@ -15475,17 +15487,6 @@ pub fn spawn_web_gateway(
             }
         });
     }
-
-    // Process-wide registry of standalone shell PTY sessions, keyed by
-    // (host_id, terminal_id). Lives as long as the web gateway task and
-    // is cloned into each per-connection handler so WS reconnects reattach
-    // to existing shells. Keyed on host_id even though there's only one
-    // host today so multi-host phase 1 can add siblings without refactor.
-    let terminal_registry: Arc<crate::terminal::TerminalRegistry> = Arc::new(
-        crate::terminal::TerminalRegistry::new(project_root.clone().unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        })),
-    );
 
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).

@@ -64,6 +64,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "stream_frames",
     "byte_streams",
     "upload_frames",
+    "terminal_frames",
     "api_peers",
     "api_sessions",
     "api_sessions_stream",
@@ -129,6 +130,7 @@ pub struct DashboardControlRegistry {
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+    terminal_registry: Arc<crate::terminal::TerminalRegistry>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
@@ -218,6 +220,7 @@ impl DashboardControlRegistry {
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+        terminal_registry: Arc<crate::terminal::TerminalRegistry>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
         display_authority: Option<DashboardDisplayAuthorityBridge>,
@@ -231,6 +234,7 @@ impl DashboardControlRegistry {
             shared_session,
             project_root,
             worktree_inventory_cache,
+            terminal_registry,
             agent_card,
             bootstrap_caches,
             display_authority,
@@ -253,6 +257,7 @@ impl DashboardControlRegistry {
             self.shared_session.clone(),
             self.project_root.clone(),
             self.worktree_inventory_cache.clone(),
+            self.terminal_registry.clone(),
             self.agent_card.clone(),
             self.bootstrap_caches.clone(),
             self.display_authority.clone(),
@@ -374,6 +379,7 @@ impl DashboardControlPeer {
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+        terminal_registry: Arc<crate::terminal::TerminalRegistry>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
         display_authority: Option<DashboardDisplayAuthorityBridge>,
@@ -448,6 +454,7 @@ impl DashboardControlPeer {
             shared_session,
             project_root,
             worktree_inventory_cache,
+            terminal_registry,
             agent_card,
             bootstrap_caches,
             display_authority,
@@ -514,6 +521,7 @@ struct ControlRuntime {
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
+    terminal_registry: Arc<crate::terminal::TerminalRegistry>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
@@ -717,6 +725,10 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
     let mut pending_requests: HashMap<String, CancellationToken> = HashMap::new();
     let mut outbound_queue = OutboundControlQueue::new();
     let mut inbound_uploads: HashMap<String, InboundUploadState> = HashMap::new();
+    let (terminal_events_tx, mut terminal_events_rx) =
+        mpsc::unbounded_channel::<serde_json::Value>();
+    let mut terminal_forwarders: HashMap<(String, String), tokio::task::JoinHandle<()>> =
+        HashMap::new();
     let mut display_authority_rx = runtime
         .display_authority
         .as_ref()
@@ -732,6 +744,8 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             &mut pending_requests,
             &mut outbound_queue,
             &mut inbound_uploads,
+            &terminal_events_tx,
+            &mut terminal_forwarders,
         )
         .await
         {
@@ -824,6 +838,10 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
                 }
                 let _ = rtc.handle_timeout(Instant::now());
             }
+            Some(frame) = terminal_events_rx.recv() => {
+                send_control_text(&mut rtc, &channels, frame.to_string());
+                let _ = rtc.handle_timeout(Instant::now());
+            }
             authority = async {
                 match display_authority_rx.as_mut() {
                     Some(rx) => Some(rx.recv().await),
@@ -861,6 +879,10 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
 
     for (_, token) in pending_requests {
         token.cancel();
+    }
+    for (_, handle) in terminal_forwarders {
+        handle.abort();
+        let _ = handle.await;
     }
     for handle in forwarder_handles {
         let _ = handle.await;
@@ -905,6 +927,8 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     pending_requests: &mut HashMap<String, CancellationToken>,
     outbound_queue: &mut OutboundControlQueue,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
+    terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         if t.transport.transport_protocol != TransportProtocol::UDP {
@@ -951,6 +975,8 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
             pending_requests,
             outbound_queue,
             inbound_uploads,
+            terminal_events_tx,
+            terminal_forwarders,
         ) {
             send_control_frame(
                 rtc,
@@ -1356,6 +1382,8 @@ fn control_frame_response(
     pending_requests: &mut HashMap<String, CancellationToken>,
     outbound_queue: &mut OutboundControlQueue,
     inbound_uploads: &mut HashMap<String, InboundUploadState>,
+    terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
 ) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
     let t = parsed.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -1393,6 +1421,12 @@ fn control_frame_response(
             spawn_dashboard_display_input(parsed, runtime.clone());
             None
         }
+        "terminal_open" => {
+            control_terminal_open_frame(parsed, runtime, terminal_events_tx, terminal_forwarders)
+        }
+        "terminal_input" => control_terminal_input_frame(parsed, runtime),
+        "terminal_resize" => control_terminal_resize_frame(parsed, runtime),
+        "terminal_close" => control_terminal_close_frame(parsed, runtime, terminal_forwarders),
         "upload_start" => control_upload_start_frame(id, parsed, pending_requests, inbound_uploads),
         "upload_chunk" => control_upload_chunk_frame(id, parsed, pending_requests, inbound_uploads),
         "upload_end" => control_upload_end_frame(
@@ -1797,6 +1831,164 @@ fn control_upload_end_frame(
     None
 }
 
+fn terminal_frame_key(frame: &serde_json::Value) -> (String, String) {
+    let host_id = frame
+        .get("host_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("local")
+        .to_string();
+    let terminal_id = frame
+        .get("terminal_id")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("shell-0")
+        .to_string();
+    (host_id, terminal_id)
+}
+
+fn terminal_frame_dimension(frame: &serde_json::Value, key: &str, default: u16) -> u16 {
+    frame
+        .get(key)
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u16::try_from(value).ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default)
+}
+
+fn control_terminal_open_frame(
+    frame: serde_json::Value,
+    runtime: &ControlRuntime,
+    terminal_events_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+) -> Option<serde_json::Value> {
+    let (host_id, terminal_id) = terminal_frame_key(&frame);
+    let cols = terminal_frame_dimension(&frame, "cols", 80);
+    let rows = terminal_frame_dimension(&frame, "rows", 24);
+    let forwarder_key = (host_id.clone(), terminal_id.clone());
+    if let Some(handle) = terminal_forwarders.remove(&forwarder_key) {
+        handle.abort();
+    }
+    let registry = runtime.terminal_registry.clone();
+    let terminal_events_tx = terminal_events_tx.clone();
+    let handle = tokio::spawn(async move {
+        let key = crate::terminal::TerminalKey {
+            host_id: host_id.clone(),
+            terminal_id: terminal_id.clone(),
+        };
+        match registry.open_or_attach(key, cols, rows).await {
+            Ok(session) => {
+                let (tx, mut rx) = mpsc::unbounded_channel();
+                session.attach(tx);
+                let _ = terminal_events_tx.send(serde_json::json!({
+                    "t": "terminal_opened",
+                    "host_id": host_id.clone(),
+                    "terminal_id": terminal_id.clone(),
+                }));
+                while let Some(event) = rx.recv().await {
+                    let frame = match event {
+                        crate::terminal::TerminalEvent::Output(bytes) => {
+                            let data = base64::engine::general_purpose::STANDARD.encode(&bytes);
+                            serde_json::json!({
+                                "t": "terminal_output",
+                                "host_id": host_id.clone(),
+                                "terminal_id": terminal_id.clone(),
+                                "data": data,
+                            })
+                        }
+                        crate::terminal::TerminalEvent::Exited { status } => {
+                            serde_json::json!({
+                                "t": "terminal_exited",
+                                "host_id": host_id.clone(),
+                                "terminal_id": terminal_id.clone(),
+                                "status": status,
+                            })
+                        }
+                    };
+                    if terminal_events_tx.send(frame).is_err() {
+                        break;
+                    }
+                }
+            }
+            Err(e) => {
+                let _ = terminal_events_tx.send(serde_json::json!({
+                    "t": "terminal_error",
+                    "host_id": host_id,
+                    "terminal_id": terminal_id,
+                    "error": e,
+                }));
+            }
+        }
+    });
+    terminal_forwarders.insert(forwarder_key, handle);
+    None
+}
+
+fn control_terminal_input_frame(
+    frame: serde_json::Value,
+    runtime: &ControlRuntime,
+) -> Option<serde_json::Value> {
+    let (host_id, terminal_id) = terminal_frame_key(&frame);
+    let data_b64 = frame
+        .get("data")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    let Ok(data) = base64::engine::general_purpose::STANDARD.decode(data_b64) else {
+        return None;
+    };
+    let registry = runtime.terminal_registry.clone();
+    tokio::spawn(async move {
+        let key = crate::terminal::TerminalKey {
+            host_id,
+            terminal_id,
+        };
+        if let Some(session) = registry.get(&key).await {
+            session.write_input(&data);
+        }
+    });
+    None
+}
+
+fn control_terminal_resize_frame(
+    frame: serde_json::Value,
+    runtime: &ControlRuntime,
+) -> Option<serde_json::Value> {
+    let (host_id, terminal_id) = terminal_frame_key(&frame);
+    let cols = terminal_frame_dimension(&frame, "cols", 80);
+    let rows = terminal_frame_dimension(&frame, "rows", 24);
+    let registry = runtime.terminal_registry.clone();
+    tokio::spawn(async move {
+        let key = crate::terminal::TerminalKey {
+            host_id,
+            terminal_id,
+        };
+        if let Some(session) = registry.get(&key).await {
+            session.resize(cols, rows);
+        }
+    });
+    None
+}
+
+fn control_terminal_close_frame(
+    frame: serde_json::Value,
+    runtime: &ControlRuntime,
+    terminal_forwarders: &mut HashMap<(String, String), tokio::task::JoinHandle<()>>,
+) -> Option<serde_json::Value> {
+    let (host_id, terminal_id) = terminal_frame_key(&frame);
+    if let Some(handle) = terminal_forwarders.remove(&(host_id.clone(), terminal_id.clone())) {
+        handle.abort();
+    }
+    let registry = runtime.terminal_registry.clone();
+    tokio::spawn(async move {
+        let key = crate::terminal::TerminalKey {
+            host_id,
+            terminal_id,
+        };
+        registry.close(&key).await;
+    });
+    None
+}
+
 fn spawn_dashboard_display_input(frame: serde_json::Value, runtime: ControlRuntime) {
     tokio::spawn(async move {
         let display_id = frame
@@ -1967,6 +2159,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_dashboard_bootstrap_available", true),
         ("byte_streams_available", true),
         ("upload_frames_available", true),
+        ("terminal_frames_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -4660,6 +4853,9 @@ mod tests {
             shared_session: crate::web_gateway::ActiveSessionState::empty(),
             project_root: None,
             worktree_inventory_cache: Arc::new(std::sync::Mutex::new(None)),
+            terminal_registry: Arc::new(crate::terminal::TerminalRegistry::new(
+                std::env::temp_dir(),
+            )),
             bootstrap_caches: DashboardBootstrapCaches::default(),
             display_authority: None,
         }
@@ -4673,6 +4869,8 @@ mod tests {
         outbound_queue: &mut OutboundControlQueue,
     ) -> Option<serde_json::Value> {
         let mut inbound_uploads = HashMap::new();
+        let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let mut terminal_forwarders = HashMap::new();
         control_frame_response(
             text,
             runtime,
@@ -4680,6 +4878,8 @@ mod tests {
             pending_requests,
             outbound_queue,
             &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
         )
     }
 
@@ -5542,6 +5742,8 @@ mod tests {
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
+        let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let mut terminal_forwarders = HashMap::new();
         let bytes = b"hello upload";
         let first = &bytes[..6];
         let second = &bytes[6..];
@@ -5566,6 +5768,8 @@ mod tests {
             &mut pending,
             &mut outbound,
             &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
         )
         .is_none());
         assert!(pending.contains_key("up1"));
@@ -5584,6 +5788,8 @@ mod tests {
                 &mut pending,
                 &mut outbound,
                 &mut inbound_uploads,
+                &terminal_tx,
+                &mut terminal_forwarders,
             )
             .is_none());
         }
@@ -5600,6 +5806,8 @@ mod tests {
             &mut pending,
             &mut outbound,
             &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
         )
         .is_none());
 
@@ -5642,6 +5850,8 @@ mod tests {
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
         let mut inbound_uploads = HashMap::new();
+        let (terminal_tx, _terminal_rx) = mpsc::unbounded_channel();
+        let mut terminal_forwarders = HashMap::new();
 
         let start = serde_json::json!({
             "t": "upload_start",
@@ -5663,6 +5873,8 @@ mod tests {
             &mut pending,
             &mut outbound,
             &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
         )
         .is_none());
         assert!(pending.contains_key("up-empty"));
@@ -5679,6 +5891,8 @@ mod tests {
             &mut pending,
             &mut outbound,
             &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
         )
         .is_none());
 
@@ -5694,6 +5908,111 @@ mod tests {
         assert_eq!(response.frame["result"]["size"], 0);
         let path = response.frame["result"]["path"].as_str().unwrap();
         assert_eq!(std::fs::read(path).unwrap(), b"");
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn terminal_frames_open_input_and_forward_output() {
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.terminal_registry = Arc::new(crate::terminal::TerminalRegistry::new(
+            project.path().to_path_buf(),
+        ));
+        let (task_tx, _task_rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let mut inbound_uploads = HashMap::new();
+        let (terminal_tx, mut terminal_rx) = mpsc::unbounded_channel();
+        let mut terminal_forwarders = HashMap::new();
+        let terminal_id = "dash-control-test-shell";
+
+        let open = serde_json::json!({
+            "t": "terminal_open",
+            "host_id": "local",
+            "terminal_id": terminal_id,
+            "cols": 80,
+            "rows": 24,
+        });
+        assert!(control_frame_response(
+            &open.to_string(),
+            &mut rt,
+            &task_tx,
+            &mut pending,
+            &mut outbound,
+            &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
+        )
+        .is_none());
+
+        let opened = tokio::time::timeout(Duration::from_secs(3), terminal_rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(opened["t"], "terminal_opened");
+        assert_eq!(opened["terminal_id"], terminal_id);
+
+        let token = "dashboard_terminal_frame_ok";
+        let input = serde_json::json!({
+            "t": "terminal_input",
+            "host_id": "local",
+            "terminal_id": terminal_id,
+            "data": base64::engine::general_purpose::STANDARD
+                .encode(format!("printf '{token}\\n'\r").as_bytes()),
+        });
+        assert!(control_frame_response(
+            &input.to_string(),
+            &mut rt,
+            &task_tx,
+            &mut pending,
+            &mut outbound,
+            &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
+        )
+        .is_none());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_token = false;
+        while Instant::now() < deadline {
+            match tokio::time::timeout(Duration::from_millis(200), terminal_rx.recv()).await {
+                Ok(Some(frame)) if frame["t"] == "terminal_output" => {
+                    let data = frame["data"].as_str().unwrap_or("");
+                    let bytes = base64::engine::general_purpose::STANDARD
+                        .decode(data)
+                        .unwrap_or_default();
+                    if String::from_utf8_lossy(&bytes).contains(token) {
+                        saw_token = true;
+                        break;
+                    }
+                }
+                Ok(Some(_)) => {}
+                Ok(None) => break,
+                Err(_) => {}
+            }
+        }
+        assert!(
+            saw_token,
+            "did not receive terminal output over control frames"
+        );
+
+        let close = serde_json::json!({
+            "t": "terminal_close",
+            "host_id": "local",
+            "terminal_id": terminal_id,
+        });
+        let _ = control_frame_response(
+            &close.to_string(),
+            &mut rt,
+            &task_tx,
+            &mut pending,
+            &mut outbound,
+            &mut inbound_uploads,
+            &terminal_tx,
+            &mut terminal_forwarders,
+        );
+        for (_, handle) in terminal_forwarders {
+            handle.abort();
+        }
     }
 
     #[tokio::test]

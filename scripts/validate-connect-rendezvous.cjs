@@ -353,7 +353,7 @@ function publicBootstrapHtml() {
       this.pc = new RTCPeerConnection({});
       this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
       this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams'] });
+        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'terminal_frames'] });
         paint(this.status());
       };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
@@ -400,6 +400,12 @@ function publicBootstrapHtml() {
     handleFrame(msg) {
       if (msg.t === 'hello_ack') {
         paint(this.status());
+        return;
+      }
+      if (msg.t === 'terminal_output' || msg.t === 'terminal_exited' || msg.t === 'terminal_opened' || msg.t === 'terminal_error') {
+        try {
+          window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
+        } catch (_) {}
         return;
       }
       if (msg.t === 'response_start') {
@@ -791,6 +797,11 @@ function publicBootstrapHtml() {
         await new Promise(resolve => setTimeout(resolve, 10));
       }
     },
+    terminalFrame(frame) {
+      if (!this.canUseRpc()) return false;
+      this.sendFrame(frame);
+      return true;
+    },
     stream(method, params = {}, options = {}, onEvent = {}) {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control stream is not connected'));
@@ -1090,6 +1101,62 @@ async function main() {
           mime: 'text/plain',
         }, bytes, { timeoutMs: 60000 }));
       };
+      const terminal = async () => {
+        const terminalId = `dashboard-terminal-rendezvous-${Date.now()}`;
+        const token = 'dashboard_terminal_e2e_rendezvous';
+        const frames = [];
+        const handler = event => frames.push(event.detail || {});
+        const waitFor = (predicate, label) => new Promise((resolve, reject) => {
+          const started = Date.now();
+          const tick = () => {
+            const found = frames.find(predicate);
+            if (found) {
+              resolve(found);
+              return;
+            }
+            if (Date.now() - started > 60000) {
+              reject(new Error(`terminal ${label} timed out`));
+              return;
+            }
+            setTimeout(tick, 25);
+          };
+          tick();
+        });
+        window.addEventListener('intendant-dashboard-terminal-frame', handler);
+        try {
+          ctl.terminalFrame({
+            t: 'terminal_open',
+            host_id: 'local',
+            terminal_id: terminalId,
+            cols: 80,
+            rows: 24,
+          });
+          await waitFor(frame => frame.t === 'terminal_opened' && frame.terminal_id === terminalId, 'open');
+          ctl.terminalFrame({
+            t: 'terminal_input',
+            host_id: 'local',
+            terminal_id: terminalId,
+            data: btoa(`printf '${token}\\n'\\r`),
+          });
+          const output = await waitFor(frame => {
+            if (frame.t !== 'terminal_output' || frame.terminal_id !== terminalId) return false;
+            return atob(String(frame.data || '')).includes(token);
+          }, 'output');
+          ctl.terminalFrame({
+            t: 'terminal_close',
+            host_id: 'local',
+            terminal_id: terminalId,
+          });
+          return {
+            opened: true,
+            sawToken: true,
+            terminalId,
+            outputBytes: atob(String(output.data || '')).length,
+          };
+        } finally {
+          window.removeEventListener('intendant-dashboard-terminal-frame', handler);
+        }
+      };
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
@@ -1110,6 +1177,7 @@ async function main() {
         dashboardAction,
         sessionReport: await sessionReport(),
         upload: await upload(),
+        terminal: await terminal(),
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -1210,6 +1278,11 @@ async function main() {
       result.status.upload_frames_available,
       true,
       'dashboard control status did not advertise upload frames'
+    );
+    assert.strictEqual(
+      result.status.terminal_frames_available,
+      true,
+      'dashboard control status did not advertise terminal frames'
     );
     assert.strictEqual(
       result.status.api_session_current_upload_available,
@@ -1424,6 +1497,8 @@ async function main() {
     assert.strictEqual(result.upload?.name, 'dashboard-upload-rendezvous.txt');
     assert.strictEqual(result.upload?.mime, 'text/plain');
     assert.strictEqual(result.upload?.size, 'dashboard upload e2e rendezvous'.length);
+    assert.strictEqual(result.terminal?.opened, true);
+    assert.strictEqual(result.terminal?.sawToken, true);
     assert.strictEqual(
       result.status.api_session_current_history_available,
       true,
@@ -1654,9 +1729,11 @@ async function main() {
         apiSessionReportAvailable: result.status.api_session_report_available,
         byteStreamsAvailable: result.status.byte_streams_available,
         uploadFramesAvailable: result.status.upload_frames_available,
+        terminalFramesAvailable: result.status.terminal_frames_available,
         apiSessionCurrentUploadAvailable: result.status.api_session_current_upload_available,
         uploadStatus: result.upload._httpStatus,
         uploadSize: result.upload.size,
+        terminalOutputBytes: result.terminal.outputBytes,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         streamEventCount: result.sessionsStream.eventCount,
