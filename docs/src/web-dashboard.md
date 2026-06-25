@@ -450,9 +450,9 @@ DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
 boundary. Current tunneled reads include sessions, session detail, lazy
 command-output loads for the active session, active-session timeline history,
 active-session changes/diffs, filesystem picker stat/list reads, deep session
-search, settings, API-key status, project root, display enumeration, and peer
-state. Managed-context history reads for records, anchors, and fission groups
-also use the tunnel.
+search, settings, API-key status, project root, display enumeration, recording
+metadata, and peer state. Managed-context history reads for records, anchors,
+and fission groups also use the tunnel.
 Current tunneled mutations include
 active-session rollback/redo/prune, settings save, API-key save, peer
 add/remove, peer access-request pairing, peer message/task/approval actions,
@@ -728,6 +728,9 @@ The active-session timeline uses `api_session_current_history`,
 rule as other writes.
 Active-session change list/detail reads use `api_session_current_changes`,
 preserving the existing path validation and `_httpStatus`/`_httpOk` metadata.
+Live and per-session recording stream lists use `api_recordings` and
+`api_session_recordings`; HLS playlists and media segments remain on HTTP until
+the tunnel has resumable byte-stream semantics.
 The filesystem picker's read-only path checks and directory listings use
 `api_fs_stat` and `api_fs_list`; mkdir remains on HTTP until the tunnel has a
 broader filesystem mutation model.
@@ -797,12 +800,12 @@ Treat this as a staged target, not current behavior:
    the future public Connect UI.
 10. Gradually migrate larger API surfaces. Managed-context history reads,
     active-session command-output loads, active-session timeline operations,
-    active-session changes/diffs, filesystem picker stat/list reads, and local
-    session hydration now use the tunnel, oversized JSON responses now use
-    credit-windowed chunked response framing, and the sessions stream uses explicit
-    `stream_start`/`stream_event`/`stream_end` frames.
-    Uploads, downloads, recordings, terminals, and file transfer still wait for
-    resumable stream/file-transfer semantics.
+    active-session changes/diffs, recording metadata, filesystem picker
+    stat/list reads, and local session hydration now use the tunnel, oversized
+    JSON responses now use credit-windowed chunked response framing, and the
+    sessions stream uses explicit `stream_start`/`stream_event`/`stream_end`
+    frames. Uploads, downloads, recording media, terminals, and file transfer
+    still wait for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

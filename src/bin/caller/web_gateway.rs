@@ -3793,6 +3793,62 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
     entries
 }
 
+pub(crate) async fn recordings_list_response_body(
+    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
+) -> String {
+    let mut all_entries = Vec::new();
+
+    if let Some(rec_reg) = recording_registry {
+        let reg = rec_reg.read().await;
+        let streams = reg.all_streams();
+        for name in &streams {
+            let manifest = reg.manifest(name).unwrap_or(serde_json::json!({}));
+            let segments = reg.segments(name);
+            let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
+            let seg_json: Vec<serde_json::Value> = segments
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "filename": s.filename,
+                        "start_secs": s.start_secs,
+                        "end_secs": s.end_secs,
+                    })
+                })
+                .collect();
+            let mut entry = manifest;
+            entry["segments"] = serde_json::Value::Array(seg_json);
+            entry["total_duration_secs"] = serde_json::json!(total_duration);
+            all_entries.push(entry);
+        }
+    }
+
+    let daemon_dir = crate::debug::daemon_recordings_dir();
+    for entry in list_recording_streams(&daemon_dir) {
+        all_entries.push(entry);
+    }
+
+    serde_json::to_string(&all_entries).unwrap_or("[]".to_string())
+}
+
+pub(crate) fn session_recordings_list_response_body(
+    session_id: &str,
+) -> (&'static str, String) {
+    if !session_lookup_id_is_safe(session_id) {
+        return (
+            "400 Bad Request",
+            serde_json::json!({ "error": "invalid session id" }).to_string(),
+        );
+    }
+    let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+        let recordings_dir = session_dir.join("recordings");
+        let entries = list_recording_streams(&recordings_dir);
+        serde_json::to_string(&entries).unwrap_or("[]".to_string())
+    } else {
+        "[]".to_string()
+    };
+    ("200 OK", body)
+}
+
 fn recording_playlist_m3u8(segments: &[crate::recording::SegmentInfo]) -> String {
     let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n");
     let max_dur = segments
@@ -18790,46 +18846,7 @@ pub fn spawn_web_gateway(
                         // GET /recordings — list all streams (session + daemon-scoped)
                         use tokio::io::AsyncWriteExt;
 
-                        let mut all_entries = Vec::new();
-
-                        // Session-scoped recordings (from RecordingRegistry)
-                        if let Some(ref rec_reg) = recording_registry {
-                            let reg = rec_reg.read().await;
-                            let streams = reg.all_streams();
-                            for name in &streams {
-                                let manifest = reg.manifest(name).unwrap_or(serde_json::json!({}));
-                                let segments = reg.segments(name);
-                                let total_duration =
-                                    segments.last().map(|s| s.end_secs).unwrap_or(0.0);
-                                let seg_json: Vec<serde_json::Value> = segments
-                                    .iter()
-                                    .map(|s| {
-                                        serde_json::json!({
-                                            "filename": s.filename,
-                                            "start_secs": s.start_secs,
-                                            "end_secs": s.end_secs,
-                                        })
-                                    })
-                                    .collect();
-                                let mut entry = manifest;
-                                entry["segments"] = serde_json::Value::Array(seg_json);
-                                entry["total_duration_secs"] = serde_json::json!(total_duration);
-                                all_entries.push(entry);
-                            }
-                        }
-
-                        // Daemon-scoped recordings (from ~/.intendant/recordings/)
-                        let daemon_dir = crate::debug::daemon_recordings_dir();
-                        let mut daemon_streams: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        for entry in list_recording_streams(&daemon_dir) {
-                            if let Some(name) = entry["stream_name"].as_str() {
-                                daemon_streams.insert(name.to_string());
-                            }
-                            all_entries.push(entry);
-                        }
-
-                        let body = serde_json::to_string(&all_entries).unwrap_or("[]".to_string());
+                        let body = recordings_list_response_body(recording_registry.clone()).await;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -19582,16 +19599,10 @@ pub fn spawn_web_gateway(
                                 }
                             } else {
                                 // GET /api/session/{id}/recordings — list streams
-                                let body =
-                                    if let Some(session_dir) = resolve_session_dir(session_id) {
-                                        let recordings_dir = session_dir.join("recordings");
-                                        let entries = list_recording_streams(&recordings_dir);
-                                        serde_json::to_string(&entries).unwrap_or("[]".to_string())
-                                    } else {
-                                        "[]".to_string()
-                                    };
+                                let (status, body) =
+                                    session_recordings_list_response_body(session_id);
                                 let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
+                                    "HTTP/1.1 {status}\r\n\
                                      Content-Type: application/json\r\n\
                                      Content-Length: {}\r\n\
                                      Cache-Control: no-cache\r\n\

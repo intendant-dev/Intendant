@@ -857,6 +857,10 @@ async function main() {
           list: await ctl.request('api_session_current_changes'),
           traversal: await ctl.request('api_session_current_changes', { path: '../Cargo.toml' }),
         },
+        recordings: {
+          live: await ctl.request('api_recordings'),
+          invalidSession: await ctl.request('api_session_recordings', { session_id: '../bad' }),
+        },
         filesystem: {
           statHome: await ctl.request('api_fs_stat', { path: '~' }),
           listHome: await ctl.request('api_fs_list', { path: '~' }),
@@ -978,6 +982,24 @@ async function main() {
       'changes path validation RPC did not preserve endpoint status'
     );
     assert.strictEqual(
+      result.status.api_recordings_available,
+      true,
+      'dashboard control status did not advertise recordings'
+    );
+    assert.strictEqual(
+      result.status.api_session_recordings_available,
+      true,
+      'dashboard control status did not advertise session recordings'
+    );
+    assert(
+      Array.isArray(result.recordings?.live),
+      'recordings RPC did not return a stream array'
+    );
+    assert(
+      result.recordings?.invalidSession?._httpStatus === 400,
+      'session recordings RPC did not preserve invalid id status'
+    );
+    assert.strictEqual(
       result.status.api_fs_stat_available,
       true,
       'dashboard control status did not advertise filesystem stat'
@@ -1043,6 +1065,10 @@ async function main() {
           value?._httpStatus || 200,
         ])),
         changesStatuses: Object.fromEntries(Object.entries(result.changes || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
+        recordingsStatuses: Object.fromEntries(Object.entries(result.recordings || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,
         ])),

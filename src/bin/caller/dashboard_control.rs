@@ -67,6 +67,8 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_api_keys_save",
     "api_project_root",
     "api_displays",
+    "api_recordings",
+    "api_session_recordings",
     "api_managed_context_records",
     "api_managed_context_anchors",
     "api_managed_context_fission",
@@ -1080,6 +1082,8 @@ fn control_frame_response(
                         "api_api_keys_save_available": true,
                         "api_project_root_available": true,
                         "api_displays_available": true,
+                        "api_recordings_available": true,
+                        "api_session_recordings_available": true,
                         "api_managed_context_available": true,
                         "api_peer_mutations_available": runtime.peer_registry.is_some(),
                         "api_peer_pairing_available": true,
@@ -1161,6 +1165,8 @@ fn control_frame_response(
                 | "api_api_keys_save"
                 | "api_project_root"
                 | "api_displays"
+                | "api_recordings"
+                | "api_session_recordings"
                 | "api_managed_context_records"
                 | "api_managed_context_anchors"
                 | "api_managed_context_fission"
@@ -1331,6 +1337,8 @@ async fn control_request_response(
             "project root",
         ),
         "api_displays" => api_displays_response(id, &runtime).await,
+        "api_recordings" => api_recordings_response(id, &runtime).await,
+        "api_session_recordings" => api_session_recordings_response(id, params.as_ref()).await,
         "api_managed_context_records" => {
             api_managed_context_response(id, "records", params.as_ref(), &runtime).await
         }
@@ -1802,6 +1810,31 @@ async fn api_displays_response(id: String, runtime: &ControlRuntime) -> serde_js
         id,
         crate::web_gateway::displays_response_body(&session_registry).await,
         "displays",
+    )
+}
+
+async fn api_recordings_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    let recording_registry = active_recording_registry(runtime).await;
+    json_body_response(
+        id,
+        crate::web_gateway::recordings_list_response_body(recording_registry).await,
+        "recordings",
+    )
+}
+
+async fn api_session_recordings_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let session_id = string_param(&params, &["session_id", "sessionId", "id"]);
+    let (status_line, body) =
+        crate::web_gateway::session_recordings_list_response_body(&session_id);
+    http_body_response(
+        id,
+        status_line_code(status_line),
+        body,
+        "session recordings",
     )
 }
 
@@ -2463,6 +2496,13 @@ async fn active_changes_handles(runtime: &ControlRuntime) -> (Option<PathBuf>, O
     )
 }
 
+async fn active_recording_registry(
+    runtime: &ControlRuntime,
+) -> Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>> {
+    let session = runtime.shared_session.read().await;
+    session.recording_registry.clone()
+}
+
 fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
     for name in names {
         if let Some(value) = params.get(*name) {
@@ -2644,6 +2684,8 @@ mod tests {
         assert_eq!(status["result"]["api_api_keys_save_available"], true);
         assert_eq!(status["result"]["api_project_root_available"], true);
         assert_eq!(status["result"]["api_displays_available"], true);
+        assert_eq!(status["result"]["api_recordings_available"], true);
+        assert_eq!(status["result"]["api_session_recordings_available"], true);
         assert_eq!(status["result"]["api_peer_mutations_available"], false);
         assert_eq!(status["result"]["api_peer_pairing_available"], true);
         assert_eq!(status["result"]["api_coordinator_available"], false);
@@ -2815,6 +2857,27 @@ mod tests {
         assert_eq!(response.frame["result"]["error"], "file watcher not active");
         assert_eq!(response.frame["result"]["_httpStatus"], 503);
         assert_eq!(response.frame["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn recording_rpcs_preserve_shapes_and_status() {
+        let rt = runtime();
+
+        let recordings = api_recordings_response("rec1".to_string(), &rt).await;
+        assert_eq!(recordings["t"], "response");
+        assert_eq!(recordings["ok"], true);
+        assert!(recordings["result"].as_array().is_some());
+
+        let invalid_session = api_session_recordings_response(
+            "rec2".to_string(),
+            Some(&serde_json::json!({ "session_id": "../bad" })),
+        )
+        .await;
+        assert_eq!(invalid_session["t"], "response");
+        assert_eq!(invalid_session["ok"], true);
+        assert_eq!(invalid_session["result"]["error"], "invalid session id");
+        assert_eq!(invalid_session["result"]["_httpStatus"], 400);
+        assert_eq!(invalid_session["result"]["_httpOk"], false);
     }
 
     #[tokio::test]

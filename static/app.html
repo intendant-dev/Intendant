@@ -32357,7 +32357,7 @@ document.getElementById('recording-stream-select').addEventListener('change', (e
 // recording that has since been deleted, so the disk/API list is authoritative.
 async function reconcileRecordingStreams() {
   try {
-    const resp = await fetch('/recordings');
+    const resp = await dashboardJsonFetch('api_recordings', {}, () => fetch('/recordings'), 'api_recordings');
     const streams = await resp.json();
     const liveNames = new Set();
     for (const s of streams) {
@@ -36665,6 +36665,12 @@ window.intendantDashboardControl = {
   currentChanges(path = '', options = {}) {
     return dashboardTransport.request('api_session_current_changes', changesRequestParams(path), options);
   },
+  recordings(options = {}) {
+    return dashboardTransport.request('api_recordings', {}, options);
+  },
+  sessionRecordings(sessionId, options = {}) {
+    return dashboardTransport.request('api_session_recordings', { session_id: sessionId }, options);
+  },
   sessionSearch(params = {}, options = {}) {
     return dashboardTransport.request('api_sessions_search', params, options);
   },
@@ -37247,6 +37253,8 @@ class DashboardControlTransport {
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
       apiProjectRootAvailable: this.lastStatus?.api_project_root_available ?? null,
       apiDisplaysAvailable: this.lastStatus?.api_displays_available ?? null,
+      apiRecordingsAvailable: this.lastStatus?.api_recordings_available ?? null,
+      apiSessionRecordingsAvailable: this.lastStatus?.api_session_recordings_available ?? null,
       apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
       pendingRequests: this.pending.size,
       pendingChunkedResponses: this.chunkedResponses.size,
@@ -37287,6 +37295,8 @@ function dashboardControlRequestTimeoutMs(method) {
       return 120000;
     case 'api_sessions_search':
     case 'api_session_current_changes':
+    case 'api_recordings':
+    case 'api_session_recordings':
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
@@ -48213,7 +48223,9 @@ async function loadSessionRecordings(sessionId) {
 
   let streams;
   try {
-    const resp = await fetch(`/api/session/${sessionId}/recordings`);
+    const resp = await dashboardJsonFetch('api_session_recordings', { session_id: sessionId }, () => (
+      fetch(`/api/session/${encodeURIComponent(sessionId)}/recordings`)
+    ), 'api_session_recordings');
     streams = await resp.json();
   } catch { return; }
   if (!Array.isArray(streams) || streams.length === 0) return;
