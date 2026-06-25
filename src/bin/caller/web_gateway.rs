@@ -298,7 +298,7 @@ struct ActivePresence {
 
 /// Identity of who currently holds input authority for one display.
 ///
-/// Two provenance kinds, with explicit identity per kind so the
+/// Three provenance kinds, with explicit identity per kind so the
 /// arbitration / gate / cleanup paths can match on the source of the
 /// hold without resorting to string-shape inference:
 ///
@@ -333,6 +333,11 @@ struct ActivePresence {
 ///   nicety, not correctness. See
 ///   `docs/design-federated-input-authority.md` for the full note.
 ///
+/// - **`DashboardControl`**: holder is one daemon-scoped dashboard
+///   control DataChannel session. It has no WS `direct_tx`; state
+///   changes are personalized and pushed through the control tunnel's
+///   event stream.
+///
 /// The map is `HashMap<u32, DisplayInputHolder>` — no `Option`, no
 /// wrapper struct. Entry absence = unclaimed; that's the pre-phase-5
 /// backwards-compat state where every connection's input flowed
@@ -354,6 +359,9 @@ enum DisplayInputHolder {
         federation_connection_id: String,
         session_id: String,
     },
+    DashboardControl {
+        session_id: String,
+    },
 }
 
 impl DisplayInputHolder {
@@ -367,7 +375,7 @@ impl DisplayInputHolder {
             Self::LocalWs {
                 connection_id: c, ..
             } => c == connection_id,
-            Self::FederatedWebRtc { .. } => false,
+            Self::FederatedWebRtc { .. } | Self::DashboardControl { .. } => false,
         }
     }
 
@@ -381,7 +389,16 @@ impl DisplayInputHolder {
                 federation_connection_id: c,
                 session_id: s,
             } => c == federation_connection_id && s == session_id,
-            Self::LocalWs { .. } => false,
+            Self::LocalWs { .. } | Self::DashboardControl { .. } => false,
+        }
+    }
+
+    /// True iff this holder is a daemon-scoped dashboard control
+    /// session with the given `session_id`.
+    fn matches_dashboard_control(&self, session_id: &str) -> bool {
+        match self {
+            Self::DashboardControl { session_id: s } => s == session_id,
+            Self::LocalWs { .. } | Self::FederatedWebRtc { .. } => false,
         }
     }
 
@@ -427,6 +444,10 @@ impl DisplayInputHolder {
                     session_id: sb,
                 },
             ) => ca == cb && sa == sb,
+            (
+                Self::DashboardControl { session_id: a },
+                Self::DashboardControl { session_id: b },
+            ) => a == b,
             _ => false,
         }
     }
@@ -718,6 +739,137 @@ fn apply_release_input_authority_federated(
         });
     }
     removed
+}
+
+fn dashboard_control_authority_state_frame(
+    session_id: &str,
+    display_id: u32,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+) -> serde_json::Value {
+    let state = {
+        let auth = authority.read().unwrap_or_else(|e| e.into_inner());
+        match auth.get(&display_id) {
+            Some(entry) if entry.matches_dashboard_control(session_id) => "you",
+            Some(_) => "other",
+            None => "unclaimed",
+        }
+    };
+    serde_json::json!({
+        "t": "display_input_authority_state",
+        "display_id": display_id,
+        "state": state,
+    })
+}
+
+fn dashboard_control_authority_snapshot_frames(
+    session_id: &str,
+    display_ids: &[u32],
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+) -> Vec<serde_json::Value> {
+    display_ids
+        .iter()
+        .map(|display_id| {
+            dashboard_control_authority_state_frame(session_id, *display_id, authority)
+        })
+        .collect()
+}
+
+fn apply_grant_input_authority_dashboard_control(
+    display_id: u32,
+    session_id: String,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Option<DisplayInputHolder> {
+    let new_holder = DisplayInputHolder::DashboardControl {
+        session_id: session_id.clone(),
+    };
+    let broadcast_holder = new_holder.clone();
+    let prior = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        map.insert(display_id, new_holder)
+    };
+    if let Some(DisplayInputHolder::LocalWs {
+        direct_tx: prior_tx,
+        ..
+    }) = prior.as_ref()
+    {
+        let notify = serde_json::json!({
+            "t": "display_input_authority_revoked",
+            "display_id": display_id,
+            "reason": "another connection requested control",
+        })
+        .to_string();
+        let _ = prior_tx.send(notify);
+    }
+    let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+        display_id,
+        holder: Some(broadcast_holder),
+    });
+    prior
+}
+
+fn apply_release_input_authority_dashboard_control(
+    display_id: u32,
+    session_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> bool {
+    let removed = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        match map.get(&display_id) {
+            Some(entry) if entry.matches_dashboard_control(session_id) => {
+                map.remove(&display_id);
+                true
+            }
+            _ => false,
+        }
+    };
+    if removed {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id,
+            holder: None,
+        });
+    }
+    removed
+}
+
+fn apply_dashboard_control_close_input_authority(
+    session_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Vec<u32> {
+    let released: Vec<u32> = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        map.retain(|did, entry| {
+            if entry.matches_dashboard_control(session_id) {
+                out.push(*did);
+                false
+            } else {
+                true
+            }
+        });
+        out
+    };
+    for did in &released {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id: *did,
+            holder: None,
+        });
+    }
+    released
+}
+
+fn dashboard_control_input_authorized(
+    session_id: &str,
+    display_id: u32,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+) -> bool {
+    let auth = authority.read().unwrap_or_else(|e| e.into_inner());
+    match auth.get(&display_id) {
+        Some(entry) => entry.matches_dashboard_control(session_id),
+        None => true,
+    }
 }
 
 /// F-1.3b: federated WS-close cleanup. Releases every
@@ -3839,9 +3991,7 @@ pub(crate) async fn recordings_list_response_body(
     serde_json::to_string(&all_entries).unwrap_or("[]".to_string())
 }
 
-pub(crate) fn session_recordings_list_response_body(
-    session_id: &str,
-) -> (&'static str, String) {
+pub(crate) fn session_recordings_list_response_body(session_id: &str) -> (&'static str, String) {
     if !session_lookup_id_is_safe(session_id) {
         return (
             "400 Bad Request",
@@ -4214,16 +4364,15 @@ pub(crate) fn session_context_snapshot_response_body(
             serde_json::json!({"error": "invalid session id"}).to_string(),
         );
     }
-    let selector =
-        match context_snapshot_selector_from_parts(file, request_id, request_index, ts) {
-            Ok(selector) => selector,
-            Err(error) => {
-                return (
-                    "400 Bad Request",
-                    serde_json::json!({"error": error}).to_string(),
-                );
-            }
-        };
+    let selector = match context_snapshot_selector_from_parts(file, request_id, request_index, ts) {
+        Ok(selector) => selector,
+        Err(error) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": error}).to_string(),
+            );
+        }
+    };
     session_context_snapshot_response_for_selector(home, session_id, source, selector)
 }
 
@@ -8813,10 +8962,7 @@ pub(crate) fn empty_worktree_inventory_response() -> String {
         .unwrap_or_else(|_| "{}".to_string())
 }
 
-pub(crate) fn scan_worktree_inventory_response(
-    home: &Path,
-    project_root: Option<&Path>,
-) -> String {
+pub(crate) fn scan_worktree_inventory_response(home: &Path, project_root: Option<&Path>) -> String {
     let hints = worktree_session_hints_from_home(home);
     let scan = crate::worktree_inventory::scan_worktrees(home, project_root, &hints);
     serde_json::to_string(&scan).unwrap_or_else(|_| "{}".to_string())
@@ -9974,10 +10120,7 @@ fn list_intendant_skeleton_sessions_with_limit(
         .collect()
 }
 
-fn merge_quick_session_rows_with_wrapper_index(
-    home: &Path,
-    rows: &mut Vec<serde_json::Value>,
-) {
+fn merge_quick_session_rows_with_wrapper_index(home: &Path, rows: &mut Vec<serde_json::Value>) {
     apply_external_wrapper_index_to_sessions(home, rows);
     let wrapped_intendant_ids = rows
         .iter()
@@ -10178,7 +10321,10 @@ pub(crate) fn stream_sessions_from_request(
     }
 
     let mut quick_rows = Vec::new();
-    quick_rows.extend(list_intendant_skeleton_sessions_with_limit(&home, quick_limit));
+    quick_rows.extend(list_intendant_skeleton_sessions_with_limit(
+        &home,
+        quick_limit,
+    ));
     quick_rows.extend(list_codex_index_skeleton_sessions_with_limit(
         &home,
         quick_limit,
@@ -11469,10 +11615,7 @@ async fn connect_dashboard_offer_response(
         Ok(body) => body,
         Err(e) => return json_error("400 Bad Request", format!("invalid JSON: {e}")),
     };
-    let sdp = body
-        .get("sdp")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let sdp = body.get("sdp").and_then(|v| v.as_str()).unwrap_or("");
     if sdp.trim().is_empty() {
         return json_error("400 Bad Request", "missing sdp");
     }
@@ -11508,7 +11651,10 @@ async fn connect_dashboard_ice_response(
         .get("candidate")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    match dashboard_control.add_ice_candidate(session_id, &candidate).await {
+    match dashboard_control
+        .add_ice_candidate(session_id, &candidate)
+        .await
+    {
         Ok(true) => json_ok(serde_json::json!({ "ok": true })),
         Ok(false) => json_error("404 Not Found", "dashboard control session not found"),
         Err(e) => json_error("500 Internal Server Error", e),
@@ -12653,11 +12799,9 @@ fn append_managed_context_fission_groups_from_dir(
         }
     } else {
         for session_id in session_ids {
-            if let Some(document) =
-                crate::fission_ledger::read_fission_ledger_document_for_session(
-                    log_dir, session_id,
-                )?
-            {
+            if let Some(document) = crate::fission_ledger::read_fission_ledger_document_for_session(
+                log_dir, session_id,
+            )? {
                 documents.push(document);
             }
         }
@@ -13764,10 +13908,7 @@ fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, Stri
 pub(crate) fn dashboard_fs_mkdir_response_body(raw: &str) -> (String, String) {
     match mkdir_dashboard_fs_path(raw) {
         Ok(body) => ("200 OK".to_string(), body.to_string()),
-        Err((status, message)) => (
-            status,
-            serde_json::json!({ "error": message }).to_string(),
-        ),
+        Err((status, message)) => (status, serde_json::json!({ "error": message }).to_string()),
     }
 }
 
@@ -15004,22 +15145,6 @@ pub fn spawn_web_gateway(
     let agent_card_value =
         serde_json::to_value(&agent_card).unwrap_or_else(|_| serde_json::json!({}));
     let bootstrap_caches = crate::dashboard_control::DashboardBootstrapCaches::default();
-    let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
-        config.clone(),
-        broadcast_tx.clone(),
-        bus.clone(),
-        peer_registry.clone(),
-        mcp_server.clone(),
-        shared_session.clone(),
-        project_root.clone(),
-        worktree_inventory_cache.clone(),
-        agent_card_value,
-        bootstrap_caches.clone(),
-    ));
-    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
-        config.connect.clone(),
-        dashboard_control.clone(),
-    );
 
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {
@@ -15104,6 +15229,108 @@ pub fn spawn_web_gateway(
     // from `unknown` to `unclaimed`.
     let (authority_change_tx, _authority_change_rx0) =
         broadcast::channel::<DisplayInputAuthorityChange>(AUTHORITY_CHANGE_CAPACITY);
+
+    let (dashboard_authority_change_tx, _dashboard_authority_change_rx0) =
+        broadcast::channel::<u32>(AUTHORITY_CHANGE_CAPACITY);
+    {
+        let mut authority_change_rx = authority_change_tx.subscribe();
+        let dashboard_authority_change_tx = dashboard_authority_change_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match authority_change_rx.recv().await {
+                    Ok(change) => {
+                        let _ = dashboard_authority_change_tx.send(change.display_id);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
+
+    let dashboard_display_authority = {
+        let snapshot_authority = Arc::clone(&display_input_authority);
+        let state_authority = Arc::clone(&display_input_authority);
+        let request_authority = Arc::clone(&display_input_authority);
+        let request_change_tx = authority_change_tx.clone();
+        let release_authority = Arc::clone(&display_input_authority);
+        let release_change_tx = authority_change_tx.clone();
+        let input_authority = Arc::clone(&display_input_authority);
+        let cleanup_authority = Arc::clone(&display_input_authority);
+        let cleanup_change_tx = authority_change_tx.clone();
+        let subscribe_tx = dashboard_authority_change_tx.clone();
+        crate::dashboard_control::DashboardDisplayAuthorityBridge::new(
+            move |session_id, display_ids| {
+                dashboard_control_authority_snapshot_frames(
+                    session_id,
+                    display_ids,
+                    &snapshot_authority,
+                )
+            },
+            move |session_id, display_id| {
+                Some(dashboard_control_authority_state_frame(
+                    session_id,
+                    display_id,
+                    &state_authority,
+                ))
+            },
+            move |session_id, display_id| {
+                apply_grant_input_authority_dashboard_control(
+                    display_id,
+                    session_id.to_string(),
+                    &request_authority,
+                    &request_change_tx,
+                );
+                vec![dashboard_control_authority_state_frame(
+                    session_id,
+                    display_id,
+                    &request_authority,
+                )]
+            },
+            move |session_id, display_id| {
+                apply_release_input_authority_dashboard_control(
+                    display_id,
+                    session_id,
+                    &release_authority,
+                    &release_change_tx,
+                );
+                vec![dashboard_control_authority_state_frame(
+                    session_id,
+                    display_id,
+                    &release_authority,
+                )]
+            },
+            move |session_id, display_id| {
+                dashboard_control_input_authorized(session_id, display_id, &input_authority)
+            },
+            move |session_id| {
+                apply_dashboard_control_close_input_authority(
+                    session_id,
+                    &cleanup_authority,
+                    &cleanup_change_tx,
+                );
+            },
+            move || subscribe_tx.subscribe(),
+        )
+    };
+
+    let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
+        config.clone(),
+        broadcast_tx.clone(),
+        bus.clone(),
+        peer_registry.clone(),
+        mcp_server.clone(),
+        shared_session.clone(),
+        project_root.clone(),
+        worktree_inventory_cache.clone(),
+        agent_card_value,
+        bootstrap_caches.clone(),
+        Some(dashboard_display_authority),
+    ));
+    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
+        config.connect.clone(),
+        dashboard_control.clone(),
+    );
 
     // F-1.3b3 federated authority subscribers. Federated counterpart
     // to local 5c's per-WS subscriber loop: federated browsers don't
@@ -18467,11 +18694,9 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
-                    } else if let Some(asset) = static_asset_arm(
-                        req_method,
-                        req_path,
-                        &["/icon-128.png", "/favicon.ico"],
-                    ) {
+                    } else if let Some(asset) =
+                        static_asset_arm(req_method, req_path, &["/icon-128.png", "/favicon.ico"])
+                    {
                         let response = build_static_asset_response(
                             req_method,
                             &header_text,
@@ -20371,8 +20596,8 @@ pub fn spawn_web_gateway(
                         let _ = stream_task.await;
                     } else if request_line.contains("/api/sessions/search") {
                         let query = query_param(request_line, "q").unwrap_or_default();
-                        let source_filter =
-                            query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
+                        let source_filter = query_param(request_line, "source")
+                            .unwrap_or_else(|| "all".to_string());
                         let mode = query_param(request_line, "mode").unwrap_or_default();
                         let project_filter = session_project_filter_from_request(request_line);
                         let body = sessions_search_response_body(
@@ -23924,12 +24149,8 @@ mod tests {
             },
         )
         .unwrap();
-        crate::fission_ledger::detach_group(
-            dir.path(),
-            &detached.group_id,
-            "anchor rewound away",
-        )
-        .unwrap();
+        crate::fission_ledger::detach_group(dir.path(), &detached.group_id, "anchor rewound away")
+            .unwrap();
 
         let response = managed_context_fission_response_from_home(
             "GET /api/managed-context/fission?session_id=fission-web-parent HTTP/1.1",
@@ -23973,7 +24194,10 @@ mod tests {
             branch["changed_files"],
             serde_json::json!(["docs/src/a.md", "docs/src/b.md"])
         );
-        assert_eq!(branch["tests_run"], serde_json::json!(["cargo test --bins"]));
+        assert_eq!(
+            branch["tests_run"],
+            serde_json::json!(["cargo test --bins"])
+        );
 
         // A session id outside the connected component sees no groups.
         let unrelated = managed_context_fission_response_from_home(
@@ -25801,11 +26025,7 @@ mod tests {
                 + "\n",
         )
         .unwrap();
-        let wrapper_dir = home
-            .path()
-            .join(".intendant")
-            .join("logs")
-            .join(wrapper_id);
+        let wrapper_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
         std::fs::create_dir_all(&wrapper_dir).unwrap();
         std::fs::write(
             wrapper_dir.join("session_meta.json"),
@@ -29362,10 +29582,12 @@ mod tests {
             .expect("exact wasm path must serve the wasm");
         assert_eq!(asset.content_type, "application/wasm");
         assert_eq!(asset.body, WASM_STATION_BIN);
-        assert!(
-            static_asset_arm("HEAD", "/wasm-station/station_web_bg.wasm", STATION_WASM_ARM_PATHS)
-                .is_some()
-        );
+        assert!(static_asset_arm(
+            "HEAD",
+            "/wasm-station/station_web_bg.wasm",
+            STATION_WASM_ARM_PATHS
+        )
+        .is_some());
 
         // Non-GET/HEAD methods and superstring paths fall through.
         assert!(static_asset_arm(
@@ -29403,7 +29625,10 @@ mod tests {
         let icon = embedded_static_asset("/icon-128.png").unwrap();
         assert!(icon.gzip.is_none());
         // The favicon alias serves the same PNG.
-        assert_eq!(embedded_static_asset("/favicon.ico").unwrap().body, ICON_128_PNG);
+        assert_eq!(
+            embedded_static_asset("/favicon.ico").unwrap().body,
+            ICON_128_PNG
+        );
         // The gzip gate is size-based: tiny assets stay identity-only.
         let audio = embedded_static_asset("/audio-processor.js").unwrap();
         assert_eq!(audio.gzip.is_some(), audio.body.len() >= GZIP_MIN_BYTES);
@@ -29437,7 +29662,9 @@ mod tests {
         ));
         assert!(accept_encoding_allows_gzip("Accept-Encoding: GZIP"));
         assert!(accept_encoding_allows_gzip("accept-encoding: x-gzip;q=0.5"));
-        assert!(accept_encoding_allows_gzip("Accept-Encoding: br, gzip;q=0.8"));
+        assert!(accept_encoding_allows_gzip(
+            "Accept-Encoding: br, gzip;q=0.8"
+        ));
         assert!(!accept_encoding_allows_gzip("Accept-Encoding: br"));
         assert!(!accept_encoding_allows_gzip("Accept-Encoding: gzip;q=0"));
         assert!(!accept_encoding_allows_gzip("Accept-Encoding: gzip;q=0.0"));
@@ -29573,13 +29800,15 @@ mod tests {
         // `?v=wgpu29` station-wasm case) and none on another.
         let html = "<script src=\"/wasm-station/station_web.js?v=wgpu29\"></script>\n\
                     import('/wasm-station/station_web_bg.wasm');";
-        let rewritten =
-            rewrite_asset_url_with_version(html, "/wasm-station/station_web.js", v);
+        let rewritten = rewrite_asset_url_with_version(html, "/wasm-station/station_web.js", v);
         let rewritten =
             rewrite_asset_url_with_version(&rewritten, "/wasm-station/station_web_bg.wasm", v);
         assert!(rewritten.contains("/wasm-station/station_web.js?v=0123456789abcdef\""));
         assert!(rewritten.contains("/wasm-station/station_web_bg.wasm?v=0123456789abcdef'"));
-        assert!(!rewritten.contains("wgpu29"), "stale buster must be replaced");
+        assert!(
+            !rewritten.contains("wgpu29"),
+            "stale buster must be replaced"
+        );
         assert!(
             !rewritten.contains("?v=0123456789abcdef?v="),
             "never a malformed double query"
@@ -29587,8 +29816,7 @@ mod tests {
 
         // Idempotent: re-applying the rewrite changes nothing.
         let twice = rewrite_asset_url_with_version(&rewritten, "/wasm-station/station_web.js", v);
-        let twice =
-            rewrite_asset_url_with_version(&twice, "/wasm-station/station_web_bg.wasm", v);
+        let twice = rewrite_asset_url_with_version(&twice, "/wasm-station/station_web_bg.wasm", v);
         assert_eq!(twice, rewritten);
 
         // Multiple occurrences are all rewritten.
@@ -31896,7 +32124,10 @@ mod tests {
         let resp = http_request_bytes(port, &req).await;
         let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let head = String::from_utf8_lossy(&resp[..split]).into_owned();
-        assert!(head.starts_with("HTTP/1.1 304 Not Modified\r\n"), "got: {head}");
+        assert!(
+            head.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+            "got: {head}"
+        );
         assert!(head.contains(&etag_line));
         assert!(head.contains("Access-Control-Allow-Origin: *\r\n"));
         assert_eq!(resp.len(), split, "304 must carry no body");
@@ -35225,6 +35456,77 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .get(&7)
             .is_none());
+    }
+
+    #[test]
+    fn dashboard_control_authority_grant_release_and_cleanup() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+
+        apply_grant_input_authority_dashboard_control(
+            11,
+            "control-session-A".to_string(),
+            &map,
+            &auth_tx,
+        );
+        let grant = auth_rx.try_recv().expect("dashboard grant emitted");
+        assert_eq!(grant.display_id, 11);
+        assert!(
+            grant
+                .holder
+                .as_ref()
+                .map(|holder| holder.matches_dashboard_control("control-session-A"))
+                .unwrap_or(false),
+            "broadcast holder must identify the dashboard-control session"
+        );
+        assert!(dashboard_control_input_authorized(
+            "control-session-A",
+            11,
+            &map
+        ));
+        assert!(!dashboard_control_input_authorized(
+            "control-session-B",
+            11,
+            &map
+        ));
+        assert_eq!(
+            dashboard_control_authority_state_frame("control-session-A", 11, &map)["state"],
+            "you"
+        );
+        assert_eq!(
+            dashboard_control_authority_state_frame("control-session-B", 11, &map)["state"],
+            "other"
+        );
+
+        let released = apply_release_input_authority_dashboard_control(
+            11,
+            "control-session-B",
+            &map,
+            &auth_tx,
+        );
+        assert!(!released, "non-holder release should be a no-op");
+        assert!(auth_rx.try_recv().is_err(), "no-op release should not emit");
+
+        apply_grant_input_authority_dashboard_control(
+            12,
+            "control-session-A".to_string(),
+            &map,
+            &auth_tx,
+        );
+        let _ = auth_rx.try_recv().expect("second dashboard grant emitted");
+        let mut cleaned =
+            apply_dashboard_control_close_input_authority("control-session-A", &map, &auth_tx);
+        cleaned.sort_unstable();
+        assert_eq!(cleaned, vec![11, 12]);
+        let cleanup_a = auth_rx.try_recv().expect("first cleanup emitted");
+        let cleanup_b = auth_rx.try_recv().expect("second cleanup emitted");
+        assert!(cleanup_a.holder.is_none());
+        assert!(cleanup_b.holder.is_none());
+        assert!(dashboard_control_input_authorized(
+            "control-session-B",
+            11,
+            &map
+        ));
     }
 
     /// Release attempted by a non-holder is a no-op — prevents A from

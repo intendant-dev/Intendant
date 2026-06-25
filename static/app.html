@@ -30233,6 +30233,61 @@ document.addEventListener('keydown', (e) => {
 
 // ── Displays (WebRTC — video track + data channels for input) ──
 
+function dashboardApplyServerFrames(frames) {
+  if (!Array.isArray(frames) || !dashboardServerMessageDispatcher) return;
+  for (const frame of frames) {
+    if (frame && typeof frame === 'object') {
+      dashboardServerMessageDispatcher(frame);
+    }
+  }
+}
+
+async function requestDisplayInputAuthorityForSlot(displayId) {
+  if (dashboardTransport?.canUseDisplayInputAuthority?.()) {
+    try {
+      const result = await dashboardTransport.requestDisplayInputAuthority(displayId, {
+        timeoutMs: 5000,
+      });
+      if (result?.ok === false) throw new Error(result.error || 'display authority request failed');
+      dashboardApplyServerFrames(result?.frames);
+      return true;
+    } catch (err) {
+      console.warn('[dashboard-control] display authority request failed, falling back to /ws', err);
+    }
+  }
+  if (typeof app !== 'undefined' && app &&
+      typeof app.request_display_input_authority === 'function') {
+    app.request_display_input_authority(displayId);
+    return true;
+  }
+  return false;
+}
+
+async function releaseDisplayInputAuthorityForSlot(displayId) {
+  if (dashboardTransport?.canUseDisplayInputAuthority?.()) {
+    try {
+      const result = await dashboardTransport.releaseDisplayInputAuthority(displayId, {
+        timeoutMs: 5000,
+      });
+      if (result?.ok === false) throw new Error(result.error || 'display authority release failed');
+      dashboardApplyServerFrames(result?.frames);
+      return true;
+    } catch (err) {
+      console.warn('[dashboard-control] display authority release failed, falling back to /ws', err);
+    }
+  }
+  if (typeof app !== 'undefined' && app &&
+      typeof app.release_display_input_authority === 'function') {
+    app.release_display_input_authority(displayId);
+    return true;
+  }
+  return false;
+}
+
+function sendDisplayInputForSlot(displayId, msg) {
+  return Boolean(dashboardTransport?.displayInput?.(displayId, msg));
+}
+
 class DisplaySlot {
   constructor(displayId, width, height) {
     this.displayId = displayId;
@@ -30711,10 +30766,7 @@ class DisplaySlot {
     // chip.  No UI change here yet — the chip still renders the current
     // (other / unclaimed / unknown) state until the server answers.
     this._takeControlPending = true;
-    if (typeof app !== 'undefined' && app &&
-        typeof app.request_display_input_authority === 'function') {
-      app.request_display_input_authority(this.displayId);
-    }
+    requestDisplayInputAuthorityForSlot(this.displayId);
   }
 
   // Phase 5c: enter interactive mode (UI + listeners).  Called from
@@ -30777,11 +30829,13 @@ class DisplaySlot {
     };
 
     const sendControl = (msg) => {
+      if (sendDisplayInputForSlot(this.displayId, msg)) return;
       if (this.controlChannel && this.controlChannel.readyState === 'open') {
         this.controlChannel.send(JSON.stringify(msg));
       }
     };
     const sendPointer = (msg) => {
+      if (sendDisplayInputForSlot(this.displayId, msg)) return;
       if (this.pointerChannel && this.pointerChannel.readyState === 'open') {
         this.pointerChannel.send(JSON.stringify(msg));
       }
@@ -30932,10 +30986,7 @@ class DisplaySlot {
   // server is idempotent: a release from a non-holder is a silent no-op,
   // so calling this when authority isn't held is harmless.
   _releaseAuthority() {
-    if (typeof app !== 'undefined' && app &&
-        typeof app.release_display_input_authority === 'function') {
-      app.release_display_input_authority(this.displayId);
-    }
+    releaseDisplayInputAuthorityForSlot(this.displayId);
     // Cancel any pending take so a server `'you'` answer arriving after
     // the release doesn't re-promote into interactive.
     this._takeControlPending = false;
@@ -36602,11 +36653,66 @@ class DashboardTransport {
     return Boolean(dashboardControlTransport?.canUseRpc());
   }
 
+  canUseDisplayInputAuthority() {
+    return Boolean(
+      this.canUseRpc() &&
+      dashboardControlTransport?.lastStatus?.api_display_input_authority_available === true
+    );
+  }
+
   request(method, params = {}, options = {}) {
     if (!this.canUseRpc()) {
       return Promise.reject(new Error('dashboard control RPC is not connected'));
     }
-    return dashboardControlTransport.request(method, params, options);
+    const request = dashboardControlTransport.request(method, params, options);
+    if (method === 'status') {
+      return request.then(status => {
+        if (status && typeof status === 'object') {
+          dashboardControlTransport.lastStatus = status;
+          dashboardUpdateTransportStatus();
+        }
+        return status;
+      });
+    }
+    return request;
+  }
+
+  displayInput(displayId, event) {
+    if (!this.canUseDisplayInputAuthority()) return false;
+    return dashboardControlTransport.displayInput(displayId, event);
+  }
+
+  displayAuthoritySnapshot(options = {}) {
+    if (!this.canUseDisplayInputAuthority()) {
+      return Promise.reject(new Error('dashboard control display authority is not available'));
+    }
+    return dashboardControlTransport.request(
+      'api_display_input_authority_snapshot',
+      {},
+      options
+    );
+  }
+
+  requestDisplayInputAuthority(displayId, options = {}) {
+    if (!this.canUseDisplayInputAuthority()) {
+      return Promise.reject(new Error('dashboard control display authority is not available'));
+    }
+    return dashboardControlTransport.request(
+      'api_display_input_authority_request',
+      { display_id: Number(displayId) || 0 },
+      options
+    );
+  }
+
+  releaseDisplayInputAuthority(displayId, options = {}) {
+    if (!this.canUseDisplayInputAuthority()) {
+      return Promise.reject(new Error('dashboard control display authority is not available'));
+    }
+    return dashboardControlTransport.request(
+      'api_display_input_authority_release',
+      { display_id: Number(displayId) || 0 },
+      options
+    );
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {
@@ -36714,6 +36820,18 @@ window.intendantDashboardControl = {
   },
   displayBootstrap(options = {}) {
     return dashboardTransport.request('api_display_bootstrap', {}, options);
+  },
+  displayAuthoritySnapshot(options = {}) {
+    return dashboardTransport.displayAuthoritySnapshot(options);
+  },
+  requestDisplayInputAuthority(displayId, options = {}) {
+    return dashboardTransport.requestDisplayInputAuthority(displayId, options);
+  },
+  releaseDisplayInputAuthority(displayId, options = {}) {
+    return dashboardTransport.releaseDisplayInputAuthority(displayId, options);
+  },
+  displayInput(displayId, event) {
+    return dashboardTransport.displayInput(displayId, event);
   },
   sessionLogReplay(options = {}) {
     return dashboardTransport.request('api_session_log_replay', {}, options);
@@ -37195,6 +37313,16 @@ class DashboardControlTransport {
     return promise;
   }
 
+  displayInput(displayId, event) {
+    if (!this.canUseRpc()) return false;
+    this.sendFrame({
+      t: 'display_input',
+      display_id: Number(displayId) || 0,
+      event,
+    });
+    return true;
+  }
+
   stream(method, params = {}, options = {}, onEvent = {}) {
     if (options.signal?.aborted) {
       return Promise.reject(dashboardControlAbortError());
@@ -37419,6 +37547,7 @@ class DashboardControlTransport {
       apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
       apiStateSnapshotAvailable: this.lastStatus?.api_state_snapshot_available ?? null,
       apiDisplayBootstrapAvailable: this.lastStatus?.api_display_bootstrap_available ?? null,
+      apiDisplayInputAuthorityAvailable: this.lastStatus?.api_display_input_authority_available ?? null,
       apiSessionLogReplayAvailable: this.lastStatus?.api_session_log_replay_available ?? null,
       apiExternalSessionActivityReplayAvailable: this.lastStatus?.api_external_session_activity_replay_available ?? null,
       apiDashboardBootstrapAvailable: this.lastStatus?.api_dashboard_bootstrap_available ?? null,

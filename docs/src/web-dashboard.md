@@ -212,7 +212,10 @@ control (see [Display Pipeline](./display-pipeline.md)):
 Displays appear automatically when the agent's first command triggers Xvfb
 auto-launch, or when access to the user's real session display is granted.
 WebRTC negotiation (SDP offer/answer + ICE candidates) is multiplexed over the
-existing dashboard WebSocket.
+existing dashboard WebSocket. When the verified dashboard-control DataChannel is
+connected, local display input authority requests and keyboard/mouse input can
+use that daemon-scoped control tunnel; video media still flows through the
+per-display WebRTC session.
 
 ### Station
 
@@ -468,9 +471,10 @@ pairing, peer message/task/approval actions, eligible-peer lookup, worktree
 scan/remove, dashboard managed-context MCP tool calls, and coordinator routing.
 Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
 external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
-the DataChannel when it is verified. Session lifecycle, steering, approval,
-display/input authority, and other high-impact `ControlMsg`s stay on the main
-WebSocket/control-plane path for now.
+the DataChannel when it is verified. Display input authority uses dedicated
+DataChannel RPCs and a `display_input` frame rather than the generic
+`ControlMsg` allowlist. Session lifecycle, steering, approval, and other
+high-impact `ControlMsg`s stay on the main WebSocket/control-plane path for now.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -488,9 +492,9 @@ Several paths intentionally stay outside this JSON tunnel:
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
 - diagnostics NDJSON uploads;
-- session lifecycle, steering, approval, display/input authority, and other
-  non-allowlisted `ControlMsg` mutations;
-- display WebRTC media/control channels and peer-display signaling;
+- session lifecycle, steering, approval, and other non-allowlisted `ControlMsg`
+  mutations;
+- display WebRTC media channels and peer-display signaling;
 - daemon-to-daemon federation authentication.
 
 Peer mTLS remains a separate trust boundary. The dashboard tunnel authenticates
@@ -774,10 +778,18 @@ control session id, not the legacy WebSocket connection id.
 whose `frames` array contains `display_ready` events for every active display
 session known to the daemon. Those frames use the same event shape as the
 WebSocket bootstrap (`event`, `display_id`, `width`, `height`), so browser code
-can feed them through the existing display-slot path. It intentionally omits
-`display_input_authority_state`: authority is still tied to the legacy
-WebSocket connection holder identity and needs a DataChannel-aware holder model
-before keyboard/mouse control chips can be bootstrapped over this channel.
+can feed them through the existing display-slot path. When the daemon exposes a
+dashboard-control display authority bridge, the envelope also includes
+personalized `display_input_authority_state` frames for the same active display
+ids; otherwise `display_input_authority_state` is listed in `omitted`.
+`api_display_input_authority_snapshot` returns just those personalized authority
+frames, while `api_display_input_authority_request` and
+`api_display_input_authority_release` claim or release the display for the
+current dashboard-control session and return fresh state frames for immediate UI
+application. The browser then sends local keyboard/mouse events as
+fire-and-forget `display_input` frames over the same daemon-scoped DataChannel.
+If the tunnel or authority bridge is unavailable, the dashboard falls back to
+the older WebSocket plus per-display input-channel path.
 `api_session_log_replay` returns the existing capped `log_replay` message shape
 used by late WebSocket joiners. When no active session log exists it returns an
 empty replay with `available: false`.
@@ -791,8 +803,9 @@ when the active Intendant session log replay already names the same
 ordered `frames` array: state snapshot, cached dashboard events, browser
 workspace snapshot, active display `display_ready` frames, and capped session
 log replay, followed by active external attached-session activity replay frames.
-It explicitly omits display authority frames until that path has a
-DataChannel-aware holder identity.
+When the display authority bridge is available, it appends personalized
+`display_input_authority_state` frames as well so a refreshed public-origin
+dashboard can hydrate display control chips without the primary WebSocket.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.
@@ -830,11 +843,10 @@ Confirmed session-data deletion uses `api_session_delete` with the same
 no-replay fallback rule as other writes; the dashboard still requires the
 existing confirmation modal before issuing the RPC.
 
-The first production APIs should be small and high value: `/config`, the main
-event stream, local session list hydration, peer access-request
-list/approve/deny, and a basic health endpoint. Uploads, downloads, recordings,
-terminal streams, and file transfer should move later after resumable stream and
-file-transfer semantics are settled.
+The remaining migration work is mostly byte-stream and lifecycle heavy:
+uploads, downloads, recording media, terminal streams, broader file transfer,
+session lifecycle, steering, and approval should move only after resumable
+stream/file-transfer semantics and no-replay mutation rules are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -901,9 +913,10 @@ Treat this as a staged target, not current behavior:
     local session hydration now use the tunnel, oversized JSON responses now use
     credit-windowed chunked response framing, and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames. Allowlisted settings
-    `ControlMsg` dispatch now uses the tunnel when verified. Uploads, downloads,
-    recording media, terminals, non-allowlisted control commands, and file
-    transfer still wait for resumable stream/file-transfer semantics.
+    `ControlMsg` dispatch, display input authority request/release/snapshot, and
+    local display input frames now use the tunnel when verified. Uploads,
+    downloads, recording media, terminals, non-allowlisted control commands, and
+    file transfer still wait for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.
 

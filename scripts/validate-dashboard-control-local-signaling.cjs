@@ -137,6 +137,7 @@ async function main() {
         browserWorkspaceSnapshot: await ctl.browserWorkspaceSnapshot({ timeoutMs: 60000 }),
         stateSnapshot: await ctl.stateSnapshot({ timeoutMs: 60000 }),
         displayBootstrap: await ctl.displayBootstrap({ timeoutMs: 60000 }),
+        displayAuthoritySnapshot: await ctl.displayAuthoritySnapshot({ timeoutMs: 60000 }),
         sessionLogReplay: await ctl.sessionLogReplay({ timeoutMs: 60000 }),
         externalSessionActivityReplay: await ctl.externalSessionActivityReplay({ timeoutMs: 60000 }),
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
@@ -176,6 +177,26 @@ async function main() {
       result.displayBootstrap.frames.length,
       'display bootstrap frame count did not match'
     );
+    assert(
+      !result.displayBootstrap.omitted?.includes('display_input_authority_state'),
+      'display bootstrap still marked authority state as omitted'
+    );
+    assert.strictEqual(
+      result.status.api_display_input_authority_available,
+      true,
+      'dashboard control status did not advertise display input authority'
+    );
+    assert.strictEqual(
+      result.displayAuthoritySnapshot?.available,
+      true,
+      'display authority snapshot did not report availability'
+    );
+    assert(Array.isArray(result.displayAuthoritySnapshot?.frames), 'display authority snapshot did not return frames');
+    assert.strictEqual(
+      result.displayAuthoritySnapshot.frame_count,
+      result.displayAuthoritySnapshot.frames.length,
+      'display authority snapshot frame count did not match'
+    );
     assert.strictEqual(result.sessionLogReplay?.t, 'log_replay', 'session log replay RPC did not return the event shape');
     assert(Array.isArray(result.sessionLogReplay.entries), 'session log replay did not return entries');
     assert(Array.isArray(result.externalSessionActivityReplay?.frames), 'external session activity replay did not return frames');
@@ -196,8 +217,8 @@ async function main() {
       'dashboard bootstrap still marked display_ready as omitted'
     );
     assert(
-      result.dashboardBootstrap.omitted?.includes('display_input_authority_state'),
-      'dashboard bootstrap did not mark authority state as omitted'
+      !result.dashboardBootstrap.omitted?.includes('display_input_authority_state'),
+      'dashboard bootstrap still marked authority state as omitted'
     );
     assert(
       !result.dashboardBootstrap.omitted?.includes('external_session_activity_replay'),
@@ -210,6 +231,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiBrowserWorkspaceSnapshotAvailable, true);
     assert.strictEqual(result.finalStatus.apiStateSnapshotAvailable, true);
     assert.strictEqual(result.finalStatus.apiDisplayBootstrapAvailable, true);
+    assert.strictEqual(result.finalStatus.apiDisplayInputAuthorityAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionLogReplayAvailable, true);
     assert.strictEqual(result.finalStatus.apiExternalSessionActivityReplayAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardBootstrapAvailable, true);
@@ -232,6 +254,7 @@ async function main() {
         browserWorkspaceCount: result.browserWorkspaceSnapshot.workspaces.length,
         stateSnapshotConnectionId: result.stateSnapshot.connection_id,
         displayBootstrapFrameCount: result.displayBootstrap.frame_count,
+        displayAuthoritySnapshotFrameCount: result.displayAuthoritySnapshot.frame_count,
         sessionLogReplayEntryCount: result.sessionLogReplay.entries.length,
         externalSessionActivityReplayFrameCount: result.externalSessionActivityReplay.frame_count,
         dashboardBootstrapFrameCount: result.dashboardBootstrap.frame_count,
@@ -241,6 +264,7 @@ async function main() {
         apiBrowserWorkspaceSnapshotAvailable: result.finalStatus.apiBrowserWorkspaceSnapshotAvailable,
         apiStateSnapshotAvailable: result.finalStatus.apiStateSnapshotAvailable,
         apiDisplayBootstrapAvailable: result.finalStatus.apiDisplayBootstrapAvailable,
+        apiDisplayInputAuthorityAvailable: result.finalStatus.apiDisplayInputAuthorityAvailable,
         apiSessionLogReplayAvailable: result.finalStatus.apiSessionLogReplayAvailable,
         apiExternalSessionActivityReplayAvailable: result.finalStatus.apiExternalSessionActivityReplayAvailable,
         apiDashboardBootstrapAvailable: result.finalStatus.apiDashboardBootstrapAvailable,

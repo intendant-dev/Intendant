@@ -49,6 +49,9 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_browser_workspace_snapshot",
     "api_state_snapshot",
     "api_display_bootstrap",
+    "api_display_input_authority_snapshot",
+    "api_display_input_authority_request",
+    "api_display_input_authority_release",
     "api_session_log_replay",
     "api_external_session_activity_replay",
     "api_dashboard_bootstrap",
@@ -121,6 +124,7 @@ pub struct DashboardControlRegistry {
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
+    display_authority: Option<DashboardDisplayAuthorityBridge>,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
@@ -136,6 +140,67 @@ pub struct DashboardBootstrapCaches {
     pub(crate) attached_external_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
+#[derive(Clone)]
+pub struct DashboardDisplayAuthorityBridge {
+    snapshot: Arc<dyn Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync>,
+    state_frame: Arc<dyn Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync>,
+    request: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
+    release: Arc<dyn Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync>,
+    input_authorized: Arc<dyn Fn(&str, u32) -> bool + Send + Sync>,
+    cleanup: Arc<dyn Fn(&str) + Send + Sync>,
+    subscribe: Arc<dyn Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync>,
+}
+
+impl DashboardDisplayAuthorityBridge {
+    pub fn new(
+        snapshot: impl Fn(&str, &[u32]) -> Vec<serde_json::Value> + Send + Sync + 'static,
+        state_frame: impl Fn(&str, u32) -> Option<serde_json::Value> + Send + Sync + 'static,
+        request: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
+        release: impl Fn(&str, u32) -> Vec<serde_json::Value> + Send + Sync + 'static,
+        input_authorized: impl Fn(&str, u32) -> bool + Send + Sync + 'static,
+        cleanup: impl Fn(&str) + Send + Sync + 'static,
+        subscribe: impl Fn() -> tokio::sync::broadcast::Receiver<u32> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            snapshot: Arc::new(snapshot),
+            state_frame: Arc::new(state_frame),
+            request: Arc::new(request),
+            release: Arc::new(release),
+            input_authorized: Arc::new(input_authorized),
+            cleanup: Arc::new(cleanup),
+            subscribe: Arc::new(subscribe),
+        }
+    }
+
+    fn snapshot(&self, session_id: &str, display_ids: &[u32]) -> Vec<serde_json::Value> {
+        (self.snapshot)(session_id, display_ids)
+    }
+
+    fn state_frame(&self, session_id: &str, display_id: u32) -> Option<serde_json::Value> {
+        (self.state_frame)(session_id, display_id)
+    }
+
+    fn request(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
+        (self.request)(session_id, display_id)
+    }
+
+    fn release(&self, session_id: &str, display_id: u32) -> Vec<serde_json::Value> {
+        (self.release)(session_id, display_id)
+    }
+
+    fn input_authorized(&self, session_id: &str, display_id: u32) -> bool {
+        (self.input_authorized)(session_id, display_id)
+    }
+
+    fn cleanup(&self, session_id: &str) {
+        (self.cleanup)(session_id)
+    }
+
+    fn subscribe(&self) -> tokio::sync::broadcast::Receiver<u32> {
+        (self.subscribe)()
+    }
+}
+
 impl DashboardControlRegistry {
     pub fn new(
         config: crate::web_gateway::WebGatewayConfig,
@@ -148,6 +213,7 @@ impl DashboardControlRegistry {
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
+        display_authority: Option<DashboardDisplayAuthorityBridge>,
     ) -> Self {
         Self {
             config,
@@ -160,6 +226,7 @@ impl DashboardControlRegistry {
             worktree_inventory_cache,
             agent_card,
             bootstrap_caches,
+            display_authority,
             identity: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         }
@@ -181,6 +248,7 @@ impl DashboardControlRegistry {
             self.worktree_inventory_cache.clone(),
             self.agent_card.clone(),
             self.bootstrap_caches.clone(),
+            self.display_authority.clone(),
             identity,
         )
         .await
@@ -207,6 +275,9 @@ impl DashboardControlRegistry {
     }
 
     pub async fn close(&self, session_id: &str) {
+        if let Some(bridge) = &self.display_authority {
+            bridge.cleanup(session_id);
+        }
         if let Some(peer) = self.peers.lock().await.remove(session_id) {
             peer.close().await;
         }
@@ -298,6 +369,7 @@ impl DashboardControlPeer {
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
+        display_authority: Option<DashboardDisplayAuthorityBridge>,
         identity: Arc<DaemonIdentity>,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
         let mut setting_engine = SettingEngine::default();
@@ -371,6 +443,7 @@ impl DashboardControlPeer {
             worktree_inventory_cache,
             agent_card,
             bootstrap_caches,
+            display_authority,
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
@@ -436,6 +509,7 @@ struct ControlRuntime {
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
+    display_authority: Option<DashboardDisplayAuthorityBridge>,
 }
 
 enum ControlCommand {
@@ -461,10 +535,7 @@ struct OutboundControlQueue {
 }
 
 enum QueuedControlFrame {
-    Immediate {
-        request_id: String,
-        text: String,
-    },
+    Immediate { request_id: String, text: String },
     Chunked(QueuedChunkedFrame),
 }
 
@@ -537,9 +608,7 @@ impl OutboundControlQueue {
             let QueuedControlFrame::Chunked(queued) = frame else {
                 continue;
             };
-            let matches_chunk = chunk_id
-                .map(|id| queued.chunk_id == id)
-                .unwrap_or(false);
+            let matches_chunk = chunk_id.map(|id| queued.chunk_id == id).unwrap_or(false);
             if matches_chunk || (chunk_id.is_none() && queued.request_id == request_id) {
                 queued.credit = queued.credit.saturating_add(granted);
             }
@@ -621,6 +690,10 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
     let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
     let mut pending_requests: HashMap<String, CancellationToken> = HashMap::new();
     let mut outbound_queue = OutboundControlQueue::new();
+    let mut display_authority_rx = runtime
+        .display_authority
+        .as_ref()
+        .map(DashboardDisplayAuthorityBridge::subscribe);
 
     loop {
         let timeout_at = match drain_control_outputs(
@@ -721,6 +794,31 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
                 }
                 let _ = rtc.handle_timeout(Instant::now());
             }
+            authority = async {
+                match display_authority_rx.as_mut() {
+                    Some(rx) => Some(rx.recv().await),
+                    None => std::future::pending::<Option<Result<u32, tokio::sync::broadcast::error::RecvError>>>().await,
+                }
+            }, if runtime.events_subscribed && display_authority_rx.is_some() => {
+                match authority {
+                    Some(Ok(display_id)) => {
+                        send_display_authority_event(&mut rtc, &channels, &mut runtime, display_id);
+                    }
+                    Some(Err(tokio::sync::broadcast::error::RecvError::Lagged(_))) => {
+                        let snapshots = display_authority_snapshot_frames(&runtime).await;
+                        for frame in snapshots {
+                            send_event_payload(&mut rtc, &channels, &mut runtime, frame);
+                        }
+                    }
+                    Some(Err(tokio::sync::broadcast::error::RecvError::Closed)) | None => {
+                        display_authority_rx = runtime
+                            .display_authority
+                            .as_ref()
+                            .map(DashboardDisplayAuthorityBridge::subscribe);
+                    }
+                }
+                let _ = rtc.handle_timeout(Instant::now());
+            }
             _ = tokio::time::sleep(timeout_dur) => {
                 if let Err(e) = rtc.handle_timeout(Instant::now()) {
                     eprintln!("[dashboard/control] handle_timeout failed: {e:?}");
@@ -736,6 +834,35 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
     }
     for handle in forwarder_handles {
         let _ = handle.await;
+    }
+}
+
+fn send_event_payload<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    runtime: &mut ControlRuntime,
+    payload: serde_json::Value,
+) {
+    runtime.events_sent = runtime.events_sent.saturating_add(1);
+    let frame = serde_json::json!({
+        "t": "event",
+        "seq": runtime.events_sent,
+        "payload": payload,
+    });
+    send_control_text(rtc, channels, frame.to_string());
+}
+
+fn send_display_authority_event<I: rtc::interceptor::Interceptor>(
+    rtc: &mut RTCPeerConnection<I>,
+    channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
+    runtime: &mut ControlRuntime,
+    display_id: u32,
+) {
+    let Some(bridge) = runtime.display_authority.as_ref() else {
+        return;
+    };
+    if let Some(frame) = bridge.state_frame(&runtime.session_id, display_id) {
+        send_event_payload(rtc, channels, runtime, frame);
     }
 }
 
@@ -908,10 +1035,7 @@ fn control_frame_texts(frame: serde_json::Value) -> Vec<String> {
     ) {
         ControlFrameTexts::Immediate(frames) => frames,
         ControlFrameTexts::Chunked {
-            start,
-            chunks,
-            end,
-            ..
+            start, chunks, end, ..
         } => {
             let mut frames = Vec::with_capacity(chunks.len() + 2);
             frames.push(start);
@@ -1005,10 +1129,7 @@ fn chunk_control_response_frame(
     match control_frame_text_parts(frame, threshold_bytes, chunk_bytes) {
         ControlFrameTexts::Immediate(frames) => frames,
         ControlFrameTexts::Chunked {
-            start,
-            chunks,
-            end,
-            ..
+            start, chunks, end, ..
         } => {
             let mut frames = Vec::with_capacity(chunks.len() + 2);
             frames.push(start);
@@ -1037,15 +1158,15 @@ fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
                     send_control_text(rtc, channels, queued.start.clone());
                     queued.started = true;
                 }
-            while queued.credit > 0 && queued.next_chunk < queued.chunks.len() {
-                let text = queued.chunks[queued.next_chunk].clone();
-                queued.next_chunk += 1;
-                queued.credit -= 1;
-                send_control_text(rtc, channels, text);
-            }
-            if queued.next_chunk >= queued.chunks.len() {
-                completed_end = Some(queued.end.clone());
-            }
+                while queued.credit > 0 && queued.next_chunk < queued.chunks.len() {
+                    let text = queued.chunks[queued.next_chunk].clone();
+                    queued.next_chunk += 1;
+                    queued.credit -= 1;
+                    send_control_text(rtc, channels, text);
+                }
+                if queued.next_chunk >= queued.chunks.len() {
+                    completed_end = Some(queued.end.clone());
+                }
             }
             None => break,
         }
@@ -1083,10 +1204,7 @@ fn control_frame_response(
                 .and_then(|features| features.as_array())
                 .map(|features| {
                     features.iter().any(|feature| {
-                        matches!(
-                            feature.as_str(),
-                            Some("response_credit") | Some("credit")
-                        )
+                        matches!(feature.as_str(), Some("response_credit") | Some("credit"))
                     })
                 })
                 .unwrap_or(false);
@@ -1104,6 +1222,10 @@ fn control_frame_response(
             "id": id,
             "unix_ms": chrono::Utc::now().timestamp_millis(),
         })),
+        "display_input" => {
+            spawn_dashboard_display_input(parsed, runtime.clone());
+            None
+        }
         "request" => {
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
             match method {
@@ -1204,6 +1326,9 @@ fn control_frame_response(
                 | "api_browser_workspace_snapshot"
                 | "api_state_snapshot"
                 | "api_display_bootstrap"
+                | "api_display_input_authority_snapshot"
+                | "api_display_input_authority_request"
+                | "api_display_input_authority_release"
                 | "api_session_log_replay"
                 | "api_external_session_activity_replay"
                 | "api_dashboard_bootstrap"
@@ -1276,6 +1401,44 @@ fn control_frame_response(
             "error": format!("unknown frame type: {t}"),
         })),
     }
+}
+
+fn spawn_dashboard_display_input(frame: serde_json::Value, runtime: ControlRuntime) {
+    tokio::spawn(async move {
+        let display_id = frame
+            .get("display_id")
+            .and_then(|value| value.as_u64())
+            .and_then(|value| u32::try_from(value).ok())
+            .unwrap_or(0);
+        let Some(event) = frame.get("event").cloned() else {
+            return;
+        };
+        let Ok(input_event) = serde_json::from_value::<crate::display::InputEvent>(event) else {
+            return;
+        };
+        let Some(bridge) = runtime.display_authority.as_ref() else {
+            return;
+        };
+        if !bridge.input_authorized(&runtime.session_id, display_id) {
+            return;
+        }
+        let session_registry = {
+            let session = runtime.shared_session.read().await;
+            session.session_registry.clone()
+        };
+        let Some(session_registry) = session_registry else {
+            return;
+        };
+        let display_session = {
+            let registry = session_registry.read().await;
+            registry.get(display_id)
+        };
+        if let Some(display_session) = display_session {
+            if let Err(e) = display_session.inject_input(input_event).await {
+                eprintln!("[dashboard/control] display input injection failed: {e}");
+            }
+        }
+    });
 }
 
 fn cached_bootstrap_events_response_frame(
@@ -1359,8 +1522,14 @@ fn push_cached_bootstrap_event(
 
 fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Value {
     let mut result = serde_json::Map::new();
-    result.insert("protocol".to_string(), serde_json::json!(CONTROL_PROTOCOL_VERSION));
-    result.insert("session_id".to_string(), serde_json::json!(runtime.session_id));
+    result.insert(
+        "protocol".to_string(),
+        serde_json::json!(CONTROL_PROTOCOL_VERSION),
+    );
+    result.insert(
+        "session_id".to_string(),
+        serde_json::json!(runtime.session_id),
+    );
     result.insert(
         "daemon_public_key".to_string(),
         serde_json::json!(runtime.daemon_public_key),
@@ -1370,12 +1539,18 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         serde_json::json!(runtime.created_unix_ms),
     );
     result.insert("features".to_string(), serde_json::json!(CONTROL_FEATURES));
-    result.insert("transport".to_string(), serde_json::json!("webrtc-datachannel"));
+    result.insert(
+        "transport".to_string(),
+        serde_json::json!("webrtc-datachannel"),
+    );
     result.insert(
         "events_subscribed".to_string(),
         serde_json::json!(runtime.events_subscribed),
     );
-    result.insert("events_sent".to_string(), serde_json::json!(runtime.events_sent));
+    result.insert(
+        "events_sent".to_string(),
+        serde_json::json!(runtime.events_sent),
+    );
     result.insert(
         "response_credit_enabled".to_string(),
         serde_json::json!(runtime.response_credit_enabled),
@@ -1389,6 +1564,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_browser_workspace_snapshot_available", true),
         ("api_state_snapshot_available", true),
         ("api_display_bootstrap_available", true),
+        (
+            "api_display_input_authority_available",
+            runtime.display_authority.is_some(),
+        ),
         ("api_session_log_replay_available", true),
         ("api_external_session_activity_replay_available", true),
         ("api_dashboard_bootstrap_available", true),
@@ -1409,7 +1588,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_fs_mkdir_available", true),
         ("api_sessions_search_available", true),
         ("api_settings_available", true),
-        ("api_settings_save_available", runtime.project_root.is_some()),
+        (
+            "api_settings_save_available",
+            runtime.project_root.is_some(),
+        ),
         ("api_control_msg_available", true),
         ("api_key_status_available", true),
         ("api_api_keys_save_available", true),
@@ -1525,13 +1707,13 @@ async fn control_request_response(
         "api_session_current_prune" => api_session_current_prune_response(id, &runtime).await,
         "api_session_current_changes" => {
             api_session_current_changes_response(id, params.as_ref(), &runtime).await
-        },
+        }
         "api_session_context_snapshot" => {
             api_session_context_snapshot_response(id, params.as_ref()).await
-        },
+        }
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
-        },
+        }
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
         "api_fs_mkdir" => api_fs_mkdir_response(id, params.as_ref()).await,
@@ -1557,6 +1739,15 @@ async fn control_request_response(
         "api_browser_workspace_snapshot" => api_browser_workspace_snapshot_response(id).await,
         "api_state_snapshot" => api_state_snapshot_response(id, &runtime).await,
         "api_display_bootstrap" => api_display_bootstrap_response(id, &runtime).await,
+        "api_display_input_authority_snapshot" => {
+            api_display_input_authority_snapshot_response(id, &runtime).await
+        }
+        "api_display_input_authority_request" => {
+            api_display_input_authority_request_response(id, params.as_ref(), &runtime).await
+        }
+        "api_display_input_authority_release" => {
+            api_display_input_authority_release_response(id, params.as_ref(), &runtime).await
+        }
         "api_session_log_replay" => api_session_log_replay_response(id, &runtime).await,
         "api_external_session_activity_replay" => {
             api_external_session_activity_replay_response(id, &runtime).await
@@ -1881,12 +2072,7 @@ async fn api_session_current_history_response(
 ) -> serde_json::Value {
     let (file_watcher, _) = active_history_handles(runtime).await;
     let (status_line, body) = crate::web_gateway::handle_history_get(file_watcher.as_ref()).await;
-    http_body_response(
-        id,
-        status_line_code(status_line),
-        body,
-        "session history",
-    )
+    http_body_response(id, status_line_code(status_line), body, "session history")
 }
 
 async fn api_session_current_rollback_response(
@@ -1903,12 +2089,7 @@ async fn api_session_current_rollback_response(
         &runtime.bus,
     )
     .await;
-    http_body_response(
-        id,
-        status_line_code(status_line),
-        body,
-        "session rollback",
-    )
+    http_body_response(id, status_line_code(status_line), body, "session rollback")
 }
 
 async fn api_session_current_redo_response(
@@ -1948,12 +2129,9 @@ async fn api_session_current_changes_response(
     })
     .await;
     match result {
-        Ok((status_line, body)) => http_body_response(
-            id,
-            status_line_code(status_line),
-            body,
-            "session changes",
-        ),
+        Ok((status_line, body)) => {
+            http_body_response(id, status_line_code(status_line), body, "session changes")
+        }
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -2001,12 +2179,9 @@ async fn api_session_context_snapshot_response(
     })
     .await;
     match result {
-        Ok((status_line, body)) => http_body_response(
-            id,
-            status_line_code(status_line),
-            body,
-            "context snapshot",
-        ),
+        Ok((status_line, body)) => {
+            http_body_response(id, status_line_code(status_line), body, "context snapshot")
+        }
         Err(e) => serde_json::json!({
             "t": "response",
             "id": id,
@@ -2045,7 +2220,9 @@ async fn api_session_current_upload_delete_response(
     match result {
         Ok((status_line, body, deleted_id)) => {
             if let Some(id) = deleted_id {
-                runtime.bus.send(crate::event::AppEvent::UploadDeleted { id });
+                runtime
+                    .bus
+                    .send(crate::event::AppEvent::UploadDeleted { id });
             }
             http_body_response(id, status_line_code(status_line), body, "upload delete")
         }
@@ -2341,8 +2518,9 @@ async fn api_dashboard_bootstrap_response(
     if let Some(frame) =
         response_result(api_session_log_replay_response("bootstrap-replay".into(), runtime).await)
     {
-        if let Some(external_session_id) =
-            frame.get("external_session_id").and_then(|value| value.as_str())
+        if let Some(external_session_id) = frame
+            .get("external_session_id")
+            .and_then(|value| value.as_str())
         {
             replayed_external_session_ids.insert(external_session_id.to_string());
         }
@@ -2352,7 +2530,9 @@ async fn api_dashboard_bootstrap_response(
         runtime,
         &replayed_external_session_ids,
     ));
+    frames.extend(display_authority_snapshot_frames(runtime).await);
     let frame_count = frames.len();
+    let omitted = dashboard_bootstrap_omitted(runtime);
 
     serde_json::json!({
         "t": "response",
@@ -2361,16 +2541,16 @@ async fn api_dashboard_bootstrap_response(
         "result": {
             "frames": frames,
             "frame_count": frame_count,
-            "omitted": [
-                "display_input_authority_state"
-            ],
+            "omitted": omitted,
         },
     })
 }
 
 async fn api_display_bootstrap_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
-    let frames = display_ready_bootstrap_frames(runtime).await;
+    let mut frames = display_ready_bootstrap_frames(runtime).await;
+    frames.extend(display_authority_snapshot_frames(runtime).await);
     let frame_count = frames.len();
+    let omitted = display_bootstrap_omitted(runtime);
     serde_json::json!({
         "t": "response",
         "id": id,
@@ -2378,14 +2558,131 @@ async fn api_display_bootstrap_response(id: String, runtime: &ControlRuntime) ->
         "result": {
             "frames": frames,
             "frame_count": frame_count,
-            "omitted": [
-                "display_input_authority_state"
-            ],
+            "omitted": omitted,
         },
     })
 }
 
+async fn api_display_input_authority_snapshot_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let frames = display_authority_snapshot_frames(runtime).await;
+    let frame_count = frames.len();
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "available": runtime.display_authority.is_some(),
+            "frames": frames,
+            "frame_count": frame_count,
+        },
+    })
+}
+
+async fn api_display_input_authority_request_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(bridge) = runtime.display_authority.as_ref() else {
+        return display_authority_unavailable_response(id);
+    };
+    let display_id = display_id_param(params);
+    let frames = bridge.request(&runtime.session_id, display_id);
+    let frame_count = frames.len();
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": true,
+            "display_id": display_id,
+            "frames": frames,
+            "frame_count": frame_count,
+        },
+    })
+}
+
+async fn api_display_input_authority_release_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(bridge) = runtime.display_authority.as_ref() else {
+        return display_authority_unavailable_response(id);
+    };
+    let display_id = display_id_param(params);
+    let frames = bridge.release(&runtime.session_id, display_id);
+    let frame_count = frames.len();
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": true,
+            "display_id": display_id,
+            "frames": frames,
+            "frame_count": frame_count,
+        },
+    })
+}
+
+fn display_authority_unavailable_response(id: String) -> serde_json::Value {
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": false,
+            "available": false,
+            "_httpStatus": 503,
+            "_httpOk": false,
+            "error": "display input authority unavailable",
+        },
+    })
+}
+
+fn display_id_param(params: Option<&serde_json::Value>) -> u32 {
+    params
+        .and_then(|params| {
+            params
+                .get("display_id")
+                .or_else(|| params.get("displayId"))
+                .or_else(|| params.get("id"))
+        })
+        .and_then(|value| value.as_u64())
+        .and_then(|value| u32::try_from(value).ok())
+        .unwrap_or(0)
+}
+
+async fn display_authority_snapshot_frames(runtime: &ControlRuntime) -> Vec<serde_json::Value> {
+    let Some(bridge) = runtime.display_authority.as_ref() else {
+        return Vec::new();
+    };
+    let display_ids = active_display_ids(runtime).await;
+    bridge.snapshot(&runtime.session_id, &display_ids)
+}
+
+fn dashboard_bootstrap_omitted(runtime: &ControlRuntime) -> Vec<&'static str> {
+    if runtime.display_authority.is_some() {
+        Vec::new()
+    } else {
+        vec!["display_input_authority_state"]
+    }
+}
+
+fn display_bootstrap_omitted(runtime: &ControlRuntime) -> Vec<&'static str> {
+    if runtime.display_authority.is_some() {
+        Vec::new()
+    } else {
+        vec!["display_input_authority_state"]
+    }
+}
+
 async fn display_ready_bootstrap_frames(runtime: &ControlRuntime) -> Vec<serde_json::Value> {
+    let display_ids = active_display_ids(runtime).await;
     let session_registry = {
         let session = runtime.shared_session.read().await;
         session.session_registry.clone()
@@ -2395,8 +2692,6 @@ async fn display_ready_bootstrap_frames(runtime: &ControlRuntime) -> Vec<serde_j
     };
 
     let registry = session_registry.read().await;
-    let mut display_ids = registry.display_ids();
-    display_ids.sort_unstable();
     display_ids
         .into_iter()
         .filter_map(|display_id| {
@@ -2411,6 +2706,21 @@ async fn display_ready_bootstrap_frames(runtime: &ControlRuntime) -> Vec<serde_j
             })
         })
         .collect()
+}
+
+async fn active_display_ids(runtime: &ControlRuntime) -> Vec<u32> {
+    let session_registry = {
+        let session = runtime.shared_session.read().await;
+        session.session_registry.clone()
+    };
+    let Some(session_registry) = session_registry else {
+        return Vec::new();
+    };
+
+    let registry = session_registry.read().await;
+    let mut display_ids = registry.display_ids();
+    display_ids.sort_unstable();
+    display_ids
 }
 
 async fn api_external_session_activity_replay_response(
@@ -2490,11 +2800,14 @@ async fn active_replay_log_dir(runtime: &ControlRuntime) -> Option<PathBuf> {
         let session = runtime.shared_session.read().await;
         (session.query_ctx.clone(), session.session_log.clone())
     };
-    query_ctx.as_ref().map(|ctx| ctx.log_dir.clone()).or_else(|| {
-        session_log
-            .as_ref()
-            .and_then(|log| log.lock().ok().map(|log| log.dir().to_path_buf()))
-    })
+    query_ctx
+        .as_ref()
+        .map(|ctx| ctx.log_dir.clone())
+        .or_else(|| {
+            session_log
+                .as_ref()
+                .and_then(|log| log.lock().ok().map(|log| log.dir().to_path_buf()))
+        })
 }
 
 async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
@@ -2512,10 +2825,8 @@ async fn api_worktrees_scan_response(id: String, runtime: &ControlRuntime) -> se
     let project_root = runtime.project_root.clone();
     let cache = runtime.worktree_inventory_cache.clone();
     let result = tokio::task::spawn_blocking(move || {
-        let body = crate::web_gateway::scan_worktree_inventory_response(
-            &home,
-            project_root.as_deref(),
-        );
+        let body =
+            crate::web_gateway::scan_worktree_inventory_response(&home, project_root.as_deref());
         if let Ok(mut guard) = cache.lock() {
             *guard = Some(body.clone());
         }
@@ -2555,12 +2866,9 @@ async fn api_worktrees_remove_response(
     })
     .await;
     match result {
-        Ok((status_line, body)) => http_body_response(
-            id,
-            status_line_code(status_line),
-            body,
-            "worktree remove",
-        ),
+        Ok((status_line, body)) => {
+            http_body_response(id, status_line_code(status_line), body, "worktree remove")
+        }
         Err(e) => http_body_response(
             id,
             500,
@@ -3565,10 +3873,7 @@ fn optional_string_param(params: &serde_json::Value, names: &[&str]) -> Option<S
     }
 }
 
-fn optional_u64_param(
-    params: &serde_json::Value,
-    names: &[&str],
-) -> Result<Option<u64>, String> {
+fn optional_u64_param(params: &serde_json::Value, names: &[&str]) -> Result<Option<u64>, String> {
     for name in names {
         let Some(value) = params.get(*name) else {
             continue;
@@ -3660,6 +3965,7 @@ mod tests {
             project_root: None,
             worktree_inventory_cache: Arc::new(std::sync::Mutex::new(None)),
             bootstrap_caches: DashboardBootstrapCaches::default(),
+            display_authority: None,
         }
     }
 
@@ -3751,10 +4057,7 @@ mod tests {
         assert_eq!(cached_bootstrap["t"], "response");
         assert_eq!(cached_bootstrap["ok"], true);
         assert_eq!(cached_bootstrap["result"]["event_count"], 2);
-        assert_eq!(
-            cached_bootstrap["result"]["events"][0]["event"],
-            "status"
-        );
+        assert_eq!(cached_bootstrap["result"]["events"][0]["event"], "status");
         assert_eq!(
             cached_bootstrap["result"]["events"][1]["event"],
             "autonomy_changed"
@@ -4008,12 +4311,10 @@ mod tests {
         assert_eq!(rejected["ok"], true);
         assert_eq!(rejected["result"]["ok"], false);
         assert_eq!(rejected["result"]["_httpStatus"], 400);
-        assert!(
-            rejected["result"]["error"]
-                .as_str()
-                .unwrap_or("")
-                .contains("not available over dashboard WebRTC")
-        );
+        assert!(rejected["result"]["error"]
+            .as_str()
+            .unwrap_or("")
+            .contains("not available over dashboard WebRTC"));
     }
 
     #[tokio::test]
@@ -4155,7 +4456,10 @@ mod tests {
             })),
         )
         .await;
-        assert_eq!(missing_selector["result"]["error"], "missing snapshot selector");
+        assert_eq!(
+            missing_selector["result"]["error"],
+            "missing snapshot selector"
+        );
         assert_eq!(missing_selector["result"]["_httpStatus"], 400);
         assert_eq!(missing_selector["result"]["_httpOk"], false);
 
@@ -4224,15 +4528,16 @@ mod tests {
         assert_eq!(invalid_session["result"]["_httpStatus"], 400);
         assert_eq!(invalid_session["result"]["_httpOk"], false);
 
-        let workspace_snapshot =
-            api_browser_workspace_snapshot_response("bw1".to_string()).await;
+        let workspace_snapshot = api_browser_workspace_snapshot_response("bw1".to_string()).await;
         assert_eq!(workspace_snapshot["t"], "response");
         assert_eq!(workspace_snapshot["ok"], true);
         assert_eq!(
             workspace_snapshot["result"]["t"],
             "browser_workspace_snapshot"
         );
-        assert!(workspace_snapshot["result"]["workspaces"].as_array().is_some());
+        assert!(workspace_snapshot["result"]["workspaces"]
+            .as_array()
+            .is_some());
     }
 
     #[tokio::test]
@@ -4270,20 +4575,17 @@ mod tests {
         assert_eq!(bootstrap["ok"], true);
         assert_eq!(bootstrap["result"]["frame_count"], 0);
         assert_eq!(bootstrap["result"]["frames"].as_array().unwrap().len(), 0);
-        assert!(
-            bootstrap["result"]["omitted"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value.as_str() == Some("display_input_authority_state"))
-        );
+        assert!(bootstrap["result"]["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("display_input_authority_state")));
     }
 
     #[tokio::test]
     async fn external_session_activity_replay_rpc_returns_empty_frames_without_attached_sessions() {
         let rt = runtime();
-        let replay =
-            api_external_session_activity_replay_response("ext1".to_string(), &rt).await;
+        let replay = api_external_session_activity_replay_response("ext1".to_string(), &rt).await;
         assert_eq!(replay["t"], "response");
         assert_eq!(replay["id"], "ext1");
         assert_eq!(replay["ok"], true);
@@ -4303,27 +4605,21 @@ mod tests {
         assert_eq!(frames[0]["t"], "state_snapshot");
         assert_eq!(frames[1]["t"], "browser_workspace_snapshot");
         assert_eq!(frames[2]["t"], "log_replay");
-        assert!(
-            !bootstrap["result"]["omitted"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value.as_str() == Some("display_ready"))
-        );
-        assert!(
-            bootstrap["result"]["omitted"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value.as_str() == Some("display_input_authority_state"))
-        );
-        assert!(
-            !bootstrap["result"]["omitted"]
-                .as_array()
-                .unwrap()
-                .iter()
-                .any(|value| value.as_str() == Some("external_session_activity_replay"))
-        );
+        assert!(!bootstrap["result"]["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("display_ready")));
+        assert!(bootstrap["result"]["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("display_input_authority_state")));
+        assert!(!bootstrap["result"]["omitted"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|value| value.as_str() == Some("external_session_activity_replay")));
     }
 
     #[tokio::test]

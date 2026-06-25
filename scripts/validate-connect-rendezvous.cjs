@@ -830,6 +830,7 @@ async function main() {
         browserWorkspaceSnapshot: await ctl.request('api_browser_workspace_snapshot'),
         stateSnapshot: await ctl.request('api_state_snapshot'),
         displayBootstrap: await ctl.request('api_display_bootstrap'),
+        displayAuthoritySnapshot: await ctl.request('api_display_input_authority_snapshot'),
         sessionLogReplay: await ctl.request('api_session_log_replay'),
         externalSessionActivityReplay: await ctl.request('api_external_session_activity_replay'),
         dashboardBootstrap: await ctl.request('api_dashboard_bootstrap'),
@@ -944,6 +945,11 @@ async function main() {
       'dashboard control status did not advertise display bootstrap'
     );
     assert.strictEqual(
+      result.status.api_display_input_authority_available,
+      true,
+      'dashboard control status did not advertise display input authority'
+    );
+    assert.strictEqual(
       result.status.api_session_log_replay_available,
       true,
       'dashboard control status did not advertise session log replay'
@@ -985,6 +991,21 @@ async function main() {
       result.displayBootstrap.frames.length,
       'display bootstrap frame count did not match'
     );
+    assert(
+      !result.displayBootstrap.omitted?.includes('display_input_authority_state'),
+      'display bootstrap still marked authority state as omitted'
+    );
+    assert.strictEqual(
+      result.displayAuthoritySnapshot?.available,
+      true,
+      'display authority snapshot did not report availability'
+    );
+    assert(Array.isArray(result.displayAuthoritySnapshot?.frames), 'display authority snapshot did not return frames');
+    assert.strictEqual(
+      result.displayAuthoritySnapshot.frame_count,
+      result.displayAuthoritySnapshot.frames.length,
+      'display authority snapshot frame count did not match'
+    );
     assert.strictEqual(result.sessionLogReplay?.t, 'log_replay', 'session log replay RPC did not return the event shape');
     assert(Array.isArray(result.sessionLogReplay.entries), 'session log replay did not return entries');
     assert(Array.isArray(result.externalSessionActivityReplay?.frames), 'external session activity replay did not return frames');
@@ -1005,8 +1026,8 @@ async function main() {
       'dashboard bootstrap still marked display_ready as omitted'
     );
     assert(
-      result.dashboardBootstrap.omitted?.includes('display_input_authority_state'),
-      'dashboard bootstrap did not mark authority state as omitted'
+      !result.dashboardBootstrap.omitted?.includes('display_input_authority_state'),
+      'dashboard bootstrap still marked authority state as omitted'
     );
     assert(
       !result.dashboardBootstrap.omitted?.includes('external_session_activity_replay'),
@@ -1275,6 +1296,7 @@ async function main() {
         browserWorkspaceCount: result.browserWorkspaceSnapshot.workspaces.length,
         stateSnapshotConnectionId: result.stateSnapshot.connection_id,
         displayBootstrapFrameCount: result.displayBootstrap.frame_count,
+        displayAuthoritySnapshotFrameCount: result.displayAuthoritySnapshot.frame_count,
         sessionLogReplayEntryCount: result.sessionLogReplay.entries.length,
         externalSessionActivityReplayFrameCount: result.externalSessionActivityReplay.frame_count,
         dashboardBootstrapFrameCount: result.dashboardBootstrap.frame_count,
