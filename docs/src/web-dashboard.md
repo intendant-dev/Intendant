@@ -434,14 +434,16 @@ control surface, see [Control Plane & Daemon](./control-plane-and-daemon.md).
 Intendant also has an experimental daemon-scoped WebRTC DataChannel transport
 for dashboard control traffic. It is not a replacement for dashboard
 authentication yet: today the browser still bootstraps from the normal dashboard
-origin and sends the WebRTC offer over the existing WebSocket. The point is to
-prove the future "public HTTPS bootstrap + direct local daemon data path" shape
-without weakening the current mTLS default.
+origin, then uses the daemon's local `/connect/dashboard/*` signaling endpoints
+to establish the DataChannel. The existing WebSocket signaling path remains as
+a compatibility fallback for older dashboard bundles. The point is to prove the
+future "public HTTPS bootstrap + direct local daemon data path" shape without
+weakening the current mTLS default.
 
 The handshake is bound to the daemon identity:
 
 - the browser creates a `intendant-dashboard-control` DataChannel and sends an
-  SDP offer over `/ws`;
+  SDP offer to `/connect/dashboard/offer`;
 - the daemon answers with SDP plus a signed binding over the offer hash, answer
   hash, session id, timestamp, and daemon Ed25519 public key;
 - the browser verifies that binding with WebCrypto before using the channel.
@@ -506,7 +508,10 @@ Those paths are deliberately allowlisted one by one. They do **not** make `/`,
 without the normal dashboard authentication. The bootstrap page exposes
 `window.intendantConnectDashboard` for tests and diagnostics; it verifies the
 same daemon-signed binding as the full dashboard control experiment, then uses
-the DataChannel RPC protocol directly.
+the DataChannel RPC protocol directly. These local endpoints are useful for
+same-origin dashboard experiments and diagnostics; by themselves they do not
+solve browser trust for a public page talking to a daemon HTTPS certificate the
+browser has not already accepted.
 
 Run the focused browser check against a local daemon with:
 
@@ -518,6 +523,18 @@ PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
 The check intentionally uses no client certificate. It must see `/config`
 rejected with `401`, then prove that `/connect/bootstrap` can create a verified
 dashboard-control DataChannel and issue a few RPC requests over it.
+
+To test the full dashboard bundle's local signaling path, run a loopback-only
+plaintext debug daemon through:
+
+```bash
+node scripts/validate-dashboard-control-local-signaling.cjs \
+  --dashboard-binary ./target/release/intendant \
+  --daemon-port 8877
+```
+
+That harness enables `window.intendantDashboardControl` in the real SPA and
+asserts that the verified DataChannel reports `signalingMode: "local-http"`.
 
 This slice is a local stand-in for a future hosted Intendant Connect service. It
 does not implement account login, passkeys, daemon claiming, or a durable daemon

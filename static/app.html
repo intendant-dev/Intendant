@@ -36518,7 +36518,7 @@ class DashboardTransport {
 
   startControl() {
     if (!this.enabled()) return;
-    if (!app || !app.send_server_action || !window.RTCPeerConnection) return;
+    if (!window.RTCPeerConnection) return;
     if (dashboardControlTransport) return;
     dashboardControlTransport = new DashboardControlTransport();
     dashboardSetControlLastError('');
@@ -36755,6 +36755,7 @@ class DashboardControlTransport {
     this.pending = new Map();
     this.chunkedResponses = new Map();
     this.completedChunkedResponses = 0;
+    this.signalingMode = '';
     this.seq = 0;
   }
 
@@ -36783,7 +36784,7 @@ class DashboardControlTransport {
         this.pendingIce.push(candidate);
         return;
       }
-      this.sendSignal({ t: 'dashboard_control_ice', session_id: this.sessionId, candidate });
+      this.sendIce(candidate).catch(err => console.warn('[dashboard-control] ICE signal failed', err));
     };
     this.pc.onconnectionstatechange = () => {
       console.info('[dashboard-control] pc state', this.pc.connectionState);
@@ -36798,7 +36799,8 @@ class DashboardControlTransport {
     await this.pc.setLocalDescription(offer);
     this.localOfferSdp = offer.sdp || '';
     dashboardUpdateTransportStatus();
-    this.sendSignal({ t: 'dashboard_control_offer', sdp: offer.sdp });
+    const answer = await this.sendOffer(this.localOfferSdp);
+    if (answer) await this.handleAnswer(answer);
   }
 
   async handleAnswer(answer) {
@@ -36820,7 +36822,7 @@ class DashboardControlTransport {
     this.verifiedBinding = verification;
     await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
     for (const candidate of this.pendingIce.splice(0)) {
-      this.sendSignal({ t: 'dashboard_control_ice', session_id: this.sessionId, candidate });
+      this.sendIce(candidate).catch(err => console.warn('[dashboard-control] queued ICE signal failed', err));
     }
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
@@ -37215,8 +37217,74 @@ class DashboardControlTransport {
     this.sendFrame(frame);
   }
 
-  sendSignal(frame) {
-    if (app && app.send_server_action) app.send_server_action(frame);
+  async postLocalSignal(path, payload) {
+    const resp = await fetch(path, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.ok === false) {
+      throw new Error(body.error || `${path} returned ${resp.status}`);
+    }
+    return body;
+  }
+
+  sendWsSignal(frame) {
+    if (app && app.send_server_action) {
+      app.send_server_action(frame);
+      return true;
+    }
+    return false;
+  }
+
+  async sendOffer(sdp) {
+    try {
+      const answer = await this.postLocalSignal('/connect/dashboard/offer', { sdp });
+      this.signalingMode = 'local-http';
+      dashboardUpdateTransportStatus();
+      return answer;
+    } catch (err) {
+      console.warn('[dashboard-control] local offer signaling failed', err);
+      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp })) {
+        this.signalingMode = 'websocket-fallback';
+        dashboardUpdateTransportStatus();
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  async sendIce(candidate) {
+    if (!this.sessionId) return;
+    if (this.signalingMode !== 'websocket-fallback') {
+      try {
+        await this.postLocalSignal('/connect/dashboard/ice', {
+          session_id: this.sessionId,
+          candidate,
+        });
+        return;
+      } catch (err) {
+        console.warn('[dashboard-control] local ICE signaling failed', err);
+        if (this.signalingMode === 'local-http') throw err;
+      }
+    }
+    if (!this.sendWsSignal({ t: 'dashboard_control_ice', session_id: this.sessionId, candidate })) {
+      throw new Error('dashboard control signaling unavailable');
+    }
+  }
+
+  signalClose(sessionId) {
+    if (!sessionId) return;
+    if (this.signalingMode !== 'websocket-fallback') {
+      fetch('/connect/dashboard/close', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ session_id: sessionId }),
+      }).catch(() => {});
+      return;
+    }
+    this.sendWsSignal({ t: 'dashboard_control_close', session_id: sessionId });
   }
 
   async refreshIceRoute() {
@@ -37257,7 +37325,7 @@ class DashboardControlTransport {
     this.pending.clear();
     this.chunkedResponses.clear();
     if (this.sessionId) {
-      this.sendSignal({ t: 'dashboard_control_close', session_id: this.sessionId });
+      this.signalClose(this.sessionId);
     }
     dashboardControlEventsActive = false;
     dashboardRecentServerMessageKeys.clear();
@@ -37276,6 +37344,7 @@ class DashboardControlTransport {
       channelState: this.channel?.readyState || '',
       sessionId: this.sessionId,
       verifiedBinding: this.verifiedBinding,
+      signalingMode: this.signalingMode,
       iceRoute: this.iceRoute,
       iceCandidatePair: this.iceCandidatePair,
       lastError: this.lastError,

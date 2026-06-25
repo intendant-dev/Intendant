@@ -704,14 +704,16 @@ async function waitFor(predicate, timeoutMs, label) {
   throw new Error(`timed out waiting for ${label}`);
 }
 
-async function waitForBrowserConnect(page) {
+async function waitForBrowserConnect(page, globalName = 'intendantPublicConnectDashboard') {
   let last = null;
   const deadline = Date.now() + CONNECT_TIMEOUT_MS;
+  const globalNameJson = JSON.stringify(globalName);
   while (Date.now() < deadline) {
-    last = await page.evaluate(() => {
-      if (!window.intendantPublicConnectDashboard) return null;
-      return window.intendantPublicConnectDashboard.status();
-    }).catch(() => null);
+    last = await page.evaluate(`(() => {
+      const dashboard = window[${globalNameJson}];
+      if (!dashboard) return null;
+      return dashboard.status();
+    })()`).catch(() => null);
     if (
       last &&
       last.connected &&
@@ -723,7 +725,7 @@ async function waitForBrowserConnect(page) {
     }
     await page.waitForTimeout(250);
   }
-  throw new Error(`public Connect dashboard did not connect: ${JSON.stringify(last)}`);
+  throw new Error(`${globalName} did not connect: ${JSON.stringify(last)}`);
 }
 
 async function main() {
@@ -762,7 +764,7 @@ async function main() {
     });
     assert.strictEqual(certlessConfigStatus, 401, `/config without client cert returned ${certlessConfigStatus}`);
 
-    browser = await launchBrowser({ headless: true });
+    browser = await launchBrowser({ headless: true, ignoreHTTPSErrors: true });
     const page = await browser.newPage();
     page.on('console', msg => console.log(`[browser:${msg.type()}] ${msg.text()}`));
     const publicOrigin = `http://127.0.0.1:${options.rendezvousPort}`;
