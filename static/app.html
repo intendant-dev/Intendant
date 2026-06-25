@@ -11119,6 +11119,8 @@ let dashboardControlLastError = '';
 const DASHBOARD_EVENT_DEDUPE_MS = 2000;
 const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
+const DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES = 16 * 1024;
+const DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
 const dashboardRecentServerMessageKeys = new Map();
 const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_autonomy',
@@ -33061,6 +33063,16 @@ function humanBytes(n) {
   return n + ' B';
 }
 
+function dashboardUploadRpcAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.upload_frames_available === true &&
+    dashboardControlTransport?.lastStatus?.api_session_current_upload_available === true
+  );
+}
+
 async function uploadOneFile(file, destination) {
   if (file.size > UPLOAD_MAX_BYTES) {
     logErrorToActivity(`File too large (${humanBytes(file.size)}): ${file.name}. Cap is ${humanBytes(UPLOAD_MAX_BYTES)}.`);
@@ -33071,16 +33083,32 @@ async function uploadOneFile(file, destination) {
   const controller = new AbortController();
   const timeout = setTimeout(() => controller.abort(), 120000);
   try {
-    const resp = await fetch(`/api/session/current/uploads?${q}`, {
-      method: 'POST',
-      headers: { 'Content-Type': mime },
-      body: file,
-      signal: controller.signal,
-    });
-    const json = await resp.json().catch(() => ({}));
-    if (!resp.ok) {
-      logErrorToActivity(`Upload failed (${file.name}): ${json.error || resp.statusText}`);
-      return null;
+    let json;
+    if (dashboardUploadRpcAvailable()) {
+      json = await dashboardTransport.uploadBytes('api_session_current_upload', {
+        destination,
+        name: file.name || 'upload.bin',
+        mime,
+      }, file, {
+        timeoutMs: 120000,
+        signal: controller.signal,
+      });
+      if (json?._httpOk === false) {
+        logErrorToActivity(`Upload failed (${file.name}): ${json.error || json._httpStatus || 'error'}`);
+        return null;
+      }
+    } else {
+      const resp = await fetch(`/api/session/current/uploads?${q}`, {
+        method: 'POST',
+        headers: { 'Content-Type': mime },
+        body: file,
+        signal: controller.signal,
+      });
+      json = await resp.json().catch(() => ({}));
+      if (!resp.ok) {
+        logErrorToActivity(`Upload failed (${file.name}): ${json.error || resp.statusText}`);
+        return null;
+      }
     }
     onUploadReady(json);
     return json;
@@ -36795,6 +36823,13 @@ class DashboardTransport {
     return dashboardControlTransport.requestBytes(method, params, options);
   }
 
+  uploadBytes(method, params = {}, bytes, options = {}) {
+    if (!this.canUseRpc()) {
+      return Promise.reject(new Error('dashboard control upload is not connected'));
+    }
+    return dashboardControlTransport.uploadBytes(method, params, bytes, options);
+  }
+
   displayInput(displayId, event) {
     if (!this.canUseDisplayInputAuthority()) return false;
     return dashboardControlTransport.displayInput(displayId, event);
@@ -36926,6 +36961,9 @@ window.intendantDashboardControl = {
   },
   requestBytes(method, params = {}, options = {}) {
     return dashboardTransport.requestBytes(method, params, options);
+  },
+  uploadBytes(method, params = {}, bytes, options = {}) {
+    return dashboardTransport.uploadBytes(method, params, bytes, options);
   },
   agentCard(options = {}) {
     return dashboardTransport.request('api_agent_card', {}, options);
@@ -37598,6 +37636,68 @@ class DashboardControlTransport {
     return promise;
   }
 
+  async uploadBytes(method, params = {}, bytes, options = {}) {
+    if (options.signal?.aborted) {
+      return Promise.reject(dashboardControlAbortError());
+    }
+    const id = this.nextId();
+    const totalBytes = Number(bytes?.size ?? bytes?.byteLength ?? bytes?.length ?? 0);
+    const chunkSize = options.chunkBytes || DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES;
+    const chunks = Math.ceil(totalBytes / chunkSize);
+    const promise = this.waitFor(id, options.timeoutMs || dashboardControlRequestTimeoutMs(method), options);
+    this.sendFrame({
+      t: 'upload_start',
+      id,
+      method,
+      params,
+      encoding: 'base64',
+      total_bytes: totalBytes,
+      chunks,
+    });
+    try {
+      for (let seq = 0, offset = 0; offset < totalBytes; seq += 1, offset += chunkSize) {
+        if (options.signal?.aborted) throw dashboardControlAbortError();
+        if (!this.pending.has(id)) break;
+        const end = Math.min(offset + chunkSize, totalBytes);
+        let chunk;
+        if (bytes instanceof Blob) {
+          chunk = new Uint8Array(await bytes.slice(offset, end).arrayBuffer());
+        } else if (bytes instanceof Uint8Array) {
+          chunk = bytes.subarray(offset, end);
+        } else {
+          chunk = new Uint8Array(bytes.slice(offset, end));
+        }
+        this.sendFrame({
+          t: 'upload_chunk',
+          id,
+          seq,
+          data: dashboardControlBytesToBase64(chunk),
+        });
+        await this.waitForBufferedAmountLow(options.signal);
+      }
+      if (this.pending.has(id)) {
+        this.sendFrame({ t: 'upload_end', id, chunks });
+      }
+    } catch (err) {
+      if (this.pending.has(id)) {
+        this.sendFrame({ t: 'cancel', id });
+      }
+      throw err;
+    }
+    return promise;
+  }
+
+  async waitForBufferedAmountLow(signal = null) {
+    while (
+      this.channel &&
+      this.channel.readyState === 'open' &&
+      this.channel.bufferedAmount > DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES
+    ) {
+      if (signal?.aborted) throw dashboardControlAbortError();
+      await new Promise(resolve => setTimeout(resolve, 10));
+    }
+  }
+
   displayInput(displayId, event) {
     if (!this.canUseRpc()) return false;
     this.sendFrame({
@@ -37852,6 +37952,7 @@ class DashboardControlTransport {
       apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
       byteStreamsAvailable: this.lastStatus?.byte_streams_available ?? null,
+      uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
       apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
@@ -37860,6 +37961,7 @@ class DashboardControlTransport {
       apiSessionCurrentRedoAvailable: this.lastStatus?.api_session_current_redo_available ?? null,
       apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
       apiSessionCurrentChangesAvailable: this.lastStatus?.api_session_current_changes_available ?? null,
+      apiSessionCurrentUploadAvailable: this.lastStatus?.api_session_current_upload_available ?? null,
       apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
@@ -37907,6 +38009,14 @@ function dashboardControlBase64ToBytes(value) {
     bytes[i] = binary.charCodeAt(i);
   }
   return bytes;
+}
+
+function dashboardControlBytesToBase64(bytes) {
+  let binary = '';
+  for (let i = 0; i < bytes.byteLength; i += 1) {
+    binary += String.fromCharCode(bytes[i]);
+  }
+  return btoa(binary);
 }
 
 function dashboardControlRequestTimeoutMs(method) {

@@ -154,6 +154,14 @@ async function main() {
           byteLength: report?.data_base64 ? atob(String(report.data_base64)).length : 0,
         };
       };
+      const upload = async () => {
+        const bytes = new TextEncoder().encode('dashboard upload e2e local');
+        return labeled('api_session_current_upload', ctl.uploadBytes('api_session_current_upload', {
+          destination: 'task',
+          name: 'dashboard-upload-local.txt',
+          mime: 'text/plain',
+        }, bytes, { timeoutMs: 60000 }));
+      };
       return {
         status: await ctl.request('status', {}, { timeoutMs: 60000 }),
         agentCard: await ctl.agentCard({ timeoutMs: 60000 }),
@@ -167,6 +175,7 @@ async function main() {
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         sessionReport: await sessionReport(),
+        upload: await upload(),
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
         }, { timeoutMs: 60000 })),
@@ -277,6 +286,13 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiDashboardActionMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionReportAvailable, true);
     assert.strictEqual(result.finalStatus.byteStreamsAvailable, true);
+    assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
+    assert.strictEqual(result.upload?._httpStatus, 200);
+    assert.strictEqual(result.upload?._httpOk, true);
+    assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
+    assert.strictEqual(result.upload?.mime, 'text/plain');
+    assert.strictEqual(result.upload?.size, 'dashboard upload e2e local'.length);
     if (result.sessionReport?.ok === true) {
       assert.strictEqual(result.sessionReport.content_type, 'application/zip');
       assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
@@ -340,6 +356,10 @@ async function main() {
         apiDashboardActionMsgAvailable: result.finalStatus.apiDashboardActionMsgAvailable,
         apiSessionReportAvailable: result.finalStatus.apiSessionReportAvailable,
         byteStreamsAvailable: result.finalStatus.byteStreamsAvailable,
+        uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
+        apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
+        uploadStatus: result.upload._httpStatus,
+        uploadSize: result.upload.size,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,

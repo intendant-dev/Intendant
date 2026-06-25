@@ -261,6 +261,8 @@ function publicBootstrapHtml() {
   const daemonId = new URLSearchParams(location.search).get('daemon_id') || '${DEFAULT_DAEMON_ID}';
   const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
   const MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
+  const UPLOAD_CHUNK_BYTES = 16 * 1024;
+  const UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
   function paint(value) {
     statusEl.textContent = typeof value === 'string' ? value : JSON.stringify(value, null, 2);
   }
@@ -281,6 +283,11 @@ function publicBootstrapHtml() {
     const bytes = new Uint8Array(binary.length);
     for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
     return bytes;
+  }
+  function bytesToBase64(bytes) {
+    let binary = '';
+    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
   }
   async function sha256B64u(text) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
@@ -736,6 +743,54 @@ function publicBootstrapHtml() {
       this.sendFrame({ t: 'request', id, method, params, bytes: true });
       return promise;
     },
+    async uploadBytes(method, params = {}, bytes, options = {}) {
+      if (options.signal?.aborted) return Promise.reject(abortError());
+      if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control upload is not connected'));
+      const data = bytes instanceof Uint8Array ? bytes : new Uint8Array(bytes);
+      const id = this.nextId();
+      const totalBytes = data.byteLength;
+      const chunkSize = options.chunkBytes || UPLOAD_CHUNK_BYTES;
+      const chunks = Math.ceil(totalBytes / chunkSize);
+      const promise = this.waitFor(id, options);
+      this.sendFrame({
+        t: 'upload_start',
+        id,
+        method,
+        params,
+        encoding: 'base64',
+        total_bytes: totalBytes,
+        chunks,
+      });
+      try {
+        for (let seq = 0, offset = 0; offset < totalBytes; seq++, offset += chunkSize) {
+          if (options.signal?.aborted) throw abortError();
+          if (!this.pending.has(id)) break;
+          const chunk = data.subarray(offset, Math.min(offset + chunkSize, totalBytes));
+          this.sendFrame({
+            t: 'upload_chunk',
+            id,
+            seq,
+            data: bytesToBase64(chunk),
+          });
+          await this.waitForBufferedAmountLow(options.signal);
+        }
+        if (this.pending.has(id)) this.sendFrame({ t: 'upload_end', id, chunks });
+      } catch (err) {
+        if (this.pending.has(id)) this.sendFrame({ t: 'cancel', id });
+        throw err;
+      }
+      return promise;
+    },
+    async waitForBufferedAmountLow(signal = null) {
+      while (
+        this.channel &&
+        this.channel.readyState === 'open' &&
+        this.channel.bufferedAmount > UPLOAD_BUFFER_HIGH_BYTES
+      ) {
+        if (signal?.aborted) throw abortError();
+        await new Promise(resolve => setTimeout(resolve, 10));
+      }
+    },
     stream(method, params = {}, options = {}, onEvent = {}) {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control stream is not connected'));
@@ -1027,6 +1082,14 @@ async function main() {
           byteLength: report?.data_base64 ? atob(String(report.data_base64)).length : 0,
         };
       };
+      const upload = async () => {
+        const bytes = new TextEncoder().encode('dashboard upload e2e rendezvous');
+        return labeled('api_session_current_upload', ctl.uploadBytes('api_session_current_upload', {
+          destination: 'task',
+          name: 'dashboard-upload-rendezvous.txt',
+          mime: 'text/plain',
+        }, bytes, { timeoutMs: 60000 }));
+      };
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
@@ -1046,6 +1109,7 @@ async function main() {
         sessionControl,
         dashboardAction,
         sessionReport: await sessionReport(),
+        upload: await upload(),
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -1141,6 +1205,16 @@ async function main() {
       result.status.byte_streams_available,
       true,
       'dashboard control status did not advertise byte streams'
+    );
+    assert.strictEqual(
+      result.status.upload_frames_available,
+      true,
+      'dashboard control status did not advertise upload frames'
+    );
+    assert.strictEqual(
+      result.status.api_session_current_upload_available,
+      true,
+      'dashboard control status did not advertise current upload frames'
     );
     assert.strictEqual(
       result.status.api_dashboard_action_msg_available,
@@ -1345,6 +1419,11 @@ async function main() {
       );
       assert.strictEqual(result.sessionReport?._httpOk, false);
     }
+    assert.strictEqual(result.upload?._httpStatus, 200);
+    assert.strictEqual(result.upload?._httpOk, true);
+    assert.strictEqual(result.upload?.name, 'dashboard-upload-rendezvous.txt');
+    assert.strictEqual(result.upload?.mime, 'text/plain');
+    assert.strictEqual(result.upload?.size, 'dashboard upload e2e rendezvous'.length);
     assert.strictEqual(
       result.status.api_session_current_history_available,
       true,
@@ -1574,6 +1653,10 @@ async function main() {
         rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
         apiSessionReportAvailable: result.status.api_session_report_available,
         byteStreamsAvailable: result.status.byte_streams_available,
+        uploadFramesAvailable: result.status.upload_frames_available,
+        apiSessionCurrentUploadAvailable: result.status.api_session_current_upload_available,
+        uploadStatus: result.upload._httpStatus,
+        uploadSize: result.upload.size,
         sessionReportStatus: result.sessionReport._httpStatus || 200,
         sessionReportSize: result.sessionReport.byteLength || result.sessionReport.size || 0,
         streamEventCount: result.sessionsStream.eventCount,

@@ -11473,7 +11473,7 @@ async fn read_post_body<S: AsyncRead + Unpin>(header_text: &str, stream: &mut S)
 /// Picked to cover common real uploads (PDFs, CSVs, source archives,
 /// annotated screenshots) without accepting arbitrary blobs. Can be made
 /// configurable later via `[upload] max_size_mb` in intendant.toml.
-const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// Stream the body of an HTTP request into a fresh tempfile, honouring
 /// `Content-Length` and bailing out early if the body exceeds `max_bytes`.
@@ -11560,6 +11560,67 @@ fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
 
 fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
     project_root.join(".intendant").join("pending_uploads")
+}
+
+pub(crate) fn current_upload_commit_response_body(
+    project_root: Option<&std::path::Path>,
+    session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
+    daemon_session_id: Option<&str>,
+    name: &str,
+    mime: &str,
+    requested_destination: crate::upload_store::UploadDestination,
+    tmp: tempfile::NamedTempFile,
+    size: usize,
+    bus: &crate::event::EventBus,
+) -> (&'static str, String) {
+    let Some(root) = project_root else {
+        return (
+            "400 Bad Request",
+            serde_json::json!({ "error": "no project root" }).to_string(),
+        );
+    };
+
+    let (session_dir, session_id) = if let Some(slog) = session_log {
+        match slog.lock() {
+            Ok(l) => (l.dir().to_path_buf(), l.session_id().to_string()),
+            Err(_) => {
+                return (
+                    "500 Internal Server Error",
+                    serde_json::json!({ "error": "session log lock poisoned" }).to_string(),
+                );
+            }
+        }
+    } else {
+        (
+            pending_upload_session_dir(root),
+            daemon_session_id.unwrap_or("pending").to_string(),
+        )
+    };
+    let destination = effective_upload_destination(requested_destination, session_log.is_some());
+    match crate::upload_store::commit_upload(
+        tmp,
+        name,
+        mime,
+        size as u64,
+        destination,
+        &session_dir,
+        &session_id,
+        root,
+    ) {
+        Ok(descriptor) => {
+            bus.send(crate::event::AppEvent::UploadReady {
+                descriptor: descriptor.clone(),
+            });
+            (
+                "200 OK",
+                serde_json::to_string(&descriptor).unwrap_or_else(|_| "{}".to_string()),
+            )
+        }
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({ "error": format!("commit upload: {e}") }).to_string(),
+        ),
+    }
 }
 
 pub(crate) fn current_upload_delete_response_body(

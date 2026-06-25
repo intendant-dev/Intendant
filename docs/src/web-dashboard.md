@@ -737,6 +737,7 @@ messages. The first useful envelope set is:
 | `response_start` / `response_chunk` / `response_end` | daemon -> browser | Chunked delivery of an oversized JSON `response` frame |
 | `stream_start` / `stream_event` / `stream_end` | daemon -> browser | Ordered event stream for a long-lived request id |
 | `byte_stream_start` / `byte_stream_chunk` / `byte_stream_end` | daemon -> browser | Bounded raw-byte artifact transfer for a request id |
+| `upload_start` / `upload_chunk` / `upload_end` | browser -> daemon | Bounded raw-byte upload transfer for a request id |
 | `event` | daemon -> browser | Control-plane event stream entry |
 | `cancel` | browser -> daemon | Cancel an in-flight request or stream |
 | `credit` | browser -> daemon | Backpressure for chunked responses, chunked stream events, or bounded byte streams |
@@ -757,9 +758,14 @@ advertise the feature still receive the legacy eager chunk burst.
 Bounded artifact downloads use `byte_stream_start`, base64 `byte_stream_chunk`
 frames, and `byte_stream_end`. This avoids wrapping raw bytes inside a JSON
 result and reuses the same credit-window queue, but it is still an in-memory,
-single-shot transfer. Resumable/range semantics are still required before moving
-uploads, generic downloads, recordings, terminal streams, or broad file
-transfer.
+single-shot transfer.
+
+Bounded dashboard uploads use `upload_start`, base64 `upload_chunk`, and
+`upload_end`. The daemon writes chunks into a tempfile and commits through the
+same upload store as `POST /api/session/current/uploads`, including the
+`UploadReady` broadcast. This is still a one-shot, ordered transfer with no
+resume token. Resumable/range semantics are still required before moving generic
+downloads, recordings, terminal streams, or broad file transfer.
 
 The first streamed API on this substrate is `api_sessions_stream`, which mirrors
 the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
@@ -834,6 +840,11 @@ The Settings debug session-report download uses `api_session_report`, returning
 the same text-artifact zip as `/api/session/{id}/report` through bounded
 `byte_stream_*` frames. This is intentionally scoped to the diagnostic report;
 generic downloads still wait for resumable/range semantics.
+The task attachment upload path uses `api_session_current_upload` over
+`upload_*` frames when the verified tunnel advertises `upload_frames`; it falls
+back to `POST /api/session/current/uploads` only when the tunnel feature is not
+available. Failed tunneled uploads are not replayed over HTTP, to avoid creating
+duplicate attachments after an ambiguous partial transfer.
 Worktree cached inventory reads, explicit scans, and guarded removals use
 `api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
 the same no-replay fallback rule as other writes.
@@ -938,9 +949,9 @@ Treat this as a staged target, not current behavior:
 10. Gradually migrate larger API surfaces. Managed-context history reads,
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, lazy context-snapshot exact-loads, session-data
-    deletion, staged upload deletion, recording metadata, session-report zip
-    downloads, bounded byte-stream artifact transfer, worktree inventory,
-    filesystem picker stat/list/mkdir operations,
+    deletion, staged upload deletion, bounded task uploads, recording metadata,
+    session-report zip downloads, bounded byte-stream artifact transfer,
+    worktree inventory, filesystem picker stat/list/mkdir operations,
     local Agent Card reads, and local session hydration now use the tunnel,
     oversized JSON responses now use credit-windowed chunked response framing,
     and the sessions stream uses explicit

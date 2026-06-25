@@ -25,6 +25,7 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Write as _;
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -62,6 +63,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "response_credit",
     "stream_frames",
     "byte_streams",
+    "upload_frames",
     "api_peers",
     "api_sessions",
     "api_sessions_stream",
@@ -545,6 +547,15 @@ struct ControlByteStream {
     result: serde_json::Value,
 }
 
+struct InboundUploadState {
+    params: serde_json::Value,
+    tmp: tempfile::NamedTempFile,
+    total_bytes: usize,
+    expected_chunks: usize,
+    next_seq: usize,
+    received_bytes: usize,
+}
+
 struct OutboundControlQueue {
     frames: VecDeque<QueuedControlFrame>,
 }
@@ -705,6 +716,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
     let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
     let mut pending_requests: HashMap<String, CancellationToken> = HashMap::new();
     let mut outbound_queue = OutboundControlQueue::new();
+    let mut inbound_uploads: HashMap<String, InboundUploadState> = HashMap::new();
     let mut display_authority_rx = runtime
         .display_authority
         .as_ref()
@@ -719,6 +731,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             &task_tx,
             &mut pending_requests,
             &mut outbound_queue,
+            &mut inbound_uploads,
         )
         .await
         {
@@ -891,6 +904,7 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     task_tx: &mpsc::Sender<ControlTaskResponse>,
     pending_requests: &mut HashMap<String, CancellationToken>,
     outbound_queue: &mut OutboundControlQueue,
+    inbound_uploads: &mut HashMap<String, InboundUploadState>,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
         if t.transport.transport_protocol != TransportProtocol::UDP {
@@ -930,9 +944,14 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
         let Ok(text) = std::str::from_utf8(&msg.data) else {
             continue;
         };
-        if let Some(response) =
-            control_frame_response(text, runtime, task_tx, pending_requests, outbound_queue)
-        {
+        if let Some(response) = control_frame_response(
+            text,
+            runtime,
+            task_tx,
+            pending_requests,
+            outbound_queue,
+            inbound_uploads,
+        ) {
             send_control_frame(
                 rtc,
                 channels,
@@ -1336,6 +1355,7 @@ fn control_frame_response(
     task_tx: &mpsc::Sender<ControlTaskResponse>,
     pending_requests: &mut HashMap<String, CancellationToken>,
     outbound_queue: &mut OutboundControlQueue,
+    inbound_uploads: &mut HashMap<String, InboundUploadState>,
 ) -> Option<serde_json::Value> {
     let parsed: serde_json::Value = serde_json::from_str(text).ok()?;
     let t = parsed.get("t").and_then(|v| v.as_str()).unwrap_or("");
@@ -1373,6 +1393,16 @@ fn control_frame_response(
             spawn_dashboard_display_input(parsed, runtime.clone());
             None
         }
+        "upload_start" => control_upload_start_frame(id, parsed, pending_requests, inbound_uploads),
+        "upload_chunk" => control_upload_chunk_frame(id, parsed, pending_requests, inbound_uploads),
+        "upload_end" => control_upload_end_frame(
+            id,
+            parsed,
+            runtime,
+            task_tx,
+            pending_requests,
+            inbound_uploads,
+        ),
         "request" => {
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
             match method {
@@ -1531,7 +1561,8 @@ fn control_frame_response(
                 })
                 .unwrap_or(false);
             let queued_existed = outbound_queue.cancel(&id);
-            let existed = pending_existed || queued_existed;
+            let upload_existed = inbound_uploads.remove(&id).is_some();
+            let existed = pending_existed || queued_existed || upload_existed;
             Some(cancelled_control_response(id, existed))
         }
         "credit" => {
@@ -1551,6 +1582,219 @@ fn control_frame_response(
             "error": format!("unknown frame type: {t}"),
         })),
     }
+}
+
+fn control_upload_error_response(
+    id: String,
+    status: u16,
+    error: impl Into<String>,
+) -> serde_json::Value {
+    http_body_response(
+        id,
+        status,
+        serde_json::json!({
+            "ok": false,
+            "error": error.into(),
+        })
+        .to_string(),
+        "dashboard upload",
+    )
+}
+
+fn control_upload_start_frame(
+    id: String,
+    frame: serde_json::Value,
+    pending_requests: &mut HashMap<String, CancellationToken>,
+    inbound_uploads: &mut HashMap<String, InboundUploadState>,
+) -> Option<serde_json::Value> {
+    if id.is_empty() {
+        return Some(control_upload_error_response(id, 400, "missing request id"));
+    }
+    let method = frame.get("method").and_then(|v| v.as_str()).unwrap_or("");
+    if method != "api_session_current_upload" {
+        return Some(control_upload_error_response(
+            id,
+            400,
+            format!("unknown upload method: {method}"),
+        ));
+    }
+    let total_bytes = frame
+        .get("total_bytes")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    let expected_chunks = frame
+        .get("chunks")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(0);
+    if total_bytes > crate::web_gateway::UPLOAD_MAX_BYTES {
+        return Some(control_upload_error_response(
+            id,
+            413,
+            format!(
+                "body too large: {} bytes (cap is {})",
+                total_bytes,
+                crate::web_gateway::UPLOAD_MAX_BYTES
+            ),
+        ));
+    }
+    if total_bytes > 0 && expected_chunks == 0 {
+        return Some(control_upload_error_response(
+            id,
+            400,
+            "missing upload chunks",
+        ));
+    }
+    if total_bytes == 0 && expected_chunks != 0 {
+        return Some(control_upload_error_response(
+            id,
+            400,
+            "empty upload declared chunks",
+        ));
+    }
+    let tmp = match tempfile::NamedTempFile::new() {
+        Ok(tmp) => tmp,
+        Err(e) => {
+            return Some(control_upload_error_response(
+                id,
+                500,
+                format!("create tempfile: {e}"),
+            ));
+        }
+    };
+    if let Some(previous) = pending_requests.remove(&id) {
+        previous.cancel();
+    }
+    inbound_uploads.remove(&id);
+    pending_requests.insert(id.clone(), CancellationToken::new());
+    inbound_uploads.insert(
+        id,
+        InboundUploadState {
+            params: frame
+                .get("params")
+                .cloned()
+                .unwrap_or_else(|| serde_json::json!({})),
+            tmp,
+            total_bytes,
+            expected_chunks,
+            next_seq: 0,
+            received_bytes: 0,
+        },
+    );
+    None
+}
+
+fn control_upload_chunk_frame(
+    id: String,
+    frame: serde_json::Value,
+    pending_requests: &mut HashMap<String, CancellationToken>,
+    inbound_uploads: &mut HashMap<String, InboundUploadState>,
+) -> Option<serde_json::Value> {
+    let Some(upload) = inbound_uploads.get_mut(&id) else {
+        pending_requests.remove(&id);
+        return Some(control_upload_error_response(id, 400, "unknown upload id"));
+    };
+    let seq = frame
+        .get("seq")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(usize::MAX);
+    if seq != upload.next_seq {
+        inbound_uploads.remove(&id);
+        pending_requests.remove(&id);
+        return Some(control_upload_error_response(
+            id,
+            400,
+            "upload chunk sequence mismatch",
+        ));
+    }
+    let data = match frame.get("data").and_then(|value| value.as_str()) {
+        Some(data) => data,
+        None => {
+            inbound_uploads.remove(&id);
+            pending_requests.remove(&id);
+            return Some(control_upload_error_response(
+                id,
+                400,
+                "missing upload chunk data",
+            ));
+        }
+    };
+    let bytes = match base64::engine::general_purpose::STANDARD.decode(data) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            inbound_uploads.remove(&id);
+            pending_requests.remove(&id);
+            return Some(control_upload_error_response(
+                id,
+                400,
+                "invalid upload chunk data",
+            ));
+        }
+    };
+    upload.received_bytes = upload.received_bytes.saturating_add(bytes.len());
+    if upload.received_bytes > upload.total_bytes {
+        inbound_uploads.remove(&id);
+        pending_requests.remove(&id);
+        return Some(control_upload_error_response(
+            id,
+            400,
+            "upload exceeded declared size",
+        ));
+    }
+    if let Err(e) = upload.tmp.as_file_mut().write_all(&bytes) {
+        inbound_uploads.remove(&id);
+        pending_requests.remove(&id);
+        return Some(control_upload_error_response(
+            id,
+            500,
+            format!("write upload tempfile: {e}"),
+        ));
+    }
+    upload.next_seq = upload.next_seq.saturating_add(1);
+    None
+}
+
+fn control_upload_end_frame(
+    id: String,
+    frame: serde_json::Value,
+    runtime: &ControlRuntime,
+    task_tx: &mpsc::Sender<ControlTaskResponse>,
+    pending_requests: &mut HashMap<String, CancellationToken>,
+    inbound_uploads: &mut HashMap<String, InboundUploadState>,
+) -> Option<serde_json::Value> {
+    let Some(mut upload) = inbound_uploads.remove(&id) else {
+        pending_requests.remove(&id);
+        return Some(control_upload_error_response(id, 400, "unknown upload id"));
+    };
+    let final_chunks = frame
+        .get("chunks")
+        .and_then(|value| value.as_u64())
+        .and_then(|value| usize::try_from(value).ok())
+        .unwrap_or(usize::MAX);
+    if final_chunks != upload.expected_chunks
+        || upload.next_seq != upload.expected_chunks
+        || upload.received_bytes != upload.total_bytes
+    {
+        pending_requests.remove(&id);
+        return Some(control_upload_error_response(id, 400, "incomplete upload"));
+    }
+    if let Err(e) = upload.tmp.as_file_mut().flush() {
+        pending_requests.remove(&id);
+        return Some(control_upload_error_response(
+            id,
+            500,
+            format!("flush upload tempfile: {e}"),
+        ));
+    }
+    let runtime = runtime.clone();
+    let task_tx = task_tx.clone();
+    tokio::spawn(async move {
+        let response = api_session_current_upload_task_response(id.clone(), upload, runtime).await;
+        let _ = task_tx.send(response).await;
+    });
+    None
 }
 
 fn spawn_dashboard_display_input(frame: serde_json::Value, runtime: ControlRuntime) {
@@ -1722,6 +1966,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_external_session_activity_replay_available", true),
         ("api_dashboard_bootstrap_available", true),
         ("byte_streams_available", true),
+        ("upload_frames_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -1734,6 +1979,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_current_prune_available", true),
         ("api_session_current_changes_available", true),
         ("api_session_context_snapshot_available", true),
+        ("api_session_current_upload_available", true),
         ("api_session_current_upload_delete_available", true),
         ("api_fs_stat_available", true),
         ("api_fs_list_available", true),
@@ -2269,6 +2515,62 @@ async fn api_session_report_task_response(
                 "size": size,
             }),
         }),
+        done: true,
+    }
+}
+
+async fn api_session_current_upload_task_response(
+    id: String,
+    upload: InboundUploadState,
+    runtime: ControlRuntime,
+) -> ControlTaskResponse {
+    let params = upload.params.clone();
+    let name = optional_string_param(&params, &["name", "filename", "file_name"])
+        .unwrap_or_else(|| "upload.bin".to_string());
+    let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let requested_destination = optional_string_param(&params, &["destination"])
+        .as_deref()
+        .and_then(crate::upload_store::UploadDestination::from_str)
+        .unwrap_or(crate::upload_store::UploadDestination::Task);
+    let (session_log, daemon_session_id) = {
+        let session = runtime.shared_session.read().await;
+        (
+            session.session_log.clone(),
+            Some(runtime.session_id.clone()),
+        )
+    };
+    let project_root = runtime.project_root.clone();
+    let bus = runtime.bus.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::current_upload_commit_response_body(
+            project_root.as_deref(),
+            session_log.as_ref(),
+            daemon_session_id.as_deref(),
+            &name,
+            &mime,
+            requested_destination,
+            upload.tmp,
+            upload.received_bytes,
+            &bus,
+        )
+    })
+    .await;
+    let frame = match result {
+        Ok((status, body)) => {
+            http_body_response(id.clone(), status_line_code(status), body, "current upload")
+        }
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id.clone(),
+            "ok": false,
+            "error": format!("upload commit task failed: {e}"),
+        }),
+    };
+    ControlTaskResponse {
+        id,
+        frame,
+        byte_stream: None,
         done: true,
     }
 }
@@ -4363,6 +4665,24 @@ mod tests {
         }
     }
 
+    fn test_control_frame_response(
+        text: &str,
+        runtime: &mut ControlRuntime,
+        task_tx: &mpsc::Sender<ControlTaskResponse>,
+        pending_requests: &mut HashMap<String, CancellationToken>,
+        outbound_queue: &mut OutboundControlQueue,
+    ) -> Option<serde_json::Value> {
+        let mut inbound_uploads = HashMap::new();
+        control_frame_response(
+            text,
+            runtime,
+            task_tx,
+            pending_requests,
+            outbound_queue,
+            &mut inbound_uploads,
+        )
+    }
+
     #[test]
     fn binding_signature_payload_verifies() {
         let dir = tempfile::tempdir().unwrap();
@@ -4385,7 +4705,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
-        let hello = control_frame_response(
+        let hello = test_control_frame_response(
             r#"{"t":"hello","id":"h1"}"#,
             &mut rt,
             &tx,
@@ -4396,7 +4716,7 @@ mod tests {
         assert_eq!(hello["t"], "hello_ack");
         assert_eq!(hello["session_id"], "session-1");
 
-        let ping = control_frame_response(
+        let ping = test_control_frame_response(
             r#"{"t":"ping","id":"p1"}"#,
             &mut rt,
             &tx,
@@ -4407,7 +4727,7 @@ mod tests {
         assert_eq!(ping["t"], "pong");
         assert_eq!(ping["id"], "p1");
 
-        let config = control_frame_response(
+        let config = test_control_frame_response(
             r#"{"t":"request","id":"r1","method":"config"}"#,
             &mut rt,
             &tx,
@@ -4419,7 +4739,7 @@ mod tests {
         assert_eq!(config["ok"], true);
         assert_eq!(config["result"]["provider"], "openai");
 
-        let card = control_frame_response(
+        let card = test_control_frame_response(
             r#"{"t":"request","id":"c1","method":"api_agent_card"}"#,
             &mut rt,
             &tx,
@@ -4440,7 +4760,7 @@ mod tests {
             let mut guard = rt.bootstrap_caches.last_autonomy_json.lock().unwrap();
             *guard = Some(r#"{"event":"autonomy_changed","mode":"ask"}"#.to_string());
         }
-        let cached_bootstrap = control_frame_response(
+        let cached_bootstrap = test_control_frame_response(
             r#"{"t":"request","id":"b1","method":"api_cached_bootstrap_events"}"#,
             &mut rt,
             &tx,
@@ -4457,7 +4777,7 @@ mod tests {
             "autonomy_changed"
         );
 
-        let status = control_frame_response(
+        let status = test_control_frame_response(
             r#"{"t":"request","id":"s1","method":"status"}"#,
             &mut rt,
             &tx,
@@ -4491,6 +4811,7 @@ mod tests {
         );
         assert_eq!(status["result"]["api_dashboard_bootstrap_available"], true);
         assert_eq!(status["result"]["byte_streams_available"], true);
+        assert_eq!(status["result"]["upload_frames_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -4522,6 +4843,10 @@ mod tests {
             true
         );
         assert_eq!(
+            status["result"]["api_session_current_upload_available"],
+            true
+        );
+        assert_eq!(
             status["result"]["api_session_current_upload_delete_available"],
             true
         );
@@ -4549,7 +4874,7 @@ mod tests {
         assert_eq!(status["result"]["api_peer_pairing_available"], true);
         assert_eq!(status["result"]["api_coordinator_available"], false);
 
-        let peers = control_frame_response(
+        let peers = test_control_frame_response(
             r#"{"t":"request","id":"a1","method":"api_peers"}"#,
             &mut rt,
             &tx,
@@ -4561,7 +4886,7 @@ mod tests {
         assert_eq!(peers["ok"], false);
         assert_eq!(peers["error"], "peer registry unavailable");
 
-        let subscribed = control_frame_response(
+        let subscribed = test_control_frame_response(
             r#"{"t":"request","id":"e1","method":"subscribe_events"}"#,
             &mut rt,
             &tx,
@@ -4574,7 +4899,7 @@ mod tests {
         assert_eq!(subscribed["result"]["subscribed"], true);
         assert!(rt.events_subscribed);
 
-        let project_root = control_frame_response(
+        let project_root = test_control_frame_response(
             r#"{"t":"request","id":"pr1","method":"api_project_root"}"#,
             &mut rt,
             &tx,
@@ -4592,7 +4917,7 @@ mod tests {
         assert_eq!(project_root["ok"], true);
         assert!(project_root["result"].get("project_root").is_some());
 
-        let queued = control_frame_response(
+        let queued = test_control_frame_response(
             r#"{"t":"request","id":"q1","method":"api_sessions","params":{"limit":1}}"#,
             &mut rt,
             &tx,
@@ -4601,7 +4926,7 @@ mod tests {
         );
         assert!(queued.is_none());
         assert!(pending.contains_key("q1"));
-        let cancelled = control_frame_response(
+        let cancelled = test_control_frame_response(
             r#"{"t":"cancel","id":"q1"}"#,
             &mut rt,
             &tx,
@@ -4873,7 +5198,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
-        let immediate = control_frame_response(
+        let immediate = test_control_frame_response(
             r#"{"t":"request","id":"session-ctrl-frame","method":"api_session_control_msg","params":{"message":{"action":"interrupt","session_id":"session-frame"}}}"#,
             &mut rt,
             &tx,
@@ -4917,7 +5242,7 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
-        let immediate = control_frame_response(
+        let immediate = test_control_frame_response(
             r#"{"t":"request","id":"dash-action-frame","method":"api_dashboard_action_msg","params":{"message":{"action":"close_browser_workspace","workspace_id":"workspace-frame"}}}"#,
             &mut rt,
             &tx,
@@ -4965,7 +5290,7 @@ mod tests {
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
 
-        let queued = control_frame_response(
+        let queued = test_control_frame_response(
             r#"{"t":"request","id":"out1","method":"api_session_current_agent_output","params":{"ids":["missing-output"]}}"#,
             &mut rt,
             &tx,
@@ -5087,7 +5412,8 @@ mod tests {
                 "params": params,
             })
             .to_string();
-            let queued = control_frame_response(&frame, &mut rt, &tx, &mut pending, &mut outbound);
+            let queued =
+                test_control_frame_response(&frame, &mut rt, &tx, &mut pending, &mut outbound);
             assert!(queued.is_none());
             assert!(pending.contains_key(&id));
 
@@ -5110,7 +5436,7 @@ mod tests {
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
 
-        let queued = control_frame_response(
+        let queued = test_control_frame_response(
             r#"{"t":"request","id":"chg1","method":"api_session_current_changes","params":{}}"#,
             &mut rt,
             &tx,
@@ -5204,6 +5530,170 @@ mod tests {
         assert_eq!(missing_id["result"]["error"], "missing upload id");
         assert_eq!(missing_id["result"]["_httpStatus"], 400);
         assert_eq!(missing_id["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn upload_frames_commit_pending_upload() {
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project.path().to_path_buf());
+        let mut events = rt.bus.subscribe();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let mut inbound_uploads = HashMap::new();
+        let bytes = b"hello upload";
+        let first = &bytes[..6];
+        let second = &bytes[6..];
+
+        let start = serde_json::json!({
+            "t": "upload_start",
+            "id": "up1",
+            "method": "api_session_current_upload",
+            "params": {
+                "name": "note.txt",
+                "mime": "text/plain",
+                "destination": "task",
+            },
+            "encoding": "base64",
+            "total_bytes": bytes.len(),
+            "chunks": 2,
+        });
+        assert!(control_frame_response(
+            &start.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+            &mut inbound_uploads,
+        )
+        .is_none());
+        assert!(pending.contains_key("up1"));
+
+        for (seq, chunk) in [first, second].into_iter().enumerate() {
+            let frame = serde_json::json!({
+                "t": "upload_chunk",
+                "id": "up1",
+                "seq": seq,
+                "data": base64::engine::general_purpose::STANDARD.encode(chunk),
+            });
+            assert!(control_frame_response(
+                &frame.to_string(),
+                &mut rt,
+                &tx,
+                &mut pending,
+                &mut outbound,
+                &mut inbound_uploads,
+            )
+            .is_none());
+        }
+
+        let end = serde_json::json!({
+            "t": "upload_end",
+            "id": "up1",
+            "chunks": 2,
+        });
+        assert!(control_frame_response(
+            &end.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+            &mut inbound_uploads,
+        )
+        .is_none());
+
+        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.id, "up1");
+        assert!(response.done);
+        assert_eq!(response.frame["t"], "response");
+        assert_eq!(response.frame["ok"], true);
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["_httpOk"], true);
+        assert_eq!(response.frame["result"]["name"], "note.txt");
+        assert_eq!(response.frame["result"]["mime"], "text/plain");
+        assert_eq!(response.frame["result"]["size"], bytes.len());
+        let path = response.frame["result"]["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), bytes);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        match event {
+            AppEvent::UploadReady { descriptor } => {
+                assert_eq!(descriptor.name, "note.txt");
+                assert_eq!(descriptor.size, bytes.len() as u64);
+            }
+            other => panic!("expected upload ready event, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn upload_frames_commit_zero_byte_upload() {
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project.path().to_path_buf());
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+        let mut inbound_uploads = HashMap::new();
+
+        let start = serde_json::json!({
+            "t": "upload_start",
+            "id": "up-empty",
+            "method": "api_session_current_upload",
+            "params": {
+                "name": "empty.txt",
+                "mime": "text/plain",
+                "destination": "task",
+            },
+            "encoding": "base64",
+            "total_bytes": 0,
+            "chunks": 0,
+        });
+        assert!(control_frame_response(
+            &start.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+            &mut inbound_uploads,
+        )
+        .is_none());
+        assert!(pending.contains_key("up-empty"));
+
+        let end = serde_json::json!({
+            "t": "upload_end",
+            "id": "up-empty",
+            "chunks": 0,
+        });
+        assert!(control_frame_response(
+            &end.to_string(),
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+            &mut inbound_uploads,
+        )
+        .is_none());
+
+        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.id, "up-empty");
+        assert_eq!(response.frame["result"]["_httpStatus"], 200);
+        assert_eq!(response.frame["result"]["_httpOk"], true);
+        assert_eq!(response.frame["result"]["name"], "empty.txt");
+        assert_eq!(response.frame["result"]["size"], 0);
+        let path = response.frame["result"]["path"].as_str().unwrap();
+        assert_eq!(std::fs::read(path).unwrap(), b"");
     }
 
     #[tokio::test]
@@ -5380,7 +5870,8 @@ mod tests {
                 "params": { "path": path.clone() },
             })
             .to_string();
-            let queued = control_frame_response(&frame, &mut rt, &tx, &mut pending, &mut outbound);
+            let queued =
+                test_control_frame_response(&frame, &mut rt, &tx, &mut pending, &mut outbound);
             assert!(queued.is_none());
             assert!(pending.contains_key(&id));
 
@@ -5456,7 +5947,7 @@ mod tests {
         let mut pending = HashMap::new();
         let mut outbound = OutboundControlQueue::new();
 
-        let hello = control_frame_response(
+        let hello = test_control_frame_response(
             r#"{"t":"hello","id":"h1","features":["response_credit"]}"#,
             &mut rt,
             &tx,
@@ -5467,7 +5958,7 @@ mod tests {
         assert_eq!(hello["t"], "hello_ack");
         assert!(rt.response_credit_enabled);
 
-        let status = control_frame_response(
+        let status = test_control_frame_response(
             r#"{"t":"request","id":"s1","method":"status"}"#,
             &mut rt,
             &tx,
@@ -5487,7 +5978,7 @@ mod tests {
         if let Some(QueuedControlFrame::Chunked(queued)) = outbound.frames.front_mut() {
             queued.credit = 0;
         }
-        assert!(control_frame_response(
+        assert!(test_control_frame_response(
             r#"{"t":"credit","id":"large","chunk_id":"large:0","chunks":3}"#,
             &mut rt,
             &tx,
@@ -5500,7 +5991,7 @@ mod tests {
         };
         assert_eq!(queued.credit, 3);
 
-        let cancelled = control_frame_response(
+        let cancelled = test_control_frame_response(
             r#"{"t":"cancel","id":"large"}"#,
             &mut rt,
             &tx,
