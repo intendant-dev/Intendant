@@ -11120,6 +11120,13 @@ const DASHBOARD_EVENT_DEDUPE_MS = 2000;
 const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const dashboardRecentServerMessageKeys = new Map();
 
+function dashboardJsonFetch(method, params, fallback, label = method, options = {}) {
+  if (dashboardTransport && typeof dashboardTransport.jsonFetch === 'function') {
+    return dashboardTransport.jsonFetch(method, params, fallback, label, options);
+  }
+  return fallback();
+}
+
 // Tracks which peer rows have their per-peer controls panel expanded.
 // Lives outside renderDaemonsList because the list re-renders on every
 // push event (PeerAdded / PeerRemoved / PeerStateChanged) and the
@@ -19212,7 +19219,7 @@ async function refreshHistory() {
     return;
   }
   try {
-    const r = await fetch('/api/session/current/history');
+    const r = await dashboardJsonFetch('api_session_current_history', {}, () => fetch('/api/session/current/history'), 'api_session_current_history');
     if (!r.ok) {
       // Older sessions or sessions without history support return 404.
       // Hide the timeline rather than showing a confusing error.
@@ -19485,15 +19492,16 @@ async function confirmRollback() {
   const revertConv = document.getElementById('rollback-conversation').checked;
   closeRollbackModal();
   try {
-    const resp = await fetch('/api/session/current/rollback', {
+    const payload = {
+      round_id: roundId,
+      revert_files: revertFiles,
+      revert_conversation: revertConv,
+    };
+    const resp = await dashboardJsonFetch('api_session_current_rollback', payload, () => fetch('/api/session/current/rollback', {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        round_id: roundId,
-        revert_files: revertFiles,
-        revert_conversation: revertConv,
-      }),
-    });
+      body: JSON.stringify(payload),
+    }), 'api_session_current_rollback', { fallbackAfterRpcFailure: false });
     if (!resp.ok) {
       // Prefer the structured {error} shape the server already uses for
       // this endpoint; fall back to raw text for unexpected error bodies.
@@ -19517,7 +19525,7 @@ window.confirmRollback = confirmRollback;
 
 async function doRedo() {
   try {
-    const r = await fetch('/api/session/current/redo', { method: 'POST' });
+    const r = await dashboardJsonFetch('api_session_current_redo', {}, () => fetch('/api/session/current/redo', { method: 'POST' }), 'api_session_current_redo', { fallbackAfterRpcFailure: false });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       showControlToast('error', `Redo failed: ${err.error || r.statusText}`);
@@ -19537,7 +19545,7 @@ async function doPrune() {
   });
   if (!ok) return;
   try {
-    const r = await fetch('/api/session/current/prune', { method: 'POST' });
+    const r = await dashboardJsonFetch('api_session_current_prune', {}, () => fetch('/api/session/current/prune', { method: 'POST' }), 'api_session_current_prune', { fallbackAfterRpcFailure: false });
     if (!r.ok) {
       const err = await r.json().catch(() => ({}));
       showControlToast('error', `Prune failed: ${err.error || r.statusText}`);
@@ -28858,7 +28866,7 @@ async function loadCommandOutputIntoBody(group, body) {
     return;
   }
   const payload = { ids: group.outputIds };
-  const resp = await dashboardTransport.jsonFetch('api_session_current_agent_output', payload, () => authedFetch('/api/session/current/agent-output', {
+  const resp = await dashboardJsonFetch('api_session_current_agent_output', payload, () => authedFetch('/api/session/current/agent-output', {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
@@ -36629,6 +36637,18 @@ window.intendantDashboardControl = {
   currentAgentOutput(ids = [], options = {}) {
     return dashboardTransport.request('api_session_current_agent_output', { ids }, options);
   },
+  currentHistory(options = {}) {
+    return dashboardTransport.request('api_session_current_history', {}, options);
+  },
+  rollbackCurrent(params = {}, options = {}) {
+    return dashboardTransport.request('api_session_current_rollback', params, options);
+  },
+  redoCurrent(options = {}) {
+    return dashboardTransport.request('api_session_current_redo', {}, options);
+  },
+  pruneCurrent(options = {}) {
+    return dashboardTransport.request('api_session_current_prune', {}, options);
+  },
   sessionSearch(params = {}, options = {}) {
     return dashboardTransport.request('api_sessions_search', params, options);
   },
@@ -37201,6 +37221,10 @@ class DashboardControlTransport {
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
+      apiSessionCurrentHistoryAvailable: this.lastStatus?.api_session_current_history_available ?? null,
+      apiSessionCurrentRollbackAvailable: this.lastStatus?.api_session_current_rollback_available ?? null,
+      apiSessionCurrentRedoAvailable: this.lastStatus?.api_session_current_redo_available ?? null,
+      apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,

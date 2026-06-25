@@ -836,6 +836,14 @@ async function main() {
           completedChunkedResponsesBefore: beforeChunks,
         },
         agentOutput: await ctl.request('api_session_current_agent_output', { ids: ['missing-output'] }),
+        timeline: {
+          history: await ctl.request('api_session_current_history'),
+          rollbackValidation: await ctl.request('api_session_current_rollback', {
+            round_id: 1,
+            revert_files: false,
+            revert_conversation: false,
+          }),
+        },
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
       };
@@ -883,12 +891,46 @@ async function main() {
       true,
       'dashboard control status did not advertise current agent output'
     );
+    assert.strictEqual(
+      result.status.api_session_current_history_available,
+      true,
+      'dashboard control status did not advertise current session history'
+    );
+    assert.strictEqual(
+      result.status.api_session_current_rollback_available,
+      true,
+      'dashboard control status did not advertise current session rollback'
+    );
+    assert.strictEqual(
+      result.status.api_session_current_redo_available,
+      true,
+      'dashboard control status did not advertise current session redo'
+    );
+    assert.strictEqual(
+      result.status.api_session_current_prune_available,
+      true,
+      'dashboard control status did not advertise current session prune'
+    );
     assert(
       result.agentOutput && (
         result.agentOutput._httpStatus === 404 ||
         Array.isArray(result.agentOutput.missing)
       ),
       'agent output RPC did not preserve endpoint result metadata'
+    );
+    assert(
+      result.timeline?.history && (
+        result.timeline.history._httpStatus === 200 ||
+        result.timeline.history._httpStatus === 503
+      ),
+      'timeline history RPC did not preserve endpoint status'
+    );
+    assert(
+      result.timeline?.rollbackValidation && (
+        result.timeline.rollbackValidation._httpStatus === 400 ||
+        result.timeline.rollbackValidation._httpStatus === 503
+      ),
+      'timeline rollback validation RPC did not preserve endpoint status'
     );
     assert(result.appError && result.appError._httpStatus === 400, 'application error metadata was not preserved');
     assert(
@@ -921,6 +963,10 @@ async function main() {
         largeSessionBytes: result.largeSessions.jsonBytes,
         completedChunkedResponses: result.finalStatus.completedChunkedResponses,
         agentOutputStatus: result.agentOutput?._httpStatus || 200,
+        timelineStatuses: Object.fromEntries(Object.entries(result.timeline || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
         appErrorStatus: result.appError._httpStatus,
         pendingRequests: result.finalStatus.pendingRequests,
         pendingChunkedResponses: result.finalStatus.pendingChunkedResponses,

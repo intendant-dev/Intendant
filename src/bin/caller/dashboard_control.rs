@@ -53,6 +53,10 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_sessions_stream",
     "api_session_detail",
     "api_session_current_agent_output",
+    "api_session_current_history",
+    "api_session_current_rollback",
+    "api_session_current_redo",
+    "api_session_current_prune",
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
@@ -1059,6 +1063,10 @@ fn control_frame_response(
                         "api_sessions_stream_available": true,
                         "api_session_detail_available": true,
                         "api_session_current_agent_output_available": true,
+                        "api_session_current_history_available": true,
+                        "api_session_current_rollback_available": true,
+                        "api_session_current_redo_available": true,
+                        "api_session_current_prune_available": true,
                         "api_sessions_search_available": true,
                         "api_settings_available": true,
                         "api_settings_save_available": runtime.project_root.is_some(),
@@ -1133,6 +1141,10 @@ fn control_frame_response(
                 "api_sessions"
                 | "api_session_detail"
                 | "api_session_current_agent_output"
+                | "api_session_current_history"
+                | "api_session_current_rollback"
+                | "api_session_current_redo"
+                | "api_session_current_prune"
                 | "api_sessions_search"
                 | "api_settings"
                 | "api_settings_save"
@@ -1284,6 +1296,12 @@ async fn control_request_response(
         "api_session_current_agent_output" => {
             api_session_current_agent_output_response(id, params.as_ref(), &runtime).await
         }
+        "api_session_current_history" => api_session_current_history_response(id, &runtime).await,
+        "api_session_current_rollback" => {
+            api_session_current_rollback_response(id, params.as_ref(), &runtime).await
+        }
+        "api_session_current_redo" => api_session_current_redo_response(id, &runtime).await,
+        "api_session_current_prune" => api_session_current_prune_response(id, &runtime).await,
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
@@ -1581,6 +1599,61 @@ async fn api_session_current_agent_output_response(
             "agent output",
         ),
     }
+}
+
+async fn api_session_current_history_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let (file_watcher, _) = active_history_handles(runtime).await;
+    let (status_line, body) = crate::web_gateway::handle_history_get(file_watcher.as_ref()).await;
+    http_body_response(
+        id,
+        status_line_code(status_line),
+        body,
+        "session history",
+    )
+}
+
+async fn api_session_current_rollback_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    let (file_watcher, agent_state) = active_history_handles(runtime).await;
+    let (status_line, body) = crate::web_gateway::handle_history_rollback(
+        &body_text,
+        file_watcher.as_ref(),
+        agent_state.as_ref(),
+        &runtime.bus,
+    )
+    .await;
+    http_body_response(
+        id,
+        status_line_code(status_line),
+        body,
+        "session rollback",
+    )
+}
+
+async fn api_session_current_redo_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let (file_watcher, agent_state) = active_history_handles(runtime).await;
+    let (status_line, body) =
+        crate::web_gateway::handle_history_redo(file_watcher.as_ref(), agent_state.as_ref()).await;
+    http_body_response(id, status_line_code(status_line), body, "session redo")
+}
+
+async fn api_session_current_prune_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let (file_watcher, _) = active_history_handles(runtime).await;
+    let (status_line, body) = crate::web_gateway::handle_history_prune(file_watcher.as_ref()).await;
+    http_body_response(id, status_line_code(status_line), body, "session prune")
 }
 
 async fn api_sessions_search_response(
@@ -2234,6 +2307,21 @@ async fn active_session_log_dir(runtime: &ControlRuntime) -> Result<Option<PathB
         .map_err(|_| "session log lock poisoned".to_string())
 }
 
+async fn active_history_handles(
+    runtime: &ControlRuntime,
+) -> (
+    Option<crate::file_watcher::SharedFileWatcher>,
+    Option<Arc<std::sync::Mutex<crate::presence::AgentStateSnapshot>>>,
+) {
+    let session = runtime.shared_session.read().await;
+    let file_watcher = session.file_watcher.clone();
+    let agent_state = session
+        .query_ctx
+        .as_ref()
+        .map(|ctx| Arc::clone(&ctx.agent_state));
+    (file_watcher, agent_state)
+}
+
 fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
     for name in names {
         if let Some(value) = params.get(*name) {
@@ -2389,6 +2477,19 @@ mod tests {
             status["result"]["api_session_current_agent_output_available"],
             true
         );
+        assert_eq!(
+            status["result"]["api_session_current_history_available"],
+            true
+        );
+        assert_eq!(
+            status["result"]["api_session_current_rollback_available"],
+            true
+        );
+        assert_eq!(status["result"]["api_session_current_redo_available"], true);
+        assert_eq!(
+            status["result"]["api_session_current_prune_available"],
+            true
+        );
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
@@ -2492,6 +2593,53 @@ mod tests {
         assert_eq!(response.frame["result"]["error"], "no active session log");
         assert_eq!(response.frame["result"]["_httpStatus"], 404);
         assert_eq!(response.frame["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn current_history_without_file_watcher_preserves_http_status() {
+        let mut rt = runtime();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        for (idx, (method, params)) in [
+            ("api_session_current_history", serde_json::json!({})),
+            (
+                "api_session_current_rollback",
+                serde_json::json!({
+                    "round_id": 1,
+                    "revert_files": true,
+                    "revert_conversation": false,
+                }),
+            ),
+            ("api_session_current_redo", serde_json::json!({})),
+            ("api_session_current_prune", serde_json::json!({})),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("hist{idx}");
+            let frame = serde_json::json!({
+                "t": "request",
+                "id": id,
+                "method": method,
+                "params": params,
+            })
+            .to_string();
+            let queued = control_frame_response(&frame, &mut rt, &tx, &mut pending, &mut outbound);
+            assert!(queued.is_none());
+            assert!(pending.contains_key(&id));
+
+            let response = rx.recv().await.unwrap();
+            assert!(pending.remove(&response.id).is_some());
+            assert_eq!(response.id, id);
+            assert!(response.done);
+            assert_eq!(response.frame["t"], "response");
+            assert_eq!(response.frame["ok"], true);
+            assert_eq!(response.frame["result"]["error"], "file watcher not active");
+            assert_eq!(response.frame["result"]["_httpStatus"], 503);
+            assert_eq!(response.frame["result"]["_httpOk"], false);
+        }
     }
 
     #[tokio::test]

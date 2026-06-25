@@ -13638,7 +13638,7 @@ fn ensure_idle(
 }
 
 /// GET /api/session/current/history — returns serialized `History` JSON.
-async fn handle_history_get(
+pub(crate) async fn handle_history_get(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
 ) -> (&'static str, String) {
     let Some(fw) = file_watcher else {
@@ -13672,7 +13672,7 @@ async fn handle_history_get(
 /// `AppEvent::ConversationRolledBack` is emitted when the work
 /// completes. The HTTP response does not wait for that completion —
 /// the dashboard observes the event stream.
-async fn handle_history_rollback(
+pub(crate) async fn handle_history_rollback(
     body_text: &str,
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
@@ -13817,7 +13817,7 @@ async fn handle_history_rollback(
 }
 
 /// POST /api/session/current/redo — no body. Advances `current_head_id`.
-async fn handle_history_redo(
+pub(crate) async fn handle_history_redo(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
 ) -> (&'static str, String) {
@@ -13849,7 +13849,7 @@ async fn handle_history_redo(
 
 /// POST /api/session/current/prune — drop abandoned branches and GC orphaned
 /// content-addressed blobs.
-async fn handle_history_prune(
+pub(crate) async fn handle_history_prune(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
 ) -> (&'static str, String) {
     let Some(fw) = file_watcher else {
