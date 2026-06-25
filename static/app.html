@@ -30101,10 +30101,21 @@ function utf8ToBase64(s) {
 // Send a raw WS message object by going through the WASM app's send_raw.
 // Falls back to send_server_action if send_raw isn't available.
 function sendRawMessage(obj) {
-  if (!app) return;
+  if (dashboardConnectModeEnabled()) {
+    console.warn('[dashboard-control] legacy WebSocket message unavailable in Connect mode', obj?.t || obj);
+    return false;
+  }
+  if (!app) return false;
   const payload = JSON.stringify(obj);
-  if (app.send_raw) { app.send_raw(payload); }
-  else if (app.send_server_action) { app.send_server_action(obj); }
+  if (app.send_raw) {
+    app.send_raw(payload);
+    return true;
+  }
+  if (app.send_server_action) {
+    app.send_server_action(obj);
+    return true;
+  }
+  return false;
 }
 
 function dashboardMediaEditorRpcAvailable() {
@@ -30193,6 +30204,7 @@ function sendTuiKey(domEvent) {
   })) {
     return;
   }
+  if (dashboardConnectModeEnabled()) return;
   if (app?.send_key) {
     app.send_key(domEvent.key, domEvent.ctrlKey, domEvent.altKey, domEvent.shiftKey);
   }
@@ -30207,6 +30219,7 @@ function sendTuiResize(cols, rows) {
   })) {
     return;
   }
+  if (dashboardConnectModeEnabled()) return;
   if (app?.send_resize) app.send_resize(cols, rows);
 }
 
@@ -30387,6 +30400,7 @@ let termSubscribed = false;
 let termSubscriptionTransport = '';
 
 function preferredTuiTransport() {
+  if (dashboardConnectModeEnabled() && !dashboardTuiFramesAvailable()) return 'none';
   return dashboardTuiFramesAvailable() ? 'webrtc' : 'websocket';
 }
 
@@ -30399,8 +30413,10 @@ function sendTuiSubscriptionFrame(wantSubscribed, transport) {
       rows: term?.rows || 24,
     });
   }
-  sendRawMessage({ t: wantSubscribed ? 'term_subscribe' : 'term_unsubscribe' });
-  return true;
+  if (transport === 'websocket') {
+    return sendRawMessage({ t: wantSubscribed ? 'term_subscribe' : 'term_unsubscribe' });
+  }
+  return false;
 }
 
 function updateTermSubscription(force = false) {
@@ -30421,9 +30437,16 @@ function updateTermSubscription(force = false) {
   termSubscribed = wantSubscribed;
   if (wantSubscribed) {
     termSubscriptionTransport = transport;
-    if (!sendTuiSubscriptionFrame(true, transport) && transport === 'webrtc') {
+    const sent = sendTuiSubscriptionFrame(true, transport);
+    if (!sent && transport === 'webrtc') {
       termSubscriptionTransport = 'websocket';
-      sendTuiSubscriptionFrame(true, 'websocket');
+      if (!sendTuiSubscriptionFrame(true, 'websocket')) {
+        termSubscribed = false;
+        termSubscriptionTransport = '';
+      }
+    } else if (!sent) {
+      termSubscribed = false;
+      termSubscriptionTransport = '';
     }
   } else {
     if (termSubscriptionTransport) {
@@ -37943,6 +37966,59 @@ window.intendantDashboardControl = {
       app = previousApp;
     }
     return { skipped: false, threw, error, wsReplayCount, httpFallbackCount };
+  },
+  _debugProbeTuiConnectNoLegacy() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof sendTuiKey !== 'function' ||
+      typeof sendTuiResize !== 'function' ||
+      typeof sendTuiSubscriptionFrame !== 'function' ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        sendKeyType: typeof sendTuiKey,
+        sendResizeType: typeof sendTuiResize,
+        subscriptionType: typeof sendTuiSubscriptionFrame,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        keyReplayCount: 0,
+        resizeReplayCount: 0,
+        wsReplayCount: 0,
+        subscriptionSent: false,
+      };
+    }
+    const previousApp = app;
+    const previousStatus = dashboardControlTransport.lastStatus;
+    let keyReplayCount = 0;
+    let resizeReplayCount = 0;
+    let wsReplayCount = 0;
+    app = {
+      send_key() { keyReplayCount += 1; },
+      send_resize() { resizeReplayCount += 1; },
+      send_raw() { wsReplayCount += 1; },
+      send_server_action() { wsReplayCount += 1; },
+    };
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      tui_frames_available: false,
+    };
+    let subscriptionSent = false;
+    try {
+      sendTuiKey({ key: 'a', ctrlKey: false, altKey: false, shiftKey: false });
+      sendTuiResize(80, 24);
+      subscriptionSent = sendTuiSubscriptionFrame(true, 'websocket') === true;
+    } finally {
+      dashboardControlTransport.lastStatus = previousStatus;
+      app = previousApp;
+    }
+    return {
+      skipped: false,
+      keyReplayCount,
+      resizeReplayCount,
+      wsReplayCount,
+      subscriptionSent,
+    };
   },
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);

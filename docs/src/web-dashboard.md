@@ -490,8 +490,10 @@ DataChannel RPCs and a `display_input` frame rather than the generic
 `terminal_*` frames over the same verified channel. The server-side ratatui TUI
 subtab uses `tui_subscribe`, `tui_key`, `tui_resize`, `tui_unsubscribe`, and
 `tui_close` frames when the daemon has a live WebTui renderer; idle daemon
-launches that do not run WebTui advertise `tui_frames_available: false` and keep
-the WebSocket path as the only possible TUI transport. Session lifecycle,
+launches that do not run WebTui advertise `tui_frames_available: false`. In
+daemon-origin dashboards the old WebSocket path remains the fallback TUI
+transport; in public-origin Connect mode the browser does not attempt that
+fallback. Session lifecycle,
 steering, approvals, interrupt, resume, stop/restart, rename, and launch-config
 changes use a separate
 `api_session_control_msg` RPC with its own allowlist instead of broadening the
@@ -867,7 +869,9 @@ dashboard-control-owned WebTui connection, forwards WebTui's existing
 `{"t":"term","d":"..."}` output as `tui_term`, and removes the connection on
 `tui_close` or DataChannel cleanup. Idle daemon launches intentionally do not run
 WebTui, so they report `tui_frames_available: false` and the browser leaves that
-subtab on the existing WebSocket/fallback behavior.
+subtab on the existing WebSocket/fallback behavior only on daemon-origin pages.
+Public-origin Connect pages have no daemon WebSocket fallback, so TUI key,
+resize, and subscription attempts are dropped until `tui_frames` is advertised.
 
 The first streamed API on this substrate is `api_sessions_stream`, which mirrors
 the existing `/api/sessions/stream` NDJSON event shape (`start`, partial

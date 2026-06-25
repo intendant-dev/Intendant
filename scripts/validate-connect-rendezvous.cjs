@@ -2952,6 +2952,7 @@ async function main() {
       const mediaConnectNoLegacy = await ctl._debugProbeMediaConnectNoLegacy();
       const diagnosticsConnectNoHttp = await ctl._debugProbeDiagnosticsConnectNoHttp();
       const displaySignalConnectNoLegacy = await ctl._debugProbeDisplaySignalConnectNoLegacy();
+      const tuiConnectNoLegacy = ctl._debugProbeTuiConnectNoLegacy();
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
       const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
@@ -2965,6 +2966,7 @@ async function main() {
         mediaConnectNoLegacy,
         diagnosticsConnectNoHttp,
         displaySignalConnectNoLegacy,
+        tuiConnectNoLegacy,
         transportLabel,
         serverLabel,
         serverClass,
@@ -3102,6 +3104,31 @@ async function main() {
       0,
       `real SPA Connect display signaling attempted HTTP fallback: ${JSON.stringify(appResult.displaySignalConnectNoLegacy)}`
     );
+    assert.strictEqual(
+      appResult.tuiConnectNoLegacy.skipped,
+      false,
+      `real SPA could not exercise Connect TUI no-legacy path: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.tuiConnectNoLegacy.keyReplayCount,
+      0,
+      `real SPA Connect TUI key replayed through legacy app path: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.tuiConnectNoLegacy.resizeReplayCount,
+      0,
+      `real SPA Connect TUI resize replayed through legacy app path: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.tuiConnectNoLegacy.wsReplayCount,
+      0,
+      `real SPA Connect TUI subscription replayed over /ws: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.tuiConnectNoLegacy.subscriptionSent,
+      false,
+      `real SPA Connect TUI subscription claimed legacy transport success: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
+    );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
       Number(appResult.sessionCount) >= 1,
@@ -3147,6 +3174,7 @@ async function main() {
         mediaConnectNoLegacy: appResult.mediaConnectNoLegacy,
         diagnosticsConnectNoHttp: appResult.diagnosticsConnectNoHttp,
         displaySignalConnectNoLegacy: appResult.displaySignalConnectNoLegacy,
+        tuiConnectNoLegacy: appResult.tuiConnectNoLegacy,
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,
