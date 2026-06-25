@@ -115,8 +115,11 @@ target** snaps back to the current prompt target.
 For a live session the pane calls the per-session MCP `get_status` and renders
 a density card: managed/vanilla mode, pressure status, effective and hard-limit
 token usage with a colored pressure bar, the soft rewind-at threshold, and
-whether rewind-only gating is active. Historical sessions show `historical`
-status — records and anchors stay readable, but live actions are disabled.
+whether rewind-only gating is active. When the verified dashboard-control
+tunnel is connected, these dashboard-originated MCP `tools/call` requests use
+`api_mcp_tool_call`; otherwise they fall back to `/mcp?session_id=...`.
+Historical sessions show `historical` status — records and anchors stay
+readable, but live actions are disabled.
 Alerts flag non-Codex selections, sessions without managed mode, an
 insufficient last rewind, and a configured Codex command that doesn't look like
 the patched managed build.
@@ -459,7 +462,7 @@ Current tunneled mutations include
 active-session rollback/redo/prune, session-data deletion, staged upload
 deletion, settings save, API-key save, peer add/remove, peer access-request
 pairing, peer message/task/approval actions, eligible-peer lookup, worktree
-scan/remove, and coordinator routing.
+scan/remove, dashboard managed-context MCP tool calls, and coordinator routing.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -475,7 +478,7 @@ Several paths intentionally stay outside this JSON tunnel:
 - static assets and WASM bundles;
 - frames, recordings, and raw file upload/download bytes;
 - general filesystem mutations and file content transfer;
-- MCP-over-HTTP;
+- generic MCP-over-HTTP for external clients;
 - diagnostics NDJSON uploads;
 - display WebRTC media/control channels and peer-display signaling;
 - daemon-to-daemon federation authentication.
@@ -750,6 +753,11 @@ resumable byte-stream semantics.
 OpenAI browser live-audio token minting uses `api_voice_session`; it preserves
 the existing `/session` behavior and error envelope while avoiding a direct
 dashboard HTTPS POST when the verified control channel is available.
+Dashboard-originated managed-context MCP actions use `api_mcp_tool_call`, which
+wraps a single `tools/call` against the daemon's existing MCP server. These
+calls use the same no-replay fallback rule as other writes because tools such
+as `rewind_context`, `fission_control`, and `fission_spawn` mutate live session
+state.
 Confirmed session-data deletion uses `api_session_delete` with the same
 no-replay fallback rule as other writes; the dashboard still requires the
 existing confirmation modal before issuing the RPC.

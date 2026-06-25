@@ -21360,16 +21360,23 @@ function managedContextSplitLines(id) {
 
 async function managedContextMcpToolForSession(sessionId, name, args = {}) {
   if (!sessionId) throw new Error('Select a Codex session first.');
-  const resp = await authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
+  const rpcId = managedContextRpcSeq++;
+  const body = {
+    jsonrpc: '2.0',
+    id: rpcId,
+    method: 'tools/call',
+    params: { name, arguments: args },
+  };
+  const resp = await dashboardJsonFetch('api_mcp_tool_call', {
+    mcp_id: rpcId,
+    session_id: sessionId,
+    name,
+    arguments: args,
+  }, () => authedFetch(`/mcp?session_id=${encodeURIComponent(sessionId)}`, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({
-      jsonrpc: '2.0',
-      id: managedContextRpcSeq++,
-      method: 'tools/call',
-      params: { name, arguments: args },
-    }),
-  });
+    body: JSON.stringify(body),
+  }), 'api_mcp_tool_call', { fallbackAfterRpcFailure: false });
   const payload = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(payload.error?.message || `MCP HTTP ${resp.status}`);
   if (payload.error) throw new Error(payload.error.message || 'MCP tool failed');
@@ -37295,6 +37302,7 @@ class DashboardControlTransport {
       apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
       apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,
       apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
+      apiMcpToolCallAvailable: this.lastStatus?.api_mcp_tool_call_available ?? null,
       pendingRequests: this.pending.size,
       pendingChunkedResponses: this.chunkedResponses.size,
       completedChunkedResponses: this.completedChunkedResponses,
@@ -37343,6 +37351,7 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
+    case 'api_mcp_tool_call':
       return 120000;
     case 'api_session_detail':
       return 15000;

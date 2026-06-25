@@ -871,6 +871,12 @@ async function main() {
         uploads: {
           missingDeleteId: await ctl.request('api_session_current_upload_delete', {}),
         },
+        mcp: {
+          missingSession: await ctl.request('api_mcp_tool_call', {
+            mcp_id: 99,
+            name: 'get_status',
+          }),
+        },
         recordings: {
           live: await ctl.request('api_recordings'),
           invalidSession: await ctl.request('api_session_recordings', { session_id: '../bad' }),
@@ -1040,6 +1046,16 @@ async function main() {
       'upload delete RPC did not preserve missing id status'
     );
     assert.strictEqual(
+      result.status.api_mcp_tool_call_available,
+      true,
+      'dashboard control status did not advertise MCP tool calls'
+    );
+    assert(
+      result.mcp?.missingSession?._httpStatus === 400 &&
+        result.mcp.missingSession.error?.code === -32602,
+      'MCP tool-call RPC did not preserve validation error metadata'
+    );
+    assert.strictEqual(
       result.status.api_recordings_available,
       true,
       'dashboard control status did not advertise recordings'
@@ -1180,6 +1196,10 @@ async function main() {
           value?._httpStatus || 200,
         ])),
         voiceSessionAvailable: result.status.api_voice_session_available,
+        mcpStatuses: Object.fromEntries(Object.entries(result.mcp || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
         recordingsStatuses: Object.fromEntries(Object.entries(result.recordings || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,

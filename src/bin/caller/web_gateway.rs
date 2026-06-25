@@ -14976,6 +14976,7 @@ pub fn spawn_web_gateway(
         broadcast_tx.clone(),
         bus.clone(),
         peer_registry.clone(),
+        mcp_server.clone(),
         shared_session.clone(),
         project_root.clone(),
         worktree_inventory_cache.clone(),

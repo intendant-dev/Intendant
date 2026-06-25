@@ -80,6 +80,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_managed_context_records",
     "api_managed_context_anchors",
     "api_managed_context_fission",
+    "api_mcp_tool_call",
     "api_peer_add",
     "api_peer_remove",
     "api_peer_eligible",
@@ -104,6 +105,7 @@ pub struct DashboardControlRegistry {
     broadcast_tx: tokio::sync::broadcast::Sender<String>,
     bus: crate::event::EventBus,
     peer_registry: Option<crate::peer::PeerRegistry>,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
@@ -117,6 +119,7 @@ impl DashboardControlRegistry {
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
         bus: crate::event::EventBus,
         peer_registry: Option<crate::peer::PeerRegistry>,
+        mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
@@ -126,6 +129,7 @@ impl DashboardControlRegistry {
             broadcast_tx,
             bus,
             peer_registry,
+            mcp_server,
             shared_session,
             project_root,
             worktree_inventory_cache,
@@ -144,6 +148,7 @@ impl DashboardControlRegistry {
             self.broadcast_tx.clone(),
             self.bus.clone(),
             self.peer_registry.clone(),
+            self.mcp_server.clone(),
             self.shared_session.clone(),
             self.project_root.clone(),
             self.worktree_inventory_cache.clone(),
@@ -258,6 +263,7 @@ impl DashboardControlPeer {
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
         bus: crate::event::EventBus,
         peer_registry: Option<crate::peer::PeerRegistry>,
+        mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
         shared_session: crate::web_gateway::SharedActiveSession,
         project_root: Option<PathBuf>,
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
@@ -328,6 +334,7 @@ impl DashboardControlPeer {
             config: serde_json::to_value(config).unwrap_or_else(|_| serde_json::json!({})),
             bus,
             peer_registry,
+            mcp_server,
             shared_session,
             project_root,
             worktree_inventory_cache,
@@ -390,6 +397,7 @@ struct ControlRuntime {
     config: serde_json::Value,
     bus: crate::event::EventBus,
     peer_registry: Option<crate::peer::PeerRegistry>,
+    mcp_server: Option<Arc<crate::mcp::IntendantServer>>,
     shared_session: crate::web_gateway::SharedActiveSession,
     project_root: Option<PathBuf>,
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
@@ -1153,6 +1161,7 @@ fn control_frame_response(
                 | "api_managed_context_records"
                 | "api_managed_context_anchors"
                 | "api_managed_context_fission"
+                | "api_mcp_tool_call"
                 | "api_peer_add"
                 | "api_peer_remove"
                 | "api_peer_eligible"
@@ -1273,6 +1282,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_worktrees_scan_available", true),
         ("api_worktrees_remove_available", true),
         ("api_managed_context_available", true),
+        ("api_mcp_tool_call_available", runtime.mcp_server.is_some()),
         ("api_peer_mutations_available", peer_registry_available),
         ("api_peer_pairing_available", true),
         ("api_coordinator_available", peer_registry_available),
@@ -1417,6 +1427,7 @@ async fn control_request_response(
         "api_managed_context_fission" => {
             api_managed_context_response(id, "fission", params.as_ref(), &runtime).await
         }
+        "api_mcp_tool_call" => api_mcp_tool_call_response(id, params.as_ref(), &runtime).await,
         "api_peer_add" => api_peer_add_response(id, params.as_ref(), &runtime).await,
         "api_peer_remove" => api_peer_remove_response(id, params.as_ref(), &runtime).await,
         "api_peer_eligible" => api_peer_eligible_response(id, params.as_ref(), &runtime).await,
@@ -2193,6 +2204,114 @@ async fn api_managed_context_response(
     http_wire_response(id, response, "managed context")
 }
 
+async fn api_mcp_tool_call_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let mcp_id = params
+        .get("mcp_id")
+        .or_else(|| params.get("rpc_id"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!(id.clone()));
+    let Some(server) = runtime.mcp_server.as_ref() else {
+        return http_body_response(
+            id,
+            503,
+            mcp_error_body(mcp_id, -32603, "MCP server not available"),
+            "mcp tool call",
+        );
+    };
+    let session_id = optional_string_param(
+        &params,
+        &["session_id", "session", "intendant_session", "sessionId"],
+    );
+    if session_id.is_none() {
+        return http_body_response(
+            id,
+            400,
+            mcp_error_body(mcp_id, -32602, "missing session_id"),
+            "mcp tool call",
+        );
+    }
+    let name = string_param(&params, &["name", "tool", "tool_name"]);
+    if name.is_empty() {
+        return http_body_response(
+            id,
+            400,
+            mcp_error_body(mcp_id, -32602, "missing tool name"),
+            "mcp tool call",
+        );
+    }
+    let arguments = params
+        .get("arguments")
+        .or_else(|| params.get("args"))
+        .cloned()
+        .unwrap_or_else(|| serde_json::json!({}));
+    let managed_context = optional_managed_context_param(&params);
+    match server
+        .call_tool_by_name_for_session(&name, arguments, session_id.as_deref(), managed_context)
+        .await
+    {
+        Ok(result) => {
+            let result = serde_json::to_value(result).unwrap_or_else(|e| {
+                serde_json::json!({
+                    "content": [{
+                        "type": "text",
+                        "text": format!("Failed to serialize MCP tool result: {}", e),
+                    }],
+                    "isError": true,
+                })
+            });
+            http_body_response(
+                id,
+                200,
+                serde_json::json!({
+                    "jsonrpc": "2.0",
+                    "id": mcp_id,
+                    "result": result,
+                })
+                .to_string(),
+                "mcp tool call",
+            )
+        }
+        Err(error) => http_body_response(
+            id,
+            200,
+            mcp_error_body(mcp_id, -32603, &error),
+            "mcp tool call",
+        ),
+    }
+}
+
+fn mcp_error_body(id: serde_json::Value, code: i64, message: &str) -> String {
+    serde_json::json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "error": {
+            "code": code,
+            "message": message,
+        },
+    })
+    .to_string()
+}
+
+fn optional_managed_context_param(params: &serde_json::Value) -> Option<bool> {
+    for name in ["managed_context", "managedContext", "codex_managed_context"] {
+        let Some(value) = params.get(name) else {
+            continue;
+        };
+        if let Some(flag) = value.as_bool() {
+            return Some(flag);
+        }
+        if let Some(mode) = value.as_str() {
+            return Some(crate::project::codex_managed_context_enabled(mode));
+        }
+    }
+    None
+}
+
 async fn api_settings_save_response(
     id: String,
     params: Option<&serde_json::Value>,
@@ -2930,6 +3049,7 @@ mod tests {
             config: serde_json::json!({"provider":"openai"}),
             bus: crate::event::EventBus::new(),
             peer_registry: None,
+            mcp_server: None,
             shared_session: crate::web_gateway::ActiveSessionState::empty(),
             project_root: None,
             worktree_inventory_cache: Arc::new(std::sync::Mutex::new(None)),
@@ -3057,6 +3177,7 @@ mod tests {
         assert_eq!(status["result"]["api_worktrees_available"], true);
         assert_eq!(status["result"]["api_worktrees_scan_available"], true);
         assert_eq!(status["result"]["api_worktrees_remove_available"], true);
+        assert_eq!(status["result"]["api_mcp_tool_call_available"], false);
         assert_eq!(status["result"]["api_peer_mutations_available"], false);
         assert_eq!(status["result"]["api_peer_pairing_available"], true);
         assert_eq!(status["result"]["api_coordinator_available"], false);
@@ -3143,6 +3264,32 @@ mod tests {
         assert_eq!(
             response["result"]["error"],
             "Unknown provider: unsupported-voice-provider"
+        );
+    }
+
+    #[tokio::test]
+    async fn api_mcp_tool_call_reports_unavailable_server_as_http_error() {
+        let rt = runtime();
+        let response = api_mcp_tool_call_response(
+            "mcp1".to_string(),
+            Some(&serde_json::json!({
+                "mcp_id": 7,
+                "session_id": "session-1",
+                "name": "get_status",
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["id"], "mcp1");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["_httpStatus"], 503);
+        assert_eq!(response["result"]["_httpOk"], false);
+        assert_eq!(response["result"]["id"], 7);
+        assert_eq!(response["result"]["error"]["code"], -32603);
+        assert_eq!(
+            response["result"]["error"]["message"],
+            "MCP server not available"
         );
     }
 
