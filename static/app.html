@@ -11330,6 +11330,54 @@ const SESSION_LIST_RECENT_LIMIT = 600;
 const SESSION_HYDRATION_DONE_HIDE_MS = 900;
 let sessionsRecentLimit = SESSION_LIST_RECENT_LIMIT;
 
+function applyGatewayConfig(config) {
+  const cfg = config && typeof config === 'object' ? config : {};
+  gatewayConfig = cfg;
+  if (currentExternalAgent === null) {
+    currentExternalAgent = normalizeAgentId(cfg.external_agent);
+  }
+  applyMainBackendStatus();
+}
+
+function applyAgentCardIdentity(card) {
+  if (!card || !card.id || !card.label) return false;
+  const previousSelfPeerId = selfPeerId;
+  // Stable host identity: shown in the status bar so the user
+  // always knows which daemon the dashboard is primarily talking
+  // to. The card's `label` is the display name; `id` is the full
+  // PeerId (e.g. "intendant:nicks-mac") used as the routing key
+  // throughout the dashboard so two peers with the same label
+  // stay distinct and a renamed daemon keeps the same routing
+  // stability.
+  selfPeerId = card.id;
+  if (previousSelfPeerId && previousSelfPeerId !== selfPeerId) {
+    const earlyUsage = hostStatsCache.get(previousSelfPeerId);
+    if (earlyUsage && !hostStatsCache.has(selfPeerId)) {
+      hostStatsCache.set(selfPeerId, earlyUsage);
+    }
+    for (const [key, earlySessions] of Array.from(sessionsListCache.entries())) {
+      if (!key.startsWith(`${previousSelfPeerId}\u001f`)) continue;
+      const newKey = `${selfPeerId}${key.slice(previousSelfPeerId.length)}`;
+      if (!sessionsListCache.has(newKey)) sessionsListCache.set(newKey, earlySessions);
+    }
+    for (const [key, earlySessionsInflight] of Array.from(sessionsListInflight.entries())) {
+      if (!key.startsWith(`${previousSelfPeerId}\u001f`)) continue;
+      const newKey = `${selfPeerId}${key.slice(previousSelfPeerId.length)}`;
+      if (!sessionsListInflight.has(newKey)) {
+        sessionsListInflight.set(newKey, earlySessionsInflight);
+      }
+    }
+  }
+  selfHostLabel = card.label;
+  const el = document.getElementById('sb-host-label');
+  if (el) el.textContent = card.label;
+  // Version + git SHA are used by the Daemons panel to flag
+  // version skew across multi-host connections.
+  selfVersion = card.version || '';
+  selfGitSha = card.git_sha || '';
+  return true;
+}
+
 function sessionListRequestLimit(options = {}) {
   if (options.limit === 'all' || options.limit === 'full' || options.full === true) return 'all';
   const raw = options.limit ?? SESSION_LIST_RECENT_LIMIT;
@@ -18627,47 +18675,8 @@ async function main() {
       fetch('/config').then(r => r.json()).catch(() => ({})),
       fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
     ]);
-    gatewayConfig = cfg;
-    if (currentExternalAgent === null) {
-      currentExternalAgent = normalizeAgentId(cfg.external_agent);
-    }
-    applyMainBackendStatus();
-    if (card && card.id && card.label) {
-      const previousSelfPeerId = selfPeerId;
-      // Stable host identity: shown in the status bar so the user
-      // always knows which daemon the dashboard is primarily talking
-      // to. The card's `label` is the display name; `id` is the full
-      // PeerId (e.g. "intendant:nicks-mac") used as the routing key
-      // throughout the dashboard so two peers with the same label
-      // stay distinct and a renamed daemon keeps the same routing
-      // stability.
-      selfPeerId = card.id;
-      if (previousSelfPeerId && previousSelfPeerId !== selfPeerId) {
-        const earlyUsage = hostStatsCache.get(previousSelfPeerId);
-        if (earlyUsage && !hostStatsCache.has(selfPeerId)) {
-          hostStatsCache.set(selfPeerId, earlyUsage);
-        }
-        for (const [key, earlySessions] of Array.from(sessionsListCache.entries())) {
-          if (!key.startsWith(`${previousSelfPeerId}\u001f`)) continue;
-          const newKey = `${selfPeerId}${key.slice(previousSelfPeerId.length)}`;
-          if (!sessionsListCache.has(newKey)) sessionsListCache.set(newKey, earlySessions);
-        }
-        for (const [key, earlySessionsInflight] of Array.from(sessionsListInflight.entries())) {
-          if (!key.startsWith(`${previousSelfPeerId}\u001f`)) continue;
-          const newKey = `${selfPeerId}${key.slice(previousSelfPeerId.length)}`;
-          if (!sessionsListInflight.has(newKey)) {
-            sessionsListInflight.set(newKey, earlySessionsInflight);
-          }
-        }
-      }
-      selfHostLabel = card.label;
-      const el = document.getElementById('sb-host-label');
-      if (el) el.textContent = card.label;
-      // Version + git SHA are used by the Daemons panel to flag
-      // version skew across multi-host connections.
-      selfVersion = card.version || '';
-      selfGitSha = card.git_sha || '';
-    }
+    applyGatewayConfig(cfg);
+    applyAgentCardIdentity(card);
   } catch {}
 
   maybeStartDashboardControlTransport();
@@ -37495,9 +37504,15 @@ class DashboardControlTransport {
     }).catch(err => console.warn('[dashboard-control] status RPC failed', err));
     this.request('config').then(config => {
       if (config && typeof config === 'object') {
+        applyGatewayConfig(config);
         console.info('[dashboard-control] config RPC ok', config.provider || '(provider unset)');
       }
     }).catch(err => console.warn('[dashboard-control] config RPC failed', err));
+    this.request('api_agent_card').then(card => {
+      if (applyAgentCardIdentity(card)) {
+        console.info('[dashboard-control] agent card RPC ok', card.id || '');
+      }
+    }).catch(err => console.warn('[dashboard-control] agent card RPC failed', err));
     this.request('subscribe_events').then(result => {
       if (result?.subscribed) {
         dashboardControlEventsActive = true;

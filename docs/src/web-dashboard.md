@@ -510,7 +510,7 @@ Several paths intentionally stay outside this JSON tunnel:
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
 - non-allowlisted `ControlMsg` mutations;
-- display WebRTC media channels and peer-display signaling;
+- display WebRTC media channels;
 - daemon-to-daemon federation authentication.
 
 Peer mTLS remains a separate trust boundary. The dashboard tunnel authenticates
@@ -800,6 +800,9 @@ the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
 The local daemon identity is available as `api_agent_card`, returning the same
 Agent Card shape served by `/.well-known/agent-card.json`; the HTTP endpoint
 remains the unauthenticated discovery surface.
+When the verified channel opens, the browser also applies `config` and
+`api_agent_card` results to the same runtime-config and self-identity state
+normally hydrated by `/config` and `/.well-known/agent-card.json`.
 `api_cached_bootstrap_events` returns the daemon's current non-personalized
 dashboard event cache (`usage`/`usage_update`, `live_usage_update`, `status`,
 `autonomy_changed`, `external_agent_changed`, and `user_display_granted` when
