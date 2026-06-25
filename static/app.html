@@ -11110,6 +11110,12 @@ let activeStatsHost = '';
 // and always rendered first in the UI.
 const DAEMONS_KEY = 'intendant_daemons';
 const DASHBOARD_TRANSPORT_KEY = 'intendant_dashboard_transport';
+const dashboardUrlParams = new URLSearchParams(window.location.search);
+const DASHBOARD_CONNECT_MODE = dashboardUrlParams.get('connect') === '1';
+const DASHBOARD_CONNECT_DAEMON_ID = String(dashboardUrlParams.get('daemon_id') || '').trim();
+const DASHBOARD_CONNECT_SIGNALING_BASE = String(
+  dashboardUrlParams.get('connect_base') || ''
+).trim().replace(/\/+$/, '');
 let daemons = [];
 let dashboardControlTransport = null;
 let dashboardTransport = null;
@@ -18657,29 +18663,46 @@ async function main() {
     }
   });
 
-  // Connect to server
-  const wsUrl = buildWsUrl();
-
-  // Store app globally for reconnect
+  // Store app globally for reconnect/debug hooks.
   window.__presenceWeb = app;
-  app.connect_server(wsUrl);
 
-  // Fetch runtime config (/config) and identity (agent card) in
-  // parallel. /config is voice/WebRTC-scoped now; identity lives on
-  // the Agent Card at /.well-known/agent-card.json — served by every
-  // Intendant daemon as its canonical "who am I" surface. We tolerate
-  // either fetch failing independently so a misconfigured daemon
-  // still gets partial UI rather than a blank dashboard.
-  try {
-    const [cfg, card] = await Promise.all([
-      fetch('/config').then(r => r.json()).catch(() => ({})),
-      fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
-    ]);
-    applyGatewayConfig(cfg);
-    applyAgentCardIdentity(card);
-  } catch {}
+  if (dashboardConnectModeEnabled()) {
+    const connDot = document.getElementById('sb-conn');
+    if (connDot) {
+      connDot.className = 'conn-dot warn';
+      connDot.title = 'Primary server events are arriving over the Connect WebRTC dashboard tunnel';
+    }
+    try {
+      await maybeStartDashboardControlTransport();
+      await waitForDashboardControlReady(30000);
+      await hydrateDashboardFromControl();
+    } catch (err) {
+      console.warn('[dashboard-control] Connect dashboard bootstrap failed', err);
+      dashboardSetControlLastError(err?.message || String(err));
+      dashboardUpdateTransportStatus();
+    }
+  } else {
+    // Connect to server over the normal daemon-origin WebSocket.
+    const wsUrl = buildWsUrl();
+    app.connect_server(wsUrl);
 
-  maybeStartDashboardControlTransport();
+    // Fetch runtime config (/config) and identity (agent card) in
+    // parallel. /config is voice/WebRTC-scoped now; identity lives on
+    // the Agent Card at /.well-known/agent-card.json — served by every
+    // Intendant daemon as its canonical "who am I" surface. We tolerate
+    // either fetch failing independently so a misconfigured daemon
+    // still gets partial UI rather than a blank dashboard.
+    try {
+      const [cfg, card] = await Promise.all([
+        fetch('/config').then(r => r.json()).catch(() => ({})),
+        fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
+      ]);
+      applyGatewayConfig(cfg);
+      applyAgentCardIdentity(card);
+    } catch {}
+
+    maybeStartDashboardControlTransport();
+  }
 
   // Initialize multi-host state now that self-label is resolved and the
   // WASM app is ready. Hydrates the peer list from the server-side
@@ -37182,11 +37205,22 @@ function dashboardServerMessageDedupeKey(message) {
 }
 
 function dashboardControlTransportEnabled() {
+  if (DASHBOARD_CONNECT_MODE) return true;
   try {
     return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
   } catch {
     return false;
   }
+}
+
+function dashboardConnectModeEnabled() {
+  return DASHBOARD_CONNECT_MODE;
+}
+
+function dashboardConnectSignalUrl(path) {
+  const normalized = String(path || '');
+  if (!DASHBOARD_CONNECT_SIGNALING_BASE) return normalized;
+  return `${DASHBOARD_CONNECT_SIGNALING_BASE}${normalized.startsWith('/') ? '' : '/'}${normalized}`;
 }
 
 function dashboardSetControlLastError(message = '') {
@@ -37221,24 +37255,28 @@ function dashboardTransportStatusSummary(status = {}) {
   const channelState = String(status.channelState || '').toLowerCase();
   const lastError = String(status.lastError || status.error || '').trim();
   if (lastError || pcState === 'failed' || pcState === 'closed' || channelState === 'closed') {
+    const fallback = dashboardConnectModeEnabled()
+      ? 'No same-origin HTTP/WebSocket fallback is available in Connect mode.'
+      : 'HTTP/mTLS fallback remains available for supported calls.';
     return {
       kind: 'err',
       label: 'failed',
-      title: `Dashboard WebRTC control failed${lastError ? `: ${lastError}` : ''}. HTTP/mTLS fallback remains available for supported calls.`,
+      title: `Dashboard WebRTC control failed${lastError ? `: ${lastError}` : ''}. ${fallback}`,
     };
   }
 
   if (status.connected && status.verifiedBinding?.ok && channelState === 'open') {
     const route = String(status.iceRoute || status.route || '').toLowerCase();
     const relayed = route === 'relay';
-    const routeLabel = relayed ? 'relay' : 'WebRTC';
+    const connectMode = status.signalingMode === 'connect-rendezvous' || dashboardConnectModeEnabled();
+    const routeLabel = relayed ? 'relay' : (connectMode ? 'Connect' : 'WebRTC');
     const routeDetail = route
       ? `ICE route: ${route}${status.iceCandidatePair ? ` (${status.iceCandidatePair})` : ''}.`
       : 'ICE route not reported by browser stats.';
     return {
       kind: relayed ? 'warn' : 'ok',
       label: routeLabel,
-      title: `Dashboard RPC uses verified ${relayed ? 'TURN-relayed' : 'direct'} WebRTC DataChannel. ${routeDetail} Events ${status.eventsActive ? 'active' : 'not active'}.`,
+      title: `Dashboard RPC uses verified ${connectMode ? 'Connect-rendezvous ' : ''}${relayed ? 'TURN-relayed' : 'direct'} WebRTC DataChannel. ${routeDetail} Events ${status.eventsActive ? 'active' : 'not active'}.`,
     };
   }
 
@@ -37258,13 +37296,13 @@ class DashboardTransport {
   }
 
   startControl() {
-    if (!this.enabled()) return;
-    if (!window.RTCPeerConnection) return;
-    if (dashboardControlTransport) return;
+    if (!this.enabled()) return Promise.resolve(false);
+    if (!window.RTCPeerConnection) return Promise.reject(new Error('RTCPeerConnection is unavailable'));
+    if (dashboardControlTransport) return this.controlStartPromise || Promise.resolve(true);
     dashboardControlTransport = new DashboardControlTransport();
     dashboardSetControlLastError('');
     dashboardUpdateTransportStatus();
-    dashboardControlTransport.connect().catch(err => {
+    this.controlStartPromise = dashboardControlTransport.connect().then(() => true).catch(err => {
       console.warn('[dashboard-control] connect failed', err);
       dashboardSetControlLastError(err?.message || String(err));
       if (dashboardControlTransport) {
@@ -37272,20 +37310,27 @@ class DashboardTransport {
       }
       dashboardUpdateTransportStatus();
       dashboardControlTransport = null;
+      this.controlStartPromise = null;
+      if (dashboardConnectModeEnabled()) throw err;
+      return false;
     });
+    return this.controlStartPromise;
   }
 
   enableControl() {
     dashboardSetControlLastError('');
+    if (dashboardConnectModeEnabled()) return;
     localStorage.setItem(DASHBOARD_TRANSPORT_KEY, 'webrtc-control');
     location.reload();
   }
 
   disableControl() {
     dashboardSetControlLastError('');
+    if (dashboardConnectModeEnabled()) return;
     localStorage.removeItem(DASHBOARD_TRANSPORT_KEY);
     dashboardControlTransport?.close();
     dashboardControlTransport = null;
+    this.controlStartPromise = null;
     dashboardUpdateTransportStatus();
     location.reload();
   }
@@ -37406,8 +37451,12 @@ class DashboardTransport {
         );
       } catch (err) {
         if (err?.name === 'AbortError') throw err;
+        if (dashboardConnectModeEnabled()) throw err;
         console.warn(`[dashboard-control] ${label} RPC failed, falling back to HTTP`, err);
       }
+    }
+    if (dashboardConnectModeEnabled()) {
+      throw new Error(`dashboard Connect RPC is not available for ${label}`);
     }
     return fallback();
   }
@@ -37424,8 +37473,12 @@ class DashboardTransport {
       } catch (err) {
         if (err?.name === 'AbortError') throw err;
         if (options.fallbackAfterRpcFailure === false) throw err;
+        if (dashboardConnectModeEnabled()) throw err;
         console.warn(`[dashboard-control] ${label} RPC failed, falling back to HTTP`, err);
       }
+    }
+    if (dashboardConnectModeEnabled()) {
+      throw new Error(`dashboard Connect RPC is not available for ${label}`);
     }
     return fallback();
   }
@@ -37464,7 +37517,43 @@ dashboardTransport = new DashboardTransport();
 dashboardUpdateTransportStatus();
 
 function maybeStartDashboardControlTransport() {
-  dashboardTransport.startControl();
+  return dashboardTransport.startControl();
+}
+
+async function waitForDashboardControlReady(timeoutMs = 30000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (dashboardTransport?.canUseRpc?.()) return true;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  throw new Error('dashboard Connect transport did not become ready');
+}
+
+async function hydrateDashboardFromControl() {
+  if (!dashboardTransport?.canUseRpc?.()) {
+    throw new Error('dashboard Connect transport is not connected');
+  }
+  const [status, config, card] = await Promise.all([
+    dashboardTransport.request('status', {}, { timeoutMs: 15000 }).catch(() => null),
+    dashboardTransport.request('config', {}, { timeoutMs: 15000 }).catch(() => ({})),
+    dashboardTransport.request('api_agent_card', {}, { timeoutMs: 15000 }).catch(() => null),
+  ]);
+  if (status && typeof status === 'object' && dashboardControlTransport) {
+    dashboardControlTransport.lastStatus = status;
+  }
+  applyGatewayConfig(config || {});
+  applyAgentCardIdentity(card);
+  const bootstrap = await dashboardTransport.request('api_dashboard_bootstrap', {}, {
+    timeoutMs: 60000,
+  }).catch(err => {
+    console.warn('[dashboard-control] dashboard bootstrap RPC failed', err);
+    return null;
+  });
+  const frames = Array.isArray(bootstrap?.frames) ? bootstrap.frames : [];
+  for (const frame of frames) {
+    if (dashboardServerMessageDispatcher) dashboardServerMessageDispatcher(frame);
+  }
+  dashboardUpdateTransportStatus();
 }
 
 window.intendantDashboardControl = {
@@ -38176,7 +38265,7 @@ class DashboardControlTransport {
 
   ping() {
     const id = this.nextId();
-    const promise = this.waitFor(id);
+    const promise = this.waitFor(id, 5000, { label: 'ping' });
     this.sendFrame({ t: 'ping', id });
     return promise;
   }
@@ -38186,7 +38275,10 @@ class DashboardControlTransport {
       return Promise.reject(dashboardControlAbortError());
     }
     const id = this.nextId();
-    const promise = this.waitFor(id, dashboardControlRequestTimeoutMs(method), options);
+    const promise = this.waitFor(id, dashboardControlRequestTimeoutMs(method), {
+      ...options,
+      method,
+    });
     this.sendFrame({ t: 'request', id, method, params });
     return promise;
   }
@@ -38196,7 +38288,10 @@ class DashboardControlTransport {
       return Promise.reject(dashboardControlAbortError());
     }
     const id = this.nextId();
-    const promise = this.waitFor(id, options.timeoutMs || dashboardControlRequestTimeoutMs(method), options);
+    const promise = this.waitFor(id, options.timeoutMs || dashboardControlRequestTimeoutMs(method), {
+      ...options,
+      method,
+    });
     const pending = this.pending.get(id);
     if (pending) pending.expectBytes = true;
     this.sendFrame({ t: 'request', id, method, params, bytes: true });
@@ -38211,7 +38306,10 @@ class DashboardControlTransport {
     const totalBytes = Number(bytes?.size ?? bytes?.byteLength ?? bytes?.length ?? 0);
     const chunkSize = options.chunkBytes || DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES;
     const chunks = Math.ceil(totalBytes / chunkSize);
-    const promise = this.waitFor(id, options.timeoutMs || dashboardControlRequestTimeoutMs(method), options);
+    const promise = this.waitFor(id, options.timeoutMs || dashboardControlRequestTimeoutMs(method), {
+      ...options,
+      method,
+    });
     this.sendFrame({
       t: 'upload_start',
       id,
@@ -38292,7 +38390,10 @@ class DashboardControlTransport {
       return Promise.reject(dashboardControlAbortError());
     }
     const id = this.nextId();
-    const promise = this.waitFor(id, options.timeoutMs || dashboardControlRequestTimeoutMs(method), options);
+    const promise = this.waitFor(id, options.timeoutMs || dashboardControlRequestTimeoutMs(method), {
+      ...options,
+      method,
+    });
     const pending = this.pending.get(id);
     if (pending) {
       pending.stream = {
@@ -38329,8 +38430,9 @@ class DashboardControlTransport {
         reject(err);
       };
       const abortHandler = signal ? () => fail(dashboardControlAbortError(), true) : null;
+      const label = String(options.label || options.method || id || 'request');
       const timer = setTimeout(() => {
-        fail(new Error('dashboard control request timed out'), true);
+        fail(new Error(`${label} dashboard control request timed out`), true);
       }, timeoutMs);
       if (signal && abortHandler) {
         signal.addEventListener('abort', abortHandler, { once: true });
@@ -38398,6 +38500,19 @@ class DashboardControlTransport {
     return body;
   }
 
+  async postConnectSignal(path, payload) {
+    const resp = await fetch(dashboardConnectSignalUrl(path), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(payload),
+    });
+    const body = await resp.json().catch(() => ({}));
+    if (!resp.ok || body.ok === false) {
+      throw new Error(body.error || `${path} returned ${resp.status}`);
+    }
+    return body;
+  }
+
   sendWsSignal(frame) {
     if (app && app.send_server_action) {
       app.send_server_action(frame);
@@ -38407,6 +38522,18 @@ class DashboardControlTransport {
   }
 
   async sendOffer(sdp) {
+    if (dashboardConnectModeEnabled()) {
+      if (!DASHBOARD_CONNECT_DAEMON_ID) {
+        throw new Error('Connect dashboard missing daemon_id');
+      }
+      const answer = await this.postConnectSignal('/api/browser/offer', {
+        daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
+        sdp,
+      });
+      this.signalingMode = 'connect-rendezvous';
+      dashboardUpdateTransportStatus();
+      return answer;
+    }
     try {
       const answer = await this.postLocalSignal('/connect/dashboard/offer', { sdp });
       this.signalingMode = 'local-http';
@@ -38425,6 +38552,14 @@ class DashboardControlTransport {
 
   async sendIce(candidate) {
     if (!this.sessionId) return;
+    if (this.signalingMode === 'connect-rendezvous') {
+      await this.postConnectSignal('/api/browser/ice', {
+        daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
+        session_id: this.sessionId,
+        candidate,
+      });
+      return;
+    }
     if (this.signalingMode !== 'websocket-fallback') {
       try {
         await this.postLocalSignal('/connect/dashboard/ice', {
@@ -38444,6 +38579,17 @@ class DashboardControlTransport {
 
   signalClose(sessionId) {
     if (!sessionId) return;
+    if (this.signalingMode === 'connect-rendezvous') {
+      fetch(dashboardConnectSignalUrl('/api/browser/close'), {
+        method: 'POST',
+        headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({
+          daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
+          session_id: sessionId,
+        }),
+      }).catch(() => {});
+      return;
+    }
     if (this.signalingMode !== 'websocket-fallback') {
       fetch('/connect/dashboard/close', {
         method: 'POST',

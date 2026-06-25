@@ -76,6 +76,49 @@ function sendText(res, status, text, contentType = 'text/plain; charset=utf-8') 
   res.end(text);
 }
 
+function sendFile(res, filePath, contentType) {
+  const body = fs.readFileSync(filePath);
+  res.writeHead(200, {
+    'content-type': contentType || contentTypeForPath(filePath),
+    'content-length': body.length,
+    'cache-control': 'no-store',
+  });
+  res.end(body);
+}
+
+function contentTypeForPath(filePath) {
+  const ext = path.extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.html': return 'text/html; charset=utf-8';
+    case '.js': return 'text/javascript; charset=utf-8';
+    case '.mjs': return 'text/javascript; charset=utf-8';
+    case '.css': return 'text/css; charset=utf-8';
+    case '.wasm': return 'application/wasm';
+    case '.json': return 'application/json; charset=utf-8';
+    case '.png': return 'image/png';
+    case '.jpg':
+    case '.jpeg': return 'image/jpeg';
+    case '.svg': return 'image/svg+xml';
+    case '.ico': return 'image/x-icon';
+    default: return 'application/octet-stream';
+  }
+}
+
+function safeStaticPath(staticRoot, pathname) {
+  let decoded;
+  try {
+    decoded = decodeURIComponent(pathname);
+  } catch {
+    return null;
+  }
+  const rel = decoded.replace(/^\/+/, '');
+  if (!rel || rel.includes('\0')) return null;
+  const candidate = path.resolve(staticRoot, rel);
+  const root = path.resolve(staticRoot);
+  if (candidate !== root && !candidate.startsWith(root + path.sep)) return null;
+  return candidate;
+}
+
 async function readJson(req) {
   const chunks = [];
   let total = 0;
@@ -88,7 +131,7 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-function createRendezvousServer() {
+function createRendezvousServer(staticRoot) {
   const daemons = new Map();
   const events = new Map();
   const pollers = new Map();
@@ -98,6 +141,15 @@ function createRendezvousServer() {
       const url = new URL(req.url, 'http://127.0.0.1');
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/connect')) {
         return sendText(res, 200, publicBootstrapHtml(), 'text/html; charset=utf-8');
+      }
+      if (req.method === 'GET' && url.pathname === '/app') {
+        return sendFile(res, path.join(staticRoot, 'app.html'), 'text/html; charset=utf-8');
+      }
+      if (req.method === 'GET' && !url.pathname.startsWith('/api/')) {
+        const assetPath = safeStaticPath(staticRoot, url.pathname);
+        if (assetPath && fs.existsSync(assetPath) && fs.statSync(assetPath).isFile()) {
+          return sendFile(res, assetPath);
+        }
       }
       if (req.method === 'GET' && url.pathname === '/api/status') {
         const daemonId = url.searchParams.get('daemon_id') || '';
@@ -745,7 +797,7 @@ function publicBootstrapHtml() {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control RPC is not connected'));
       const id = this.nextId();
-      const promise = this.waitFor(id, options);
+      const promise = this.waitFor(id, { ...options, method });
       this.sendFrame({ t: 'request', id, method, params });
       if (method === 'status') {
         return promise.then(status => {
@@ -759,7 +811,7 @@ function publicBootstrapHtml() {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control byte stream is not connected'));
       const id = this.nextId();
-      const promise = this.waitFor(id, options);
+      const promise = this.waitFor(id, { ...options, method });
       const pending = this.pending.get(id);
       if (pending) pending.expectBytes = true;
       this.sendFrame({ t: 'request', id, method, params, bytes: true });
@@ -773,7 +825,7 @@ function publicBootstrapHtml() {
       const totalBytes = data.byteLength;
       const chunkSize = options.chunkBytes || UPLOAD_CHUNK_BYTES;
       const chunks = Math.ceil(totalBytes / chunkSize);
-      const promise = this.waitFor(id, options);
+      const promise = this.waitFor(id, { ...options, method });
       this.sendFrame({
         t: 'upload_start',
         id,
@@ -827,7 +879,7 @@ function publicBootstrapHtml() {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control stream is not connected'));
       const id = this.nextId();
-      const promise = this.waitFor(id, options);
+      const promise = this.waitFor(id, { ...options, method });
       const pending = this.pending.get(id);
       if (pending) {
         pending.stream = {
@@ -855,7 +907,8 @@ function publicBootstrapHtml() {
           reject(err);
         };
         const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 10000;
-        const timer = setTimeout(() => fail(new Error('request timed out'), true), timeoutMs);
+        const label = String(options.label || options.method || id || 'request');
+        const timer = setTimeout(() => fail(new Error(label + ' request timed out'), true), timeoutMs);
         const abortHandler = signal ? () => fail(abortError(), true) : null;
         if (signal && abortHandler) signal.addEventListener('abort', abortHandler, { once: true });
         this.pending.set(id, {
@@ -1100,7 +1153,7 @@ async function waitForBrowserConnect(page, globalName = 'intendantPublicConnectD
 
 async function main() {
   const options = parseArgs(process.argv);
-  const rendezvous = createRendezvousServer();
+  const rendezvous = createRendezvousServer(path.join(options.repoRoot, 'static'));
   await new Promise((resolve, reject) => {
     rendezvous.once('error', reject);
     rendezvous.listen(options.rendezvousPort, '127.0.0.1', resolve);
@@ -2569,6 +2622,76 @@ async function main() {
         appErrorStatus: result.appError._httpStatus,
         pendingRequests: result.finalStatus.pendingRequests,
         pendingChunkedResponses: result.finalStatus.pendingChunkedResponses,
+      },
+    }, null, 2));
+
+    const appPage = await browser.newPage();
+    appPage.on('console', msg => console.log(`[app-browser:${msg.type()}] ${msg.text()}`));
+    const appResponse = await appPage.goto(
+      `${publicOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}`,
+      {
+        waitUntil: 'domcontentloaded',
+        timeout: CONNECT_TIMEOUT_MS,
+      }
+    );
+    assert(appResponse, 'public app produced no response');
+    assert.strictEqual(appResponse.status(), 200, `public app returned ${appResponse.status()}`);
+    await appPage.waitForFunction(() => Boolean(window.intendantDashboardControl));
+    const appConnected = await waitForBrowserConnect(appPage, 'intendantDashboardControl');
+    const appResult = await appPage.evaluate(async () => {
+      const ctl = window.intendantDashboardControl;
+      const status = ctl.status();
+      const [config, agentCard, sessions, bootstrap] = await Promise.all([
+        ctl.request('config', {}, { timeoutMs: 60000 }),
+        ctl.agentCard({ timeoutMs: 60000 }),
+        ctl.request('api_sessions', { limit: 1 }, { timeoutMs: 60000 }),
+        ctl.dashboardBootstrap({ timeoutMs: 60000 }),
+      ]);
+      const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
+      const serverClass = document.getElementById('sb-conn')?.className || '';
+      return {
+        status,
+        configProvider: config?.provider || '',
+        agentCardId: agentCard?.id || '',
+        sessionCount: Array.isArray(sessions) ? sessions.length : null,
+        bootstrapFrameCount: bootstrap?.frame_count ?? (Array.isArray(bootstrap?.frames) ? bootstrap.frames.length : null),
+        transportLabel,
+        serverClass,
+      };
+    });
+    assert.strictEqual(
+      appConnected.signalingMode,
+      'connect-rendezvous',
+      `real SPA did not use Connect signaling: ${JSON.stringify(appConnected)}`
+    );
+    assert.strictEqual(
+      appResult.status.signalingMode,
+      'connect-rendezvous',
+      `real SPA debug status did not keep Connect signaling: ${JSON.stringify(appResult.status)}`
+    );
+    assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
+    assert(
+      Number(appResult.sessionCount) >= 1,
+      `real SPA Connect mode did not fetch sessions over DataChannel: ${JSON.stringify(appResult)}`
+    );
+    assert(
+      Number(appResult.bootstrapFrameCount) >= 0,
+      `real SPA Connect mode did not fetch dashboard bootstrap: ${JSON.stringify(appResult)}`
+    );
+    assert.strictEqual(
+      appResult.transportLabel,
+      'Connect',
+      `real SPA did not expose Connect transport status: ${JSON.stringify(appResult)}`
+    );
+
+    console.log(JSON.stringify({
+      publicApp: {
+        connected: appConnected,
+        agentCardId: appResult.agentCardId,
+        sessionCount: appResult.sessionCount,
+        dashboardBootstrapFrameCount: appResult.bootstrapFrameCount,
+        transportLabel: appResult.transportLabel,
+        serverClass: appResult.serverClass,
       },
     }, null, 2));
 

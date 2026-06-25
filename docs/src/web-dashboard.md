@@ -611,12 +611,21 @@ Chrome/Chromium through the DevTools Protocol. The fallback honors
 The validator starts a local rendezvous HTTP origin, launches a fresh daemon
 child with Connect env vars, verifies that
 `https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
-`401`, then loads the browser from the rendezvous origin and drives `status`,
-`config`, `api_sessions`, id-filtered `api_sessions`, streamed
-`api_sessions_stream` hydration, a chunked large `api_sessions_stream` event, a
-chunked large `api_sessions` response, active-session command-output lookup,
-active-session timeline lookup/validation, and application error RPCs over the
-verified DataChannel.
+`401`, then performs two browser passes:
+
+1. It loads the minimal public bootstrap page from the rendezvous origin and
+   drives `status`, `config`, `api_sessions`, id-filtered `api_sessions`,
+   streamed `api_sessions_stream` hydration, a chunked large
+   `api_sessions_stream` event, a chunked large `api_sessions` response,
+   active-session command-output lookup, active-session timeline
+   lookup/validation, bounded byte streams, uploads, media/editor writes, and
+   application error RPCs over the verified DataChannel.
+2. It serves the real `static/app.html` bundle from the same public origin at
+   `/app?connect=1&daemon_id=...`, proves that it uses rendezvous signaling
+   (`signalingMode: "connect-rendezvous"`), and checks that first-load dashboard
+   data such as config, Agent Card identity, sessions, bootstrap frames, event
+   subscription, and visible transport status all arrive through
+   `window.intendantDashboardControl` instead of same-origin daemon HTTP/WSS.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the
@@ -1026,6 +1035,9 @@ Treat this as a staged target, not current behavior:
 2. Define daemon identity keys, claim codes, Connect account binding, and
    revocation semantics.
 3. Host a public static dashboard shell with a placeholder sign-in/device model.
+   The local rendezvous validator now serves the real dashboard bundle from its
+   emulator origin and exercises the SPA's `connect=1` mode, but there is still
+   no hosted Connect service or account UI.
 4. Add daemon outbound signaling to Intendant Connect. The local emulator now
    exercises this shape without hosted auth.
 5. Add a signaling rendezvous API keyed by browser session and daemon id. The
