@@ -11127,6 +11127,7 @@ const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES = 16 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
+const DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS = 30000;
 const dashboardRecentServerMessageKeys = new Map();
 const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_autonomy',
@@ -37836,6 +37837,8 @@ class DashboardControlTransport {
     this.verifiedBinding = null;
     this.claimedDaemonPublicKey = '';
     this.sessionGrantSha256 = '';
+    this.clientNonce = '';
+    this.expiresUnixMs = 0;
     this.localOfferSdp = '';
     this.lastStatus = null;
     this.lastError = '';
@@ -37889,6 +37892,7 @@ class DashboardControlTransport {
       this.refreshIceRoute().catch(err => console.debug('[dashboard-control] ICE route stats failed', err));
       dashboardUpdateTransportStatus();
     };
+    this.clientNonce = dashboardRandomBase64Url(32);
     const offer = await this.pc.createOffer();
     await this.pc.setLocalDescription(offer);
     this.localOfferSdp = offer.sdp || '';
@@ -37921,7 +37925,8 @@ class DashboardControlTransport {
       this.sessionId,
       this.localOfferSdp,
       answer.sdp || '',
-      sessionGrant
+      sessionGrant,
+      this.clientNonce
     );
     if (!verification.ok) {
       this.lastError = verification.error || 'binding verification failed';
@@ -37940,6 +37945,7 @@ class DashboardControlTransport {
     this.verifiedBinding = verification;
     this.claimedDaemonPublicKey = claimedDaemonPublicKey || String(verification.daemonPublicKey || '');
     this.sessionGrantSha256 = verification.sessionGrantSha256 || '';
+    this.expiresUnixMs = verification.expiresUnixMs || 0;
     await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
     for (const candidate of this.pendingIce.splice(0)) {
       this.sendIce(candidate).catch(err => console.warn('[dashboard-control] queued ICE signal failed', err));
@@ -38681,19 +38687,23 @@ class DashboardControlTransport {
       const answer = await this.postConnectSignal('/api/browser/offer', {
         daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
         sdp,
+        client_nonce: this.clientNonce,
       });
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
       return answer;
     }
     try {
-      const answer = await this.postLocalSignal('/connect/dashboard/offer', { sdp });
+      const answer = await this.postLocalSignal('/connect/dashboard/offer', {
+        sdp,
+        client_nonce: this.clientNonce,
+      });
       this.signalingMode = 'local-http';
       dashboardUpdateTransportStatus();
       return answer;
     } catch (err) {
       console.warn('[dashboard-control] local offer signaling failed', err);
-      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp })) {
+      if (this.sendWsSignal({ t: 'dashboard_control_offer', sdp, client_nonce: this.clientNonce })) {
         this.signalingMode = 'websocket-fallback';
         dashboardUpdateTransportStatus();
         return null;
@@ -38813,6 +38823,8 @@ class DashboardControlTransport {
       verifiedBinding: this.verifiedBinding,
       claimedDaemonPublicKey: this.claimedDaemonPublicKey,
       sessionGrantSha256: this.sessionGrantSha256,
+      clientNonce: this.clientNonce,
+      expiresUnixMs: this.expiresUnixMs,
       signalingMode: this.signalingMode,
       iceRoute: this.iceRoute,
       iceCandidatePair: this.iceCandidatePair,
@@ -38954,7 +38966,7 @@ function dashboardControlRequestTimeoutMs(method) {
   }
 }
 
-async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answerSdp, sessionGrant = '') {
+async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answerSdp, sessionGrant = '', clientNonce = '') {
   if (!binding || typeof binding !== 'object') {
     return { ok: false, error: 'missing binding' };
   }
@@ -38967,6 +38979,21 @@ async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answe
   if (!window.crypto?.subtle) {
     return { ok: false, error: 'WebCrypto unavailable' };
   }
+  const createdUnixMs = Number(binding.created_unix_ms || 0);
+  const expiresUnixMs = Number(binding.expires_unix_ms || 0);
+  if (!Number.isFinite(createdUnixMs) || createdUnixMs <= 0) {
+    return { ok: false, error: 'missing binding creation time' };
+  }
+  if (!Number.isFinite(expiresUnixMs) || expiresUnixMs <= 0) {
+    return { ok: false, error: 'missing binding expiry' };
+  }
+  const nowUnixMs = Date.now();
+  if (expiresUnixMs + DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS < nowUnixMs) {
+    return { ok: false, error: 'binding expired' };
+  }
+  if (createdUnixMs - DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS > nowUnixMs) {
+    return { ok: false, error: 'binding timestamp from future' };
+  }
   const offerHash = await dashboardSha256B64u(offerSdp || '');
   if (binding.offer_sha256 !== offerHash) {
     return { ok: false, error: 'offer hash mismatch' };
@@ -38974,6 +39001,14 @@ async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answe
   const answerHash = await dashboardSha256B64u(answerSdp || '');
   if (binding.answer_sha256 !== answerHash) {
     return { ok: false, error: 'answer hash mismatch' };
+  }
+  const nonce = String(clientNonce || '');
+  if (nonce) {
+    if (String(binding.client_nonce || '') !== nonce) {
+      return { ok: false, error: 'client nonce mismatch' };
+    }
+  } else if (binding.client_nonce) {
+    return { ok: false, error: 'unexpected client nonce binding' };
   }
   const grant = String(sessionGrant || '');
   if (grant) {
@@ -39001,7 +39036,9 @@ async function verifyDashboardControlBinding(binding, sessionId, offerSdp, answe
   return {
     ok: true,
     daemonPublicKey: binding.daemon_public_key,
-    createdUnixMs: Number(binding.created_unix_ms || 0),
+    createdUnixMs,
+    expiresUnixMs,
+    clientNonce: binding.client_nonce || '',
     sessionGrantSha256: binding.session_grant_sha256 || '',
   };
 }
@@ -39188,9 +39225,11 @@ function dashboardControlBindingPayload(binding) {
     binding.session_id || '',
     binding.daemon_public_key || '',
     String(binding.created_unix_ms || ''),
+    String(binding.expires_unix_ms || ''),
     binding.offer_sha256 || '',
     binding.answer_sha256 || '',
   ];
+  if (binding.client_nonce) parts.push(binding.client_nonce);
   if (binding.session_grant_sha256) parts.push(binding.session_grant_sha256);
   return parts.join('\n');
 }
@@ -39231,6 +39270,12 @@ function dashboardBytesToBase64Url(bytes) {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+function dashboardRandomBase64Url(byteLength = 32) {
+  const bytes = new Uint8Array(byteLength);
+  crypto.getRandomValues(bytes);
+  return dashboardBytesToBase64Url(bytes);
 }
 
 // True when `url`'s hostname is loopback (127.0.0.1 / ::1 / localhost).

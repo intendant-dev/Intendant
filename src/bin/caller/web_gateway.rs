@@ -11720,7 +11720,16 @@ async fn connect_dashboard_offer_response(
     if sdp.trim().is_empty() {
         return json_error("400 Bad Request", "missing sdp");
     }
-    match dashboard_control.answer_offer(sdp.to_string(), None).await {
+    let client_nonce = body
+        .get("client_nonce")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|nonce| !nonce.is_empty())
+        .map(str::to_string);
+    match dashboard_control
+        .answer_offer(sdp.to_string(), None, client_nonce)
+        .await
+    {
         Ok(answer) => json_ok(serde_json::json!({
             "ok": true,
             "signaling": "connect-bootstrap-local",
@@ -11856,15 +11865,23 @@ fn connect_bootstrap_html() -> String {
     return bytesToBase64Url(new Uint8Array(digest));
   }
 
+  function randomB64u(byteLength = 32) {
+    const bytes = new Uint8Array(byteLength);
+    crypto.getRandomValues(bytes);
+    return bytesToBase64Url(bytes);
+  }
+
   function bindingPayload(binding) {
     const parts = [
       binding.protocol || '',
       binding.session_id || '',
       binding.daemon_public_key || '',
       String(binding.created_unix_ms || ''),
+      String(binding.expires_unix_ms || ''),
       binding.offer_sha256 || '',
       binding.answer_sha256 || '',
     ];
+    if (binding.client_nonce) parts.push(binding.client_nonce);
     if (binding.session_grant_sha256) parts.push(binding.session_grant_sha256);
     return parts.join('\n');
   }
@@ -11883,13 +11900,26 @@ fn connect_bootstrap_html() -> String {
     return crypto.subtle.verify({ name: 'Ed25519' }, key, signatureBytes, payloadBytes);
   }
 
-  async function verifyBinding(binding, sessionId, offerSdp, answerSdp) {
+  async function verifyBinding(binding, sessionId, offerSdp, answerSdp, clientNonce = '') {
     if (!binding || typeof binding !== 'object') return { ok: false, error: 'missing binding' };
     if (binding.protocol !== 'intendant-dashboard-control-v1') return { ok: false, error: 'unexpected protocol' };
     if (String(binding.session_id || '') !== String(sessionId || '')) return { ok: false, error: 'session mismatch' };
     if (!crypto?.subtle) return { ok: false, error: 'WebCrypto unavailable' };
+    const createdUnixMs = Number(binding.created_unix_ms || 0);
+    const expiresUnixMs = Number(binding.expires_unix_ms || 0);
+    if (!Number.isFinite(createdUnixMs) || createdUnixMs <= 0) return { ok: false, error: 'missing binding creation time' };
+    if (!Number.isFinite(expiresUnixMs) || expiresUnixMs <= 0) return { ok: false, error: 'missing binding expiry' };
+    const nowUnixMs = Date.now();
+    if (expiresUnixMs + 30000 < nowUnixMs) return { ok: false, error: 'binding expired' };
+    if (createdUnixMs - 30000 > nowUnixMs) return { ok: false, error: 'binding timestamp from future' };
     if (binding.offer_sha256 !== await sha256B64u(offerSdp || '')) return { ok: false, error: 'offer hash mismatch' };
     if (binding.answer_sha256 !== await sha256B64u(answerSdp || '')) return { ok: false, error: 'answer hash mismatch' };
+    const nonce = String(clientNonce || '');
+    if (nonce) {
+      if (String(binding.client_nonce || '') !== nonce) return { ok: false, error: 'client nonce mismatch' };
+    } else if (binding.client_nonce) {
+      return { ok: false, error: 'unexpected client nonce binding' };
+    }
     const verified = await verifyEd25519(
       base64UrlToBytes(binding.daemon_public_key || ''),
       base64UrlToBytes(binding.signature || ''),
@@ -11899,7 +11929,9 @@ fn connect_bootstrap_html() -> String {
     return {
       ok: true,
       daemonPublicKey: binding.daemon_public_key,
-      createdUnixMs: Number(binding.created_unix_ms || 0),
+      createdUnixMs,
+      expiresUnixMs,
+      clientNonce: binding.client_nonce || '',
     };
   }
 
@@ -11909,6 +11941,8 @@ fn connect_bootstrap_html() -> String {
     sessionId: '',
     binding: null,
     verifiedBinding: null,
+    clientNonce: '',
+    expiresUnixMs: 0,
     localOfferSdp: '',
 	    pendingIce: [],
 	    pending: new Map(),
@@ -11943,10 +11977,11 @@ fn connect_bootstrap_html() -> String {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
       this.localOfferSdp = offer.sdp || '';
+      this.clientNonce = randomB64u(32);
       const answer = await fetch('/connect/dashboard/offer', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sdp: this.localOfferSdp }),
+        body: JSON.stringify({ sdp: this.localOfferSdp, client_nonce: this.clientNonce }),
       }).then(async resp => {
         const body = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(body.error || `HTTP ${resp.status}`);
@@ -11954,9 +11989,10 @@ fn connect_bootstrap_html() -> String {
       });
       this.sessionId = String(answer.session_id || '');
       this.binding = answer.binding || null;
-      const verified = await verifyBinding(this.binding, this.sessionId, this.localOfferSdp, answer.sdp || '');
+      const verified = await verifyBinding(this.binding, this.sessionId, this.localOfferSdp, answer.sdp || '', this.clientNonce);
       if (!verified.ok) throw new Error(`binding rejected: ${verified.error || 'unknown'}`);
       this.verifiedBinding = verified;
+      this.expiresUnixMs = verified.expiresUnixMs || 0;
       await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
       for (const candidate of this.pendingIce.splice(0)) await this.sendIce(candidate);
       paint(this.status(), 'ok');
@@ -12396,9 +12432,11 @@ fn connect_bootstrap_html() -> String {
       return {
         connected: this.pc?.connectionState === 'connected',
         pcState: this.pc?.connectionState || '',
-        channelState: this.channel?.readyState || '',
-        sessionId: this.sessionId,
+	        channelState: this.channel?.readyState || '',
+	        sessionId: this.sessionId,
 	        verifiedBinding: this.verifiedBinding,
+	        clientNonce: this.clientNonce,
+	        expiresUnixMs: this.expiresUnixMs,
 	        pendingRequests: this.pending.size,
 	        pendingChunkedResponses: this.chunkedResponses.size,
 	        pendingByteStreams: this.byteStreams.size,
@@ -18112,6 +18150,11 @@ pub fn spawn_web_gateway(
                                         Some("dashboard_control_offer") => {
                                             let sdp =
                                                 json["sdp"].as_str().unwrap_or("").to_string();
+                                            let client_nonce = json["client_nonce"]
+                                                .as_str()
+                                                .map(str::trim)
+                                                .filter(|nonce| !nonce.is_empty())
+                                                .map(str::to_string);
                                             if sdp.is_empty() {
                                                 let msg = serde_json::json!({
                                                     "t": "dashboard_control_error",
@@ -18121,7 +18164,7 @@ pub fn spawn_web_gateway(
                                                 continue;
                                             }
                                             match dashboard_control_inbound
-                                                .answer_offer(sdp, None)
+                                                .answer_offer(sdp, None, client_nonce)
                                                 .await
                                             {
                                                 Ok(answer) => {

@@ -340,13 +340,13 @@ PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
 
 The emulator intentionally has no account, passkey, claim-code, durable device
 registry, or authorization-grant policy. It does mint an opaque per-offer
-session grant and verifies that the browser-visible grant is bound into the
-daemon-signed WebRTC session statement. It exists to prove the
-browser-public-origin → rendezvous → daemon-outbound-signaling → direct WebRTC
-DataChannel path while keeping the normal dashboard mTLS default in place. The
-same validator also serves the real dashboard bundle in `connect=1` mode,
-requires the daemon-side bearer token on `/api/daemon/*`, and asserts that
-unauthenticated daemon polling is rejected, so
+session grant and verifies that the browser-visible grant, browser challenge
+nonce, and signed expiry are bound into the daemon-signed WebRTC session
+statement. It exists to prove the browser-public-origin → rendezvous →
+daemon-outbound-signaling → direct WebRTC DataChannel path while keeping the
+normal dashboard mTLS default in place. The same validator also serves the real
+dashboard bundle in `connect=1` mode, requires the daemon-side bearer token on
+`/api/daemon/*`, and asserts that unauthenticated daemon polling is rejected, so
 this is not only a protocol smoke test.
 
 ### `[server]` (daemon and federation)

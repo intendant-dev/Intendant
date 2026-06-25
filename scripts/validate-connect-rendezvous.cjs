@@ -18,6 +18,7 @@ const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
 const TAMPERED_DAEMON_PUBLIC_KEY = 'tampered-daemon-public-key';
 const TAMPERED_SESSION_GRANT = 'tampered-connect-session-grant';
+const TAMPERED_CLIENT_NONCE = 'tampered-connect-client-nonce';
 const FRAME_FIXTURE_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 
 function parseArgs(argv) {
@@ -277,8 +278,10 @@ function createRendezvousServer(staticRoot, options = {}) {
         const refererParams = requestRefererSearchParams(req);
         const tamperRegisteredKey = refererParams.get('tamper_registered_key') === '1';
         const tamperSessionGrant = refererParams.get('tamper_session_grant') === '1';
+        const tamperClientNonce = refererParams.get('tamper_client_nonce') === '1';
         const id = crypto.randomUUID();
         const sessionGrant = `connect-session-grant-${crypto.randomUUID()}`;
+        const clientNonce = String(body.client_nonce || '').trim();
         const timer = setTimeout(() => {
           if (!pendingOffers.has(id)) return;
           pendingOffers.delete(id);
@@ -291,13 +294,21 @@ function createRendezvousServer(staticRoot, options = {}) {
           timer,
           tamperRegisteredKey,
           tamperSessionGrant,
+          tamperClientNonce,
           sessionGrant,
+          clientNonce,
         });
         res.on('close', () => {
           clearTimeout(timer);
           pendingOffers.delete(id);
         });
-        enqueueEvent(daemonId, { id, kind: 'offer', sdp, session_grant: sessionGrant });
+        enqueueEvent(daemonId, {
+          id,
+          kind: 'offer',
+          sdp,
+          session_grant: sessionGrant,
+          client_nonce: tamperClientNonce ? TAMPERED_CLIENT_NONCE : clientNonce,
+        });
         return;
       }
       if (req.method === 'POST' && url.pathname === '/api/browser/ice') {
@@ -409,9 +420,11 @@ function publicBootstrapHtml() {
       binding.session_id || '',
       binding.daemon_public_key || '',
       String(binding.created_unix_ms || ''),
+      String(binding.expires_unix_ms || ''),
       binding.offer_sha256 || '',
       binding.answer_sha256 || '',
     ];
+    if (binding.client_nonce) parts.push(binding.client_nonce);
     if (binding.session_grant_sha256) parts.push(binding.session_grant_sha256);
     return parts.join('\\n');
   }
@@ -428,12 +441,25 @@ function publicBootstrapHtml() {
     }
     return crypto.subtle.verify({ name: 'Ed25519' }, key, signatureBytes, payloadBytes);
   }
-  async function verifyBinding(binding, sessionId, offerSdp, answerSdp, sessionGrant = '') {
+  async function verifyBinding(binding, sessionId, offerSdp, answerSdp, sessionGrant = '', clientNonce = '') {
     if (!binding || typeof binding !== 'object') return { ok: false, error: 'missing binding' };
     if (binding.protocol !== 'intendant-dashboard-control-v1') return { ok: false, error: 'unexpected protocol' };
     if (String(binding.session_id || '') !== String(sessionId || '')) return { ok: false, error: 'session mismatch' };
+    const createdUnixMs = Number(binding.created_unix_ms || 0);
+    const expiresUnixMs = Number(binding.expires_unix_ms || 0);
+    if (!Number.isFinite(createdUnixMs) || createdUnixMs <= 0) return { ok: false, error: 'missing binding creation time' };
+    if (!Number.isFinite(expiresUnixMs) || expiresUnixMs <= 0) return { ok: false, error: 'missing binding expiry' };
+    const nowUnixMs = Date.now();
+    if (expiresUnixMs + 30000 < nowUnixMs) return { ok: false, error: 'binding expired' };
+    if (createdUnixMs - 30000 > nowUnixMs) return { ok: false, error: 'binding timestamp from future' };
     if (binding.offer_sha256 !== await sha256B64u(offerSdp || '')) return { ok: false, error: 'offer hash mismatch' };
     if (binding.answer_sha256 !== await sha256B64u(answerSdp || '')) return { ok: false, error: 'answer hash mismatch' };
+    const nonce = String(clientNonce || '');
+    if (nonce) {
+      if (String(binding.client_nonce || '') !== nonce) return { ok: false, error: 'client nonce mismatch' };
+    } else if (binding.client_nonce) {
+      return { ok: false, error: 'unexpected client nonce binding' };
+    }
     const grant = String(sessionGrant || '');
     if (grant) {
       const grantHash = await sha256B64u(grant);
@@ -450,7 +476,9 @@ function publicBootstrapHtml() {
     return {
       ok: true,
       daemonPublicKey: binding.daemon_public_key,
-      createdUnixMs: Number(binding.created_unix_ms || 0),
+      createdUnixMs,
+      expiresUnixMs,
+      clientNonce: binding.client_nonce || '',
       sessionGrantSha256: binding.session_grant_sha256 || '',
     };
   }
@@ -468,6 +496,8 @@ function publicBootstrapHtml() {
     verifiedBinding: null,
     claimedDaemonPublicKey: '',
     sessionGrantSha256: '',
+    clientNonce: '',
+    expiresUnixMs: 0,
     pendingIce: [],
     pending: new Map(),
     chunkedResponses: new Map(),
@@ -494,10 +524,11 @@ function publicBootstrapHtml() {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
       const offerSdp = offer.sdp || '';
+      this.clientNonce = bytesToBase64Url(crypto.getRandomValues(new Uint8Array(32)));
       const answer = await fetch('/api/browser/offer', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ daemon_id: daemonId, sdp: offerSdp }),
+        body: JSON.stringify({ daemon_id: daemonId, sdp: offerSdp, client_nonce: this.clientNonce }),
       }).then(async resp => {
         const body = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(body.error || 'offer failed');
@@ -512,7 +543,7 @@ function publicBootstrapHtml() {
       if (!sessionGrant) {
         throw new Error('rendezvous answer missing session_grant');
       }
-      const verified = await verifyBinding(answer.binding, this.sessionId, offerSdp, answer.sdp || '', sessionGrant);
+      const verified = await verifyBinding(answer.binding, this.sessionId, offerSdp, answer.sdp || '', sessionGrant, this.clientNonce);
       if (!verified.ok) throw new Error('binding rejected: ' + (verified.error || 'unknown'));
       if (String(verified.daemonPublicKey || '') !== claimedDaemonPublicKey) {
         throw new Error('binding rejected: daemon public key mismatch');
@@ -520,6 +551,7 @@ function publicBootstrapHtml() {
       this.verifiedBinding = verified;
       this.claimedDaemonPublicKey = claimedDaemonPublicKey;
       this.sessionGrantSha256 = verified.sessionGrantSha256 || '';
+      this.expiresUnixMs = verified.expiresUnixMs || 0;
       await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
       for (const candidate of this.pendingIce.splice(0)) await this.sendIce(candidate);
       paint(this.status());
@@ -1044,6 +1076,8 @@ function publicBootstrapHtml() {
         verifiedBinding: this.verifiedBinding,
         claimedDaemonPublicKey: this.claimedDaemonPublicKey,
         sessionGrantSha256: this.sessionGrantSha256,
+        clientNonce: this.clientNonce,
+        expiresUnixMs: this.expiresUnixMs,
         pendingRequests: this.pending.size,
         pendingChunkedResponses: this.chunkedResponses.size,
         pendingByteStreams: this.byteStreams.size,
@@ -1313,6 +1347,15 @@ async function main() {
       connected.sessionGrantSha256 &&
         connected.sessionGrantSha256 === connected.verifiedBinding.sessionGrantSha256,
       `public bootstrap did not verify Connect session grant binding: ${JSON.stringify(connected)}`
+    );
+    assert(
+      connected.clientNonce &&
+        connected.clientNonce === connected.verifiedBinding.clientNonce,
+      `public bootstrap did not verify client nonce binding: ${JSON.stringify(connected)}`
+    );
+    assert(
+      Number(connected.expiresUnixMs) > Date.now(),
+      `public bootstrap binding did not expose a future expiry: ${JSON.stringify(connected)}`
     );
 
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
@@ -2858,6 +2901,21 @@ async function main() {
       appConnected.sessionGrantSha256,
       `real SPA debug status did not expose verified session grant hash: ${JSON.stringify(appResult.status)}`
     );
+    assert(
+      appConnected.clientNonce &&
+        appConnected.clientNonce === appConnected.verifiedBinding.clientNonce,
+      `real SPA did not verify client nonce binding: ${JSON.stringify(appConnected)}`
+    );
+    assert.strictEqual(
+      appResult.status.clientNonce,
+      appConnected.clientNonce,
+      `real SPA debug status did not expose verified client nonce: ${JSON.stringify(appResult.status)}`
+    );
+    assert(
+      Number(appConnected.expiresUnixMs) > Date.now() &&
+        Number(appConnected.verifiedBinding.expiresUnixMs) === Number(appConnected.expiresUnixMs),
+      `real SPA did not verify a future binding expiry: ${JSON.stringify(appConnected)}`
+    );
     assert.strictEqual(
       appResult.status.claimedDaemonPublicKey,
       registeredStatus.daemon_public_key,
@@ -3164,6 +3222,93 @@ async function main() {
         serverClass: grantMismatchAppResult.serverClass,
         unexpectedPublicRequests: grantMismatchGuards.unexpectedPublicRequests,
         unexpectedPublicWebSockets: grantMismatchGuards.unexpectedPublicWebSockets,
+      },
+    }, null, 2));
+
+    const nonceMismatchAppPage = await browser.newPage();
+    const nonceMismatchGuards = installPublicAppGuards(nonceMismatchAppPage, 'app-nonce-mismatch-browser');
+    const nonceMismatchAppResponse = await nonceMismatchAppPage.goto(
+      `${publicOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}&tamper_client_nonce=1`,
+      {
+        waitUntil: 'domcontentloaded',
+        timeout: CONNECT_TIMEOUT_MS,
+      }
+    );
+    assert(nonceMismatchAppResponse, 'nonce-mismatch public app produced no response');
+    assert.strictEqual(
+      nonceMismatchAppResponse.status(),
+      200,
+      `nonce-mismatch public app returned ${nonceMismatchAppResponse.status()}`
+    );
+    await nonceMismatchAppPage.waitForFunction(() => {
+      const status = window.intendantDashboardControl?.status?.();
+      return Boolean(status?.lastError);
+    }, undefined, { timeout: CONNECT_TIMEOUT_MS });
+    const nonceMismatchAppResult = await nonceMismatchAppPage.evaluate(() => {
+      const status = window.intendantDashboardControl.status();
+      return {
+        lastError: status.lastError || '',
+        connected: Boolean(status.connected),
+        verifiedBinding: status.verifiedBinding || null,
+        clientNonce: status.clientNonce || '',
+        expiresUnixMs: status.expiresUnixMs || 0,
+        transportLabel: document.getElementById('sb-dashboard-transport-label')?.textContent || '',
+        serverLabel: document.getElementById('sb-conn-label')?.textContent || '',
+        serverClass: document.getElementById('sb-conn')?.className || '',
+      };
+    });
+    assert(
+      /client nonce mismatch/i.test(nonceMismatchAppResult.lastError),
+      `real SPA Connect nonce mismatch did not fail closed: ${JSON.stringify(nonceMismatchAppResult)}`
+    );
+    assert.strictEqual(nonceMismatchAppResult.connected, false, 'nonce-mismatch real SPA reported connected transport');
+    assert.strictEqual(
+      nonceMismatchAppResult.verifiedBinding,
+      null,
+      `nonce-mismatch real SPA kept a verified binding: ${JSON.stringify(nonceMismatchAppResult)}`
+    );
+    assert.strictEqual(
+      Number(nonceMismatchAppResult.expiresUnixMs || 0),
+      0,
+      `nonce-mismatch real SPA accepted a binding expiry: ${JSON.stringify(nonceMismatchAppResult)}`
+    );
+    assert.strictEqual(
+      nonceMismatchAppResult.transportLabel,
+      'failed',
+      'nonce-mismatch real SPA did not show failed Connect transport'
+    );
+    assert.strictEqual(nonceMismatchAppResult.serverLabel, 'events', 'nonce-mismatch real SPA did not keep events label');
+    assert(
+      String(nonceMismatchAppResult.serverClass || '').includes('err'),
+      `nonce-mismatch real SPA did not mark event tunnel failed: ${JSON.stringify(nonceMismatchAppResult)}`
+    );
+    assert.deepStrictEqual(
+      [...new Set(nonceMismatchGuards.unexpectedPublicRequests)],
+      [],
+      'nonce-mismatch real SPA attempted public-origin daemon REST/media fallback requests'
+    );
+    assert.deepStrictEqual(
+      [...new Set(nonceMismatchGuards.unexpectedPublicWebSockets)],
+      [],
+      'nonce-mismatch real SPA attempted public-origin WebSocket fallback requests'
+    );
+    assert.deepStrictEqual(
+      nonceMismatchGuards.consoleErrors,
+      [],
+      'nonce-mismatch real SPA emitted browser console errors'
+    );
+
+    console.log(JSON.stringify({
+      publicAppNonceMismatch: {
+        lastError: nonceMismatchAppResult.lastError,
+        verifiedBinding: nonceMismatchAppResult.verifiedBinding,
+        clientNonce: nonceMismatchAppResult.clientNonce,
+        expiresUnixMs: nonceMismatchAppResult.expiresUnixMs,
+        transportLabel: nonceMismatchAppResult.transportLabel,
+        serverLabel: nonceMismatchAppResult.serverLabel,
+        serverClass: nonceMismatchAppResult.serverClass,
+        unexpectedPublicRequests: nonceMismatchGuards.unexpectedPublicRequests,
+        unexpectedPublicWebSockets: nonceMismatchGuards.unexpectedPublicWebSockets,
       },
     }, null, 2));
 

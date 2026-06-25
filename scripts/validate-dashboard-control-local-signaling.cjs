@@ -186,6 +186,16 @@ async function main() {
     await page.waitForFunction(() => Boolean(window.intendantDashboardControl));
 
     const connected = await waitForDashboardControl(page);
+    assert(
+      connected.clientNonce &&
+        connected.verifiedBinding?.clientNonce === connected.clientNonce,
+      `local dashboard-control binding did not echo the browser nonce: ${JSON.stringify(connected)}`
+    );
+    assert(
+      Number(connected.expiresUnixMs) > Date.now() &&
+        Number(connected.verifiedBinding?.expiresUnixMs) === Number(connected.expiresUnixMs),
+      `local dashboard-control binding did not expose a future expiry: ${JSON.stringify(connected)}`
+    );
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
     await page.evaluate(`window.__intendantHlsRecordingStreamName = ${JSON.stringify(hlsRecordingFixture.streamName)}`);
     await page.evaluate(`window.__intendantSessionFrameFixture = ${JSON.stringify({

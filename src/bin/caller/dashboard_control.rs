@@ -44,6 +44,7 @@ const CONTROL_RESPONSE_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_BYTE_STREAM_CHUNK_BYTES: usize = 16 * 1024;
 const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
+const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
 const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
 const CONTROL_FEATURES: &[&str] = &[
     "ping",
@@ -267,6 +268,7 @@ impl DashboardControlRegistry {
         &self,
         offer_sdp: String,
         session_grant: Option<String>,
+        client_nonce: Option<String>,
     ) -> Result<DashboardControlAnswer, String> {
         let identity = self.identity().await?;
         let session_id = uuid::Uuid::new_v4().to_string();
@@ -274,6 +276,7 @@ impl DashboardControlRegistry {
             session_id.clone(),
             offer_sdp,
             session_grant,
+            client_nonce,
             &self.config,
             self.broadcast_tx.clone(),
             self.bus.clone(),
@@ -345,8 +348,11 @@ pub struct DashboardControlBinding {
     pub session_id: String,
     pub daemon_public_key: String,
     pub created_unix_ms: i64,
+    pub expires_unix_ms: i64,
     pub offer_sha256: String,
     pub answer_sha256: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub client_nonce: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub session_grant_sha256: Option<String>,
     pub signature: String,
@@ -359,11 +365,17 @@ impl DashboardControlBinding {
         offer_sdp: &str,
         answer_sdp: &str,
         session_grant: Option<&str>,
+        client_nonce: Option<&str>,
     ) -> Self {
         let daemon_public_key = identity.public_key_b64u();
         let created_unix_ms = chrono::Utc::now().timestamp_millis();
+        let expires_unix_ms = created_unix_ms + CONTROL_BINDING_TTL_MS;
         let offer_sha256 = sha256_b64u(offer_sdp.as_bytes());
         let answer_sha256 = sha256_b64u(answer_sdp.as_bytes());
+        let client_nonce = client_nonce
+            .map(str::trim)
+            .filter(|nonce| !nonce.is_empty())
+            .map(str::to_string);
         let session_grant_sha256 = session_grant
             .map(str::trim)
             .filter(|grant| !grant.is_empty())
@@ -373,8 +385,10 @@ impl DashboardControlBinding {
             session_id,
             daemon_public_key,
             created_unix_ms,
+            expires_unix_ms,
             offer_sha256,
             answer_sha256,
+            client_nonce,
             session_grant_sha256,
             signature: String::new(),
         };
@@ -385,14 +399,19 @@ impl DashboardControlBinding {
 
     pub fn signing_payload(&self) -> String {
         let mut payload = format!(
-            "{}\n{}\n{}\n{}\n{}\n{}",
+            "{}\n{}\n{}\n{}\n{}\n{}\n{}",
             self.protocol,
             self.session_id,
             self.daemon_public_key,
             self.created_unix_ms,
+            self.expires_unix_ms,
             self.offer_sha256,
             self.answer_sha256,
         );
+        if let Some(client_nonce) = &self.client_nonce {
+            payload.push('\n');
+            payload.push_str(client_nonce);
+        }
         if let Some(session_grant_sha256) = &self.session_grant_sha256 {
             payload.push('\n');
             payload.push_str(session_grant_sha256);
@@ -411,6 +430,7 @@ impl DashboardControlPeer {
         session_id: String,
         offer_sdp: String,
         session_grant: Option<String>,
+        client_nonce: Option<String>,
         config: &crate::web_gateway::WebGatewayConfig,
         broadcast_tx: tokio::sync::broadcast::Sender<String>,
         bus: crate::event::EventBus,
@@ -485,6 +505,7 @@ impl DashboardControlPeer {
             &offer_sdp,
             &answer_sdp,
             session_grant.as_deref(),
+            client_nonce.as_deref(),
         );
         let runtime = ControlRuntime {
             session_id,
@@ -7042,8 +7063,14 @@ mod tests {
     fn binding_signature_payload_verifies() {
         let dir = tempfile::tempdir().unwrap();
         let identity = DaemonIdentity::load_or_create(dir.path().join("identity.pk8")).unwrap();
-        let binding =
-            DashboardControlBinding::new(&identity, "session-1".into(), "offer", "answer", None);
+        let binding = DashboardControlBinding::new(
+            &identity,
+            "session-1".into(),
+            "offer",
+            "answer",
+            None,
+            None,
+        );
         assert!(crate::daemon_identity::verify_b64u(
             &binding.daemon_public_key,
             binding.signing_payload().as_bytes(),
@@ -7052,6 +7079,12 @@ mod tests {
         assert_eq!(binding.protocol, CONTROL_SIGNATURE_CONTEXT);
         assert_eq!(binding.offer_sha256, sha256_b64u(b"offer"));
         assert_eq!(binding.answer_sha256, sha256_b64u(b"answer"));
+        assert!(binding.expires_unix_ms > binding.created_unix_ms);
+        assert_eq!(
+            binding.expires_unix_ms - binding.created_unix_ms,
+            CONTROL_BINDING_TTL_MS
+        );
+        assert_eq!(binding.client_nonce, None);
         assert_eq!(binding.session_grant_sha256, None);
 
         let granted = DashboardControlBinding::new(
@@ -7060,8 +7093,10 @@ mod tests {
             "offer-2",
             "answer-2",
             Some("connect-session-grant"),
+            Some("browser-client-nonce"),
         );
         let expected_grant_hash = sha256_b64u(b"connect-session-grant");
+        assert_eq!(granted.client_nonce.as_deref(), Some("browser-client-nonce"));
         assert_eq!(
             granted.session_grant_sha256.as_deref(),
             Some(expected_grant_hash.as_str())

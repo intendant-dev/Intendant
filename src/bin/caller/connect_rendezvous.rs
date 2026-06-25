@@ -32,6 +32,8 @@ struct RendezvousEvent {
     candidate: Option<serde_json::Value>,
     #[serde(default)]
     session_grant: Option<String>,
+    #[serde(default)]
+    client_nonce: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -233,8 +235,14 @@ async fn handle_event(
                 .map(str::trim)
                 .filter(|grant| !grant.is_empty())
                 .map(str::to_string);
+            let client_nonce = event
+                .client_nonce
+                .as_deref()
+                .map(str::trim)
+                .filter(|nonce| !nonce.is_empty())
+                .map(str::to_string);
             match dashboard_control
-                .answer_offer(sdp.to_string(), session_grant)
+                .answer_offer(sdp.to_string(), session_grant, client_nonce)
                 .await
             {
                 Ok(answer) => {
