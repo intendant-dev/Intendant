@@ -47,8 +47,10 @@ const CONTROL_FEATURES: &[&str] = &[
     "events",
     "response_chunks",
     "response_credit",
+    "stream_frames",
     "api_peers",
     "api_sessions",
+    "api_sessions_stream",
     "api_session_detail",
     "api_sessions_search",
     "api_settings",
@@ -383,24 +385,37 @@ struct InboundPacket {
 struct ControlTaskResponse {
     id: String,
     frame: serde_json::Value,
+    done: bool,
 }
 
 struct OutboundControlQueue {
-    chunked: HashMap<String, QueuedChunkedResponse>,
-    order: VecDeque<String>,
+    frames: VecDeque<QueuedControlFrame>,
 }
 
-struct QueuedChunkedResponse {
+enum QueuedControlFrame {
+    Immediate {
+        request_id: String,
+        text: String,
+    },
+    Chunked(QueuedChunkedFrame),
+}
+
+struct QueuedChunkedFrame {
+    request_id: String,
+    chunk_id: String,
+    start: String,
     chunks: Vec<String>,
     end: String,
     next_chunk: usize,
     credit: usize,
+    started: bool,
 }
 
 enum ControlFrameTexts {
     Immediate(Vec<String>),
     Chunked {
-        id: String,
+        request_id: String,
+        chunk_id: String,
         start: String,
         chunks: Vec<String>,
         end: String,
@@ -410,42 +425,80 @@ enum ControlFrameTexts {
 impl OutboundControlQueue {
     fn new() -> Self {
         Self {
-            chunked: HashMap::new(),
-            order: VecDeque::new(),
+            frames: VecDeque::new(),
         }
     }
 
-    fn enqueue_chunked(&mut self, id: String, chunks: Vec<String>, end: String) {
-        self.cancel(&id);
-        self.order.push_back(id.clone());
-        self.chunked.insert(
-            id,
-            QueuedChunkedResponse {
+    fn is_empty(&self) -> bool {
+        self.frames.is_empty()
+    }
+
+    fn enqueue_immediate(&mut self, request_id: String, text: String) {
+        self.frames
+            .push_back(QueuedControlFrame::Immediate { request_id, text });
+    }
+
+    fn enqueue_chunked(
+        &mut self,
+        request_id: String,
+        chunk_id: String,
+        start: String,
+        chunks: Vec<String>,
+        end: String,
+    ) {
+        self.cancel_chunk(&chunk_id);
+        self.frames
+            .push_back(QueuedControlFrame::Chunked(QueuedChunkedFrame {
+                request_id,
+                chunk_id,
+                start,
                 chunks,
                 end,
                 next_chunk: 0,
                 credit: CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT,
-            },
-        );
+                started: false,
+            }));
     }
 
-    fn grant_credit(&mut self, id: &str, chunks: usize) {
+    fn grant_credit(&mut self, request_id: &str, chunk_id: Option<&str>, chunks: usize) {
         if chunks == 0 {
             return;
         }
-        if let Some(queued) = self.chunked.get_mut(id) {
-            queued.credit = queued
-                .credit
-                .saturating_add(chunks.min(CONTROL_RESPONSE_MAX_CREDIT_GRANT));
+        let granted = chunks.min(CONTROL_RESPONSE_MAX_CREDIT_GRANT);
+        for frame in &mut self.frames {
+            let QueuedControlFrame::Chunked(queued) = frame else {
+                continue;
+            };
+            let matches_chunk = chunk_id
+                .map(|id| queued.chunk_id == id)
+                .unwrap_or(false);
+            if matches_chunk || (chunk_id.is_none() && queued.request_id == request_id) {
+                queued.credit = queued.credit.saturating_add(granted);
+            }
         }
     }
 
-    fn cancel(&mut self, id: &str) -> bool {
-        let removed = self.chunked.remove(id).is_some();
-        if removed {
-            self.order.retain(|queued_id| queued_id != id);
-        }
-        removed
+    fn cancel(&mut self, request_id: &str) -> bool {
+        let before = self.frames.len();
+        self.frames.retain(|frame| match frame {
+            QueuedControlFrame::Immediate {
+                request_id: queued_id,
+                ..
+            } => queued_id != request_id,
+            QueuedControlFrame::Chunked(queued) => {
+                queued.request_id != request_id && queued.chunk_id != request_id
+            }
+        });
+        self.frames.len() != before
+    }
+
+    fn cancel_chunk(&mut self, chunk_id: &str) -> bool {
+        let before = self.frames.len();
+        self.frames.retain(|frame| match frame {
+            QueuedControlFrame::Immediate { .. } => true,
+            QueuedControlFrame::Chunked(queued) => queued.chunk_id != chunk_id,
+        });
+        self.frames.len() != before
     }
 }
 
@@ -560,7 +613,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
                 let _ = rtc.handle_timeout(Instant::now());
             }
             Some(task_response) = task_rx.recv() => {
-                if pending_requests.remove(&task_response.id).is_some() {
+                if pending_requests.contains_key(&task_response.id) {
                     send_control_frame(
                         &mut rtc,
                         &channels,
@@ -568,6 +621,9 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
                         runtime.response_credit_enabled,
                         task_response.frame,
                     );
+                    if task_response.done {
+                        pending_requests.remove(&task_response.id);
+                    }
                 }
                 let _ = rtc.handle_timeout(Instant::now());
             }
@@ -734,6 +790,11 @@ fn send_control_frame<I: rtc::interceptor::Interceptor>(
     response_credit_enabled: bool,
     frame: serde_json::Value,
 ) {
+    let request_id = frame
+        .get("id")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
     match control_frame_text_parts(
         frame,
         CONTROL_RESPONSE_CHUNK_THRESHOLD_BYTES,
@@ -741,20 +802,26 @@ fn send_control_frame<I: rtc::interceptor::Interceptor>(
     ) {
         ControlFrameTexts::Immediate(frames) => {
             for text in frames {
-                send_control_text(rtc, channels, text);
+                if response_credit_enabled && !outbound_queue.is_empty() && !request_id.is_empty() {
+                    outbound_queue.enqueue_immediate(request_id.clone(), text);
+                } else {
+                    send_control_text(rtc, channels, text);
+                }
             }
+            drain_queued_control_frames(rtc, channels, outbound_queue);
         }
         ControlFrameTexts::Chunked {
-            id,
+            request_id,
+            chunk_id,
             start,
             chunks,
             end,
         } => {
-            send_control_text(rtc, channels, start);
             if response_credit_enabled {
-                outbound_queue.enqueue_chunked(id, chunks, end);
+                outbound_queue.enqueue_chunked(request_id, chunk_id, start, chunks, end);
                 drain_queued_control_frames(rtc, channels, outbound_queue);
             } else {
+                send_control_text(rtc, channels, start);
                 for text in chunks {
                     send_control_text(rtc, channels, text);
                 }
@@ -793,26 +860,40 @@ fn control_frame_text_parts(
     chunk_bytes: usize,
 ) -> ControlFrameTexts {
     let text = frame.to_string();
-    if frame.get("t").and_then(|v| v.as_str()) != Some("response")
+    let frame_type = frame.get("t").and_then(|v| v.as_str());
+    if !matches!(frame_type, Some("response") | Some("stream_event"))
         || text.len() <= threshold_bytes
         || chunk_bytes == 0
     {
         return ControlFrameTexts::Immediate(vec![text]);
     }
-    let id = frame
+    let request_id = frame
         .get("id")
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
-    if id.is_empty() {
+    if request_id.is_empty() {
         return ControlFrameTexts::Immediate(vec![text]);
     }
+    let chunk_id = frame
+        .get("chunk_id")
+        .and_then(|v| v.as_str())
+        .filter(|v| !v.is_empty())
+        .map(ToString::to_string)
+        .or_else(|| {
+            frame
+                .get("seq")
+                .and_then(|v| v.as_u64())
+                .map(|seq| format!("{request_id}:{seq}"))
+        })
+        .unwrap_or_else(|| request_id.clone());
 
     let bytes = text.as_bytes();
     let chunk_count = bytes.len().div_ceil(chunk_bytes);
     let start = serde_json::json!({
         "t": "response_start",
-        "id": id,
+        "id": request_id,
+        "chunk_id": chunk_id,
         "encoding": "base64-json-frame",
         "total_bytes": bytes.len(),
         "chunks": chunk_count,
@@ -823,7 +904,8 @@ fn control_frame_text_parts(
         chunks.push(
             serde_json::json!({
                 "t": "response_chunk",
-                "id": id,
+                "id": request_id,
+                "chunk_id": chunk_id,
                 "seq": seq,
                 "data": base64::engine::general_purpose::STANDARD.encode(chunk),
             })
@@ -832,12 +914,14 @@ fn control_frame_text_parts(
     }
     let end = serde_json::json!({
         "t": "response_end",
-        "id": id,
+        "id": request_id,
+        "chunk_id": chunk_id,
         "chunks": chunk_count,
     })
     .to_string();
     ControlFrameTexts::Chunked {
-        id,
+        request_id,
+        chunk_id,
         start,
         chunks,
         end,
@@ -872,10 +956,19 @@ fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
     channels: &HashMap<String, rtc::data_channel::RTCDataChannelId>,
     outbound_queue: &mut OutboundControlQueue,
 ) {
-    let ids: Vec<String> = outbound_queue.order.iter().cloned().collect();
-    for id in ids {
+    loop {
+        let mut pop_front = false;
         let mut completed_end: Option<String> = None;
-        if let Some(queued) = outbound_queue.chunked.get_mut(&id) {
+        match outbound_queue.frames.front_mut() {
+            Some(QueuedControlFrame::Immediate { text, .. }) => {
+                send_control_text(rtc, channels, text.clone());
+                pop_front = true;
+            }
+            Some(QueuedControlFrame::Chunked(queued)) => {
+                if !queued.started {
+                    send_control_text(rtc, channels, queued.start.clone());
+                    queued.started = true;
+                }
             while queued.credit > 0 && queued.next_chunk < queued.chunks.len() {
                 let text = queued.chunks[queued.next_chunk].clone();
                 queued.next_chunk += 1;
@@ -885,11 +978,19 @@ fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
             if queued.next_chunk >= queued.chunks.len() {
                 completed_end = Some(queued.end.clone());
             }
+            }
+            None => break,
         }
         if let Some(end) = completed_end {
-            outbound_queue.cancel(&id);
+            outbound_queue.frames.pop_front();
             send_control_text(rtc, channels, end);
+            continue;
         }
+        if pop_front {
+            outbound_queue.frames.pop_front();
+            continue;
+        }
+        break;
     }
 }
 
@@ -954,6 +1055,7 @@ fn control_frame_response(
                         "response_credit_enabled": runtime.response_credit_enabled,
                         "api_peers_available": runtime.peer_registry.is_some(),
                         "api_sessions_available": true,
+                        "api_sessions_stream_available": true,
                         "api_session_detail_available": true,
                         "api_sessions_search_available": true,
                         "api_settings_available": true,
@@ -1016,6 +1118,16 @@ fn control_frame_response(
                     "ok": true,
                     "result": runtime.config,
                 })),
+                "api_sessions_stream" => {
+                    spawn_control_stream(
+                        id,
+                        method.to_string(),
+                        parsed.get("params").cloned(),
+                        task_tx.clone(),
+                        pending_requests,
+                    );
+                    None
+                }
                 "api_sessions"
                 | "api_session_detail"
                 | "api_sessions_search"
@@ -1079,7 +1191,8 @@ fn control_frame_response(
                 .and_then(|value| value.as_u64())
                 .and_then(|value| usize::try_from(value).ok())
                 .unwrap_or(0);
-            outbound_queue.grant_credit(&id, chunks);
+            let chunk_id = parsed.get("chunk_id").and_then(|value| value.as_str());
+            outbound_queue.grant_credit(&id, chunk_id, chunks);
             None
         }
         _ => Some(serde_json::json!({
@@ -1106,7 +1219,49 @@ fn spawn_control_request(
     pending_requests.insert(id.clone(), cancel.clone());
     tokio::spawn(async move {
         let frame = control_request_response(id.clone(), method, params, runtime, cancel).await;
-        let _ = task_tx.send(ControlTaskResponse { id, frame }).await;
+        let _ = task_tx
+            .send(ControlTaskResponse {
+                id,
+                frame,
+                done: true,
+            })
+            .await;
+    });
+}
+
+fn spawn_control_stream(
+    id: String,
+    method: String,
+    params: Option<serde_json::Value>,
+    task_tx: mpsc::Sender<ControlTaskResponse>,
+    pending_requests: &mut HashMap<String, CancellationToken>,
+) {
+    if let Some(previous) = pending_requests.remove(&id) {
+        previous.cancel();
+    }
+    let cancel = CancellationToken::new();
+    pending_requests.insert(id.clone(), cancel.clone());
+    tokio::spawn(async move {
+        match method.as_str() {
+            "api_sessions_stream" => {
+                stream_sessions_response(id, params.as_ref(), task_tx, cancel).await;
+            }
+            _ => {
+                let frame = serde_json::json!({
+                    "t": "stream_end",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("unknown stream method: {method}"),
+                });
+                let _ = task_tx
+                    .send(ControlTaskResponse {
+                        id,
+                        frame,
+                        done: true,
+                    })
+                    .await;
+            }
+        }
     });
 }
 
@@ -1181,6 +1336,165 @@ async fn control_request_response(
             "error": format!("unknown method: {method}"),
         }),
     }
+}
+
+async fn stream_sessions_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    task_tx: mpsc::Sender<ControlTaskResponse>,
+    cancel: CancellationToken,
+) {
+    let request_line = sessions_stream_request_line(params);
+    let (line_tx, line_rx) = mpsc::channel::<String>(64);
+    let stream_task = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::stream_sessions_from_request(&request_line, line_tx);
+    });
+    stream_json_lines_response(
+        id,
+        "api_sessions_stream".to_string(),
+        line_rx,
+        stream_task,
+        task_tx,
+        cancel,
+    )
+    .await;
+}
+
+async fn stream_json_lines_response(
+    id: String,
+    method: String,
+    mut line_rx: mpsc::Receiver<String>,
+    stream_task: tokio::task::JoinHandle<()>,
+    task_tx: mpsc::Sender<ControlTaskResponse>,
+    cancel: CancellationToken,
+) {
+    if cancel.is_cancelled() {
+        return;
+    }
+
+    if task_tx
+        .send(ControlTaskResponse {
+            id: id.clone(),
+            frame: serde_json::json!({
+                "t": "stream_start",
+                "id": id,
+                "method": method,
+            }),
+            done: false,
+        })
+        .await
+        .is_err()
+    {
+        return;
+    }
+
+    let mut seq: u64 = 0;
+    while let Some(line) = line_rx.recv().await {
+        if cancel.is_cancelled() {
+            return;
+        }
+        let trimmed = line.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let event = match serde_json::from_str::<serde_json::Value>(trimmed) {
+            Ok(event) => event,
+            Err(e) => {
+                let frame = serde_json::json!({
+                    "t": "stream_end",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("session stream returned invalid JSON: {e}"),
+                });
+                let _ = task_tx
+                    .send(ControlTaskResponse {
+                        id,
+                        frame,
+                        done: true,
+                    })
+                    .await;
+                return;
+            }
+        };
+        let chunk_id = format!("{id}:{seq}");
+        let frame = serde_json::json!({
+            "t": "stream_event",
+            "id": id,
+            "seq": seq,
+            "chunk_id": chunk_id,
+            "event": event,
+        });
+        seq = seq.saturating_add(1);
+        if task_tx
+            .send(ControlTaskResponse {
+                id: id.clone(),
+                frame,
+                done: false,
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let frame = match stream_task.await {
+        Ok(()) => serde_json::json!({
+            "t": "stream_end",
+            "id": id,
+            "ok": true,
+            "result": {
+                "events": seq,
+            },
+        }),
+        Err(e) => serde_json::json!({
+            "t": "stream_end",
+            "id": id,
+            "ok": false,
+            "error": format!("session stream task failed: {e}"),
+        }),
+    };
+    if !cancel.is_cancelled() {
+        let _ = task_tx
+            .send(ControlTaskResponse {
+                id,
+                frame,
+                done: true,
+            })
+            .await;
+    }
+}
+
+fn sessions_stream_request_line(params: Option<&serde_json::Value>) -> String {
+    let Some(params) = params else {
+        return "GET /api/sessions/stream HTTP/1.1".to_string();
+    };
+    let Some(limit_value) = params.get("limit") else {
+        return "GET /api/sessions/stream HTTP/1.1".to_string();
+    };
+    let limit = match limit_value {
+        serde_json::Value::String(value) => {
+            let value = value.trim();
+            if value.eq_ignore_ascii_case("all") || value.eq_ignore_ascii_case("full") {
+                "all".to_string()
+            } else {
+                value
+                    .parse::<usize>()
+                    .ok()
+                    .filter(|limit| *limit > 0)
+                    .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
+                    .to_string()
+            }
+        }
+        serde_json::Value::Number(value) => value
+            .as_u64()
+            .and_then(|limit| usize::try_from(limit).ok())
+            .filter(|limit| *limit > 0)
+            .unwrap_or(CONTROL_DEFAULT_SESSION_LIMIT)
+            .to_string(),
+        _ => CONTROL_DEFAULT_SESSION_LIMIT.to_string(),
+    };
+    format!("GET /api/sessions/stream?limit={limit} HTTP/1.1")
 }
 
 fn cancelled_control_response(id: String, existed: bool) -> serde_json::Value {
@@ -2036,6 +2350,7 @@ mod tests {
         assert_eq!(status["result"]["response_credit_enabled"], false);
         assert_eq!(status["result"]["api_peers_available"], false);
         assert_eq!(status["result"]["api_sessions_available"], true);
+        assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
@@ -2085,6 +2400,7 @@ mod tests {
         let project_root = rx.recv().await.unwrap();
         assert!(pending.remove(&project_root.id).is_some());
         assert_eq!(project_root.id, "pr1");
+        assert!(project_root.done);
         let project_root = project_root.frame;
         assert_eq!(project_root["t"], "response");
         assert_eq!(project_root["ok"], true);
@@ -2141,19 +2457,28 @@ mod tests {
         .unwrap();
         assert_eq!(status["result"]["response_credit_enabled"], true);
 
-        outbound.enqueue_chunked("large".into(), vec!["chunk".into()], "end".into());
-        if let Some(queued) = outbound.chunked.get_mut("large") {
+        outbound.enqueue_chunked(
+            "large".into(),
+            "large:0".into(),
+            "start".into(),
+            vec!["chunk".into()],
+            "end".into(),
+        );
+        if let Some(QueuedControlFrame::Chunked(queued)) = outbound.frames.front_mut() {
             queued.credit = 0;
         }
         assert!(control_frame_response(
-            r#"{"t":"credit","id":"large","chunks":3}"#,
+            r#"{"t":"credit","id":"large","chunk_id":"large:0","chunks":3}"#,
             &mut rt,
             &tx,
             &mut pending,
             &mut outbound,
         )
         .is_none());
-        assert_eq!(outbound.chunked["large"].credit, 3);
+        let Some(QueuedControlFrame::Chunked(queued)) = outbound.frames.front() else {
+            panic!("expected queued chunked frame");
+        };
+        assert_eq!(queued.credit, 3);
 
         let cancelled = control_frame_response(
             r#"{"t":"cancel","id":"large"}"#,
@@ -2164,7 +2489,54 @@ mod tests {
         )
         .unwrap();
         assert_eq!(cancelled["cancelled"], true);
-        assert!(!outbound.chunked.contains_key("large"));
+        assert!(outbound.frames.is_empty());
+    }
+
+    #[tokio::test]
+    async fn control_stream_json_lines_emit_lifecycle_frames() {
+        let (line_tx, line_rx) = mpsc::channel::<String>(8);
+        let stream_task = tokio::spawn(async move {
+            for line in [
+                r#"{"type":"start","limit":1,"quick_limit":1}"#,
+                r#"{"type":"session","partial":true,"session":{"session_id":"s1"}}"#,
+                r#"{"type":"done"}"#,
+            ] {
+                line_tx.send(format!("{line}\n")).await.unwrap();
+            }
+        });
+        let (task_tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+
+        stream_json_lines_response(
+            "stream1".to_string(),
+            "api_sessions_stream".to_string(),
+            line_rx,
+            stream_task,
+            task_tx,
+            CancellationToken::new(),
+        )
+        .await;
+
+        let mut frames = Vec::new();
+        while let Some(task) = rx.recv().await {
+            frames.push(task);
+            if frames.last().unwrap().done {
+                break;
+            }
+        }
+
+        assert_eq!(frames.len(), 5);
+        assert_eq!(frames[0].frame["t"], "stream_start");
+        assert_eq!(frames[0].frame["method"], "api_sessions_stream");
+        assert!(!frames[0].done);
+        assert_eq!(frames[1].frame["t"], "stream_event");
+        assert_eq!(frames[1].frame["seq"], 0);
+        assert_eq!(frames[1].frame["event"]["type"], "start");
+        assert_eq!(frames[2].frame["event"]["session"]["session_id"], "s1");
+        assert_eq!(frames[3].frame["event"]["type"], "done");
+        assert_eq!(frames[4].frame["t"], "stream_end");
+        assert_eq!(frames[4].frame["ok"], true);
+        assert_eq!(frames[4].frame["result"]["events"], 3);
+        assert!(frames[4].done);
     }
 
     #[test]
@@ -2209,6 +2581,18 @@ mod tests {
         assert_eq!(
             control_session_ids(&serde_json::json!({"ids": ["a,b", "c"]})),
             vec!["a".to_string(), "b".to_string(), "c".to_string()]
+        );
+        assert_eq!(
+            sessions_stream_request_line(Some(&serde_json::json!({}))),
+            "GET /api/sessions/stream HTTP/1.1"
+        );
+        assert_eq!(
+            sessions_stream_request_line(Some(&serde_json::json!({"limit": "all"}))),
+            "GET /api/sessions/stream?limit=all HTTP/1.1"
+        );
+        assert_eq!(
+            sessions_stream_request_line(Some(&serde_json::json!({"limit": 25}))),
+            "GET /api/sessions/stream?limit=25 HTTP/1.1"
         );
         assert_eq!(
             control_project_filter(&serde_json::json!({"projects": ["a", " b "]})),

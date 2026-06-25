@@ -546,8 +546,9 @@ The validator starts a local rendezvous HTTP origin, launches a fresh daemon
 child with Connect env vars, verifies that
 `https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
 `401`, then loads the browser from the rendezvous origin and drives `status`,
-`config`, `api_sessions`, a chunked large `api_sessions` response, and
-application error RPCs over the verified DataChannel.
+`config`, `api_sessions`, a streamed `api_sessions_stream` hydration pass, a
+chunked large `api_sessions` response, and application error RPCs over the
+verified DataChannel.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the
@@ -686,27 +687,37 @@ messages. The first useful envelope set is:
 | `request` | browser -> daemon | HTTP-like method/body call with a request id |
 | `response` | daemon -> browser | Status, metadata, body, or application error for a request id |
 | `response_start` / `response_chunk` / `response_end` | daemon -> browser | Chunked delivery of an oversized JSON `response` frame |
+| `stream_start` / `stream_event` / `stream_end` | daemon -> browser | Ordered event stream for a long-lived request id |
 | `event` | daemon -> browser | Control-plane event stream entry |
 | `cancel` | browser -> daemon | Cancel an in-flight request or stream |
-| `credit` | both | Backpressure for large responses or long streams |
+| `credit` | browser -> daemon | Backpressure for chunked responses or chunked stream events |
 | `ping` / `pong` | both | Liveness, latency, and reconnect diagnostics |
 
-Oversized DataChannel `response` frames are now split at the transport layer.
-The daemon sends a `response_start` header, base64-encoded `response_chunk`
-frames containing the original JSON response bytes, and a `response_end` marker.
-The browser reassembles and parses the original `response` frame before handing
-it to existing request/response code, so API semantics stay unchanged. Current
-browser clients advertise `response_credit` in `hello`; when that feature is
-negotiated, the daemon sends an initial chunk window and then waits for browser
-`credit` frames before releasing more chunks. Older clients that do not
+Oversized DataChannel `response` and `stream_event` frames are split at the
+transport layer. The daemon sends a `response_start` header, base64-encoded
+`response_chunk` frames containing the original JSON frame bytes, and a
+`response_end` marker. The browser reassembles and parses the original frame
+before handing it to existing request or stream code, so API semantics stay
+unchanged. Current browser clients advertise `response_credit` in `hello`; when
+that feature is negotiated, the daemon sends an initial chunk window and then
+waits for browser `credit` frames before releasing more chunks. Stream chunks
+carry a `chunk_id` so a large event inside a longer stream can be credited and
+cancelled without ending the whole request id. Older clients that do not
 advertise the feature still receive the legacy eager chunk burst. Resumable
 transfer semantics are still required before moving uploads, downloads,
 recordings, terminal streams, or file transfer.
 
+The first streamed API on this substrate is `api_sessions_stream`, which mirrors
+the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
+`session`, `phase`, final `replace`, `done`). When the verified DataChannel is
+connected, local dashboard session hydration uses that stream and falls back to
+the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
+
 The first production APIs should be small and high value: `/config`, the main
-event stream, peer access-request list/approve/deny, and a basic health
-endpoint. Uploads, downloads, recordings, terminal streams, and file transfer
-should move later after chunking, flow control, and resume semantics are settled.
+event stream, local session list hydration, peer access-request
+list/approve/deny, and a basic health endpoint. Uploads, downloads, recordings,
+terminal streams, and file transfer should move later after resumable stream and
+file-transfer semantics are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -765,9 +776,10 @@ Treat this as a staged target, not current behavior:
    now routes peer access-request list/decision and related pairing APIs through
    the DataChannel transport boundary; hosted passkey step-up still belongs to
    the future public Connect UI.
-10. Gradually migrate larger API surfaces. Managed-context history reads now use
-    the tunnel, and oversized JSON responses now use credit-windowed chunked
-    response framing.
+10. Gradually migrate larger API surfaces. Managed-context history reads and
+    local session hydration now use the tunnel, oversized JSON responses now use
+    credit-windowed chunked response framing, and the sessions stream uses
+    explicit `stream_start`/`stream_event`/`stream_end` frames.
     Uploads, downloads, recordings, terminals, and file transfer still wait for
     resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working

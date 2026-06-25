@@ -10035,7 +10035,10 @@ fn send_session_stream_rows(
     true
 }
 
-fn stream_sessions_from_request(request_line: &str, tx: tokio::sync::mpsc::Sender<String>) {
+pub(crate) fn stream_sessions_from_request(
+    request_line: &str,
+    tx: tokio::sync::mpsc::Sender<String>,
+) {
     let requested_limit = session_list_limit_from_request(request_line);
     let quick_limit = requested_limit
         .unwrap_or(SESSION_LIST_LIMIT)

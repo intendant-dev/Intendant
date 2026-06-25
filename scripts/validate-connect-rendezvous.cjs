@@ -404,6 +404,18 @@ function publicBootstrapHtml() {
         this.handleResponseEnd(msg);
         return;
       }
+      if (msg.t === 'stream_start') {
+        this.handleStreamStart(msg);
+        return;
+      }
+      if (msg.t === 'stream_event') {
+        this.handleStreamEvent(msg);
+        return;
+      }
+      if (msg.t === 'stream_end') {
+        this.handleStreamEnd(msg);
+        return;
+      }
       if (msg.t !== 'pong' && msg.t !== 'response') return;
       const pending = this.pending.get(msg.id);
       if (!pending) return;
@@ -414,7 +426,8 @@ function publicBootstrapHtml() {
     },
     handleResponseStart(msg) {
       const id = String(msg.id || '');
-      if (!id || !this.pending.has(id)) return;
+      const chunkKey = String(msg.chunk_id || id);
+      if (!id || !chunkKey || !this.pending.has(id)) return;
       const totalBytes = Number(msg.total_bytes);
       const expectedChunks = Number(msg.chunks);
       if (
@@ -425,10 +438,11 @@ function publicBootstrapHtml() {
         !Number.isSafeInteger(expectedChunks) ||
         expectedChunks < 0
       ) {
-        this.rejectChunkedResponse(id, 'invalid dashboard control chunked response header');
+        this.rejectChunkedResponse(chunkKey, 'invalid dashboard control chunked response header');
         return;
       }
-      this.chunkedResponses.set(id, {
+      this.chunkedResponses.set(chunkKey, {
+        id,
         totalBytes,
         expectedChunks,
         receivedBytes: 0,
@@ -439,11 +453,12 @@ function publicBootstrapHtml() {
     },
     handleResponseChunk(msg) {
       const id = String(msg.id || '');
-      const state = this.chunkedResponses.get(id);
+      const chunkKey = String(msg.chunk_id || id);
+      const state = this.chunkedResponses.get(chunkKey);
       if (!state) return;
       const seq = Number(msg.seq);
       if (!Number.isSafeInteger(seq) || seq < 0 || seq >= state.expectedChunks) {
-        this.rejectChunkedResponse(id, 'invalid dashboard control chunk sequence');
+        this.rejectChunkedResponse(chunkKey, 'invalid dashboard control chunk sequence');
         return;
       }
       if (state.chunks.has(seq)) return;
@@ -451,70 +466,73 @@ function publicBootstrapHtml() {
       try {
         bytes = base64ToBytes(msg.data);
       } catch {
-        this.rejectChunkedResponse(id, 'invalid dashboard control chunk encoding');
+        this.rejectChunkedResponse(chunkKey, 'invalid dashboard control chunk encoding');
         return;
       }
       state.chunks.set(seq, bytes);
       state.receivedBytes += bytes.byteLength;
       if (state.receivedBytes > state.totalBytes) {
-        this.rejectChunkedResponse(id, 'dashboard control chunked response exceeded declared size');
+        this.rejectChunkedResponse(chunkKey, 'dashboard control chunked response exceeded declared size');
         return;
       }
-      const completed = this.maybeCompleteChunkedResponse(id);
-      if (!completed && this.chunkedResponses.has(id)) {
-        this.sendChunkCredit(id, 1);
+      const completed = this.maybeCompleteChunkedResponse(chunkKey);
+      if (!completed && this.chunkedResponses.has(chunkKey)) {
+        this.sendChunkCredit(id, 1, chunkKey === id ? null : chunkKey);
       }
       paint(this.status());
     },
     handleResponseEnd(msg) {
       const id = String(msg.id || '');
-      const state = this.chunkedResponses.get(id);
+      const chunkKey = String(msg.chunk_id || id);
+      const state = this.chunkedResponses.get(chunkKey);
       if (!state) return;
       const finalChunks = Number(msg.chunks);
       if (!Number.isSafeInteger(finalChunks) || finalChunks !== state.expectedChunks) {
-        this.rejectChunkedResponse(id, 'invalid dashboard control chunked response footer');
+        this.rejectChunkedResponse(chunkKey, 'invalid dashboard control chunked response footer');
         return;
       }
       state.ended = true;
-      this.maybeCompleteChunkedResponse(id);
+      this.maybeCompleteChunkedResponse(chunkKey);
       paint(this.status());
     },
-    maybeCompleteChunkedResponse(id) {
-      const state = this.chunkedResponses.get(id);
+    maybeCompleteChunkedResponse(chunkKey) {
+      const state = this.chunkedResponses.get(chunkKey);
       if (!state || !state.ended || state.chunks.size !== state.expectedChunks) return false;
       const merged = new Uint8Array(state.totalBytes);
       let offset = 0;
       for (let seq = 0; seq < state.expectedChunks; seq++) {
         const chunk = state.chunks.get(seq);
         if (!chunk) {
-          this.rejectChunkedResponse(id, 'dashboard control chunked response missed a chunk');
+          this.rejectChunkedResponse(chunkKey, 'dashboard control chunked response missed a chunk');
           return false;
         }
         merged.set(chunk, offset);
         offset += chunk.byteLength;
       }
       if (offset !== state.totalBytes) {
-        this.rejectChunkedResponse(id, 'dashboard control chunked response size mismatch');
+        this.rejectChunkedResponse(chunkKey, 'dashboard control chunked response size mismatch');
         return false;
       }
-      this.chunkedResponses.delete(id);
+      this.chunkedResponses.delete(chunkKey);
       let frame;
       try {
         frame = JSON.parse(new TextDecoder().decode(merged));
       } catch {
-        this.rejectChunkedResponse(id, 'dashboard control chunked response was not valid JSON');
+        this.rejectChunkedResponse(chunkKey, 'dashboard control chunked response was not valid JSON');
         return false;
       }
-      if (frame.t !== 'response' || String(frame.id || '') !== id) {
-        this.rejectChunkedResponse(id, 'dashboard control chunked response id mismatch');
+      if (!['response', 'stream_event'].includes(frame.t) || String(frame.id || '') !== state.id) {
+        this.rejectChunkedResponse(chunkKey, 'dashboard control chunked response id mismatch');
         return false;
       }
       this.completedChunkedResponses += 1;
       this.handleFrame(frame);
       return true;
     },
-    rejectChunkedResponse(id, message) {
-      this.chunkedResponses.delete(id);
+    rejectChunkedResponse(chunkKey, message) {
+      const state = this.chunkedResponses.get(chunkKey);
+      const id = state?.id || chunkKey;
+      this.chunkedResponses.delete(chunkKey);
       const pending = this.pending.get(id);
       if (pending) {
         this.pending.delete(id);
@@ -522,12 +540,63 @@ function publicBootstrapHtml() {
       }
       paint(this.status());
     },
+    handleStreamStart(msg) {
+      const pending = this.pending.get(String(msg.id || ''));
+      const stream = pending?.stream;
+      if (!stream) return;
+      stream.started = true;
+      this.callStreamCallback(stream, 'start', msg);
+    },
+    handleStreamEvent(msg) {
+      const pending = this.pending.get(String(msg.id || ''));
+      const stream = pending?.stream;
+      if (!stream) return;
+      stream.eventCount += 1;
+      this.callStreamCallback(stream, 'event', msg.event, msg);
+    },
+    handleStreamEnd(msg) {
+      const id = String(msg.id || '');
+      const pending = this.pending.get(id);
+      const stream = pending?.stream;
+      if (!pending || !stream) return;
+      this.pending.delete(id);
+      if (msg.ok === false) {
+        pending.reject(new Error(msg.error || 'dashboard control stream failed'));
+        return;
+      }
+      this.callStreamCallback(stream, 'end', msg.result || null, msg);
+      pending.resolve(msg.result || null);
+    },
+    callStreamCallback(stream, name, ...args) {
+      const callbacks = stream.callbacks;
+      if (typeof callbacks === 'function' && name === 'event') {
+        callbacks(...args);
+      } else if (callbacks && typeof callbacks[name] === 'function') {
+        callbacks[name](...args);
+      }
+    },
     request(method, params = {}, options = {}) {
       if (options.signal?.aborted) return Promise.reject(abortError());
       if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control RPC is not connected'));
       const id = this.nextId();
       const promise = this.waitFor(id, options);
       this.sendFrame({ t: 'request', id, method, params });
+      return promise;
+    },
+    stream(method, params = {}, options = {}, onEvent = {}) {
+      if (options.signal?.aborted) return Promise.reject(abortError());
+      if (!this.canUseRpc()) return Promise.reject(new Error('dashboard control stream is not connected'));
+      const id = this.nextId();
+      const promise = this.waitFor(id, options);
+      const pending = this.pending.get(id);
+      if (pending) {
+        pending.stream = {
+          callbacks: onEvent,
+          eventCount: 0,
+          started: false,
+        };
+      }
+      this.sendFrame({ t: 'request', id, method, params, stream: true });
       return promise;
     },
     waitFor(id, options = {}) {
@@ -540,7 +609,7 @@ function publicBootstrapHtml() {
           clearTimeout(timer);
           if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
           this.pending.delete(id);
-          this.chunkedResponses.delete(id);
+          this.deleteChunkedResponsesForRequest(id);
           if (cancel) this.sendFrame({ t: 'cancel', id });
           reject(err);
         };
@@ -554,12 +623,19 @@ function publicBootstrapHtml() {
             settled = true;
             clearTimeout(timer);
             if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
-            this.chunkedResponses.delete(id);
+            this.deleteChunkedResponsesForRequest(id);
             resolve(value);
           },
           reject: err => fail(err),
         });
       });
+    },
+    deleteChunkedResponsesForRequest(id) {
+      for (const [chunkKey, state] of this.chunkedResponses) {
+        if (chunkKey === id || state?.id === id) {
+          this.chunkedResponses.delete(chunkKey);
+        }
+      }
     },
     canUseRpc() {
       return Boolean(this.verifiedBinding && this.pc?.connectionState === 'connected' && this.channel?.readyState === 'open');
@@ -567,8 +643,10 @@ function publicBootstrapHtml() {
     sendFrame(frame) {
       if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify(frame));
     },
-    sendChunkCredit(id, chunks) {
-      this.sendFrame({ t: 'credit', id, chunks });
+    sendChunkCredit(id, chunks, chunkId = null) {
+      const frame = { t: 'credit', id, chunks };
+      if (chunkId) frame.chunk_id = chunkId;
+      this.sendFrame(frame);
     },
     status() {
       return {
@@ -702,10 +780,26 @@ async function main() {
       const beforeChunks = ctl.status().completedChunkedResponses || 0;
       const largeSessions = await ctl.request('api_sessions', { limit: 'all' }, { timeoutMs: 60000 });
       const largeSessionsJson = JSON.stringify(largeSessions);
+      const streamEvents = [];
+      const streamResult = await ctl.stream('api_sessions_stream', { limit: 3 }, { timeoutMs: 60000 }, {
+        event(event) {
+          streamEvents.push({
+            type: event?.type || '',
+            hasSession: Boolean(event?.session),
+            sessionCount: Array.isArray(event?.sessions) ? event.sessions.length : null,
+          });
+        },
+      });
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
         sessions: await ctl.request('api_sessions', { limit: 2 }),
+        sessionsStream: {
+          result: streamResult,
+          eventTypes: streamEvents.map(event => event.type),
+          eventCount: streamEvents.length,
+          replaceCount: streamEvents.find(event => event.type === 'replace')?.sessionCount ?? null,
+        },
         largeSessions: {
           ok: Array.isArray(largeSessions),
           length: Array.isArray(largeSessions) ? largeSessions.length : null,
@@ -722,8 +816,20 @@ async function main() {
       true,
       'dashboard control did not negotiate response credit'
     );
+    assert.strictEqual(
+      result.status.api_sessions_stream_available,
+      true,
+      'dashboard control status did not advertise sessions streaming'
+    );
     assert(result.config && typeof result.config === 'object', 'config RPC did not return an object');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
+    assert(result.sessionsStream.eventTypes.includes('start'), 'api_sessions_stream missed start event');
+    assert(result.sessionsStream.eventTypes.includes('replace'), 'api_sessions_stream missed replace event');
+    assert(result.sessionsStream.eventTypes.includes('done'), 'api_sessions_stream missed done event');
+    assert(
+      result.sessionsStream.result && result.sessionsStream.result.events >= result.sessionsStream.eventCount,
+      'api_sessions_stream did not report completed events'
+    );
     assert(result.largeSessions.ok, 'large api_sessions did not return an array');
     assert(
       result.largeSessions.jsonBytes > 65536,
@@ -751,6 +857,8 @@ async function main() {
         controlSessionId: result.status.session_id,
         responseCredit: result.status.response_credit_enabled,
         sessionCount: result.sessions.length,
+        streamEventCount: result.sessionsStream.eventCount,
+        streamReplaceCount: result.sessionsStream.replaceCount,
         largeSessionCount: result.largeSessions.length,
         largeSessionBytes: result.largeSessions.jsonBytes,
         completedChunkedResponses: result.finalStatus.completedChunkedResponses,
