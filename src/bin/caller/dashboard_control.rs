@@ -72,8 +72,10 @@ const CONTROL_FEATURES: &[&str] = &[
     "upload_frames",
     "terminal_frames",
     "tui_frames",
+    "presence_frames",
     "api_session_current_uploads",
     "api_session_current_upload_raw",
+    "api_presence_video_frame",
     "api_media_annotation_attach",
     "api_media_annotation_submit",
     "api_media_clip_start",
@@ -1551,6 +1553,7 @@ fn control_frame_response(
         "tui_resize" => control_tui_resize_frame(parsed, runtime, tui_connections),
         "tui_unsubscribe" => control_tui_unsubscribe_frame(parsed, runtime, tui_connections),
         "tui_close" => control_tui_close_frame(parsed, runtime, tui_connections),
+        "presence_frame" => control_presence_frame(parsed, runtime.clone()),
         "upload_start" => control_upload_start_frame(id, parsed, pending_requests, inbound_uploads),
         "upload_chunk" => control_upload_chunk_frame(id, parsed, pending_requests, inbound_uploads),
         "upload_end" => control_upload_end_frame(
@@ -1978,12 +1981,12 @@ fn control_upload_end_frame(
             "api_media_annotation_submit" => {
                 api_media_annotation_upload_task_response(id.clone(), upload, runtime, true).await
             }
-            "api_media_clip_frame" => api_media_clip_frame_upload_task_response(
-                id.clone(),
-                upload,
-                runtime,
-            )
-            .await,
+            "api_media_clip_frame" => {
+                api_media_clip_frame_upload_task_response(id.clone(), upload, runtime).await
+            }
+            "api_presence_video_frame" => {
+                api_presence_video_frame_upload_task_response(id.clone(), upload, runtime).await
+            }
             method => ControlTaskResponse {
                 id: id.clone(),
                 frame: control_upload_error_response(
@@ -2375,6 +2378,306 @@ async fn close_dashboard_tui_connections(
     }
 }
 
+fn control_presence_frame(
+    frame: serde_json::Value,
+    runtime: ControlRuntime,
+) -> Option<serde_json::Value> {
+    let id = frame
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let payload = frame
+        .get("frame")
+        .or_else(|| frame.get("payload"))
+        .cloned()
+        .unwrap_or(frame);
+    tokio::spawn(async move {
+        handle_dashboard_presence_frame(payload, runtime).await;
+    });
+    if id.is_empty() {
+        None
+    } else {
+        Some(serde_json::json!({
+            "t": "presence_ack",
+            "id": id,
+            "ok": true,
+        }))
+    }
+}
+
+async fn handle_dashboard_presence_frame(frame: serde_json::Value, runtime: ControlRuntime) {
+    let frame_type = frame
+        .get("t")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    match frame_type {
+        "presence_connect" => dashboard_presence_connect(frame, runtime).await,
+        "presence_disconnect" => dashboard_presence_disconnect(runtime).await,
+        "voice_log" => dashboard_voice_log(frame, runtime).await,
+        "presence_checkpoint" => dashboard_presence_checkpoint(frame, runtime).await,
+        "voice_diagnostic" => dashboard_voice_diagnostic(frame, runtime).await,
+        "live_usage_update" => dashboard_live_usage_update(frame, runtime).await,
+        _ => {
+            eprintln!("[dashboard/control] ignored unsupported presence frame: {frame_type}");
+        }
+    }
+}
+
+fn dashboard_control_emit_browser_event(runtime: &ControlRuntime, payload: serde_json::Value) {
+    if let Some(tx) = &runtime.control_frames_tx {
+        let _ = tx.send(serde_json::json!({
+            "t": "event",
+            "payload": payload,
+        }));
+    }
+}
+
+async fn dashboard_presence_connect(frame: serde_json::Value, runtime: ControlRuntime) {
+    let server_session_id = frame
+        .get("server_session_id")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let last_event_seq = frame
+        .get("last_event_seq")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let provider = frame
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            runtime
+                .config
+                .get("provider")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let model = frame
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            runtime
+                .config
+                .get("model")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+
+    let active = runtime.shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let session_log = active.session_log.clone();
+    drop(active);
+
+    if let Some(ctx) = &query_ctx {
+        let conversation_ctx = crate::presence::build_conversation_context(&ctx.log_dir, 20);
+        if let Some(ps) = &ctx.presence_session {
+            let mut session = ps.lock().unwrap_or_else(|e| e.into_inner());
+            session.set_connected(true);
+            let state = ctx
+                .agent_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let welcome = session.build_welcome(last_event_seq, &state);
+            dashboard_control_emit_browser_event(
+                &runtime,
+                serde_json::json!({
+                    "t": "presence_welcome",
+                    "session_id": welcome.session_id,
+                    "state": welcome.state,
+                    "events": welcome.events,
+                    "last_checkpoint_summary": welcome.last_checkpoint_summary,
+                    "current_seq": welcome.current_seq,
+                    "is_active": true,
+                    "conversation_context": conversation_ctx,
+                }),
+            );
+        } else {
+            dashboard_control_emit_browser_event(
+                &runtime,
+                serde_json::json!({
+                    "t": "presence_welcome",
+                    "is_active": true,
+                    "conversation_context": conversation_ctx,
+                }),
+            );
+        }
+    } else {
+        dashboard_control_emit_browser_event(
+            &runtime,
+            serde_json::json!({
+                "t": "presence_welcome",
+                "is_active": true,
+            }),
+        );
+    }
+
+    if let Some(sl) = session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.presence_connected(provider.as_deref(), model.as_deref());
+        }
+    }
+    runtime.bus.send(AppEvent::PresenceConnected {
+        server_session_id,
+        last_event_seq,
+        live_provider: provider,
+        live_model: model,
+    });
+}
+
+async fn dashboard_presence_disconnect(runtime: ControlRuntime) {
+    let active = runtime.shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let session_log = active.session_log.clone();
+    drop(active);
+    if let Some(ctx) = query_ctx {
+        if let Some(ps) = ctx.presence_session {
+            ps.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_connected(false);
+        }
+    }
+    if let Some(sl) = session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.presence_disconnected();
+        }
+    }
+    runtime.bus.send(AppEvent::PresenceDisconnected);
+}
+
+async fn dashboard_voice_log(frame: serde_json::Value, runtime: ControlRuntime) {
+    let text = frame
+        .get("text")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let seq = frame
+        .get("seq")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let tool_context = frame
+        .get("tool_context")
+        .and_then(|value| value.as_str())
+        .map(str::to_string);
+    let active = runtime.shared_session.read().await;
+    let session_log = active.session_log.clone();
+    drop(active);
+    if let Some(sl) = session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.voice_log(&text, seq, tool_context.as_deref());
+        }
+    }
+    runtime.bus.send(AppEvent::VoiceLog {
+        text,
+        seq,
+        tool_context,
+    });
+}
+
+async fn dashboard_presence_checkpoint(frame: serde_json::Value, runtime: ControlRuntime) {
+    let summary = frame
+        .get("summary")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let last_event_seq = frame
+        .get("last_event_seq")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(0);
+    let active = runtime.shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let session_log = active.session_log.clone();
+    drop(active);
+    if let Some(ctx) = query_ctx {
+        if let Some(ps) = ctx.presence_session {
+            let checkpoint = presence_core::PresenceCheckpoint {
+                summary: summary.clone(),
+                last_event_seq,
+            };
+            let ack = ps
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .record_checkpoint(checkpoint);
+            dashboard_control_emit_browser_event(
+                &runtime,
+                serde_json::json!({
+                    "t": "presence_checkpoint_ack",
+                    "seq": ack.seq,
+                }),
+            );
+        }
+    }
+    if let Some(sl) = session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.presence_checkpoint(&summary, last_event_seq);
+        }
+    }
+    runtime.bus.send(AppEvent::PresenceCheckpointReceived {
+        summary,
+        last_event_seq,
+    });
+}
+
+async fn dashboard_voice_diagnostic(frame: serde_json::Value, runtime: ControlRuntime) {
+    let kind = frame
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .unwrap_or("unknown")
+        .to_string();
+    let detail = frame
+        .get("detail")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let active = runtime.shared_session.read().await;
+    let session_log = active.session_log.clone();
+    drop(active);
+    if let Some(sl) = session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.voice_diagnostic(&kind, &detail);
+        }
+    }
+    runtime.bus.send(AppEvent::VoiceDiagnostic { kind, detail });
+}
+
+fn json_u64(frame: &serde_json::Value, key: &str) -> u64 {
+    frame.get(key).and_then(|value| value.as_u64()).unwrap_or(0)
+}
+
+async fn dashboard_live_usage_update(frame: serde_json::Value, runtime: ControlRuntime) {
+    runtime.bus.send(AppEvent::LiveUsageUpdate {
+        provider: frame
+            .get("provider")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        model: frame
+            .get("model")
+            .and_then(|value| value.as_str())
+            .unwrap_or("")
+            .to_string(),
+        input_tokens: json_u64(&frame, "input_tokens"),
+        output_tokens: json_u64(&frame, "output_tokens"),
+        cached_tokens: json_u64(&frame, "cached_tokens"),
+        total_tokens: json_u64(&frame, "total_tokens"),
+        thinking_tokens: json_u64(&frame, "thinking_tokens"),
+        input_text_tokens: json_u64(&frame, "input_text_tokens"),
+        input_audio_tokens: json_u64(&frame, "input_audio_tokens"),
+        input_image_tokens: json_u64(&frame, "input_image_tokens"),
+        cached_text_tokens: json_u64(&frame, "cached_text_tokens"),
+        cached_audio_tokens: json_u64(&frame, "cached_audio_tokens"),
+        cached_image_tokens: json_u64(&frame, "cached_image_tokens"),
+        output_text_tokens: json_u64(&frame, "output_text_tokens"),
+        output_audio_tokens: json_u64(&frame, "output_audio_tokens"),
+    });
+}
+
 fn spawn_dashboard_display_input(frame: serde_json::Value, runtime: ControlRuntime) {
     tokio::spawn(async move {
         let display_id = frame
@@ -2548,6 +2851,8 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("upload_frames_available", true),
         ("terminal_frames_available", true),
         ("tui_frames_available", runtime.web_tui_tx.is_some()),
+        ("presence_frames_available", true),
+        ("api_presence_video_frame_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -3563,6 +3868,93 @@ async fn register_dashboard_media_frame(
     }
 }
 
+async fn api_presence_video_frame_upload_task_response(
+    id: String,
+    mut upload: InboundUploadState,
+    runtime: ControlRuntime,
+) -> ControlTaskResponse {
+    let params = upload.params.clone();
+    let frame_id = string_param(&params, &["frame_id", "frameId"]);
+    if frame_id.is_empty() {
+        return media_error_task_response(id, 400, "missing frame_id");
+    }
+    let stream = optional_string_param(&params, &["stream", "stream_name", "streamName"])
+        .unwrap_or_else(|| "cam0".to_string());
+    let bytes = match read_inbound_upload_bytes(&mut upload) {
+        Ok(bytes) if !bytes.is_empty() => bytes,
+        Ok(_) => return media_error_task_response(id, 400, "empty video frame upload"),
+        Err(e) => return media_error_task_response(id, 500, e),
+    };
+    let (registered, recorded) =
+        register_dashboard_presence_video_frame(&runtime, &frame_id, &stream, &bytes).await;
+    media_task_response(
+        id,
+        200,
+        serde_json::json!({
+            "t": "presence_video_frame_saved",
+            "ok": true,
+            "frame_id": frame_id,
+            "stream": stream,
+            "registered": registered,
+            "recorded": recorded,
+        }),
+    )
+}
+
+async fn register_dashboard_presence_video_frame(
+    runtime: &ControlRuntime,
+    frame_id: &str,
+    stream: &str,
+    jpeg_bytes: &[u8],
+) -> (bool, bool) {
+    let session = runtime.shared_session.read().await;
+    let frame_registry = session.frame_registry.clone();
+    let recording_registry = session.recording_registry.clone();
+    drop(session);
+
+    let mut registered = false;
+    if let Some(registry) = frame_registry {
+        let meta = presence_core::FrameMeta {
+            frame_id: frame_id.to_string(),
+            stream: stream.to_string(),
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            sent_to_live: true,
+            live_resolution: Some("768x768".to_string()),
+            hq_resolution: None,
+            note: None,
+        };
+        let mut reg = registry.write().await;
+        match reg.register(meta, jpeg_bytes) {
+            Ok(_) => registered = true,
+            Err(e) => eprintln!("presence video frame registry write failed: {e}"),
+        }
+    }
+
+    let mut recorded = false;
+    if let Some(registry) = recording_registry {
+        let mut rec = registry.write().await;
+        if rec.is_enabled() {
+            if !rec.is_recording(stream) && crate::recording::is_ffmpeg_available() {
+                match rec.start_stream(stream).await {
+                    Ok(()) => {
+                        runtime.bus.send(AppEvent::RecordingStarted {
+                            stream_name: stream.to_string(),
+                        });
+                    }
+                    Err(e) => eprintln!("presence video recording start failed: {e}"),
+                }
+            }
+            if let Err(e) = rec.feed_frame(stream, jpeg_bytes).await {
+                eprintln!("presence video recording frame failed: {e}");
+            } else {
+                recorded = true;
+            }
+        }
+    }
+
+    (registered, recorded)
+}
+
 fn inject_annotation_context(
     query_ctx: Option<&crate::web_gateway::WebQueryCtx>,
     note: &str,
@@ -3682,7 +4074,8 @@ async fn api_media_annotation_upload_task_response(
     .await;
 
     if submit {
-        let injected_to_queue = inject && inject_annotation_context(query_ctx.as_ref(), &note, data_b64);
+        let injected_to_queue =
+            inject && inject_annotation_context(query_ctx.as_ref(), &note, data_b64);
         let status_label = if inject {
             if injected_to_queue {
                 " (sent to agent)"
@@ -3748,11 +4141,7 @@ fn usize_param(params: &serde_json::Value, name: &str, default: usize) -> usize 
             value
                 .as_u64()
                 .and_then(|number| usize::try_from(number).ok())
-                .or_else(|| {
-                    value
-                        .as_str()
-                        .and_then(|text| text.parse::<usize>().ok())
-                })
+                .or_else(|| value.as_str().and_then(|text| text.parse::<usize>().ok()))
         })
         .unwrap_or(default)
 }
@@ -3948,7 +4337,11 @@ async fn api_media_clip_end_response(
     runtime.bus.send(AppEvent::PresenceLog {
         message: format!(
             "[clip] {clip_id} - {frames_registered} frames{}",
-            if injected { " (sent to agent)" } else { " (saved)" }
+            if injected {
+                " (sent to agent)"
+            } else {
+                " (saved)"
+            }
         ),
         level: Some(LogLevel::Info),
         turn: None,
@@ -3981,7 +4374,12 @@ async fn api_media_clip_cancel_response(
             serde_json::json!({"ok": false, "error": "missing clip_id"}),
         );
     }
-    let existed = runtime.media_clip_ops.lock().await.remove(&clip_id).is_some();
+    let existed = runtime
+        .media_clip_ops
+        .lock()
+        .await
+        .remove(&clip_id)
+        .is_some();
     media_http_response(
         id,
         200,
@@ -7438,6 +7836,8 @@ mod tests {
         assert_eq!(status["result"]["api_dashboard_bootstrap_available"], true);
         assert_eq!(status["result"]["byte_streams_available"], true);
         assert_eq!(status["result"]["upload_frames_available"], true);
+        assert_eq!(status["result"]["presence_frames_available"], true);
+        assert_eq!(status["result"]["api_presence_video_frame_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -7583,6 +7983,45 @@ mod tests {
         assert_eq!(cancelled["ok"], false);
         assert_eq!(cancelled["cancelled"], true);
         assert!(pending.get("q1").is_none());
+    }
+
+    #[tokio::test]
+    async fn presence_frame_routes_voice_log() {
+        let mut rt = runtime();
+        let mut events = rt.bus.subscribe();
+        let (task_tx, _task_rx) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        let ack = test_control_frame_response(
+            r#"{"t":"presence_frame","id":"p1","frame":{"t":"voice_log","text":"hello from connect","seq":7,"tool_context":"debug"}}"#,
+            &mut rt,
+            &task_tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("presence frame should ack when id is present");
+
+        assert_eq!(ack["t"], "presence_ack");
+        assert_eq!(ack["id"], "p1");
+        assert_eq!(ack["ok"], true);
+
+        let event = tokio::time::timeout(Duration::from_secs(1), events.recv())
+            .await
+            .expect("voice log event should arrive")
+            .expect("event bus should be open");
+        match event {
+            AppEvent::VoiceLog {
+                text,
+                seq,
+                tool_context,
+            } => {
+                assert_eq!(text, "hello from connect");
+                assert_eq!(seq, 7);
+                assert_eq!(tool_context.as_deref(), Some("debug"));
+            }
+            other => panic!("expected VoiceLog, got {other:?}"),
+        }
     }
 
     #[tokio::test]

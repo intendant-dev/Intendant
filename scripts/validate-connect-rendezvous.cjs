@@ -1099,6 +1099,8 @@ function publicBootstrapHtml() {
         uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
         terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
         tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
+        presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
+        apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
         apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
         apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
         apiSessionDeleteAvailable: this.lastStatus?.api_session_delete_available ?? null,
@@ -2953,6 +2955,7 @@ async function main() {
       const diagnosticsConnectNoHttp = await ctl._debugProbeDiagnosticsConnectNoHttp();
       const displaySignalConnectNoLegacy = await ctl._debugProbeDisplaySignalConnectNoLegacy();
       const tuiConnectNoLegacy = ctl._debugProbeTuiConnectNoLegacy();
+      const presenceMediaConnectNoLegacy = await ctl._debugProbePresenceMediaConnectNoLegacy();
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
       const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
@@ -2967,6 +2970,7 @@ async function main() {
         diagnosticsConnectNoHttp,
         displaySignalConnectNoLegacy,
         tuiConnectNoLegacy,
+        presenceMediaConnectNoLegacy,
         transportLabel,
         serverLabel,
         serverClass,
@@ -3129,6 +3133,26 @@ async function main() {
       false,
       `real SPA Connect TUI subscription claimed legacy transport success: ${JSON.stringify(appResult.tuiConnectNoLegacy)}`
     );
+    assert.strictEqual(
+      appResult.presenceMediaConnectNoLegacy.skipped,
+      false,
+      `real SPA could not exercise Connect presence/media no-legacy path: ${JSON.stringify(appResult.presenceMediaConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.presenceMediaConnectNoLegacy.presenceFrameCount,
+      2,
+      `real SPA Connect voice events did not use presence frames: ${JSON.stringify(appResult.presenceMediaConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.presenceMediaConnectNoLegacy.uploadCount,
+      1,
+      `real SPA Connect video frame did not use upload media tunnel: ${JSON.stringify(appResult.presenceMediaConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.presenceMediaConnectNoLegacy.legacyCount,
+      0,
+      `real SPA Connect presence/media replayed through legacy app path: ${JSON.stringify(appResult.presenceMediaConnectNoLegacy)}`
+    );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
       Number(appResult.sessionCount) >= 1,
@@ -3175,6 +3199,7 @@ async function main() {
         diagnosticsConnectNoHttp: appResult.diagnosticsConnectNoHttp,
         displaySignalConnectNoLegacy: appResult.displaySignalConnectNoLegacy,
         tuiConnectNoLegacy: appResult.tuiConnectNoLegacy,
+        presenceMediaConnectNoLegacy: appResult.presenceMediaConnectNoLegacy,
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,

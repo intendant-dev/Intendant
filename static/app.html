@@ -17918,12 +17918,10 @@ function requestMakeActive() {
   localStorage.setItem('passive_mode', 'false');
   app.set_passive_mode(false);
   const sent = app.send_make_active();
-  try {
-    app.send_voice_diagnostic(
-      'make_active_request_client',
-      sent ? 'request sent to server' : 'request NOT sent (server socket not open)',
-    );
-  } catch(_) {}
+  sendDashboardVoiceDiagnostic(
+    'make_active_request_client',
+    sent ? 'request sent to server' : 'request NOT sent (server socket not open)',
+  );
   if (sent) {
     document.getElementById('makeActiveBtn').disabled = true;
     showVoiceStatus('Requesting active...');
@@ -18021,7 +18019,7 @@ async function startMic() {
       pcm16[i] = Math.max(-32768, Math.min(32767, Math.floor(resampled[i] * 32768)));
     app.send_audio(arrayBufferToBase64(pcm16.buffer));
     if (gatewayConfig && gatewayConfig.transcription_enabled) {
-      app.send_user_audio(arrayBufferToBase64(pcm16.buffer));
+      sendDashboardUserAudio(arrayBufferToBase64(pcm16.buffer));
     }
   };
   source.connect(workletNode);
@@ -18093,7 +18091,7 @@ async function startVideo() {
       tickerFramesSent++;
     } else {
       tickerFramesDropped++;
-      try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
+      sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
     }
     updateTickerFrames();
 
@@ -18105,7 +18103,7 @@ async function startVideo() {
     ctx.drawImage(videoEl, 0, 0, canvas.width, canvas.height);
     const hqJpeg = canvas.toDataURL('image/jpeg', 0.80);
     const hqB64 = hqJpeg.split(',')[1];
-    app.send_video_frame_to_server(hqB64, frameId, FRAME_STREAM);
+    sendDashboardVideoFrameToServer(hqB64, frameId, FRAME_STREAM);
 
     // Update preview UI
     document.getElementById('videoFrameId').textContent = frameId;
@@ -18170,6 +18168,9 @@ async function connectVoice() {
   if (audioCtx.state === 'suspended') audioCtx.resume();
   showVoiceStatus('Connecting...');
   app.connect_voice(provider, token, model, inputRate);
+  if (dashboardConnectModeEnabled()) {
+    sendDashboardPresenceConnect(provider, model);
+  }
   voiceConnecting = false;
 }
 
@@ -18503,7 +18504,7 @@ async function main() {
       // context. Send a strong grounding message to prevent the model from
       // confabulating a continuation of a conversation that no longer exists.
       app.send_text('[System: Voice session reconnected after a disconnection. This is a fresh session — you have NO memory of any prior conversation, frames, or analysis. Briefly tell the user you reconnected, then wait for them to speak. Do NOT describe the screen or reference prior context.]');
-      try { app.send_voice_diagnostic('reconnected', provider + ' voice model reconnected after disconnect'); } catch(_) {}
+      sendDashboardVoiceDiagnostic('reconnected', provider + ' voice model reconnected after disconnect');
     } else if (storedConversationCtx) {
       app.send_text('[System: conversation so far]\n' + storedConversationCtx);
       storedConversationCtx = null;
@@ -18515,17 +18516,17 @@ async function main() {
       app.send_text('[System: Ready. Waiting for user.]');
     }
     app.inject_pending_approval_if_any();
-    try { app.send_voice_diagnostic('connected', provider + ' voice model ready'); } catch(_) {}
+    sendDashboardVoiceDiagnostic('connected', provider + ' voice model ready');
   });
 
   app.set_on_voice_audio((b64) => playAudioChunk(b64));
 
   app.set_on_voice_text((text) => {
-    app.send_voice_log(text, undefined);
+    sendDashboardVoiceLog(text, undefined);
   });
 
   app.set_on_voice_transcript((text) => {
-    app.send_voice_log(text, 'transcript');
+    sendDashboardVoiceLog(text, 'transcript');
   });
 
   app.set_on_voice_tool_call((call) => {
@@ -18533,13 +18534,14 @@ async function main() {
   });
 
   app.set_on_voice_interrupted(() => {
-    try { app.send_voice_diagnostic('interrupted', 'voice model interrupted by user'); } catch(_) {}
+    sendDashboardVoiceDiagnostic('interrupted', 'voice model interrupted by user');
   });
 
   app.set_on_live_usage((usage) => {
     if (!usage) return;
     const cmds = app.handle_live_usage(usage);
     if (cmds) processCommands(cmds);
+    if (dashboardConnectModeEnabled()) sendDashboardLiveUsage(usage);
   });
 
   app.set_on_error((msg) => {
@@ -18553,17 +18555,17 @@ async function main() {
       document.getElementById('videoBtn').classList.add('is-disabled');
     }
     showVoiceStatus(msg, true);
-    try { app.send_voice_diagnostic('error', msg); } catch(_) {}
+    sendDashboardVoiceDiagnostic('error', msg);
   });
 
   app.set_on_diagnostic((kind, detail) => {
-    try { app.send_voice_diagnostic(kind, detail); } catch(_) {}
+    sendDashboardVoiceDiagnostic(kind, detail);
   });
 
   app.set_on_session_changed(() => {
     if (modelConnected) {
       if (videoActive) stopVideo();
-      app.disconnect_voice();
+      disconnectDashboardVoice();
       modelConnected = false;
       if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
       document.getElementById('sb-voice').className = 'voice-dot err';
@@ -18647,10 +18649,10 @@ async function main() {
   });
 
   app.set_on_force_disconnect((reason) => {
-    try { app.send_voice_diagnostic('make_active_force_disconnect_client', 'reason=' + reason); } catch(_) {}
+    sendDashboardVoiceDiagnostic('make_active_force_disconnect_client', 'reason=' + reason);
     if (modelConnected) {
       if (videoActive) stopVideo();
-      app.disconnect_voice();
+      disconnectDashboardVoice();
       modelConnected = false;
       if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
       micActive = false;
@@ -18667,12 +18669,10 @@ async function main() {
   });
 
   app.set_on_active_granted((handoverContext, conversationContext) => {
-    try {
-      app.send_voice_diagnostic(
-        'make_active_granted_client',
-        'handover=' + (handoverContext ? 'yes' : 'no') + ', conversation=' + (conversationContext ? 'yes' : 'no'),
-      );
-    } catch(_) {}
+    sendDashboardVoiceDiagnostic(
+      'make_active_granted_client',
+      'handover=' + (handoverContext ? 'yes' : 'no') + ', conversation=' + (conversationContext ? 'yes' : 'no'),
+    );
     isActiveBrowser = true;
     document.getElementById('makeActiveBtn').disabled = false;
     updateActivePassiveUI();
@@ -18817,7 +18817,7 @@ async function main() {
       app.set_passive_mode(true);
       if (modelConnected) {
         if (videoActive) stopVideo();
-        app.disconnect_voice();
+        disconnectDashboardVoice();
         modelConnected = false;
         if (typeof updateAnnotationSendState === 'function') updateAnnotationSendState();
         micActive = false;
@@ -18861,7 +18861,7 @@ async function main() {
 
   // Clean up on unload
   window.addEventListener('beforeunload', () => {
-    if (modelConnected && app) app.disconnect_voice();
+    if (modelConnected && app) disconnectDashboardVoice();
   });
 }
 
@@ -30118,6 +30118,172 @@ function sendRawMessage(obj) {
   return false;
 }
 
+const dashboardPresenceWarned = new Set();
+let dashboardVoiceLogSeq = 0;
+
+function dashboardWarnPresenceOnce(key, message, err = null) {
+  if (dashboardPresenceWarned.has(key)) return;
+  dashboardPresenceWarned.add(key);
+  if (err) console.warn(message, err);
+  else console.warn(message);
+}
+
+function dashboardPresenceFramesAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.presence_frames_available === true
+  );
+}
+
+function dashboardPresenceVideoFrameAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.upload_frames_available === true &&
+    dashboardControlTransport?.lastStatus?.api_presence_video_frame_available === true
+  );
+}
+
+function sendDashboardPresenceFrame(frame, fallback = null, label = frame?.t || 'presence frame') {
+  if (dashboardPresenceFramesAvailable() && dashboardTransport.presenceFrame(frame)) {
+    return true;
+  }
+  if (dashboardConnectModeEnabled()) {
+    dashboardWarnPresenceOnce(
+      `presence:${label}`,
+      `[dashboard-control] ${label} unavailable without the Connect presence tunnel`
+    );
+    return false;
+  }
+  if (typeof fallback === 'function') return fallback() === true;
+  return false;
+}
+
+function activeVoiceModelForPresence(provider, explicitModel = null) {
+  if (explicitModel) return explicitModel;
+  if (gatewayConfig?.model) return gatewayConfig.model;
+  if (provider === 'openai') return 'gpt-4o-realtime-preview';
+  if (provider === 'gemini') return 'gemini-2.5-flash-native-audio-preview-12-2025';
+  return 'unknown';
+}
+
+function sendDashboardPresenceConnect(provider, explicitModel = null) {
+  const model = activeVoiceModelForPresence(provider, explicitModel);
+  return sendDashboardPresenceFrame({
+    t: 'presence_connect',
+    server_session_id: null,
+    last_event_seq: 0,
+    provider,
+    model,
+    passive: localStorage.getItem('passive_mode') === 'true',
+  }, () => true, 'presence_connect');
+}
+
+function sendDashboardPresenceDisconnect() {
+  return sendDashboardPresenceFrame({ t: 'presence_disconnect' }, () => true, 'presence_disconnect');
+}
+
+function disconnectDashboardVoice() {
+  if (!app) return;
+  app.disconnect_voice();
+  if (dashboardConnectModeEnabled()) sendDashboardPresenceDisconnect();
+}
+
+function sendDashboardVoiceLog(text, toolContext) {
+  dashboardVoiceLogSeq += 1;
+  return sendDashboardPresenceFrame({
+    t: 'voice_log',
+    text,
+    seq: dashboardVoiceLogSeq,
+    tool_context: toolContext || null,
+  }, () => {
+    app?.send_voice_log(text, toolContext);
+    return true;
+  }, 'voice_log');
+}
+
+function sendDashboardVoiceDiagnostic(kind, detail) {
+  return sendDashboardPresenceFrame({
+    t: 'voice_diagnostic',
+    kind,
+    detail,
+  }, () => {
+    app?.send_voice_diagnostic(kind, detail);
+    return true;
+  }, `voice_diagnostic:${kind}`);
+}
+
+function sendDashboardLiveUsage(usage) {
+  if (!usage || typeof usage !== 'object') return false;
+  return sendDashboardPresenceFrame({
+    t: 'live_usage_update',
+    provider: usage.provider || '',
+    model: usage.model || '',
+    input_tokens: Number(usage.input_tokens || 0),
+    output_tokens: Number(usage.output_tokens || 0),
+    cached_tokens: Number(usage.cached_tokens || 0),
+    total_tokens: Number(usage.total_tokens || 0),
+    thinking_tokens: Number(usage.thinking_tokens || 0),
+    input_text_tokens: Number(usage.input_text_tokens || 0),
+    input_audio_tokens: Number(usage.input_audio_tokens || 0),
+    input_image_tokens: Number(usage.input_image_tokens || 0),
+    cached_text_tokens: Number(usage.cached_text_tokens || 0),
+    cached_audio_tokens: Number(usage.cached_audio_tokens || 0),
+    cached_image_tokens: Number(usage.cached_image_tokens || 0),
+    output_text_tokens: Number(usage.output_text_tokens || 0),
+    output_audio_tokens: Number(usage.output_audio_tokens || 0),
+  }, null, 'live_usage_update');
+}
+
+function sendDashboardUserAudio(base64Pcm) {
+  if (dashboardConnectModeEnabled()) {
+    dashboardWarnPresenceOnce(
+      'user_audio',
+      '[dashboard-control] server-side transcription audio is not tunneled in Connect mode yet'
+    );
+    return false;
+  }
+  app?.send_user_audio(base64Pcm);
+  return true;
+}
+
+async function sendDashboardVideoFrameToServer(base64Jpeg, frameId, stream) {
+  if (dashboardPresenceVideoFrameAvailable()) {
+    try {
+      const bytes = dashboardControlBase64ToBytes(base64Jpeg);
+      const result = await dashboardTransport.uploadBytes('api_presence_video_frame', {
+        frame_id: frameId,
+        stream,
+        mime: 'image/jpeg',
+      }, bytes, {
+        timeoutMs: 120000,
+      });
+      if (result?._httpOk === false || result?.ok === false) {
+        throw new Error(result.error || `presence video frame returned ${result._httpStatus || 'error'}`);
+      }
+      return true;
+    } catch (err) {
+      if (dashboardConnectModeEnabled()) {
+        dashboardWarnPresenceOnce('video_frame_upload', '[dashboard-control] Connect video frame upload failed', err);
+        return false;
+      }
+      console.warn('[dashboard-control] presence video frame upload failed; falling back to /ws', err);
+    }
+  }
+  if (dashboardConnectModeEnabled()) {
+    dashboardWarnPresenceOnce(
+      'video_frame_unavailable',
+      '[dashboard-control] video frame archival unavailable without the Connect media tunnel'
+    );
+    return false;
+  }
+  app?.send_video_frame_to_server(base64Jpeg, frameId, stream);
+  return true;
+}
+
 function dashboardMediaEditorRpcAvailable() {
   return Boolean(
     dashboardTransport &&
@@ -31589,7 +31755,7 @@ class DisplaySlot {
         this.frameIdEl.textContent = frameId.split('-').pop() + ' dropped';
         this.frameIdEl.style.color = 'var(--yellow)';
         tickerFramesDropped++;
-        try { app.send_voice_diagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)'); } catch(_) {}
+        sendDashboardVoiceDiagnostic('frame_skip', 'duplicate frame skipped (delta=' + (sizeDelta * 100).toFixed(1) + '%)');
       }
       updateTickerFrames();
       // HQ: logical resolution — always sent for archival
@@ -31599,7 +31765,7 @@ class DisplaySlot {
       ctx.drawImage(vid, 0, 0, this._streamCanvas.width, this._streamCanvas.height);
       const hqJpeg = this._streamCanvas.toDataURL('image/jpeg', 0.80);
       const hqB64 = hqJpeg.split(',')[1];
-      app.send_video_frame_to_server(hqB64, frameId, streamName);
+      sendDashboardVideoFrameToServer(hqB64, frameId, streamName);
     }, 1000);
   }
   stopStreaming() {
@@ -37553,6 +37719,11 @@ class DashboardTransport {
     return dashboardControlTransport.tuiFrame(frame);
   }
 
+  presenceFrame(frame) {
+    if (!this.canUseRpc()) return false;
+    return dashboardControlTransport.presenceFrame(frame);
+  }
+
   displayInput(displayId, event) {
     if (!this.canUseDisplayInputAuthority()) return false;
     return dashboardControlTransport.displayInput(displayId, event);
@@ -38020,6 +38191,73 @@ window.intendantDashboardControl = {
       subscriptionSent,
     };
   },
+  async _debugProbePresenceMediaConnectNoLegacy() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof sendDashboardVoiceLog !== 'function' ||
+      typeof sendDashboardVoiceDiagnostic !== 'function' ||
+      typeof sendDashboardVideoFrameToServer !== 'function' ||
+      !dashboardTransport ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        voiceLogType: typeof sendDashboardVoiceLog,
+        diagnosticType: typeof sendDashboardVoiceDiagnostic,
+        videoFrameType: typeof sendDashboardVideoFrameToServer,
+        hasDashboardTransport: Boolean(dashboardTransport),
+        hasControlTransport: Boolean(dashboardControlTransport),
+        presenceFrameCount: 0,
+        uploadCount: 0,
+        legacyCount: 0,
+      };
+    }
+    const previousStatus = dashboardControlTransport.lastStatus;
+    const previousPresenceFrame = dashboardTransport.presenceFrame;
+    const previousUploadBytes = dashboardTransport.uploadBytes;
+    const previousApp = app;
+    let presenceFrameCount = 0;
+    let uploadCount = 0;
+    let legacyCount = 0;
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      presence_frames_available: true,
+      upload_frames_available: true,
+      api_presence_video_frame_available: true,
+    };
+    dashboardTransport.presenceFrame = function(frame) {
+      if (frame && (frame.t === 'voice_log' || frame.t === 'voice_diagnostic')) {
+        presenceFrameCount += 1;
+      }
+      return true;
+    };
+    dashboardTransport.uploadBytes = async function(method, params, bytes, options) {
+      if (method === 'api_presence_video_frame') uploadCount += 1;
+      return { ok: true, _httpOk: true };
+    };
+    app = {
+      send_voice_log() { legacyCount += 1; },
+      send_voice_diagnostic() { legacyCount += 1; },
+      send_video_frame_to_server() { legacyCount += 1; },
+    };
+    try {
+      sendDashboardVoiceLog('connect probe', 'debug');
+      sendDashboardVoiceDiagnostic('connect_probe', 'ok');
+      await sendDashboardVideoFrameToServer('AQID', 'connect-probe-f00001', 'debug');
+    } finally {
+      dashboardControlTransport.lastStatus = previousStatus;
+      dashboardTransport.presenceFrame = previousPresenceFrame;
+      dashboardTransport.uploadBytes = previousUploadBytes;
+      app = previousApp;
+    }
+    return {
+      skipped: false,
+      presenceFrameCount,
+      uploadCount,
+      legacyCount,
+    };
+  },
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);
   },
@@ -38034,6 +38272,9 @@ window.intendantDashboardControl = {
   },
   tuiFrame(frame) {
     return dashboardTransport.tuiFrame(frame);
+  },
+  presenceFrame(frame) {
+    return dashboardTransport.presenceFrame(frame);
   },
   agentCard(options = {}) {
     return dashboardTransport.request('api_agent_card', {}, options);
@@ -38875,6 +39116,12 @@ class DashboardControlTransport {
     return true;
   }
 
+  presenceFrame(frame) {
+    if (!this.canUseRpc()) return false;
+    this.sendFrame({ t: 'presence_frame', frame });
+    return true;
+  }
+
   stream(method, params = {}, options = {}, onEvent = {}) {
     if (options.signal?.aborted) {
       return Promise.reject(dashboardControlAbortError());
@@ -39179,6 +39426,8 @@ class DashboardControlTransport {
       uploadFramesAvailable: this.lastStatus?.upload_frames_available ?? null,
       terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
       tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
+      presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
+      apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
       apiSessionDeleteAvailable: this.lastStatus?.api_session_delete_available ?? null,
