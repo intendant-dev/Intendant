@@ -2,35 +2,10 @@
 'use strict';
 
 const assert = require('assert');
-const path = require('path');
+const { httpJson, httpStatus, launchBrowser } = require('./lib/browser-automation.cjs');
 
 const DEFAULT_ORIGIN = 'https://127.0.0.1:8766';
 const CONNECT_TIMEOUT_MS = 30000;
-
-function loadPlaywright() {
-  const candidates = ['playwright'];
-  if (process.env.PLAYWRIGHT_NODE_PATH) {
-    candidates.push(path.join(process.env.PLAYWRIGHT_NODE_PATH, 'playwright'));
-    candidates.push(path.join(process.env.PLAYWRIGHT_NODE_PATH, 'node_modules', 'playwright'));
-  }
-  if (process.env.NODE_PATH) {
-    for (const entry of process.env.NODE_PATH.split(path.delimiter).filter(Boolean)) {
-      candidates.push(path.join(entry, 'playwright'));
-    }
-  }
-  for (const candidate of candidates) {
-    try {
-      return require(candidate);
-    } catch (err) {
-      if (err && err.code !== 'MODULE_NOT_FOUND') throw err;
-    }
-  }
-  throw new Error(
-    'Playwright is required. Install it in a temporary prefix and run with ' +
-      '`PLAYWRIGHT_NODE_PATH=<prefix>/node_modules node scripts/validate-connect-bootstrap.cjs`, ' +
-      'or run from a workspace that has the `playwright` package installed.'
-  );
-}
 
 function usage() {
   console.log(`Usage:
@@ -39,6 +14,7 @@ function usage() {
 Environment:
   INTENDANT_CONNECT_ORIGIN   Origin to test. Defaults to ${DEFAULT_ORIGIN}.
   PLAYWRIGHT_NODE_PATH       Optional node_modules directory containing playwright.
+  CHROME_PATH/CHROME_BIN     Optional Chromium executable for the CDP fallback.
 `);
 }
 
@@ -95,21 +71,17 @@ async function waitForConnect(page) {
 
 async function main() {
   const { origin } = parseArgs(process.argv);
-  const { chromium } = loadPlaywright();
-  const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ ignoreHTTPSErrors: true });
+  const browser = await launchBrowser({ headless: true, ignoreHTTPSErrors: true });
 
   try {
-    const configResp = await context.request.get(`${origin}/config`);
+    const certlessConfigStatus = await httpStatus(`${origin}/config`, { ignoreHTTPSErrors: true });
     assert.strictEqual(
-      configResp.status(),
+      certlessConfigStatus,
       401,
-      `/config without client cert returned ${configResp.status()}`
+      `/config without client cert returned ${certlessConfigStatus}`
     );
 
-    const statusResp = await context.request.get(`${origin}/connect/status`);
-    assert.strictEqual(statusResp.status(), 200, `/connect/status returned ${statusResp.status()}`);
-    const statusBody = await statusResp.json();
+    const statusBody = await httpJson(`${origin}/connect/status`, { ignoreHTTPSErrors: true });
     assert.strictEqual(
       statusBody.transport,
       'webrtc-dashboard-control',
@@ -121,9 +93,23 @@ async function main() {
       'connect status did not report dashboard mTLS requirement'
     );
 
-    const page = await context.newPage();
+    const page = await browser.newPage();
     page.on('console', msg => console.log(`[browser:${msg.type()}] ${msg.text()}`));
-    const response = await page.goto(`${origin}/connect/bootstrap`, { waitUntil: 'domcontentloaded' });
+    let response;
+    try {
+      response = await page.goto(`${origin}/connect/bootstrap`, {
+        waitUntil: 'domcontentloaded',
+        timeout: CONNECT_TIMEOUT_MS,
+      });
+    } catch (err) {
+      if (browser.kind === 'cdp') {
+        throw new Error(
+          `CDP browser fallback could not load ${origin}/connect/bootstrap: ${err.message}. ` +
+            'Install Playwright, set PLAYWRIGHT_NODE_PATH, or use a Chrome profile that trusts this daemon HTTPS origin.'
+        );
+      }
+      throw err;
+    }
     assert(response, '/connect/bootstrap produced no response');
     assert.strictEqual(response.status(), 200, `/connect/bootstrap returned ${response.status()}`);
     await page.waitForFunction(() => Boolean(window.intendantConnectDashboard));
@@ -174,7 +160,7 @@ async function main() {
 
     console.log(JSON.stringify({
       origin,
-      certlessConfigStatus: configResp.status(),
+      certlessConfigStatus,
       connectStatus: statusBody,
       connected,
       rpc: {

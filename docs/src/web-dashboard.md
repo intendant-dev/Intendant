@@ -533,16 +533,21 @@ can opt into an outbound rendezvous client with `[connect]` or the
 Run the end-to-end validator with:
 
 ```bash
-PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
-  node scripts/validate-connect-rendezvous.cjs
+node scripts/validate-connect-rendezvous.cjs
 ```
 
-That script starts a local rendezvous HTTP origin, launches a fresh daemon child
-with Connect env vars, verifies that `https://127.0.0.1:<daemon-port>/config`
-still rejects a certless request with `401`, then loads the browser from the
-rendezvous origin and drives `status`, `config`, `api_sessions`, a chunked
-large `api_sessions` response, and application error RPCs over the verified
-DataChannel.
+That script uses Playwright when it is installed (`PLAYWRIGHT_NODE_PATH` may
+point at a temporary `node_modules`), otherwise it falls back to launching
+Chrome/Chromium through the DevTools Protocol. The fallback honors
+`INTENDANT_BROWSER_WORKSPACE_EXECUTABLE`, `INTENDANT_BROWSER_EXECUTABLE`,
+`CHROME_PATH`, and `CHROME_BIN`.
+
+The validator starts a local rendezvous HTTP origin, launches a fresh daemon
+child with Connect env vars, verifies that
+`https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
+`401`, then loads the browser from the rendezvous origin and drives `status`,
+`config`, `api_sessions`, a chunked large `api_sessions` response, and
+application error RPCs over the verified DataChannel.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the

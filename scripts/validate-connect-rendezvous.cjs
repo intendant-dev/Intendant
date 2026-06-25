@@ -4,38 +4,15 @@
 const assert = require('assert');
 const crypto = require('crypto');
 const http = require('http');
-const https = require('https');
 const path = require('path');
 const { spawn } = require('child_process');
+const { httpStatus, launchBrowser } = require('./lib/browser-automation.cjs');
 
 const DEFAULT_DAEMON_PORT = 8876;
 const DEFAULT_RENDEZVOUS_PORT = 9876;
 const DEFAULT_DAEMON_ID = 'connect-e2e-daemon';
 const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
-
-function loadPlaywright() {
-  const candidates = ['playwright'];
-  if (process.env.PLAYWRIGHT_NODE_PATH) {
-    candidates.push(path.join(process.env.PLAYWRIGHT_NODE_PATH, 'playwright'));
-    candidates.push(path.join(process.env.PLAYWRIGHT_NODE_PATH, 'node_modules', 'playwright'));
-  }
-  if (process.env.NODE_PATH) {
-    for (const entry of process.env.NODE_PATH.split(path.delimiter).filter(Boolean)) {
-      candidates.push(path.join(entry, 'playwright'));
-    }
-  }
-  for (const candidate of candidates) {
-    try {
-      return require(candidate);
-    } catch (err) {
-      if (err && err.code !== 'MODULE_NOT_FOUND') throw err;
-    }
-  }
-  throw new Error(
-    'Playwright is required. Set PLAYWRIGHT_NODE_PATH to a node_modules directory containing playwright.'
-  );
-}
 
 function parseArgs(argv) {
   const repoRoot = path.resolve(__dirname, '..');
@@ -643,17 +620,6 @@ async function waitFor(predicate, timeoutMs, label) {
   throw new Error(`timed out waiting for ${label}`);
 }
 
-function httpsStatus(url) {
-  return new Promise((resolve, reject) => {
-    const req = https.request(url, { rejectUnauthorized: false, method: 'GET' }, res => {
-      res.resume();
-      res.on('end', () => resolve(res.statusCode));
-    });
-    req.on('error', reject);
-    req.end();
-  });
-}
-
 async function waitForBrowserConnect(page) {
   let last = null;
   const deadline = Date.now() + CONNECT_TIMEOUT_MS;
@@ -678,7 +644,6 @@ async function waitForBrowserConnect(page) {
 
 async function main() {
   const options = parseArgs(process.argv);
-  const { chromium } = loadPlaywright();
   const rendezvous = createRendezvousServer();
   await new Promise((resolve, reject) => {
     rendezvous.once('error', reject);
@@ -708,16 +673,18 @@ async function main() {
       return status.registered ? status : null;
     }, START_TIMEOUT_MS, 'daemon rendezvous registration');
 
-    const certlessConfigStatus = await httpsStatus(`https://127.0.0.1:${options.daemonPort}/config`);
+    const certlessConfigStatus = await httpStatus(`https://127.0.0.1:${options.daemonPort}/config`, {
+      ignoreHTTPSErrors: true,
+    });
     assert.strictEqual(certlessConfigStatus, 401, `/config without client cert returned ${certlessConfigStatus}`);
 
-    browser = await chromium.launch({ headless: true });
-    const context = await browser.newContext();
-    const page = await context.newPage();
+    browser = await launchBrowser({ headless: true });
+    const page = await browser.newPage();
     page.on('console', msg => console.log(`[browser:${msg.type()}] ${msg.text()}`));
     const publicOrigin = `http://127.0.0.1:${options.rendezvousPort}`;
     const response = await page.goto(`${publicOrigin}/connect?daemon_id=${encodeURIComponent(options.daemonId)}`, {
       waitUntil: 'domcontentloaded',
+      timeout: CONNECT_TIMEOUT_MS,
     });
     assert(response, 'public bootstrap produced no response');
     assert.strictEqual(response.status(), 200, `public bootstrap returned ${response.status()}`);
