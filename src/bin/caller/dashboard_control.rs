@@ -57,6 +57,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_session_current_rollback",
     "api_session_current_redo",
     "api_session_current_prune",
+    "api_session_current_changes",
     "api_fs_stat",
     "api_fs_list",
     "api_sessions_search",
@@ -1069,6 +1070,7 @@ fn control_frame_response(
                         "api_session_current_rollback_available": true,
                         "api_session_current_redo_available": true,
                         "api_session_current_prune_available": true,
+                        "api_session_current_changes_available": true,
                         "api_fs_stat_available": true,
                         "api_fs_list_available": true,
                         "api_sessions_search_available": true,
@@ -1149,6 +1151,7 @@ fn control_frame_response(
                 | "api_session_current_rollback"
                 | "api_session_current_redo"
                 | "api_session_current_prune"
+                | "api_session_current_changes"
                 | "api_fs_stat"
                 | "api_fs_list"
                 | "api_sessions_search"
@@ -1308,6 +1311,9 @@ async fn control_request_response(
         }
         "api_session_current_redo" => api_session_current_redo_response(id, &runtime).await,
         "api_session_current_prune" => api_session_current_prune_response(id, &runtime).await,
+        "api_session_current_changes" => {
+            api_session_current_changes_response(id, params.as_ref(), &runtime).await
+        },
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
@@ -1662,6 +1668,39 @@ async fn api_session_current_prune_response(
     let (file_watcher, _) = active_history_handles(runtime).await;
     let (status_line, body) = crate::web_gateway::handle_history_prune(file_watcher.as_ref()).await;
     http_body_response(id, status_line_code(status_line), body, "session prune")
+}
+
+async fn api_session_current_changes_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let request_line = changes_request_line(params);
+    let (snapshot_dir, project_root) = active_changes_handles(runtime).await;
+    let home = crate::platform::home_dir();
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::handle_changes_request_for_home(
+            &request_line,
+            snapshot_dir.as_deref(),
+            project_root.as_deref(),
+            &home,
+        )
+    })
+    .await;
+    match result {
+        Ok((status_line, body)) => http_body_response(
+            id,
+            status_line_code(status_line),
+            body,
+            "session changes",
+        ),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("session changes task failed: {e}"),
+        }),
+    }
 }
 
 async fn api_fs_stat_response(id: String, params: Option<&serde_json::Value>) -> serde_json::Value {
@@ -2335,6 +2374,44 @@ fn managed_context_query_from_params(params: &serde_json::Value) -> String {
     pairs.join("&")
 }
 
+fn changes_request_line(params: Option<&serde_json::Value>) -> String {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let path = string_param(&params, &["path", "file", "file_path", "filePath"]);
+    let query = request_query_string_param(&params);
+    let mut target = "/api/session/current/changes".to_string();
+    if !path.trim().is_empty() {
+        target.push('/');
+        target.push_str(&percent_encode_path_value(path.trim()));
+    }
+    if !query.is_empty() {
+        target.push('?');
+        target.push_str(&query);
+    }
+    format!("GET {target} HTTP/1.1")
+}
+
+fn request_query_string_param(params: &serde_json::Value) -> String {
+    string_param(params, &["query", "search"])
+        .trim()
+        .trim_start_matches('?')
+        .chars()
+        .take_while(|ch| !ch.is_whitespace() && *ch != '#')
+        .collect()
+}
+
+fn percent_encode_path_value(value: &str) -> String {
+    let mut out = String::new();
+    for byte in value.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
 fn percent_encode_query_value(value: &str) -> String {
     let mut out = String::new();
     for byte in value.as_bytes() {
@@ -2376,6 +2453,14 @@ async fn active_history_handles(
         .as_ref()
         .map(|ctx| Arc::clone(&ctx.agent_state));
     (file_watcher, agent_state)
+}
+
+async fn active_changes_handles(runtime: &ControlRuntime) -> (Option<PathBuf>, Option<PathBuf>) {
+    let session = runtime.shared_session.read().await;
+    (
+        session.snapshot_dir.clone(),
+        session.project_root_for_changes.clone(),
+    )
 }
 
 fn string_param(params: &serde_json::Value, names: &[&str]) -> String {
@@ -2546,6 +2631,10 @@ mod tests {
             status["result"]["api_session_current_prune_available"],
             true
         );
+        assert_eq!(
+            status["result"]["api_session_current_changes_available"],
+            true
+        );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
@@ -2701,6 +2790,34 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn current_changes_without_file_watcher_preserves_http_status() {
+        let mut rt = runtime();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        let queued = control_frame_response(
+            r#"{"t":"request","id":"chg1","method":"api_session_current_changes","params":{}}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(queued.is_none());
+        assert!(pending.contains_key("chg1"));
+
+        let response = rx.recv().await.unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.id, "chg1");
+        assert!(response.done);
+        assert_eq!(response.frame["t"], "response");
+        assert_eq!(response.frame["ok"], true);
+        assert_eq!(response.frame["result"]["error"], "file watcher not active");
+        assert_eq!(response.frame["result"]["_httpStatus"], 503);
+        assert_eq!(response.frame["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
     async fn fs_stat_and_list_preserve_http_status() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("note.txt"), b"hello").unwrap();
@@ -2757,6 +2874,32 @@ mod tests {
                 assert_eq!(response.frame["result"]["_httpOk"], true);
             }
         }
+    }
+
+    #[test]
+    fn changes_rpc_params_build_request_lines() {
+        let params = serde_json::json!({
+            "path": "src/file name.rs",
+            "query": "session_id=abc&source=codex",
+        });
+        assert_eq!(
+            changes_request_line(Some(&params)),
+            "GET /api/session/current/changes/src%2Ffile%20name.rs?session_id=abc&source=codex HTTP/1.1"
+        );
+
+        let params = serde_json::json!({
+            "path": "/tmp/a+b c",
+            "query": "?backend_session_id=thread%2F1#ignored",
+        });
+        assert_eq!(
+            changes_request_line(Some(&params)),
+            "GET /api/session/current/changes/%2Ftmp%2Fa%2Bb%20c?backend_session_id=thread%2F1 HTTP/1.1"
+        );
+
+        assert_eq!(
+            changes_request_line(None),
+            "GET /api/session/current/changes HTTP/1.1"
+        );
     }
 
     #[tokio::test]

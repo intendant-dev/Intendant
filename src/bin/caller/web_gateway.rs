@@ -10132,7 +10132,7 @@ fn handle_changes_request(
     handle_changes_request_inner(request_line, snapshot_dir, project_root, false)
 }
 
-fn handle_changes_request_for_home(
+pub(crate) fn handle_changes_request_for_home(
     request_line: &str,
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,

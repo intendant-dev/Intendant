@@ -13824,7 +13824,7 @@ async function stationCopyChangeDiff(pathArg = '') {
     showControlToast?.('error', 'Select a changed file before copying a diff');
     return;
   }
-  const resp = await fetch(changesRequestUrl(path));
+  const resp = await fetchChangesResponse(path);
   const data = await parseChangesResponse(resp);
   if (data.diff_available === false) {
     throw new Error(data.reason || 'Textual diff is unavailable for this file.');
@@ -15667,7 +15667,7 @@ async function stationOpenDiff(path) {
   let rows = [];
   let error = '';
   try {
-    const resp = await fetch(changesRequestUrl(p));
+    const resp = await fetchChangesResponse(p);
     const data = await parseChangesResponse(resp);
     if (data.diff_available === false) {
       error = data.reason || 'Textual diff is unavailable for this file.';
@@ -19074,6 +19074,19 @@ function changesRequestUrl(path = '') {
   return `/api/session/current/changes${suffix}${query ? `?${query}` : ''}`;
 }
 
+function changesRequestParams(path = '') {
+  return {
+    path: String(path || ''),
+    query: currentChangesTargetQuery(),
+  };
+}
+
+function fetchChangesResponse(path = '') {
+  return dashboardJsonFetch('api_session_current_changes', changesRequestParams(path), () => (
+    fetch(changesRequestUrl(path))
+  ), 'api_session_current_changes');
+}
+
 function showChangesTargetMismatch(message) {
   activeChangesFile = null;
   changedFiles.clear();
@@ -19097,7 +19110,7 @@ async function refreshChangesList(options = {}) {
     return;
   }
   try {
-    const resp = await fetch(changesRequestUrl());
+    const resp = await fetchChangesResponse();
     const data = await parseChangesResponse(resp);
     if (seq !== changesRefreshSeq) return;
     changedFiles.clear();
@@ -19162,7 +19175,7 @@ async function selectChangesFile(path, options = {}) {
   renderChangesDiffHeader(path, changedFiles.get(path), 'Loading');
   content.innerHTML = '<span class="changes-empty">Loading...</span>';
   try {
-    const resp = await fetch(changesRequestUrl(path));
+    const resp = await fetchChangesResponse(path);
     const data = await parseChangesResponse(resp);
     if (path !== activeChangesFile) return;
     if (changedFiles.has(path)) {
@@ -36649,6 +36662,9 @@ window.intendantDashboardControl = {
   pruneCurrent(options = {}) {
     return dashboardTransport.request('api_session_current_prune', {}, options);
   },
+  currentChanges(path = '', options = {}) {
+    return dashboardTransport.request('api_session_current_changes', changesRequestParams(path), options);
+  },
   sessionSearch(params = {}, options = {}) {
     return dashboardTransport.request('api_sessions_search', params, options);
   },
@@ -37225,6 +37241,7 @@ class DashboardControlTransport {
       apiSessionCurrentRollbackAvailable: this.lastStatus?.api_session_current_rollback_available ?? null,
       apiSessionCurrentRedoAvailable: this.lastStatus?.api_session_current_redo_available ?? null,
       apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
+      apiSessionCurrentChangesAvailable: this.lastStatus?.api_session_current_changes_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,
       apiSettingsAvailable: this.lastStatus?.api_settings_available ?? null,
       apiKeyStatusAvailable: this.lastStatus?.api_key_status_available ?? null,
@@ -37269,6 +37286,7 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_sessions_stream':
       return 120000;
     case 'api_sessions_search':
+    case 'api_session_current_changes':
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':

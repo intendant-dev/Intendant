@@ -853,6 +853,10 @@ async function main() {
             revert_conversation: false,
           }),
         },
+        changes: {
+          list: await ctl.request('api_session_current_changes'),
+          traversal: await ctl.request('api_session_current_changes', { path: '../Cargo.toml' }),
+        },
         filesystem: {
           statHome: await ctl.request('api_fs_stat', { path: '~' }),
           listHome: await ctl.request('api_fs_list', { path: '~' }),
@@ -954,6 +958,26 @@ async function main() {
       'timeline rollback validation RPC did not preserve endpoint status'
     );
     assert.strictEqual(
+      result.status.api_session_current_changes_available,
+      true,
+      'dashboard control status did not advertise current session changes'
+    );
+    assert(
+      result.changes?.list && (
+        Array.isArray(result.changes.list) ||
+        result.changes.list._httpStatus === 200 ||
+        result.changes.list._httpStatus === 503
+      ),
+      'changes list RPC did not preserve endpoint status'
+    );
+    assert(
+      result.changes?.traversal && (
+        result.changes.traversal._httpStatus === 400 ||
+        result.changes.traversal._httpStatus === 503
+      ),
+      'changes path validation RPC did not preserve endpoint status'
+    );
+    assert.strictEqual(
       result.status.api_fs_stat_available,
       true,
       'dashboard control status did not advertise filesystem stat'
@@ -1015,6 +1039,10 @@ async function main() {
         completedChunkedResponses: result.finalStatus.completedChunkedResponses,
         agentOutputStatus: result.agentOutput?._httpStatus || 200,
         timelineStatuses: Object.fromEntries(Object.entries(result.timeline || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
+        changesStatuses: Object.fromEntries(Object.entries(result.changes || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,
         ])),
