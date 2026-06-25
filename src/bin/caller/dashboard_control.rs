@@ -48,6 +48,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_cached_bootstrap_events",
     "api_browser_workspace_snapshot",
     "api_state_snapshot",
+    "api_session_log_replay",
     "status",
     "events",
     "response_chunks",
@@ -1198,6 +1199,7 @@ fn control_frame_response(
                 | "api_session_recordings"
                 | "api_browser_workspace_snapshot"
                 | "api_state_snapshot"
+                | "api_session_log_replay"
                 | "api_worktrees"
                 | "api_worktrees_scan"
                 | "api_worktrees_remove"
@@ -1379,6 +1381,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_cached_bootstrap_events_available", true),
         ("api_browser_workspace_snapshot_available", true),
         ("api_state_snapshot_available", true),
+        ("api_session_log_replay_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
@@ -1543,6 +1546,7 @@ async fn control_request_response(
         "api_session_recordings" => api_session_recordings_response(id, params.as_ref()).await,
         "api_browser_workspace_snapshot" => api_browser_workspace_snapshot_response(id).await,
         "api_state_snapshot" => api_state_snapshot_response(id, &runtime).await,
+        "api_session_log_replay" => api_session_log_replay_response(id, &runtime).await,
         "api_worktrees" => api_worktrees_response(id, &runtime).await,
         "api_worktrees_scan" => api_worktrees_scan_response(id, &runtime).await,
         "api_worktrees_remove" => {
@@ -2252,6 +2256,48 @@ async fn api_state_snapshot_response(id: String, runtime: &ControlRuntime) -> se
     })
 }
 
+async fn api_session_log_replay_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let replay_log_dir = active_replay_log_dir(runtime).await;
+    let mut replay = replay_log_dir
+        .as_ref()
+        .and_then(|log_dir| {
+            crate::web_gateway::session_log_replay_payload_for_websocket_bootstrap(log_dir)
+        })
+        .and_then(|(payload, external_session_id)| {
+            let mut value = serde_json::from_str::<serde_json::Value>(&payload).ok()?;
+            if let (Some(external_session_id), Some(map)) =
+                (external_session_id, value.as_object_mut())
+            {
+                map.insert(
+                    "external_session_id".to_string(),
+                    serde_json::Value::String(external_session_id),
+                );
+            }
+            Some(value)
+        })
+        .unwrap_or_else(|| {
+            serde_json::json!({
+                "t": "log_replay",
+                "entries": [],
+                "available": false,
+            })
+        });
+    if let Some(map) = replay.as_object_mut() {
+        map.entry("available".to_string())
+            .or_insert(serde_json::Value::Bool(true));
+    }
+
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": replay,
+    })
+}
+
 fn control_replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
     std::fs::read_to_string(log_dir.join("session_meta.json"))
         .ok()
@@ -2274,6 +2320,18 @@ fn control_session_log_id(
         .ok()
         .map(|log| log.session_id().to_string())
         .filter(|id| !id.trim().is_empty())
+}
+
+async fn active_replay_log_dir(runtime: &ControlRuntime) -> Option<PathBuf> {
+    let (query_ctx, session_log) = {
+        let session = runtime.shared_session.read().await;
+        (session.query_ctx.clone(), session.session_log.clone())
+    };
+    query_ctx.as_ref().map(|ctx| ctx.log_dir.clone()).or_else(|| {
+        session_log
+            .as_ref()
+            .and_then(|log| log.lock().ok().map(|log| log.dir().to_path_buf()))
+    })
 }
 
 async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
@@ -3565,6 +3623,7 @@ mod tests {
             true
         );
         assert_eq!(status["result"]["api_state_snapshot_available"], true);
+        assert_eq!(status["result"]["api_session_log_replay_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
@@ -4019,6 +4078,18 @@ mod tests {
         assert_eq!(snapshot["result"]["config"]["provider"], "openai");
         assert_eq!(snapshot["result"]["session_id"], "");
         assert!(snapshot["result"]["state"].is_object());
+    }
+
+    #[tokio::test]
+    async fn session_log_replay_rpc_returns_empty_replay_without_active_log() {
+        let rt = runtime();
+        let replay = api_session_log_replay_response("replay1".to_string(), &rt).await;
+        assert_eq!(replay["t"], "response");
+        assert_eq!(replay["id"], "replay1");
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["result"]["t"], "log_replay");
+        assert_eq!(replay["result"]["available"], false);
+        assert_eq!(replay["result"]["entries"].as_array().unwrap().len(), 0);
     }
 
     #[tokio::test]

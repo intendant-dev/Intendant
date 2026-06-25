@@ -2442,6 +2442,15 @@ fn session_log_replay_payload_from_dir_with_limit(
     ))
 }
 
+pub(crate) fn session_log_replay_payload_for_websocket_bootstrap(
+    log_dir: &std::path::Path,
+) -> Option<(String, Option<String>)> {
+    session_log_replay_payload_from_dir_with_limit(
+        log_dir,
+        Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
+    )
+}
+
 fn limited_session_detail_entries(
     entries: Vec<serde_json::Value>,
     limit: Option<usize>,

@@ -136,6 +136,7 @@ async function main() {
         cachedBootstrapEvents: await ctl.cachedBootstrapEvents({ timeoutMs: 60000 }),
         browserWorkspaceSnapshot: await ctl.browserWorkspaceSnapshot({ timeoutMs: 60000 }),
         stateSnapshot: await ctl.stateSnapshot({ timeoutMs: 60000 }),
+        sessionLogReplay: await ctl.sessionLogReplay({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         rejectedControlMsg: await ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
@@ -166,12 +167,15 @@ async function main() {
       'state snapshot connection id did not match control session id'
     );
     assert(result.stateSnapshot.state && typeof result.stateSnapshot.state === 'object', 'state snapshot did not return state');
+    assert.strictEqual(result.sessionLogReplay?.t, 'log_replay', 'session log replay RPC did not return the event shape');
+    assert(Array.isArray(result.sessionLogReplay.entries), 'session log replay did not return entries');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert.strictEqual(result.finalStatus.signalingMode, 'local-http');
     assert.strictEqual(result.finalStatus.apiAgentCardAvailable, true);
     assert.strictEqual(result.finalStatus.apiCachedBootstrapEventsAvailable, true);
     assert.strictEqual(result.finalStatus.apiBrowserWorkspaceSnapshotAvailable, true);
     assert.strictEqual(result.finalStatus.apiStateSnapshotAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionLogReplayAvailable, true);
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
     assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedControlMsg?._httpOk, false);
@@ -190,11 +194,13 @@ async function main() {
         cachedBootstrapEventCount: result.cachedBootstrapEvents.event_count,
         browserWorkspaceCount: result.browserWorkspaceSnapshot.workspaces.length,
         stateSnapshotConnectionId: result.stateSnapshot.connection_id,
+        sessionLogReplayEntryCount: result.sessionLogReplay.entries.length,
         sessionCount: result.sessions.length,
         apiAgentCardAvailable: result.finalStatus.apiAgentCardAvailable,
         apiCachedBootstrapEventsAvailable: result.finalStatus.apiCachedBootstrapEventsAvailable,
         apiBrowserWorkspaceSnapshotAvailable: result.finalStatus.apiBrowserWorkspaceSnapshotAvailable,
         apiStateSnapshotAvailable: result.finalStatus.apiStateSnapshotAvailable,
+        apiSessionLogReplayAvailable: result.finalStatus.apiSessionLogReplayAvailable,
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,

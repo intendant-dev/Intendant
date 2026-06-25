@@ -829,6 +829,7 @@ async function main() {
         cachedBootstrapEvents: await ctl.request('api_cached_bootstrap_events'),
         browserWorkspaceSnapshot: await ctl.request('api_browser_workspace_snapshot'),
         stateSnapshot: await ctl.request('api_state_snapshot'),
+        sessionLogReplay: await ctl.request('api_session_log_replay'),
         sessions,
         sessionsById,
         sessionsByIdTarget: firstSessionId,
@@ -934,6 +935,11 @@ async function main() {
       true,
       'dashboard control status did not advertise state snapshots'
     );
+    assert.strictEqual(
+      result.status.api_session_log_replay_available,
+      true,
+      'dashboard control status did not advertise session log replay'
+    );
     assert(result.config && typeof result.config === 'object', 'config RPC did not return an object');
     assert(result.agentCard && result.agentCard.id, 'api_agent_card did not return an id');
     assert(Array.isArray(result.cachedBootstrapEvents?.events), 'cached bootstrap events RPC did not return events');
@@ -955,6 +961,8 @@ async function main() {
       'state snapshot connection id did not match control session id'
     );
     assert(result.stateSnapshot.state && typeof result.stateSnapshot.state === 'object', 'state snapshot did not return state');
+    assert.strictEqual(result.sessionLogReplay?.t, 'log_replay', 'session log replay RPC did not return the event shape');
+    assert(Array.isArray(result.sessionLogReplay.entries), 'session log replay did not return entries');
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert(Array.isArray(result.sessionsById), 'api_sessions ids did not return an array');
     if (result.sessionsByIdTarget) {
@@ -1217,6 +1225,7 @@ async function main() {
         cachedBootstrapEventCount: result.cachedBootstrapEvents.event_count,
         browserWorkspaceCount: result.browserWorkspaceSnapshot.workspaces.length,
         stateSnapshotConnectionId: result.stateSnapshot.connection_id,
+        sessionLogReplayEntryCount: result.sessionLogReplay.entries.length,
         sessionCount: result.sessions.length,
         sessionByIdCount: result.sessionsById.length,
         sessionDeleteInvalidOk: result.sessionDelete.invalidSession?.ok,

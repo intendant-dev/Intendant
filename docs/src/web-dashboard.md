@@ -772,6 +772,10 @@ and a DataChannel-scoped `connection_id`. The connection id is the WebRTC
 control session id, not the legacy WebSocket connection id; display authority
 still needs its own DataChannel-aware identity handling before display bootstrap
 can move off the primary WebSocket.
+`api_session_log_replay` returns the existing capped `log_replay` message shape
+used by late WebSocket joiners. When no active session log exists it returns an
+empty replay with `available: false`; external attached-session transcript replay
+is still separate and has not moved onto this RPC.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.
