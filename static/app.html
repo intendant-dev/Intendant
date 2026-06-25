@@ -18168,9 +18168,6 @@ async function connectVoice() {
   if (audioCtx.state === 'suspended') audioCtx.resume();
   showVoiceStatus('Connecting...');
   app.connect_voice(provider, token, model, inputRate);
-  if (dashboardConnectModeEnabled()) {
-    sendDashboardPresenceConnect(provider, model);
-  }
   voiceConnecting = false;
 }
 
@@ -18193,6 +18190,7 @@ function showSettingsDialog() {
 async function main() {
   await init({ module_or_path: '/wasm-web/presence_web_bg.wasm' });
   app = new PresenceWeb();
+  installDashboardControlServerSender();
 
   // Intercept all server messages for AppState routing.
   // The WebRTC dashboard-control dev path reuses this same dispatcher for
@@ -18437,6 +18435,7 @@ async function main() {
       if (eventRefreshesSessionMetadata(d.event)) {
         scheduleSessionsMetadataRefresh();
       }
+      maybeHandleDashboardTunneledServerMessage(d);
     } catch(_) {}
     const cmds = app.handle_server_message(msg);
     if (cmds) processCommands(cmds);
@@ -18541,7 +18540,6 @@ async function main() {
     if (!usage) return;
     const cmds = app.handle_live_usage(usage);
     if (cmds) processCommands(cmds);
-    if (dashboardConnectModeEnabled()) sendDashboardLiveUsage(usage);
   });
 
   app.set_on_error((msg) => {
@@ -30162,6 +30160,78 @@ function sendDashboardPresenceFrame(frame, fallback = null, label = frame?.t || 
   return false;
 }
 
+const DASHBOARD_TUNNELED_SERVER_TYPES = new Set([
+  'state_snapshot',
+  'presence_welcome',
+  'presence_checkpoint_ack',
+  'force_disconnect_voice',
+  'active_granted',
+  'tool_response',
+  'async_query_result',
+  'display_input_authority_state',
+]);
+
+function maybeHandleDashboardTunneledServerMessage(message) {
+  if (!dashboardConnectModeEnabled()) return false;
+  if (!message || typeof message !== 'object') return false;
+  if (!DASHBOARD_TUNNELED_SERVER_TYPES.has(String(message.t || ''))) return false;
+  if (!app || typeof app.handle_tunneled_server_message !== 'function') return false;
+  try {
+    app.handle_tunneled_server_message(message);
+    return true;
+  } catch (err) {
+    console.warn('[dashboard-control] tunneled presence message handling failed', err);
+    return false;
+  }
+}
+
+function dashboardControlServerSender(message) {
+  if (!dashboardConnectModeEnabled()) return false;
+  if (!message || typeof message !== 'object') return false;
+  const t = String(message.t || '');
+  if (
+    t === 'presence_connect' ||
+    t === 'presence_disconnect' ||
+    t === 'voice_log' ||
+    t === 'presence_checkpoint' ||
+    t === 'voice_diagnostic' ||
+    t === 'live_usage_update' ||
+    t === 'tool_request' ||
+    t === 'async_query' ||
+    t === 'make_active'
+  ) {
+    return sendDashboardPresenceFrame(message, null, t);
+  }
+  if (t === 'video_frame') {
+    sendDashboardVideoFrameToServer(message.data || '', message.frame_id || message.frameId || '', message.stream || 'cam0')
+      .catch(err => console.warn('[dashboard-control] tunneled video frame failed', err));
+    return true;
+  }
+  if (message.action) {
+    if (!dashboardTransport || !dashboardTransport.canUseRpc || !dashboardTransport.canUseRpc()) {
+      dashboardWarnPresenceOnce(
+        'control_action',
+        '[dashboard-control] voice action unavailable without the Connect control tunnel'
+      );
+      return false;
+    }
+    dashboardTransport.request('api_control_msg', { message }, { timeoutMs: 10000 })
+      .catch(err => console.warn('[dashboard-control] voice action RPC failed', err));
+    return true;
+  }
+  dashboardWarnPresenceOnce(
+    `server_sender:${t || 'unknown'}`,
+    `[dashboard-control] unsupported tunneled server message: ${t || 'unknown'}`
+  );
+  return false;
+}
+
+function installDashboardControlServerSender() {
+  if (!dashboardConnectModeEnabled()) return;
+  if (!app || typeof app.set_server_sender !== 'function') return;
+  app.set_server_sender((message) => dashboardControlServerSender(message));
+}
+
 function activeVoiceModelForPresence(provider, explicitModel = null) {
   if (explicitModel) return explicitModel;
   if (gatewayConfig?.model) return gatewayConfig.model;
@@ -30189,7 +30259,6 @@ function sendDashboardPresenceDisconnect() {
 function disconnectDashboardVoice() {
   if (!app) return;
   app.disconnect_voice();
-  if (dashboardConnectModeEnabled()) sendDashboardPresenceDisconnect();
 }
 
 function sendDashboardVoiceLog(text, toolContext) {
@@ -38258,6 +38327,110 @@ window.intendantDashboardControl = {
       legacyCount,
     };
   },
+  async _debugProbePresenceServerSenderConnectNoLegacy() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof dashboardControlServerSender !== 'function' ||
+      !dashboardTransport ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        senderType: typeof dashboardControlServerSender,
+        hasDashboardTransport: Boolean(dashboardTransport),
+        hasControlTransport: Boolean(dashboardControlTransport),
+        presenceFrameCount: 0,
+        actionRpcCount: 0,
+      };
+    }
+    const previousStatus = dashboardControlTransport.lastStatus;
+    const previousPresenceFrame = dashboardTransport.presenceFrame;
+    const previousRequest = dashboardTransport.request;
+    let presenceFrameCount = 0;
+    let actionRpcCount = 0;
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      presence_frames_available: true,
+      presence_active_handoff_available: true,
+      presence_tool_request_available: true,
+    };
+    dashboardTransport.presenceFrame = function(frame) {
+      if (frame && (frame.t === 'make_active' || frame.t === 'async_query')) {
+        presenceFrameCount += 1;
+      }
+      return true;
+    };
+    dashboardTransport.request = function(method, params, options) {
+      if (method === 'api_control_msg') actionRpcCount += 1;
+      return Promise.resolve({ ok: true, _httpOk: true });
+    };
+    try {
+      dashboardControlServerSender({ t: 'make_active', provider: 'gemini', model: 'debug' });
+      dashboardControlServerSender({ t: 'async_query', id: 'aq_debug', tool: 'recall_memory', args: {} });
+      dashboardControlServerSender({ action: 'approve', id: 123 });
+      await new Promise(resolve => setTimeout(resolve, 0));
+    } finally {
+      dashboardControlTransport.lastStatus = previousStatus;
+      dashboardTransport.presenceFrame = previousPresenceFrame;
+      dashboardTransport.request = previousRequest;
+    }
+    return {
+      skipped: false,
+      presenceFrameCount,
+      actionRpcCount,
+    };
+  },
+  async _debugProbeTunneledPresenceServerCallback() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof maybeHandleDashboardTunneledServerMessage !== 'function' ||
+      !app ||
+      typeof app.handle_tunneled_server_message !== 'function'
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        hasApp: Boolean(app),
+        hasHandler: Boolean(app && typeof app.handle_tunneled_server_message === 'function'),
+        diagnosticCount: 0,
+      };
+    }
+    const previousDiagnostic = sendDashboardVoiceDiagnostic;
+    const previousHasVoiceCredentials = hasVoiceCredentials;
+    const previousIsActiveBrowser = isActiveBrowser;
+    const previousStoredConversationCtx = storedConversationCtx;
+    let diagnosticCount = 0;
+    sendDashboardVoiceDiagnostic = function(kind, detail) {
+      if (kind === 'make_active_granted_client' && String(detail || '').includes('handover=yes')) {
+        diagnosticCount += 1;
+      }
+      return true;
+    };
+    hasVoiceCredentials = function() {
+      return false;
+    };
+    try {
+      const handled = maybeHandleDashboardTunneledServerMessage({
+        t: 'active_granted',
+        handover_context: 'connect handoff probe',
+        conversation_context: 'connect conversation probe',
+      });
+      await new Promise(resolve => setTimeout(resolve, 0));
+      return {
+        skipped: false,
+        handled,
+        diagnosticCount,
+        isActiveBrowserAfter: isActiveBrowser,
+      };
+    } finally {
+      sendDashboardVoiceDiagnostic = previousDiagnostic;
+      hasVoiceCredentials = previousHasVoiceCredentials;
+      isActiveBrowser = previousIsActiveBrowser;
+      storedConversationCtx = previousStoredConversationCtx;
+      updateActivePassiveUI();
+    }
+  },
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);
   },
@@ -38549,7 +38722,7 @@ class DashboardControlTransport {
     dashboardSetControlLastError('');
     this.refreshIceRoute().catch(() => {});
     dashboardUpdateTransportStatus();
-    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'tui_frames'] });
+    this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'tui_frames', 'presence_frames', 'presence_active_handoff', 'presence_tool_request'] });
     this.ping().catch(() => {});
     this.request('status').then(status => {
       if (status && typeof status === 'object') {
@@ -39427,6 +39600,8 @@ class DashboardControlTransport {
       terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
       tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
       presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
+      presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
+      presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,
       apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,

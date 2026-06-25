@@ -95,8 +95,159 @@ mod wasm_impl {
         /// Pending voice tool calls waiting for async_query_result from server.
         /// Maps async query ID → original JsValue tool call (for send_voice_tool_response).
         pending_async_calls: Rc<RefCell<std::collections::HashMap<String, JsValue>>>,
+        last_server_session_id: Rc<RefCell<Option<String>>>,
         tool_request_counter: RefCell<u32>,
         dashboard: RefCell<app_state::AppState>,
+    }
+
+    fn route_server_message(
+        cb: &Rc<Callbacks>,
+        pending: &Rc<RefCell<std::collections::HashMap<String, js_sys::Function>>>,
+        pending_async: &Rc<RefCell<std::collections::HashMap<String, JsValue>>>,
+        presence: &Rc<RefCell<WasmPresence>>,
+        last_session_id: &Rc<RefCell<Option<String>>>,
+        msg: serde_json::Value,
+        fire_raw_message: bool,
+    ) {
+        let t = msg.get("t").and_then(|v| v.as_str());
+
+        match t {
+            Some("terminal_output") => {
+                let host_id = msg
+                    .get("host_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("local");
+                let terminal_id = msg
+                    .get("terminal_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("shell-0");
+                if let Some(data) = msg.get("data").and_then(|v| v.as_str()) {
+                    cb.invoke_terminal_output(host_id, terminal_id, data);
+                }
+                return;
+            }
+            Some("terminal_exited") => {
+                let host_id = msg
+                    .get("host_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("local");
+                let terminal_id = msg
+                    .get("terminal_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("shell-0");
+                let status = msg.get("status").and_then(|v| v.as_i64()).unwrap_or(-1);
+                cb.invoke_terminal_exited(host_id, terminal_id, status as i32);
+                return;
+            }
+            _ => {}
+        }
+
+        if fire_raw_message {
+            cb.invoke_raw_message(&to_js(&msg));
+        }
+
+        match t {
+            Some("term") => {
+                if let Some(d) = msg["d"].as_str() {
+                    cb.invoke_term(d);
+                }
+            }
+            Some("state_snapshot") => {
+                if let Some(state) = msg.get("state") {
+                    presence.borrow_mut().set_state(to_js(state));
+                }
+                cb.invoke_state_snapshot(&to_js(&msg));
+            }
+            Some("presence_welcome") => {
+                if let Some(sid) = msg.get("session_id").and_then(|v| v.as_str()) {
+                    let mut last = last_session_id.borrow_mut();
+                    if let Some(ref prev) = *last {
+                        if prev != sid {
+                            cb.invoke_diagnostic(
+                                "session_changed",
+                                &format!("{} -> {}", prev, sid),
+                            );
+                            cb.invoke_session_changed();
+                        }
+                    }
+                    *last = Some(sid.to_string());
+                }
+                if let Some(state) = msg.get("state") {
+                    presence.borrow_mut().set_state(to_js(state));
+                }
+                if let Some(events) = msg.get("events").and_then(|v| v.as_array()) {
+                    for event in events {
+                        if let Some(inner) = event.get("event") {
+                            presence.borrow_mut().update_from_event(to_js(inner));
+                        }
+                    }
+                }
+                cb.invoke_state_snapshot(&to_js(&msg));
+            }
+            Some("presence_checkpoint_ack") => {}
+            Some("force_disconnect_voice") => {
+                let reason = msg["reason"].as_str().unwrap_or("unknown");
+                cb.invoke_force_disconnect(reason);
+            }
+            Some("active_granted") => {
+                let handover_context = msg["handover_context"].as_str().unwrap_or("");
+                let conversation_context = msg["conversation_context"].as_str().unwrap_or("");
+                cb.invoke_active_granted(handover_context, conversation_context);
+            }
+            Some("tool_response") => {
+                if let Some(id) = msg["id"].as_str() {
+                    let resolver = pending.borrow_mut().remove(id);
+                    if let Some(f) = resolver {
+                        let result_js =
+                            to_js(msg.get("result").unwrap_or(&serde_json::Value::Null));
+                        let _ = f.call1(&JsValue::NULL, &result_js);
+                    }
+                }
+            }
+            Some("async_query_result") => {
+                let req_id = msg["id"].as_str().unwrap_or("");
+                let tool = msg["tool"].as_str().unwrap_or("query");
+                let result_text = msg["result"].as_str().unwrap_or("");
+                let truncated = if result_text.len() > 2000 {
+                    format!("{}...(truncated)", &result_text[..2000])
+                } else {
+                    result_text.to_string()
+                };
+
+                if let Some(images) = msg["images"].as_array() {
+                    for (i, img) in images.iter().enumerate() {
+                        if let Some(data) = img["data"].as_str() {
+                            let label = format!("{}_{}", tool, i);
+                            cb.invoke_inject_voice_image(data, &label);
+                        }
+                    }
+                }
+
+                let pending_call = pending_async.borrow_mut().remove(req_id);
+                if let Some(original_call) = pending_call {
+                    let result = serde_json::json!({"result": truncated});
+                    cb.invoke_tool_response(&original_call, &to_js(&result));
+                } else {
+                    let text = format!("[System: {} result] {}", tool, truncated);
+                    cb.invoke_inject_voice_text_passive(&text);
+                }
+            }
+            Some("display_input_authority_state") => {
+                if let (Some(display_id), Some(state)) = (
+                    msg.get("display_id").and_then(|v| v.as_u64()),
+                    msg.get("state").and_then(|v| v.as_str()),
+                ) {
+                    cb.invoke_display_input_authority_change(display_id as u32, state);
+                }
+            }
+            _ => {
+                if msg.get("event").is_some() {
+                    let event_js = to_js(&msg);
+                    presence.borrow_mut().update_from_event(event_js.clone());
+                    cb.invoke_server_event(&event_js);
+                }
+            }
+        }
     }
 
     #[wasm_bindgen]
@@ -106,6 +257,7 @@ mod wasm_impl {
             let callbacks = Rc::new(Callbacks::default());
             let presence = Rc::new(RefCell::new(WasmPresence::new()));
             let pending = Rc::new(RefCell::new(std::collections::HashMap::new()));
+            let last_server_session_id = Rc::new(RefCell::new(None));
 
             let mut server = server::ServerConnection::new(callbacks.clone());
 
@@ -127,6 +279,7 @@ mod wasm_impl {
                 active_provider: RefCell::new(String::new()),
                 pending_tool_requests: pending,
                 pending_async_calls: Rc::new(RefCell::new(std::collections::HashMap::new())),
+                last_server_session_id,
                 tool_request_counter: RefCell::new(0),
                 dashboard: RefCell::new(app_state::AppState::new()),
             }
@@ -441,6 +594,40 @@ mod wasm_impl {
             let mut server = self.server.borrow_mut();
             server.set_message_handler(handler);
             server.connect(url);
+        }
+
+        /// Install a custom JSON sender for transports other than the daemon
+        /// WebSocket. Public-origin Connect mode uses this to route the same
+        /// presence/server messages through the verified dashboard-control
+        /// DataChannel.
+        #[wasm_bindgen]
+        pub fn set_server_sender(&self, sender: Function) {
+            self.server.borrow_mut().set_custom_sender(Some(sender));
+        }
+
+        #[wasm_bindgen]
+        pub fn clear_server_sender(&self) {
+            self.server.borrow_mut().set_custom_sender(None);
+        }
+
+        /// Route a server-origin message delivered by a non-WebSocket transport
+        /// through the same presence callbacks as the normal WebSocket path.
+        /// Raw-message callbacks are intentionally suppressed to avoid
+        /// re-entering the dashboard dispatcher that delivered the frame.
+        #[wasm_bindgen]
+        pub fn handle_tunneled_server_message(&self, msg: JsValue) {
+            let Ok(val) = serde_wasm_bindgen::from_value::<serde_json::Value>(msg) else {
+                return;
+            };
+            route_server_message(
+                &self.callbacks,
+                &self.pending_tool_requests,
+                &self.pending_async_calls,
+                &self.presence,
+                &self.last_server_session_id,
+                val,
+                false,
+            );
         }
 
         #[wasm_bindgen]

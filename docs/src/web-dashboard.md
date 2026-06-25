@@ -992,16 +992,21 @@ fallback, so annotation and clip writes fail visibly when the verified media
 tunnel is not available. After a tunneled media write is attempted, failures are
 surfaced and are not replayed over the WebSocket.
 Browser-side live voice keeps its provider WebSocket in the browser, but the
-daemon coordination side now has a partial Connect tunnel: `presence_frame`
-DataChannel messages carry `presence_connect`, `presence_disconnect`,
-`voice_log`, `presence_checkpoint`, `voice_diagnostic`, and
-`live_usage_update`, while HQ browser video/archive frames use
+daemon coordination side uses the Connect control tunnel. The WASM presence
+bridge can install a custom sender so its normal server messages route over the
+verified DataChannel instead of `/ws`: `presence_frame` carries
+`presence_connect`, `presence_disconnect`, `make_active`, `voice_log`,
+`presence_checkpoint`, `voice_diagnostic`, `live_usage_update`, `tool_request`,
+and `async_query`. Server responses such as `presence_welcome`,
+`force_disconnect_voice`, `active_granted`, `tool_response`, and
+`async_query_result` are delivered back to the same WASM callback router that
+the WebSocket path uses. HQ browser video/archive frames use
 `api_presence_video_frame` over the ordered `upload_*` substrate. Public-origin
-Connect pages therefore do not depend on the daemon-origin WebSocket for voice
-event logging or frame archival. Server-side transcription audio and live voice
-tool requests still originate inside the WASM presence bridge and need a sender
-hook before they can use this tunnel; Connect mode drops transcription audio
-rather than replaying it over the legacy bridge.
+Connect pages therefore do not depend on the daemon-origin WebSocket for active
+voice handoff, voice event logging, live voice tool/query dispatch, or frame
+archival. Server-side transcription audio remains intentionally untunneled for
+now; Connect mode drops that optional audio stream rather than replaying it over
+the legacy bridge.
 Current-upload list reads use `api_session_current_uploads`, returning the same
 staged-upload descriptor array as `GET /api/session/current/uploads`.
 Current-upload raw reads use `api_session_current_upload_raw` over

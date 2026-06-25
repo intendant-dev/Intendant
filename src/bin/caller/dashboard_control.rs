@@ -26,9 +26,11 @@ use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::future::Future;
 use std::io::{Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -73,6 +75,8 @@ const CONTROL_FEATURES: &[&str] = &[
     "terminal_frames",
     "tui_frames",
     "presence_frames",
+    "presence_active_handoff",
+    "presence_tool_request",
     "api_session_current_uploads",
     "api_session_current_upload_raw",
     "api_presence_video_frame",
@@ -155,9 +159,11 @@ pub struct DashboardControlRegistry {
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     terminal_registry: Arc<crate::terminal::TerminalRegistry>,
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
+    task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
+    presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
@@ -173,6 +179,90 @@ pub struct DashboardBootstrapCaches {
     pub(crate) last_external_agent_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_user_display_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) attached_external_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
+}
+
+type DashboardPresenceFuture = Pin<Box<dyn Future<Output = ()> + Send>>;
+
+#[derive(Clone)]
+pub struct DashboardPresenceBridge {
+    connect: Arc<dyn Fn(DashboardPresenceConnectRequest) -> DashboardPresenceFuture + Send + Sync>,
+    disconnect:
+        Arc<dyn Fn(DashboardPresenceDisconnectRequest) -> DashboardPresenceFuture + Send + Sync>,
+    make_active:
+        Arc<dyn Fn(DashboardPresenceMakeActiveRequest) -> DashboardPresenceFuture + Send + Sync>,
+    cleanup: Arc<dyn Fn(String) -> DashboardPresenceFuture + Send + Sync>,
+    record_voice_log: Arc<dyn Fn(String) + Send + Sync>,
+}
+
+#[derive(Clone)]
+pub struct DashboardPresenceConnectRequest {
+    pub session_id: String,
+    pub control_tx: mpsc::UnboundedSender<serde_json::Value>,
+    pub server_session_id: Option<String>,
+    pub last_event_seq: u64,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+    pub passive: bool,
+}
+
+#[derive(Clone)]
+pub struct DashboardPresenceDisconnectRequest {
+    pub session_id: String,
+}
+
+#[derive(Clone)]
+pub struct DashboardPresenceMakeActiveRequest {
+    pub session_id: String,
+    pub control_tx: mpsc::UnboundedSender<serde_json::Value>,
+    pub provider: Option<String>,
+    pub model: Option<String>,
+}
+
+impl DashboardPresenceBridge {
+    pub fn new(
+        connect: impl Fn(DashboardPresenceConnectRequest) -> DashboardPresenceFuture
+            + Send
+            + Sync
+            + 'static,
+        disconnect: impl Fn(DashboardPresenceDisconnectRequest) -> DashboardPresenceFuture
+            + Send
+            + Sync
+            + 'static,
+        make_active: impl Fn(DashboardPresenceMakeActiveRequest) -> DashboardPresenceFuture
+            + Send
+            + Sync
+            + 'static,
+        cleanup: impl Fn(String) -> DashboardPresenceFuture + Send + Sync + 'static,
+        record_voice_log: impl Fn(String) + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            connect: Arc::new(connect),
+            disconnect: Arc::new(disconnect),
+            make_active: Arc::new(make_active),
+            cleanup: Arc::new(cleanup),
+            record_voice_log: Arc::new(record_voice_log),
+        }
+    }
+
+    async fn connect(&self, request: DashboardPresenceConnectRequest) {
+        (self.connect)(request).await
+    }
+
+    async fn disconnect(&self, request: DashboardPresenceDisconnectRequest) {
+        (self.disconnect)(request).await
+    }
+
+    async fn make_active(&self, request: DashboardPresenceMakeActiveRequest) {
+        (self.make_active)(request).await
+    }
+
+    async fn cleanup(&self, session_id: String) {
+        (self.cleanup)(session_id).await
+    }
+
+    fn record_voice_log(&self, text: String) {
+        (self.record_voice_log)(text)
+    }
 }
 
 #[derive(Clone)]
@@ -248,9 +338,11 @@ impl DashboardControlRegistry {
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         terminal_registry: Arc<crate::terminal::TerminalRegistry>,
         web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
+        task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
         display_authority: Option<DashboardDisplayAuthorityBridge>,
+        presence: Option<DashboardPresenceBridge>,
         ice_config: crate::display::IceConfig,
         tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     ) -> Self {
@@ -265,9 +357,11 @@ impl DashboardControlRegistry {
             worktree_inventory_cache,
             terminal_registry,
             web_tui_tx,
+            task_tx,
             agent_card,
             bootstrap_caches,
             display_authority,
+            presence,
             ice_config,
             tcp_peer_registry,
             identity: Mutex::new(None),
@@ -298,9 +392,11 @@ impl DashboardControlRegistry {
             self.worktree_inventory_cache.clone(),
             self.terminal_registry.clone(),
             self.web_tui_tx.clone(),
+            self.task_tx.clone(),
             self.agent_card.clone(),
             self.bootstrap_caches.clone(),
             self.display_authority.clone(),
+            self.presence.clone(),
             self.ice_config.clone(),
             Arc::clone(&self.tcp_peer_registry),
             identity,
@@ -331,6 +427,9 @@ impl DashboardControlRegistry {
     pub async fn close(&self, session_id: &str) {
         if let Some(bridge) = &self.display_authority {
             bridge.cleanup(session_id);
+        }
+        if let Some(bridge) = &self.presence {
+            bridge.cleanup(session_id.to_string()).await;
         }
         if let Some(peer) = self.peers.lock().await.remove(session_id) {
             peer.close().await;
@@ -454,9 +553,11 @@ impl DashboardControlPeer {
         worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
         terminal_registry: Arc<crate::terminal::TerminalRegistry>,
         web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
+        task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
         display_authority: Option<DashboardDisplayAuthorityBridge>,
+        presence: Option<DashboardPresenceBridge>,
         ice_config: crate::display::IceConfig,
         tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
         identity: Arc<DaemonIdentity>,
@@ -538,9 +639,11 @@ impl DashboardControlPeer {
             worktree_inventory_cache,
             terminal_registry,
             web_tui_tx,
+            task_tx,
             agent_card,
             bootstrap_caches,
             display_authority,
+            presence,
             ice_config,
             tcp_peer_registry,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
@@ -611,9 +714,11 @@ struct ControlRuntime {
     worktree_inventory_cache: Arc<std::sync::Mutex<Option<String>>>,
     terminal_registry: Arc<crate::terminal::TerminalRegistry>,
     web_tui_tx: Option<mpsc::UnboundedSender<crate::tui::web::WebTuiCommand>>,
+    task_tx: Option<mpsc::Sender<presence_core::TaskEnvelope>>,
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
+    presence: Option<DashboardPresenceBridge>,
     ice_config: crate::display::IceConfig,
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
@@ -1000,6 +1105,9 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
         let _ = handle.await;
     }
     close_dashboard_tui_connections(&runtime, &mut tui_connections).await;
+    if let Some(bridge) = &runtime.presence {
+        bridge.cleanup(runtime.session_id.clone()).await;
+    }
     for handle in forwarder_handles {
         let _ = handle.await;
     }
@@ -2414,10 +2522,13 @@ async fn handle_dashboard_presence_frame(frame: serde_json::Value, runtime: Cont
     match frame_type {
         "presence_connect" => dashboard_presence_connect(frame, runtime).await,
         "presence_disconnect" => dashboard_presence_disconnect(runtime).await,
+        "make_active" => dashboard_make_active(frame, runtime).await,
         "voice_log" => dashboard_voice_log(frame, runtime).await,
         "presence_checkpoint" => dashboard_presence_checkpoint(frame, runtime).await,
         "voice_diagnostic" => dashboard_voice_diagnostic(frame, runtime).await,
         "live_usage_update" => dashboard_live_usage_update(frame, runtime).await,
+        "tool_request" => dashboard_tool_request(frame, runtime).await,
+        "async_query" => dashboard_async_query(frame, runtime).await,
         _ => {
             eprintln!("[dashboard/control] ignored unsupported presence frame: {frame_type}");
         }
@@ -2468,6 +2579,27 @@ async fn dashboard_presence_connect(frame: serde_json::Value, runtime: ControlRu
                 .filter(|value| !value.is_empty())
                 .map(str::to_string)
         });
+    let passive = frame
+        .get("passive")
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false);
+
+    if let (Some(bridge), Some(control_tx)) =
+        (runtime.presence.as_ref(), runtime.control_frames_tx.clone())
+    {
+        bridge
+            .connect(DashboardPresenceConnectRequest {
+                session_id: runtime.session_id.clone(),
+                control_tx,
+                server_session_id,
+                last_event_seq,
+                provider,
+                model,
+                passive,
+            })
+            .await;
+        return;
+    }
 
     let active = runtime.shared_session.read().await;
     let query_ctx = active.query_ctx.clone();
@@ -2532,6 +2664,15 @@ async fn dashboard_presence_connect(frame: serde_json::Value, runtime: ControlRu
 }
 
 async fn dashboard_presence_disconnect(runtime: ControlRuntime) {
+    if let Some(bridge) = runtime.presence.as_ref() {
+        bridge
+            .disconnect(DashboardPresenceDisconnectRequest {
+                session_id: runtime.session_id.clone(),
+            })
+            .await;
+        return;
+    }
+
     let active = runtime.shared_session.read().await;
     let query_ctx = active.query_ctx.clone();
     let session_log = active.session_log.clone();
@@ -2551,6 +2692,57 @@ async fn dashboard_presence_disconnect(runtime: ControlRuntime) {
     runtime.bus.send(AppEvent::PresenceDisconnected);
 }
 
+async fn dashboard_make_active(frame: serde_json::Value, runtime: ControlRuntime) {
+    let provider = frame
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            runtime
+                .config
+                .get("provider")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    let model = frame
+        .get("model")
+        .and_then(|value| value.as_str())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            runtime
+                .config
+                .get("model")
+                .and_then(|value| value.as_str())
+                .filter(|value| !value.is_empty())
+                .map(str::to_string)
+        });
+    if let (Some(bridge), Some(control_tx)) =
+        (runtime.presence.as_ref(), runtime.control_frames_tx.clone())
+    {
+        bridge
+            .make_active(DashboardPresenceMakeActiveRequest {
+                session_id: runtime.session_id.clone(),
+                control_tx,
+                provider,
+                model,
+            })
+            .await;
+        return;
+    }
+    dashboard_control_emit_browser_event(
+        &runtime,
+        serde_json::json!({
+            "t": "active_granted",
+            "is_active": true,
+            "handover_context": "",
+            "conversation_context": null,
+        }),
+    );
+}
+
 async fn dashboard_voice_log(frame: serde_json::Value, runtime: ControlRuntime) {
     let text = frame
         .get("text")
@@ -2565,6 +2757,9 @@ async fn dashboard_voice_log(frame: serde_json::Value, runtime: ControlRuntime) 
         .get("tool_context")
         .and_then(|value| value.as_str())
         .map(str::to_string);
+    if let Some(bridge) = runtime.presence.as_ref() {
+        bridge.record_voice_log(text.clone());
+    }
     let active = runtime.shared_session.read().await;
     let session_log = active.session_log.clone();
     drop(active);
@@ -2676,6 +2871,211 @@ async fn dashboard_live_usage_update(frame: serde_json::Value, runtime: ControlR
         output_text_tokens: json_u64(&frame, "output_text_tokens"),
         output_audio_tokens: json_u64(&frame, "output_audio_tokens"),
     });
+}
+
+fn dashboard_preview_text(s: &str, max: usize) -> String {
+    if s.len() <= max {
+        s.to_string()
+    } else {
+        format!("{}...", &s[..max])
+    }
+}
+
+fn dashboard_tool_result_frame(
+    kind: &str,
+    req_id: String,
+    tool: Option<String>,
+    query_result: crate::presence::ToolQueryResult,
+) -> serde_json::Value {
+    let mut response = serde_json::json!({
+        "t": kind,
+        "id": req_id,
+        "result": query_result.text,
+    });
+    if let Some(tool) = tool {
+        response["tool"] = serde_json::Value::String(tool);
+    }
+    if !query_result.images.is_empty() {
+        let images = query_result
+            .images
+            .iter()
+            .map(|img| {
+                serde_json::json!({
+                    "mime_type": img.media_type,
+                    "data": img.data,
+                })
+            })
+            .collect();
+        response["images"] = serde_json::Value::Array(images);
+    }
+    response
+}
+
+async fn dashboard_tool_request(frame: serde_json::Value, runtime: ControlRuntime) {
+    let req_id = frame
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tool = frame
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args = frame
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+
+    let args_preview = serde_json::to_string(&args)
+        .map(|s| dashboard_preview_text(&s, 200))
+        .unwrap_or_default();
+    runtime.bus.send(AppEvent::PresenceLog {
+        message: format!("[tool_request] {}({})", tool, args_preview),
+        level: Some(LogLevel::Debug),
+        turn: None,
+    });
+
+    let active = runtime.shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let frame_registry = active.frame_registry.clone();
+    drop(active);
+
+    let state = query_ctx
+        .as_ref()
+        .map(|ctx| {
+            ctx.agent_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        })
+        .unwrap_or_default();
+    let action = crate::presence::dispatch_tool_call(&tool, &args, &state);
+
+    let query_result = if let crate::presence::PresenceAction::SubmitTask(envelope) = action {
+        let msg = format!("Task submitted: {}", envelope.task);
+        if let Some(tx) = runtime.task_tx.as_ref() {
+            let _ = tx.send(envelope).await;
+        } else {
+            let ctrl_action = crate::presence::PresenceAction::SubmitTask(envelope);
+            if let Some((ctrl, _)) = crate::presence::action_to_control_msg(&ctrl_action) {
+                runtime.bus.send(AppEvent::ControlCommand(ctrl));
+            }
+        }
+        crate::presence::ToolQueryResult::text(msg)
+    } else if let Some((ctrl, msg)) = crate::presence::action_to_control_msg(&action) {
+        runtime.bus.send(AppEvent::ControlCommand(ctrl));
+        crate::presence::ToolQueryResult::text(msg)
+    } else {
+        match action {
+            crate::presence::PresenceAction::TextResult(text) => {
+                crate::presence::ToolQueryResult::text(text)
+            }
+            crate::presence::PresenceAction::NeedsIO {
+                tool_name,
+                args: io_args,
+            } => {
+                if let Some(ctx) = query_ctx.as_ref() {
+                    crate::presence::handle_tool_query(
+                        &ctx.agent_state,
+                        &ctx.project_root,
+                        &ctx.log_dir,
+                        &ctx.knowledge_path,
+                        &tool_name,
+                        &io_args,
+                        frame_registry.as_ref(),
+                        ctx.context_injection.as_ref(),
+                    )
+                    .await
+                    .unwrap_or_else(|| {
+                        crate::presence::ToolQueryResult::text(format!("Unknown tool: {}", tool))
+                    })
+                } else {
+                    crate::presence::ToolQueryResult::text(
+                        "Presence query context not available".to_string(),
+                    )
+                }
+            }
+            _ => unreachable!(),
+        }
+    };
+
+    runtime.bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[tool_response] {} -> {}",
+            tool,
+            dashboard_preview_text(&query_result.text, 200)
+        ),
+        level: Some(LogLevel::Debug),
+        turn: None,
+    });
+
+    dashboard_control_emit_browser_event(
+        &runtime,
+        dashboard_tool_result_frame("tool_response", req_id, None, query_result),
+    );
+}
+
+async fn dashboard_async_query(frame: serde_json::Value, runtime: ControlRuntime) {
+    let req_id = frame
+        .get("id")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let tool = frame
+        .get("tool")
+        .and_then(|value| value.as_str())
+        .unwrap_or("")
+        .to_string();
+    let args = frame
+        .get("args")
+        .cloned()
+        .unwrap_or_else(|| serde_json::Value::Object(Default::default()));
+
+    runtime.bus.send(AppEvent::PresenceLog {
+        message: format!("[async_query] {}", tool),
+        level: Some(LogLevel::Debug),
+        turn: None,
+    });
+
+    let active = runtime.shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let frame_registry = active.frame_registry.clone();
+    drop(active);
+
+    let query_result = if let Some(ctx) = query_ctx.as_ref() {
+        crate::presence::handle_tool_query(
+            &ctx.agent_state,
+            &ctx.project_root,
+            &ctx.log_dir,
+            &ctx.knowledge_path,
+            &tool,
+            &args,
+            frame_registry.as_ref(),
+            ctx.context_injection.as_ref(),
+        )
+        .await
+        .unwrap_or_else(|| {
+            crate::presence::ToolQueryResult::text(format!("Unknown query tool: {}", tool))
+        })
+    } else {
+        crate::presence::ToolQueryResult::text("Presence query context not available".to_string())
+    };
+
+    runtime.bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[async_query_result] {} -> {}",
+            tool,
+            dashboard_preview_text(&query_result.text, 200)
+        ),
+        level: Some(LogLevel::Debug),
+        turn: None,
+    });
+
+    dashboard_control_emit_browser_event(
+        &runtime,
+        dashboard_tool_result_frame("async_query_result", req_id, Some(tool), query_result),
+    );
 }
 
 fn spawn_dashboard_display_input(frame: serde_json::Value, runtime: ControlRuntime) {
@@ -2852,6 +3252,11 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("terminal_frames_available", true),
         ("tui_frames_available", runtime.web_tui_tx.is_some()),
         ("presence_frames_available", true),
+        (
+            "presence_active_handoff_available",
+            runtime.presence.is_some(),
+        ),
+        ("presence_tool_request_available", true),
         ("api_presence_video_frame_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
@@ -7578,8 +7983,10 @@ mod tests {
                 std::env::temp_dir(),
             )),
             web_tui_tx: None,
+            task_tx: None,
             bootstrap_caches: DashboardBootstrapCaches::default(),
             display_authority: None,
+            presence: None,
             ice_config: crate::display::IceConfig::default(),
             tcp_peer_registry: crate::display::webrtc::TcpPeerRegistry::new(),
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
@@ -7837,6 +8244,8 @@ mod tests {
         assert_eq!(status["result"]["byte_streams_available"], true);
         assert_eq!(status["result"]["upload_frames_available"], true);
         assert_eq!(status["result"]["presence_frames_available"], true);
+        assert_eq!(status["result"]["presence_active_handoff_available"], false);
+        assert_eq!(status["result"]["presence_tool_request_available"], true);
         assert_eq!(status["result"]["api_presence_video_frame_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
@@ -8022,6 +8431,39 @@ mod tests {
             }
             other => panic!("expected VoiceLog, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn presence_frame_routes_tool_request_response() {
+        let mut rt = runtime();
+        let (control_tx, mut control_rx) = mpsc::unbounded_channel();
+        rt.control_frames_tx = Some(control_tx);
+        let (task_tx, _task_rx) = mpsc::channel(1);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        let ack = test_control_frame_response(
+            r#"{"t":"presence_frame","id":"p1","frame":{"t":"tool_request","id":"req_1","tool":"check_status","args":{}}}"#,
+            &mut rt,
+            &task_tx,
+            &mut pending,
+            &mut outbound,
+        )
+        .expect("presence frame should ack when id is present");
+
+        assert_eq!(ack["t"], "presence_ack");
+        assert_eq!(ack["id"], "p1");
+        assert_eq!(ack["ok"], true);
+
+        let frame = tokio::time::timeout(Duration::from_secs(1), control_rx.recv())
+            .await
+            .expect("tool response event should arrive")
+            .expect("control frame channel should stay open");
+        assert_eq!(frame["t"], "event");
+        let payload = &frame["payload"];
+        assert_eq!(payload["t"], "tool_response");
+        assert_eq!(payload["id"], "req_1");
+        assert!(!payload["result"].as_str().unwrap_or("").is_empty());
     }
 
     #[tokio::test]

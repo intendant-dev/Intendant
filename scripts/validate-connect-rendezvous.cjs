@@ -1100,6 +1100,8 @@ function publicBootstrapHtml() {
         terminalFramesAvailable: this.lastStatus?.terminal_frames_available ?? null,
         tuiFramesAvailable: this.lastStatus?.tui_frames_available ?? null,
         presenceFramesAvailable: this.lastStatus?.presence_frames_available ?? null,
+        presenceActiveHandoffAvailable: this.lastStatus?.presence_active_handoff_available ?? null,
+        presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,
         apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
         apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
         apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
@@ -2956,6 +2958,8 @@ async function main() {
       const displaySignalConnectNoLegacy = await ctl._debugProbeDisplaySignalConnectNoLegacy();
       const tuiConnectNoLegacy = ctl._debugProbeTuiConnectNoLegacy();
       const presenceMediaConnectNoLegacy = await ctl._debugProbePresenceMediaConnectNoLegacy();
+      const presenceServerSenderConnectNoLegacy = await ctl._debugProbePresenceServerSenderConnectNoLegacy();
+      const tunneledPresenceServerCallback = await ctl._debugProbeTunneledPresenceServerCallback();
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
       const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
@@ -2971,6 +2975,8 @@ async function main() {
         displaySignalConnectNoLegacy,
         tuiConnectNoLegacy,
         presenceMediaConnectNoLegacy,
+        presenceServerSenderConnectNoLegacy,
+        tunneledPresenceServerCallback,
         transportLabel,
         serverLabel,
         serverClass,
@@ -3153,6 +3159,36 @@ async function main() {
       0,
       `real SPA Connect presence/media replayed through legacy app path: ${JSON.stringify(appResult.presenceMediaConnectNoLegacy)}`
     );
+    assert.strictEqual(
+      appResult.presenceServerSenderConnectNoLegacy.skipped,
+      false,
+      `real SPA could not exercise Connect presence server sender: ${JSON.stringify(appResult.presenceServerSenderConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.presenceServerSenderConnectNoLegacy.presenceFrameCount,
+      2,
+      `real SPA Connect server sender did not route presence frames: ${JSON.stringify(appResult.presenceServerSenderConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.presenceServerSenderConnectNoLegacy.actionRpcCount,
+      1,
+      `real SPA Connect server sender did not route actions over RPC: ${JSON.stringify(appResult.presenceServerSenderConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.tunneledPresenceServerCallback.skipped,
+      false,
+      `real SPA could not exercise Connect tunneled presence callback: ${JSON.stringify(appResult.tunneledPresenceServerCallback)}`
+    );
+    assert.strictEqual(
+      appResult.tunneledPresenceServerCallback.handled,
+      true,
+      `real SPA did not accept tunneled active_granted frame: ${JSON.stringify(appResult.tunneledPresenceServerCallback)}`
+    );
+    assert.strictEqual(
+      appResult.tunneledPresenceServerCallback.diagnosticCount,
+      1,
+      `real SPA tunneled active_granted did not reach the normal callback router: ${JSON.stringify(appResult.tunneledPresenceServerCallback)}`
+    );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
       Number(appResult.sessionCount) >= 1,
@@ -3200,6 +3236,8 @@ async function main() {
         displaySignalConnectNoLegacy: appResult.displaySignalConnectNoLegacy,
         tuiConnectNoLegacy: appResult.tuiConnectNoLegacy,
         presenceMediaConnectNoLegacy: appResult.presenceMediaConnectNoLegacy,
+        presenceServerSenderConnectNoLegacy: appResult.presenceServerSenderConnectNoLegacy,
+        tunneledPresenceServerCallback: appResult.tunneledPresenceServerCallback,
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,
