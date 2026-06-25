@@ -887,9 +887,10 @@ Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
 large raw request payloads out of ordinary session-detail hydration while still
 allowing the Context pane to fetch a single archived snapshot on demand.
 Staged upload deletion uses `api_session_current_upload_delete` so removing a
-pending attachment can travel over the verified control channel; browser image
-chips still render through HTTP URLs, while bounded raw upload bytes are
-available to clients over `api_session_current_upload_raw`.
+pending attachment can travel over the verified control channel. Browser image
+chips now prefer `api_session_current_upload_raw` and render the returned bytes
+through a local blob URL, falling back to the legacy raw HTTP URL only when the
+tunnel is unavailable or preview loading fails.
 OpenAI browser live-audio token minting uses `api_voice_session`; it preserves
 the existing `/session` behavior and error envelope while avoiding a direct
 dashboard HTTPS POST when the verified control channel is available.

@@ -14302,7 +14302,7 @@ async function stationStartSession() {
   showControlToast?.('info', 'Spawning new session...');
   if (Array.isArray(pendingAttachments) && pendingAttachments.length > 0) {
     renderAttachmentReceipt?.(task, pendingAttachments.slice(), 'Sent');
-    clearPendingAttachments?.();
+    clearPendingAttachments?.({ retainPreviewUrls: true });
   }
   stationScheduleUpdate();
 }
@@ -33114,20 +33114,42 @@ function exitAnnotationMode() {
 //
 // Client-side only — not persisted across reloads. Each entry is
 //   { frameId, stream, note, dataUrl }
-// where `dataUrl` is a small data: URL for the chip thumbnail.
+// where `dataUrl` is a data:, blob:, or legacy raw HTTP URL for the chip thumbnail.
 const ATTACHMENT_SOFT_LIMIT = 20;
 const pendingAttachments = [];
+const retainedAttachmentPreviewObjectUrls = new Set();
 
 function addPendingAttachment(att) {
   if (!att || !att.frameId) return;
   // De-dupe by frame ID
   if (pendingAttachments.some(p => p.frameId === att.frameId)) {
+    revokePendingAttachmentPreview(att);
     renderPendingAttachments();
     return;
   }
   pendingAttachments.push(att);
   renderPendingAttachments();
 }
+
+function revokePendingAttachmentPreview(att) {
+  const objectUrl = String(att?.dataObjectUrl || '').trim();
+  if (objectUrl) {
+    try { URL.revokeObjectURL(objectUrl); } catch (_) {}
+    retainedAttachmentPreviewObjectUrls.delete(objectUrl);
+  }
+}
+
+function retainPendingAttachmentPreview(att) {
+  const objectUrl = String(att?.dataObjectUrl || '').trim();
+  if (objectUrl) retainedAttachmentPreviewObjectUrls.add(objectUrl);
+}
+
+window.addEventListener('beforeunload', () => {
+  for (const objectUrl of retainedAttachmentPreviewObjectUrls) {
+    try { URL.revokeObjectURL(objectUrl); } catch (_) {}
+  }
+  retainedAttachmentPreviewObjectUrls.clear();
+});
 
 function pendingAttachmentUploadId(att) {
   const explicit = String(att?.uploadId || '').trim();
@@ -33155,6 +33177,7 @@ function removePendingAttachment(frameId, options = {}) {
   const idx = pendingAttachments.findIndex(p => p.frameId === frameId);
   if (idx >= 0) {
     const [removed] = pendingAttachments.splice(idx, 1);
+    revokePendingAttachmentPreview(removed);
     renderPendingAttachments();
     if (options.deleteUpload) deletePendingUploadRecord(pendingAttachmentUploadId(removed));
   }
@@ -33164,6 +33187,11 @@ function clearPendingAttachments(options = {}) {
   const uploadIds = options.deleteUploads
     ? pendingAttachments.map(pendingAttachmentUploadId).filter(Boolean)
     : [];
+  if (options.retainPreviewUrls) {
+    pendingAttachments.forEach(retainPendingAttachmentPreview);
+  } else {
+    pendingAttachments.forEach(revokePendingAttachmentPreview);
+  }
   pendingAttachments.length = 0;
   renderPendingAttachments();
   uploadIds.forEach(deletePendingUploadRecord);
@@ -33203,6 +33231,43 @@ function dashboardUploadRpcAvailable() {
     dashboardControlTransport?.lastStatus?.upload_frames_available === true &&
     dashboardControlTransport?.lastStatus?.api_session_current_upload_available === true
   );
+}
+
+function dashboardUploadRawRpcAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.byte_streams_available === true &&
+    dashboardControlTransport?.lastStatus?.api_session_current_upload_raw_available === true
+  );
+}
+
+async function uploadImagePreviewUrl(descriptor) {
+  const id = String(descriptor?.id || '').trim();
+  const mime = String(descriptor?.mime || 'application/octet-stream');
+  if (!id || !mime.startsWith('image/')) return { dataUrl: null, dataObjectUrl: null };
+  if (dashboardUploadRawRpcAvailable()) {
+    try {
+      const raw = await dashboardTransport.requestBytes('api_session_current_upload_raw', { id }, {
+        timeoutMs: 60000,
+      });
+      if (raw?._httpOk === false) {
+        throw new Error(raw.error || `upload raw returned ${raw._httpStatus || 'error'}`);
+      }
+      if (raw?.bytes instanceof Uint8Array && raw.bytes.byteLength > 0) {
+        const blob = new Blob([raw.bytes], { type: raw.content_type || mime });
+        const url = URL.createObjectURL(blob);
+        return { dataUrl: url, dataObjectUrl: url };
+      }
+    } catch (err) {
+      console.warn('[upload] Failed to load image preview over dashboard control; using HTTP URL fallback', err);
+    }
+  }
+  return {
+    dataUrl: `/api/session/current/uploads/${encodeURIComponent(id)}/raw`,
+    dataObjectUrl: null,
+  };
 }
 
 function dashboardTerminalFramesAvailable() {
@@ -33260,7 +33325,7 @@ async function uploadOneFile(file, destination) {
         return null;
       }
     }
-    onUploadReady(json);
+    await onUploadReady(json);
     return json;
   } catch (e) {
     if (e && e.name === 'AbortError') {
@@ -33386,15 +33451,15 @@ async function triggerUploadFlow(files) {
   }
 }
 
-function onUploadReady(descriptor, options = {}) {
+async function onUploadReady(descriptor, options = {}) {
   if (!descriptor || !descriptor.id) return;
   if (options.fromBroadcast) return;
   const frameId = `upload:${descriptor.id}`;
   // Thumbnail for images, a paperclip + name label for files.
   const isImage = typeof descriptor.mime === 'string' && descriptor.mime.startsWith('image/');
-  const dataUrl = isImage
-    ? `/api/session/current/uploads/${encodeURIComponent(descriptor.id)}/raw`
-    : null;
+  const preview = isImage
+    ? await uploadImagePreviewUrl(descriptor)
+    : { dataUrl: null, dataObjectUrl: null };
   const safeName = String(descriptor.name || 'upload.bin');
   const originalName = String(descriptor.original_name || descriptor.originalName || '').trim();
   const displayName = originalName || safeName;
@@ -33405,7 +33470,8 @@ function onUploadReady(descriptor, options = {}) {
     frameId,
     stream: 'upload',
     note: `${noteName} (${humanBytes(descriptor.size || 0)}, ${descriptor.destination})`,
-    dataUrl,
+    dataUrl: preview.dataUrl,
+    dataObjectUrl: preview.dataObjectUrl,
     uploadId: descriptor.id,
     uploadName: displayName,
     uploadSafeName: safeName,
@@ -44946,7 +45012,7 @@ function submitEditedUserMessage(input, text) {
   markSessionWindowPendingActive(targetSessionId);
   if (attachments.length > 0) {
     renderAttachmentReceipt(text, attachmentReceipt, 'Edited', targetSessionId);
-    clearPendingAttachments();
+    clearPendingAttachments({ retainPreviewUrls: true });
   }
   clearTaskTextarea(input);
   editMessageDraft = null;
@@ -45119,7 +45185,7 @@ function dispatchTaskText(text, options = {}) {
   if (targetSessionId) markSessionWindowPendingActive(targetSessionId);
   if (attachments.length > 0) {
     renderAttachmentReceipt(text, attachmentReceipt, 'Sent', targetSessionId);
-    clearPendingAttachments();
+    clearPendingAttachments({ retainPreviewUrls: true });
   }
   return true;
 }
@@ -45174,7 +45240,7 @@ function submitComposedText(text) {
     );
     if (attachments.length > 0) {
       renderAttachmentReceipt(text, attachmentReceipt, 'Steered', targetSessionId);
-      clearPendingAttachments();
+      clearPendingAttachments({ retainPreviewUrls: true });
     }
     return true;
   }
@@ -46280,7 +46346,7 @@ async function startNewSession() {
   renderNewSessionAgentControls();
   if (attachments.length > 0) {
     renderAttachmentReceipt(task, attachmentReceipt, 'Sent');
-    clearPendingAttachments();
+    clearPendingAttachments({ retainPreviewUrls: true });
   }
 }
 window.startNewSession = startNewSession;

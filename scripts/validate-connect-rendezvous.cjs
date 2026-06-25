@@ -1154,6 +1154,38 @@ async function main() {
           text: raw?.data_base64 ? atob(String(raw.data_base64)) : '',
         };
       };
+      const imagePreview = async () => {
+        const input = document.getElementById('upload-file-input');
+        if (!input) {
+          return { skipped: true, reason: 'upload file input unavailable on rendezvous emulator' };
+        }
+        const png = Uint8Array.from(
+          atob('iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII='),
+          ch => ch.charCodeAt(0)
+        );
+        const before = ctl.status().completedByteStreams || 0;
+        const file = new File([png], 'dashboard-preview-rendezvous.png', { type: 'image/png' });
+        const transfer = new DataTransfer();
+        transfer.items.add(file);
+        input.files = transfer.files;
+        input.dispatchEvent(new Event('change', { bubbles: true }));
+        const deadline = performance.now() + 60000;
+        let img = null;
+        while (performance.now() < deadline) {
+          img = document.querySelector('.pending-attachment-chip img.chip-thumb');
+          if (img && String(img.src || '').startsWith('blob:')) break;
+          await new Promise(resolve => setTimeout(resolve, 50));
+        }
+        const after = ctl.status().completedByteStreams || 0;
+        const previewUrl = String(img?.src || '');
+        const result = {
+          ok: previewUrl.startsWith('blob:'),
+          previewScheme: previewUrl.split(':', 1)[0],
+          byteStreamDelta: after - before,
+        };
+        document.querySelector('.pending-attachment-chip .chip-remove')?.click();
+        return result;
+      };
       const recordingAsset = async () => {
         const raw = await labeled('api_recording_asset segment', ctl.requestBytes('api_recording_asset', {
           stream_name: recordingStreamName,
@@ -1313,6 +1345,7 @@ async function main() {
         sessionReport: await sessionReport(),
         upload: uploaded,
         uploadRaw: await uploadRaw(uploaded),
+        imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
         terminal: await terminal(),
         tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
@@ -1666,6 +1699,13 @@ async function main() {
     assert.strictEqual(result.uploadRaw?.range_start, 10);
     assert.strictEqual(result.uploadRaw?.range_end, 16);
     assert.strictEqual(result.uploadRaw?.resumable, true);
+    if (result.imagePreview?.skipped) {
+      assert.strictEqual(result.imagePreview.reason, 'upload file input unavailable on rendezvous emulator');
+    } else {
+      assert.strictEqual(result.imagePreview?.ok, true);
+      assert.strictEqual(result.imagePreview?.previewScheme, 'blob');
+      assert(result.imagePreview?.byteStreamDelta >= 1, `image preview did not use a byte stream: ${JSON.stringify(result.imagePreview)}`);
+    }
     assert.strictEqual(result.recordingAsset?.ok, true);
     assert.strictEqual(result.recordingAsset?.byteLength, 7);
     assert.strictEqual(result.recordingAsset?.text, 'segment');
@@ -1922,6 +1962,9 @@ async function main() {
         uploadSize: result.upload.size,
         uploadRawBytes: result.uploadRaw.byteLength,
         uploadRawText: result.uploadRaw.text,
+        imagePreviewScheme: result.imagePreview.previewScheme || null,
+        imagePreviewByteStreamDelta: result.imagePreview.byteStreamDelta || 0,
+        imagePreviewSkipped: Boolean(result.imagePreview.skipped),
         recordingAssetBytes: result.recordingAsset.byteLength,
         recordingAssetText: result.recordingAsset.text,
         terminalOutputBytes: result.terminal.outputBytes,
