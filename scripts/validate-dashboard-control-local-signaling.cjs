@@ -451,6 +451,12 @@ async function main() {
         diagnosticsMarkerActionMsg: await labeled('api_dashboard_action_msg diagnostics visual marker', ctl.request('api_dashboard_action_msg', {
           message: { action: 'set_diagnostics_visual_marker', display_id: 0, enabled: false },
         }, { timeoutMs: 60000 })),
+        peerWebRtcSignal: await labeled('api_peer_webrtc_signal missing peer', ctl.request('api_peer_webrtc_signal', {
+          peer_id: 'missing-peer',
+          display_id: 0,
+          session_id: `validator-peer-display-${Date.now()}`,
+          signal: { kind: 'close' },
+        }, { timeoutMs: 60000 })),
         rejectedDashboardActionMsg: await labeled('api_dashboard_action_msg rejected set_codex_sandbox', ctl.request('api_dashboard_action_msg', {
           message: { action: 'set_codex_sandbox', mode: 'workspace-write' },
         }, { timeoutMs: 60000 })),
@@ -548,6 +554,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiSessionControlMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardActionMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiDiagnosticsVisualFreshnessAvailable, true);
+    assert.strictEqual(result.finalStatus.apiPeerWebRtcSignalAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionReportAvailable, true);
     assert.strictEqual(result.finalStatus.byteStreamsAvailable, true);
     assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
@@ -637,6 +644,9 @@ async function main() {
     assert.strictEqual(result.diagnosticsMarkerActionMsg?.display_id, 0);
     assert.strictEqual(typeof result.diagnosticsMarkerActionMsg?.registry_available, 'boolean');
     assert.strictEqual(typeof result.diagnosticsMarkerActionMsg?.active_display_updated, 'boolean');
+    assert.strictEqual(result.peerWebRtcSignal?._httpStatus, 404);
+    assert.strictEqual(result.peerWebRtcSignal?._httpOk, false);
+    assert.strictEqual(result.peerWebRtcSignal?.error, 'peer not found');
     assert.strictEqual(result.rejectedDashboardActionMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedDashboardActionMsg?._httpOk, false);
     assert(
@@ -673,6 +683,7 @@ async function main() {
         apiSessionControlMsgAvailable: result.finalStatus.apiSessionControlMsgAvailable,
         apiDashboardActionMsgAvailable: result.finalStatus.apiDashboardActionMsgAvailable,
         apiDiagnosticsVisualFreshnessAvailable: result.finalStatus.apiDiagnosticsVisualFreshnessAvailable,
+        apiPeerWebRtcSignalAvailable: result.finalStatus.apiPeerWebRtcSignalAvailable,
         apiSessionReportAvailable: result.finalStatus.apiSessionReportAvailable,
         byteStreamsAvailable: result.finalStatus.byteStreamsAvailable,
         uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
@@ -704,6 +715,7 @@ async function main() {
         dashboardActionAction: result.dashboardActionMsg.action,
         diagnosticsMarkerRegistryAvailable: result.diagnosticsMarkerActionMsg.registry_available,
         diagnosticsMarkerActiveDisplayUpdated: result.diagnosticsMarkerActionMsg.active_display_updated,
+        peerWebRtcSignalStatus: result.peerWebRtcSignal._httpStatus,
         rejectedDashboardActionStatus: result.rejectedDashboardActionMsg._httpStatus,
         signalingMode: result.finalStatus.signalingMode,
         pendingRequests: result.finalStatus.pendingRequests,

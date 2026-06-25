@@ -468,7 +468,8 @@ the tunnel.
 Current tunneled mutations include
 active-session rollback/redo/prune, session-data deletion, staged upload
 deletion, settings save, API-key save, peer add/remove, peer access-request
-pairing, peer message/task/approval actions, eligible-peer lookup,
+pairing, peer message/task/approval actions, peer-display WebRTC signaling,
+eligible-peer lookup,
 visual-freshness diagnostics NDJSON appends, worktree scan/remove, dashboard
 managed-context MCP tool calls, coordinator routing, and dashboard
 session-control and dashboard-action controls.
@@ -908,6 +909,12 @@ state.
 Confirmed session-data deletion uses `api_session_delete` with the same
 no-replay fallback rule as other writes; the dashboard still requires the
 existing confirmation modal before issuing the RPC.
+Peer-display WebRTC signaling uses `api_peer_webrtc_signal`, carrying the same
+`display_id`, `session_id`, and `signal` body as `POST /api/peers/{id}/webrtc`
+plus the target `peer_id`. Answers and remote ICE still arrive asynchronously
+through the normal peer-event path; the RPC only confirms that the signal was
+accepted for forwarding. Failed tunneled signaling requests are not replayed
+over HTTP after a verified tunnel attempt.
 Dashboard session-control actions use `api_session_control_msg`. This includes
 create/start/resume/stop/restart session, targeted follow-up, mid-turn steer,
 cancel queued steer/follow-up, edit user message, interrupt, approvals,
@@ -1007,6 +1014,8 @@ Treat this as a staged target, not current behavior:
     now covers Codex/Gemini thread actions, display take/release/grant/revoke,
     diagnostics visual-marker toggles, recording/debug toggles, and browser
     workspace create/acquire/close/release.
+    Peer-display WebRTC signaling now uses `api_peer_webrtc_signal` with the
+    same no-replay fallback rule.
     Standalone Shell terminal frames and WebTui frames also use the tunnel when
     verified and advertised by the daemon. Visual-freshness diagnostics NDJSON
     appends use the tunnel when verified and fall back to HTTP only when the

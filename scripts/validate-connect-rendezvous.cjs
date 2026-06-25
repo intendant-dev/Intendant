@@ -1387,6 +1387,12 @@ async function main() {
         sessionDelete,
         sessionControl,
         dashboardAction,
+        peerWebRtcSignal: await labeled('api_peer_webrtc_signal missing peer', ctl.request('api_peer_webrtc_signal', {
+          peer_id: 'missing-peer',
+          display_id: 0,
+          session_id: `validator-peer-display-${Date.now()}`,
+          signal: { kind: 'close' },
+        }, { timeoutMs: 60000 })),
         sessionReport: await sessionReport(),
         upload: uploaded,
         uploadList: await ctl.request('api_session_current_uploads', {}, { timeoutMs: 60000 }),
@@ -1532,6 +1538,11 @@ async function main() {
       result.status.api_diagnostics_visual_freshness_available,
       true,
       'dashboard control status did not advertise diagnostics visual freshness uploads'
+    );
+    assert.strictEqual(
+      result.status.api_peer_webrtc_signal_available,
+      true,
+      'dashboard control status did not advertise peer WebRTC signaling'
     );
     assert.strictEqual(
       result.status.api_agent_card_available,
@@ -1731,6 +1742,13 @@ async function main() {
       String(result.dashboardAction?.rejectedSettingsAction?.error || '').includes('not available over dashboard action WebRTC'),
       `unexpected dashboard-action rejection: ${JSON.stringify(result.dashboardAction?.rejectedSettingsAction)}`
     );
+    assert.strictEqual(
+      result.peerWebRtcSignal?._httpStatus,
+      404,
+      'peer WebRTC signaling did not preserve missing-peer status'
+    );
+    assert.strictEqual(result.peerWebRtcSignal?._httpOk, false);
+    assert.strictEqual(result.peerWebRtcSignal?.error, 'peer not found');
     if (result.sessionReport?.ok === true) {
       assert.strictEqual(result.sessionReport.content_type, 'application/zip');
       assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
@@ -2027,10 +2045,12 @@ async function main() {
         rejectedSessionControlStatus: result.sessionControl.rejectedSettingsAction?._httpStatus,
         apiDashboardActionMsgAvailable: result.status.api_dashboard_action_msg_available,
         apiDiagnosticsVisualFreshnessAvailable: result.status.api_diagnostics_visual_freshness_available,
+        apiPeerWebRtcSignalAvailable: result.status.api_peer_webrtc_signal_available,
         dashboardActionAction: result.dashboardAction.closeWorkspace?.action,
         diagnosticsMarkerRegistryAvailable: result.dashboardAction.diagnosticsVisualMarker?.registry_available,
         diagnosticsMarkerActiveDisplayUpdated: result.dashboardAction.diagnosticsVisualMarker?.active_display_updated,
         rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
+        peerWebRtcSignalStatus: result.peerWebRtcSignal?._httpStatus,
         apiSessionReportAvailable: result.status.api_session_report_available,
         byteStreamsAvailable: result.status.byte_streams_available,
         uploadFramesAvailable: result.status.upload_frames_available,

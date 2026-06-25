@@ -114,6 +114,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_peer_message",
     "api_peer_task",
     "api_peer_approval",
+    "api_peer_webrtc_signal",
     "api_peer_pairing_invite",
     "api_peer_pairing_join",
     "api_peer_pairing_request_access",
@@ -1595,6 +1596,7 @@ fn control_frame_response(
                 | "api_peer_message"
                 | "api_peer_task"
                 | "api_peer_approval"
+                | "api_peer_webrtc_signal"
                 | "api_peer_pairing_invite"
                 | "api_peer_pairing_join"
                 | "api_peer_pairing_request_access"
@@ -2458,6 +2460,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_managed_context_available", true),
         ("api_mcp_tool_call_available", runtime.mcp_server.is_some()),
         ("api_peer_mutations_available", peer_registry_available),
+        ("api_peer_webrtc_signal_available", peer_registry_available),
         ("api_peer_pairing_available", true),
         ("api_coordinator_available", peer_registry_available),
     ];
@@ -2655,6 +2658,9 @@ async fn control_request_response(
         "api_peer_message" => api_peer_message_response(id, params.as_ref(), &runtime).await,
         "api_peer_task" => api_peer_task_response(id, params.as_ref(), &runtime).await,
         "api_peer_approval" => api_peer_approval_response(id, params.as_ref(), &runtime).await,
+        "api_peer_webrtc_signal" => {
+            api_peer_webrtc_signal_response(id, params.as_ref(), &runtime).await
+        }
         "api_peer_pairing_invite" => api_peer_pairing_invite_response(id, params.as_ref()).await,
         "api_peer_pairing_join" => {
             api_peer_pairing_join_response(id, params.as_ref(), &runtime).await
@@ -5295,6 +5301,25 @@ async fn api_peer_approval_response(
     http_body_response(id, status, body, "peer approval")
 }
 
+async fn api_peer_webrtc_signal_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(registry) = runtime.peer_registry.as_ref() else {
+        return peer_registry_unavailable_response(id);
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let peer_id = string_param(&params, &["peer_id", "peerId", "host_id", "hostId", "id"]);
+    if peer_id.is_empty() {
+        return missing_param_response(id, "peer_id");
+    }
+    let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let (status, body) =
+        crate::web_gateway::peers_webrtc_signal(registry, &peer_id, &body_text, &runtime.bus).await;
+    http_body_response(id, status, body, "peer webrtc signal")
+}
+
 async fn api_peer_pairing_invite_response(
     id: String,
     params: Option<&serde_json::Value>,
@@ -6180,6 +6205,7 @@ mod tests {
         assert_eq!(status["result"]["api_worktrees_remove_available"], true);
         assert_eq!(status["result"]["api_mcp_tool_call_available"], false);
         assert_eq!(status["result"]["api_peer_mutations_available"], false);
+        assert_eq!(status["result"]["api_peer_webrtc_signal_available"], false);
         assert_eq!(status["result"]["api_peer_pairing_available"], true);
         assert_eq!(status["result"]["api_coordinator_available"], false);
 
@@ -6952,6 +6978,29 @@ mod tests {
             uploads.iter().any(|upload| upload["id"] == descriptor.id),
             "upload list did not include committed descriptor: {response}"
         );
+    }
+
+    #[tokio::test]
+    async fn peer_webrtc_signal_returns_http_error_metadata() {
+        let (log_tx, _log_rx) =
+            tokio::sync::mpsc::channel::<crate::peer::event::TaggedPeerEvent>(8);
+        let mut rt = runtime();
+        rt.peer_registry = Some(crate::peer::PeerRegistry::new(log_tx));
+
+        let params = serde_json::json!({
+            "peer_id": "missing-peer",
+            "display_id": 0,
+            "session_id": "dashboard-test-session",
+            "signal": { "kind": "close" },
+        });
+        let response =
+            api_peer_webrtc_signal_response("webrtc1".to_string(), Some(&params), &rt).await;
+
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["_httpOk"], false);
+        assert_eq!(response["result"]["_httpStatus"], 404);
+        assert_eq!(response["result"]["error"], "peer not found");
     }
 
     #[tokio::test]

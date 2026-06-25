@@ -22109,7 +22109,7 @@ struct PeerWebRtcSignalRequest {
 /// callers don't get the answer in this HTTP response, they
 /// observe it on the dashboard's primary `/ws` as a
 /// `PeerEventForwarded` whose payload is `PeerEvent::WebRtcSignal`.
-async fn peers_webrtc_signal(
+pub(crate) async fn peers_webrtc_signal(
     registry: &crate::peer::PeerRegistry,
     id: &str,
     body_text: &str,
