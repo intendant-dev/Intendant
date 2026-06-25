@@ -1030,6 +1030,11 @@ async function main() {
       true,
       'dashboard control status did not advertise upload deletion'
     );
+    assert.strictEqual(
+      result.status.api_voice_session_available,
+      true,
+      'dashboard control status did not advertise voice session token minting'
+    );
     assert(
       result.uploads?.missingDeleteId?._httpStatus === 400,
       'upload delete RPC did not preserve missing id status'
@@ -1174,6 +1179,7 @@ async function main() {
           key,
           value?._httpStatus || 200,
         ])),
+        voiceSessionAvailable: result.status.api_voice_session_available,
         recordingsStatuses: Object.fromEntries(Object.entries(result.recordings || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,

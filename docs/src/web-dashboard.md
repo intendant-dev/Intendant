@@ -451,9 +451,10 @@ boundary. Current tunneled reads include sessions, session detail, lazy
 command-output loads for the active session, active-session timeline history,
 active-session changes/diffs, lazy exact context-snapshot loads, filesystem
 picker stat/list/mkdir operations, deep session search, settings, API-key
-status, project root, display enumeration, recording metadata, worktree
-inventory, and peer state. Managed-context history reads for records, anchors,
-and fission groups also use the tunnel.
+status, server-side voice-session token minting, project root, display
+enumeration, recording metadata, worktree inventory, and peer state.
+Managed-context history reads for records, anchors, and fission groups also use
+the tunnel.
 Current tunneled mutations include
 active-session rollback/redo/prune, session-data deletion, staged upload
 deletion, settings save, API-key save, peer add/remove, peer access-request
@@ -746,6 +747,9 @@ Staged upload deletion uses `api_session_current_upload_delete` so removing a
 pending attachment can travel over the verified control channel; upload POST
 bodies and raw preview/download bytes remain on HTTP until the tunnel has
 resumable byte-stream semantics.
+OpenAI browser live-audio token minting uses `api_voice_session`; it preserves
+the existing `/session` behavior and error envelope while avoiding a direct
+dashboard HTTPS POST when the verified control channel is available.
 Confirmed session-data deletion uses `api_session_delete` with the same
 no-replay fallback rule as other writes; the dashboard still requires the
 existing confirmation modal before issuing the RPC.

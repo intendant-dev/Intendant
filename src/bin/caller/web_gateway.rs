@@ -1246,7 +1246,7 @@ pub const DEFAULT_PORT: u16 = 8765;
 
 /// Mint a short-lived vendor session token server-side so the browser
 /// never handles (or stores) a long-lived API key.
-async fn mint_session_token(provider: &str, model: &str) -> Result<String, String> {
+pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<String, String> {
     match provider {
         "openai" => {
             let api_key = std::env::var("OPENAI_API_KEY")

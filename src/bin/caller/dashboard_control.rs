@@ -69,6 +69,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_settings_save",
     "api_key_status",
     "api_api_keys_save",
+    "api_voice_session",
     "api_project_root",
     "api_displays",
     "api_recordings",
@@ -1141,6 +1142,7 @@ fn control_frame_response(
                 | "api_settings_save"
                 | "api_key_status"
                 | "api_api_keys_save"
+                | "api_voice_session"
                 | "api_project_root"
                 | "api_displays"
                 | "api_recordings"
@@ -1262,6 +1264,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_settings_save_available", runtime.project_root.is_some()),
         ("api_key_status_available", true),
         ("api_api_keys_save_available", true),
+        ("api_voice_session_available", true),
         ("api_project_root_available", true),
         ("api_displays_available", true),
         ("api_recordings_available", true),
@@ -1391,6 +1394,7 @@ async fn control_request_response(
             "api key status",
         ),
         "api_api_keys_save" => api_api_keys_save_response(id, params.as_ref()).await,
+        "api_voice_session" => api_voice_session_response(id, &runtime).await,
         "api_project_root" => json_body_response(
             id,
             crate::web_gateway::project_root_response_body(runtime.project_root.as_deref()),
@@ -2004,6 +2008,28 @@ async fn api_displays_response(id: String, runtime: &ControlRuntime) -> serde_js
         crate::web_gateway::displays_response_body(&session_registry).await,
         "displays",
     )
+}
+
+async fn api_voice_session_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    let provider = runtime
+        .config
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .unwrap_or("gemini");
+    let model = runtime
+        .config
+        .get("model")
+        .and_then(|value| value.as_str())
+        .unwrap_or("");
+    match crate::web_gateway::mint_session_token(provider, model).await {
+        Ok(body) => http_body_response(id, 200, body, "voice session"),
+        Err(msg) => http_body_response(
+            id,
+            502,
+            serde_json::json!({ "error": msg }).to_string(),
+            "voice session",
+        ),
+    }
 }
 
 async fn api_recordings_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
@@ -3023,6 +3049,7 @@ mod tests {
         assert_eq!(status["result"]["api_settings_save_available"], false);
         assert_eq!(status["result"]["api_key_status_available"], true);
         assert_eq!(status["result"]["api_api_keys_save_available"], true);
+        assert_eq!(status["result"]["api_voice_session_available"], true);
         assert_eq!(status["result"]["api_project_root_available"], true);
         assert_eq!(status["result"]["api_displays_available"], true);
         assert_eq!(status["result"]["api_recordings_available"], true);
@@ -3098,6 +3125,25 @@ mod tests {
         assert_eq!(cancelled["ok"], false);
         assert_eq!(cancelled["cancelled"], true);
         assert!(pending.get("q1").is_none());
+    }
+
+    #[tokio::test]
+    async fn api_voice_session_preserves_endpoint_error_metadata() {
+        let mut rt = runtime();
+        rt.config = serde_json::json!({
+            "provider": "unsupported-voice-provider",
+            "model": "unused",
+        });
+        let response = api_voice_session_response("voice1".to_string(), &rt).await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["id"], "voice1");
+        assert_eq!(response["ok"], true);
+        assert_eq!(response["result"]["_httpStatus"], 502);
+        assert_eq!(response["result"]["_httpOk"], false);
+        assert_eq!(
+            response["result"]["error"],
+            "Unknown provider: unsupported-voice-provider"
+        );
     }
 
     #[tokio::test]

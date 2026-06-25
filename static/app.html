@@ -17920,7 +17920,9 @@ async function connectVoice() {
     // OpenAI: fetch ephemeral client secret from server (uses OPENAI_API_KEY server-side)
     showVoiceStatus('Requesting session token...');
     try {
-      const resp = await fetch('/session', { method: 'POST' });
+      const resp = await dashboardJsonFetch('api_voice_session', {}, () => (
+        fetch('/session', { method: 'POST' })
+      ), 'api_voice_session');
       const data = await resp.json();
       if (data.error) { showVoiceStatus('Token error: ' + data.error, true); return; }
       token = data.client_secret?.value || data.client_secret;
