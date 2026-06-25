@@ -632,6 +632,9 @@ then performs these browser passes:
    `window.intendantDashboardControl` instead of same-origin daemon HTTP/WSS.
    It also asserts that the SPA's signed daemon binding key matches the daemon
    public key registered with the rendezvous service for the selected daemon id.
+   It injects a synthetic `api_control_msg` failure in the connected SPA and
+   verifies that the generic settings-style write path does not replay the same
+   mutation over the legacy WebSocket.
    This real-SPA pass also fails if the public-origin dashboard attempts daemon
    REST/media/WebSocket fallback paths such as `/config`,
    `/.well-known/agent-card.json`, `/api/...`, `/recordings`,

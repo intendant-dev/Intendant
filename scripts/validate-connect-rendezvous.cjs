@@ -2762,6 +2762,7 @@ async function main() {
     const appConnected = await waitForBrowserConnect(appPage, 'intendantDashboardControl');
     const appResult = await appPage.evaluate(async () => {
       const ctl = window.intendantDashboardControl;
+      await ctl.request('status', {}, { timeoutMs: 60000 });
       const status = ctl.status();
       const [config, agentCard, sessions, bootstrap] = await Promise.all([
         ctl.request('config', {}, { timeoutMs: 60000 }),
@@ -2769,6 +2770,7 @@ async function main() {
         ctl.request('api_sessions', { limit: 1 }, { timeoutMs: 60000 }),
         ctl.dashboardBootstrap({ timeoutMs: 60000 }),
       ]);
+      const genericControlNoReplay = await ctl._debugProbeControlNoReplay();
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
       const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
@@ -2778,6 +2780,7 @@ async function main() {
         agentCardId: agentCard?.id || '',
         sessionCount: Array.isArray(sessions) ? sessions.length : null,
         bootstrapFrameCount: bootstrap?.frame_count ?? (Array.isArray(bootstrap?.frames) ? bootstrap.frames.length : null),
+        genericControlNoReplay,
         transportLabel,
         serverLabel,
         serverClass,
@@ -2807,6 +2810,26 @@ async function main() {
       appResult.status.claimedDaemonPublicKey,
       registeredStatus.daemon_public_key,
       `real SPA debug status did not expose registered daemon key: ${JSON.stringify(appResult.status)}`
+    );
+    assert.strictEqual(
+      appResult.genericControlNoReplay.skipped,
+      false,
+      `real SPA could not exercise generic ControlMsg no-replay path: ${JSON.stringify(appResult.genericControlNoReplay)}`
+    );
+    assert.strictEqual(
+      appResult.genericControlNoReplay.rpcFailureWarnings,
+      1,
+      `real SPA generic ControlMsg did not surface one RPC failure: ${JSON.stringify(appResult.genericControlNoReplay)}`
+    );
+    assert.strictEqual(
+      appResult.genericControlNoReplay.rpcAttempts,
+      1,
+      `real SPA generic ControlMsg did not attempt one RPC: ${JSON.stringify(appResult.genericControlNoReplay)}`
+    );
+    assert.strictEqual(
+      appResult.genericControlNoReplay.wsReplayCount,
+      0,
+      `real SPA generic ControlMsg replayed over /ws after RPC failure: ${JSON.stringify(appResult.genericControlNoReplay)}`
     );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
@@ -2849,6 +2872,7 @@ async function main() {
         agentCardId: appResult.agentCardId,
         sessionCount: appResult.sessionCount,
         dashboardBootstrapFrameCount: appResult.bootstrapFrameCount,
+        genericControlNoReplay: appResult.genericControlNoReplay,
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,

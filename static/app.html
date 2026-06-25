@@ -20013,13 +20013,15 @@ function dispatchControlMsg(payload) {
     DASHBOARD_CONTROL_MSG_RPC_ACTIONS.has(action) &&
     dashboardTransport &&
     dashboardTransport.canUseRpc &&
-    dashboardTransport.canUseRpc()
+    dashboardTransport.canUseRpc() &&
+    dashboardControlTransport?.lastStatus?.api_control_msg_available === true
   ) {
     dashboardTransport.request('api_control_msg', { message: payload }, { timeoutMs: 10000 })
       .catch(err => {
-        console.warn(`[dashboard-control] ${action} ControlMsg RPC failed, falling back to /ws`, err);
-        if (app && app.send_server_action) app.send_server_action(payload);
-        else console.warn('control pane: no app connection, dropped', payload);
+        console.warn(`[dashboard-control] ${action} ControlMsg RPC failed; not replaying over /ws`, err);
+        if (typeof showControlToast === 'function') {
+          showControlToast('error', err?.message || 'Dashboard control request failed');
+        }
       });
     return;
   }
@@ -37625,6 +37627,68 @@ window.intendantDashboardControl = {
   },
   status() {
     return dashboardTransport.status();
+  },
+  async _debugProbeControlNoReplay() {
+    if (
+      typeof dispatchControlMsg !== 'function' ||
+      !dashboardTransport ||
+      typeof dashboardTransport.request !== 'function'
+    ) {
+      return {
+        skipped: true,
+        dispatchType: typeof dispatchControlMsg,
+        hasDashboardTransport: Boolean(dashboardTransport),
+        requestType: typeof dashboardTransport?.request,
+        rpcAttempts: 0,
+        wsReplayCount: 0,
+        rpcFailureWarnings: 0,
+      };
+    }
+    const previousRequest = dashboardTransport.request;
+    const previousWarn = console.warn;
+    const previousApp = app;
+    const previousSend = app && typeof app.send_server_action === 'function'
+      ? app.send_server_action
+      : null;
+    let rpcAttempts = 0;
+    let wsReplayCount = 0;
+    let rpcFailureWarnings = 0;
+    if (app && typeof app === 'object') {
+      app.send_server_action = function() {
+        wsReplayCount += 1;
+      };
+    } else {
+      app = {
+        send_server_action() {
+          wsReplayCount += 1;
+        },
+      };
+    }
+    console.warn = function(...args) {
+      if (String(args[0] || '').includes('ControlMsg RPC failed; not replaying over /ws')) {
+        rpcFailureWarnings += 1;
+      }
+      return previousWarn.apply(this, args);
+    };
+    dashboardTransport.request = function(method, params, options) {
+      if (method === 'api_control_msg') {
+        rpcAttempts += 1;
+        return Promise.reject(new Error('synthetic api_control_msg failure'));
+      }
+      return previousRequest.call(this, method, params, options);
+    };
+    try {
+      dispatchControlMsg({ action: 'set_codex_sandbox', mode: 'workspace-write' });
+      await new Promise(resolve => setTimeout(resolve, 50));
+      return { skipped: false, rpcAttempts, wsReplayCount, rpcFailureWarnings };
+    } finally {
+      dashboardTransport.request = previousRequest;
+      console.warn = previousWarn;
+      if (previousApp && previousSend) {
+        previousApp.send_server_action = previousSend;
+      }
+      app = previousApp;
+    }
   },
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);
