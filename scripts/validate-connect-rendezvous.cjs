@@ -831,6 +831,7 @@ async function main() {
         stateSnapshot: await ctl.request('api_state_snapshot'),
         displayBootstrap: await ctl.request('api_display_bootstrap'),
         sessionLogReplay: await ctl.request('api_session_log_replay'),
+        externalSessionActivityReplay: await ctl.request('api_external_session_activity_replay'),
         dashboardBootstrap: await ctl.request('api_dashboard_bootstrap'),
         sessions,
         sessionsById,
@@ -948,6 +949,11 @@ async function main() {
       'dashboard control status did not advertise session log replay'
     );
     assert.strictEqual(
+      result.status.api_external_session_activity_replay_available,
+      true,
+      'dashboard control status did not advertise external session activity replay'
+    );
+    assert.strictEqual(
       result.status.api_dashboard_bootstrap_available,
       true,
       'dashboard control status did not advertise dashboard bootstrap'
@@ -981,6 +987,12 @@ async function main() {
     );
     assert.strictEqual(result.sessionLogReplay?.t, 'log_replay', 'session log replay RPC did not return the event shape');
     assert(Array.isArray(result.sessionLogReplay.entries), 'session log replay did not return entries');
+    assert(Array.isArray(result.externalSessionActivityReplay?.frames), 'external session activity replay did not return frames');
+    assert.strictEqual(
+      result.externalSessionActivityReplay.frame_count,
+      result.externalSessionActivityReplay.frames.length,
+      'external session activity replay frame count did not match'
+    );
     assert(Array.isArray(result.dashboardBootstrap?.frames), 'dashboard bootstrap did not return frames');
     assert.strictEqual(
       result.dashboardBootstrap.frame_count,
@@ -995,6 +1007,10 @@ async function main() {
     assert(
       result.dashboardBootstrap.omitted?.includes('display_input_authority_state'),
       'dashboard bootstrap did not mark authority state as omitted'
+    );
+    assert(
+      !result.dashboardBootstrap.omitted?.includes('external_session_activity_replay'),
+      'dashboard bootstrap still marked external session activity replay as omitted'
     );
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert(Array.isArray(result.sessionsById), 'api_sessions ids did not return an array');
@@ -1260,6 +1276,7 @@ async function main() {
         stateSnapshotConnectionId: result.stateSnapshot.connection_id,
         displayBootstrapFrameCount: result.displayBootstrap.frame_count,
         sessionLogReplayEntryCount: result.sessionLogReplay.entries.length,
+        externalSessionActivityReplayFrameCount: result.externalSessionActivityReplay.frame_count,
         dashboardBootstrapFrameCount: result.dashboardBootstrap.frame_count,
         sessionCount: result.sessions.length,
         sessionByIdCount: result.sessionsById.length,
@@ -1312,10 +1329,6 @@ async function main() {
       },
     }, null, 2));
 
-    await Promise.race([
-      page.evaluate(() => window.intendantPublicConnectDashboard.close()),
-      wait(1000),
-    ]).catch(() => {});
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (!daemon.killed) daemon.kill('SIGINT');
@@ -1330,7 +1343,9 @@ async function fetchJson(url) {
   return resp.json();
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch(err => {
+    console.error(err);
+    process.exit(1);
+  });

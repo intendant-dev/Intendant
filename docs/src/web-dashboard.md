@@ -780,14 +780,19 @@ WebSocket connection holder identity and needs a DataChannel-aware holder model
 before keyboard/mouse control chips can be bootstrapped over this channel.
 `api_session_log_replay` returns the existing capped `log_replay` message shape
 used by late WebSocket joiners. When no active session log exists it returns an
-empty replay with `available: false`; external attached-session transcript replay
-is still separate and has not moved onto this RPC.
+empty replay with `available: false`.
+`api_external_session_activity_replay` returns an envelope whose `frames` array
+contains compact external attached-session activity replay frames for currently
+attached Codex/Claude/Gemini sessions. It uses the same transcript payloads as
+WebSocket bootstrap. The combined bootstrap skips an attached external session
+when the active Intendant session log replay already names the same
+`external_session_id`, avoiding duplicate transcript hydration.
 `api_dashboard_bootstrap` composes the DataChannel-safe bootstrap pieces into an
 ordered `frames` array: state snapshot, cached dashboard events, browser
 workspace snapshot, active display `display_ready` frames, and capped session
-log replay. It explicitly omits display authority frames and external
-attached-session transcript replay until those paths have DataChannel-aware
-identity and stream handling.
+log replay, followed by active external attached-session activity replay frames.
+It explicitly omits display authority frames until that path has a
+DataChannel-aware holder identity.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.

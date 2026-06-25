@@ -7929,7 +7929,7 @@ fn external_session_activity_replay_from_home(
     )
 }
 
-fn external_session_activity_replay_for_websocket(
+pub(crate) fn external_session_activity_replay_for_websocket(
     source: &str,
     session_id: &str,
 ) -> Option<String> {
@@ -15180,8 +15180,7 @@ pub fn spawn_web_gateway(
     // transcript shown in the Sessions tab. This must be a set, not "last
     // attached", because multiple Codex/Claude/Gemini session windows may be
     // open at once.
-    let attached_external_sessions: Arc<Mutex<HashMap<String, String>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let attached_external_sessions = bootstrap_caches.attached_external_sessions.clone();
     // Cache the latest user_display_granted event. The authoritative
     // state lives in AutonomyState.user_display_granted on the server,
     // but the dashboard only learns about it via the broadcast; without

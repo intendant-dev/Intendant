@@ -138,6 +138,7 @@ async function main() {
         stateSnapshot: await ctl.stateSnapshot({ timeoutMs: 60000 }),
         displayBootstrap: await ctl.displayBootstrap({ timeoutMs: 60000 }),
         sessionLogReplay: await ctl.sessionLogReplay({ timeoutMs: 60000 }),
+        externalSessionActivityReplay: await ctl.externalSessionActivityReplay({ timeoutMs: 60000 }),
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         rejectedControlMsg: await ctl.request('api_control_msg', {
@@ -177,6 +178,12 @@ async function main() {
     );
     assert.strictEqual(result.sessionLogReplay?.t, 'log_replay', 'session log replay RPC did not return the event shape');
     assert(Array.isArray(result.sessionLogReplay.entries), 'session log replay did not return entries');
+    assert(Array.isArray(result.externalSessionActivityReplay?.frames), 'external session activity replay did not return frames');
+    assert.strictEqual(
+      result.externalSessionActivityReplay.frame_count,
+      result.externalSessionActivityReplay.frames.length,
+      'external session activity replay frame count did not match'
+    );
     assert(Array.isArray(result.dashboardBootstrap?.frames), 'dashboard bootstrap did not return frames');
     assert.strictEqual(
       result.dashboardBootstrap.frame_count,
@@ -192,6 +199,10 @@ async function main() {
       result.dashboardBootstrap.omitted?.includes('display_input_authority_state'),
       'dashboard bootstrap did not mark authority state as omitted'
     );
+    assert(
+      !result.dashboardBootstrap.omitted?.includes('external_session_activity_replay'),
+      'dashboard bootstrap still marked external session activity replay as omitted'
+    );
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
     assert.strictEqual(result.finalStatus.signalingMode, 'local-http');
     assert.strictEqual(result.finalStatus.apiAgentCardAvailable, true);
@@ -200,6 +211,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiStateSnapshotAvailable, true);
     assert.strictEqual(result.finalStatus.apiDisplayBootstrapAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionLogReplayAvailable, true);
+    assert.strictEqual(result.finalStatus.apiExternalSessionActivityReplayAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardBootstrapAvailable, true);
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
     assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
@@ -221,6 +233,7 @@ async function main() {
         stateSnapshotConnectionId: result.stateSnapshot.connection_id,
         displayBootstrapFrameCount: result.displayBootstrap.frame_count,
         sessionLogReplayEntryCount: result.sessionLogReplay.entries.length,
+        externalSessionActivityReplayFrameCount: result.externalSessionActivityReplay.frame_count,
         dashboardBootstrapFrameCount: result.dashboardBootstrap.frame_count,
         sessionCount: result.sessions.length,
         apiAgentCardAvailable: result.finalStatus.apiAgentCardAvailable,
@@ -229,6 +242,7 @@ async function main() {
         apiStateSnapshotAvailable: result.finalStatus.apiStateSnapshotAvailable,
         apiDisplayBootstrapAvailable: result.finalStatus.apiDisplayBootstrapAvailable,
         apiSessionLogReplayAvailable: result.finalStatus.apiSessionLogReplayAvailable,
+        apiExternalSessionActivityReplayAvailable: result.finalStatus.apiExternalSessionActivityReplayAvailable,
         apiDashboardBootstrapAvailable: result.finalStatus.apiDashboardBootstrapAvailable,
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,
@@ -237,10 +251,6 @@ async function main() {
       },
     }, null, 2));
 
-    await Promise.race([
-      page.evaluate(() => window.intendantDashboardControl.disable()),
-      wait(1000),
-    ]).catch(() => {});
   } finally {
     if (browser) await browser.close().catch(() => {});
     if (!daemon.killed) daemon.kill('SIGINT');
@@ -252,7 +262,9 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch(err => {
+    console.error(err);
+    process.exit(1);
+  });

@@ -24,7 +24,7 @@ use rtc::sansio::Protocol;
 use rtc::shared::{TaggedBytesMut, TransportContext, TransportProtocol};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -50,6 +50,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_state_snapshot",
     "api_display_bootstrap",
     "api_session_log_replay",
+    "api_external_session_activity_replay",
     "api_dashboard_bootstrap",
     "status",
     "events",
@@ -132,6 +133,7 @@ pub struct DashboardBootstrapCaches {
     pub(crate) last_autonomy_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_external_agent_json: Arc<std::sync::Mutex<Option<String>>>,
     pub(crate) last_user_display_json: Arc<std::sync::Mutex<Option<String>>>,
+    pub(crate) attached_external_sessions: Arc<std::sync::Mutex<HashMap<String, String>>>,
 }
 
 impl DashboardControlRegistry {
@@ -1203,6 +1205,7 @@ fn control_frame_response(
                 | "api_state_snapshot"
                 | "api_display_bootstrap"
                 | "api_session_log_replay"
+                | "api_external_session_activity_replay"
                 | "api_dashboard_bootstrap"
                 | "api_worktrees"
                 | "api_worktrees_scan"
@@ -1387,6 +1390,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_state_snapshot_available", true),
         ("api_display_bootstrap_available", true),
         ("api_session_log_replay_available", true),
+        ("api_external_session_activity_replay_available", true),
         ("api_dashboard_bootstrap_available", true),
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
@@ -1554,6 +1558,9 @@ async fn control_request_response(
         "api_state_snapshot" => api_state_snapshot_response(id, &runtime).await,
         "api_display_bootstrap" => api_display_bootstrap_response(id, &runtime).await,
         "api_session_log_replay" => api_session_log_replay_response(id, &runtime).await,
+        "api_external_session_activity_replay" => {
+            api_external_session_activity_replay_response(id, &runtime).await
+        }
         "api_dashboard_bootstrap" => api_dashboard_bootstrap_response(id, &runtime).await,
         "api_worktrees" => api_worktrees_response(id, &runtime).await,
         "api_worktrees_scan" => api_worktrees_scan_response(id, &runtime).await,
@@ -2324,17 +2331,27 @@ async fn api_dashboard_bootstrap_response(
             frames.extend(events.iter().cloned());
         }
     }
-    frames.extend(display_ready_bootstrap_frames(runtime).await);
     if let Some(frame) =
         response_result(api_browser_workspace_snapshot_response("bootstrap-browser".into()).await)
     {
         frames.push(frame);
     }
+    frames.extend(display_ready_bootstrap_frames(runtime).await);
+    let mut replayed_external_session_ids = HashSet::new();
     if let Some(frame) =
         response_result(api_session_log_replay_response("bootstrap-replay".into(), runtime).await)
     {
+        if let Some(external_session_id) =
+            frame.get("external_session_id").and_then(|value| value.as_str())
+        {
+            replayed_external_session_ids.insert(external_session_id.to_string());
+        }
         frames.push(frame);
     }
+    frames.extend(external_session_activity_replay_frames(
+        runtime,
+        &replayed_external_session_ids,
+    ));
     let frame_count = frames.len();
 
     serde_json::json!({
@@ -2345,8 +2362,7 @@ async fn api_dashboard_bootstrap_response(
             "frames": frames,
             "frame_count": frame_count,
             "omitted": [
-                "display_input_authority_state",
-                "external_session_activity_replay"
+                "display_input_authority_state"
             ],
         },
     })
@@ -2393,6 +2409,50 @@ async fn display_ready_bootstrap_frames(runtime: &ControlRuntime) -> Vec<serde_j
                     "height": height,
                 })
             })
+        })
+        .collect()
+}
+
+async fn api_external_session_activity_replay_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let frames = external_session_activity_replay_frames(runtime, &HashSet::new());
+    let frame_count = frames.len();
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "frames": frames,
+            "frame_count": frame_count,
+        },
+    })
+}
+
+fn external_session_activity_replay_frames(
+    runtime: &ControlRuntime,
+    skip_session_ids: &HashSet<String>,
+) -> Vec<serde_json::Value> {
+    let mut active_external_sessions: Vec<(String, String)> = runtime
+        .bootstrap_caches
+        .attached_external_sessions
+        .lock()
+        .ok()
+        .map(|guard| {
+            guard
+                .iter()
+                .map(|(session_id, source)| (session_id.clone(), source.clone()))
+                .collect()
+        })
+        .unwrap_or_default();
+    active_external_sessions.sort_by(|a, b| a.0.cmp(&b.0));
+    active_external_sessions
+        .into_iter()
+        .filter(|(session_id, _)| !skip_session_ids.contains(session_id))
+        .filter_map(|(session_id, source)| {
+            crate::web_gateway::external_session_activity_replay_for_websocket(&source, &session_id)
+                .and_then(|payload| serde_json::from_str::<serde_json::Value>(&payload).ok())
         })
         .collect()
 }
@@ -3728,6 +3788,10 @@ mod tests {
         assert_eq!(status["result"]["api_state_snapshot_available"], true);
         assert_eq!(status["result"]["api_display_bootstrap_available"], true);
         assert_eq!(status["result"]["api_session_log_replay_available"], true);
+        assert_eq!(
+            status["result"]["api_external_session_activity_replay_available"],
+            true
+        );
         assert_eq!(status["result"]["api_dashboard_bootstrap_available"], true);
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
@@ -4216,6 +4280,18 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_session_activity_replay_rpc_returns_empty_frames_without_attached_sessions() {
+        let rt = runtime();
+        let replay =
+            api_external_session_activity_replay_response("ext1".to_string(), &rt).await;
+        assert_eq!(replay["t"], "response");
+        assert_eq!(replay["id"], "ext1");
+        assert_eq!(replay["ok"], true);
+        assert_eq!(replay["result"]["frame_count"], 0);
+        assert_eq!(replay["result"]["frames"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
     async fn dashboard_bootstrap_rpc_returns_ordered_bootstrap_frames() {
         let rt = runtime();
         let bootstrap = api_dashboard_bootstrap_response("boot1".to_string(), &rt).await;
@@ -4240,6 +4316,13 @@ mod tests {
                 .unwrap()
                 .iter()
                 .any(|value| value.as_str() == Some("display_input_authority_state"))
+        );
+        assert!(
+            !bootstrap["result"]["omitted"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|value| value.as_str() == Some("external_session_activity_replay"))
         );
     }
 
