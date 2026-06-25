@@ -13,6 +13,7 @@ const { httpStatus, launchBrowser } = require('./lib/browser-automation.cjs');
 const DEFAULT_DAEMON_PORT = 8876;
 const DEFAULT_RENDEZVOUS_PORT = 9876;
 const DEFAULT_DAEMON_ID = 'connect-e2e-daemon';
+const DEFAULT_CONNECT_TOKEN = 'connect-e2e-token';
 const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
 const FRAME_FIXTURE_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
@@ -25,6 +26,7 @@ function parseArgs(argv) {
     daemonPort: DEFAULT_DAEMON_PORT,
     rendezvousPort: DEFAULT_RENDEZVOUS_PORT,
     daemonId: DEFAULT_DAEMON_ID,
+    connectToken: DEFAULT_CONNECT_TOKEN,
   };
   for (let i = 2; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -36,6 +38,8 @@ function parseArgs(argv) {
       out.rendezvousPort = Number(argv[++i]);
     } else if (arg === '--daemon-id') {
       out.daemonId = String(argv[++i] || '').trim();
+    } else if (arg === '--connect-token') {
+      out.connectToken = String(argv[++i] || '').trim();
     } else if (arg === '--help' || arg === '-h') {
       console.log(`Usage:
   node scripts/validate-connect-rendezvous.cjs [options]
@@ -45,6 +49,7 @@ Options:
   --daemon-port <port>        Fresh daemon web port. Default ${DEFAULT_DAEMON_PORT}.
   --rendezvous-port <port>    Local public-origin emulator port. Default ${DEFAULT_RENDEZVOUS_PORT}.
   --daemon-id <id>            Rendezvous daemon id. Default ${DEFAULT_DAEMON_ID}.
+  --connect-token <token>     Bearer token required for daemon rendezvous endpoints. Default ${DEFAULT_CONNECT_TOKEN}.
 `);
       process.exit(0);
     } else {
@@ -54,6 +59,7 @@ Options:
   assert(Number.isInteger(out.daemonPort) && out.daemonPort > 0, 'invalid daemon port');
   assert(Number.isInteger(out.rendezvousPort) && out.rendezvousPort > 0, 'invalid rendezvous port');
   assert(out.daemonId, 'daemon id is required');
+  assert(out.connectToken, 'connect token is required');
   return out;
 }
 
@@ -131,14 +137,21 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
-function createRendezvousServer(staticRoot) {
+function createRendezvousServer(staticRoot, options = {}) {
   const daemons = new Map();
   const events = new Map();
   const pollers = new Map();
   const pendingOffers = new Map();
+  const authToken = String(options.authToken || '').trim();
   const server = http.createServer(async (req, res) => {
     try {
       const url = new URL(req.url, 'http://127.0.0.1');
+      if (url.pathname.startsWith('/api/daemon/') && authToken) {
+        const expected = `Bearer ${authToken}`;
+        if (String(req.headers.authorization || '') !== expected) {
+          return sendJson(res, 401, { error: 'missing or invalid daemon bearer token' });
+        }
+      }
       if (req.method === 'GET' && (url.pathname === '/' || url.pathname === '/connect')) {
         return sendText(res, 200, publicBootstrapHtml(), 'text/html; charset=utf-8');
       }
@@ -159,6 +172,7 @@ function createRendezvousServer(staticRoot) {
           registered: daemons.has(daemonId),
           queued: (events.get(daemonId) || []).length,
           pending_offers: Array.from(pendingOffers.values()).filter(p => p.daemonId === daemonId).length,
+          daemon_auth_required: Boolean(authToken),
         });
       }
       if (req.method === 'POST' && url.pathname === '/api/daemon/register') {
@@ -1153,7 +1167,9 @@ async function waitForBrowserConnect(page, globalName = 'intendantPublicConnectD
 
 async function main() {
   const options = parseArgs(process.argv);
-  const rendezvous = createRendezvousServer(path.join(options.repoRoot, 'static'));
+  const rendezvous = createRendezvousServer(path.join(options.repoRoot, 'static'), {
+    authToken: options.connectToken,
+  });
   await new Promise((resolve, reject) => {
     rendezvous.once('error', reject);
     rendezvous.listen(options.rendezvousPort, '127.0.0.1', resolve);
@@ -1170,6 +1186,7 @@ async function main() {
       ...process.env,
       INTENDANT_CONNECT_RENDEZVOUS_URL: `http://127.0.0.1:${options.rendezvousPort}`,
       INTENDANT_CONNECT_DAEMON_ID: options.daemonId,
+      INTENDANT_CONNECT_TOKEN: options.connectToken,
     },
     stdio: ['ignore', 'pipe', 'pipe'],
   });
@@ -1181,8 +1198,11 @@ async function main() {
   let browser;
   try {
     await waitFor(() => daemonLogs.join('').includes(`Web TUI: https://0.0.0.0:${options.daemonPort}`), START_TIMEOUT_MS, 'daemon web startup');
+    const daemonNoAuthStatus = await httpStatus(`http://127.0.0.1:${options.rendezvousPort}/api/daemon/next?daemon_id=${encodeURIComponent(options.daemonId)}&timeout_ms=1`);
+    assert.strictEqual(daemonNoAuthStatus, 401, `/api/daemon/next without bearer returned ${daemonNoAuthStatus}`);
     await waitFor(async () => {
       const status = await fetchJson(`http://127.0.0.1:${options.rendezvousPort}/api/status?daemon_id=${encodeURIComponent(options.daemonId)}`);
+      assert.strictEqual(status.daemon_auth_required, true, 'rendezvous status did not advertise daemon auth requirement');
       return status.registered ? status : null;
     }, START_TIMEOUT_MS, 'daemon rendezvous registration');
 
@@ -2494,6 +2514,7 @@ async function main() {
       publicOrigin,
       daemonPort: options.daemonPort,
       daemonId: options.daemonId,
+      daemonNoAuthStatus,
       certlessConfigStatus,
       connected,
       rpc: {

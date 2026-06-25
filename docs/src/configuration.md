@@ -342,7 +342,9 @@ The emulator intentionally has no account, passkey, claim-code, or durable
 device registry. It exists to prove the browser-public-origin → rendezvous →
 daemon-outbound-signaling → direct WebRTC DataChannel path while keeping the
 normal dashboard mTLS default in place. The same validator also serves the real
-dashboard bundle in `connect=1` mode, so this is not only a protocol smoke test.
+dashboard bundle in `connect=1` mode, requires the daemon-side bearer token on
+`/api/daemon/*`, and asserts that unauthenticated daemon polling is rejected, so
+this is not only a protocol smoke test.
 
 ### `[server]` (daemon and federation)
 

@@ -611,7 +611,8 @@ Chrome/Chromium through the DevTools Protocol. The fallback honors
 The validator starts a local rendezvous HTTP origin, launches a fresh daemon
 child with Connect env vars, verifies that
 `https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
-`401`, then performs two browser passes:
+`401`, verifies that daemon rendezvous endpoints reject missing bearer auth, and
+then performs two browser passes:
 
 1. It loads the minimal public bootstrap page from the rendezvous origin and
    drives `status`, `config`, `api_sessions`, id-filtered `api_sessions`,
