@@ -853,6 +853,11 @@ async function main() {
             revert_conversation: false,
           }),
         },
+        filesystem: {
+          statHome: await ctl.request('api_fs_stat', { path: '~' }),
+          listHome: await ctl.request('api_fs_list', { path: '~' }),
+          badRelative: await ctl.request('api_fs_stat', { path: 'relative/path' }),
+        },
         appError: await ctl.request('api_peer_eligible', { capabilities: [] }),
         finalStatus: ctl.status(),
       };
@@ -948,6 +953,35 @@ async function main() {
       ),
       'timeline rollback validation RPC did not preserve endpoint status'
     );
+    assert.strictEqual(
+      result.status.api_fs_stat_available,
+      true,
+      'dashboard control status did not advertise filesystem stat'
+    );
+    assert.strictEqual(
+      result.status.api_fs_list_available,
+      true,
+      'dashboard control status did not advertise filesystem list'
+    );
+    assert(
+      result.filesystem?.statHome &&
+        result.filesystem.statHome._httpStatus === 200 &&
+        result.filesystem.statHome.exists === true &&
+        result.filesystem.statHome.is_dir === true,
+      'filesystem stat RPC did not return home directory status'
+    );
+    assert(
+      result.filesystem?.listHome &&
+        result.filesystem.listHome._httpStatus === 200 &&
+        Array.isArray(result.filesystem.listHome.entries),
+      'filesystem list RPC did not return home directory entries'
+    );
+    assert(
+      result.filesystem?.badRelative &&
+        result.filesystem.badRelative._httpStatus === 400 &&
+        result.filesystem.badRelative._httpOk === false,
+      'filesystem stat RPC did not preserve bad path status'
+    );
     assert(result.appError && result.appError._httpStatus === 400, 'application error metadata was not preserved');
     assert(
       result.finalStatus.completedChunkedResponses > result.largeSessions.completedChunkedResponsesBefore,
@@ -981,6 +1015,10 @@ async function main() {
         completedChunkedResponses: result.finalStatus.completedChunkedResponses,
         agentOutputStatus: result.agentOutput?._httpStatus || 200,
         timelineStatuses: Object.fromEntries(Object.entries(result.timeline || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
+        filesystemStatuses: Object.fromEntries(Object.entries(result.filesystem || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,
         ])),

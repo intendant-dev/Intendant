@@ -57,6 +57,8 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_session_current_rollback",
     "api_session_current_redo",
     "api_session_current_prune",
+    "api_fs_stat",
+    "api_fs_list",
     "api_sessions_search",
     "api_settings",
     "api_settings_save",
@@ -1067,6 +1069,8 @@ fn control_frame_response(
                         "api_session_current_rollback_available": true,
                         "api_session_current_redo_available": true,
                         "api_session_current_prune_available": true,
+                        "api_fs_stat_available": true,
+                        "api_fs_list_available": true,
                         "api_sessions_search_available": true,
                         "api_settings_available": true,
                         "api_settings_save_available": runtime.project_root.is_some(),
@@ -1145,6 +1149,8 @@ fn control_frame_response(
                 | "api_session_current_rollback"
                 | "api_session_current_redo"
                 | "api_session_current_prune"
+                | "api_fs_stat"
+                | "api_fs_list"
                 | "api_sessions_search"
                 | "api_settings"
                 | "api_settings_save"
@@ -1302,6 +1308,8 @@ async fn control_request_response(
         }
         "api_session_current_redo" => api_session_current_redo_response(id, &runtime).await,
         "api_session_current_prune" => api_session_current_prune_response(id, &runtime).await,
+        "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
+        "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
         "api_sessions_search" => api_sessions_search_response(id, params.as_ref(), cancel).await,
         "api_settings" => api_settings_response(id, &runtime).await,
         "api_settings_save" => api_settings_save_response(id, params.as_ref(), &runtime).await,
@@ -1654,6 +1662,54 @@ async fn api_session_current_prune_response(
     let (file_watcher, _) = active_history_handles(runtime).await;
     let (status_line, body) = crate::web_gateway::handle_history_prune(file_watcher.as_ref()).await;
     http_body_response(id, status_line_code(status_line), body, "session prune")
+}
+
+async fn api_fs_stat_response(id: String, params: Option<&serde_json::Value>) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let path = string_param(&params, &["path"]);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::dashboard_fs_stat_response_body(&path)
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => http_body_response(id, 200, body, "filesystem stat"),
+        Ok(Err(error)) => http_body_response(
+            id,
+            400,
+            serde_json::json!({ "error": error }).to_string(),
+            "filesystem stat",
+        ),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("filesystem stat task failed: {e}"),
+        }),
+    }
+}
+
+async fn api_fs_list_response(id: String, params: Option<&serde_json::Value>) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let path = string_param(&params, &["path"]);
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::dashboard_fs_list_response_body(&path)
+    })
+    .await;
+    match result {
+        Ok(Ok(body)) => http_body_response(id, 200, body, "filesystem list"),
+        Ok(Err(error)) => http_body_response(
+            id,
+            400,
+            serde_json::json!({ "error": error }).to_string(),
+            "filesystem list",
+        ),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("filesystem list task failed: {e}"),
+        }),
+    }
 }
 
 async fn api_sessions_search_response(
@@ -2490,6 +2546,8 @@ mod tests {
             status["result"]["api_session_current_prune_available"],
             true
         );
+        assert_eq!(status["result"]["api_fs_stat_available"], true);
+        assert_eq!(status["result"]["api_fs_list_available"], true);
         assert_eq!(status["result"]["api_sessions_search_available"], true);
         assert_eq!(status["result"]["api_settings_available"], true);
         assert_eq!(status["result"]["api_settings_save_available"], false);
@@ -2639,6 +2697,65 @@ mod tests {
             assert_eq!(response.frame["result"]["error"], "file watcher not active");
             assert_eq!(response.frame["result"]["_httpStatus"], 503);
             assert_eq!(response.frame["result"]["_httpOk"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn fs_stat_and_list_preserve_http_status() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("note.txt"), b"hello").unwrap();
+
+        let mut rt = runtime();
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        for (idx, (method, path)) in [
+            ("api_fs_stat", dir.path().to_string_lossy().to_string()),
+            ("api_fs_list", dir.path().to_string_lossy().to_string()),
+            ("api_fs_stat", "relative/path".to_string()),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let id = format!("fs{idx}");
+            let is_list = method == "api_fs_list";
+            let is_bad_path = path == "relative/path";
+            let frame = serde_json::json!({
+                "t": "request",
+                "id": id,
+                "method": method,
+                "params": { "path": path.clone() },
+            })
+            .to_string();
+            let queued = control_frame_response(&frame, &mut rt, &tx, &mut pending, &mut outbound);
+            assert!(queued.is_none());
+            assert!(pending.contains_key(&id));
+
+            let response = rx.recv().await.unwrap();
+            assert!(pending.remove(&response.id).is_some());
+            assert_eq!(response.id, id);
+            assert!(response.done);
+            assert_eq!(response.frame["t"], "response");
+            assert_eq!(response.frame["ok"], true);
+
+            if is_list {
+                assert!(response.frame["result"]["entries"].is_array());
+                assert_eq!(response.frame["result"]["_httpStatus"], 200);
+                assert_eq!(response.frame["result"]["_httpOk"], true);
+            } else if is_bad_path {
+                assert_eq!(response.frame["result"]["_httpStatus"], 400);
+                assert_eq!(response.frame["result"]["_httpOk"], false);
+                assert!(response.frame["result"]["error"]
+                    .as_str()
+                    .unwrap_or("")
+                    .contains("path must be absolute"));
+            } else {
+                assert_eq!(response.frame["result"]["exists"], true);
+                assert_eq!(response.frame["result"]["is_dir"], true);
+                assert_eq!(response.frame["result"]["_httpStatus"], 200);
+                assert_eq!(response.frame["result"]["_httpOk"], true);
+            }
         }
     }
 

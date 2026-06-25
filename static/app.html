@@ -44365,7 +44365,10 @@ function setNewSessionCreateVisible(visible) {
 }
 
 async function fetchProjectPathStatus(path) {
-  const resp = await authedFetch('/api/fs/stat?path=' + encodeURIComponent(path || ''));
+  const target = path || '';
+  const resp = await dashboardJsonFetch('api_fs_stat', { path: target }, () => (
+    authedFetch('/api/fs/stat?path=' + encodeURIComponent(target))
+  ), 'api_fs_stat');
   const data = await resp.json().catch(() => ({}));
   if (!resp.ok) throw new Error(data.error || `Path check failed (${resp.status})`);
   return data;
@@ -44623,7 +44626,9 @@ async function resolveFsPickerListTarget(target) {
   if (fsPickerMode !== 'file' || !fsPathLooksAbsolute(target)) {
     return { listPath: target, selectedPath: '' };
   }
-  const resp = await authedFetch('/api/fs/stat?path=' + encodeURIComponent(target));
+  const resp = await dashboardJsonFetch('api_fs_stat', { path: target }, () => (
+    authedFetch('/api/fs/stat?path=' + encodeURIComponent(target))
+  ), 'api_fs_stat');
   const status = await resp.json().catch(() => ({}));
   if (!resp.ok) return { listPath: target, selectedPath: '' };
   if (status.exists && status.is_file && status.parent) {
@@ -44653,7 +44658,9 @@ async function loadFsPicker(path) {
   try {
     const resolved = await resolveFsPickerListTarget(target);
     fsPickerSelectedPath = resolved.selectedPath || '';
-    const resp = await authedFetch('/api/fs/list?path=' + encodeURIComponent(resolved.listPath));
+    const resp = await dashboardJsonFetch('api_fs_list', { path: resolved.listPath }, () => (
+      authedFetch('/api/fs/list?path=' + encodeURIComponent(resolved.listPath))
+    ), 'api_fs_list');
     const data = await resp.json().catch(() => ({}));
     if (!resp.ok) throw new Error(data.error || `Directory load failed (${resp.status})`);
     if (input) input.value = fsPickerSelectedPath || data.path || resolved.listPath;

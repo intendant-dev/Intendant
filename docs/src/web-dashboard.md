@@ -449,9 +449,10 @@ When enabled with
 DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
 boundary. Current tunneled reads include sessions, session detail, lazy
 command-output loads for the active session, active-session timeline history,
-deep session search, settings, API-key status, project root, display
-enumeration, and peer state. Managed-context history reads for records, anchors,
-and fission groups also use the tunnel. Current tunneled mutations include
+filesystem picker stat/list reads, deep session search, settings, API-key
+status, project root, display enumeration, and peer state. Managed-context
+history reads for records, anchors, and fission groups also use the tunnel.
+Current tunneled mutations include
 active-session rollback/redo/prune, settings save, API-key save, peer
 add/remove, peer access-request pairing, peer message/task/approval actions,
 eligible-peer lookup, and coordinator routing.
@@ -469,6 +470,7 @@ Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
 - frames, recordings, and file uploads;
+- filesystem mutations such as mkdir;
 - MCP-over-HTTP;
 - diagnostics NDJSON uploads;
 - display WebRTC media/control channels and peer-display signaling;
@@ -723,6 +725,9 @@ The active-session timeline uses `api_session_current_history`,
 `api_session_current_rollback`, `api_session_current_redo`, and
 `api_session_current_prune`; the mutation calls use the same no-replay fallback
 rule as other writes.
+The filesystem picker's read-only path checks and directory listings use
+`api_fs_stat` and `api_fs_list`; mkdir remains on HTTP until the tunnel has a
+broader filesystem mutation model.
 
 The first production APIs should be small and high value: `/config`, the main
 event stream, local session list hydration, peer access-request
@@ -788,9 +793,10 @@ Treat this as a staged target, not current behavior:
    the DataChannel transport boundary; hosted passkey step-up still belongs to
    the future public Connect UI.
 10. Gradually migrate larger API surfaces. Managed-context history reads,
-    active-session command-output loads, active-session timeline operations, and
-    local session hydration now use the tunnel, oversized JSON responses now use
-    credit-windowed chunked response framing, and the sessions stream uses explicit
+    active-session command-output loads, active-session timeline operations,
+    filesystem picker stat/list reads, and local session hydration now use the
+    tunnel, oversized JSON responses now use credit-windowed chunked response
+    framing, and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames.
     Uploads, downloads, recordings, terminals, and file transfer still wait for
     resumable stream/file-transfer semantics.

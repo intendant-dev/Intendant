@@ -13513,6 +13513,11 @@ fn inspect_dashboard_fs_path(raw: &str) -> Result<FsPathStatus, String> {
     })
 }
 
+pub(crate) fn dashboard_fs_stat_response_body(raw: &str) -> Result<String, String> {
+    inspect_dashboard_fs_path(raw)
+        .and_then(|status| serde_json::to_string(&status).map_err(|e| e.to_string()))
+}
+
 fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, String> {
     let path = expand_dashboard_fs_path(raw)?;
     let canonical = std::fs::canonicalize(&path)
@@ -13553,6 +13558,10 @@ fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, String> {
         "entries": entries,
         "truncated": truncated,
     }))
+}
+
+pub(crate) fn dashboard_fs_list_response_body(raw: &str) -> Result<String, String> {
+    list_dashboard_fs_dir(raw).map(|body| body.to_string())
 }
 
 fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, String)> {
