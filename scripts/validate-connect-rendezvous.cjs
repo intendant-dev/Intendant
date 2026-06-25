@@ -16,6 +16,7 @@ const DEFAULT_DAEMON_ID = 'connect-e2e-daemon';
 const DEFAULT_CONNECT_TOKEN = 'connect-e2e-token';
 const START_TIMEOUT_MS = 30000;
 const CONNECT_TIMEOUT_MS = 30000;
+const TAMPERED_DAEMON_PUBLIC_KEY = 'tampered-daemon-public-key';
 const FRAME_FIXTURE_PNG_BASE64 = 'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+/p9sAAAAASUVORK5CYII=';
 
 function parseArgs(argv) {
@@ -137,6 +138,16 @@ async function readJson(req) {
   return JSON.parse(Buffer.concat(chunks).toString('utf8'));
 }
 
+function requestRefererSearchParams(req) {
+  const raw = String(req.headers.referer || '');
+  if (!raw) return new URLSearchParams();
+  try {
+    return new URL(raw, 'http://127.0.0.1').searchParams;
+  } catch {
+    return new URLSearchParams();
+  }
+}
+
 function createRendezvousServer(staticRoot, options = {}) {
   const daemons = new Map();
   const events = new Map();
@@ -226,12 +237,15 @@ function createRendezvousServer(staticRoot, options = {}) {
         }
         pendingOffers.delete(offer.id);
         clearTimeout(offer.timer);
+        const advertisedDaemonPublicKey = offer.tamperRegisteredKey
+          ? TAMPERED_DAEMON_PUBLIC_KEY
+          : daemon.daemonPublicKey;
         sendJson(offer.res, 200, {
           ok: true,
           session_id: body.session_id,
           sdp: body.sdp,
           binding: body.binding,
-          daemon_public_key: daemon.daemonPublicKey,
+          daemon_public_key: advertisedDaemonPublicKey,
         });
         return sendJson(res, 200, { ok: true });
       }
@@ -255,13 +269,14 @@ function createRendezvousServer(staticRoot, options = {}) {
         const sdp = String(body.sdp || '');
         if (!daemonId || !sdp.trim()) return sendJson(res, 400, { error: 'missing daemon_id or sdp' });
         if (!daemons.has(daemonId)) return sendJson(res, 404, { error: 'daemon not registered' });
+        const tamperRegisteredKey = requestRefererSearchParams(req).get('tamper_registered_key') === '1';
         const id = crypto.randomUUID();
         const timer = setTimeout(() => {
           if (!pendingOffers.has(id)) return;
           pendingOffers.delete(id);
           sendJson(res, 504, { error: 'timed out waiting for daemon answer' });
         }, CONNECT_TIMEOUT_MS);
-        pendingOffers.set(id, { id, daemonId, res, timer });
+        pendingOffers.set(id, { id, daemonId, res, timer, tamperRegisteredKey });
         res.on('close', () => {
           clearTimeout(timer);
           pendingOffers.delete(id);
@@ -434,7 +449,7 @@ function publicBootstrapHtml() {
       this.pc = new RTCPeerConnection({});
       this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
       this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'terminal_frames', 'tui_frames'] });
+        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames', 'tui_frames'] });
         paint(this.status());
       };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
@@ -2908,6 +2923,86 @@ async function main() {
         consoleErrors: failedGuards.consoleErrors,
         unexpectedPublicRequests: failedGuards.unexpectedPublicRequests,
         unexpectedPublicWebSockets: failedGuards.unexpectedPublicWebSockets,
+      },
+    }, null, 2));
+
+    const mismatchAppPage = await browser.newPage();
+    const mismatchGuards = installPublicAppGuards(mismatchAppPage, 'app-mismatch-browser');
+    const mismatchAppResponse = await mismatchAppPage.goto(
+      `${publicOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}&tamper_registered_key=1`,
+      {
+        waitUntil: 'domcontentloaded',
+        timeout: CONNECT_TIMEOUT_MS,
+      }
+    );
+    assert(mismatchAppResponse, 'mismatch public app produced no response');
+    assert.strictEqual(
+      mismatchAppResponse.status(),
+      200,
+      `mismatch public app returned ${mismatchAppResponse.status()}`
+    );
+    await mismatchAppPage.waitForFunction(() => {
+      const status = window.intendantDashboardControl?.status?.();
+      return Boolean(status?.lastError);
+    }, undefined, { timeout: CONNECT_TIMEOUT_MS });
+    const mismatchAppResult = await mismatchAppPage.evaluate(() => {
+      const status = window.intendantDashboardControl.status();
+      return {
+        lastError: status.lastError || '',
+        connected: Boolean(status.connected),
+        verifiedBinding: status.verifiedBinding || null,
+        claimedDaemonPublicKey: status.claimedDaemonPublicKey || '',
+        transportLabel: document.getElementById('sb-dashboard-transport-label')?.textContent || '',
+        serverLabel: document.getElementById('sb-conn-label')?.textContent || '',
+        serverClass: document.getElementById('sb-conn')?.className || '',
+      };
+    });
+    assert(
+      /daemon public key mismatch/i.test(mismatchAppResult.lastError),
+      `real SPA Connect key mismatch did not fail closed: ${JSON.stringify(mismatchAppResult)}`
+    );
+    assert.strictEqual(mismatchAppResult.connected, false, 'key-mismatch real SPA reported connected transport');
+    assert.strictEqual(
+      mismatchAppResult.verifiedBinding,
+      null,
+      `key-mismatch real SPA kept a verified binding: ${JSON.stringify(mismatchAppResult)}`
+    );
+    assert.strictEqual(
+      mismatchAppResult.transportLabel,
+      'failed',
+      'key-mismatch real SPA did not show failed Connect transport'
+    );
+    assert.strictEqual(mismatchAppResult.serverLabel, 'events', 'key-mismatch real SPA did not keep events label');
+    assert(
+      String(mismatchAppResult.serverClass || '').includes('err'),
+      `key-mismatch real SPA did not mark event tunnel failed: ${JSON.stringify(mismatchAppResult)}`
+    );
+    assert.deepStrictEqual(
+      [...new Set(mismatchGuards.unexpectedPublicRequests)],
+      [],
+      'key-mismatch real SPA attempted public-origin daemon REST/media fallback requests'
+    );
+    assert.deepStrictEqual(
+      [...new Set(mismatchGuards.unexpectedPublicWebSockets)],
+      [],
+      'key-mismatch real SPA attempted public-origin WebSocket fallback requests'
+    );
+    assert.deepStrictEqual(
+      mismatchGuards.consoleErrors,
+      [],
+      'key-mismatch real SPA emitted browser console errors'
+    );
+
+    console.log(JSON.stringify({
+      publicAppKeyMismatch: {
+        lastError: mismatchAppResult.lastError,
+        verifiedBinding: mismatchAppResult.verifiedBinding,
+        claimedDaemonPublicKey: mismatchAppResult.claimedDaemonPublicKey,
+        transportLabel: mismatchAppResult.transportLabel,
+        serverLabel: mismatchAppResult.serverLabel,
+        serverClass: mismatchAppResult.serverClass,
+        unexpectedPublicRequests: mismatchGuards.unexpectedPublicRequests,
+        unexpectedPublicWebSockets: mismatchGuards.unexpectedPublicWebSockets,
       },
     }, null, 2));
 

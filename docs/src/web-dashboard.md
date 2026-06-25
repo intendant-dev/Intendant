@@ -615,7 +615,7 @@ The validator starts a local rendezvous HTTP origin, launches a fresh daemon
 child with Connect env vars, verifies that
 `https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
 `401`, verifies that daemon rendezvous endpoints reject missing bearer auth, and
-then performs two browser passes:
+then performs these browser passes:
 
 1. It loads the minimal public bootstrap page from the rendezvous origin and
    drives `status`, `config`, `api_sessions`, id-filtered `api_sessions`,
@@ -630,6 +630,8 @@ then performs two browser passes:
    data such as config, Agent Card identity, sessions, bootstrap frames, event
    subscription, and visible transport status all arrive through
    `window.intendantDashboardControl` instead of same-origin daemon HTTP/WSS.
+   It also asserts that the SPA's signed daemon binding key matches the daemon
+   public key registered with the rendezvous service for the selected daemon id.
    This real-SPA pass also fails if the public-origin dashboard attempts daemon
    REST/media/WebSocket fallback paths such as `/config`,
    `/.well-known/agent-card.json`, `/api/...`, `/recordings`,
@@ -639,6 +641,11 @@ then performs two browser passes:
    REST/media/WebSocket fallbacks. This page must also stop daemon-dependent
    startup hydrators such as settings, project-root, and recording refreshes so
    the initial rendezvous failure does not cascade into unrelated errors.
+4. It opens the real dashboard with the same registered daemon id while the
+   emulator deliberately tampers with the advertised registry key for that offer.
+   The SPA must reject the tunnel before it stores a verified binding, report a
+   failed Connect transport, and still avoid daemon REST/media/WebSocket
+   fallbacks.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the
@@ -802,12 +809,13 @@ transport layer. The daemon sends a `response_start` header, base64-encoded
 `response_chunk` frames containing the original JSON frame bytes, and a
 `response_end` marker. The browser reassembles and parses the original frame
 before handing it to existing request or stream code, so API semantics stay
-unchanged. Current browser clients advertise `response_credit` in `hello`; when
-that feature is negotiated, the daemon sends an initial chunk window and then
-waits for browser `credit` frames before releasing more chunks. Stream chunks
-carry a `chunk_id` so a large event inside a longer stream can be credited and
-cancelled without ending the whole request id. Older clients that do not
-advertise the feature still receive the legacy eager chunk burst.
+unchanged. Current browser clients advertise `response_credit`, `byte_streams`,
+`upload_frames`, `terminal_frames`, and `tui_frames` in `hello`; when
+`response_credit` is negotiated, the daemon sends an initial chunk window and
+then waits for browser `credit` frames before releasing more chunks. Stream
+chunks carry a `chunk_id` so a large event inside a longer stream can be
+credited and cancelled without ending the whole request id. Older clients that
+do not advertise the feature still receive the legacy eager chunk burst.
 
 Bounded artifact downloads use `byte_stream_start`, base64 `byte_stream_chunk`
 frames, and `byte_stream_end`. This avoids wrapping raw bytes inside a JSON
