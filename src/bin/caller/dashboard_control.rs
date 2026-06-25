@@ -2692,6 +2692,46 @@ mod tests {
     }
 
     #[test]
+    fn oversized_stream_event_frames_are_chunked_with_chunk_ids() {
+        let frame = serde_json::json!({
+            "t": "stream_event",
+            "id": "stream-1",
+            "seq": 7,
+            "chunk_id": "stream-1:7",
+            "event": {
+                "type": "replace",
+                "sessions": ["x".repeat(128)]
+            }
+        });
+        let frames = chunk_control_response_frame(frame.clone(), 40, 24);
+        assert!(frames.len() > 3, "expected stream event chunking");
+
+        let start: serde_json::Value = serde_json::from_str(&frames[0]).unwrap();
+        assert_eq!(start["t"], "response_start");
+        assert_eq!(start["id"], "stream-1");
+        assert_eq!(start["chunk_id"], "stream-1:7");
+
+        let end: serde_json::Value = serde_json::from_str(frames.last().unwrap()).unwrap();
+        assert_eq!(end["t"], "response_end");
+        assert_eq!(end["id"], "stream-1");
+        assert_eq!(end["chunk_id"], "stream-1:7");
+
+        let mut bytes = Vec::new();
+        for text in &frames[1..frames.len() - 1] {
+            let chunk: serde_json::Value = serde_json::from_str(text).unwrap();
+            assert_eq!(chunk["t"], "response_chunk");
+            assert_eq!(chunk["id"], "stream-1");
+            assert_eq!(chunk["chunk_id"], "stream-1:7");
+            bytes.extend(
+                base64::engine::general_purpose::STANDARD
+                    .decode(chunk["data"].as_str().unwrap())
+                    .unwrap(),
+            );
+        }
+        assert_eq!(String::from_utf8(bytes).unwrap(), frame.to_string());
+    }
+
+    #[test]
     fn default_response_chunks_stay_below_datachannel_edge() {
         let frame = serde_json::json!({
             "t": "response",

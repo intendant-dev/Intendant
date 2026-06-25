@@ -790,6 +790,26 @@ async function main() {
           });
         },
       });
+      const largeStreamEvents = [];
+      const beforeLargeStreamChunks = ctl.status().completedChunkedResponses || 0;
+      const largeStreamResult = await ctl.stream('api_sessions_stream', { limit: 'all' }, { timeoutMs: 120000 }, {
+        event(event) {
+          if (event?.type === 'replace' && Array.isArray(event.sessions)) {
+            largeStreamEvents.push({
+              type: 'replace',
+              sessionCount: event.sessions.length,
+              jsonBytes: new TextEncoder().encode(JSON.stringify(event)).length,
+            });
+          } else {
+            largeStreamEvents.push({
+              type: event?.type || '',
+              sessionCount: null,
+              jsonBytes: null,
+            });
+          }
+        },
+      });
+      const afterLargeStreamChunks = ctl.status().completedChunkedResponses || 0;
       return {
         status: await ctl.request('status'),
         config: await ctl.request('config'),
@@ -799,6 +819,15 @@ async function main() {
           eventTypes: streamEvents.map(event => event.type),
           eventCount: streamEvents.length,
           replaceCount: streamEvents.find(event => event.type === 'replace')?.sessionCount ?? null,
+        },
+        largeSessionsStream: {
+          result: largeStreamResult,
+          eventTypes: largeStreamEvents.map(event => event.type),
+          eventCount: largeStreamEvents.length,
+          replaceCount: largeStreamEvents.find(event => event.type === 'replace')?.sessionCount ?? null,
+          replaceBytes: largeStreamEvents.find(event => event.type === 'replace')?.jsonBytes ?? null,
+          completedChunkedResponsesBefore: beforeLargeStreamChunks,
+          completedChunkedResponsesAfter: afterLargeStreamChunks,
         },
         largeSessions: {
           ok: Array.isArray(largeSessions),
@@ -830,6 +859,19 @@ async function main() {
       result.sessionsStream.result && result.sessionsStream.result.events >= result.sessionsStream.eventCount,
       'api_sessions_stream did not report completed events'
     );
+    assert(result.largeSessionsStream.eventTypes.includes('replace'), 'large api_sessions_stream missed replace event');
+    assert(
+      result.largeSessionsStream.replaceBytes > 65536,
+      `large api_sessions_stream replace event did not cross chunk threshold: ${result.largeSessionsStream.replaceBytes}`
+    );
+    assert(
+      result.largeSessionsStream.completedChunkedResponsesAfter > result.largeSessionsStream.completedChunkedResponsesBefore,
+      'chunked stream event counter did not advance'
+    );
+    assert(
+      result.largeSessionsStream.result && result.largeSessionsStream.result.events >= result.largeSessionsStream.eventCount,
+      'large api_sessions_stream did not report completed events'
+    );
     assert(result.largeSessions.ok, 'large api_sessions did not return an array');
     assert(
       result.largeSessions.jsonBytes > 65536,
@@ -859,6 +901,9 @@ async function main() {
         sessionCount: result.sessions.length,
         streamEventCount: result.sessionsStream.eventCount,
         streamReplaceCount: result.sessionsStream.replaceCount,
+        largeStreamEventCount: result.largeSessionsStream.eventCount,
+        largeStreamReplaceCount: result.largeSessionsStream.replaceCount,
+        largeStreamReplaceBytes: result.largeSessionsStream.replaceBytes,
         largeSessionCount: result.largeSessions.length,
         largeSessionBytes: result.largeSessions.jsonBytes,
         completedChunkedResponses: result.finalStatus.completedChunkedResponses,
