@@ -37321,6 +37321,9 @@ window.intendantDashboardControl = {
   deleteCurrentUpload(id, options = {}) {
     return dashboardTransport.request('api_session_current_upload_delete', { id }, options);
   },
+  currentUploads(options = {}) {
+    return dashboardTransport.request('api_session_current_uploads', {}, options);
+  },
   recordings(options = {}) {
     return dashboardTransport.request('api_recordings', {}, options);
   },
@@ -38285,6 +38288,7 @@ class DashboardControlTransport {
       apiSessionCurrentPruneAvailable: this.lastStatus?.api_session_current_prune_available ?? null,
       apiSessionCurrentChangesAvailable: this.lastStatus?.api_session_current_changes_available ?? null,
       apiSessionCurrentUploadAvailable: this.lastStatus?.api_session_current_upload_available ?? null,
+      apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
       apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
       apiFsMkdirAvailable: this.lastStatus?.api_fs_mkdir_available ?? null,
       apiSessionsSearchAvailable: this.lastStatus?.api_sessions_search_available ?? null,

@@ -428,6 +428,7 @@ async function main() {
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
         sessionReport: await sessionReport(),
         upload: uploaded,
+        uploads: await ctl.request('api_session_current_uploads', {}, { timeoutMs: 60000 }),
         uploadRaw: await uploadRaw(uploaded),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
@@ -552,6 +553,7 @@ async function main() {
     assert.strictEqual(result.finalStatus.uploadFramesAvailable, true);
     assert.strictEqual(result.finalStatus.terminalFramesAvailable, true);
     assert.strictEqual(result.finalStatus.tuiFramesAvailable, result.status.tui_frames_available === true);
+    assert.strictEqual(result.finalStatus.apiSessionCurrentUploadsAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionCurrentUploadRawAvailable, true);
     assert.strictEqual(result.finalStatus.apiRecordingAssetAvailable, true);
@@ -560,6 +562,11 @@ async function main() {
     assert.strictEqual(result.upload?.name, 'dashboard-upload-local.txt');
     assert.strictEqual(result.upload?.mime, 'text/plain');
     assert.strictEqual(result.upload?.size, 'dashboard upload e2e local'.length);
+    assert(Array.isArray(result.uploads), 'api_session_current_uploads did not return an array');
+    assert(
+      result.uploads.some(upload => upload.id === result.upload.id),
+      `api_session_current_uploads did not include the uploaded descriptor: ${JSON.stringify(result.uploads)}`
+    );
     assert.strictEqual(result.uploadRaw?.ok, true);
     assert.strictEqual(result.uploadRaw?.byteLength, 6);
     assert.strictEqual(result.uploadRaw?.text, 'upload');
@@ -671,10 +678,12 @@ async function main() {
         uploadFramesAvailable: result.finalStatus.uploadFramesAvailable,
         terminalFramesAvailable: result.finalStatus.terminalFramesAvailable,
         tuiFramesAvailable: result.finalStatus.tuiFramesAvailable,
+        apiSessionCurrentUploadsAvailable: result.finalStatus.apiSessionCurrentUploadsAvailable,
         apiSessionCurrentUploadAvailable: result.finalStatus.apiSessionCurrentUploadAvailable,
         apiSessionCurrentUploadRawAvailable: result.finalStatus.apiSessionCurrentUploadRawAvailable,
         apiRecordingAssetAvailable: result.finalStatus.apiRecordingAssetAvailable,
         uploadStatus: result.upload._httpStatus,
+        uploadListCount: result.uploads.length,
         uploadSize: result.upload.size,
         uploadRawBytes: result.uploadRaw.byteLength,
         uploadRawText: result.uploadRaw.text,

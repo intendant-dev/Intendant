@@ -461,8 +461,8 @@ active-session timeline history, active-session changes/diffs, lazy exact
 context-snapshot loads, filesystem picker stat/list/mkdir operations, deep
 session search, settings, API-key status, server-side voice-session token
 minting, project root, display enumeration, recording metadata, worktree
-inventory, scoped recording asset byte streams, bounded session-report zip
-downloads, and peer state.
+inventory, staged-upload descriptors, scoped recording asset byte streams,
+bounded session-report zip downloads, and peer state.
 Managed-context history reads for records, anchors, and fission groups also use
 the tunnel.
 Current tunneled mutations include
@@ -875,6 +875,8 @@ The task attachment upload path uses `api_session_current_upload` over
 back to `POST /api/session/current/uploads` only when the tunnel feature is not
 available. Failed tunneled uploads are not replayed over HTTP, to avoid creating
 duplicate attachments after an ambiguous partial transfer.
+Current-upload list reads use `api_session_current_uploads`, returning the same
+staged-upload descriptor array as `GET /api/session/current/uploads`.
 Current-upload raw reads use `api_session_current_upload_raw` over
 `byte_stream_*` frames. The request names an uploaded attachment id and may
 include `offset`/`length`; the response carries `range_start`, `range_end`,
@@ -989,8 +991,8 @@ Treat this as a staged target, not current behavior:
 10. Gradually migrate larger API surfaces. Managed-context history reads,
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, lazy context-snapshot exact-loads, session-data
-    deletion, staged upload deletion, bounded task uploads, recording metadata,
-    scoped recording asset byte streams, session-report zip downloads,
+    deletion, staged upload list/delete operations, bounded task uploads,
+    recording metadata, scoped recording asset byte streams, session-report zip downloads,
     bounded byte-stream artifact transfer,
     worktree inventory, filesystem picker stat/list/mkdir operations,
     local Agent Card reads, and local session hydration now use the tunnel,

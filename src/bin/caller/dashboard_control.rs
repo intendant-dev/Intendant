@@ -66,6 +66,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "upload_frames",
     "terminal_frames",
     "tui_frames",
+    "api_session_current_uploads",
     "api_session_current_upload_raw",
     "api_peers",
     "api_sessions",
@@ -1550,6 +1551,7 @@ fn control_frame_response(
                 | "api_session_current_prune"
                 | "api_session_current_changes"
                 | "api_session_context_snapshot"
+                | "api_session_current_uploads"
                 | "api_session_current_upload_raw"
                 | "api_session_current_upload_delete"
                 | "api_fs_stat"
@@ -2424,6 +2426,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_current_prune_available", true),
         ("api_session_current_changes_available", true),
         ("api_session_context_snapshot_available", true),
+        ("api_session_current_uploads_available", true),
         ("api_session_current_upload_available", true),
         ("api_session_current_upload_raw_available", true),
         ("api_session_current_upload_delete_available", true),
@@ -2579,6 +2582,7 @@ async fn control_request_response(
         "api_session_context_snapshot" => {
             api_session_context_snapshot_response(id, params.as_ref()).await
         }
+        "api_session_current_uploads" => api_session_current_uploads_response(id, &runtime).await,
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
         }
@@ -3203,6 +3207,47 @@ async fn api_session_current_upload_raw_task_response(
             result,
         }),
         done: true,
+    }
+}
+
+async fn api_session_current_uploads_response(
+    id: String,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let (project_root, session_dir) = match active_upload_handles(runtime).await {
+        Ok(handles) => handles,
+        Err(error) => {
+            return http_body_response(
+                id,
+                500,
+                serde_json::json!({ "error": error }).to_string(),
+                "current uploads",
+            );
+        }
+    };
+    let Some(root) = project_root else {
+        return http_body_response(
+            id,
+            404,
+            serde_json::json!({ "error": "no project root" }).to_string(),
+            "current uploads",
+        );
+    };
+    let session_dir =
+        session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&root));
+    let result = tokio::task::spawn_blocking(move || {
+        serde_json::to_string(&crate::upload_store::list_uploads(&session_dir, &root))
+            .unwrap_or_else(|_| "[]".to_string())
+    })
+    .await;
+    match result {
+        Ok(body) => json_body_response(id, body, "current uploads"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("current uploads task failed: {e}"),
+        }),
     }
 }
 
@@ -6090,6 +6135,10 @@ mod tests {
             true
         );
         assert_eq!(
+            status["result"]["api_session_current_uploads_available"],
+            true
+        );
+        assert_eq!(
             status["result"]["api_session_current_upload_available"],
             true
         );
@@ -6865,6 +6914,44 @@ mod tests {
         assert_eq!(missing_id["result"]["error"], "missing upload id");
         assert_eq!(missing_id["result"]["_httpStatus"], 400);
         assert_eq!(missing_id["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn current_uploads_lists_pending_uploads() {
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project.path().to_path_buf());
+        {
+            let mut session = rt.shared_session.write().await;
+            session.project_root_for_changes = Some(project.path().to_path_buf());
+        }
+        let bytes = b"dashboard list upload bytes";
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            Some(project.path()),
+            None,
+            Some(rt.session_id.as_str()),
+            "listed.txt",
+            "text/plain",
+            crate::upload_store::UploadDestination::Task,
+            tmp,
+            bytes.len(),
+            &rt.bus,
+        );
+        assert_eq!(status, "200 OK");
+        let descriptor: crate::upload_store::UploadDescriptor =
+            serde_json::from_str(&body).unwrap();
+
+        let response = api_session_current_uploads_response("uploads1".to_string(), &rt).await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["ok"], true);
+        let uploads = response["result"].as_array().expect("uploads array");
+        assert!(
+            uploads.iter().any(|upload| upload["id"] == descriptor.id),
+            "upload list did not include committed descriptor: {response}"
+        );
     }
 
     #[tokio::test]

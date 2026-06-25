@@ -1389,6 +1389,7 @@ async function main() {
         dashboardAction,
         sessionReport: await sessionReport(),
         upload: uploaded,
+        uploadList: await ctl.request('api_session_current_uploads', {}, { timeoutMs: 60000 }),
         uploadRaw: await uploadRaw(uploaded),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
@@ -1501,6 +1502,11 @@ async function main() {
       result.status.terminal_frames_available,
       true,
       'dashboard control status did not advertise terminal frames'
+    );
+    assert.strictEqual(
+      result.status.api_session_current_uploads_available,
+      true,
+      'dashboard control status did not advertise current upload lists'
     );
     assert.strictEqual(
       result.status.api_session_current_upload_available,
@@ -1744,6 +1750,11 @@ async function main() {
     assert.strictEqual(result.upload?.name, 'dashboard-upload-rendezvous.txt');
     assert.strictEqual(result.upload?.mime, 'text/plain');
     assert.strictEqual(result.upload?.size, 'dashboard upload e2e rendezvous'.length);
+    assert(Array.isArray(result.uploadList), 'api_session_current_uploads did not return an array');
+    assert(
+      result.uploadList.some(upload => upload.id === result.upload.id),
+      `api_session_current_uploads did not include the uploaded descriptor: ${JSON.stringify(result.uploadList)}`
+    );
     assert.strictEqual(result.uploadRaw?.ok, true);
     assert.strictEqual(result.uploadRaw?.byteLength, 6);
     assert.strictEqual(result.uploadRaw?.text, 'upload');
@@ -2025,10 +2036,12 @@ async function main() {
         uploadFramesAvailable: result.status.upload_frames_available,
         terminalFramesAvailable: result.status.terminal_frames_available,
         tuiFramesAvailable: result.status.tui_frames_available,
+        apiSessionCurrentUploadsAvailable: result.status.api_session_current_uploads_available,
         apiSessionCurrentUploadAvailable: result.status.api_session_current_upload_available,
         apiSessionCurrentUploadRawAvailable: result.status.api_session_current_upload_raw_available,
         apiRecordingAssetAvailable: result.status.api_recording_asset_available,
         uploadStatus: result.upload._httpStatus,
+        uploadListCount: result.uploadList.length,
         uploadSize: result.upload.size,
         uploadRawBytes: result.uploadRaw.byteLength,
         uploadRawText: result.uploadRaw.text,
