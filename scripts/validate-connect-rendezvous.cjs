@@ -864,6 +864,9 @@ async function main() {
             file: 'snapshot.json',
           }),
         },
+        uploads: {
+          missingDeleteId: await ctl.request('api_session_current_upload_delete', {}),
+        },
         recordings: {
           live: await ctl.request('api_recordings'),
           invalidSession: await ctl.request('api_session_recordings', { session_id: '../bad' }),
@@ -1009,6 +1012,15 @@ async function main() {
       'context snapshot RPC did not preserve invalid session status'
     );
     assert.strictEqual(
+      result.status.api_session_current_upload_delete_available,
+      true,
+      'dashboard control status did not advertise upload deletion'
+    );
+    assert(
+      result.uploads?.missingDeleteId?._httpStatus === 400,
+      'upload delete RPC did not preserve missing id status'
+    );
+    assert.strictEqual(
       result.status.api_recordings_available,
       true,
       'dashboard control status did not advertise recordings'
@@ -1140,6 +1152,10 @@ async function main() {
           value?._httpStatus || 200,
         ])),
         contextSnapshotStatuses: Object.fromEntries(Object.entries(result.contextSnapshots || {}).map(([key, value]) => [
+          key,
+          value?._httpStatus || 200,
+        ])),
+        uploadStatuses: Object.fromEntries(Object.entries(result.uploads || {}).map(([key, value]) => [
           key,
           value?._httpStatus || 200,
         ])),

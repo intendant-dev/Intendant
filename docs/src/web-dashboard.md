@@ -455,9 +455,10 @@ status, project root, display enumeration, recording metadata, worktree
 inventory, and peer state. Managed-context history reads for records, anchors,
 and fission groups also use the tunnel.
 Current tunneled mutations include
-active-session rollback/redo/prune, settings save, API-key save, peer
-add/remove, peer access-request pairing, peer message/task/approval actions,
-eligible-peer lookup, worktree scan/remove, and coordinator routing.
+active-session rollback/redo/prune, staged upload deletion, settings save,
+API-key save, peer add/remove, peer access-request pairing, peer
+message/task/approval actions, eligible-peer lookup, worktree scan/remove, and
+coordinator routing.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
 instead of repeating the write over HTTP.
@@ -471,7 +472,7 @@ browser-side promise.
 Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
-- frames, recordings, and file uploads;
+- frames, recordings, and raw file upload/download bytes;
 - general filesystem mutations and file content transfer;
 - MCP-over-HTTP;
 - diagnostics NDJSON uploads;
@@ -741,6 +742,10 @@ fallback rule as other writes.
 Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
 large raw request payloads out of ordinary session-detail hydration while still
 allowing the Context pane to fetch a single archived snapshot on demand.
+Staged upload deletion uses `api_session_current_upload_delete` so removing a
+pending attachment can travel over the verified control channel; upload POST
+bodies and raw preview/download bytes remain on HTTP until the tunnel has
+resumable byte-stream semantics.
 
 The first production APIs should be small and high value: `/config`, the main
 event stream, local session list hydration, peer access-request
@@ -807,10 +812,11 @@ Treat this as a staged target, not current behavior:
    the future public Connect UI.
 10. Gradually migrate larger API surfaces. Managed-context history reads,
     active-session command-output loads, active-session timeline operations,
-    active-session changes/diffs, lazy context-snapshot exact-loads, recording
-    metadata, worktree inventory, filesystem picker stat/list/mkdir operations,
-    and local session hydration now use the tunnel, oversized JSON responses now
-    use credit-windowed chunked response framing, and the sessions stream uses explicit
+    active-session changes/diffs, lazy context-snapshot exact-loads, staged
+    upload deletion, recording metadata, worktree inventory, filesystem picker
+    stat/list/mkdir operations, and local session hydration now use the tunnel,
+    oversized JSON responses now use credit-windowed chunked response framing,
+    and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames. Uploads, downloads,
     recording media, terminals, and file transfer still wait for resumable
     stream/file-transfer semantics.

@@ -11367,6 +11367,48 @@ fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::Path
     project_root.join(".intendant").join("pending_uploads")
 }
 
+pub(crate) fn current_upload_delete_response_body(
+    project_root: Option<&std::path::Path>,
+    session_dir: Option<&std::path::Path>,
+    id: &str,
+) -> (&'static str, String, Option<String>) {
+    let Some(root) = project_root else {
+        return (
+            "404 Not Found",
+            serde_json::json!({ "error": "no project root" }).to_string(),
+            None,
+        );
+    };
+    let id = id.trim();
+    if id.is_empty() {
+        return (
+            "400 Bad Request",
+            serde_json::json!({ "error": "missing upload id" }).to_string(),
+            None,
+        );
+    }
+    let pending_dir;
+    let session_dir = match session_dir {
+        Some(dir) => dir,
+        None => {
+            pending_dir = pending_upload_session_dir(root);
+            pending_dir.as_path()
+        }
+    };
+    match crate::upload_store::delete_upload(id, session_dir, root) {
+        Ok(_) => (
+            "200 OK",
+            serde_json::json!({ "ok": true }).to_string(),
+            Some(id.to_string()),
+        ),
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({ "error": format!("delete: {e}") }).to_string(),
+            None,
+        ),
+    }
+}
+
 fn json_response(status: &str, body: String) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
@@ -19218,60 +19260,38 @@ pub fn spawn_web_gateway(
                     {
                         // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
                         use tokio::io::AsyncWriteExt;
-                        let response = 'del_upload: {
-                            let Some(ref root) = project_root_for_changes else {
-                                break 'del_upload upload_error_response(
-                                    "404 Not Found",
-                                    "no project root",
-                                );
-                            };
+                        let response = {
                             let session_dir = if let Some(ref slog) = session_log {
                                 match slog.lock() {
-                                    Ok(l) => l.dir().to_path_buf(),
-                                    Err(_) => {
-                                        break 'del_upload upload_error_response(
-                                            "500 Internal Server Error",
-                                            "session log lock poisoned",
-                                        );
-                                    }
+                                    Ok(l) => Ok(Some(l.dir().to_path_buf())),
+                                    Err(_) => Err("session log lock poisoned"),
                                 }
                             } else {
-                                pending_upload_session_dir(root)
+                                Ok(None)
                             };
-                            let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
-                            let path = path_and_q.splitn(2, '?').next().unwrap_or("");
-                            let id = path
-                                .trim_start_matches("/api/session/current/uploads/")
-                                .trim_matches('/');
-                            if id.is_empty() {
-                                break 'del_upload upload_error_response(
-                                    "400 Bad Request",
-                                    "missing upload id",
-                                );
-                            }
-                            match crate::upload_store::delete_upload(id, &session_dir, root) {
-                                Ok(_) => {
-                                    bus.send(crate::event::AppEvent::UploadDeleted {
-                                        id: id.to_string(),
-                                    });
-                                    let body = serde_json::json!({"ok": true}).to_string();
-                                    format!(
-                                        "HTTP/1.1 200 OK\r\n\
-                                         Content-Type: application/json\r\n\
-                                         Content-Length: {}\r\n\
-                                         Cache-Control: no-cache\r\n\
-                                         Access-Control-Allow-Origin: *\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        body.len(),
-                                        body
-                                    )
-                                }
-                                Err(e) => upload_error_response(
+                            match session_dir {
+                                Err(error) => json_response(
                                     "500 Internal Server Error",
-                                    &format!("delete: {e}"),
+                                    serde_json::json!({ "error": error }).to_string(),
                                 ),
+                                Ok(session_dir) => {
+                                    let path_and_q =
+                                        request_line.split_whitespace().nth(1).unwrap_or("");
+                                    let path = path_and_q.splitn(2, '?').next().unwrap_or("");
+                                    let id = path
+                                        .trim_start_matches("/api/session/current/uploads/")
+                                        .trim_matches('/');
+                                    let (status, body, deleted_id) =
+                                        current_upload_delete_response_body(
+                                            project_root_for_changes.as_deref(),
+                                            session_dir.as_deref(),
+                                            id,
+                                        );
+                                    if let Some(id) = deleted_id {
+                                        bus.send(crate::event::AppEvent::UploadDeleted { id });
+                                    }
+                                    json_response(status, body)
+                                }
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;

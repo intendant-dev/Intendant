@@ -32794,7 +32794,10 @@ function pendingAttachmentUploadId(att) {
 function deletePendingUploadRecord(uploadId) {
   const id = String(uploadId || '').trim();
   if (!id) return;
-  fetch(`/api/session/current/uploads/${encodeURIComponent(id)}`, { method: 'DELETE' })
+  const url = `/api/session/current/uploads/${encodeURIComponent(id)}`;
+  dashboardJsonFetch('api_session_current_upload_delete', { id }, () => (
+    fetch(url, { method: 'DELETE' })
+  ), 'api_session_current_upload_delete', { fallbackAfterRpcFailure: false })
     .then(resp => {
       if (!resp.ok && resp.status !== 404) {
         console.warn(`[upload] Delete failed (${id}): ${resp.status}`);
@@ -36679,6 +36682,9 @@ window.intendantDashboardControl = {
   },
   contextSnapshot(params = {}, options = {}) {
     return dashboardTransport.request('api_session_context_snapshot', params, options);
+  },
+  deleteCurrentUpload(id, options = {}) {
+    return dashboardTransport.request('api_session_current_upload_delete', { id }, options);
   },
   recordings(options = {}) {
     return dashboardTransport.request('api_recordings', {}, options);

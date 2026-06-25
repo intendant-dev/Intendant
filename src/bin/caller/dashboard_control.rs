@@ -59,6 +59,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_session_current_prune",
     "api_session_current_changes",
     "api_session_context_snapshot",
+    "api_session_current_upload_delete",
     "api_fs_stat",
     "api_fs_list",
     "api_fs_mkdir",
@@ -1129,6 +1130,7 @@ fn control_frame_response(
                 | "api_session_current_prune"
                 | "api_session_current_changes"
                 | "api_session_context_snapshot"
+                | "api_session_current_upload_delete"
                 | "api_fs_stat"
                 | "api_fs_list"
                 | "api_fs_mkdir"
@@ -1248,6 +1250,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_current_prune_available", true),
         ("api_session_current_changes_available", true),
         ("api_session_context_snapshot_available", true),
+        ("api_session_current_upload_delete_available", true),
         ("api_fs_stat_available", true),
         ("api_fs_list_available", true),
         ("api_fs_mkdir_available", true),
@@ -1368,6 +1371,9 @@ async fn control_request_response(
         },
         "api_session_context_snapshot" => {
             api_session_context_snapshot_response(id, params.as_ref()).await
+        },
+        "api_session_current_upload_delete" => {
+            api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
         },
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
@@ -1815,6 +1821,48 @@ async fn api_session_context_snapshot_response(
             "id": id,
             "ok": false,
             "error": format!("context snapshot task failed: {e}"),
+        }),
+    }
+}
+
+async fn api_session_current_upload_delete_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let upload_id = string_param(&params, &["upload_id", "uploadId", "id"]);
+    let (project_root, session_dir) = match active_upload_handles(runtime).await {
+        Ok(handles) => handles,
+        Err(error) => {
+            return http_body_response(
+                id,
+                500,
+                serde_json::json!({ "error": error }).to_string(),
+                "upload delete",
+            );
+        }
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::current_upload_delete_response_body(
+            project_root.as_deref(),
+            session_dir.as_deref(),
+            &upload_id,
+        )
+    })
+    .await;
+    match result {
+        Ok((status_line, body, deleted_id)) => {
+            if let Some(id) = deleted_id {
+                runtime.bus.send(crate::event::AppEvent::UploadDeleted { id });
+            }
+            http_body_response(id, status_line_code(status_line), body, "upload delete")
+        }
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("upload delete task failed: {e}"),
         }),
     }
 }
@@ -2691,6 +2739,28 @@ async fn active_changes_handles(runtime: &ControlRuntime) -> (Option<PathBuf>, O
     )
 }
 
+async fn active_upload_handles(
+    runtime: &ControlRuntime,
+) -> Result<(Option<PathBuf>, Option<PathBuf>), String> {
+    let (project_root, session_log) = {
+        let session = runtime.shared_session.read().await;
+        (
+            session.project_root_for_changes.clone(),
+            session.session_log.clone(),
+        )
+    };
+    let session_dir = match session_log {
+        Some(log) => Some(
+            log.lock()
+                .map_err(|_| "session log lock poisoned".to_string())?
+                .dir()
+                .to_path_buf(),
+        ),
+        None => None,
+    };
+    Ok((project_root, session_dir))
+}
+
 async fn active_recording_registry(
     runtime: &ControlRuntime,
 ) -> Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>> {
@@ -2911,6 +2981,10 @@ mod tests {
         );
         assert_eq!(
             status["result"]["api_session_context_snapshot_available"],
+            true
+        );
+        assert_eq!(
+            status["result"]["api_session_current_upload_delete_available"],
             true
         );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
@@ -3139,6 +3213,38 @@ mod tests {
         assert_eq!(invalid_index["result"]["error"], "invalid request_index");
         assert_eq!(invalid_index["result"]["_httpStatus"], 400);
         assert_eq!(invalid_index["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn current_upload_delete_preserves_http_status() {
+        let rt_no_root = runtime();
+        let no_root = api_session_current_upload_delete_response(
+            "upl1".to_string(),
+            Some(&serde_json::json!({ "id": "missing-upload" })),
+            &rt_no_root,
+        )
+        .await;
+        assert_eq!(no_root["t"], "response");
+        assert_eq!(no_root["ok"], true);
+        assert_eq!(no_root["result"]["error"], "no project root");
+        assert_eq!(no_root["result"]["_httpStatus"], 404);
+        assert_eq!(no_root["result"]["_httpOk"], false);
+
+        let dir = tempfile::tempdir().unwrap();
+        let rt = runtime();
+        {
+            let mut session = rt.shared_session.write().await;
+            session.project_root_for_changes = Some(dir.path().to_path_buf());
+        }
+        let missing_id = api_session_current_upload_delete_response(
+            "upl2".to_string(),
+            Some(&serde_json::json!({})),
+            &rt,
+        )
+        .await;
+        assert_eq!(missing_id["result"]["error"], "missing upload id");
+        assert_eq!(missing_id["result"]["_httpStatus"], 400);
+        assert_eq!(missing_id["result"]["_httpOk"], false);
     }
 
     #[tokio::test]
