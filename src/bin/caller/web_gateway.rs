@@ -15715,6 +15715,8 @@ pub fn spawn_web_gateway(
         agent_card_value,
         bootstrap_caches.clone(),
         Some(dashboard_display_authority),
+        ice_config.clone(),
+        Arc::clone(&tcp_peer_registry),
     ));
     let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
         config.connect.clone(),

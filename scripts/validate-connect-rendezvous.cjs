@@ -2951,6 +2951,7 @@ async function main() {
       const genericControlNoReplay = await ctl._debugProbeControlNoReplay();
       const mediaConnectNoLegacy = await ctl._debugProbeMediaConnectNoLegacy();
       const diagnosticsConnectNoHttp = await ctl._debugProbeDiagnosticsConnectNoHttp();
+      const displaySignalConnectNoLegacy = await ctl._debugProbeDisplaySignalConnectNoLegacy();
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
       const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
@@ -2963,6 +2964,7 @@ async function main() {
         genericControlNoReplay,
         mediaConnectNoLegacy,
         diagnosticsConnectNoHttp,
+        displaySignalConnectNoLegacy,
         transportLabel,
         serverLabel,
         serverClass,
@@ -3076,6 +3078,30 @@ async function main() {
       0,
       `real SPA Connect diagnostics attempted HTTP fallback: ${JSON.stringify(appResult.diagnosticsConnectNoHttp)}`
     );
+    assert.strictEqual(
+      appResult.displaySignalConnectNoLegacy.skipped,
+      false,
+      `real SPA could not exercise Connect display signaling path: ${JSON.stringify(appResult.displaySignalConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.displaySignalConnectNoLegacy.threw,
+      true,
+      `real SPA Connect display signaling did not fail visibly for missing display: ${JSON.stringify(appResult.displaySignalConnectNoLegacy)}`
+    );
+    assert(
+      String(appResult.displaySignalConnectNoLegacy.error || '').includes('display session not found'),
+      `real SPA Connect display signaling had unexpected error: ${JSON.stringify(appResult.displaySignalConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.displaySignalConnectNoLegacy.wsReplayCount,
+      0,
+      `real SPA Connect display signaling replayed over /ws: ${JSON.stringify(appResult.displaySignalConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.displaySignalConnectNoLegacy.httpFallbackCount,
+      0,
+      `real SPA Connect display signaling attempted HTTP fallback: ${JSON.stringify(appResult.displaySignalConnectNoLegacy)}`
+    );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
       Number(appResult.sessionCount) >= 1,
@@ -3120,6 +3146,7 @@ async function main() {
         genericControlNoReplay: appResult.genericControlNoReplay,
         mediaConnectNoLegacy: appResult.mediaConnectNoLegacy,
         diagnosticsConnectNoHttp: appResult.diagnosticsConnectNoHttp,
+        displaySignalConnectNoLegacy: appResult.displaySignalConnectNoLegacy,
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,

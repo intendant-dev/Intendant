@@ -912,6 +912,15 @@ application. The browser then sends local keyboard/mouse events as
 fire-and-forget `display_input` frames over the same daemon-scoped DataChannel.
 If the tunnel or authority bridge is unavailable, the dashboard falls back to
 the older WebSocket plus per-display input-channel path.
+Local display WebRTC signaling uses `api_display_webrtc_signal` when the
+verified tunnel advertises it. The browser sends the same `display_id`, offer
+SDP, and ICE candidate shapes that the legacy `display_offer`/`display_ice`
+WebSocket frames used; the offer RPC returns a `display_answer`, while daemon
+ICE candidates arrive later as `display_ice` event payloads over the control
+DataChannel. Daemon-origin dashboards may still fall back to the WebSocket when
+the tunnel is unavailable. Public-origin Connect mode does not attempt a daemon
+WebSocket fallback for local display signaling, so missing tunnel support fails
+the display slot visibly.
 `api_session_log_replay` returns the existing capped `log_replay` message shape
 used by late WebSocket joiners. When no active session log exists it returns an
 empty replay with `available: false`.
@@ -1043,8 +1052,9 @@ the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
 generic downloads, native media fallback URLs, broader/resumable file transfer,
-and remaining non-allowlisted control mutations should move only after resumable
-stream/file-transfer semantics and per-action no-replay rules are settled.
+and any remaining non-allowlisted control mutations should move only after
+resumable stream/file-transfer semantics and per-action no-replay rules are
+settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
@@ -1137,8 +1147,9 @@ Treat this as a staged target, not current behavior:
     oversized JSON responses now use credit-windowed chunked response framing,
     and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames. Allowlisted settings
-    `ControlMsg` dispatch, display input authority request/release/snapshot, and
-    local display input frames now use the tunnel when verified. Dedicated
+    `ControlMsg` dispatch, display input authority request/release/snapshot,
+    local display input frames, and local display WebRTC offer/ICE signaling now
+    use the tunnel when verified. Dedicated
     session-control `ControlMsg` dispatch now covers lifecycle, steering,
     approvals, interrupt, resume/stop/restart, rename, and launch-config writes
     with no-replay fallback. Dedicated dashboard-action `ControlMsg` dispatch

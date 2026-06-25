@@ -30859,6 +30859,65 @@ class DisplaySlot {
     enterLiveAnnotationMode(this, frame);
   }
 
+  sendLegacyDisplaySignal(payload) {
+    if (!app) return false;
+    if (app.send_raw) {
+      app.send_raw(JSON.stringify(payload));
+      return true;
+    }
+    if (app.send_server_action) {
+      app.send_server_action(payload);
+      return true;
+    }
+    return false;
+  }
+
+  async sendDisplayIceCandidate(candidate) {
+    const payload = {
+      signal: 'ice',
+      display_id: this.displayId,
+      candidate,
+    };
+    if (dashboardTransport?.canUseDisplayWebRtcSignal?.()) {
+      await dashboardTransport.displayWebRtcSignal(payload, { timeoutMs: 15000 });
+      return;
+    }
+    if (dashboardConnectModeEnabled()) {
+      throw new Error('dashboard control display signaling is not available');
+    }
+    if (!this.sendLegacyDisplaySignal({
+      t: 'display_ice',
+      display_id: this.displayId,
+      candidate,
+    })) {
+      throw new Error('display signaling is not available');
+    }
+  }
+
+  async sendDisplayOffer(sdp) {
+    if (dashboardTransport?.canUseDisplayWebRtcSignal?.()) {
+      const answer = await dashboardTransport.displayWebRtcSignal({
+        signal: 'offer',
+        display_id: this.displayId,
+        sdp,
+      }, { timeoutMs: 30000 });
+      const answerSdp = answer?.sdp || answer?.answer_sdp || '';
+      if (!answerSdp) throw new Error('display signaling answer missing SDP');
+      this.handleAnswer(answerSdp);
+      return;
+    }
+    if (dashboardConnectModeEnabled()) {
+      throw new Error('dashboard control display signaling is not available');
+    }
+    if (!this.sendLegacyDisplaySignal({
+      t: 'display_offer',
+      display_id: this.displayId,
+      sdp,
+    })) {
+      throw new Error('display signaling is not available');
+    }
+  }
+
   connect() {
     // ICE config — STUN/TURN servers from [webrtc].ice_servers TOML config,
     // default empty for local LAN deployments. Goes through the shared
@@ -30941,17 +31000,14 @@ class DisplaySlot {
       this.statusEl.className = 'display-status connected';
     };
 
-    // ICE candidates — send to server via WASM app
+    // ICE candidates — prefer the verified dashboard-control tunnel, falling
+    // back to the daemon WebSocket only on direct daemon-origin dashboards.
     this.pc.onicecandidate = (e) => {
-      if (e.candidate && app) {
-        const iceMsg = JSON.stringify({
-          t: 'display_ice',
-          display_id: this.displayId,
-          candidate: e.candidate.toJSON()
-        });
-        if (app.send_raw) { app.send_raw(iceMsg); }
-        else { app.send_server_action({ t: 'display_ice', display_id: this.displayId, candidate: e.candidate.toJSON() }); }
-      }
+      if (!e.candidate) return;
+      const candidate = e.candidate.toJSON ? e.candidate.toJSON() : e.candidate;
+      this.sendDisplayIceCandidate(candidate).catch(err => {
+        console.warn(`[DisplaySlot ${this.displayId}] ICE signal failed`, err);
+      });
     };
 
     // Connection state changes — auto-reconnect on failure
@@ -31035,15 +31091,8 @@ class DisplaySlot {
         `[DisplaySlot ${this.displayId}] offer first codec: ${firstCodec}`
       );
       return this.pc.setLocalDescription(munged);
-    }).then(() => {
-      if (app) {
-        const offerPayload = { t: 'display_offer', display_id: this.displayId, sdp: this.pc.localDescription.sdp };
-        if (app.send_raw) {
-          app.send_raw(JSON.stringify(offerPayload));
-        } else {
-          app.send_server_action(offerPayload);
-        }
-      }
+    }).then(async () => {
+      await this.sendDisplayOffer(this.pc.localDescription.sdp);
     }).catch(err => {
       this.statusEl.textContent = 'Offer FAILED: ' + err.message;
       this.statusEl.className = 'display-status error';
@@ -37432,6 +37481,13 @@ class DashboardTransport {
     );
   }
 
+  canUseDisplayWebRtcSignal() {
+    return Boolean(
+      this.canUseRpc() &&
+      dashboardControlTransport?.lastStatus?.api_display_webrtc_signal_available === true
+    );
+  }
+
   request(method, params = {}, options = {}) {
     if (!this.canUseRpc()) {
       return Promise.reject(new Error('dashboard control RPC is not connected'));
@@ -37508,6 +37564,17 @@ class DashboardTransport {
     return dashboardControlTransport.request(
       'api_display_input_authority_release',
       { display_id: Number(displayId) || 0 },
+      options
+    );
+  }
+
+  displayWebRtcSignal(params = {}, options = {}) {
+    if (!this.canUseDisplayWebRtcSignal()) {
+      return Promise.reject(new Error('dashboard control display signaling is not available'));
+    }
+    return dashboardControlTransport.request(
+      'api_display_webrtc_signal',
+      params,
       options
     );
   }
@@ -37813,6 +37880,70 @@ window.intendantDashboardControl = {
     }
     return { skipped: false, threw, error, httpFallbackCount };
   },
+  async _debugProbeDisplaySignalConnectNoLegacy() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      !dashboardTransport ||
+      typeof dashboardTransport.displayWebRtcSignal !== 'function'
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        signalType: typeof dashboardTransport?.displayWebRtcSignal,
+        threw: false,
+        wsReplayCount: 0,
+        httpFallbackCount: 0,
+      };
+    }
+    const previousApp = app;
+    const previousSendRaw = app && typeof app.send_raw === 'function'
+      ? app.send_raw
+      : null;
+    const previousSendAction = app && typeof app.send_server_action === 'function'
+      ? app.send_server_action
+      : null;
+    const previousFetch = window.fetch;
+    let wsReplayCount = 0;
+    let httpFallbackCount = 0;
+    if (app && typeof app === 'object') {
+      app.send_raw = function() { wsReplayCount += 1; };
+      app.send_server_action = function() { wsReplayCount += 1; };
+    } else {
+      app = {
+        send_raw() { wsReplayCount += 1; },
+        send_server_action() { wsReplayCount += 1; },
+      };
+    }
+    window.fetch = function(input, init) {
+      const url = typeof input === 'string' ? input : (input?.url || '');
+      if (String(url).includes('/api/display') || String(url).includes('/ws')) {
+        httpFallbackCount += 1;
+      }
+      return previousFetch.call(this, input, init);
+    };
+    let threw = false;
+    let error = '';
+    try {
+      await dashboardTransport.displayWebRtcSignal({
+        signal: 'offer',
+        display_id: 4294967295,
+        sdp: 'synthetic-offer',
+      }, { timeoutMs: 15000 });
+    } catch (err) {
+      threw = true;
+      error = err?.message || String(err);
+    } finally {
+      window.fetch = previousFetch;
+      if (previousApp) {
+        if (previousSendRaw) previousApp.send_raw = previousSendRaw;
+        else delete previousApp.send_raw;
+        if (previousSendAction) previousApp.send_server_action = previousSendAction;
+        else delete previousApp.send_server_action;
+      }
+      app = previousApp;
+    }
+    return { skipped: false, threw, error, wsReplayCount, httpFallbackCount };
+  },
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);
   },
@@ -37944,6 +38075,9 @@ window.intendantDashboardControl = {
   },
   managedContextFission(query) {
     return dashboardTransport.request('api_managed_context_fission', { query });
+  },
+  displayWebRtcSignal(params = {}, options = {}) {
+    return dashboardTransport.displayWebRtcSignal(params, options);
   },
   peerWebRtcSignal(peerId, params = {}, options = {}) {
     return dashboardTransport.request('api_peer_webrtc_signal', { peer_id: peerId, ...params }, options);
@@ -38958,6 +39092,7 @@ class DashboardControlTransport {
       apiStateSnapshotAvailable: this.lastStatus?.api_state_snapshot_available ?? null,
       apiDisplayBootstrapAvailable: this.lastStatus?.api_display_bootstrap_available ?? null,
       apiDisplayInputAuthorityAvailable: this.lastStatus?.api_display_input_authority_available ?? null,
+      apiDisplayWebRtcSignalAvailable: this.lastStatus?.api_display_webrtc_signal_available ?? null,
       apiSessionLogReplayAvailable: this.lastStatus?.api_session_log_replay_available ?? null,
       apiExternalSessionActivityReplayAvailable: this.lastStatus?.api_external_session_activity_replay_available ?? null,
       apiDashboardBootstrapAvailable: this.lastStatus?.api_dashboard_bootstrap_available ?? null,

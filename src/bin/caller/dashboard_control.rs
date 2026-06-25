@@ -29,6 +29,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{Read as _, Seek as _, Write as _};
 use std::net::SocketAddr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 use tokio::net::UdpSocket;
@@ -46,6 +47,7 @@ const CONTROL_RESPONSE_INITIAL_CHUNK_CREDIT: usize = 16;
 const CONTROL_RESPONSE_MAX_CREDIT_GRANT: usize = 64;
 const CONTROL_BINDING_TTL_MS: i64 = 5 * 60 * 1000;
 const DASHBOARD_MEDIA_CLIP_MAX_FRAMES: usize = 1000;
+static NEXT_DASHBOARD_DISPLAY_PEER_ID: AtomicU64 = AtomicU64::new(1);
 const CONTROL_FEATURES: &[&str] = &[
     "ping",
     "config",
@@ -54,6 +56,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_browser_workspace_snapshot",
     "api_state_snapshot",
     "api_display_bootstrap",
+    "api_display_webrtc_signal",
     "api_display_input_authority_snapshot",
     "api_display_input_authority_request",
     "api_display_input_authority_release",
@@ -153,6 +156,8 @@ pub struct DashboardControlRegistry {
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
+    ice_config: crate::display::IceConfig,
+    tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
 }
@@ -244,6 +249,8 @@ impl DashboardControlRegistry {
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
         display_authority: Option<DashboardDisplayAuthorityBridge>,
+        ice_config: crate::display::IceConfig,
+        tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     ) -> Self {
         Self {
             config,
@@ -259,6 +266,8 @@ impl DashboardControlRegistry {
             agent_card,
             bootstrap_caches,
             display_authority,
+            ice_config,
+            tcp_peer_registry,
             identity: Mutex::new(None),
             peers: Mutex::new(HashMap::new()),
         }
@@ -290,6 +299,8 @@ impl DashboardControlRegistry {
             self.agent_card.clone(),
             self.bootstrap_caches.clone(),
             self.display_authority.clone(),
+            self.ice_config.clone(),
+            Arc::clone(&self.tcp_peer_registry),
             identity,
         )
         .await
@@ -444,6 +455,8 @@ impl DashboardControlPeer {
         agent_card: serde_json::Value,
         bootstrap_caches: DashboardBootstrapCaches,
         display_authority: Option<DashboardDisplayAuthorityBridge>,
+        ice_config: crate::display::IceConfig,
+        tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
         identity: Arc<DaemonIdentity>,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
         let mut setting_engine = SettingEngine::default();
@@ -526,7 +539,11 @@ impl DashboardControlPeer {
             agent_card,
             bootstrap_caches,
             display_authority,
+            ice_config,
+            tcp_peer_registry,
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
+            control_frames_tx: None,
+            display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
@@ -595,7 +612,11 @@ struct ControlRuntime {
     agent_card: serde_json::Value,
     bootstrap_caches: DashboardBootstrapCaches,
     display_authority: Option<DashboardDisplayAuthorityBridge>,
+    ice_config: crate::display::IceConfig,
+    tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
+    control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
+    display_peer_id: crate::display::PeerId,
 }
 
 #[derive(Debug)]
@@ -816,6 +837,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
     let mut inbound_uploads: HashMap<String, InboundUploadState> = HashMap::new();
     let (terminal_events_tx, mut terminal_events_rx) =
         mpsc::unbounded_channel::<serde_json::Value>();
+    runtime.control_frames_tx = Some(terminal_events_tx.clone());
     let mut terminal_forwarders: HashMap<(String, String), tokio::task::JoinHandle<()>> =
         HashMap::new();
     let mut tui_connections: HashMap<String, DashboardTuiConnection> = HashMap::new();
@@ -1652,6 +1674,7 @@ fn control_frame_response(
                 | "api_browser_workspace_snapshot"
                 | "api_state_snapshot"
                 | "api_display_bootstrap"
+                | "api_display_webrtc_signal"
                 | "api_display_input_authority_snapshot"
                 | "api_display_input_authority_request"
                 | "api_display_input_authority_release"
@@ -2517,6 +2540,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             "api_display_input_authority_available",
             runtime.display_authority.is_some(),
         ),
+        ("api_display_webrtc_signal_available", true),
         ("api_session_log_replay_available", true),
         ("api_external_session_activity_replay_available", true),
         ("api_dashboard_bootstrap_available", true),
@@ -2710,9 +2734,13 @@ async fn control_request_response(
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
         }
-        "api_media_clip_start" => api_media_clip_start_response(id, params.as_ref(), &runtime).await,
+        "api_media_clip_start" => {
+            api_media_clip_start_response(id, params.as_ref(), &runtime).await
+        }
         "api_media_clip_end" => api_media_clip_end_response(id, params.as_ref(), &runtime).await,
-        "api_media_clip_cancel" => api_media_clip_cancel_response(id, params.as_ref(), &runtime).await,
+        "api_media_clip_cancel" => {
+            api_media_clip_cancel_response(id, params.as_ref(), &runtime).await
+        }
         "api_fs_stat" => api_fs_stat_response(id, params.as_ref()).await,
         "api_fs_list" => api_fs_list_response(id, params.as_ref()).await,
         "api_fs_mkdir" => api_fs_mkdir_response(id, params.as_ref()).await,
@@ -2747,6 +2775,9 @@ async fn control_request_response(
         "api_browser_workspace_snapshot" => api_browser_workspace_snapshot_response(id).await,
         "api_state_snapshot" => api_state_snapshot_response(id, &runtime).await,
         "api_display_bootstrap" => api_display_bootstrap_response(id, &runtime).await,
+        "api_display_webrtc_signal" => {
+            api_display_webrtc_signal_response(id, params.as_ref(), &runtime).await
+        }
         "api_display_input_authority_snapshot" => {
             api_display_input_authority_snapshot_response(id, &runtime).await
         }
@@ -5307,6 +5338,175 @@ async fn api_display_bootstrap_response(id: String, runtime: &ControlRuntime) ->
     })
 }
 
+async fn api_display_webrtc_signal_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let signal = string_param(&params, &["signal", "kind", "type", "t"]);
+    match signal.as_str() {
+        "offer" | "display_offer" => api_display_webrtc_offer_response(id, &params, runtime).await,
+        "ice" | "candidate" | "display_ice" => {
+            api_display_webrtc_ice_response(id, &params, runtime).await
+        }
+        _ => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": "missing or unknown display webrtc signal",
+        }),
+    }
+}
+
+async fn api_display_webrtc_offer_response(
+    id: String,
+    params: &serde_json::Value,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let display_id = display_id_param(Some(params));
+    let sdp = string_param(params, &["sdp", "offer", "offer_sdp"]);
+    if sdp.is_empty() {
+        return missing_param_response(id, "sdp");
+    }
+    let Some(display_session) = active_display_session(runtime, display_id).await else {
+        return display_signal_error_response(id, 404, display_id, "display session not found");
+    };
+
+    let (ice_tx, mut ice_rx) = mpsc::channel::<(crate::display::PeerId, String)>(64);
+    if let Some(control_frames_tx) = runtime.control_frames_tx.clone() {
+        tokio::spawn(async move {
+            while let Some((_peer_id, candidate_json)) = ice_rx.recv().await {
+                let candidate =
+                    serde_json::from_str::<serde_json::Value>(&candidate_json).unwrap_or_default();
+                let payload = serde_json::json!({
+                    "t": "display_ice",
+                    "display_id": display_id,
+                    "candidate": candidate,
+                });
+                let frame = serde_json::json!({
+                    "t": "event",
+                    "payload": payload,
+                });
+                if control_frames_tx.send(frame).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let input_authorized = dashboard_display_input_authorizer(
+        runtime.display_authority.clone(),
+        runtime.session_id.clone(),
+        display_id,
+    );
+    let authority_handler = crate::display::webrtc::noop_authority_handler();
+    match display_session
+        .handle_offer(
+            runtime.display_peer_id,
+            &sdp,
+            &runtime.ice_config,
+            Some(Arc::clone(&runtime.tcp_peer_registry)),
+            None,
+            ice_tx,
+            input_authorized,
+            authority_handler,
+        )
+        .await
+    {
+        Ok(answer_sdp) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": true,
+            "result": {
+                "t": "display_answer",
+                "display_id": display_id,
+                "sdp": answer_sdp,
+            },
+        }),
+        Err(e) => display_signal_error_response(
+            id,
+            502,
+            display_id,
+            &format!("display offer failed: {e}"),
+        ),
+    }
+}
+
+async fn api_display_webrtc_ice_response(
+    id: String,
+    params: &serde_json::Value,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let display_id = display_id_param(Some(params));
+    let Some(candidate) = params.get("candidate").cloned() else {
+        return missing_param_response(id, "candidate");
+    };
+    if candidate.is_null() {
+        return missing_param_response(id, "candidate");
+    }
+    let Some(display_session) = active_display_session(runtime, display_id).await else {
+        return display_signal_error_response(id, 404, display_id, "display session not found");
+    };
+    let candidate = candidate.to_string();
+    let peer_id = runtime.display_peer_id;
+    tokio::spawn(async move {
+        if let Err(e) = display_session.add_ice_candidate(peer_id, &candidate).await {
+            eprintln!(
+                "[dashboard/control] display ICE candidate failed for display {display_id}: {e}"
+            );
+        }
+    });
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": true,
+            "display_id": display_id,
+        },
+    })
+}
+
+async fn active_display_session(
+    runtime: &ControlRuntime,
+    display_id: u32,
+) -> Option<Arc<crate::display::DisplaySession>> {
+    let session_registry = {
+        let session = runtime.shared_session.read().await;
+        session.session_registry.clone()
+    }?;
+    let registry = session_registry.read().await;
+    registry.get(display_id)
+}
+
+fn dashboard_display_input_authorizer(
+    display_authority: Option<DashboardDisplayAuthorityBridge>,
+    session_id: String,
+    display_id: u32,
+) -> Arc<dyn Fn() -> bool + Send + Sync> {
+    Arc::new(move || match display_authority.as_ref() {
+        Some(bridge) => bridge.input_authorized(&session_id, display_id),
+        None => true,
+    })
+}
+
+fn display_signal_error_response(
+    id: String,
+    status: u16,
+    display_id: u32,
+    error: &str,
+) -> serde_json::Value {
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": false,
+        "status": status,
+        "display_id": display_id,
+        "error": error,
+    })
+}
+
 async fn api_display_input_authority_snapshot_response(
     id: String,
     runtime: &ControlRuntime,
@@ -6982,7 +7182,11 @@ mod tests {
             web_tui_tx: None,
             bootstrap_caches: DashboardBootstrapCaches::default(),
             display_authority: None,
+            ice_config: crate::display::IceConfig::default(),
+            tcp_peer_registry: crate::display::webrtc::TcpPeerRegistry::new(),
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
+            control_frames_tx: None,
+            display_peer_id: 1,
         }
     }
 
@@ -7096,7 +7300,10 @@ mod tests {
             Some("browser-client-nonce"),
         );
         let expected_grant_hash = sha256_b64u(b"connect-session-grant");
-        assert_eq!(granted.client_nonce.as_deref(), Some("browser-client-nonce"));
+        assert_eq!(
+            granted.client_nonce.as_deref(),
+            Some("browser-client-nonce")
+        );
         assert_eq!(
             granted.session_grant_sha256.as_deref(),
             Some(expected_grant_hash.as_str())
@@ -7219,6 +7426,10 @@ mod tests {
         );
         assert_eq!(status["result"]["api_state_snapshot_available"], true);
         assert_eq!(status["result"]["api_display_bootstrap_available"], true);
+        assert_eq!(
+            status["result"]["api_display_webrtc_signal_available"],
+            true
+        );
         assert_eq!(status["result"]["api_session_log_replay_available"], true);
         assert_eq!(
             status["result"]["api_external_session_activity_replay_available"],
@@ -8368,9 +8579,12 @@ mod tests {
             }),
             bytes,
         );
-        let frame =
-            api_media_clip_frame_upload_task_response("clip-frame".into(), frame_upload, rt.clone())
-                .await;
+        let frame = api_media_clip_frame_upload_task_response(
+            "clip-frame".into(),
+            frame_upload,
+            rt.clone(),
+        )
+        .await;
         assert_eq!(frame.frame["result"]["_httpStatus"], 200);
         assert_eq!(frame.frame["result"]["t"], "media_clip_frame_saved");
         assert_eq!(frame.frame["result"]["frames_received"], 1);
@@ -8932,6 +9146,24 @@ mod tests {
             .unwrap()
             .iter()
             .any(|value| value.as_str() == Some("display_input_authority_state")));
+    }
+
+    #[tokio::test]
+    async fn display_webrtc_signal_rpc_reports_missing_display() {
+        let rt = runtime();
+        let params = serde_json::json!({
+            "signal": "offer",
+            "display_id": 99,
+            "sdp": "synthetic-offer",
+        });
+        let response =
+            api_display_webrtc_signal_response("sig1".to_string(), Some(&params), &rt).await;
+        assert_eq!(response["t"], "response");
+        assert_eq!(response["id"], "sig1");
+        assert_eq!(response["ok"], false);
+        assert_eq!(response["status"], 404);
+        assert_eq!(response["display_id"], 99);
+        assert_eq!(response["error"], "display session not found");
     }
 
     #[tokio::test]
