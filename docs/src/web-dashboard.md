@@ -973,9 +973,11 @@ opens a `clip_id` operation with `api_media_clip_start`, uploads each JPEG frame
 with `api_media_clip_frame` in strict `frame_index` order, then commits with
 `api_media_clip_end` or discards with `api_media_clip_cancel`. The dashboard
 chooses the transport once per media operation. If the media protocol is not
-advertised before the first write, it uses the legacy WebSocket media messages;
-after a tunneled media write is attempted, failures are surfaced and are not
-replayed over the WebSocket.
+advertised before the first write, daemon-origin dashboards use the legacy
+WebSocket media messages. Public-origin Connect mode has no daemon WebSocket
+fallback, so annotation and clip writes fail visibly when the verified media
+tunnel is not available. After a tunneled media write is attempted, failures are
+surfaced and are not replayed over the WebSocket.
 Current-upload list reads use `api_session_current_uploads`, returning the same
 staged-upload descriptor array as `GET /api/session/current/uploads`.
 Current-upload raw reads use `api_session_current_upload_raw` over

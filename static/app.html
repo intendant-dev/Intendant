@@ -30135,6 +30135,10 @@ function dashboardMediaTransferFailed(err, label) {
   showControlToast?.('error', err?.message || `${label} failed`);
 }
 
+function dashboardMediaTunnelUnavailableError(label) {
+  return new Error(`dashboard Connect media tunnel is not available for ${label || 'media transfer'}`);
+}
+
 async function uploadDashboardMediaTunnel(method, params, bytes, label, options = {}) {
   const result = await dashboardTransport.uploadBytes(method, params, bytes, {
     timeoutMs: options.timeoutMs || 120000,
@@ -30155,6 +30159,9 @@ async function requestDashboardMediaTunnel(method, params, label, options = {}) 
 async function sendDashboardMediaUpload(method, params, bytes, legacyObj, label, options = {}) {
   if (dashboardMediaEditorRpcAvailable()) {
     return uploadDashboardMediaTunnel(method, params, bytes, label, options);
+  }
+  if (dashboardConnectModeEnabled()) {
+    throw dashboardMediaTunnelUnavailableError(label);
   }
   sendLegacyMediaEditorMessage(legacyObj);
   return null;
@@ -34961,6 +34968,14 @@ async function submitClip(action) {
   let mediaStarted = false;
   let frameIndex = 0;
   const sentFrames = []; // { frameId, dataUrl } for 'attach'
+  if (!useMediaTunnel && dashboardConnectModeEnabled()) {
+    progress.classList.add('hidden');
+    status.textContent = 'Media tunnel unavailable';
+    status.style.color = 'var(--red)';
+    setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 5000);
+    dashboardMediaTransferFailed(dashboardMediaTunnelUnavailableError('clip creation'), 'clip creation');
+    return;
+  }
 
   try {
     const startPayload = {
@@ -37690,6 +37705,71 @@ window.intendantDashboardControl = {
       }
       app = previousApp;
     }
+  },
+  async _debugProbeMediaConnectNoLegacy() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof sendDashboardMediaUpload !== 'function' ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        sendType: typeof sendDashboardMediaUpload,
+        hasControlTransport: Boolean(dashboardControlTransport),
+        threw: false,
+        wsReplayCount: 0,
+      };
+    }
+    const previousApp = app;
+    const previousSend = app && typeof app.send_server_action === 'function'
+      ? app.send_server_action
+      : null;
+    const previousStatus = dashboardControlTransport.lastStatus;
+    let wsReplayCount = 0;
+    if (app && typeof app === 'object') {
+      app.send_server_action = function() {
+        wsReplayCount += 1;
+      };
+    } else {
+      app = {
+        send_server_action() {
+          wsReplayCount += 1;
+        },
+      };
+    }
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      upload_frames_available: false,
+      api_media_editor_available: false,
+      api_media_annotation_attach_available: false,
+      api_media_annotation_submit_available: false,
+      api_media_clip_start_available: false,
+      api_media_clip_frame_available: false,
+      api_media_clip_end_available: false,
+      api_media_clip_cancel_available: false,
+    };
+    let threw = false;
+    let error = '';
+    try {
+      await sendDashboardMediaUpload(
+        'api_media_annotation_attach',
+        { frame_id: 'debug-media-unavailable', stream: 'debug' },
+        new Uint8Array([1, 2, 3]),
+        { t: 'annotation_attach', frame_id: 'debug-media-unavailable', stream: 'debug', data: 'AQID' },
+        'annotation attach'
+      );
+    } catch (err) {
+      threw = true;
+      error = err?.message || String(err);
+    } finally {
+      dashboardControlTransport.lastStatus = previousStatus;
+      if (previousApp && previousSend) {
+        previousApp.send_server_action = previousSend;
+      }
+      app = previousApp;
+    }
+    return { skipped: false, threw, error, wsReplayCount };
   },
   request(method, params = {}, options = {}) {
     return dashboardTransport.request(method, params, options);

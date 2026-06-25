@@ -2949,6 +2949,7 @@ async function main() {
         ctl.dashboardBootstrap({ timeoutMs: 60000 }),
       ]);
       const genericControlNoReplay = await ctl._debugProbeControlNoReplay();
+      const mediaConnectNoLegacy = await ctl._debugProbeMediaConnectNoLegacy();
       const transportLabel = document.getElementById('sb-dashboard-transport-label')?.textContent || '';
       const serverLabel = document.getElementById('sb-conn-label')?.textContent || '';
       const serverClass = document.getElementById('sb-conn')?.className || '';
@@ -2959,6 +2960,7 @@ async function main() {
         sessionCount: Array.isArray(sessions) ? sessions.length : null,
         bootstrapFrameCount: bootstrap?.frame_count ?? (Array.isArray(bootstrap?.frames) ? bootstrap.frames.length : null),
         genericControlNoReplay,
+        mediaConnectNoLegacy,
         transportLabel,
         serverLabel,
         serverClass,
@@ -3034,6 +3036,25 @@ async function main() {
       0,
       `real SPA generic ControlMsg replayed over /ws after RPC failure: ${JSON.stringify(appResult.genericControlNoReplay)}`
     );
+    assert.strictEqual(
+      appResult.mediaConnectNoLegacy.skipped,
+      false,
+      `real SPA could not exercise Connect media no-legacy path: ${JSON.stringify(appResult.mediaConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.mediaConnectNoLegacy.threw,
+      true,
+      `real SPA Connect media fallback did not fail visibly: ${JSON.stringify(appResult.mediaConnectNoLegacy)}`
+    );
+    assert(
+      String(appResult.mediaConnectNoLegacy.error || '').includes('Connect media tunnel is not available'),
+      `real SPA Connect media fallback had unexpected error: ${JSON.stringify(appResult.mediaConnectNoLegacy)}`
+    );
+    assert.strictEqual(
+      appResult.mediaConnectNoLegacy.wsReplayCount,
+      0,
+      `real SPA Connect media fallback replayed over /ws: ${JSON.stringify(appResult.mediaConnectNoLegacy)}`
+    );
     assert(appResult.agentCardId, 'real SPA Connect mode did not fetch agent card over DataChannel');
     assert(
       Number(appResult.sessionCount) >= 1,
@@ -3076,6 +3097,7 @@ async function main() {
         sessionCount: appResult.sessionCount,
         dashboardBootstrapFrameCount: appResult.bootstrapFrameCount,
         genericControlNoReplay: appResult.genericControlNoReplay,
+        mediaConnectNoLegacy: appResult.mediaConnectNoLegacy,
         transportLabel: appResult.transportLabel,
         serverLabel: appResult.serverLabel,
         serverClass: appResult.serverClass,
