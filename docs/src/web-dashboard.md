@@ -626,6 +626,10 @@ child with Connect env vars, verifies that
    data such as config, Agent Card identity, sessions, bootstrap frames, event
    subscription, and visible transport status all arrive through
    `window.intendantDashboardControl` instead of same-origin daemon HTTP/WSS.
+   This real-SPA pass also fails if the public-origin dashboard attempts daemon
+   REST/media/WebSocket fallback paths such as `/config`,
+   `/.well-known/agent-card.json`, `/api/...`, `/recordings`,
+   `/connect/dashboard/...`, or `/ws`.
 
 This still is not consumer Connect. It has no account, passkey, daemon claim,
 grant issuance, revocation, audit log, or hosted public HTTPS. It is the

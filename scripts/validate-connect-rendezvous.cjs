@@ -2627,6 +2627,48 @@ async function main() {
 
     const appPage = await browser.newPage();
     const appConsoleErrors = [];
+    const appUnexpectedPublicRequests = [];
+    const appUnexpectedPublicWebSockets = [];
+    const allowedAppSignalPaths = new Set([
+      '/api/browser/offer',
+      '/api/browser/ice',
+      '/api/browser/close',
+    ]);
+    const shouldAllowPublicAppRequest = req => {
+      const parsed = new URL(req.url());
+      if (parsed.origin !== publicOrigin) return true;
+      const method = req.method();
+      const pathname = parsed.pathname;
+      if (method === 'POST' && allowedAppSignalPaths.has(pathname)) return true;
+      if (method !== 'GET') return false;
+      if (pathname === '/app') return true;
+      if (pathname === '/config') return false;
+      if (pathname === '/ws') return false;
+      if (pathname === '/.well-known/agent-card.json') return false;
+      if (pathname.startsWith('/api/')) return false;
+      if (pathname.startsWith('/connect/dashboard/')) return false;
+      if (pathname.startsWith('/recordings')) return false;
+      return true;
+    };
+    appPage.on('request', req => {
+      try {
+        if (shouldAllowPublicAppRequest(req)) return;
+        const parsed = new URL(req.url());
+        appUnexpectedPublicRequests.push(`${req.method()} ${parsed.pathname}`);
+      } catch (err) {
+        appUnexpectedPublicRequests.push(`${req.method()} ${req.url()}`);
+      }
+    });
+    appPage.on('websocket', ws => {
+      try {
+        const parsed = new URL(ws.url());
+        if (parsed.origin.replace(/^http/, 'ws') === publicOrigin.replace(/^http/, 'ws')) {
+          appUnexpectedPublicWebSockets.push(parsed.pathname);
+        }
+      } catch {
+        appUnexpectedPublicWebSockets.push(ws.url());
+      }
+    });
     appPage.on('console', msg => {
       const type = msg.type();
       const text = msg.text();
@@ -2690,6 +2732,16 @@ async function main() {
       `real SPA did not expose Connect transport status: ${JSON.stringify(appResult)}`
     );
     assert.deepStrictEqual(appConsoleErrors, [], 'real SPA emitted browser console errors');
+    assert.deepStrictEqual(
+      [...new Set(appUnexpectedPublicRequests)],
+      [],
+      'real SPA attempted public-origin daemon REST/media fallback requests'
+    );
+    assert.deepStrictEqual(
+      [...new Set(appUnexpectedPublicWebSockets)],
+      [],
+      'real SPA attempted public-origin WebSocket fallback requests'
+    );
 
     console.log(JSON.stringify({
       publicApp: {
@@ -2699,6 +2751,8 @@ async function main() {
         dashboardBootstrapFrameCount: appResult.bootstrapFrameCount,
         transportLabel: appResult.transportLabel,
         serverClass: appResult.serverClass,
+        unexpectedPublicRequests: appUnexpectedPublicRequests,
+        unexpectedPublicWebSockets: appUnexpectedPublicWebSockets,
       },
     }, null, 2));
 
