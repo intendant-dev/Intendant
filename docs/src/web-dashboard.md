@@ -461,7 +461,7 @@ active-session timeline history, active-session changes/diffs, lazy exact
 context-snapshot loads, filesystem picker stat/list/mkdir operations, deep
 session search, settings, API-key status, server-side voice-session token
 minting, project root, display enumeration, recording metadata, worktree
-inventory, and peer state.
+inventory, bounded session-report zip downloads, and peer state.
 Managed-context history reads for records, anchors, and fission groups also use
 the tunnel.
 Current tunneled mutations include
@@ -824,6 +824,11 @@ preserving the existing path validation and `_httpStatus`/`_httpOk` metadata.
 Live and per-session recording stream lists use `api_recordings` and
 `api_session_recordings`; HLS playlists and media segments remain on HTTP until
 the tunnel has resumable byte-stream semantics.
+The Settings debug session-report download uses `api_session_report`, returning
+the same text-artifact zip as `/api/session/{id}/report` as base64 inside the
+existing credited chunked JSON response framing. This is intentionally scoped to
+the bounded diagnostic report; generic downloads still wait for raw byte-stream
+semantics.
 Worktree cached inventory reads, explicit scans, and guarded removals use
 `api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
 the same no-replay fallback rule as other writes.
@@ -863,8 +868,8 @@ before a verified DataChannel request is attempted, then surface RPC failures
 instead of duplicating a potentially state-changing action.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
-uploads, downloads, recording media, terminal streams, broader file transfer,
-and remaining non-allowlisted control mutations should move only after
+uploads, generic downloads, recording media, terminal streams, broader file
+transfer, and remaining non-allowlisted control mutations should move only after
 resumable stream/file-transfer semantics and per-action no-replay rules are
 settled.
 
@@ -928,10 +933,11 @@ Treat this as a staged target, not current behavior:
 10. Gradually migrate larger API surfaces. Managed-context history reads,
     active-session command-output loads, active-session timeline operations,
     active-session changes/diffs, lazy context-snapshot exact-loads, session-data
-    deletion, staged upload deletion, recording metadata, worktree inventory,
-    filesystem picker stat/list/mkdir operations, local Agent Card reads, and
-    local session hydration now use the tunnel, oversized JSON responses now use
-    credit-windowed chunked response framing, and the sessions stream uses explicit
+    deletion, staged upload deletion, recording metadata, session-report zip
+    downloads, worktree inventory, filesystem picker stat/list/mkdir operations,
+    local Agent Card reads, and local session hydration now use the tunnel,
+    oversized JSON responses now use credit-windowed chunked response framing,
+    and the sessions stream uses explicit
     `stream_start`/`stream_event`/`stream_end` frames. Allowlisted settings
     `ControlMsg` dispatch, display input authority request/release/snapshot, and
     local display input frames now use the tunnel when verified. Dedicated
@@ -940,8 +946,8 @@ Treat this as a staged target, not current behavior:
     with no-replay fallback. Dedicated dashboard-action `ControlMsg` dispatch
     now covers Codex/Gemini thread actions, display take/release/grant/revoke,
     recording/debug toggles, and browser workspace create/acquire/close/release.
-    Uploads, downloads, recording media, terminals, remaining non-allowlisted
-    control commands, and file transfer still wait for resumable
+    Uploads, generic downloads, recording media, terminals, remaining
+    non-allowlisted control commands, and file transfer still wait for resumable
     stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
     throughout.

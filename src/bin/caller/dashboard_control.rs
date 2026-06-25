@@ -64,6 +64,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_sessions",
     "api_sessions_stream",
     "api_session_detail",
+    "api_session_report",
     "api_session_delete",
     "api_session_current_agent_output",
     "api_session_current_history",
@@ -1302,6 +1303,7 @@ fn control_frame_response(
                 }
                 "api_sessions"
                 | "api_session_detail"
+                | "api_session_report"
                 | "api_session_delete"
                 | "api_session_current_agent_output"
                 | "api_session_current_history"
@@ -1578,6 +1580,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_sessions_available", true),
         ("api_sessions_stream_available", true),
         ("api_session_detail_available", true),
+        ("api_session_report_available", true),
         ("api_session_delete_available", true),
         ("api_session_current_agent_output_available", true),
         ("api_session_current_history_available", true),
@@ -1701,6 +1704,7 @@ async fn control_request_response(
     match method.as_str() {
         "api_sessions" => api_sessions_response(id, params.as_ref()).await,
         "api_session_detail" => api_session_detail_response(id, params.as_ref()).await,
+        "api_session_report" => api_session_report_response(id, params.as_ref(), &runtime).await,
         "api_session_delete" => api_session_delete_response(id, params.as_ref()).await,
         "api_session_current_agent_output" => {
             api_session_current_agent_output_response(id, params.as_ref(), &runtime).await
@@ -2026,6 +2030,75 @@ async fn api_session_detail_response(
         }
     };
     json_body_response(id, body, "session detail")
+}
+
+async fn api_session_report_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let session_id = optional_string_param(&params, &["session_id", "sessionId", "id"])
+        .unwrap_or_else(|| "current".to_string());
+    let (session_log, query_ctx) = {
+        let session = runtime.shared_session.read().await;
+        (session.session_log.clone(), session.query_ctx.clone())
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::session_report_zip_for_request(
+            &session_id,
+            session_log.as_ref(),
+            query_ctx.as_ref(),
+        )
+    })
+    .await;
+    let report = match result {
+        Ok(Ok(report)) => report,
+        Ok(Err(err)) => {
+            let (status, error) = match err {
+                crate::web_gateway::SessionReportZipError::InvalidSessionId => {
+                    (400, "invalid session id".to_string())
+                }
+                crate::web_gateway::SessionReportZipError::NotFound => {
+                    (404, "Session not found".to_string())
+                }
+                crate::web_gateway::SessionReportZipError::Build(error) => {
+                    (500, format!("Failed to build report: {error}"))
+                }
+            };
+            return http_body_response(
+                id,
+                status,
+                serde_json::json!({
+                    "ok": false,
+                    "error": error,
+                })
+                .to_string(),
+                "session report",
+            );
+        }
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("session report task failed: {e}"),
+            });
+        }
+    };
+    let size = report.bytes.len();
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": true,
+        "result": {
+            "ok": true,
+            "filename": report.filename,
+            "content_type": "application/zip",
+            "size": size,
+            "data_base64": base64::engine::general_purpose::STANDARD.encode(report.bytes),
+        },
+    })
 }
 
 async fn api_session_delete_response(
@@ -4248,6 +4321,7 @@ mod tests {
         assert_eq!(status["result"]["api_sessions_available"], true);
         assert_eq!(status["result"]["api_sessions_stream_available"], true);
         assert_eq!(status["result"]["api_session_detail_available"], true);
+        assert_eq!(status["result"]["api_session_report_available"], true);
         assert_eq!(status["result"]["api_session_delete_available"], true);
         assert_eq!(
             status["result"]["api_session_current_agent_output_available"],
@@ -4737,6 +4811,58 @@ mod tests {
         assert_eq!(response.frame["result"]["error"], "no active session log");
         assert_eq!(response.frame["result"]["_httpStatus"], 404);
         assert_eq!(response.frame["result"]["_httpOk"], false);
+    }
+
+    #[tokio::test]
+    async fn session_report_rpc_returns_zip_for_active_log() {
+        use base64::Engine as _;
+
+        let dir = tempfile::tempdir().unwrap();
+        let session_dir = dir.path().join("session-report");
+        let log = crate::session_log::SessionLog::open(session_dir.clone()).unwrap();
+        std::fs::write(session_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
+        std::fs::create_dir_all(session_dir.join("turns")).unwrap();
+        std::fs::write(
+            session_dir.join("turns").join("turn_001_stdout.txt"),
+            "hello\n",
+        )
+        .unwrap();
+
+        let rt = runtime();
+        {
+            let mut session = rt.shared_session.write().await;
+            session.session_log = Some(Arc::new(std::sync::Mutex::new(log)));
+        }
+        let report =
+            api_session_report_response("report1".to_string(), Some(&serde_json::json!({})), &rt)
+                .await;
+        assert_eq!(report["t"], "response");
+        assert_eq!(report["ok"], true);
+        assert_eq!(report["result"]["ok"], true);
+        assert_eq!(report["result"]["content_type"], "application/zip");
+        assert!(report["result"]["filename"]
+            .as_str()
+            .unwrap_or("")
+            .ends_with(".zip"));
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(report["result"]["data_base64"].as_str().unwrap_or(""))
+            .unwrap();
+        assert_eq!(
+            report["result"]["size"].as_u64().unwrap(),
+            bytes.len() as u64
+        );
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(bytes)).unwrap();
+        assert!(zip.by_name("summary.json").is_ok());
+        assert!(zip.by_name("turns/turn_001_stdout.txt").is_ok());
+
+        let invalid = api_session_report_response(
+            "report2".to_string(),
+            Some(&serde_json::json!({ "session_id": "../bad" })),
+            &rt,
+        )
+        .await;
+        assert_eq!(invalid["result"]["_httpStatus"], 400);
+        assert_eq!(invalid["result"]["_httpOk"], false);
     }
 
     #[tokio::test]

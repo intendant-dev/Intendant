@@ -37665,6 +37665,7 @@ class DashboardControlTransport {
       apiSessionsAvailable: this.lastStatus?.api_sessions_available ?? null,
       apiSessionsStreamAvailable: this.lastStatus?.api_sessions_stream_available ?? null,
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
+      apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
       apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
       apiSessionCurrentHistoryAvailable: this.lastStatus?.api_session_current_history_available ?? null,
       apiSessionCurrentRollbackAvailable: this.lastStatus?.api_session_current_rollback_available ?? null,
@@ -37726,6 +37727,7 @@ function dashboardControlRequestTimeoutMs(method) {
       return 120000;
     case 'api_sessions_search':
     case 'api_session_current_changes':
+    case 'api_session_report':
     case 'api_recordings':
     case 'api_session_recordings':
     case 'api_worktrees':
@@ -37872,6 +37874,64 @@ async function fetchProjectRoot() {
     if (!resp.ok) throw new Error(`/api/project-root returned ${resp.status}`);
     return resp.json();
   }, 'api_project_root');
+}
+
+function dashboardReportRpcAvailable() {
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    dashboardTransport.lastStatus?.api_session_report_available === true
+  );
+}
+
+function downloadDashboardBytes(bytes, filename, contentType) {
+  const blob = new Blob([bytes], { type: contentType || 'application/octet-stream' });
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement('a');
+  link.href = url;
+  link.download = filename || 'intendant-session-report.zip';
+  link.style.display = 'none';
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+async function downloadSessionReportViaDashboardControl(event) {
+  if (!dashboardReportRpcAvailable()) return;
+  event.preventDefault();
+  const link = event.currentTarget;
+  const previousText = link?.textContent || '';
+  if (link) {
+    link.textContent = 'Preparing...';
+    link.setAttribute('aria-busy', 'true');
+  }
+  try {
+    const report = await dashboardTransport.request('api_session_report', {
+      session_id: 'current',
+    }, { timeoutMs: 120000 });
+    if (report?.ok === false || report?._httpOk === false) {
+      throw new Error(report.error || `Session report failed (${report._httpStatus || 'error'})`);
+    }
+    const bytes = dashboardControlBase64ToBytes(report?.data_base64 || '');
+    if (!bytes.length) throw new Error('Session report was empty');
+    downloadDashboardBytes(
+      bytes,
+      report.filename || 'intendant-session-report.zip',
+      report.content_type || 'application/zip'
+    );
+  } catch (err) {
+    console.warn('[dashboard-control] api_session_report RPC failed', err);
+    if (typeof showControlToast === 'function') {
+      showControlToast('error', err?.message || 'Session report download failed');
+    }
+  } finally {
+    if (link) {
+      link.textContent = previousText || 'Download session report';
+      link.removeAttribute('aria-busy');
+    }
+  }
 }
 
 function normalizeDisplaysPayload(payload) {
@@ -42822,6 +42882,7 @@ async function saveSettings() {
 
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
 document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
+document.getElementById('download-session-report-btn')?.addEventListener('click', downloadSessionReportViaDashboardControl);
 
 // External agent dropdown is applied on Save click alongside other settings,
 // not on change — matches the rest of the Settings tab UX.

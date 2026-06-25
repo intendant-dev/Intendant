@@ -3608,6 +3608,46 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
     Ok(cursor.into_inner())
 }
 
+pub(crate) struct SessionReportZip {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) enum SessionReportZipError {
+    InvalidSessionId,
+    NotFound,
+    Build(String),
+}
+
+pub(crate) fn session_report_zip_for_request(
+    session_id: &str,
+    session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
+    query_ctx: Option<&WebQueryCtx>,
+) -> Result<SessionReportZip, SessionReportZipError> {
+    let session_id = session_id.trim();
+    if session_id != "current" && !session_lookup_id_is_safe(session_id) {
+        return Err(SessionReportZipError::InvalidSessionId);
+    }
+    let resolved_dir: Option<PathBuf> = if session_id == "current" {
+        current_session_log_dir(session_log, query_ctx)
+    } else {
+        resolve_session_dir(session_id)
+    };
+    let Some(dir) = resolved_dir else {
+        return Err(SessionReportZipError::NotFound);
+    };
+    let bytes =
+        build_session_report_zip(&dir).map_err(|e| SessionReportZipError::Build(e.to_string()))?;
+    let fname = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "session".to_string());
+    Ok(SessionReportZip {
+        filename: format!("intendant-session-{fname}.zip"),
+        bytes,
+    })
+}
+
 fn current_session_log_dir(
     session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<&WebQueryCtx>,

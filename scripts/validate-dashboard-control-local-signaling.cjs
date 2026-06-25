@@ -149,6 +149,9 @@ async function main() {
         externalSessionActivityReplay: await ctl.externalSessionActivityReplay({ timeoutMs: 60000 }),
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
+        sessionReport: await labeled('api_session_report current', ctl.request('api_session_report', {
+          session_id: 'current',
+        }, { timeoutMs: 120000 })),
         rejectedControlMsg: await labeled('api_control_msg rejected create_session', ctl.request('api_control_msg', {
           message: { action: 'create_session', task: 'noop' },
         }, { timeoutMs: 60000 })),
@@ -257,6 +260,16 @@ async function main() {
     assert.strictEqual(result.finalStatus.apiControlMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiSessionControlMsgAvailable, true);
     assert.strictEqual(result.finalStatus.apiDashboardActionMsgAvailable, true);
+    assert.strictEqual(result.finalStatus.apiSessionReportAvailable, true);
+    if (result.sessionReport?.ok === true) {
+      assert.strictEqual(result.sessionReport.content_type, 'application/zip');
+      assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
+      assert(Number(result.sessionReport.size || 0) > 0, 'session report had no bytes');
+      assert(String(result.sessionReport.data_base64 || '').length > 0, 'session report had no base64 body');
+    } else {
+      assert.strictEqual(result.sessionReport?._httpStatus, 404);
+      assert.strictEqual(result.sessionReport?._httpOk, false);
+    }
     assert.strictEqual(result.rejectedControlMsg?._httpStatus, 400);
     assert.strictEqual(result.rejectedControlMsg?._httpOk, false);
     assert(
@@ -308,6 +321,9 @@ async function main() {
         apiControlMsgAvailable: result.finalStatus.apiControlMsgAvailable,
         apiSessionControlMsgAvailable: result.finalStatus.apiSessionControlMsgAvailable,
         apiDashboardActionMsgAvailable: result.finalStatus.apiDashboardActionMsgAvailable,
+        apiSessionReportAvailable: result.finalStatus.apiSessionReportAvailable,
+        sessionReportStatus: result.sessionReport._httpStatus || 200,
+        sessionReportSize: result.sessionReport.size || 0,
         rejectedControlStatus: result.rejectedControlMsg._httpStatus,
         sessionControlAction: result.sessionControlMsg.action,
         rejectedSessionControlStatus: result.rejectedSessionControlMsg._httpStatus,

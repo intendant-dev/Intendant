@@ -863,6 +863,9 @@ async function main() {
         sessionDelete,
         sessionControl,
         dashboardAction,
+        sessionReport: await labeled('api_session_report current', ctl.request('api_session_report', {
+          session_id: 'current',
+        }, { timeoutMs: 120000 })),
         sessionsStream: {
           result: streamResult,
           eventTypes: streamEvents.map(event => event.type),
@@ -948,6 +951,11 @@ async function main() {
       result.status.api_session_control_msg_available,
       true,
       'dashboard control status did not advertise session control messages'
+    );
+    assert.strictEqual(
+      result.status.api_session_report_available,
+      true,
+      'dashboard control status did not advertise session report downloads'
     );
     assert.strictEqual(
       result.status.api_dashboard_action_msg_available,
@@ -1138,6 +1146,19 @@ async function main() {
       String(result.dashboardAction?.rejectedSettingsAction?.error || '').includes('not available over dashboard action WebRTC'),
       `unexpected dashboard-action rejection: ${JSON.stringify(result.dashboardAction?.rejectedSettingsAction)}`
     );
+    if (result.sessionReport?.ok === true) {
+      assert.strictEqual(result.sessionReport.content_type, 'application/zip');
+      assert(String(result.sessionReport.filename || '').endsWith('.zip'), 'session report filename was not a zip');
+      assert(Number(result.sessionReport.size || 0) > 0, 'session report had no bytes');
+      assert(String(result.sessionReport.data_base64 || '').length > 0, 'session report had no base64 body');
+    } else {
+      assert.strictEqual(
+        result.sessionReport?._httpStatus,
+        404,
+        'idle current session report should preserve 404 status'
+      );
+      assert.strictEqual(result.sessionReport?._httpOk, false);
+    }
     assert.strictEqual(
       result.status.api_session_current_history_available,
       true,
@@ -1365,6 +1386,9 @@ async function main() {
         apiDashboardActionMsgAvailable: result.status.api_dashboard_action_msg_available,
         dashboardActionAction: result.dashboardAction.closeWorkspace?.action,
         rejectedDashboardActionStatus: result.dashboardAction.rejectedSettingsAction?._httpStatus,
+        apiSessionReportAvailable: result.status.api_session_report_available,
+        sessionReportStatus: result.sessionReport._httpStatus || 200,
+        sessionReportSize: result.sessionReport.size || 0,
         streamEventCount: result.sessionsStream.eventCount,
         streamReplaceCount: result.sessionsStream.replaceCount,
         largeStreamEventCount: result.largeSessionsStream.eventCount,
