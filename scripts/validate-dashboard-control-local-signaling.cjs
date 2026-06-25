@@ -591,6 +591,27 @@ async function main() {
         externalSessionActivityReplay: await ctl.externalSessionActivityReplay({ timeoutMs: 60000 }),
         dashboardBootstrap: await ctl.dashboardBootstrap({ timeoutMs: 60000 }),
         sessions: await ctl.request('api_sessions', { limit: 2 }, { timeoutMs: 60000 }),
+        safeReads: {
+          sessionsSearch: await ctl.request('api_sessions_search', {
+            q: '',
+            source: 'all',
+            mode: '',
+            projects: [],
+          }, { timeoutMs: 60000 }),
+          settings: await ctl.request('api_settings', {}, { timeoutMs: 60000 }),
+          apiKeyStatus: await ctl.request('api_key_status', {}, { timeoutMs: 60000 }),
+          projectRoot: await ctl.request('api_project_root', {}, { timeoutMs: 60000 }),
+          displays: await ctl.request('api_displays', {}, { timeoutMs: 60000 }),
+          managedContextRecords: await ctl.request('api_managed_context_records', {
+            session_id: 'missing-managed-context-session',
+          }, { timeoutMs: 60000 }),
+          managedContextAnchors: await ctl.request('api_managed_context_anchors', {
+            session_id: 'missing-managed-context-session',
+          }, { timeoutMs: 60000 }),
+          managedContextFission: await ctl.request('api_managed_context_fission', {
+            session_id: 'missing-managed-context-session',
+          }, { timeoutMs: 60000 }),
+        },
         sessionReport: await sessionReport(),
         upload: uploaded,
         uploads: await ctl.request('api_session_current_uploads', {}, { timeoutMs: 60000 }),
@@ -710,6 +731,29 @@ async function main() {
       'dashboard bootstrap still marked external session activity replay as omitted'
     );
     assert(Array.isArray(result.sessions), 'api_sessions did not return an array');
+    assert(
+      result.safeReads?.sessionsSearch &&
+        Array.isArray(result.safeReads.sessionsSearch.results) &&
+        typeof result.safeReads.sessionsSearch.searched === 'number',
+      'session search RPC did not return search metadata'
+    );
+    assert(
+      result.safeReads?.settings && typeof result.safeReads.settings === 'object',
+      'settings RPC did not return an object'
+    );
+    assert(
+      result.safeReads?.apiKeyStatus && typeof result.safeReads.apiKeyStatus === 'object',
+      'API key status RPC did not return an object'
+    );
+    assert(
+      result.safeReads?.projectRoot &&
+        Object.prototype.hasOwnProperty.call(result.safeReads.projectRoot, 'project_root'),
+      'project-root RPC did not return project_root'
+    );
+    assert(Array.isArray(result.safeReads?.displays), 'displays RPC did not return an array');
+    assert(Array.isArray(result.safeReads?.managedContextRecords?.records), 'managed context records RPC did not return records');
+    assert(Array.isArray(result.safeReads?.managedContextAnchors?.anchors), 'managed context anchors RPC did not return anchors');
+    assert(Array.isArray(result.safeReads?.managedContextFission?.groups), 'managed context fission RPC did not return groups');
     assert.strictEqual(result.finalStatus.signalingMode, 'local-http');
     assert.strictEqual(result.finalStatus.apiAgentCardAvailable, true);
     assert.strictEqual(result.finalStatus.apiCachedBootstrapEventsAvailable, true);
@@ -895,6 +939,11 @@ async function main() {
         externalSessionActivityReplayFrameCount: result.externalSessionActivityReplay.frame_count,
         dashboardBootstrapFrameCount: result.dashboardBootstrap.frame_count,
         sessionCount: result.sessions.length,
+        sessionsSearchResultCount: result.safeReads.sessionsSearch.results.length,
+        displaysCount: result.safeReads.displays.length,
+        managedContextRecordCount: result.safeReads.managedContextRecords.records.length,
+        managedContextAnchorCount: result.safeReads.managedContextAnchors.anchors.length,
+        managedContextFissionGroupCount: result.safeReads.managedContextFission.groups.length,
         apiAgentCardAvailable: result.finalStatus.apiAgentCardAvailable,
         apiCachedBootstrapEventsAvailable: result.finalStatus.apiCachedBootstrapEventsAvailable,
         apiBrowserWorkspaceSnapshotAvailable: result.finalStatus.apiBrowserWorkspaceSnapshotAvailable,
