@@ -31986,6 +31986,9 @@ class RecordingPlayer {
     this._mseGeneration = 0;
     this._segmentObjectUrl = null;
     this._segmentLoadGeneration = 0;
+    this._hlsObjectUrls = [];
+    this._hlsFallbackHandler = null;
+    this._hlsLoadGeneration = 0;
 
     // Bound handlers — stored so destroy() can remove them
     this._onEnded = () => this._onSegmentEnd();
@@ -32066,13 +32069,98 @@ class RecordingPlayer {
     this._segmentObjectUrl = null;
   }
 
+  _clearHlsFallbackHandler() {
+    if (!this._hlsFallbackHandler) return;
+    this.video.removeEventListener('error', this._hlsFallbackHandler);
+    this._hlsFallbackHandler = null;
+  }
+
+  _revokeHlsObjectUrls() {
+    this._clearHlsFallbackHandler();
+    for (const url of this._hlsObjectUrls) {
+      try { URL.revokeObjectURL(url); } catch (_) {}
+    }
+    this._hlsObjectUrls = [];
+  }
+
   _setVideoSrc(src, options = {}) {
     const objectUrl = String(options.objectUrl || '').trim();
+    const hlsObjectUrls = Array.isArray(options.hlsObjectUrls) ? options.hlsObjectUrls : null;
     if (this._segmentObjectUrl && this._segmentObjectUrl !== objectUrl) {
       this._revokeSegmentObjectUrl();
     }
     this._segmentObjectUrl = objectUrl || null;
+    if (hlsObjectUrls) {
+      this._clearHlsFallbackHandler();
+      this._hlsObjectUrls = hlsObjectUrls;
+    } else {
+      this._revokeHlsObjectUrls();
+    }
     this.video.src = src;
+  }
+
+  _installHlsFallback(primarySrc, fallbackSrc, generation) {
+    if (!fallbackSrc) return;
+    this._clearHlsFallbackHandler();
+    const handler = () => {
+      if (this._hlsLoadGeneration !== generation) return;
+      const currentSrc = this.video.currentSrc || this.video.src || '';
+      if (currentSrc && currentSrc !== primarySrc && !this._hlsObjectUrls.includes(currentSrc)) return;
+      console.warn('[dashboard-control] HLS blob playlist failed; using HTTP playlist fallback');
+      this._hlsLoadGeneration++;
+      this._setVideoSrc(fallbackSrc);
+    };
+    this._hlsFallbackHandler = handler;
+    this.video.addEventListener('error', handler, { once: true });
+  }
+
+  async _loadHlsBlobPlaylist(fallbackSrc = '') {
+    const target = this._assetRpcTarget();
+    if (!target || !this.streamName) return false;
+    const generation = ++this._hlsLoadGeneration;
+    this._revokeHlsObjectUrls();
+    const objectUrls = [];
+    try {
+      const playlistBytes = await this._requestAssetBytes('playlist.m3u8', { timeoutMs: 60000 });
+      if (!playlistBytes) return false;
+      const playlistText = new TextDecoder().decode(playlistBytes);
+      const rewritten = [];
+      for (const line of playlistText.split(/\r?\n/)) {
+        const trimmed = line.trim();
+        if (!trimmed || trimmed.startsWith('#')) {
+          rewritten.push(line);
+          continue;
+        }
+        if (!/^seg_[A-Za-z0-9_.-]+\.ts$/.test(trimmed)) {
+          rewritten.push(line);
+          continue;
+        }
+        const segmentBytes = await this._requestAssetBytes(trimmed, { timeoutMs: 120000 });
+        if (!segmentBytes) return false;
+        const segmentUrl = URL.createObjectURL(new Blob([segmentBytes], { type: 'video/mp2t' }));
+        objectUrls.push(segmentUrl);
+        rewritten.push(segmentUrl);
+      }
+      const playlistUrl = URL.createObjectURL(new Blob([rewritten.join('\n')], {
+        type: 'application/vnd.apple.mpegurl',
+      }));
+      objectUrls.push(playlistUrl);
+      if (this._hlsLoadGeneration !== generation) {
+        for (const url of objectUrls) {
+          try { URL.revokeObjectURL(url); } catch (_) {}
+        }
+        return true;
+      }
+      this._setVideoSrc(playlistUrl, { hlsObjectUrls: objectUrls });
+      this._installHlsFallback(playlistUrl, fallbackSrc, generation);
+      return true;
+    } catch (err) {
+      for (const url of objectUrls) {
+        try { URL.revokeObjectURL(url); } catch (_) {}
+      }
+      console.warn('[dashboard-control] HLS playlist RPC failed', err);
+      return false;
+    }
   }
 
   async load(streamName) {
@@ -32272,10 +32360,12 @@ class RecordingPlayer {
     const generation = ++this._segmentLoadGeneration;
     this.currentSegIdx = idx;
     const seg = this.segments[idx];
-    // Use server-side HLS playlist for .ts segments (Safari/WKWebView
-    // requires HTTP-served m3u8, not blob URLs)
+    // Native HLS wants a URL. Prefer a blob playlist built from tunneled bytes;
+    // fall back to the daemon-served playlist if the browser rejects it.
     if (seg.filename.endsWith('.ts')) {
-      this._setVideoSrc(`${this.baseUrl}/${this.streamName}/playlist.m3u8`);
+      const playlistUrl = `${this.baseUrl}/${this.streamName}/playlist.m3u8`;
+      const tunneled = await this._loadHlsBlobPlaylist(playlistUrl);
+      if (!tunneled) this._setVideoSrc(playlistUrl);
     } else {
       try {
         const buf = await this._fetchSegmentArrayBuffer(seg.filename);
@@ -32374,6 +32464,8 @@ class RecordingPlayer {
       this._msObjectUrl = null;
     }
     this._revokeSegmentObjectUrl();
+    this._hlsLoadGeneration++;
+    this._revokeHlsObjectUrls();
     this._mediaSource = null;
     this.useMSE = false;
     this._mseReady = false;
@@ -32388,6 +32480,7 @@ class RecordingPlayer {
   async _loadAllMSE() {
     const generation = ++this._mseGeneration;
     this._revokeSegmentObjectUrl();
+    this._revokeHlsObjectUrls();
     const abortCtrl = new AbortController();
     this._mseAbort = abortCtrl;
     const signal = abortCtrl.signal;

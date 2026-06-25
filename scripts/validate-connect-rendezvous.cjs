@@ -947,6 +947,15 @@ function createRecordingFixture(label) {
   return { streamName, dir };
 }
 
+function createHlsRecordingFixture(label) {
+  const streamName = `dashboard_control_hls_${label}_${process.pid}_${Date.now()}`;
+  const dir = path.join(os.homedir(), '.intendant', 'recordings', streamName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'segments.csv'), 'seg_00000.ts,0,1.25\n');
+  fs.writeFileSync(path.join(dir, 'seg_00000.ts'), 'recording hls transport stream e2e rendezvous');
+  return { streamName, dir };
+}
+
 function removeRecordingFixture(fixture) {
   if (!fixture?.dir) return;
   fs.rmSync(fixture.dir, { recursive: true, force: true });
@@ -1012,6 +1021,7 @@ async function main() {
 
   const daemonLogs = [];
   const recordingFixture = createRecordingFixture('rendezvous');
+  const hlsRecordingFixture = createHlsRecordingFixture('rendezvous');
   const sessionFrameFixture = createSessionFrameFixture('rendezvous');
   const daemon = spawn(options.dashboardBinary, ['--no-tui', '--web', String(options.daemonPort)], {
     cwd: options.repoRoot,
@@ -1054,6 +1064,7 @@ async function main() {
     const connected = await waitForBrowserConnect(page);
 
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
+    await page.evaluate(`window.__intendantHlsRecordingStreamName = ${JSON.stringify(hlsRecordingFixture.streamName)}`);
     await page.evaluate(`window.__intendantSessionFrameFixture = ${JSON.stringify({
       sessionId: sessionFrameFixture.sessionId,
       filename: sessionFrameFixture.filename,
@@ -1061,6 +1072,7 @@ async function main() {
     const result = await page.evaluate(async () => {
       const ctl = window.intendantPublicConnectDashboard;
       const recordingStreamName = window.__intendantRecordingStreamName;
+      const hlsRecordingStreamName = window.__intendantHlsRecordingStreamName;
       const sessionFrameFixture = window.__intendantSessionFrameFixture;
       const labeled = async (label, promise) => {
         try {
@@ -1249,6 +1261,38 @@ async function main() {
           ...(raw || {}),
           byteLength: text.length,
           firstBytes: Array.from(text, ch => ch.charCodeAt(0)),
+        };
+      };
+      const recordingHlsAssets = async () => {
+        const playlistRaw = await labeled('api_recording_asset hls playlist', ctl.requestBytes('api_recording_asset', {
+          stream_name: hlsRecordingStreamName,
+          asset: 'playlist.m3u8',
+        }, { timeoutMs: 60000 }));
+        const segmentRaw = await labeled('api_recording_asset hls segment', ctl.requestBytes('api_recording_asset', {
+          stream_name: hlsRecordingStreamName,
+          asset: 'seg_00000.ts',
+          offset: 10,
+          length: 9,
+        }, { timeoutMs: 60000 }));
+        const bytesToText = raw => {
+          if (raw?.bytes instanceof Uint8Array) return new TextDecoder().decode(raw.bytes);
+          return raw?.data_base64 ? atob(String(raw.data_base64)) : '';
+        };
+        return {
+          playlist: {
+            ...Object.fromEntries(Object.entries(playlistRaw || {}).filter(([key]) => key !== 'bytes')),
+            byteLength: playlistRaw?.bytes instanceof Uint8Array
+              ? playlistRaw.bytes.byteLength
+              : (playlistRaw?.data_base64 ? atob(String(playlistRaw.data_base64)).length : 0),
+            text: bytesToText(playlistRaw),
+          },
+          segment: {
+            ...Object.fromEntries(Object.entries(segmentRaw || {}).filter(([key]) => key !== 'bytes')),
+            byteLength: segmentRaw?.bytes instanceof Uint8Array
+              ? segmentRaw.bytes.byteLength
+              : (segmentRaw?.data_base64 ? atob(String(segmentRaw.data_base64)).length : 0),
+            text: bytesToText(segmentRaw),
+          },
         };
       };
       const recordingFallbackPlayback = async () => {
@@ -1443,6 +1487,7 @@ async function main() {
         uploadRaw: await uploadRaw(uploaded),
         imagePreview: await imagePreview(),
         recordingAsset: await recordingAsset(),
+        recordingHlsAssets: await recordingHlsAssets(),
         sessionFrameAsset: await sessionFrameAsset(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
@@ -1844,6 +1889,16 @@ async function main() {
     assert.strictEqual(result.recordingAsset?.range_start, 10);
     assert.strictEqual(result.recordingAsset?.range_end, 17);
     assert.strictEqual(result.recordingAsset?.resumable, true);
+    assert.strictEqual(result.recordingHlsAssets?.playlist?.ok, true);
+    assert.strictEqual(result.recordingHlsAssets?.playlist?.content_type, 'application/vnd.apple.mpegurl');
+    assert(String(result.recordingHlsAssets?.playlist?.text || '').includes('seg_00000.ts'), 'HLS playlist did not include the TS segment');
+    assert.strictEqual(result.recordingHlsAssets?.segment?.ok, true);
+    assert.strictEqual(result.recordingHlsAssets?.segment?.byteLength, 9);
+    assert.strictEqual(result.recordingHlsAssets?.segment?.text, 'hls trans');
+    assert.strictEqual(result.recordingHlsAssets?.segment?.content_type, 'video/mp2t');
+    assert.strictEqual(result.recordingHlsAssets?.segment?.range_start, 10);
+    assert.strictEqual(result.recordingHlsAssets?.segment?.range_end, 19);
+    assert.strictEqual(result.recordingHlsAssets?.segment?.resumable, true);
     assert.strictEqual(result.sessionFrameAsset?.ok, true);
     assert.strictEqual(result.sessionFrameAsset?.content_type, 'image/png');
     assert.strictEqual(result.sessionFrameAsset?.filename, sessionFrameFixture.filename);
@@ -2130,6 +2185,8 @@ async function main() {
         imagePreviewSkipped: Boolean(result.imagePreview.skipped),
         recordingAssetBytes: result.recordingAsset.byteLength,
         recordingAssetText: result.recordingAsset.text,
+        recordingHlsPlaylistBytes: result.recordingHlsAssets.playlist.byteLength,
+        recordingHlsSegmentBytes: result.recordingHlsAssets.segment.byteLength,
         sessionFrameAssetBytes: result.sessionFrameAsset.byteLength,
         sessionFrameAssetSignature: result.sessionFrameAsset.firstBytes,
         recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme || null,
@@ -2194,6 +2251,7 @@ async function main() {
     await Promise.race([daemonExit, wait(5000)]);
     await new Promise(resolve => rendezvous.close(resolve));
     removeRecordingFixture(recordingFixture);
+    removeRecordingFixture(hlsRecordingFixture);
     removeSessionFrameFixture(sessionFrameFixture);
   }
 }

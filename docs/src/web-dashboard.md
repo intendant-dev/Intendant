@@ -507,7 +507,7 @@ browser-side promise.
 Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
-- HLS/native playlist media playback and broad file-transfer bytes;
+- native media fallback URLs and broad file-transfer bytes;
 - general filesystem mutations and file content transfer;
 - generic MCP-over-HTTP for external clients;
 - non-allowlisted `ControlMsg` mutations;
@@ -869,13 +869,16 @@ and `api_session_recording_asset` for `segments`, `playlist.m3u8`, and validated
 recording player uses these byte streams for segment lists and MP4 MSE buffers
 when the verified tunnel is available. The non-MSE MP4 fallback also reads the
 segment over the tunnel and assigns a local blob URL to the video element.
+HLS/`.ts` playback also prefers the tunnel when available: the browser reads
+`playlist.m3u8` and validated `.ts` segments with the same recording asset RPC,
+rewrites the playlist to local blob URLs, and points the native video element at
+that object URL. If the browser rejects the blob playlist, it falls back to the
+daemon-served `m3u8` URL.
 Archived session frame images use `api_session_frame_asset` for validated `.jpg`
 and `.png` filenames under a resolved session's `frames/` directory. The session
 detail gallery renders returned bytes through browser blob URLs when the verified
 tunnel advertises byte streams, falling back to the existing HTTP image URL when
 the tunnel is unavailable or a tunneled image read fails.
-HLS/`.ts` playlist playback still uses HTTP because Safari/WKWebView requires a
-served `m3u8` URL source.
 The Settings debug session-report download uses `api_session_report`, returning
 the same text-artifact zip as `/api/session/{id}/report` through bounded
 `byte_stream_*` frames. This is intentionally scoped to the diagnostic report;
@@ -943,7 +946,7 @@ available, or records the desired state as a pending per-display default for
 the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
-generic downloads, HLS/native playlist media playback, broader file transfer,
+generic downloads, native media fallback URLs, broader file transfer,
 and remaining non-allowlisted control mutations should move only after resumable
 stream/file-transfer semantics and per-action no-replay rules are settled.
 
@@ -1029,7 +1032,9 @@ Treat this as a staged target, not current behavior:
     Standalone Shell terminal frames and WebTui frames also use the tunnel when
     verified and advertised by the daemon. Visual-freshness diagnostics NDJSON
     appends use the tunnel when verified and fall back to HTTP only when the
-    tunnel is unavailable. Generic downloads, HLS/native playlist playback,
+    tunnel is unavailable. HLS `.ts` playback now builds a blob playlist from
+    tunneled recording bytes and falls back to the native daemon URL if rejected.
+    Generic downloads, native media fallback URLs,
     remaining non-allowlisted control commands, and file transfer still wait
     for resumable stream/file-transfer semantics.
 11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working

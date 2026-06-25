@@ -7689,9 +7689,15 @@ mod tests {
         let session_dir = tempfile::tempdir().unwrap();
         let stream_dir = session_dir.path().join("recordings").join("display_0");
         std::fs::create_dir_all(&stream_dir).unwrap();
-        std::fs::write(stream_dir.join("segments.csv"), "seg_00000.mp4,0,1.25\n").unwrap();
+        std::fs::write(
+            stream_dir.join("segments.csv"),
+            "seg_00000.mp4,0,1.25\nseg_00001.ts,1.25,2.00\n",
+        )
+        .unwrap();
         let media = b"recording segment bytes";
         std::fs::write(stream_dir.join("seg_00000.mp4"), media).unwrap();
+        let ts_media = b"recording transport stream bytes";
+        std::fs::write(stream_dir.join("seg_00001.ts"), ts_media).unwrap();
 
         let rt = runtime();
         {
@@ -7720,9 +7726,28 @@ mod tests {
         assert_eq!(stream.filename.as_deref(), Some("segments.json"));
         let json: serde_json::Value = serde_json::from_slice(&stream.bytes).unwrap();
         assert_eq!(json[0]["filename"], "seg_00000.mp4");
+        assert_eq!(json[1]["filename"], "seg_00001.ts");
         assert_eq!(stream.result["stream_name"], "display_0");
         assert_eq!(stream.result["asset"], "segments");
         assert_eq!(stream.result["resumable"], true);
+
+        let playlist = api_recording_asset_task_response(
+            "rec-asset-playlist".to_string(),
+            Some(&serde_json::json!({
+                "stream_name": "display_0",
+                "asset": "playlist.m3u8",
+            })),
+            &rt,
+        )
+        .await;
+        assert!(playlist.done);
+        assert!(playlist.byte_stream.is_some());
+        let stream = playlist.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "application/vnd.apple.mpegurl");
+        assert_eq!(stream.filename.as_deref(), Some("playlist.m3u8"));
+        let playlist_text = String::from_utf8(stream.bytes).unwrap();
+        assert!(playlist_text.contains("#EXTM3U"));
+        assert!(playlist_text.contains("seg_00001.ts"));
 
         let segment = api_recording_asset_task_response(
             "rec-asset2".to_string(),
@@ -7749,6 +7774,28 @@ mod tests {
         assert_eq!(stream.result["total_size"], media.len());
         assert_eq!(stream.result["range_start"], 10);
         assert_eq!(stream.result["range_end"], 17);
+
+        let ts_segment = api_recording_asset_task_response(
+            "rec-asset-ts".to_string(),
+            Some(&serde_json::json!({
+                "stream_name": "display_0",
+                "asset": "seg_00001.ts",
+                "offset": 10,
+                "length": 9,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(ts_segment.done);
+        assert!(ts_segment.byte_stream.is_some());
+        let stream = ts_segment.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "video/mp2t");
+        assert_eq!(stream.filename.as_deref(), Some("seg_00001.ts"));
+        assert_eq!(stream.bytes, b"transport");
+        assert_eq!(stream.result["size"], 9);
+        assert_eq!(stream.result["total_size"], ts_media.len());
+        assert_eq!(stream.result["range_start"], 10);
+        assert_eq!(stream.result["range_end"], 19);
 
         let invalid = api_recording_asset_task_response(
             "rec-asset3".to_string(),

@@ -56,6 +56,15 @@ function createRecordingFixture(label) {
   return { streamName, dir };
 }
 
+function createHlsRecordingFixture(label) {
+  const streamName = `dashboard_control_hls_${label}_${process.pid}_${Date.now()}`;
+  const dir = path.join(os.homedir(), '.intendant', 'recordings', streamName);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'segments.csv'), 'seg_00000.ts,0,1.25\n');
+  fs.writeFileSync(path.join(dir, 'seg_00000.ts'), 'recording hls transport stream e2e local');
+  return { streamName, dir };
+}
+
 function removeRecordingFixture(fixture) {
   if (!fixture?.dir) return;
   fs.rmSync(fixture.dir, { recursive: true, force: true });
@@ -115,6 +124,7 @@ async function main() {
   const origin = `http://127.0.0.1:${options.daemonPort}`;
   const daemonLogs = [];
   const recordingFixture = createRecordingFixture('local');
+  const hlsRecordingFixture = createHlsRecordingFixture('local');
   const sessionFrameFixture = createSessionFrameFixture('local');
   const daemon = spawn(options.dashboardBinary, [
     '--no-tui',
@@ -163,6 +173,7 @@ async function main() {
 
     const connected = await waitForDashboardControl(page);
     await page.evaluate(`window.__intendantRecordingStreamName = ${JSON.stringify(recordingFixture.streamName)}`);
+    await page.evaluate(`window.__intendantHlsRecordingStreamName = ${JSON.stringify(hlsRecordingFixture.streamName)}`);
     await page.evaluate(`window.__intendantSessionFrameFixture = ${JSON.stringify({
       sessionId: sessionFrameFixture.sessionId,
       filename: sessionFrameFixture.filename,
@@ -170,6 +181,7 @@ async function main() {
     const result = await page.evaluate(async () => {
       const ctl = window.intendantDashboardControl;
       const recordingStreamName = window.__intendantRecordingStreamName;
+      const hlsRecordingStreamName = window.__intendantHlsRecordingStreamName;
       const sessionFrameFixture = window.__intendantSessionFrameFixture;
       const labeled = async (label, promise) => {
         try {
@@ -355,6 +367,40 @@ async function main() {
           wrap.remove();
         }
       };
+      const recordingHlsBlobPlaylist = async () => {
+        if (typeof RecordingPlayer !== 'function') {
+          throw new Error('RecordingPlayer is not available on the dashboard page');
+        }
+        const wrap = document.createElement('div');
+        wrap.style.display = 'none';
+        const video = document.createElement('video');
+        const timeline = document.createElement('div');
+        const cursor = document.createElement('div');
+        const progress = document.createElement('div');
+        const timeLabel = document.createElement('span');
+        const playBtn = document.createElement('button');
+        wrap.append(video, timeline, cursor, progress, timeLabel, playBtn);
+        document.body.appendChild(wrap);
+        const player = new RecordingPlayer(video, timeline, cursor, progress, timeLabel, playBtn, '/recordings');
+        try {
+          if (typeof player._loadHlsBlobPlaylist !== 'function') {
+            throw new Error('RecordingPlayer HLS blob loader is not available');
+          }
+          player.streamName = hlsRecordingStreamName;
+          const before = ctl.status().completedByteStreams || 0;
+          const ok = await labeled('recording HLS blob playlist', player._loadHlsBlobPlaylist(`/recordings/${hlsRecordingStreamName}/playlist.m3u8`));
+          const after = ctl.status().completedByteStreams || 0;
+          return {
+            ok,
+            srcScheme: String(video.src || '').split(':', 1)[0],
+            objectUrlCount: Array.isArray(player._hlsObjectUrls) ? player._hlsObjectUrls.length : 0,
+            byteStreamDelta: after - before,
+          };
+        } finally {
+          player.destroy();
+          wrap.remove();
+        }
+      };
       const diagnosticsVisualFreshness = async () => {
         const sessionId = `validator-local-vf-${Date.now()}-${Math.random().toString(36).slice(2)}`;
         const body = '{"t":"session_start"}\n{"t":"summary","transitions":1}\n';
@@ -506,6 +552,7 @@ async function main() {
         sessionFrameAsset: await sessionFrameAsset(),
         sessionFramePreview: await sessionFramePreview(),
         recordingFallbackPlayback: await recordingFallbackPlayback(),
+        recordingHlsBlobPlaylist: await recordingHlsBlobPlaylist(),
         diagnosticsVisualFreshness: await diagnosticsVisualFreshness(),
         terminal: await terminal(),
         tui: status.tui_frames_available ? await tui() : { skipped: true, subscribed: false, frameBytes: 0 },
@@ -680,6 +727,10 @@ async function main() {
     assert.strictEqual(result.recordingFallbackPlayback?.srcScheme, 'blob');
     assert.strictEqual(result.recordingFallbackPlayback?.objectUrl, true);
     assert(result.recordingFallbackPlayback?.byteStreamDelta >= 1, `recording fallback playback did not use a byte stream: ${JSON.stringify(result.recordingFallbackPlayback)}`);
+    assert.strictEqual(result.recordingHlsBlobPlaylist?.ok, true);
+    assert.strictEqual(result.recordingHlsBlobPlaylist?.srcScheme, 'blob');
+    assert(result.recordingHlsBlobPlaylist?.objectUrlCount >= 2, `HLS blob playlist did not create playlist and segment URLs: ${JSON.stringify(result.recordingHlsBlobPlaylist)}`);
+    assert(result.recordingHlsBlobPlaylist?.byteStreamDelta >= 2, `HLS blob playlist did not use byte streams: ${JSON.stringify(result.recordingHlsBlobPlaylist)}`);
     assert.strictEqual(result.status.api_diagnostics_visual_freshness_available, true);
     assert.strictEqual(result.diagnosticsVisualFreshness?.ok, true);
     assert.strictEqual(result.diagnosticsVisualFreshness?._httpStatus, 200);
@@ -794,6 +845,9 @@ async function main() {
         sessionFramePreviewByteStreamDelta: result.sessionFramePreview.byteStreamDelta,
         recordingFallbackSrcScheme: result.recordingFallbackPlayback.srcScheme,
         recordingFallbackByteStreamDelta: result.recordingFallbackPlayback.byteStreamDelta,
+        recordingHlsSrcScheme: result.recordingHlsBlobPlaylist.srcScheme,
+        recordingHlsObjectUrlCount: result.recordingHlsBlobPlaylist.objectUrlCount,
+        recordingHlsByteStreamDelta: result.recordingHlsBlobPlaylist.byteStreamDelta,
         diagnosticsVisualFreshnessWritten: result.diagnosticsVisualFreshness.written,
         terminalOutputBytes: result.terminal.outputBytes,
         tuiFrameBytes: result.tui.frameBytes,
@@ -818,6 +872,7 @@ async function main() {
     await Promise.race([daemonExit, wait(5000)]);
     if (daemon.exitCode === null) daemon.kill('SIGKILL');
     removeRecordingFixture(recordingFixture);
+    removeRecordingFixture(hlsRecordingFixture);
     removeSessionFrameFixture(sessionFrameFixture);
     if (daemonLogs.length && daemon.exitCode && daemon.exitCode !== 0 && daemon.exitCode !== 130) {
       console.error(daemonLogs.join('').slice(-4000));
