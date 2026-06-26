@@ -369,6 +369,8 @@ async function main() {
         '_debugProbeDisplayAuthorityConnectNoLegacy',
         '_debugProbeTuiConnectNoLegacy',
         '_debugProbeShellQueuesUntilOpened',
+        '_debugProbeTerminalOutputBypassesDedupe',
+        '_debugProbeDuplicateShellInputSends',
         '_debugProbePresenceMediaConnectNoLegacy',
         '_debugProbePresenceServerSenderConnectNoLegacy',
         '_debugProbeTunneledPresenceServerCallback',
@@ -410,6 +412,10 @@ async function main() {
     assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.queuedAfterAck, '', `Shell queued input was not cleared after ACK: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.ackedBeforeAck, false, `Shell unexpectedly marked ACKed before terminal_opened: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.ackedAfterAck, true, `Shell did not mark ACKed after terminal_opened: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTerminalOutputBypassesDedupe.writtenBytes, 2, `duplicate Shell output was deduped: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeTerminalOutputBypassesDedupe.recentKeyCount, 0, `terminal output polluted event dedupe state: ${JSON.stringify(probes)}`);
+    assert.deepStrictEqual(probes._debugProbeDuplicateShellInputSends.inputFrames, ['eA==', 'eA=='], `duplicate Shell input was not sent twice: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeDuplicateShellInputSends.queuedAfterSend, '', `duplicate Shell input was unexpectedly queued: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.presenceFrameCount, 2, `presence frames did not use tunnel: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.uploadCount, 1, `presence video did not use upload tunnel: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.legacyCount, 0, `presence media used legacy path: ${JSON.stringify(probes)}`);

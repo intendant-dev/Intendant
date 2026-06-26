@@ -37794,6 +37794,7 @@ function hasTurnInIceServers(iceServers) {
 function dashboardShouldDropDuplicateServerMessage(message) {
   if (!dashboardControlEventsActive) return false;
   if (!message || typeof message !== 'object') return false;
+  if (dashboardMessageBypassesDedupe(message)) return false;
   if (String(message.t || '').startsWith('dashboard_control_')) return false;
   const key = dashboardServerMessageDedupeKey(message);
   if (!key) return false;
@@ -37806,6 +37807,18 @@ function dashboardShouldDropDuplicateServerMessage(message) {
   if (dashboardRecentServerMessageKeys.has(key)) return true;
   dashboardRecentServerMessageKeys.set(key, now);
   return false;
+}
+
+function dashboardMessageBypassesDedupe(message) {
+  const t = String(message?.t || '');
+  return (
+    t === 'terminal_output' ||
+    t === 'terminal_exited' ||
+    t === 'terminal_opened' ||
+    t === 'terminal_error' ||
+    t === 'tui_term' ||
+    t === 'tui_error'
+  );
 }
 
 function dashboardServerMessageDedupeKey(message) {
@@ -38788,6 +38801,135 @@ window.intendantDashboardControl = {
       shellQueuedInput = previousShellQueuedInput;
       shellWaitingNoticeShown = previousShellWaitingNoticeShown;
       shellPendingResize = previousShellPendingResize;
+      dashboardControlTransport.lastStatus = previousStatus;
+      if (hadOwnTerminalFrame) {
+        dashboardTransport.terminalFrame = previousTerminalFrame;
+      } else {
+        delete dashboardTransport.terminalFrame;
+      }
+    }
+  },
+  _debugProbeTerminalOutputBypassesDedupe() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof dashboardServerMessageDispatcher !== 'function' ||
+      typeof flushShellOutput !== 'function'
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        dispatcherType: typeof dashboardServerMessageDispatcher,
+        flushType: typeof flushShellOutput,
+        writeCalls: 0,
+        writtenBytes: 0,
+      };
+    }
+    const previousEventsActive = dashboardControlEventsActive;
+    const previousRecentKeys = new Map(dashboardRecentServerMessageKeys);
+    const previousShellTerm = shellTerm;
+    const previousOutputQueue = shellOutputQueue;
+    const previousOutputQueuedBytes = shellOutputQueuedBytes;
+    const previousOutputFlushScheduled = shellOutputFlushScheduled;
+    const previousRequestAnimationFrame = window.requestAnimationFrame;
+    let rafCount = 0;
+    let writeCalls = 0;
+    let writtenBytes = 0;
+    window.requestAnimationFrame = function() {
+      rafCount += 1;
+      return 0;
+    };
+    shellTerm = {
+      write(data) {
+        writeCalls += 1;
+        if (typeof data === 'string') writtenBytes += data.length;
+        else writtenBytes += Number(data?.byteLength || data?.length || 0);
+      },
+    };
+    shellOutputQueue = [];
+    shellOutputQueuedBytes = 0;
+    shellOutputFlushScheduled = false;
+    dashboardControlEventsActive = true;
+    dashboardRecentServerMessageKeys.clear();
+    try {
+      const frame = {
+        t: 'terminal_output',
+        host_id: SHELL_HOST_ID,
+        terminal_id: SHELL_TERMINAL_ID,
+        data: 'YQ==',
+      };
+      dashboardServerMessageDispatcher(JSON.stringify(frame));
+      dashboardServerMessageDispatcher(JSON.stringify(frame));
+      flushShellOutput();
+      return {
+        skipped: false,
+        writeCalls,
+        writtenBytes,
+        rafCount,
+        recentKeyCount: dashboardRecentServerMessageKeys.size,
+      };
+    } finally {
+      dashboardControlEventsActive = previousEventsActive;
+      dashboardRecentServerMessageKeys.clear();
+      for (const [key, value] of previousRecentKeys) dashboardRecentServerMessageKeys.set(key, value);
+      shellTerm = previousShellTerm;
+      shellOutputQueue = previousOutputQueue;
+      shellOutputQueuedBytes = previousOutputQueuedBytes;
+      shellOutputFlushScheduled = previousOutputFlushScheduled;
+      window.requestAnimationFrame = previousRequestAnimationFrame;
+    }
+  },
+  _debugProbeDuplicateShellInputSends() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof sendShellBytes !== 'function' ||
+      !dashboardTransport ||
+      !dashboardControlTransport ||
+      typeof dashboardTransport.terminalFrame !== 'function' ||
+      typeof dashboardTransport.canUseRpc !== 'function' ||
+      !dashboardTransport.canUseRpc()
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        sendType: typeof sendShellBytes,
+        hasDashboardTransport: Boolean(dashboardTransport),
+        hasControlTransport: Boolean(dashboardControlTransport),
+        canUseRpc: Boolean(dashboardTransport?.canUseRpc?.()),
+        inputFrames: [],
+      };
+    }
+    const previousShellOpenSent = shellOpenSent;
+    const previousShellOpenAcked = shellOpenAcked;
+    const previousShellQueuedInput = shellQueuedInput;
+    const previousStatus = dashboardControlTransport.lastStatus;
+    const hadOwnTerminalFrame = Object.prototype.hasOwnProperty.call(dashboardTransport, 'terminalFrame');
+    const previousTerminalFrame = dashboardTransport.terminalFrame;
+    const frames = [];
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      terminal_frames_available: true,
+    };
+    dashboardTransport.terminalFrame = function(frame) {
+      frames.push({ ...frame });
+      return true;
+    };
+    shellOpenSent = true;
+    shellOpenAcked = true;
+    shellQueuedInput = '';
+    try {
+      sendShellBytes('x');
+      sendShellBytes('x');
+      return {
+        skipped: false,
+        inputFrames: frames
+          .filter(frame => frame.t === 'terminal_input')
+          .map(frame => frame.data),
+        queuedAfterSend: shellQueuedInput,
+      };
+    } finally {
+      shellOpenSent = previousShellOpenSent;
+      shellOpenAcked = previousShellOpenAcked;
+      shellQueuedInput = previousShellQueuedInput;
       dashboardControlTransport.lastStatus = previousStatus;
       if (hadOwnTerminalFrame) {
         dashboardTransport.terminalFrame = previousTerminalFrame;
