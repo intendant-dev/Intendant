@@ -579,10 +579,10 @@ node scripts/validate-dashboard-control-local-signaling.cjs \
 That harness enables `window.intendantDashboardControl` in the real SPA and
 asserts that the verified DataChannel reports `signalingMode: "local-http"`.
 
-This slice is a local stand-in for a future hosted Intendant Connect service. It
+This slice is a local low-level harness for the dashboard-control tunnel. It
 does not implement account login, passkeys, daemon claiming, or a durable daemon
-registry. Its job is to make the signaling boundary concrete and testable before
-moving the real SPA and hosted account UX onto that boundary.
+registry. Its job is to keep the same-origin tunnel protocol easy to exercise
+while the hosted Connect service owns the account and daemon-claim UX.
 
 ### Local Rendezvous Emulator Slice
 
@@ -660,11 +660,100 @@ then performs these browser passes:
    received, so the SPA must reject the answer before it stores a verified
    binding or expiry.
 
-This still is not consumer Connect. It has no account, passkey, daemon claim,
-authorization grant issuance, revocation, audit log, or hosted public HTTPS. The
-emulator's grant is only an opaque per-offer session value used to prove that a
-future Connect-issued grant can be carried through signaling and bound into the
-daemon-signed WebRTC session statement.
+This is still a protocol emulator rather than the consumer Connect service. It
+has no account, passkey, daemon claim, revocation, audit log, or hosted public
+HTTPS. The emulator's grant is only an opaque per-offer session value used to
+prove that a Connect-issued grant can be carried through signaling and bound
+into the daemon-signed WebRTC session statement.
+
+### Hosted Connect MVP
+
+The first hosted-service slice is implemented as a separate binary,
+`intendant-connect`. It serves a public web origin, handles passkey-only account
+registration/login, lets a signed-in user claim a daemon with a short-lived code,
+and brokers dashboard WebRTC signaling without asking the browser to trust the
+daemon's private HTTPS certificate.
+
+In production, run it behind ordinary public TLS for a public origin such as
+`https://connect.intendant.dev`:
+
+```bash
+INTENDANT_CONNECT_TOKEN="$(openssl rand -base64 32)" \
+  ./target/release/intendant-connect \
+    --listen 127.0.0.1:9876 \
+    --origin https://connect.intendant.dev \
+    --rp-id intendant.dev \
+    --static-root static \
+    --data-file /var/lib/intendant-connect/state.json
+```
+
+The `--rp-id intendant.dev` value means passkeys are scoped to the owned
+Intendant domain while the actual UI can live on `connect.intendant.dev`.
+Browsers also allow `http://localhost:<port>` as a secure context for local
+development, so the same binary can be E2E-tested without public TLS.
+
+The daemon side still uses the normal `[connect]` outbound rendezvous client:
+
+```toml
+[connect]
+enabled = true
+rendezvous_url = "https://connect.intendant.dev"
+daemon_id = "vortex-deb-x11-intendant"
+auth_token = "same daemon token configured on intendant-connect"
+```
+
+The hosted MVP flow is:
+
+1. The daemon registers its `daemon_id` and persistent daemon identity public
+   key through `/api/daemon/register`.
+2. If the daemon is unclaimed, Connect returns a short-lived claim code and URL.
+3. The user opens Connect, signs in or registers with a passkey, and submits the
+   claim code.
+4. Connect sends a `claim_challenge` event to the daemon. The daemon signs that
+   challenge with its daemon identity key, and Connect verifies the signature
+   before assigning ownership.
+5. The user chooses the daemon in Connect and opens the dashboard. Connect
+   issues a short-lived opaque dashboard grant, forwards the browser SDP offer
+   to the daemon, and waits for the daemon answer.
+6. The daemon signs the same WebRTC binding used by the local/rendezvous paths,
+   including the offer hash, answer hash, browser nonce, expiry, daemon public
+   key, and hash of the Connect-issued grant.
+7. Connect validates that the answer came from the registered daemon key and
+   that the signed grant hash matches before returning the answer to the
+   browser. The browser independently verifies the daemon-signed binding before
+   sending dashboard RPC over the DataChannel.
+
+The state file durably stores users, passkeys, daemon ownership, hashed claim
+codes, and a capped audit log. Plain claim codes, WebAuthn challenge state,
+browser offers, and dashboard grants are memory-only. The service exposes a
+minimal account/daemon UI today: passkey registration/login, claim-code entry,
+daemon list, open dashboard, revoke ownership, and audit events.
+
+Current MVP limits:
+
+- one owner per daemon; no shared roles, teams, recovery, or account email flow;
+- one bearer token protects daemon service endpoints; production deployments
+  should put the service behind rate limits and normal reverse-proxy hardening;
+- revocation removes ownership and future dashboard grants but does not yet
+  forcibly close an already-open browser DataChannel;
+- no high-availability storage or database migrations; the state file is a
+  single-node MVP persistence layer;
+- no application-layer dashboard RPC relay; the default path is browser to
+  daemon WebRTC, with TURN/WebRTC relay remaining a transport-level option;
+- peer daemon-to-daemon mTLS remains separate from Connect account login.
+
+Run the hosted MVP E2E locally with:
+
+```bash
+cargo build --bin intendant-connect --bin intendant
+node scripts/validate-connect-hosted-mvp.cjs
+```
+
+That validator starts `intendant-connect`, launches a daemon with outbound
+Connect enabled, uses a browser virtual authenticator for passkey registration,
+claims the daemon, opens the real SPA in `connect=1` mode, verifies the
+daemon-signed binding and Connect grant hash, revokes the daemon, and checks the
+audit events.
 
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
@@ -1120,77 +1209,42 @@ trust model is deliberately redesigned. In user-facing copy, that should appear
 as "grant access to this daemon" and "revoke access," not as manual certificate
 management.
 
-#### Staged Rollout
+#### Status and Remaining Rollout
 
-Treat this as a staged target, not current behavior:
+The current implementation has crossed from protocol sketch into hosted MVP:
 
-1. Keep the current mTLS dashboard as the default and keep WebRTC dashboard
-   control opt-in.
-2. Define daemon identity keys, claim codes, Connect account binding, and
-   revocation semantics.
-3. Host a public static dashboard shell with a placeholder sign-in/device model.
-   The local rendezvous validator now serves the real dashboard bundle from its
-   emulator origin and exercises the SPA's `connect=1` mode, but there is still
-   no hosted Connect service or account UI.
-4. Add daemon outbound signaling to Intendant Connect. The local emulator now
-   exercises this shape without hosted auth.
-5. Add a signaling rendezvous API keyed by browser session and daemon id. The
-   local emulator implements the minimal offer/answer/ICE/close subset and
-   exposes the daemon public key registered for the selected daemon id.
-6. Let a locally running daemon register/poll that rendezvous while it is online.
-   The daemon now has a disabled-by-default outbound polling client.
-7. Reuse the existing daemon binding and DataChannel RPC frame format. This is
-   shared by the direct local bootstrap and rendezvous-emulator slices; the
-   rendezvous browser path now rejects answers whose signed binding key does not
-   match the rendezvous-advertised daemon key or whose visible session grant
-   does not hash to the daemon-signed grant hash. The browser also sends a
-   challenge nonce and rejects answers whose signed binding nonce does not match
-   or whose signed expiry is stale.
-8. Add visible transport status: disconnected, mTLS HTTP fallback, WebRTC direct,
-   WebRTC relayed, failed verification, or application-proxied. The dashboard
-   now shows mTLS/HTTP, checking, verified WebRTC, TURN-relay, and failed states
-   for the current control transport.
-9. Carry peer access-request approve/deny over the DataChannel. The dashboard
-   now routes peer access-request list/decision and related pairing APIs through
-   the DataChannel transport boundary; hosted passkey step-up still belongs to
-   the future public Connect UI.
-10. Gradually migrate larger API surfaces. Managed-context history reads,
-    active-session command-output loads, active-session timeline operations,
-    active-session changes/diffs, lazy context-snapshot exact-loads, session-data
-    deletion, staged upload list/delete operations, bounded task uploads,
-    recording metadata, scoped recording asset byte streams, archived session
-    frame image byte streams, session-report zip downloads,
-    bounded byte-stream artifact transfer,
-    worktree inventory, filesystem picker stat/list/mkdir operations,
-    bounded filesystem file reads,
-    local Agent Card reads, and local session hydration now use the tunnel,
-    oversized JSON responses now use credit-windowed chunked response framing,
-    and the sessions stream uses explicit
-    `stream_start`/`stream_event`/`stream_end` frames. Allowlisted settings
-    `ControlMsg` dispatch, display input authority request/release/snapshot,
-    local display input frames, and local display WebRTC offer/ICE signaling now
-    use the tunnel when verified. Dedicated
-    session-control `ControlMsg` dispatch now covers lifecycle, steering,
-    approvals, interrupt, resume/stop/restart, rename, and launch-config writes
-    with no-replay fallback. Dedicated dashboard-action `ControlMsg` dispatch
-    now covers Codex/Gemini thread actions, display take/release/grant/revoke,
-    diagnostics visual-marker toggles, recording/debug toggles, and browser
-    workspace create/acquire/close/release.
-    Peer-display WebRTC signaling now uses `api_peer_webrtc_signal` with the
-    same no-replay fallback rule.
-    Standalone Shell terminal frames and WebTui frames also use the tunnel when
-    verified and advertised by the daemon. Visual-freshness diagnostics NDJSON
-    appends use the tunnel when verified and fall back to HTTP only on
-    daemon-origin dashboard pages when the tunnel is unavailable. HLS `.ts`
-    playback now builds a blob playlist from tunneled recording bytes and falls
-    back to the native daemon URL only on a daemon-origin dashboard page.
-    Annotation/clip media-editor writes now use a dedicated media protocol with
-    operation ids, ordered frame uploads, commit/cancel, and no replay after a
-    tunneled write attempt. Generic downloads, native media fallback URLs,
-    remaining non-allowlisted control commands, and broad/resumable file
-    transfer still wait for resumable stream/file-transfer semantics.
-11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
-    throughout.
+1. Direct mTLS dashboard access remains the default local/offline path.
+2. The daemon has a persistent daemon identity key and can expose a
+   dashboard-control WebRTC DataChannel.
+3. The real SPA has a `connect=1` public-origin mode and a
+   `DashboardTransport` boundary for tunneled reads, streams, bounded byte
+   transfer, uploads, terminal/WebTui frames, selected control messages, peer
+   pairing actions, local display signaling, and media/editor writes.
+4. The daemon has a disabled-by-default outbound Connect polling client.
+5. `intendant-connect` provides the hosted MVP: passkey-only account sessions,
+   daemon registration, claim-code ownership proof, short-lived dashboard
+   grants, signaling, revoke, and audit.
+6. The browser and hosted service both verify that the daemon-signed WebRTC
+   binding matches the registered daemon identity and Connect-issued grant.
+7. Focused validators cover the local bootstrap, local rendezvous emulator, and
+   hosted Connect MVP paths.
+
+The remaining rollout work is production hardening and breadth, not proving the
+core browser-trust escape hatch:
+
+1. Deploy `connect.intendant.dev` behind public TLS and a normal reverse proxy.
+2. Add service-side rate limits, CSRF hardening, structured logs/metrics, backup
+   and restore guidance, and a database-backed store.
+3. Add account recovery, multi-device management, teams/roles, and optional
+   passkey step-up for sensitive actions.
+4. Add active-session revocation so a revoked daemon/account grant tears down
+   already-open dashboard DataChannels.
+5. Add daemon identity rotation/recovery semantics for VM clones, disk restore,
+   and deliberate transfer of ownership.
+6. Continue migrating remaining dashboard APIs only when the tunnel has the
+   required streaming, byte-range, resumable transfer, or media semantics.
+7. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
+   throughout.
 
 Non-goals for this path:
 
@@ -1201,11 +1255,11 @@ Non-goals for this path:
 - no attempt to obtain public certificates for private VM IPs or `.local`
   names.
 
-Open design questions before implementation:
+Remaining design questions before production rollout:
 
-- Is Intendant Connect allowed to serve all dashboard JavaScript, or do we want
-  an additional app-integrity story such as signed static assets or a pinned web
-  bundle?
+- Do we need an additional app-integrity story such as signed static assets or a
+  pinned web bundle, even though the hosted MVP serves the dashboard JavaScript
+  from Intendant Connect?
 - How are daemon identity keys backed up, rotated, revoked, and recovered after
   VM cloning or disk restore?
 - What local policy does the daemon enforce when Connect says a signed-in user

@@ -14,6 +14,10 @@ path = "src/main.rs"
 name = "intendant"
 path = "src/bin/caller/main.rs"
 
+[[bin]]
+name = "intendant-connect"
+path = "src/bin/connect/main.rs"
+
 [dependencies]
 tokio = { version = "1.0", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
@@ -27,7 +31,10 @@ html2text = "0.17"
 portable-pty = "0.9"
 dotenvy = "0.15"
 toml = "0.8"
-uuid = { version = "1", features = ["v4"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+url = "2"
+axum = "0.8"
+passkey-auth = "0.1.3"
 # Used by upload_store for atomic-rename of streamed uploads into the final
 # store location, and by tests elsewhere as a dev-dep.
 tempfile = "3"
