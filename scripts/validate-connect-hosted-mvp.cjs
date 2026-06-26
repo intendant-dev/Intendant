@@ -368,6 +368,7 @@ async function main() {
         '_debugProbeDisplaySignalConnectNoLegacy',
         '_debugProbeDisplayAuthorityConnectNoLegacy',
         '_debugProbeTuiConnectNoLegacy',
+        '_debugProbeShellQueuesUntilOpened',
         '_debugProbePresenceMediaConnectNoLegacy',
         '_debugProbePresenceServerSenderConnectNoLegacy',
         '_debugProbeTunneledPresenceServerCallback',
@@ -403,6 +404,12 @@ async function main() {
     assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.resizeReplayCount, 0, `TUI resize used legacy path: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.wsReplayCount, 0, `TUI subscription used WS fallback: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeTuiConnectNoLegacy.subscriptionSent, false, `TUI subscription unexpectedly sent over WS: ${JSON.stringify(probes)}`);
+    assert.deepStrictEqual(probes._debugProbeShellQueuesUntilOpened.framesBeforeAck, ['terminal_open'], `Shell input was sent before terminal_opened: ${JSON.stringify(probes)}`);
+    assert.deepStrictEqual(probes._debugProbeShellQueuesUntilOpened.framesAfterAck, ['terminal_open', 'terminal_resize', 'terminal_input'], `Shell queued input did not flush after terminal_opened: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.queuedBeforeAck, 'queued-before-open', `Shell probe did not queue input before ACK: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.queuedAfterAck, '', `Shell queued input was not cleared after ACK: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.ackedBeforeAck, false, `Shell unexpectedly marked ACKed before terminal_opened: ${JSON.stringify(probes)}`);
+    assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.ackedAfterAck, true, `Shell did not mark ACKed after terminal_opened: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.presenceFrameCount, 2, `presence frames did not use tunnel: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.uploadCount, 1, `presence video did not use upload tunnel: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.legacyCount, 0, `presence media used legacy path: ${JSON.stringify(probes)}`);

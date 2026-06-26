@@ -11349,6 +11349,7 @@ let shellOutputQueuedBytes = 0;
 let shellOutputFlushScheduled = false;
 let shellQueuedInput = '';
 let shellWaitingNoticeShown = false;
+let shellPendingResize = null;
 const SHELL_QUEUED_INPUT_MAX_BYTES = 64 * 1024;
 let activeTermSubtab = 'tui';
 
@@ -30151,6 +30152,13 @@ function handleShellOpened() {
   shellOpenSent = true;
   shellOpenAcked = true;
   shellWaitingNoticeShown = false;
+  const resize = shellPendingResize || {
+    cols: shellTerm?.cols || 80,
+    rows: shellTerm?.rows || 24,
+  };
+  shellPendingResize = null;
+  sendShellResize(resize.cols, resize.rows, { allowBeforeAck: true });
+  flushQueuedShellInput();
 }
 
 function handleShellError(error) {
@@ -30554,7 +30562,7 @@ function shellOpenFrame() {
 }
 
 function flushQueuedShellInput() {
-  if (!shellQueuedInput || !shellOpenSent) return;
+  if (!shellQueuedInput || !shellOpenAcked) return;
   const queued = shellQueuedInput;
   shellQueuedInput = '';
   sendShellBytes(queued);
@@ -30577,10 +30585,12 @@ function openShellSessionIfPossible(force = false) {
   const sent = sendShellMessage(shellOpenFrame());
   if (sent) {
     shellOpenSent = true;
+    shellOpenAcked = false;
     shellWaitingNoticeShown = false;
-    flushQueuedShellInput();
     return true;
   }
+  shellOpenSent = false;
+  shellOpenAcked = false;
   return false;
 }
 
@@ -30588,6 +30598,25 @@ function maybeOpenShellAfterTransportReady() {
   if (activeTab !== 'terminal' || activeTermSubtab !== 'shell') return;
   if (!shellInitialized || !shellTerm || shellOpenSent) return;
   openShellSessionIfPossible();
+}
+
+function sendShellResize(cols, rows, options = {}) {
+  const next = {
+    cols: Number(cols) || 80,
+    rows: Number(rows) || 24,
+  };
+  if (!options.allowBeforeAck && !shellOpenAcked) {
+    shellPendingResize = next;
+    if (!shellOpenSent) openShellSessionIfPossible();
+    return false;
+  }
+  return sendShellMessage({
+    t: 'terminal_resize',
+    host_id: SHELL_HOST_ID,
+    terminal_id: SHELL_TERMINAL_ID,
+    cols: next.cols,
+    rows: next.rows,
+  });
 }
 
 const TUI_CONNECTION_ID = `tui-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
@@ -30716,12 +30745,7 @@ function initShell() {
     });
 
     shellTerm.onResize(({ cols, rows }) => {
-      sendShellMessage({
-        t: 'terminal_resize',
-        host_id: SHELL_HOST_ID,
-        terminal_id: SHELL_TERMINAL_ID,
-        cols, rows,
-      });
+      sendShellResize(cols, rows);
     });
 
     new ResizeObserver(() => {
@@ -30872,8 +30896,10 @@ function updateTermSubscription(force = false) {
 //   being sent. One-shot: the modifier clears after one transform.
 
 function sendShellBytes(bytes) {
-  if (!shellOpenSent && !openShellSessionIfPossible()) {
-    if (dashboardConnectModeEnabled()) queueShellInput(bytes);
+  if (!bytes) return;
+  if (!shellOpenAcked) {
+    if (!shellOpenSent) openShellSessionIfPossible();
+    queueShellInput(bytes);
     return;
   }
   const sent = sendShellMessage({
@@ -30882,8 +30908,9 @@ function sendShellBytes(bytes) {
     terminal_id: SHELL_TERMINAL_ID,
     data: utf8ToBase64(bytes),
   });
-  if (!sent && dashboardConnectModeEnabled()) {
+  if (!sent) {
     shellOpenSent = false;
+    shellOpenAcked = false;
     queueShellInput(bytes);
   }
 }
@@ -38683,6 +38710,91 @@ window.intendantDashboardControl = {
       wsReplayCount,
       subscriptionSent,
     };
+  },
+  _debugProbeShellQueuesUntilOpened() {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof sendShellBytes !== 'function' ||
+      typeof handleShellOpened !== 'function' ||
+      !dashboardTransport ||
+      !dashboardControlTransport ||
+      typeof dashboardTransport.terminalFrame !== 'function' ||
+      typeof dashboardTransport.canUseRpc !== 'function' ||
+      !dashboardTransport.canUseRpc()
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        sendType: typeof sendShellBytes,
+        handleOpenedType: typeof handleShellOpened,
+        hasDashboardTransport: Boolean(dashboardTransport),
+        hasControlTransport: Boolean(dashboardControlTransport),
+        canUseRpc: Boolean(dashboardTransport?.canUseRpc?.()),
+        framesBeforeAck: [],
+        framesAfterAck: [],
+      };
+    }
+    const previousShellTerm = shellTerm;
+    const previousShellOpenSent = shellOpenSent;
+    const previousShellOpenAcked = shellOpenAcked;
+    const previousShellQueuedInput = shellQueuedInput;
+    const previousShellWaitingNoticeShown = shellWaitingNoticeShown;
+    const previousShellPendingResize = shellPendingResize;
+    const previousStatus = dashboardControlTransport.lastStatus;
+    const hadOwnTerminalFrame = Object.prototype.hasOwnProperty.call(dashboardTransport, 'terminalFrame');
+    const previousTerminalFrame = dashboardTransport.terminalFrame;
+    const frames = [];
+    let noticeWrites = 0;
+    dashboardControlTransport.lastStatus = {
+      ...(previousStatus || {}),
+      terminal_frames_available: true,
+    };
+    dashboardTransport.terminalFrame = function(frame) {
+      frames.push({ ...frame });
+      return true;
+    };
+    shellTerm = {
+      cols: 101,
+      rows: 29,
+      write() { noticeWrites += 1; },
+    };
+    shellOpenSent = false;
+    shellOpenAcked = false;
+    shellQueuedInput = '';
+    shellWaitingNoticeShown = false;
+    shellPendingResize = null;
+    try {
+      sendShellBytes('queued-before-open');
+      const framesBeforeAck = frames.map(frame => frame.t);
+      const queuedBeforeAck = shellQueuedInput;
+      const sentBeforeAck = shellOpenSent;
+      const ackedBeforeAck = shellOpenAcked;
+      handleShellOpened();
+      return {
+        skipped: false,
+        framesBeforeAck,
+        framesAfterAck: frames.map(frame => frame.t),
+        queuedBeforeAck,
+        queuedAfterAck: shellQueuedInput,
+        sentBeforeAck,
+        ackedBeforeAck,
+        ackedAfterAck: shellOpenAcked,
+        noticeWrites,
+      };
+    } finally {
+      shellTerm = previousShellTerm;
+      shellOpenSent = previousShellOpenSent;
+      shellOpenAcked = previousShellOpenAcked;
+      shellQueuedInput = previousShellQueuedInput;
+      shellWaitingNoticeShown = previousShellWaitingNoticeShown;
+      shellPendingResize = previousShellPendingResize;
+      dashboardControlTransport.lastStatus = previousStatus;
+      if (hadOwnTerminalFrame) {
+        dashboardTransport.terminalFrame = previousTerminalFrame;
+      } else {
+        delete dashboardTransport.terminalFrame;
+      }
+    }
   },
   async _debugProbePresenceMediaConnectNoLegacy() {
     if (
