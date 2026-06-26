@@ -670,9 +670,9 @@ into the daemon-signed WebRTC session statement.
 
 The hosted-service slice is implemented as a separate binary,
 `intendant-connect`. It serves a public web origin, handles passkey-only account
-registration/login, lets a signed-in user claim a daemon with a short-lived code,
-and brokers dashboard WebRTC signaling without asking the browser to trust the
-daemon's private HTTPS certificate.
+registration/login, lets a signed-in user claim a daemon with a short-lived
+12-word phrase, and brokers dashboard WebRTC signaling without asking the
+browser to trust the daemon's private HTTPS certificate.
 
 In production, run it behind ordinary public TLS for a public origin such as
 `https://connect.intendant.dev`:
@@ -688,9 +688,12 @@ INTENDANT_CONNECT_TOKEN="$(openssl rand -base64 32)" \
 ```
 
 The `--rp-id intendant.dev` value means passkeys are scoped to the owned
-Intendant domain while the actual UI can live on `connect.intendant.dev`.
-Browsers also allow `http://localhost:<port>` as a secure context for local
-development, so the same binary can be E2E-tested without public TLS.
+Intendant parent domain while the actual UI can live on `connect.intendant.dev`.
+For compatibility, the live production-alpha instance currently keeps its
+original `INTENDANT_CONNECT_RP_ID=connect.intendant.dev`; changing that value is
+a credential migration and existing users must register new passkeys. Browsers
+also allow `http://localhost:<port>` as a secure context for local development,
+so the same binary can be E2E-tested without public TLS.
 
 The daemon side still uses the normal `[connect]` outbound rendezvous client:
 
@@ -754,6 +757,22 @@ strip any inbound copies of those client-IP headers before setting them. Keep
 the service bound to `127.0.0.1`, keep `INTENDANT_CONNECT_TOKEN` in a secret
 store, and back up `/var/lib/intendant-connect/state.json`; that file is the
 current account/passkey/device ownership database.
+
+The production-alpha operator path is captured in scripts:
+
+```bash
+scripts/deploy-connect-prod-alpha.sh
+scripts/connect-state-backup.sh --passphrase-file ~/.config/intendant/connect-backup.passphrase
+scripts/connect-state-restore.sh --yes \
+  --passphrase-file ~/.config/intendant/connect-backup.passphrase \
+  ~/.local/share/intendant/connect-backups/intendant-connect-state-YYYYMMDDTHHMMSSZ.json.enc
+```
+
+The deploy script syncs the current worktree to the EC2 source directory,
+builds on the host, restarts the systemd service, and checks both the local
+readiness URL and the public `connect.intendant.dev` readiness URL. Backup and
+restore default to encrypted state snapshots and require an explicit plaintext
+flag for diagnostics.
 
 Current alpha limits:
 
@@ -1255,20 +1274,21 @@ The current implementation has crossed from protocol sketch into hosted MVP:
    binding matches the registered daemon identity and Connect-issued grant.
 7. Focused validators cover the local bootstrap, local rendezvous emulator, and
    hosted Connect MVP paths.
+8. `connect.intendant.dev` has a repeatable production-alpha deploy path plus
+   encrypted state backup/restore scripts.
 
 The remaining rollout work is production operations and breadth, not proving the
 core browser-trust escape hatch:
 
-1. Deploy `connect.intendant.dev` behind public TLS and a normal reverse proxy.
-2. Add durable/database-backed rate limits, structured metrics, backup/restore
-   automation, and database migrations.
-3. Add account recovery, richer multi-device management, teams/roles, and optional
+1. Add durable/database-backed rate limits, structured metrics, and database
+   migrations.
+2. Add account recovery, richer multi-device management, teams/roles, and optional
    passkey step-up for sensitive actions.
-4. Add daemon identity rotation/recovery semantics for VM clones, disk restore,
+3. Add daemon identity rotation/recovery semantics for VM clones, disk restore,
    and deliberate transfer of ownership.
-5. Continue migrating remaining dashboard APIs only when the tunnel has the
+4. Continue migrating remaining dashboard APIs only when the tunnel has the
    required streaming, byte-range, resumable transfer, or media semantics.
-6. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
+5. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
    throughout.
 
 Non-goals for this path:

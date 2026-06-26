@@ -2164,109 +2164,193 @@ fn connect_ui_html(origin: &str) -> String {
   <style>
     :root {{
       color-scheme: dark;
-      --bg: #111318;
-      --panel: #191c23;
-      --panel-2: #20242d;
-      --line: #343946;
-      --text: #eef1f7;
-      --muted: #a9b0bf;
-      --accent: #7db4ff;
-      --ok: #8fe19a;
-      --warn: #ffd37a;
-      --err: #ff8aa3;
+      --bg: #0d1016;
+      --top: #121722;
+      --surface: #161b24;
+      --surface-2: #1c2330;
+      --surface-3: #222b38;
+      --line: #2b3443;
+      --line-strong: #3d4858;
+      --text: #f5f7fb;
+      --muted: #9da8b7;
+      --muted-2: #727f8f;
+      --accent: #69b7ff;
+      --accent-hover: #88c8ff;
+      --accent-ink: #061320;
+      --ok: #7edc8f;
+      --warn: #ffd166;
+      --err: #ff7d9a;
+      --focus: #f2c94c;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg);
       color: var(--text);
     }}
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; min-height: 100vh; }}
-    header {{ padding: 20px 24px 12px; border-bottom: 1px solid var(--line); background: #151820; }}
-    main {{ width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 20px 0 40px; }}
-    h1 {{ font-size: 20px; line-height: 1.2; margin: 0; letter-spacing: 0; }}
-    h2 {{ font-size: 15px; margin: 0 0 12px; letter-spacing: 0; }}
-    .sub {{ color: var(--muted); font-size: 13px; margin-top: 4px; }}
-    .grid {{ display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }}
-    section {{ border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 16px; }}
-    label {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }}
-    input {{ width: 100%; height: 38px; padding: 8px 10px; color: var(--text); background: #10131a; border: 1px solid var(--line); border-radius: 6px; font: inherit; }}
-    button {{ height: 36px; padding: 0 12px; color: #07111f; background: var(--accent); border: 0; border-radius: 6px; font-weight: 650; cursor: pointer; }}
-    button.secondary {{ color: var(--text); background: var(--panel-2); border: 1px solid var(--line); }}
-    button.danger {{ color: var(--err); background: transparent; border: 1px solid var(--err); }}
-    button:disabled {{ opacity: .55; cursor: default; }}
-    .stack {{ display: grid; gap: 12px; }}
-    .row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+    html {{ min-height: 100%; }}
+    body {{ margin: 0; min-height: 100vh; background: var(--bg); }}
+    button, input {{ font: inherit; }}
+    button {{ height: 38px; padding: 0 14px; color: var(--accent-ink); background: var(--accent); border: 1px solid transparent; border-radius: 7px; font-weight: 700; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease, transform .12s ease; white-space: nowrap; }}
+    button:hover:not(:disabled) {{ background: var(--accent-hover); transform: translateY(-1px); }}
+    button:focus-visible, input:focus-visible {{ outline: 2px solid var(--focus); outline-offset: 2px; }}
+    button.secondary {{ color: var(--text); background: var(--surface-2); border-color: var(--line-strong); }}
+    button.secondary:hover:not(:disabled) {{ background: var(--surface-3); }}
+    button.ghost {{ color: var(--muted); background: transparent; border-color: var(--line); }}
+    button.ghost:hover:not(:disabled) {{ color: var(--text); background: var(--surface-2); }}
+    button.danger {{ color: var(--err); background: rgba(255, 125, 154, .08); border-color: rgba(255, 125, 154, .58); }}
+    button.danger:hover:not(:disabled) {{ background: rgba(255, 125, 154, .15); }}
+    button:disabled {{ opacity: .58; cursor: default; transform: none; }}
+    input {{ width: 100%; min-width: 0; height: 42px; padding: 9px 12px; color: var(--text); background: #10151d; border: 1px solid var(--line-strong); border-radius: 7px; }}
+    input::placeholder {{ color: var(--muted-2); }}
+    header {{ border-bottom: 1px solid var(--line); background: var(--top); }}
+    .topbar {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
+    .brand {{ display: flex; align-items: center; gap: 12px; min-width: 0; }}
+    .brand-mark {{ width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--accent); background: #101722; font-size: 13px; font-weight: 800; letter-spacing: 0; }}
+    .brand h1 {{ font-size: 20px; line-height: 1.15; margin: 0; letter-spacing: 0; }}
+    .origin-chip {{ min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }}
+    .origin-chip code {{ max-width: min(48vw, 420px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    main.shell {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 22px 0 44px; display: grid; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); gap: 16px; align-items: start; }}
+    body.signed-out main.shell {{ width: min(440px, calc(100vw - 32px)); grid-template-columns: 1fr; padding-top: 54px; }}
+    section {{ min-width: 0; border: 1px solid var(--line); background: var(--surface); border-radius: 8px; box-shadow: var(--shadow); }}
+    .panel-header {{ min-height: 62px; padding: 16px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 14px; }}
+    .panel-title {{ min-width: 0; }}
+    h2 {{ font-size: 15px; line-height: 1.25; margin: 0; letter-spacing: 0; }}
+    .sub {{ color: var(--muted); font-size: 13px; line-height: 1.35; margin-top: 4px; }}
+    .panel-body {{ padding: 18px; }}
+    .stack {{ display: grid; gap: 14px; }}
+    .row {{ display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }}
     .split {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
-    .status {{ min-height: 20px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }}
-    .status.ok {{ color: var(--ok); }}
-    .status.err {{ color: var(--err); }}
+    label {{ display: block; color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 7px; }}
+    .actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+    .account-summary {{ padding-top: 14px; border-top: 1px solid var(--line); }}
+    .handle {{ color: var(--text); font-size: 17px; font-weight: 750; overflow-wrap: anywhere; }}
+    .metric-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }}
+    .claim-strip {{ display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 9px; align-items: end; padding-bottom: 16px; border-bottom: 1px solid var(--line); }}
+    .status {{ min-height: 20px; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }}
+    .status.status-ok {{ color: var(--ok); }}
+    .status.status-err {{ color: var(--err); }}
+    .status.status-warn {{ color: var(--warn); }}
+    .table-wrap {{ overflow-x: auto; }}
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
-    th {{ color: var(--muted); font-weight: 600; }}
+    th, td {{ text-align: left; padding: 13px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
+    th {{ color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }}
+    tbody tr:hover {{ background: rgba(255, 255, 255, .025); }}
+    tbody tr:last-child td {{ border-bottom: 0; }}
     code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
-    .pill {{ display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px; background: var(--panel-2); color: var(--muted); font-size: 12px; }}
-    .pill.ok {{ color: var(--ok); }}
-    .pill.warn {{ color: var(--warn); }}
+    .daemon-name {{ display: grid; gap: 3px; min-width: 220px; }}
+    .daemon-name strong {{ font-size: 14px; }}
+    .daemon-activity {{ display: grid; gap: 6px; min-width: 116px; }}
+    .action-cell .actions {{ justify-content: flex-end; flex-wrap: nowrap; }}
+    .pill {{ display: inline-flex; align-items: center; width: fit-content; min-height: 24px; padding: 0 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); font-size: 12px; font-weight: 750; }}
+    .pill.ok {{ color: var(--ok); border-color: rgba(126, 220, 143, .4); background: rgba(126, 220, 143, .09); }}
+    .pill.warn {{ color: var(--warn); border-color: rgba(255, 209, 102, .35); background: rgba(255, 209, 102, .08); }}
+    .empty-state {{ padding: 22px 10px; color: var(--muted); }}
     .hidden {{ display: none !important; }}
-    .audit {{ display: grid; gap: 8px; }}
-    .event {{ padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: #141720; font-size: 12px; }}
+    .wide {{ grid-column: 1 / -1; }}
+    .audit {{ display: grid; gap: 0; }}
+    .event {{ padding: 13px 0; border-bottom: 1px solid var(--line); font-size: 13px; }}
+    .event:first-child {{ padding-top: 0; }}
+    .event:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .event-line {{ display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }}
+    .event-name {{ font-weight: 750; }}
+    .event time {{ color: var(--muted); font-size: 12px; white-space: nowrap; }}
+    .event code {{ display: inline-block; margin-top: 4px; }}
     @media (max-width: 820px) {{
-      .grid {{ grid-template-columns: 1fr; }}
-      header {{ padding-left: 16px; padding-right: 16px; }}
+      .topbar, main.shell {{ width: min(100vw - 24px, 680px); }}
+      .topbar {{ min-height: auto; padding: 14px 0; align-items: flex-start; }}
+      main.shell {{ grid-template-columns: 1fr; padding-top: 14px; }}
+      .origin-chip {{ display: none; }}
+      .claim-strip {{ grid-template-columns: 1fr; }}
+      .claim-strip button {{ width: 100%; }}
+      table, thead, tbody, tr, th, td {{ display: block; width: 100%; }}
+      thead {{ display: none; }}
+      tr {{ padding: 12px 0; border-bottom: 1px solid var(--line); }}
+      tr:last-child {{ border-bottom: 0; }}
+      td {{ border-bottom: 0; padding: 7px 0; }}
+      td::before {{ content: attr(data-label); display: block; color: var(--muted-2); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }}
+      .action-cell::before {{ display: none; }}
+      .action-cell .actions {{ justify-content: stretch; flex-wrap: wrap; }}
+      .action-cell button {{ flex: 1 1 92px; }}
     }}
   </style>
 </head>
-<body>
+<body class="signed-out">
   <header>
-    <div class="split">
-      <div>
+    <div class="topbar">
+      <div class="brand">
+        <div class="brand-mark" aria-hidden="true">IC</div>
+        <div>
         <h1>Intendant Connect</h1>
-        <div class="sub">{origin}</div>
+          <div class="origin-chip"><span>Origin</span><code>{origin}</code></div>
+        </div>
       </div>
-      <button id="logout" class="secondary hidden">Sign Out</button>
+      <button id="logout" class="ghost hidden">Sign out</button>
     </div>
   </header>
-  <main class="grid">
+  <main class="shell">
     <section id="auth">
-      <h2>Account</h2>
-      <div class="stack">
-        <div>
-          <label for="account">Account name</label>
-          <input id="account" autocomplete="username webauthn" placeholder="you">
+      <div class="panel-header">
+        <div class="panel-title">
+          <h2>Account</h2>
+          <div class="sub">Passkey access</div>
         </div>
-        <div class="row">
-          <button id="login">Sign In</button>
-          <button id="register" class="secondary">Create Passkey</button>
+      </div>
+      <div class="panel-body stack">
+        <div>
+          <label for="account">Account handle</label>
+          <input id="account" autocomplete="username webauthn" autocapitalize="none" spellcheck="false" placeholder="user">
+        </div>
+        <div id="auth-actions" class="actions">
+          <button id="login">Sign in</button>
+          <button id="register" class="secondary">Create passkey</button>
+        </div>
+        <div id="session-card" class="account-summary hidden">
+          <div id="session-handle" class="handle"></div>
+          <div class="metric-row">
+            <span id="session-passkeys" class="pill"></span>
+            <span class="pill ok">active</span>
+          </div>
         </div>
         <div id="auth-status" class="status"></div>
       </div>
     </section>
 
     <section id="manage" class="hidden">
-      <div class="split">
-        <div>
+      <div class="panel-header">
+        <div class="panel-title">
           <h2>Daemons</h2>
           <div id="who" class="sub"></div>
         </div>
         <button id="refresh" class="secondary">Refresh</button>
       </div>
-      <div class="stack" style="margin-top:12px">
-        <div class="row">
-          <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="Claim phrase" style="max-width:620px">
+      <div class="panel-body stack">
+        <div class="claim-strip">
+          <div>
+            <label for="claim-code">Claim phrase</label>
+            <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="12-word claim phrase">
+          </div>
           <button id="claim">Claim</button>
         </div>
         <div id="claim-status" class="status"></div>
-        <div style="overflow-x:auto">
+        <div class="table-wrap">
           <table>
-            <thead><tr><th>Name</th><th>Status</th><th>Key</th><th></th></tr></thead>
+            <thead><tr><th>Daemon</th><th>Activity</th><th>Public key</th><th></th></tr></thead>
             <tbody id="daemon-rows"></tbody>
           </table>
         </div>
       </div>
     </section>
 
-    <section id="audit-section" class="hidden" style="grid-column: 1 / -1">
-      <h2>Audit</h2>
-      <div id="audit" class="audit"></div>
+    <section id="audit-section" class="wide hidden">
+      <div class="panel-header">
+        <div class="panel-title">
+          <h2>Audit</h2>
+          <div class="sub">Recent account activity</div>
+        </div>
+      </div>
+      <div class="panel-body">
+        <div id="audit" class="audit"></div>
+      </div>
     </section>
   </main>
 <script>
@@ -2276,7 +2360,13 @@ const state = {{ user: null, daemons: [], csrfToken: '' }};
 function setStatus(id, text, kind = '') {{
   const el = $(id);
   el.textContent = text || '';
-  el.className = `status ${{kind}}`;
+  el.className = 'status' + (kind ? ' status-' + kind : '');
+}}
+
+function setBusy(id, busy) {{
+  const el = $(id);
+  if (!el) return;
+  el.disabled = Boolean(busy);
 }}
 
 async function api(path, options = {{}}) {{
@@ -2343,115 +2433,151 @@ function authenticationCredentialJSON(credential) {{
 
 async function createPasskey() {{
   const account = $('account').value.trim();
+  if (!account) throw new Error('Account handle is required');
+  setBusy('register', true);
   setStatus('auth-status', 'Waiting for passkey', '');
-  const start = await api('/api/auth/register/start', {{
-    method: 'POST',
-    body: JSON.stringify({{ account_name: account }}),
-  }});
-  const credential = await navigator.credentials.create({{ publicKey: publicKeyOptions(start) }});
-  const done = await api('/api/auth/register/finish', {{
-    method: 'POST',
-    body: JSON.stringify({{
-      flow_id: start.flow_id,
-      credential: registrationCredentialJSON(credential),
-    }}),
-  }});
-  state.user = done.user;
-  state.csrfToken = done.csrf_token || state.csrfToken;
-  setStatus('auth-status', 'Signed in', 'ok');
-  await refreshAll();
+  try {{
+    const start = await api('/api/auth/register/start', {{
+      method: 'POST',
+      body: JSON.stringify({{ account_name: account }}),
+    }});
+    const credential = await navigator.credentials.create({{ publicKey: publicKeyOptions(start) }});
+    const done = await api('/api/auth/register/finish', {{
+      method: 'POST',
+      body: JSON.stringify({{
+        flow_id: start.flow_id,
+        credential: registrationCredentialJSON(credential),
+      }}),
+    }});
+    state.user = done.user;
+    state.csrfToken = done.csrf_token || state.csrfToken;
+    setStatus('auth-status', 'Signed in', 'ok');
+    await refreshAll();
+  }} finally {{
+    setBusy('register', false);
+  }}
 }}
 
 async function login() {{
   const account = $('account').value.trim();
+  if (!account) throw new Error('Account handle is required');
+  setBusy('login', true);
   setStatus('auth-status', 'Waiting for passkey', '');
-  const start = await api('/api/auth/login/start', {{
-    method: 'POST',
-    body: JSON.stringify({{ account_name: account }}),
-  }});
-  const credential = await navigator.credentials.get({{ publicKey: publicKeyOptions(start) }});
-  const done = await api('/api/auth/login/finish', {{
-    method: 'POST',
-    body: JSON.stringify({{
-      flow_id: start.flow_id,
-      credential: authenticationCredentialJSON(credential),
-    }}),
-  }});
-  state.user = done.user;
-  state.csrfToken = done.csrf_token || state.csrfToken;
-  setStatus('auth-status', 'Signed in', 'ok');
-  await refreshAll();
+  try {{
+    const start = await api('/api/auth/login/start', {{
+      method: 'POST',
+      body: JSON.stringify({{ account_name: account }}),
+    }});
+    const credential = await navigator.credentials.get({{ publicKey: publicKeyOptions(start) }});
+    const done = await api('/api/auth/login/finish', {{
+      method: 'POST',
+      body: JSON.stringify({{
+        flow_id: start.flow_id,
+        credential: authenticationCredentialJSON(credential),
+      }}),
+    }});
+    state.user = done.user;
+    state.csrfToken = done.csrf_token || state.csrfToken;
+    setStatus('auth-status', 'Signed in', 'ok');
+    await refreshAll();
+  }} finally {{
+    setBusy('login', false);
+  }}
 }}
 
 async function claimDaemon() {{
   const claimCode = $('claim-code').value.trim();
+  if (!claimCode) throw new Error('Claim phrase is required');
+  setBusy('claim', true);
   setStatus('claim-status', 'Waiting for daemon proof', '');
-  const start = await api('/api/claims/claim', {{
-    method: 'POST',
-    body: JSON.stringify({{ claim_code: claimCode }}),
-  }});
-  const deadline = Date.now() + 65000;
-  while (Date.now() < deadline) {{
-    await new Promise(resolve => setTimeout(resolve, 750));
-    const status = await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}`);
-    if (status.result?.status === 'approved') {{
-      setStatus('claim-status', `Claimed ${{status.result.daemon_id}}`, 'ok');
-      $('claim-code').value = '';
-      await refreshAll();
-      return;
+  try {{
+    const start = await api('/api/claims/claim', {{
+      method: 'POST',
+      body: JSON.stringify({{ claim_code: claimCode }}),
+    }});
+    const deadline = Date.now() + 65000;
+    while (Date.now() < deadline) {{
+      await new Promise(resolve => setTimeout(resolve, 750));
+      const status = await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}`);
+      if (status.result?.status === 'approved') {{
+        setStatus('claim-status', `Claimed ${{status.result.daemon_id}}`, 'ok');
+        $('claim-code').value = '';
+        await refreshAll();
+        return;
+      }}
+      if (status.result?.status === 'rejected') {{
+        throw new Error(status.result.error || 'claim rejected');
+      }}
     }}
-    if (status.result?.status === 'rejected') {{
-      throw new Error(status.result.error || 'claim rejected');
-    }}
+    throw new Error('claim timed out');
+  }} finally {{
+    setBusy('claim', false);
   }}
-  throw new Error('claim timed out');
 }}
 
 async function refreshAll() {{
-  const me = await api('/api/me');
-  state.csrfToken = me.csrf_token || '';
-  state.user = me.authenticated ? me.user : null;
-  renderAuth();
-  if (!state.user) return;
-  const [daemons, audit] = await Promise.all([
-    api('/api/daemons'),
-    api('/api/audit'),
-  ]);
-  state.daemons = daemons.daemons || [];
-  renderDaemons();
-  renderAudit(audit.events || []);
+  setBusy('refresh', true);
+  try {{
+    const me = await api('/api/me');
+    state.csrfToken = me.csrf_token || '';
+    state.user = me.authenticated ? me.user : null;
+    renderAuth();
+    if (!state.user) return;
+    const [daemons, audit] = await Promise.all([
+      api('/api/daemons'),
+      api('/api/audit'),
+    ]);
+    state.daemons = daemons.daemons || [];
+    renderDaemons();
+    renderAudit(audit.events || []);
+  }} finally {{
+    setBusy('refresh', false);
+  }}
 }}
 
 function renderAuth() {{
   const authed = Boolean(state.user);
+  document.body.classList.toggle('signed-out', !authed);
+  document.body.classList.toggle('signed-in', authed);
   $('manage').classList.toggle('hidden', !authed);
   $('audit-section').classList.toggle('hidden', !authed);
   $('logout').classList.toggle('hidden', !authed);
-  $('who').textContent = authed ? `${{state.user.account_name}} (${{
-    state.user.passkey_count
-  }} passkey${{state.user.passkey_count === 1 ? '' : 's'}})` : '';
+  $('auth-actions').classList.toggle('hidden', authed);
+  $('session-card').classList.toggle('hidden', !authed);
+  $('account').disabled = authed;
+  if (authed) {{
+    $('account').value = state.user.account_name || '';
+    $('session-handle').textContent = '@' + state.user.account_name;
+    $('session-passkeys').textContent = `${{state.user.passkey_count}} passkey${{state.user.passkey_count === 1 ? '' : 's'}}`;
+    $('who').textContent = '@' + state.user.account_name;
+  }} else {{
+    $('session-handle').textContent = '';
+    $('session-passkeys').textContent = '';
+    $('who').textContent = '';
+  }}
 }}
 
 function renderDaemons() {{
   const rows = $('daemon-rows');
   rows.innerHTML = '';
   if (state.daemons.length === 0) {{
-    rows.innerHTML = '<tr><td colspan="4"><span class="sub">No claimed daemons</span></td></tr>';
+    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No claimed daemons</td></tr>';
     return;
   }}
   for (const daemon of state.daemons) {{
     const tr = document.createElement('tr');
     const key = String(daemon.daemon_public_key || '');
     const label = String(daemon.label || daemon.daemon_id || '');
+    const lastSeen = formatRelative(daemon.last_seen_unix_ms);
     tr.innerHTML = `
-      <td><strong>${{escapeHtml(label)}}</strong><br><code>${{escapeHtml(daemon.daemon_id)}}</code></td>
-      <td><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span></td>
-      <td><code>${{escapeHtml(key.slice(0, 16))}}${{key.length > 16 ? '...' : ''}}</code></td>
-      <td class="row">
+      <td data-label="Daemon"><div class="daemon-name"><strong>${{escapeHtml(label)}}</strong><code>${{escapeHtml(daemon.daemon_id)}}</code></div></td>
+      <td data-label="Activity"><div class="daemon-activity"><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span><span class="sub">${{escapeHtml(lastSeen)}}</span></div></td>
+      <td data-label="Public key"><code title="${{escapeAttr(key)}}">${{escapeHtml(compactKey(key))}}</code></td>
+      <td class="action-cell" data-label="Actions"><div class="actions">
         <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open</button>
         <button class="secondary" data-label="${{escapeAttr(daemon.daemon_id)}}">Rename</button>
         <button class="danger" data-revoke="${{escapeAttr(daemon.daemon_id)}}">Revoke</button>
-      </td>`;
+      </div></td>`;
     rows.appendChild(tr);
   }}
   rows.querySelectorAll('[data-open]').forEach(button => {{
@@ -2463,6 +2589,7 @@ function renderDaemons() {{
   rows.querySelectorAll('[data-revoke]').forEach(button => {{
     button.addEventListener('click', async () => {{
       const id = button.getAttribute('data-revoke');
+      if (!confirm(`Revoke access to ${{id}}?`)) return;
       await api(`/api/daemons/${{encodeURIComponent(id)}}/revoke`, {{ method: 'POST', body: '{{}}' }});
       await refreshAll();
     }});
@@ -2486,16 +2613,42 @@ function renderAudit(events) {{
   const el = $('audit');
   el.innerHTML = '';
   if (!events.length) {{
-    el.innerHTML = '<div class="sub">No audit events</div>';
+    el.innerHTML = '<div class="empty-state">No audit events</div>';
     return;
   }}
   for (const event of events.slice(0, 30)) {{
     const div = document.createElement('div');
     div.className = 'event';
-    const date = new Date(Number(event.unix_ms || 0)).toLocaleString();
-    div.innerHTML = `<strong>${{escapeHtml(event.event)}}</strong> <span class="sub">${{escapeHtml(date)}}</span><br><code>${{escapeHtml(event.daemon_id || '')}}</code>`;
+    const date = formatDate(event.unix_ms);
+    const name = String(event.event || '').replaceAll('_', ' ');
+    div.innerHTML = `<div class="event-line"><span class="event-name">${{escapeHtml(name)}}</span><time>${{escapeHtml(date)}}</time></div><code>${{escapeHtml(event.daemon_id || '')}}</code>`;
     el.appendChild(div);
   }}
+}}
+
+function compactKey(value) {{
+  const key = String(value || '');
+  if (key.length <= 24) return key;
+  return key.slice(0, 12) + '...' + key.slice(-8);
+}}
+
+function formatDate(unixMs) {{
+  const value = Number(unixMs || 0);
+  if (!value) return 'unknown';
+  return new Date(value).toLocaleString();
+}}
+
+function formatRelative(unixMs) {{
+  const value = Number(unixMs || 0);
+  if (!value) return 'never seen';
+  const seconds = Math.max(0, Math.floor((Date.now() - value) / 1000));
+  if (seconds < 10) return 'just now';
+  if (seconds < 60) return `${{seconds}}s ago`;
+  const minutes = Math.floor(seconds / 60);
+  if (minutes < 60) return `${{minutes}}m ago`;
+  const hours = Math.floor(minutes / 60);
+  if (hours < 48) return `${{hours}}h ago`;
+  return `${{Math.floor(hours / 24)}}d ago`;
 }}
 
 function escapeHtml(value) {{
@@ -2508,6 +2661,8 @@ $('login').addEventListener('click', () => login().catch(err => setStatus('auth-
 $('claim').addEventListener('click', () => claimDaemon().catch(err => setStatus('claim-status', err.message, 'err')));
 $('refresh').addEventListener('click', () => refreshAll().catch(err => setStatus('claim-status', err.message, 'err')));
 $('logout').addEventListener('click', async () => {{ await api('/api/logout', {{ method: 'POST', body: '{{}}' }}); state.user = null; state.csrfToken = ''; renderAuth(); }});
+$('account').addEventListener('keydown', event => {{ if (event.key === 'Enter') login().catch(err => setStatus('auth-status', err.message, 'err')); }});
+$('claim-code').addEventListener('keydown', event => {{ if (event.key === 'Enter') claimDaemon().catch(err => setStatus('claim-status', err.message, 'err')); }});
 
 const params = new URLSearchParams(location.search);
 if (params.get('claim_code')) $('claim-code').value = params.get('claim_code');

@@ -355,6 +355,13 @@ dashboard session tracking are memory-only. The claim API field remains named
 `claim_code` for compatibility, but newly generated claims are standard 12-word
 BIP39 English mnemonic phrases rather than short PIN-style codes.
 
+For new `*.intendant.dev` deployments, the default RP ID is `intendant.dev`, so
+passkeys can be scoped to the owned parent domain. The current
+`connect.intendant.dev` production-alpha instance was originally launched with
+`INTENDANT_CONNECT_RP_ID=connect.intendant.dev`; keep that setting until the
+alpha account is deliberately migrated, because changing RP ID invalidates
+previously registered passkeys and requires users to register new credentials.
+
 For production alpha, terminate public TLS at a reverse proxy and keep
 `intendant-connect` bound to `127.0.0.1`. The proxy should forward `Host`, set
 `X-Forwarded-For`/`X-Real-IP`, and strip any inbound copies of those headers
@@ -365,6 +372,54 @@ and store `INTENDANT_CONNECT_TOKEN` in the deployment secret store.
 Cookie-backed user mutations require a same-origin request and the per-session
 CSRF token returned by `/api/me`. The bundled Connect UI and dashboard
 `connect=1` mode set that header automatically.
+
+Production-alpha operations are intentionally boring and repeatable. The current
+deployment script syncs this repository to the EC2 host, builds
+`intendant-connect` on the host, restarts the systemd unit, and verifies both
+local and public readiness:
+
+```bash
+scripts/deploy-connect-prod-alpha.sh
+```
+
+The script defaults to the current alpha service:
+`ubuntu@16.171.75.210`, `/opt/intendant/source`,
+`intendant-connect.service`, and `https://connect.intendant.dev`. Override
+those with `CONNECT_HOST`, `CONNECT_SSH_USER`, `CONNECT_SSH_KEY`,
+`CONNECT_REMOTE_SOURCE`, `CONNECT_SERVICE`, or the matching command-line flags.
+It does not copy or print the daemon bearer token; the token remains in the
+remote systemd environment.
+
+Backups should be encrypted because the state file is the authoritative account
+and device registry. It stores account handles, passkey public-key records,
+daemon ownership and labels, hashed claim phrases, and audit entries. It does
+not store plaintext claim phrases, WebAuthn challenges, active browser sessions,
+pending offers, dashboard grants, or rate-limit buckets. Create an encrypted
+backup with:
+
+```bash
+scripts/connect-state-backup.sh \
+  --passphrase-file ~/.config/intendant/connect-backup.passphrase
+```
+
+The backup is written under
+`~/.local/share/intendant/connect-backups/` by default, alongside a SHA-256
+checksum file. Plaintext backup is available only with an explicit
+`--allow-plaintext` flag for local diagnostics.
+
+Restore is deliberately explicit because it replaces the production state file,
+takes a pre-restore backup on the host, restarts the service, and verifies
+readiness:
+
+```bash
+scripts/connect-state-restore.sh --yes \
+  --passphrase-file ~/.config/intendant/connect-backup.passphrase \
+  ~/.local/share/intendant/connect-backups/intendant-connect-state-YYYYMMDDTHHMMSSZ.json.enc
+```
+
+After a restore, existing browser sessions are gone because sessions are
+memory-only. Claimed daemons continue to be owned by the restored account state,
+but currently connected dashboards must reconnect.
 
 The service accepts equivalent environment variables:
 
