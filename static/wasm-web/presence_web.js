@@ -50,6 +50,9 @@ export class PresenceWeb {
             wasm.__wbindgen_free(deferred1_0, deferred1_1, 1);
         }
     }
+    clear_server_sender() {
+        wasm.presenceweb_clear_server_sender(this.__wbg_ptr);
+    }
     /**
      * @param {string} url
      */
@@ -160,6 +163,16 @@ export class PresenceWeb {
     handle_server_message(msg) {
         const ret = wasm.presenceweb_handle_server_message(this.__wbg_ptr, msg);
         return ret;
+    }
+    /**
+     * Route a server-origin message delivered by a non-WebSocket transport
+     * through the same presence callbacks as the normal WebSocket path.
+     * Raw-message callbacks are intentionally suppressed to avoid
+     * re-entering the dashboard dispatcher that delivered the frame.
+     * @param {any} msg
+     */
+    handle_tunneled_server_message(msg) {
+        wasm.presenceweb_handle_tunneled_server_message(this.__wbg_ptr, msg);
     }
     /**
      * Handle a voice model tool call end-to-end.
@@ -701,6 +714,16 @@ export class PresenceWeb {
      */
     set_passive_mode(passive) {
         wasm.presenceweb_set_passive_mode(this.__wbg_ptr, passive);
+    }
+    /**
+     * Install a custom JSON sender for transports other than the daemon
+     * WebSocket. Public-origin Connect mode uses this to route the same
+     * presence/server messages through the verified dashboard-control
+     * DataChannel.
+     * @param {Function} sender
+     */
+    set_server_sender(sender) {
+        wasm.presenceweb_set_server_sender(this.__wbg_ptr, sender);
     }
     /**
      * @param {any} state

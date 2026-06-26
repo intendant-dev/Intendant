@@ -1,0 +1,2047 @@
+use axum::extract::{Path as AxumPath, Query, State};
+use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
+use axum::response::{Html, IntoResponse, Response};
+use axum::routing::{get, post};
+use axum::{Json, Router};
+use base64::Engine as _;
+use passkey_auth::{
+    AuthenticationResponse, AuthenticationState, CredentialId, PasskeyCredential,
+    RegistrationResponse, RegistrationState, Webauthn,
+};
+use rand::RngCore as _;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
+use sha2::{Digest as _, Sha256};
+use std::collections::{HashMap, VecDeque};
+use std::net::SocketAddr;
+use std::path::{Component, Path, PathBuf};
+use std::sync::Arc;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use tokio::sync::{oneshot, Mutex, Notify};
+use url::Url;
+use uuid::Uuid;
+
+const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
+const CLAIM_PROTOCOL: &str = "intendant-connect-claim-v1";
+const COOKIE_NAME: &str = "ic_session";
+const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
+const OFFER_TIMEOUT_MS: u64 = 30_000;
+const CLAIM_TIMEOUT_MS: u64 = 60_000;
+const CLAIM_CODE_TTL_MS: u64 = 10 * 60 * 1000;
+
+#[tokio::main]
+async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ServiceConfig::from_env_and_args()?;
+    let rp_origin = Url::parse(&config.public_origin)?;
+    validate_rp_id_matches_origin(&config.rp_id, &rp_origin)?;
+    let webauthn = Webauthn::new(&config.rp_id, "Intendant Connect", &config.public_origin)
+        .require_user_verification(true)
+        .strict_base64(true);
+    let store = load_store(&config.data_file)?;
+    let state = Arc::new(AppState {
+        config: config.clone(),
+        webauthn,
+        store: Mutex::new(store),
+        sessions: Mutex::new(HashMap::new()),
+        pending_registrations: Mutex::new(HashMap::new()),
+        pending_authentications: Mutex::new(HashMap::new()),
+        pending_offers: Mutex::new(HashMap::new()),
+        pending_claims: Mutex::new(HashMap::new()),
+        event_queues: Mutex::new(HashMap::new()),
+        event_notify: Notify::new(),
+        claim_codes: Mutex::new(HashMap::new()),
+    });
+
+    let app = Router::new()
+        .route("/", get(connect_ui))
+        .route("/connect", get(connect_ui))
+        .route("/app", get(app_html))
+        .route("/healthz", get(healthz))
+        .route("/api/me", get(api_me))
+        .route("/api/logout", post(api_logout))
+        .route("/api/auth/register/start", post(auth_register_start))
+        .route("/api/auth/register/finish", post(auth_register_finish))
+        .route("/api/auth/login/start", post(auth_login_start))
+        .route("/api/auth/login/finish", post(auth_login_finish))
+        .route("/api/daemons", get(api_daemons))
+        .route("/api/daemons/{daemon_id}/revoke", post(api_daemon_revoke))
+        .route("/api/claims/claim", post(api_claim_start))
+        .route("/api/claims/{claim_id}", get(api_claim_status))
+        .route("/api/audit", get(api_audit))
+        .route("/api/status", get(api_status))
+        .route("/api/daemon/register", post(daemon_register))
+        .route("/api/daemon/next", get(daemon_next))
+        .route("/api/daemon/answer", post(daemon_answer))
+        .route("/api/daemon/error", post(daemon_error))
+        .route("/api/daemon/ack", post(daemon_ack))
+        .route("/api/daemon/claim-proof", post(daemon_claim_proof))
+        .route("/api/browser/offer", post(browser_offer))
+        .route("/api/browser/ice", post(browser_ice))
+        .route("/api/browser/close", post(browser_close))
+        .fallback(static_asset)
+        .with_state(state);
+
+    let listener = tokio::net::TcpListener::bind(config.listen).await?;
+    eprintln!(
+        "[connect] listening on http://{} with origin {} rp_id {}",
+        config.listen, config.public_origin, config.rp_id
+    );
+    eprintln!("[connect] state file {}", config.data_file.display());
+    axum::serve(listener, app).await?;
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct ServiceConfig {
+    listen: SocketAddr,
+    public_origin: String,
+    rp_id: String,
+    static_root: PathBuf,
+    data_file: PathBuf,
+    daemon_token: Option<String>,
+    cookie_secure: bool,
+}
+
+impl ServiceConfig {
+    fn from_env_and_args() -> Result<Self, String> {
+        let mut listen: SocketAddr = std::env::var("INTENDANT_CONNECT_LISTEN")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or_else(|| SocketAddr::from(([127, 0, 0, 1], 9876)));
+        let mut public_origin = std::env::var("INTENDANT_CONNECT_ORIGIN")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let mut rp_id = std::env::var("INTENDANT_CONNECT_RP_ID")
+            .ok()
+            .filter(|v| !v.trim().is_empty());
+        let mut static_root = std::env::var("INTENDANT_CONNECT_STATIC_ROOT")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("static"));
+        let mut data_file = std::env::var("INTENDANT_CONNECT_DATA_FILE")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| default_data_file());
+        let mut daemon_token = std::env::var("INTENDANT_CONNECT_TOKEN")
+            .ok()
+            .map(|v| v.trim().to_string())
+            .filter(|v| !v.is_empty());
+
+        let mut args = std::env::args().skip(1);
+        while let Some(arg) = args.next() {
+            match arg.as_str() {
+                "--listen" => {
+                    let value = args.next().ok_or("--listen requires an address")?;
+                    listen = value
+                        .parse()
+                        .map_err(|e| format!("invalid --listen {value:?}: {e}"))?;
+                }
+                "--origin" => {
+                    public_origin = Some(args.next().ok_or("--origin requires a URL")?);
+                }
+                "--rp-id" => {
+                    rp_id = Some(args.next().ok_or("--rp-id requires a domain")?);
+                }
+                "--static-root" => {
+                    static_root =
+                        PathBuf::from(args.next().ok_or("--static-root requires a path")?);
+                }
+                "--data-file" => {
+                    data_file = PathBuf::from(args.next().ok_or("--data-file requires a path")?);
+                }
+                "--daemon-token" => {
+                    daemon_token = Some(args.next().ok_or("--daemon-token requires a token")?);
+                }
+                "--help" | "-h" => {
+                    print_help();
+                    std::process::exit(0);
+                }
+                other => return Err(format!("unknown argument: {other}")),
+            }
+        }
+
+        let public_origin =
+            public_origin.unwrap_or_else(|| format!("http://localhost:{}", listen.port()));
+        let parsed_origin = Url::parse(&public_origin)
+            .map_err(|e| format!("invalid Connect origin {public_origin:?}: {e}"))?;
+        let rp_id = rp_id.unwrap_or_else(|| {
+            let host = parsed_origin.host_str().unwrap_or("localhost");
+            if host == "intendant.dev" || host.ends_with(".intendant.dev") {
+                "intendant.dev".to_string()
+            } else {
+                host.to_string()
+            }
+        });
+        let cookie_secure = parsed_origin.scheme() == "https";
+        Ok(Self {
+            listen,
+            public_origin: trim_trailing_slash(&public_origin),
+            rp_id,
+            static_root,
+            data_file,
+            daemon_token,
+            cookie_secure,
+        })
+    }
+}
+
+fn print_help() {
+    println!(
+        "Usage: intendant-connect [--listen 127.0.0.1:9876] [--origin https://connect.intendant.dev] [--rp-id intendant.dev]\n\
+         \n\
+         Env: INTENDANT_CONNECT_LISTEN, INTENDANT_CONNECT_ORIGIN, INTENDANT_CONNECT_RP_ID,\n\
+              INTENDANT_CONNECT_STATIC_ROOT, INTENDANT_CONNECT_DATA_FILE, INTENDANT_CONNECT_TOKEN"
+    );
+}
+
+fn trim_trailing_slash(value: &str) -> String {
+    value.trim().trim_end_matches('/').to_string()
+}
+
+fn default_data_file() -> PathBuf {
+    dirs::data_dir()
+        .unwrap_or_else(std::env::temp_dir)
+        .join("intendant")
+        .join("connect")
+        .join("state.json")
+}
+
+fn validate_rp_id_matches_origin(rp_id: &str, origin: &Url) -> Result<(), String> {
+    let host = origin
+        .host_str()
+        .ok_or_else(|| "Connect origin must include a host".to_string())?;
+    if host == rp_id || host.ends_with(&format!(".{rp_id}")) {
+        Ok(())
+    } else {
+        Err(format!(
+            "rp_id {rp_id:?} is not an effective domain of origin host {host:?}"
+        ))
+    }
+}
+
+struct AppState {
+    config: ServiceConfig,
+    webauthn: Webauthn,
+    store: Mutex<Store>,
+    sessions: Mutex<HashMap<String, SessionRecord>>,
+    pending_registrations: Mutex<HashMap<String, PendingRegistration>>,
+    pending_authentications: Mutex<HashMap<String, PendingAuthentication>>,
+    pending_offers: Mutex<HashMap<String, PendingOffer>>,
+    pending_claims: Mutex<HashMap<String, PendingClaim>>,
+    event_queues: Mutex<HashMap<String, VecDeque<RendezvousEvent>>>,
+    event_notify: Notify,
+    claim_codes: Mutex<HashMap<String, String>>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+struct Store {
+    #[serde(default)]
+    users: Vec<UserRecord>,
+    #[serde(default)]
+    daemons: Vec<DaemonRecord>,
+    #[serde(default)]
+    audit: Vec<AuditEvent>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct UserRecord {
+    id: Uuid,
+    account_name: String,
+    display_name: String,
+    passkeys: Vec<PasskeyCredential>,
+    created_unix_ms: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct DaemonRecord {
+    daemon_id: String,
+    daemon_public_key: String,
+    owner_user_id: Option<Uuid>,
+    claim_code_hash: Option<String>,
+    claim_code_created_unix_ms: Option<u64>,
+    registered_unix_ms: u64,
+    last_seen_unix_ms: u64,
+    updated_unix_ms: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AuditEvent {
+    id: String,
+    unix_ms: u64,
+    event: String,
+    user_id: Option<Uuid>,
+    daemon_id: Option<String>,
+    detail: serde_json::Value,
+}
+
+#[derive(Debug, Clone)]
+struct SessionRecord {
+    user_id: Uuid,
+    expires_unix_ms: u64,
+}
+
+struct PendingRegistration {
+    user_id: Uuid,
+    account_name: String,
+    display_name: String,
+    state: RegistrationState,
+    expires_unix_ms: u64,
+}
+
+struct PendingAuthentication {
+    user_id: Uuid,
+    state: AuthenticationState,
+    expires_unix_ms: u64,
+}
+
+struct PendingOffer {
+    daemon_id: String,
+    user_id: Uuid,
+    daemon_public_key: String,
+    session_grant: String,
+    response_tx: oneshot::Sender<Result<BrowserAnswerResponse, String>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingClaim {
+    user_id: Uuid,
+    daemon_id: String,
+    challenge: String,
+    created_unix_ms: u64,
+    status: ClaimStatus,
+}
+
+#[derive(Debug, Clone, Serialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum ClaimStatus {
+    Pending,
+    Approved { daemon_id: String },
+    Rejected { error: String },
+}
+
+#[derive(Debug)]
+struct ApiError {
+    status: StatusCode,
+    message: String,
+}
+
+type ApiResult<T> = Result<T, ApiError>;
+
+impl ApiError {
+    fn new(status: StatusCode, message: impl Into<String>) -> Self {
+        Self {
+            status,
+            message: message.into(),
+        }
+    }
+
+    fn bad_request(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::BAD_REQUEST, message)
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::UNAUTHORIZED, message)
+    }
+
+    fn forbidden(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::FORBIDDEN, message)
+    }
+
+    fn not_found(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::NOT_FOUND, message)
+    }
+
+    fn conflict(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::CONFLICT, message)
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::INTERNAL_SERVER_ERROR, message)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        (
+            self.status,
+            Json(json!({
+                "ok": false,
+                "error": self.message,
+            })),
+        )
+            .into_response()
+    }
+}
+
+fn load_store(path: &Path) -> Result<Store, String> {
+    match std::fs::read(path) {
+        Ok(bytes) => serde_json::from_slice(&bytes)
+            .map_err(|e| format!("parse Connect state {}: {e}", path.display())),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Store::default()),
+        Err(e) => Err(format!("read Connect state {}: {e}", path.display())),
+    }
+}
+
+fn save_store(path: &Path, store: &Store) -> Result<(), String> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|e| format!("create Connect state dir {}: {e}", parent.display()))?;
+    }
+    let bytes = serde_json::to_vec_pretty(store).map_err(|e| format!("serialize state: {e}"))?;
+    let tmp = path.with_extension("json.tmp");
+    std::fs::write(&tmp, bytes)
+        .map_err(|e| format!("write Connect state {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| format!("replace Connect state {}: {e}", path.display()))?;
+    Ok(())
+}
+
+fn persist_locked(state: &AppState, store: &Store) -> ApiResult<()> {
+    save_store(&state.config.data_file, store).map_err(ApiError::internal)
+}
+
+fn now_unix_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis() as u64
+}
+
+fn random_b64u(bytes: usize) -> String {
+    let mut buf = vec![0u8; bytes];
+    rand::thread_rng().fill_bytes(&mut buf);
+    b64u(&buf)
+}
+
+fn b64u(bytes: &[u8]) -> String {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(bytes)
+}
+
+fn b64u_decode(value: &str) -> Result<Vec<u8>, base64::DecodeError> {
+    base64::engine::general_purpose::URL_SAFE_NO_PAD.decode(value)
+}
+
+fn sha256_b64u(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    b64u(&hasher.finalize())
+}
+
+fn normalize_account_name(value: &str) -> String {
+    value.trim().to_ascii_lowercase()
+}
+
+fn user_view(user: &UserRecord) -> serde_json::Value {
+    json!({
+        "id": user.id,
+        "account_name": user.account_name,
+        "display_name": user.display_name,
+        "passkey_count": user.passkeys.len(),
+    })
+}
+
+fn daemon_view(daemon: &DaemonRecord) -> serde_json::Value {
+    let now = now_unix_ms();
+    json!({
+        "daemon_id": daemon.daemon_id,
+        "daemon_public_key": daemon.daemon_public_key,
+        "claimed": daemon.owner_user_id.is_some(),
+        "online": now.saturating_sub(daemon.last_seen_unix_ms) < 45_000,
+        "registered_unix_ms": daemon.registered_unix_ms,
+        "last_seen_unix_ms": daemon.last_seen_unix_ms,
+    })
+}
+
+fn audit(
+    store: &mut Store,
+    event: &str,
+    user_id: Option<Uuid>,
+    daemon_id: Option<String>,
+    detail: serde_json::Value,
+) {
+    store.audit.push(AuditEvent {
+        id: Uuid::new_v4().to_string(),
+        unix_ms: now_unix_ms(),
+        event: event.to_string(),
+        user_id,
+        daemon_id,
+        detail,
+    });
+    const MAX_AUDIT_EVENTS: usize = 2000;
+    if store.audit.len() > MAX_AUDIT_EVENTS {
+        let drop_count = store.audit.len() - MAX_AUDIT_EVENTS;
+        store.audit.drain(0..drop_count);
+    }
+}
+
+async fn healthz() -> impl IntoResponse {
+    Json(json!({ "ok": true }))
+}
+
+async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(connect_ui_html(&state.config.public_origin))
+}
+
+async fn app_html(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
+    let path = state.config.static_root.join("app.html");
+    serve_file(&state.config.static_root, &path)
+}
+
+async fn static_asset(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {
+    let path = safe_static_path(&state.config.static_root, uri.path())
+        .ok_or_else(|| ApiError::not_found("not found"))?;
+    serve_file(&state.config.static_root, &path)
+}
+
+fn safe_static_path(root: &Path, uri_path: &str) -> Option<PathBuf> {
+    let trimmed = uri_path.trim_start_matches('/');
+    if trimmed.is_empty() || trimmed.contains('\0') {
+        return None;
+    }
+    let rel = Path::new(trimmed);
+    if rel.components().any(|c| !matches!(c, Component::Normal(_))) {
+        return None;
+    }
+    Some(root.join(rel))
+}
+
+fn serve_file(root: &Path, path: &Path) -> ApiResult<Response> {
+    if !path.starts_with(root) || !path.is_file() {
+        return Err(ApiError::not_found("not found"));
+    }
+    let body = std::fs::read(path).map_err(|e| ApiError::not_found(format!("not found: {e}")))?;
+    let content_type = content_type_for_path(path);
+    Ok((
+        [(header::CONTENT_TYPE, HeaderValue::from_static(content_type))],
+        body,
+    )
+        .into_response())
+}
+
+fn content_type_for_path(path: &Path) -> &'static str {
+    match path.extension().and_then(|ext| ext.to_str()).unwrap_or("") {
+        "html" => "text/html; charset=utf-8",
+        "js" | "mjs" => "text/javascript; charset=utf-8",
+        "css" => "text/css; charset=utf-8",
+        "wasm" => "application/wasm",
+        "json" => "application/json; charset=utf-8",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "svg" => "image/svg+xml",
+        "ico" => "image/x-icon",
+        _ => "application/octet-stream",
+    }
+}
+
+fn cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
+    let raw = headers.get(header::COOKIE)?.to_str().ok()?;
+    for part in raw.split(';') {
+        let (k, v) = part.trim().split_once('=').unwrap_or((part.trim(), ""));
+        if k == name && !v.is_empty() {
+            return Some(v.to_string());
+        }
+    }
+    None
+}
+
+fn session_cookie(config: &ServiceConfig, token: &str, max_age_seconds: u64) -> HeaderValue {
+    let mut cookie =
+        format!("{COOKIE_NAME}={token}; Max-Age={max_age_seconds}; Path=/; HttpOnly; SameSite=Lax");
+    if config.cookie_secure {
+        cookie.push_str("; Secure");
+    }
+    HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+fn clear_session_cookie(config: &ServiceConfig) -> HeaderValue {
+    let mut cookie = format!("{COOKIE_NAME}=; Max-Age=0; Path=/; HttpOnly; SameSite=Lax");
+    if config.cookie_secure {
+        cookie.push_str("; Secure");
+    }
+    HeaderValue::from_str(&cookie).unwrap_or_else(|_| HeaderValue::from_static(""))
+}
+
+async fn optional_user(state: &Arc<AppState>, headers: &HeaderMap) -> Option<UserRecord> {
+    let token = cookie_value(headers, COOKIE_NAME)?;
+    let now = now_unix_ms();
+    let user_id = {
+        let mut sessions = state.sessions.lock().await;
+        let session = sessions.get(&token)?;
+        if session.expires_unix_ms <= now {
+            sessions.remove(&token);
+            return None;
+        }
+        session.user_id
+    };
+    let store = state.store.lock().await;
+    store.users.iter().find(|u| u.id == user_id).cloned()
+}
+
+async fn require_user(state: &Arc<AppState>, headers: &HeaderMap) -> ApiResult<UserRecord> {
+    optional_user(state, headers)
+        .await
+        .ok_or_else(|| ApiError::unauthorized("sign in required"))
+}
+
+async fn create_session(state: &Arc<AppState>, user_id: Uuid) -> String {
+    let token = random_b64u(32);
+    let session = SessionRecord {
+        user_id,
+        expires_unix_ms: now_unix_ms().saturating_add(SESSION_TTL_MS),
+    };
+    state.sessions.lock().await.insert(token.clone(), session);
+    token
+}
+
+fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    let Some(token) = state.config.daemon_token.as_deref() else {
+        return Ok(());
+    };
+    let expected = format!("Bearer {token}");
+    if headers
+        .get(header::AUTHORIZATION)
+        .and_then(|h| h.to_str().ok())
+        == Some(expected.as_str())
+    {
+        Ok(())
+    } else {
+        Err(ApiError::unauthorized(
+            "missing or invalid daemon bearer token",
+        ))
+    }
+}
+
+async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+    let Some(user) = optional_user(&state, &headers).await else {
+        return Ok(Json(json!({ "authenticated": false })).into_response());
+    };
+    Ok(Json(json!({
+        "authenticated": true,
+        "user": user_view(&user),
+    }))
+    .into_response())
+}
+
+async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+    if let Some(token) = cookie_value(&headers, COOKIE_NAME) {
+        state.sessions.lock().await.remove(&token);
+    }
+    let mut response = Json(json!({ "ok": true })).into_response();
+    response
+        .headers_mut()
+        .insert(header::SET_COOKIE, clear_session_cookie(&state.config));
+    response
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterStartRequest {
+    account_name: String,
+    #[serde(default)]
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ChallengeStartResponse {
+    ok: bool,
+    flow_id: String,
+    options: serde_json::Value,
+}
+
+async fn auth_register_start(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RegisterStartRequest>,
+) -> ApiResult<Json<ChallengeStartResponse>> {
+    let account_name = normalize_account_name(&body.account_name);
+    if account_name.is_empty() {
+        return Err(ApiError::bad_request("account_name is required"));
+    }
+    let display_name = body.display_name.trim();
+    let display_name = if display_name.is_empty() {
+        account_name.clone()
+    } else {
+        display_name.to_string()
+    };
+    let (user_id, exclude_credentials) = {
+        let store = state.store.lock().await;
+        let existing = store.users.iter().find(|u| u.account_name == account_name);
+        let user_id = existing.map(|u| u.id).unwrap_or_else(Uuid::new_v4);
+        let exclude = existing
+            .map(|u| {
+                u.passkeys
+                    .iter()
+                    .map(|pk| pk.id.clone())
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+        (user_id, exclude)
+    };
+    let (options, registration) = state.webauthn.start_registration(
+        user_id.as_bytes(),
+        &account_name,
+        &display_name,
+        &exclude_credentials,
+    );
+    let flow_id = Uuid::new_v4().to_string();
+    let pending = PendingRegistration {
+        user_id,
+        account_name,
+        display_name,
+        state: registration,
+        expires_unix_ms: now_unix_ms().saturating_add(300_000),
+    };
+    state
+        .pending_registrations
+        .lock()
+        .await
+        .insert(flow_id.clone(), pending);
+    Ok(Json(ChallengeStartResponse {
+        ok: true,
+        flow_id,
+        options: serde_json::to_value(options).map_err(|e| ApiError::internal(e.to_string()))?,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterFinishRequest {
+    flow_id: String,
+    credential: RegistrationResponse,
+}
+
+async fn auth_register_finish(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<RegisterFinishRequest>,
+) -> ApiResult<Response> {
+    let pending = state
+        .pending_registrations
+        .lock()
+        .await
+        .remove(body.flow_id.trim())
+        .ok_or_else(|| ApiError::not_found("registration flow not found"))?;
+    if pending.expires_unix_ms <= now_unix_ms() {
+        return Err(ApiError::bad_request("registration flow expired"));
+    }
+    let passkey = state
+        .webauthn
+        .finish_registration(&pending.state, &body.credential)
+        .map_err(|e| ApiError::bad_request(format!("finish passkey registration: {e}")))?;
+    let user = {
+        let mut store = state.store.lock().await;
+        if store
+            .users
+            .iter()
+            .flat_map(|u| u.passkeys.iter())
+            .any(|pk| pk.id == passkey.id)
+        {
+            return Err(ApiError::conflict("passkey is already registered"));
+        }
+        let now = now_unix_ms();
+        if let Some(user) = store.users.iter_mut().find(|u| u.id == pending.user_id) {
+            user.display_name = pending.display_name.clone();
+            user.passkeys.push(passkey);
+            user.updated_unix_ms = now;
+        } else {
+            store.users.push(UserRecord {
+                id: pending.user_id,
+                account_name: pending.account_name.clone(),
+                display_name: pending.display_name.clone(),
+                passkeys: vec![passkey],
+                created_unix_ms: now,
+                updated_unix_ms: now,
+            });
+        }
+        audit(
+            &mut store,
+            "passkey_registered",
+            Some(pending.user_id),
+            None,
+            json!({ "account_name": pending.account_name }),
+        );
+        persist_locked(&state, &store)?;
+        store
+            .users
+            .iter()
+            .find(|u| u.id == pending.user_id)
+            .cloned()
+            .ok_or_else(|| ApiError::internal("created user missing"))?
+    };
+    let token = create_session(&state, user.id).await;
+    let mut response = Json(json!({
+        "ok": true,
+        "user": user_view(&user),
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie(&state.config, &token, SESSION_TTL_MS / 1000),
+    );
+    Ok(response)
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginStartRequest {
+    account_name: String,
+}
+
+async fn auth_login_start(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoginStartRequest>,
+) -> ApiResult<Json<ChallengeStartResponse>> {
+    let account_name = normalize_account_name(&body.account_name);
+    if account_name.is_empty() {
+        return Err(ApiError::bad_request("account_name is required"));
+    }
+    let user = {
+        let store = state.store.lock().await;
+        store
+            .users
+            .iter()
+            .find(|u| u.account_name == account_name)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("account not found"))?
+    };
+    if user.passkeys.is_empty() {
+        return Err(ApiError::bad_request("account has no passkeys"));
+    }
+    let (options, authentication) = state
+        .webauthn
+        .start_authentication_with_creds_for_user(user.id.as_bytes(), &user.passkeys);
+    let flow_id = Uuid::new_v4().to_string();
+    state.pending_authentications.lock().await.insert(
+        flow_id.clone(),
+        PendingAuthentication {
+            user_id: user.id,
+            state: authentication,
+            expires_unix_ms: now_unix_ms().saturating_add(300_000),
+        },
+    );
+    Ok(Json(ChallengeStartResponse {
+        ok: true,
+        flow_id,
+        options: serde_json::to_value(options).map_err(|e| ApiError::internal(e.to_string()))?,
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct LoginFinishRequest {
+    flow_id: String,
+    credential: AuthenticationResponse,
+}
+
+async fn auth_login_finish(
+    State(state): State<Arc<AppState>>,
+    Json(body): Json<LoginFinishRequest>,
+) -> ApiResult<Response> {
+    let pending = state
+        .pending_authentications
+        .lock()
+        .await
+        .remove(body.flow_id.trim())
+        .ok_or_else(|| ApiError::not_found("login flow not found"))?;
+    if pending.expires_unix_ms <= now_unix_ms() {
+        return Err(ApiError::bad_request("login flow expired"));
+    }
+    let user = {
+        let mut store = state.store.lock().await;
+        let user = store
+            .users
+            .iter_mut()
+            .find(|u| u.id == pending.user_id)
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        let asserted_id = CredentialId::from_b64url(&body.credential.id)
+            .map_err(|e| ApiError::bad_request(format!("credential id: {e}")))?;
+        let stored = user
+            .passkeys
+            .iter_mut()
+            .find(|passkey| passkey.id == asserted_id)
+            .ok_or_else(|| ApiError::bad_request("passkey did not match account"))?;
+        let auth_result = state
+            .webauthn
+            .finish_authentication(&pending.state, &body.credential, stored)
+            .map_err(|e| ApiError::bad_request(format!("finish passkey login: {e}")))?;
+        stored.counter = auth_result.new_counter;
+        user.updated_unix_ms = now_unix_ms();
+        let user = user.clone();
+        audit(
+            &mut store,
+            "passkey_login",
+            Some(user.id),
+            None,
+            json!({ "account_name": user.account_name }),
+        );
+        persist_locked(&state, &store)?;
+        user
+    };
+    let token = create_session(&state, user.id).await;
+    let mut response = Json(json!({
+        "ok": true,
+        "user": user_view(&user),
+    }))
+    .into_response();
+    response.headers_mut().insert(
+        header::SET_COOKIE,
+        session_cookie(&state.config, &token, SESSION_TTL_MS / 1000),
+    );
+    Ok(response)
+}
+
+async fn api_daemons(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    let store = state.store.lock().await;
+    let daemons = store
+        .daemons
+        .iter()
+        .filter(|d| d.owner_user_id == Some(user.id))
+        .map(daemon_view)
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "ok": true,
+        "daemons": daemons,
+    })))
+}
+
+async fn api_daemon_revoke(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(daemon_id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    let mut store = state.store.lock().await;
+    let daemon = store
+        .daemons
+        .iter_mut()
+        .find(|d| d.daemon_id == daemon_id && d.owner_user_id == Some(user.id))
+        .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+    daemon.owner_user_id = None;
+    daemon.claim_code_hash = None;
+    daemon.claim_code_created_unix_ms = None;
+    daemon.updated_unix_ms = now_unix_ms();
+    audit(
+        &mut store,
+        "daemon_revoked",
+        Some(user.id),
+        Some(daemon_id.clone()),
+        json!({}),
+    );
+    persist_locked(&state, &store)?;
+    state.claim_codes.lock().await.remove(&daemon_id);
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimStartRequest {
+    claim_code: String,
+}
+
+async fn api_claim_start(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimStartRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    let code = body.claim_code.trim().replace(' ', "").to_ascii_uppercase();
+    if code.is_empty() {
+        return Err(ApiError::bad_request("claim_code is required"));
+    }
+    let code_hash = sha256_b64u(code.as_bytes());
+    let now = now_unix_ms();
+    let daemon = {
+        let store = state.store.lock().await;
+        store
+            .daemons
+            .iter()
+            .find(|d| {
+                d.owner_user_id.is_none()
+                    && d.claim_code_hash.as_deref() == Some(&code_hash)
+                    && d.claim_code_created_unix_ms
+                        .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS)
+            })
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("claim code not found"))?
+    };
+    let claim_id = Uuid::new_v4().to_string();
+    let challenge = random_b64u(32);
+    state.pending_claims.lock().await.insert(
+        claim_id.clone(),
+        PendingClaim {
+            user_id: user.id,
+            daemon_id: daemon.daemon_id.clone(),
+            challenge: challenge.clone(),
+            created_unix_ms: now_unix_ms(),
+            status: ClaimStatus::Pending,
+        },
+    );
+    enqueue_event(
+        &state,
+        &daemon.daemon_id,
+        RendezvousEvent {
+            id: Uuid::new_v4().to_string(),
+            kind: "claim_challenge".to_string(),
+            claim_id: Some(claim_id.clone()),
+            challenge: Some(challenge),
+            ..RendezvousEvent::default()
+        },
+    )
+    .await;
+    {
+        let mut store = state.store.lock().await;
+        audit(
+            &mut store,
+            "daemon_claim_started",
+            Some(user.id),
+            Some(daemon.daemon_id.clone()),
+            json!({ "claim_id": claim_id }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "claim_id": claim_id,
+        "daemon_id": daemon.daemon_id,
+    })))
+}
+
+async fn api_claim_status(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(claim_id): AxumPath<String>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    let mut claims = state.pending_claims.lock().await;
+    let claim = claims
+        .get_mut(claim_id.trim())
+        .ok_or_else(|| ApiError::not_found("claim not found"))?;
+    if claim.user_id != user.id {
+        return Err(ApiError::forbidden("claim belongs to a different account"));
+    }
+    if matches!(claim.status, ClaimStatus::Pending)
+        && now_unix_ms().saturating_sub(claim.created_unix_ms) > CLAIM_TIMEOUT_MS
+    {
+        claim.status = ClaimStatus::Rejected {
+            error: "claim timed out".to_string(),
+        };
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "claim_id": claim_id,
+        "daemon_id": claim.daemon_id,
+        "result": claim.status,
+    })))
+}
+
+async fn api_audit(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    let store = state.store.lock().await;
+    let events = store
+        .audit
+        .iter()
+        .filter(|event| event.user_id == Some(user.id))
+        .rev()
+        .take(100)
+        .cloned()
+        .collect::<Vec<_>>();
+    Ok(Json(json!({
+        "ok": true,
+        "events": events,
+    })))
+}
+
+#[derive(Debug, Deserialize)]
+struct StatusQuery {
+    #[serde(default)]
+    daemon_id: String,
+}
+
+async fn api_status(
+    State(state): State<Arc<AppState>>,
+    Query(query): Query<StatusQuery>,
+) -> Json<serde_json::Value> {
+    let daemon_id = query.daemon_id.trim();
+    let (daemon, queued) = {
+        let store = state.store.lock().await;
+        let daemon = store
+            .daemons
+            .iter()
+            .find(|d| d.daemon_id == daemon_id)
+            .cloned();
+        let queued = state
+            .event_queues
+            .lock()
+            .await
+            .get(daemon_id)
+            .map(|q| q.len())
+            .unwrap_or(0);
+        (daemon, queued)
+    };
+    Json(json!({
+        "ok": true,
+        "daemon_id": daemon_id,
+        "registered": daemon.is_some(),
+        "claimed": daemon.as_ref().and_then(|d| d.owner_user_id).is_some(),
+        "daemon_public_key": daemon.as_ref().map(|d| d.daemon_public_key.as_str()).unwrap_or(""),
+        "queued": queued,
+        "daemon_auth_required": state.config.daemon_token.is_some(),
+    }))
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonRegisterRequest {
+    protocol: String,
+    daemon_id: String,
+    daemon_public_key: String,
+}
+
+async fn daemon_register(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DaemonRegisterRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    if body.protocol != PROTOCOL {
+        return Err(ApiError::bad_request("unsupported protocol"));
+    }
+    let daemon_id = body.daemon_id.trim().to_string();
+    let daemon_public_key = body.daemon_public_key.trim().to_string();
+    if daemon_id.is_empty() || daemon_public_key.is_empty() {
+        return Err(ApiError::bad_request(
+            "daemon_id and daemon_public_key are required",
+        ));
+    }
+    let mut claim_code = None;
+    let claimed = {
+        let mut claim_codes = state.claim_codes.lock().await;
+        let mut store = state.store.lock().await;
+        let now = now_unix_ms();
+        let claimed_now = if let Some(existing) =
+            store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id)
+        {
+            if existing.owner_user_id.is_some() && existing.daemon_public_key != daemon_public_key {
+                return Err(ApiError::conflict(
+                    "claimed daemon_id is already bound to a different daemon key",
+                ));
+            }
+            existing.daemon_public_key = daemon_public_key.clone();
+            existing.last_seen_unix_ms = now;
+            existing.updated_unix_ms = now;
+            if existing.owner_user_id.is_none() {
+                claim_code = Some(ensure_claim_code(&mut claim_codes, existing));
+            }
+            existing.owner_user_id.is_some()
+        } else {
+            let mut record = DaemonRecord {
+                daemon_id: daemon_id.clone(),
+                daemon_public_key: daemon_public_key.clone(),
+                owner_user_id: None,
+                claim_code_hash: None,
+                claim_code_created_unix_ms: None,
+                registered_unix_ms: now,
+                last_seen_unix_ms: now,
+                updated_unix_ms: now,
+            };
+            claim_code = Some(ensure_claim_code(&mut claim_codes, &mut record));
+            store.daemons.push(record);
+            false
+        };
+        persist_locked(&state, &store)?;
+        claimed_now
+    };
+    let claim_url = claim_code
+        .as_ref()
+        .map(|code| format!("{}/connect?claim_code={code}", state.config.public_origin));
+    if let Some(url) = claim_url.as_deref() {
+        eprintln!("[connect] daemon {daemon_id} awaiting claim: {url}");
+    }
+    Ok(Json(json!({
+        "ok": true,
+        "claimed": claimed,
+        "claim_code": claim_code,
+        "claim_url": claim_url,
+        "daemon_public_key": daemon_public_key,
+    })))
+}
+
+fn ensure_claim_code(
+    claim_codes: &mut HashMap<String, String>,
+    daemon: &mut DaemonRecord,
+) -> String {
+    let now = now_unix_ms();
+    let existing_is_fresh = daemon
+        .claim_code_created_unix_ms
+        .is_some_and(|created| now.saturating_sub(created) <= CLAIM_CODE_TTL_MS);
+    if existing_is_fresh {
+        if let Some(code) = claim_codes.get(&daemon.daemon_id).cloned() {
+            return code;
+        }
+    }
+    if !existing_is_fresh {
+        claim_codes.remove(&daemon.daemon_id);
+    }
+    let code = generate_claim_code();
+    daemon.claim_code_hash = Some(sha256_b64u(code.as_bytes()));
+    daemon.claim_code_created_unix_ms = Some(now);
+    claim_codes.insert(daemon.daemon_id.clone(), code.clone());
+    code
+}
+
+fn generate_claim_code() -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
+    let mut bytes = [0u8; 8];
+    rand::thread_rng().fill_bytes(&mut bytes);
+    bytes
+        .iter()
+        .map(|b| ALPHABET[*b as usize % ALPHABET.len()] as char)
+        .collect()
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonNextQuery {
+    daemon_id: String,
+    #[serde(default)]
+    timeout_ms: Option<u64>,
+}
+
+async fn daemon_next(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<DaemonNextQuery>,
+) -> ApiResult<Response> {
+    require_daemon_auth(&state, &headers)?;
+    let daemon_id = query.daemon_id.trim().to_string();
+    if daemon_id.is_empty() {
+        return Err(ApiError::bad_request("daemon_id is required"));
+    }
+    touch_daemon(&state, &daemon_id).await?;
+    let timeout = Duration::from_millis(query.timeout_ms.unwrap_or(15_000).min(30_000));
+    let deadline = tokio::time::Instant::now() + timeout;
+    loop {
+        if let Some(event) = pop_event(&state, &daemon_id).await {
+            return Ok(Json(event).into_response());
+        }
+        let now = tokio::time::Instant::now();
+        if now >= deadline {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+        let remaining = deadline.saturating_duration_since(now);
+        if tokio::time::timeout(remaining, state.event_notify.notified())
+            .await
+            .is_err()
+        {
+            return Ok(StatusCode::NO_CONTENT.into_response());
+        }
+    }
+}
+
+async fn touch_daemon(state: &AppState, daemon_id: &str) -> ApiResult<()> {
+    let mut store = state.store.lock().await;
+    if let Some(daemon) = store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id) {
+        daemon.last_seen_unix_ms = now_unix_ms();
+        daemon.updated_unix_ms = daemon.last_seen_unix_ms;
+        persist_locked(state, &store)?;
+        Ok(())
+    } else {
+        Err(ApiError::not_found("daemon is not registered"))
+    }
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct RendezvousEvent {
+    id: String,
+    kind: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    sdp: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    candidate: Option<serde_json::Value>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    session_grant: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_nonce: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    claim_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    challenge: Option<String>,
+}
+
+async fn enqueue_event(state: &AppState, daemon_id: &str, event: RendezvousEvent) {
+    let mut queues = state.event_queues.lock().await;
+    queues
+        .entry(daemon_id.to_string())
+        .or_default()
+        .push_back(event);
+    drop(queues);
+    state.event_notify.notify_waiters();
+}
+
+async fn pop_event(state: &AppState, daemon_id: &str) -> Option<RendezvousEvent> {
+    let mut queues = state.event_queues.lock().await;
+    let queue = queues.get_mut(daemon_id)?;
+    let event = queue.pop_front();
+    if queue.is_empty() {
+        queues.remove(daemon_id);
+    }
+    event
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonAnswerRequest {
+    daemon_id: String,
+    request_id: String,
+    session_id: String,
+    sdp: String,
+    binding: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+struct BrowserAnswerResponse {
+    ok: bool,
+    session_id: String,
+    sdp: String,
+    binding: serde_json::Value,
+    daemon_public_key: String,
+    session_grant: String,
+}
+
+async fn daemon_answer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DaemonAnswerRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    let pending = state
+        .pending_offers
+        .lock()
+        .await
+        .remove(body.request_id.trim())
+        .ok_or_else(|| ApiError::not_found("offer not found"))?;
+    if pending.daemon_id != body.daemon_id {
+        let _ = pending
+            .response_tx
+            .send(Err("daemon_id mismatch in answer".to_string()));
+        return Err(ApiError::bad_request("daemon_id mismatch"));
+    }
+    let validation_error = validate_dashboard_binding(
+        &body.binding,
+        &pending.daemon_public_key,
+        &pending.session_grant,
+    );
+    if let Err(error) = validation_error {
+        let _ = pending.response_tx.send(Err(error.clone()));
+        return Err(ApiError::bad_request(error));
+    }
+    let answer = BrowserAnswerResponse {
+        ok: true,
+        session_id: body.session_id,
+        sdp: body.sdp,
+        binding: body.binding,
+        daemon_public_key: pending.daemon_public_key,
+        session_grant: pending.session_grant,
+    };
+    let _ = pending.response_tx.send(Ok(answer));
+    {
+        let mut store = state.store.lock().await;
+        audit(
+            &mut store,
+            "dashboard_grant_answered",
+            Some(pending.user_id),
+            Some(pending.daemon_id),
+            json!({ "request_id": body.request_id }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+fn validate_dashboard_binding(
+    binding: &serde_json::Value,
+    daemon_public_key: &str,
+    session_grant: &str,
+) -> Result<(), String> {
+    let binding_key = binding
+        .get("daemon_public_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    if binding_key != daemon_public_key {
+        return Err("binding daemon_public_key mismatch".to_string());
+    }
+    let grant_hash = binding
+        .get("session_grant_sha256")
+        .and_then(|v| v.as_str())
+        .unwrap_or("");
+    let expected = sha256_b64u(session_grant.as_bytes());
+    if grant_hash != expected {
+        return Err("binding session_grant_sha256 mismatch".to_string());
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonErrorRequest {
+    daemon_id: String,
+    request_id: String,
+    error: String,
+}
+
+async fn daemon_error(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<DaemonErrorRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    if let Some(pending) = state
+        .pending_offers
+        .lock()
+        .await
+        .remove(body.request_id.trim())
+    {
+        if pending.daemon_id == body.daemon_id {
+            let _ = pending.response_tx.send(Err(body.error));
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct AckRequest {
+    daemon_id: String,
+    request_id: String,
+    ok: bool,
+}
+
+async fn daemon_ack(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AckRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    let _ = (body.daemon_id, body.request_id, body.ok);
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaimProofRequest {
+    daemon_id: String,
+    request_id: String,
+    claim_id: String,
+    challenge: String,
+    signature: String,
+}
+
+async fn daemon_claim_proof(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<ClaimProofRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_daemon_auth(&state, &headers)?;
+    let pending = state
+        .pending_claims
+        .lock()
+        .await
+        .get(body.claim_id.trim())
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("claim not found"))?;
+    if pending.daemon_id != body.daemon_id || pending.challenge != body.challenge {
+        reject_claim(&state, &body.claim_id, "claim proof mismatch").await;
+        return Err(ApiError::bad_request("claim proof mismatch"));
+    }
+    if !matches!(pending.status, ClaimStatus::Pending) {
+        return Err(ApiError::bad_request("claim is already resolved"));
+    }
+    if now_unix_ms().saturating_sub(pending.created_unix_ms) > CLAIM_TIMEOUT_MS {
+        reject_claim(&state, &body.claim_id, "claim timed out").await;
+        return Err(ApiError::bad_request("claim timed out"));
+    }
+    let daemon = {
+        let store = state.store.lock().await;
+        store
+            .daemons
+            .iter()
+            .find(|d| d.daemon_id == body.daemon_id)
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("daemon not found"))?
+    };
+    let payload = claim_signing_payload(
+        &body.claim_id,
+        &body.daemon_id,
+        &daemon.daemon_public_key,
+        &body.challenge,
+    );
+    if !verify_ed25519_b64u(
+        &daemon.daemon_public_key,
+        payload.as_bytes(),
+        body.signature.trim(),
+    ) {
+        reject_claim(&state, &body.claim_id, "claim signature invalid").await;
+        return Err(ApiError::bad_request("claim signature invalid"));
+    }
+    {
+        let mut store = state.store.lock().await;
+        let daemon = store
+            .daemons
+            .iter_mut()
+            .find(|d| d.daemon_id == body.daemon_id)
+            .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+        daemon.owner_user_id = Some(pending.user_id);
+        daemon.claim_code_hash = None;
+        daemon.claim_code_created_unix_ms = None;
+        daemon.updated_unix_ms = now_unix_ms();
+        audit(
+            &mut store,
+            "daemon_claimed",
+            Some(pending.user_id),
+            Some(body.daemon_id.clone()),
+            json!({ "claim_id": body.claim_id, "request_id": body.request_id }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    state.claim_codes.lock().await.remove(&body.daemon_id);
+    {
+        let mut claims = state.pending_claims.lock().await;
+        if let Some(claim) = claims.get_mut(body.claim_id.trim()) {
+            claim.status = ClaimStatus::Approved {
+                daemon_id: body.daemon_id.clone(),
+            };
+        }
+    }
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn reject_claim(state: &AppState, claim_id: &str, error: &str) {
+    let mut claims = state.pending_claims.lock().await;
+    if let Some(claim) = claims.get_mut(claim_id.trim()) {
+        claim.status = ClaimStatus::Rejected {
+            error: error.to_string(),
+        };
+    }
+}
+
+fn claim_signing_payload(
+    claim_id: &str,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    challenge: &str,
+) -> String {
+    format!("{CLAIM_PROTOCOL}\n{claim_id}\n{daemon_id}\n{daemon_public_key}\n{challenge}\n")
+}
+
+fn verify_ed25519_b64u(public_key_b64u: &str, payload: &[u8], signature_b64u: &str) -> bool {
+    let Ok(public_key) = b64u_decode(public_key_b64u) else {
+        return false;
+    };
+    let Ok(signature) = b64u_decode(signature_b64u) else {
+        return false;
+    };
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, public_key)
+        .verify(payload, &signature)
+        .is_ok()
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserOfferRequest {
+    daemon_id: String,
+    sdp: String,
+    #[serde(default)]
+    client_nonce: Option<String>,
+}
+
+async fn browser_offer(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BrowserOfferRequest>,
+) -> ApiResult<Response> {
+    let user = require_user(&state, &headers).await?;
+    let daemon_id = body.daemon_id.trim().to_string();
+    let sdp = body.sdp;
+    if daemon_id.is_empty() || sdp.trim().is_empty() {
+        return Err(ApiError::bad_request("daemon_id and sdp are required"));
+    }
+    let daemon = {
+        let store = state.store.lock().await;
+        store
+            .daemons
+            .iter()
+            .find(|d| d.daemon_id == daemon_id && d.owner_user_id == Some(user.id))
+            .cloned()
+            .ok_or_else(|| ApiError::not_found("daemon not found"))?
+    };
+    let request_id = Uuid::new_v4().to_string();
+    let session_grant = random_b64u(32);
+    let (tx, rx) = oneshot::channel();
+    state.pending_offers.lock().await.insert(
+        request_id.clone(),
+        PendingOffer {
+            daemon_id: daemon_id.clone(),
+            user_id: user.id,
+            daemon_public_key: daemon.daemon_public_key.clone(),
+            session_grant: session_grant.clone(),
+            response_tx: tx,
+        },
+    );
+    enqueue_event(
+        &state,
+        &daemon_id,
+        RendezvousEvent {
+            id: request_id.clone(),
+            kind: "offer".to_string(),
+            sdp: Some(sdp),
+            session_grant: Some(session_grant),
+            client_nonce: body
+                .client_nonce
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            ..RendezvousEvent::default()
+        },
+    )
+    .await;
+    {
+        let mut store = state.store.lock().await;
+        audit(
+            &mut store,
+            "dashboard_grant_started",
+            Some(user.id),
+            Some(daemon_id.clone()),
+            json!({ "request_id": request_id }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    match tokio::time::timeout(Duration::from_millis(OFFER_TIMEOUT_MS), rx).await {
+        Ok(Ok(Ok(answer))) => Ok(Json(answer).into_response()),
+        Ok(Ok(Err(error))) => Err(ApiError::new(StatusCode::BAD_GATEWAY, error)),
+        Ok(Err(_)) => Err(ApiError::new(
+            StatusCode::BAD_GATEWAY,
+            "daemon answer channel closed",
+        )),
+        Err(_) => {
+            state.pending_offers.lock().await.remove(&request_id);
+            Err(ApiError::new(
+                StatusCode::GATEWAY_TIMEOUT,
+                "timed out waiting for daemon answer",
+            ))
+        }
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserIceRequest {
+    daemon_id: String,
+    session_id: String,
+    #[serde(default)]
+    candidate: serde_json::Value,
+}
+
+async fn browser_ice(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BrowserIceRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_owned_daemon(&state, user.id, &body.daemon_id).await?;
+    enqueue_event(
+        &state,
+        body.daemon_id.trim(),
+        RendezvousEvent {
+            id: Uuid::new_v4().to_string(),
+            kind: "ice".to_string(),
+            session_id: Some(body.session_id),
+            candidate: Some(body.candidate),
+            ..RendezvousEvent::default()
+        },
+    )
+    .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+#[derive(Debug, Deserialize)]
+struct BrowserCloseRequest {
+    daemon_id: String,
+    session_id: String,
+}
+
+async fn browser_close(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<BrowserCloseRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_owned_daemon(&state, user.id, &body.daemon_id).await?;
+    enqueue_event(
+        &state,
+        body.daemon_id.trim(),
+        RendezvousEvent {
+            id: Uuid::new_v4().to_string(),
+            kind: "close".to_string(),
+            session_id: Some(body.session_id),
+            ..RendezvousEvent::default()
+        },
+    )
+    .await;
+    Ok(Json(json!({ "ok": true })))
+}
+
+async fn require_owned_daemon(
+    state: &AppState,
+    user_id: Uuid,
+    daemon_id: &str,
+) -> ApiResult<DaemonRecord> {
+    let store = state.store.lock().await;
+    store
+        .daemons
+        .iter()
+        .find(|d| d.daemon_id == daemon_id.trim() && d.owner_user_id == Some(user_id))
+        .cloned()
+        .ok_or_else(|| ApiError::not_found("daemon not found"))
+}
+
+fn connect_ui_html(origin: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Intendant Connect</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #111318;
+      --panel: #191c23;
+      --panel-2: #20242d;
+      --line: #343946;
+      --text: #eef1f7;
+      --muted: #a9b0bf;
+      --accent: #7db4ff;
+      --ok: #8fe19a;
+      --warn: #ffd37a;
+      --err: #ff8aa3;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; }}
+    header {{ padding: 20px 24px 12px; border-bottom: 1px solid var(--line); background: #151820; }}
+    main {{ width: min(1120px, calc(100vw - 32px)); margin: 0 auto; padding: 20px 0 40px; }}
+    h1 {{ font-size: 20px; line-height: 1.2; margin: 0; letter-spacing: 0; }}
+    h2 {{ font-size: 15px; margin: 0 0 12px; letter-spacing: 0; }}
+    .sub {{ color: var(--muted); font-size: 13px; margin-top: 4px; }}
+    .grid {{ display: grid; grid-template-columns: 360px 1fr; gap: 16px; align-items: start; }}
+    section {{ border: 1px solid var(--line); background: var(--panel); border-radius: 8px; padding: 16px; }}
+    label {{ display: block; color: var(--muted); font-size: 12px; margin-bottom: 6px; }}
+    input {{ width: 100%; height: 38px; padding: 8px 10px; color: var(--text); background: #10131a; border: 1px solid var(--line); border-radius: 6px; font: inherit; }}
+    button {{ height: 36px; padding: 0 12px; color: #07111f; background: var(--accent); border: 0; border-radius: 6px; font-weight: 650; cursor: pointer; }}
+    button.secondary {{ color: var(--text); background: var(--panel-2); border: 1px solid var(--line); }}
+    button.danger {{ color: var(--err); background: transparent; border: 1px solid var(--err); }}
+    button:disabled {{ opacity: .55; cursor: default; }}
+    .stack {{ display: grid; gap: 12px; }}
+    .row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+    .split {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
+    .status {{ min-height: 20px; color: var(--muted); font-size: 13px; overflow-wrap: anywhere; }}
+    .status.ok {{ color: var(--ok); }}
+    .status.err {{ color: var(--err); }}
+    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
+    th, td {{ text-align: left; padding: 10px 8px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
+    th {{ color: var(--muted); font-weight: 600; }}
+    code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
+    .pill {{ display: inline-flex; align-items: center; height: 22px; padding: 0 8px; border-radius: 999px; background: var(--panel-2); color: var(--muted); font-size: 12px; }}
+    .pill.ok {{ color: var(--ok); }}
+    .pill.warn {{ color: var(--warn); }}
+    .hidden {{ display: none !important; }}
+    .audit {{ display: grid; gap: 8px; }}
+    .event {{ padding: 10px; border: 1px solid var(--line); border-radius: 6px; background: #141720; font-size: 12px; }}
+    @media (max-width: 820px) {{
+      .grid {{ grid-template-columns: 1fr; }}
+      header {{ padding-left: 16px; padding-right: 16px; }}
+    }}
+  </style>
+</head>
+<body>
+  <header>
+    <div class="split">
+      <div>
+        <h1>Intendant Connect</h1>
+        <div class="sub">{origin}</div>
+      </div>
+      <button id="logout" class="secondary hidden">Sign Out</button>
+    </div>
+  </header>
+  <main class="grid">
+    <section id="auth">
+      <h2>Account</h2>
+      <div class="stack">
+        <div>
+          <label for="account">Account name</label>
+          <input id="account" autocomplete="username webauthn" placeholder="you">
+        </div>
+        <div>
+          <label for="display">Display name</label>
+          <input id="display" autocomplete="name" placeholder="Your name">
+        </div>
+        <div class="row">
+          <button id="login">Sign In</button>
+          <button id="register" class="secondary">Create Passkey</button>
+        </div>
+        <div id="auth-status" class="status"></div>
+      </div>
+    </section>
+
+    <section id="manage" class="hidden">
+      <div class="split">
+        <div>
+          <h2>Daemons</h2>
+          <div id="who" class="sub"></div>
+        </div>
+        <button id="refresh" class="secondary">Refresh</button>
+      </div>
+      <div class="stack" style="margin-top:12px">
+        <div class="row">
+          <input id="claim-code" placeholder="Claim code" style="max-width:260px">
+          <button id="claim">Claim</button>
+        </div>
+        <div id="claim-status" class="status"></div>
+        <div style="overflow-x:auto">
+          <table>
+            <thead><tr><th>Name</th><th>Status</th><th>Key</th><th></th></tr></thead>
+            <tbody id="daemon-rows"></tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <section id="audit-section" class="hidden" style="grid-column: 1 / -1">
+      <h2>Audit</h2>
+      <div id="audit" class="audit"></div>
+    </section>
+  </main>
+<script>
+const $ = id => document.getElementById(id);
+const state = {{ user: null, daemons: [] }};
+
+function setStatus(id, text, kind = '') {{
+  const el = $(id);
+  el.textContent = text || '';
+  el.className = `status ${{kind}}`;
+}}
+
+async function api(path, options = {{}}) {{
+  const resp = await fetch(path, {{
+    ...options,
+    headers: {{
+      'content-type': 'application/json',
+      ...(options.headers || {{}}),
+    }},
+  }});
+  const body = await resp.json().catch(() => ({{}}));
+  if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${{resp.status}}`);
+  return body;
+}}
+
+function b64uToBuf(value) {{
+  const text = String(value || '').replace(/-/g, '+').replace(/_/g, '/');
+  const padded = text.padEnd(Math.ceil(text.length / 4) * 4, '=');
+  const bin = atob(padded);
+  const out = new Uint8Array(bin.length);
+  for (let i = 0; i < bin.length; i += 1) out[i] = bin.charCodeAt(i);
+  return out.buffer;
+}}
+
+function bufToB64u(value) {{
+  const bytes = new Uint8Array(value || new ArrayBuffer(0));
+  let bin = '';
+  for (const b of bytes) bin += String.fromCharCode(b);
+  return btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}}
+
+function publicKeyOptions(start) {{
+  const options = start.options && (start.options.publicKey || start.options);
+  if (!options) throw new Error('missing WebAuthn options');
+  options.challenge = b64uToBuf(options.challenge);
+  if (options.user?.id) options.user.id = b64uToBuf(options.user.id);
+  for (const cred of options.excludeCredentials || []) cred.id = b64uToBuf(cred.id);
+  for (const cred of options.allowCredentials || []) cred.id = b64uToBuf(cred.id);
+  return options;
+}}
+
+function registrationCredentialJSON(credential) {{
+  return {{
+    id: credential.id,
+    clientDataJSON: bufToB64u(credential.response.clientDataJSON),
+    attestationObject: bufToB64u(credential.response.attestationObject),
+    transports: credential.response.getTransports ? credential.response.getTransports() : [],
+  }};
+}}
+
+function authenticationCredentialJSON(credential) {{
+  return {{
+    id: credential.id,
+    clientDataJSON: bufToB64u(credential.response.clientDataJSON),
+    authenticatorData: bufToB64u(credential.response.authenticatorData),
+    signature: bufToB64u(credential.response.signature),
+    userHandle: credential.response.userHandle ? bufToB64u(credential.response.userHandle) : null,
+  }};
+}}
+
+async function createPasskey() {{
+  const account = $('account').value.trim();
+  const display = $('display').value.trim();
+  setStatus('auth-status', 'Waiting for passkey', '');
+  const start = await api('/api/auth/register/start', {{
+    method: 'POST',
+    body: JSON.stringify({{ account_name: account, display_name: display }}),
+  }});
+  const credential = await navigator.credentials.create({{ publicKey: publicKeyOptions(start) }});
+  const done = await api('/api/auth/register/finish', {{
+    method: 'POST',
+    body: JSON.stringify({{
+      flow_id: start.flow_id,
+      credential: registrationCredentialJSON(credential),
+    }}),
+  }});
+  state.user = done.user;
+  setStatus('auth-status', 'Signed in', 'ok');
+  await refreshAll();
+}}
+
+async function login() {{
+  const account = $('account').value.trim();
+  setStatus('auth-status', 'Waiting for passkey', '');
+  const start = await api('/api/auth/login/start', {{
+    method: 'POST',
+    body: JSON.stringify({{ account_name: account }}),
+  }});
+  const credential = await navigator.credentials.get({{ publicKey: publicKeyOptions(start) }});
+  const done = await api('/api/auth/login/finish', {{
+    method: 'POST',
+    body: JSON.stringify({{
+      flow_id: start.flow_id,
+      credential: authenticationCredentialJSON(credential),
+    }}),
+  }});
+  state.user = done.user;
+  setStatus('auth-status', 'Signed in', 'ok');
+  await refreshAll();
+}}
+
+async function claimDaemon() {{
+  const claimCode = $('claim-code').value.trim();
+  setStatus('claim-status', 'Waiting for daemon proof', '');
+  const start = await api('/api/claims/claim', {{
+    method: 'POST',
+    body: JSON.stringify({{ claim_code: claimCode }}),
+  }});
+  const deadline = Date.now() + 65000;
+  while (Date.now() < deadline) {{
+    await new Promise(resolve => setTimeout(resolve, 750));
+    const status = await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}`);
+    if (status.result?.status === 'approved') {{
+      setStatus('claim-status', `Claimed ${{status.result.daemon_id}}`, 'ok');
+      $('claim-code').value = '';
+      await refreshAll();
+      return;
+    }}
+    if (status.result?.status === 'rejected') {{
+      throw new Error(status.result.error || 'claim rejected');
+    }}
+  }}
+  throw new Error('claim timed out');
+}}
+
+async function refreshAll() {{
+  const me = await api('/api/me');
+  state.user = me.authenticated ? me.user : null;
+  renderAuth();
+  if (!state.user) return;
+  const [daemons, audit] = await Promise.all([
+    api('/api/daemons'),
+    api('/api/audit'),
+  ]);
+  state.daemons = daemons.daemons || [];
+  renderDaemons();
+  renderAudit(audit.events || []);
+}}
+
+function renderAuth() {{
+  const authed = Boolean(state.user);
+  $('manage').classList.toggle('hidden', !authed);
+  $('audit-section').classList.toggle('hidden', !authed);
+  $('logout').classList.toggle('hidden', !authed);
+  $('who').textContent = authed ? `${{state.user.display_name || state.user.account_name}} (${{
+    state.user.passkey_count
+  }} passkey${{state.user.passkey_count === 1 ? '' : 's'}})` : '';
+}}
+
+function renderDaemons() {{
+  const rows = $('daemon-rows');
+  rows.innerHTML = '';
+  if (state.daemons.length === 0) {{
+    rows.innerHTML = '<tr><td colspan="4"><span class="sub">No claimed daemons</span></td></tr>';
+    return;
+  }}
+  for (const daemon of state.daemons) {{
+    const tr = document.createElement('tr');
+    const key = String(daemon.daemon_public_key || '');
+    tr.innerHTML = `
+      <td><code>${{escapeHtml(daemon.daemon_id)}}</code></td>
+      <td><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span></td>
+      <td><code>${{escapeHtml(key.slice(0, 16))}}${{key.length > 16 ? '...' : ''}}</code></td>
+      <td class="row">
+        <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open</button>
+        <button class="danger" data-revoke="${{escapeAttr(daemon.daemon_id)}}">Revoke</button>
+      </td>`;
+    rows.appendChild(tr);
+  }}
+  rows.querySelectorAll('[data-open]').forEach(button => {{
+    button.addEventListener('click', () => {{
+      const id = button.getAttribute('data-open');
+      window.location.href = `/app?connect=1&daemon_id=${{encodeURIComponent(id)}}`;
+    }});
+  }});
+  rows.querySelectorAll('[data-revoke]').forEach(button => {{
+    button.addEventListener('click', async () => {{
+      const id = button.getAttribute('data-revoke');
+      await api(`/api/daemons/${{encodeURIComponent(id)}}/revoke`, {{ method: 'POST', body: '{{}}' }});
+      await refreshAll();
+    }});
+  }});
+}}
+
+function renderAudit(events) {{
+  const el = $('audit');
+  el.innerHTML = '';
+  if (!events.length) {{
+    el.innerHTML = '<div class="sub">No audit events</div>';
+    return;
+  }}
+  for (const event of events.slice(0, 30)) {{
+    const div = document.createElement('div');
+    div.className = 'event';
+    const date = new Date(Number(event.unix_ms || 0)).toLocaleString();
+    div.innerHTML = `<strong>${{escapeHtml(event.event)}}</strong> <span class="sub">${{escapeHtml(date)}}</span><br><code>${{escapeHtml(event.daemon_id || '')}}</code>`;
+    el.appendChild(div);
+  }}
+}}
+
+function escapeHtml(value) {{
+  return String(value ?? '').replace(/[&<>"']/g, c => ({{'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}}[c]));
+}}
+function escapeAttr(value) {{ return escapeHtml(value); }}
+
+$('register').addEventListener('click', () => createPasskey().catch(err => setStatus('auth-status', err.message, 'err')));
+$('login').addEventListener('click', () => login().catch(err => setStatus('auth-status', err.message, 'err')));
+$('claim').addEventListener('click', () => claimDaemon().catch(err => setStatus('claim-status', err.message, 'err')));
+$('refresh').addEventListener('click', () => refreshAll().catch(err => setStatus('claim-status', err.message, 'err')));
+$('logout').addEventListener('click', async () => {{ await api('/api/logout', {{ method: 'POST', body: '{{}}' }}); state.user = null; renderAuth(); }});
+
+const params = new URLSearchParams(location.search);
+if (params.get('claim_code')) $('claim-code').value = params.get('claim_code');
+refreshAll().catch(() => renderAuth());
+</script>
+</body>
+</html>"#
+    )
+}

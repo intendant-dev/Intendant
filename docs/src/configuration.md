@@ -307,9 +307,9 @@ optional `credential`.
 
 ### `[connect]`
 
-Experimental Intendant Connect rendezvous client for public-origin dashboard
-bootstrap work. This is disabled by default and does **not** replace dashboard
-mTLS. When enabled, the daemon opens outbound requests to a rendezvous service
+Experimental Intendant Connect client for public-origin dashboard access. This
+is disabled by default and does **not** replace local/offline dashboard mTLS.
+When enabled, the daemon opens outbound requests to a Connect/rendezvous service
 that brokers WebRTC dashboard-control signaling; the browser still verifies the
 daemon-signed DataChannel binding before sending dashboard RPC.
 
@@ -318,9 +318,49 @@ daemon-signed DataChannel binding before sending dashboard RPC.
 | `enabled` | bool | `false` | Enable outbound Connect rendezvous polling |
 | `rendezvous_url` | string | unset | Base URL of the Connect/rendezvous service |
 | `daemon_id` | string | daemon identity public key | Public daemon id at the rendezvous service |
-| `auth_token` | string | unset | Optional bearer token for service authentication; not dashboard authorization |
+| `auth_token` | string | unset | Optional bearer token for daemon-to-service authentication; not dashboard authorization |
 | `poll_timeout_ms` | integer | `15000` | Long-poll timeout per daemon `/next` request |
 | `retry_delay_ms` | integer | `1000` | Delay after transient rendezvous errors |
+
+Hosted Connect uses the same daemon-side settings:
+
+```toml
+[connect]
+enabled = true
+rendezvous_url = "https://connect.intendant.dev"
+daemon_id = "vortex-deb-x11-intendant"
+auth_token = "same daemon token configured on intendant-connect"
+```
+
+The service is a separate binary:
+
+```bash
+INTENDANT_CONNECT_TOKEN="shared daemon bearer token" \
+  ./target/release/intendant-connect \
+    --listen 127.0.0.1:9876 \
+    --origin https://connect.intendant.dev \
+    --rp-id intendant.dev \
+    --static-root static \
+    --data-file /var/lib/intendant-connect/state.json
+```
+
+`intendant-connect` is intended to sit behind public TLS for the configured
+origin. It handles passkey-only account sessions, claim-code ownership proof,
+daemon list/open/revoke UI, short-lived dashboard grants, WebRTC signaling, and
+a capped audit log. The state file durably stores users/passkeys, daemon
+ownership, hashed claim codes, and audit events. Plain claim codes, WebAuthn
+challenge state, pending offers, and issued dashboard grants are memory-only.
+
+The service accepts equivalent environment variables:
+
+| Env | Equivalent flag |
+|-----|-----------------|
+| `INTENDANT_CONNECT_LISTEN` | `--listen` |
+| `INTENDANT_CONNECT_ORIGIN` | `--origin` |
+| `INTENDANT_CONNECT_RP_ID` | `--rp-id` |
+| `INTENDANT_CONNECT_STATIC_ROOT` | `--static-root` |
+| `INTENDANT_CONNECT_DATA_FILE` | `--data-file` |
+| `INTENDANT_CONNECT_TOKEN` | `--daemon-token` |
 
 For local E2E without editing `intendant.toml`, the daemon also accepts
 environment overrides:
@@ -328,20 +368,30 @@ environment overrides:
 ```bash
 INTENDANT_CONNECT_RENDEZVOUS_URL=http://127.0.0.1:9876 \
 INTENDANT_CONNECT_DAEMON_ID=connect-e2e-daemon \
+INTENDANT_CONNECT_TOKEN=shared-dev-token \
   ./target/release/intendant --no-tui --web 8876
 ```
 
-The committed validator starts that local rendezvous emulator itself:
+There are two committed validators. The hosted MVP validator starts
+`intendant-connect`, a daemon, and a browser virtual authenticator:
+
+```bash
+node scripts/validate-connect-hosted-mvp.cjs
+```
+
+The protocol-emulator validator starts a local rendezvous HTTP origin:
 
 ```bash
 PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
   node scripts/validate-connect-rendezvous.cjs
 ```
 
-The emulator intentionally has no account, passkey, claim-code, or durable
-device registry. It exists to prove the browser-public-origin → rendezvous →
-daemon-outbound-signaling → direct WebRTC DataChannel path while keeping the
-normal dashboard mTLS default in place.
+The emulator intentionally has no account, passkey, claim-code, durable device
+registry, or authorization-grant policy. It exists to prove the
+browser-public-origin -> rendezvous -> daemon-outbound-signaling -> direct
+WebRTC DataChannel path while keeping the normal dashboard mTLS default in
+place. The hosted MVP validator covers passkeys, claim proof, grant binding,
+revoke, and audit.
 
 ### `[server]` (daemon and federation)
 

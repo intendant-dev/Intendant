@@ -1,9 +1,9 @@
 //! Outbound Intendant Connect rendezvous client for dashboard-control signaling.
 //!
-//! This module intentionally implements only signaling. It does not authorize a
-//! browser, issue grants, or replace mTLS dashboard access. A production Connect
-//! service must wrap this with account/passkey/device policy; this client is the
-//! daemon-side transport substrate and local E2E hook.
+//! This module intentionally implements only signaling plus opaque session-grant
+//! binding. It does not authorize a browser or replace mTLS dashboard access. A
+//! production Connect service must wrap this with account/passkey/device policy;
+//! this client is the daemon-side transport substrate and local E2E hook.
 
 use crate::daemon_identity::DaemonIdentity;
 use crate::dashboard_control::DashboardControlRegistry;
@@ -11,13 +11,25 @@ use crate::project::ConnectConfig;
 use reqwest::{Client, RequestBuilder, Url};
 use serde::{Deserialize, Serialize};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
+
+const REGISTER_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Serialize)]
 struct RegisterRequest {
     protocol: &'static str,
     daemon_id: String,
     daemon_public_key: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct RegisterResponse {
+    #[serde(default)]
+    claimed: bool,
+    #[serde(default)]
+    claim_code: Option<String>,
+    #[serde(default)]
+    claim_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -30,6 +42,14 @@ struct RendezvousEvent {
     session_id: Option<String>,
     #[serde(default)]
     candidate: Option<serde_json::Value>,
+    #[serde(default)]
+    session_grant: Option<String>,
+    #[serde(default)]
+    client_nonce: Option<String>,
+    #[serde(default)]
+    claim_id: Option<String>,
+    #[serde(default)]
+    challenge: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -54,6 +74,16 @@ struct AckRequest {
     daemon_id: String,
     request_id: String,
     ok: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ClaimProofRequest {
+    protocol: &'static str,
+    daemon_id: String,
+    request_id: String,
+    claim_id: String,
+    challenge: String,
+    signature: String,
 }
 
 pub fn spawn_connect_rendezvous_client(
@@ -129,6 +159,7 @@ async fn run_connect_rendezvous_client(
             }
         }
 
+        let mut last_register = Instant::now();
         loop {
             match poll_next(&client, &base_url, &config, &daemon_id).await {
                 Ok(Some(event)) => {
@@ -137,12 +168,28 @@ async fn run_connect_rendezvous_client(
                         &base_url,
                         &config,
                         &daemon_id,
+                        &identity,
                         &dashboard_control,
                         event,
                     )
                     .await;
                 }
-                Ok(None) => {}
+                Ok(None) => {
+                    if last_register.elapsed() >= REGISTER_REFRESH_INTERVAL {
+                        match register(&client, &base_url, &config, &daemon_id, &daemon_public_key)
+                            .await
+                        {
+                            Ok(()) => {
+                                last_register = Instant::now();
+                            }
+                            Err(e) => {
+                                eprintln!("[connect] refresh register failed: {e}");
+                                tokio::time::sleep(retry_delay).await;
+                                break;
+                            }
+                        }
+                    }
+                }
                 Err(e) => {
                     eprintln!("[connect] poll failed: {e}");
                     tokio::time::sleep(retry_delay).await;
@@ -174,6 +221,22 @@ async fn register(
     .await
     .map_err(|e| e.to_string())?
     .error_for_status()
+    .map_err(|e| e.to_string())?
+    .json::<RegisterResponse>()
+    .await
+    .map(|response| {
+        if !response.claimed {
+            if let Some(url) = response.claim_url.as_deref().filter(|url| !url.is_empty()) {
+                eprintln!("[connect] claim this daemon at {url}");
+            } else if let Some(code) = response
+                .claim_code
+                .as_deref()
+                .filter(|code| !code.is_empty())
+            {
+                eprintln!("[connect] claim this daemon with code {code}");
+            }
+        }
+    })
     .map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -208,6 +271,7 @@ async fn handle_event(
     base_url: &Url,
     config: &ConnectConfig,
     daemon_id: &str,
+    identity: &DaemonIdentity,
     dashboard_control: &Arc<DashboardControlRegistry>,
     event: RendezvousEvent,
 ) {
@@ -225,7 +289,22 @@ async fn handle_event(
                 .await;
                 return;
             };
-            match dashboard_control.answer_offer(sdp.to_string()).await {
+            let session_grant = event
+                .session_grant
+                .as_deref()
+                .map(str::trim)
+                .filter(|grant| !grant.is_empty())
+                .map(str::to_string);
+            let client_nonce = event
+                .client_nonce
+                .as_deref()
+                .map(str::trim)
+                .filter(|nonce| !nonce.is_empty())
+                .map(str::to_string);
+            match dashboard_control
+                .answer_offer(sdp.to_string(), session_grant, client_nonce)
+                .await
+            {
                 Ok(answer) => {
                     let body = AnswerRequest {
                         protocol: "intendant-connect-rendezvous-v1",
@@ -278,6 +357,64 @@ async fn handle_event(
             }
             let _ = post_ack(client, base_url, config, daemon_id, &event.id, true).await;
         }
+        "claim_challenge" => {
+            let Some(claim_id) = event.claim_id.as_deref().filter(|s| !s.trim().is_empty()) else {
+                let _ = post_error(
+                    client,
+                    base_url,
+                    config,
+                    daemon_id,
+                    &event.id,
+                    "missing claim_id",
+                )
+                .await;
+                return;
+            };
+            let Some(challenge) = event.challenge.as_deref().filter(|s| !s.trim().is_empty())
+            else {
+                let _ = post_error(
+                    client,
+                    base_url,
+                    config,
+                    daemon_id,
+                    &event.id,
+                    "missing claim challenge",
+                )
+                .await;
+                return;
+            };
+            let payload =
+                claim_signing_payload(claim_id, daemon_id, &identity.public_key_b64u(), challenge);
+            let body = ClaimProofRequest {
+                protocol: "intendant-connect-claim-v1",
+                daemon_id: daemon_id.to_string(),
+                request_id: event.id,
+                claim_id: claim_id.to_string(),
+                challenge: challenge.to_string(),
+                signature: identity.sign_b64u(payload.as_bytes()),
+            };
+            if let Err(e) = authenticated(
+                config,
+                client.post(match join_url(base_url, "api/daemon/claim-proof") {
+                    Ok(url) => url,
+                    Err(e) => {
+                        eprintln!("[connect] claim-proof URL failed: {e}");
+                        return;
+                    }
+                }),
+            )
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())
+            .and_then(|resp| {
+                resp.error_for_status()
+                    .map(|_| ())
+                    .map_err(|e| e.to_string())
+            }) {
+                eprintln!("[connect] post claim proof failed: {e}");
+            }
+        }
         other => {
             let _ = post_error(
                 client,
@@ -290,6 +427,17 @@ async fn handle_event(
             .await;
         }
     }
+}
+
+fn claim_signing_payload(
+    claim_id: &str,
+    daemon_id: &str,
+    daemon_public_key: &str,
+    challenge: &str,
+) -> String {
+    format!(
+        "intendant-connect-claim-v1\n{claim_id}\n{daemon_id}\n{daemon_public_key}\n{challenge}\n"
+    )
 }
 
 async fn post_error(

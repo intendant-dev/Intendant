@@ -3,6 +3,8 @@
 //! Handles: TUI ANSI frames, state snapshots, presence_welcome, tool requests/responses,
 //! outbound events, keyboard/resize input, presence_connect/disconnect, voice_log.
 
+use js_sys::Function;
+use serde::Serialize as _;
 use std::cell::RefCell;
 use std::rc::Rc;
 use wasm_bindgen::prelude::*;
@@ -40,6 +42,8 @@ pub struct ServerConnection {
     /// Handles server messages (term, state_snapshot, presence_welcome, tool_response, events).
     /// Stored as a shared handler so the main module can process messages.
     on_message_handler: Option<Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>>>,
+    /// Optional non-WebSocket sender used by public-origin Connect mode.
+    custom_sender: Option<Function>,
     /// Voice log sequence counter (monotonic).
     voice_log_seq: u64,
     /// Last event sequence number from the server.
@@ -64,6 +68,7 @@ impl ServerConnection {
             _onclose: None,
             _onerror: None,
             on_message_handler: None,
+            custom_sender: None,
             voice_log_seq: 0,
             last_event_seq: 0,
             server_session_id: None,
@@ -97,6 +102,10 @@ impl ServerConnection {
     /// Set a handler for parsed server messages.
     pub fn set_message_handler(&mut self, handler: Rc<RefCell<Box<dyn FnMut(serde_json::Value)>>>) {
         self.on_message_handler = Some(handler);
+    }
+
+    pub fn set_custom_sender(&mut self, sender: Option<Function>) {
+        self.custom_sender = sender;
     }
 
     /// Connect to the server WebSocket.
@@ -223,6 +232,22 @@ impl ServerConnection {
 
     /// Send a JSON message to the server.
     pub fn send_json(&self, msg: &serde_json::Value) -> bool {
+        if let Some(sender) = self.custom_sender.as_ref() {
+            let js_msg = match msg
+                .serialize(&serde_wasm_bindgen::Serializer::new().serialize_maps_as_objects(true))
+            {
+                Ok(value) => value,
+                Err(_) => return false,
+            };
+            let sent = sender
+                .call1(&JsValue::NULL, &js_msg)
+                .ok()
+                .and_then(|value| value.as_bool())
+                .unwrap_or(true);
+            if sent {
+                return true;
+            }
+        }
         if let Some(ref ws) = self.ws {
             if ws.ready_state() != 1 {
                 // WebSocket not in OPEN state — log and drop

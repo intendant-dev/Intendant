@@ -19,6 +19,7 @@ export class PresenceWeb {
      * Get the active voice provider name (e.g. "gemini", "openai", or "").
      */
     active_voice_provider(): string;
+    clear_server_sender(): void;
     connect_server(url: string): void;
     connect_voice(provider: string, token: string, model?: string | null, input_sample_rate?: number | null): void;
     disconnect_voice(): void;
@@ -55,6 +56,13 @@ export class PresenceWeb {
      * Returns `UiCommand[]` as a JS array for the rendering layer.
      */
     handle_server_message(msg: any): any;
+    /**
+     * Route a server-origin message delivered by a non-WebSocket transport
+     * through the same presence callbacks as the normal WebSocket path.
+     * Raw-message callbacks are intentionally suppressed to avoid
+     * re-entering the dashboard dispatcher that delivered the frame.
+     */
+    handle_tunneled_server_message(msg: any): void;
     /**
      * Handle a voice model tool call end-to-end.
      *
@@ -252,6 +260,13 @@ export class PresenceWeb {
      * Use for observer/follow-along mode.
      */
     set_passive_mode(passive: boolean): void;
+    /**
+     * Install a custom JSON sender for transports other than the daemon
+     * WebSocket. Public-origin Connect mode uses this to route the same
+     * presence/server messages through the verified dashboard-control
+     * DataChannel.
+     */
+    set_server_sender(sender: Function): void;
     set_state(state: any): void;
     /**
      * Change log verbosity and return commands to re-filter.
@@ -338,6 +353,7 @@ export interface InitOutput {
     readonly __wbg_presenceweb_free: (a: number, b: number) => void;
     readonly presenceweb_active_voice_model: (a: number) => [number, number];
     readonly presenceweb_active_voice_provider: (a: number) => [number, number];
+    readonly presenceweb_clear_server_sender: (a: number) => void;
     readonly presenceweb_connect_server: (a: number, b: number, c: number) => void;
     readonly presenceweb_connect_voice: (a: number, b: number, c: number, d: number, e: number, f: number, g: number, h: number) => void;
     readonly presenceweb_disconnect_voice: (a: number) => void;
@@ -350,6 +366,7 @@ export interface InitOutput {
     readonly presenceweb_handle_live_usage: (a: number, b: any) => any;
     readonly presenceweb_handle_server_event: (a: number, b: any) => number;
     readonly presenceweb_handle_server_message: (a: number, b: any) => any;
+    readonly presenceweb_handle_tunneled_server_message: (a: number, b: any) => void;
     readonly presenceweb_handle_voice_tool_call: (a: number, b: any) => any;
     readonly presenceweb_has_pending_approval: (a: number) => number;
     readonly presenceweb_inject_pending_approval_if_any: (a: number) => number;
@@ -411,6 +428,7 @@ export interface InitOutput {
     readonly presenceweb_set_on_voice_tool_call: (a: number, b: any) => void;
     readonly presenceweb_set_on_voice_transcript: (a: number, b: any) => void;
     readonly presenceweb_set_passive_mode: (a: number, b: number) => void;
+    readonly presenceweb_set_server_sender: (a: number, b: any) => void;
     readonly presenceweb_set_state: (a: number, b: any) => void;
     readonly presenceweb_set_verbosity: (a: number, b: number, c: number) => any;
     readonly presenceweb_take_display: (a: number, b: bigint) => void;

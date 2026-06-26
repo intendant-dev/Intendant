@@ -296,9 +296,359 @@ struct ActivePresence {
     direct_tx: mpsc::UnboundedSender<String>,
 }
 
+fn dashboard_control_presence_sender(
+    control_tx: mpsc::UnboundedSender<serde_json::Value>,
+) -> mpsc::UnboundedSender<String> {
+    let (tx, mut rx) = mpsc::unbounded_channel::<String>();
+    tokio::spawn(async move {
+        while let Some(text) = rx.recv().await {
+            let payload = serde_json::from_str::<serde_json::Value>(&text)
+                .unwrap_or_else(|_| serde_json::json!({"t": "raw", "text": text}));
+            let _ = control_tx.send(serde_json::json!({
+                "t": "event",
+                "payload": payload,
+            }));
+        }
+    });
+    tx
+}
+
+fn send_dashboard_control_presence_event(
+    control_tx: &mpsc::UnboundedSender<serde_json::Value>,
+    payload: serde_json::Value,
+) {
+    let _ = control_tx.send(serde_json::json!({
+        "t": "event",
+        "payload": payload,
+    }));
+}
+
+async fn dashboard_control_presence_connect(
+    request: crate::dashboard_control::DashboardPresenceConnectRequest,
+    active_presence: Arc<Mutex<Option<ActivePresence>>>,
+    voice_debug: Arc<Mutex<VoiceDebugState>>,
+    shared_session: SharedActiveSession,
+    bus: EventBus,
+    default_provider: String,
+    default_model: String,
+) {
+    voice_debug
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .connected = true;
+
+    let provider = request.provider.unwrap_or(default_provider);
+    let model = request.model.unwrap_or(default_model);
+    let sender = dashboard_control_presence_sender(request.control_tx.clone());
+    let (becomes_active, was_already_active) = {
+        let mut slot = active_presence.lock().unwrap_or_else(|e| e.into_inner());
+        let was_already_active = slot
+            .as_ref()
+            .map(|active| active.connection_id == request.session_id)
+            .unwrap_or(false);
+        let becomes_active = !request.passive && (slot.is_none() || was_already_active);
+        if becomes_active {
+            *slot = Some(ActivePresence {
+                connection_id: request.session_id.clone(),
+                direct_tx: sender,
+            });
+        }
+        (becomes_active, was_already_active)
+    };
+
+    let active = shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let session_log = active.session_log.clone();
+    drop(active);
+
+    if let Some(ctx) = &query_ctx {
+        let conversation_ctx = presence::build_conversation_context(&ctx.log_dir, 20);
+        if let Some(ps) = &ctx.presence_session {
+            let mut session = ps.lock().unwrap_or_else(|e| e.into_inner());
+            if becomes_active {
+                session.set_connected(true);
+            }
+            let state = ctx
+                .agent_state
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone();
+            let welcome = session.build_welcome(request.last_event_seq, &state);
+            send_dashboard_control_presence_event(
+                &request.control_tx,
+                serde_json::json!({
+                    "t": "presence_welcome",
+                    "session_id": welcome.session_id,
+                    "state": welcome.state,
+                    "events": welcome.events,
+                    "last_checkpoint_summary": welcome.last_checkpoint_summary,
+                    "current_seq": welcome.current_seq,
+                    "is_active": becomes_active,
+                    "conversation_context": conversation_ctx,
+                }),
+            );
+        } else {
+            send_dashboard_control_presence_event(
+                &request.control_tx,
+                serde_json::json!({
+                    "t": "presence_welcome",
+                    "is_active": becomes_active,
+                    "conversation_context": conversation_ctx,
+                }),
+            );
+        }
+    } else {
+        send_dashboard_control_presence_event(
+            &request.control_tx,
+            serde_json::json!({
+                "t": "presence_welcome",
+                "is_active": becomes_active,
+            }),
+        );
+    }
+
+    if becomes_active && !was_already_active {
+        if let Some(sl) = session_log {
+            if let Ok(mut log) = sl.lock() {
+                log.presence_connected(Some(&provider), Some(&model));
+            }
+        }
+        bus.send(AppEvent::PresenceConnected {
+            server_session_id: request.server_session_id,
+            last_event_seq: request.last_event_seq,
+            live_provider: Some(provider),
+            live_model: Some(model),
+        });
+    }
+}
+
+async fn dashboard_control_presence_disconnect(
+    request: crate::dashboard_control::DashboardPresenceDisconnectRequest,
+    active_presence: Arc<Mutex<Option<ActivePresence>>>,
+    voice_debug: Arc<Mutex<VoiceDebugState>>,
+    shared_session: SharedActiveSession,
+    bus: EventBus,
+) {
+    voice_debug
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .connected = false;
+    let active = shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let session_log = active.session_log.clone();
+    drop(active);
+    if let Some(ctx) = query_ctx {
+        if let Some(ps) = ctx.presence_session {
+            ps.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_connected(false);
+        }
+    }
+    let was_active = {
+        let mut slot = active_presence.lock().unwrap_or_else(|e| e.into_inner());
+        if slot
+            .as_ref()
+            .map(|active| active.connection_id == request.session_id)
+            .unwrap_or(false)
+        {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    };
+    if was_active {
+        if let Some(sl) = session_log {
+            if let Ok(mut log) = sl.lock() {
+                log.presence_disconnected();
+            }
+        }
+        bus.send(AppEvent::PresenceDisconnected);
+    }
+}
+
+async fn dashboard_control_presence_make_active(
+    request: crate::dashboard_control::DashboardPresenceMakeActiveRequest,
+    active_presence: Arc<Mutex<Option<ActivePresence>>>,
+    voice_debug: Arc<Mutex<VoiceDebugState>>,
+    shared_session: SharedActiveSession,
+    bus: EventBus,
+    default_provider: String,
+    default_model: String,
+) {
+    let provider = request.provider.unwrap_or(default_provider);
+    let model = request.model.unwrap_or(default_model);
+    let sender = dashboard_control_presence_sender(request.control_tx.clone());
+
+    let previous_active = {
+        let slot = active_presence.lock().unwrap_or_else(|e| e.into_inner());
+        slot.as_ref().map(|active| active.connection_id.clone())
+    };
+    let active = shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let session_log = active.session_log.clone();
+    drop(active);
+
+    if let Some(sl) = &session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.voice_diagnostic(
+                "make_active_received_gateway",
+                &format!(
+                    "request from connection={} previous_active={}",
+                    request.session_id,
+                    previous_active.as_deref().unwrap_or("none"),
+                ),
+            );
+        }
+    }
+
+    {
+        let mut slot = active_presence.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(old) = slot.as_ref() {
+            if old.connection_id != request.session_id {
+                let _ = old.direct_tx.send(
+                    serde_json::json!({
+                        "t": "force_disconnect_voice",
+                        "reason": "handover",
+                    })
+                    .to_string(),
+                );
+                if let Some(sl) = &session_log {
+                    if let Ok(mut log) = sl.lock() {
+                        log.voice_diagnostic(
+                            "make_active_force_disconnect_gateway",
+                            &format!(
+                                "old_active={} new_active={}",
+                                old.connection_id, request.session_id,
+                            ),
+                        );
+                    }
+                }
+            } else if let Some(sl) = &session_log {
+                if let Ok(mut log) = sl.lock() {
+                    log.voice_diagnostic(
+                        "make_active_noop_gateway",
+                        &format!(
+                            "request from already-active connection={}",
+                            request.session_id,
+                        ),
+                    );
+                }
+            }
+        }
+        *slot = Some(ActivePresence {
+            connection_id: request.session_id.clone(),
+            direct_tx: sender,
+        });
+    }
+
+    voice_debug
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .connected = true;
+
+    let handover_context = query_ctx
+        .as_ref()
+        .and_then(|ctx| ctx.presence_session.as_ref())
+        .and_then(|ps| {
+            let session = ps.lock().unwrap_or_else(|e| e.into_inner());
+            session.last_checkpoint_summary()
+        })
+        .unwrap_or_default();
+    let conversation_ctx = query_ctx
+        .as_ref()
+        .and_then(|ctx| presence::build_conversation_context(&ctx.log_dir, 20));
+    let has_handover_context = !handover_context.is_empty();
+    let has_conversation_context = conversation_ctx
+        .as_deref()
+        .map(|s| !s.is_empty())
+        .unwrap_or(false);
+
+    send_dashboard_control_presence_event(
+        &request.control_tx,
+        serde_json::json!({
+            "t": "active_granted",
+            "is_active": true,
+            "handover_context": handover_context,
+            "conversation_context": conversation_ctx,
+        }),
+    );
+
+    if let Some(sl) = session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.voice_diagnostic(
+                "make_active_granted_gateway",
+                &format!(
+                    "connection={} handover_context={} conversation_context={}",
+                    request.session_id,
+                    if has_handover_context { "yes" } else { "no" },
+                    if has_conversation_context {
+                        "yes"
+                    } else {
+                        "no"
+                    },
+                ),
+            );
+            log.presence_connected(Some(&provider), Some(&model));
+        }
+    }
+    bus.send(AppEvent::PresenceConnected {
+        server_session_id: None,
+        last_event_seq: 0,
+        live_provider: Some(provider),
+        live_model: Some(model),
+    });
+}
+
+async fn dashboard_control_presence_cleanup(
+    session_id: String,
+    active_presence: Arc<Mutex<Option<ActivePresence>>>,
+    voice_debug: Arc<Mutex<VoiceDebugState>>,
+    shared_session: SharedActiveSession,
+    bus: EventBus,
+) {
+    let was_active = {
+        let mut slot = active_presence.lock().unwrap_or_else(|e| e.into_inner());
+        if slot
+            .as_ref()
+            .map(|active| active.connection_id == session_id)
+            .unwrap_or(false)
+        {
+            *slot = None;
+            true
+        } else {
+            false
+        }
+    };
+    if !was_active {
+        return;
+    }
+    voice_debug
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .connected = false;
+    let active = shared_session.read().await;
+    let query_ctx = active.query_ctx.clone();
+    let session_log = active.session_log.clone();
+    drop(active);
+    if let Some(ctx) = query_ctx {
+        if let Some(ps) = ctx.presence_session {
+            ps.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .set_connected(false);
+        }
+    }
+    if let Some(sl) = session_log {
+        if let Ok(mut log) = sl.lock() {
+            log.presence_disconnected();
+        }
+    }
+    bus.send(AppEvent::PresenceDisconnected);
+}
+
 /// Identity of who currently holds input authority for one display.
 ///
-/// Two provenance kinds, with explicit identity per kind so the
+/// Three provenance kinds, with explicit identity per kind so the
 /// arbitration / gate / cleanup paths can match on the source of the
 /// hold without resorting to string-shape inference:
 ///
@@ -333,6 +683,11 @@ struct ActivePresence {
 ///   nicety, not correctness. See
 ///   `docs/design-federated-input-authority.md` for the full note.
 ///
+/// - **`DashboardControl`**: holder is one daemon-scoped dashboard
+///   control DataChannel session. It has no WS `direct_tx`; state
+///   changes are personalized and pushed through the control tunnel's
+///   event stream.
+///
 /// The map is `HashMap<u32, DisplayInputHolder>` — no `Option`, no
 /// wrapper struct. Entry absence = unclaimed; that's the pre-phase-5
 /// backwards-compat state where every connection's input flowed
@@ -354,6 +709,9 @@ enum DisplayInputHolder {
         federation_connection_id: String,
         session_id: String,
     },
+    DashboardControl {
+        session_id: String,
+    },
 }
 
 impl DisplayInputHolder {
@@ -367,7 +725,7 @@ impl DisplayInputHolder {
             Self::LocalWs {
                 connection_id: c, ..
             } => c == connection_id,
-            Self::FederatedWebRtc { .. } => false,
+            Self::FederatedWebRtc { .. } | Self::DashboardControl { .. } => false,
         }
     }
 
@@ -381,7 +739,16 @@ impl DisplayInputHolder {
                 federation_connection_id: c,
                 session_id: s,
             } => c == federation_connection_id && s == session_id,
-            Self::LocalWs { .. } => false,
+            Self::LocalWs { .. } | Self::DashboardControl { .. } => false,
+        }
+    }
+
+    /// True iff this holder is a daemon-scoped dashboard control
+    /// session with the given `session_id`.
+    fn matches_dashboard_control(&self, session_id: &str) -> bool {
+        match self {
+            Self::DashboardControl { session_id: s } => s == session_id,
+            Self::LocalWs { .. } | Self::FederatedWebRtc { .. } => false,
         }
     }
 
@@ -427,6 +794,10 @@ impl DisplayInputHolder {
                     session_id: sb,
                 },
             ) => ca == cb && sa == sb,
+            (
+                Self::DashboardControl { session_id: a },
+                Self::DashboardControl { session_id: b },
+            ) => a == b,
             _ => false,
         }
     }
@@ -718,6 +1089,137 @@ fn apply_release_input_authority_federated(
         });
     }
     removed
+}
+
+fn dashboard_control_authority_state_frame(
+    session_id: &str,
+    display_id: u32,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+) -> serde_json::Value {
+    let state = {
+        let auth = authority.read().unwrap_or_else(|e| e.into_inner());
+        match auth.get(&display_id) {
+            Some(entry) if entry.matches_dashboard_control(session_id) => "you",
+            Some(_) => "other",
+            None => "unclaimed",
+        }
+    };
+    serde_json::json!({
+        "t": "display_input_authority_state",
+        "display_id": display_id,
+        "state": state,
+    })
+}
+
+fn dashboard_control_authority_snapshot_frames(
+    session_id: &str,
+    display_ids: &[u32],
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+) -> Vec<serde_json::Value> {
+    display_ids
+        .iter()
+        .map(|display_id| {
+            dashboard_control_authority_state_frame(session_id, *display_id, authority)
+        })
+        .collect()
+}
+
+fn apply_grant_input_authority_dashboard_control(
+    display_id: u32,
+    session_id: String,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Option<DisplayInputHolder> {
+    let new_holder = DisplayInputHolder::DashboardControl {
+        session_id: session_id.clone(),
+    };
+    let broadcast_holder = new_holder.clone();
+    let prior = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        map.insert(display_id, new_holder)
+    };
+    if let Some(DisplayInputHolder::LocalWs {
+        direct_tx: prior_tx,
+        ..
+    }) = prior.as_ref()
+    {
+        let notify = serde_json::json!({
+            "t": "display_input_authority_revoked",
+            "display_id": display_id,
+            "reason": "another connection requested control",
+        })
+        .to_string();
+        let _ = prior_tx.send(notify);
+    }
+    let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+        display_id,
+        holder: Some(broadcast_holder),
+    });
+    prior
+}
+
+fn apply_release_input_authority_dashboard_control(
+    display_id: u32,
+    session_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> bool {
+    let removed = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        match map.get(&display_id) {
+            Some(entry) if entry.matches_dashboard_control(session_id) => {
+                map.remove(&display_id);
+                true
+            }
+            _ => false,
+        }
+    };
+    if removed {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id,
+            holder: None,
+        });
+    }
+    removed
+}
+
+fn apply_dashboard_control_close_input_authority(
+    session_id: &str,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+    authority_change_tx: &broadcast::Sender<DisplayInputAuthorityChange>,
+) -> Vec<u32> {
+    let released: Vec<u32> = {
+        let mut map = authority.write().unwrap_or_else(|e| e.into_inner());
+        let mut out = Vec::new();
+        map.retain(|did, entry| {
+            if entry.matches_dashboard_control(session_id) {
+                out.push(*did);
+                false
+            } else {
+                true
+            }
+        });
+        out
+    };
+    for did in &released {
+        let _ = authority_change_tx.send(DisplayInputAuthorityChange {
+            display_id: *did,
+            holder: None,
+        });
+    }
+    released
+}
+
+fn dashboard_control_input_authorized(
+    session_id: &str,
+    display_id: u32,
+    authority: &Arc<StdRwLock<HashMap<u32, DisplayInputHolder>>>,
+) -> bool {
+    let auth = authority.read().unwrap_or_else(|e| e.into_inner());
+    match auth.get(&display_id) {
+        Some(entry) => entry.matches_dashboard_control(session_id),
+        None => true,
+    }
 }
 
 /// F-1.3b: federated WS-close cleanup. Releases every
@@ -1246,7 +1748,7 @@ pub const DEFAULT_PORT: u16 = 8765;
 
 /// Mint a short-lived vendor session token server-side so the browser
 /// never handles (or stores) a long-lived API key.
-async fn mint_session_token(provider: &str, model: &str) -> Result<String, String> {
+pub(crate) async fn mint_session_token(provider: &str, model: &str) -> Result<String, String> {
     match provider {
         "openai" => {
             let api_key = std::env::var("OPENAI_API_KEY")
@@ -2442,6 +2944,15 @@ fn session_log_replay_payload_from_dir_with_limit(
     ))
 }
 
+pub(crate) fn session_log_replay_payload_for_websocket_bootstrap(
+    log_dir: &std::path::Path,
+) -> Option<(String, Option<String>)> {
+    session_log_replay_payload_from_dir_with_limit(
+        log_dir,
+        Some(WEBSOCKET_BOOTSTRAP_REPLAY_ENTRY_LIMIT),
+    )
+}
+
 fn limited_session_detail_entries(
     entries: Vec<serde_json::Value>,
     limit: Option<usize>,
@@ -3466,6 +3977,46 @@ fn build_session_report_zip(session_dir: &std::path::Path) -> std::io::Result<Ve
     Ok(cursor.into_inner())
 }
 
+pub(crate) struct SessionReportZip {
+    pub filename: String,
+    pub bytes: Vec<u8>,
+}
+
+pub(crate) enum SessionReportZipError {
+    InvalidSessionId,
+    NotFound,
+    Build(String),
+}
+
+pub(crate) fn session_report_zip_for_request(
+    session_id: &str,
+    session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
+    query_ctx: Option<&WebQueryCtx>,
+) -> Result<SessionReportZip, SessionReportZipError> {
+    let session_id = session_id.trim();
+    if session_id != "current" && !session_lookup_id_is_safe(session_id) {
+        return Err(SessionReportZipError::InvalidSessionId);
+    }
+    let resolved_dir: Option<PathBuf> = if session_id == "current" {
+        current_session_log_dir(session_log, query_ctx)
+    } else {
+        resolve_session_dir(session_id)
+    };
+    let Some(dir) = resolved_dir else {
+        return Err(SessionReportZipError::NotFound);
+    };
+    let bytes =
+        build_session_report_zip(&dir).map_err(|e| SessionReportZipError::Build(e.to_string()))?;
+    let fname = dir
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| "session".to_string());
+    Ok(SessionReportZip {
+        filename: format!("intendant-session-{fname}.zip"),
+        bytes,
+    })
+}
+
 fn current_session_log_dir(
     session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
     query_ctx: Option<&WebQueryCtx>,
@@ -3588,7 +4139,7 @@ mod host_header_tests {
 /// for each session (newest first, capped at 100).
 /// Return session detail: replayed log entries + metadata for a single session.
 /// Resolve a session directory by exact ID or prefix match.
-fn session_lookup_id_is_safe(session_id: &str) -> bool {
+pub(crate) fn session_lookup_id_is_safe(session_id: &str) -> bool {
     !session_id.is_empty()
         && session_id.trim() == session_id
         && session_id != "."
@@ -3647,7 +4198,7 @@ fn resolve_session_dir_from_listed_external_row(home: &Path, session_id: &str) -
     None
 }
 
-fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
+pub(crate) fn resolve_session_dir(session_id: &str) -> Option<PathBuf> {
     resolve_session_dir_from_home(&crate::platform::home_dir(), session_id)
 }
 
@@ -3812,7 +4363,61 @@ fn list_recording_streams(recordings_dir: &std::path::Path) -> Vec<serde_json::V
     entries
 }
 
-fn recording_playlist_m3u8(segments: &[crate::recording::SegmentInfo]) -> String {
+pub(crate) async fn recordings_list_response_body(
+    recording_registry: Option<Arc<tokio::sync::RwLock<crate::recording::RecordingRegistry>>>,
+) -> String {
+    let mut all_entries = Vec::new();
+
+    if let Some(rec_reg) = recording_registry {
+        let reg = rec_reg.read().await;
+        let streams = reg.all_streams();
+        for name in &streams {
+            let manifest = reg.manifest(name).unwrap_or(serde_json::json!({}));
+            let segments = reg.segments(name);
+            let total_duration = segments.last().map(|s| s.end_secs).unwrap_or(0.0);
+            let seg_json: Vec<serde_json::Value> = segments
+                .iter()
+                .map(|s| {
+                    serde_json::json!({
+                        "filename": s.filename,
+                        "start_secs": s.start_secs,
+                        "end_secs": s.end_secs,
+                    })
+                })
+                .collect();
+            let mut entry = manifest;
+            entry["segments"] = serde_json::Value::Array(seg_json);
+            entry["total_duration_secs"] = serde_json::json!(total_duration);
+            all_entries.push(entry);
+        }
+    }
+
+    let daemon_dir = crate::debug::daemon_recordings_dir();
+    for entry in list_recording_streams(&daemon_dir) {
+        all_entries.push(entry);
+    }
+
+    serde_json::to_string(&all_entries).unwrap_or("[]".to_string())
+}
+
+pub(crate) fn session_recordings_list_response_body(session_id: &str) -> (&'static str, String) {
+    if !session_lookup_id_is_safe(session_id) {
+        return (
+            "400 Bad Request",
+            serde_json::json!({ "error": "invalid session id" }).to_string(),
+        );
+    }
+    let body = if let Some(session_dir) = resolve_session_dir(session_id) {
+        let recordings_dir = session_dir.join("recordings");
+        let entries = list_recording_streams(&recordings_dir);
+        serde_json::to_string(&entries).unwrap_or("[]".to_string())
+    } else {
+        "[]".to_string()
+    };
+    ("200 OK", body)
+}
+
+pub(crate) fn recording_playlist_m3u8(segments: &[crate::recording::SegmentInfo]) -> String {
     let mut m3u8 = String::from("#EXTM3U\n#EXT-X-VERSION:3\n#EXT-X-MEDIA-SEQUENCE:0\n");
     let max_dur = segments
         .iter()
@@ -3984,12 +4589,6 @@ fn context_snapshot_selector_from_request(
     request_line: &str,
 ) -> Result<ContextSnapshotSelector, String> {
     let file = query_param(request_line, "file").filter(|value| !value.trim().is_empty());
-    if file
-        .as_deref()
-        .is_some_and(|file| !context_snapshot_file_selector_is_safe(file))
-    {
-        return Err("invalid snapshot file".to_string());
-    }
     let request_index =
         match query_param(request_line, "request_index").filter(|value| !value.trim().is_empty()) {
             Some(value) => Some(
@@ -3999,12 +4598,32 @@ fn context_snapshot_selector_from_request(
             ),
             None => None,
         };
+    context_snapshot_selector_from_parts(
+        file,
+        query_param(request_line, "request_id").filter(|value| !value.trim().is_empty()),
+        request_index,
+        query_param(request_line, "ts").filter(|value| !value.trim().is_empty()),
+    )
+}
+
+fn context_snapshot_selector_from_parts(
+    file: Option<String>,
+    request_id: Option<String>,
+    request_index: Option<u64>,
+    ts: Option<String>,
+) -> Result<ContextSnapshotSelector, String> {
+    let file = file.filter(|value| !value.trim().is_empty());
+    if file
+        .as_deref()
+        .is_some_and(|file| !context_snapshot_file_selector_is_safe(file))
+    {
+        return Err("invalid snapshot file".to_string());
+    }
     let selector = ContextSnapshotSelector {
         file,
-        request_id: query_param(request_line, "request_id")
-            .filter(|value| !value.trim().is_empty()),
+        request_id: request_id.filter(|value| !value.trim().is_empty()),
         request_index,
-        ts: query_param(request_line, "ts").filter(|value| !value.trim().is_empty()),
+        ts: ts.filter(|value| !value.trim().is_empty()),
     };
     if selector.is_empty() {
         return Err("missing snapshot selector".to_string());
@@ -4139,6 +4758,33 @@ fn exact_context_snapshot_from_log_entry(
     Some(value)
 }
 
+pub(crate) fn session_context_snapshot_response_body(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+    file: Option<String>,
+    request_id: Option<String>,
+    request_index: Option<u64>,
+    ts: Option<String>,
+) -> (&'static str, String) {
+    if !session_lookup_id_is_safe(session_id) {
+        return (
+            "400 Bad Request",
+            serde_json::json!({"error": "invalid session id"}).to_string(),
+        );
+    }
+    let selector = match context_snapshot_selector_from_parts(file, request_id, request_index, ts) {
+        Ok(selector) => selector,
+        Err(error) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({"error": error}).to_string(),
+            );
+        }
+    };
+    session_context_snapshot_response_for_selector(home, session_id, source, selector)
+}
+
 fn get_session_context_snapshot_from_home(
     home: &Path,
     session_id: &str,
@@ -4160,6 +4806,15 @@ fn get_session_context_snapshot_from_home(
             );
         }
     };
+    session_context_snapshot_response_for_selector(home, session_id, source, selector)
+}
+
+fn session_context_snapshot_response_for_selector(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+    selector: ContextSnapshotSelector,
+) -> (&'static str, String) {
     for log_dir in context_snapshot_candidate_log_dirs(home, session_id, source) {
         let Ok(contents) = std::fs::read_to_string(log_dir.join("session.jsonl")) else {
             continue;
@@ -7832,7 +8487,7 @@ fn external_session_activity_replay_from_home(
     )
 }
 
-fn external_session_activity_replay_for_websocket(
+pub(crate) fn external_session_activity_replay_for_websocket(
     source: &str,
     session_id: &str,
 ) -> Option<String> {
@@ -8711,18 +9366,21 @@ fn cached_intendant_log_dirs_for_session_id(session_id: &str) -> Vec<PathBuf> {
     dirs
 }
 
-fn empty_worktree_inventory_response() -> String {
+pub(crate) fn empty_worktree_inventory_response() -> String {
     serde_json::to_string(&crate::worktree_inventory::empty_scan())
         .unwrap_or_else(|_| "{}".to_string())
 }
 
-fn scan_worktree_inventory_response(home: &Path, project_root: Option<&Path>) -> String {
+pub(crate) fn scan_worktree_inventory_response(home: &Path, project_root: Option<&Path>) -> String {
     let hints = worktree_session_hints_from_home(home);
     let scan = crate::worktree_inventory::scan_worktrees(home, project_root, &hints);
     serde_json::to_string(&scan).unwrap_or_else(|_| "{}".to_string())
 }
 
-fn remove_worktree_inventory_response(home: &Path, body_text: &str) -> (&'static str, String) {
+pub(crate) fn remove_worktree_inventory_response(
+    home: &Path,
+    body_text: &str,
+) -> (&'static str, String) {
     let request =
         match serde_json::from_str::<crate::worktree_inventory::WorktreeRemoveRequest>(body_text) {
             Ok(request) => request,
@@ -9871,10 +10529,7 @@ fn list_intendant_skeleton_sessions_with_limit(
         .collect()
 }
 
-fn merge_quick_session_rows_with_wrapper_index(
-    home: &Path,
-    rows: &mut Vec<serde_json::Value>,
-) {
+fn merge_quick_session_rows_with_wrapper_index(home: &Path, rows: &mut Vec<serde_json::Value>) {
     apply_external_wrapper_index_to_sessions(home, rows);
     let wrapped_intendant_ids = rows
         .iter()
@@ -10075,7 +10730,10 @@ pub(crate) fn stream_sessions_from_request(
     }
 
     let mut quick_rows = Vec::new();
-    quick_rows.extend(list_intendant_skeleton_sessions_with_limit(&home, quick_limit));
+    quick_rows.extend(list_intendant_skeleton_sessions_with_limit(
+        &home,
+        quick_limit,
+    ));
     quick_rows.extend(list_codex_index_skeleton_sessions_with_limit(
         &home,
         quick_limit,
@@ -10151,7 +10809,7 @@ fn handle_changes_request(
     handle_changes_request_inner(request_line, snapshot_dir, project_root, false)
 }
 
-fn handle_changes_request_for_home(
+pub(crate) fn handle_changes_request_for_home(
     request_line: &str,
     snapshot_dir: Option<&Path>,
     project_root: Option<&Path>,
@@ -11184,7 +11842,7 @@ async fn read_post_body<S: AsyncRead + Unpin>(header_text: &str, stream: &mut S)
 /// Picked to cover common real uploads (PDFs, CSVs, source archives,
 /// annotated screenshots) without accepting arbitrary blobs. Can be made
 /// configurable later via `[upload] max_size_mb` in intendant.toml.
-const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
+pub(crate) const UPLOAD_MAX_BYTES: usize = 100 * 1024 * 1024;
 
 /// Stream the body of an HTTP request into a fresh tempfile, honouring
 /// `Content-Length` and bailing out early if the body exceeds `max_bytes`.
@@ -11269,8 +11927,111 @@ fn initial_body_bytes(initial_request_bytes: &[u8]) -> Result<&[u8], String> {
         .ok_or_else(|| "incomplete HTTP headers".to_string())
 }
 
-fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn pending_upload_session_dir(project_root: &std::path::Path) -> std::path::PathBuf {
     project_root.join(".intendant").join("pending_uploads")
+}
+
+pub(crate) fn current_upload_commit_response_body(
+    project_root: Option<&std::path::Path>,
+    session_log: Option<&Arc<Mutex<crate::session_log::SessionLog>>>,
+    daemon_session_id: Option<&str>,
+    name: &str,
+    mime: &str,
+    requested_destination: crate::upload_store::UploadDestination,
+    tmp: tempfile::NamedTempFile,
+    size: usize,
+    bus: &crate::event::EventBus,
+) -> (&'static str, String) {
+    let Some(root) = project_root else {
+        return (
+            "400 Bad Request",
+            serde_json::json!({ "error": "no project root" }).to_string(),
+        );
+    };
+
+    let (session_dir, session_id) = if let Some(slog) = session_log {
+        match slog.lock() {
+            Ok(l) => (l.dir().to_path_buf(), l.session_id().to_string()),
+            Err(_) => {
+                return (
+                    "500 Internal Server Error",
+                    serde_json::json!({ "error": "session log lock poisoned" }).to_string(),
+                );
+            }
+        }
+    } else {
+        (
+            pending_upload_session_dir(root),
+            daemon_session_id.unwrap_or("pending").to_string(),
+        )
+    };
+    let destination = effective_upload_destination(requested_destination, session_log.is_some());
+    match crate::upload_store::commit_upload(
+        tmp,
+        name,
+        mime,
+        size as u64,
+        destination,
+        &session_dir,
+        &session_id,
+        root,
+    ) {
+        Ok(descriptor) => {
+            bus.send(crate::event::AppEvent::UploadReady {
+                descriptor: descriptor.clone(),
+            });
+            (
+                "200 OK",
+                serde_json::to_string(&descriptor).unwrap_or_else(|_| "{}".to_string()),
+            )
+        }
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({ "error": format!("commit upload: {e}") }).to_string(),
+        ),
+    }
+}
+
+pub(crate) fn current_upload_delete_response_body(
+    project_root: Option<&std::path::Path>,
+    session_dir: Option<&std::path::Path>,
+    id: &str,
+) -> (&'static str, String, Option<String>) {
+    let Some(root) = project_root else {
+        return (
+            "404 Not Found",
+            serde_json::json!({ "error": "no project root" }).to_string(),
+            None,
+        );
+    };
+    let id = id.trim();
+    if id.is_empty() {
+        return (
+            "400 Bad Request",
+            serde_json::json!({ "error": "missing upload id" }).to_string(),
+            None,
+        );
+    }
+    let pending_dir;
+    let session_dir = match session_dir {
+        Some(dir) => dir,
+        None => {
+            pending_dir = pending_upload_session_dir(root);
+            pending_dir.as_path()
+        }
+    };
+    match crate::upload_store::delete_upload(id, session_dir, root) {
+        Ok(_) => (
+            "200 OK",
+            serde_json::json!({ "ok": true }).to_string(),
+            Some(id.to_string()),
+        ),
+        Err(e) => (
+            "500 Internal Server Error",
+            serde_json::json!({ "error": format!("delete: {e}") }).to_string(),
+            None,
+        ),
+    }
 }
 
 fn json_response(status: &str, body: String) -> String {
@@ -11324,14 +12085,20 @@ async fn connect_dashboard_offer_response(
         Ok(body) => body,
         Err(e) => return json_error("400 Bad Request", format!("invalid JSON: {e}")),
     };
-    let sdp = body
-        .get("sdp")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let sdp = body.get("sdp").and_then(|v| v.as_str()).unwrap_or("");
     if sdp.trim().is_empty() {
         return json_error("400 Bad Request", "missing sdp");
     }
-    match dashboard_control.answer_offer(sdp.to_string()).await {
+    let client_nonce = body
+        .get("client_nonce")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|nonce| !nonce.is_empty())
+        .map(str::to_string);
+    match dashboard_control
+        .answer_offer(sdp.to_string(), None, client_nonce)
+        .await
+    {
         Ok(answer) => json_ok(serde_json::json!({
             "ok": true,
             "signaling": "connect-bootstrap-local",
@@ -11363,7 +12130,10 @@ async fn connect_dashboard_ice_response(
         .get("candidate")
         .cloned()
         .unwrap_or_else(|| serde_json::json!({}));
-    match dashboard_control.add_ice_candidate(session_id, &candidate).await {
+    match dashboard_control
+        .add_ice_candidate(session_id, &candidate)
+        .await
+    {
         Ok(true) => json_ok(serde_json::json!({ "ok": true })),
         Ok(false) => json_error("404 Not Found", "dashboard control session not found"),
         Err(e) => json_error("500 Internal Server Error", e),
@@ -11414,12 +12184,15 @@ fn connect_bootstrap_html() -> String {
   </main>
   <script>
 (() => {
-  const statusEl = document.getElementById('status');
-  const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
-  function paint(message, kind = '') {
-    statusEl.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
-    statusEl.className = kind;
-  }
+	  const statusEl = document.getElementById('status');
+	  const MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
+	  const MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
+	  const UPLOAD_CHUNK_BYTES = 16 * 1024;
+	  const UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
+	  function paint(message, kind = '') {
+	    statusEl.textContent = typeof message === 'string' ? message : JSON.stringify(message, null, 2);
+	    statusEl.className = kind;
+	  }
 
   function abortError(message = 'dashboard control request aborted') {
     try { return new DOMException(message, 'AbortError'); } catch {
@@ -11443,27 +12216,43 @@ fn connect_bootstrap_html() -> String {
     return bytes;
   }
 
-  function base64ToBytes(value) {
-    const binary = atob(String(value || ''));
-    const bytes = new Uint8Array(binary.length);
-    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
-    return bytes;
-  }
+	  function base64ToBytes(value) {
+	    const binary = atob(String(value || ''));
+	    const bytes = new Uint8Array(binary.length);
+	    for (let i = 0; i < binary.length; i++) bytes[i] = binary.charCodeAt(i);
+	    return bytes;
+	  }
+
+	  function bytesToBase64(bytes) {
+	    let binary = '';
+	    for (let i = 0; i < bytes.byteLength; i++) binary += String.fromCharCode(bytes[i]);
+	    return btoa(binary);
+	  }
 
   async function sha256B64u(text) {
     const digest = await crypto.subtle.digest('SHA-256', new TextEncoder().encode(String(text)));
     return bytesToBase64Url(new Uint8Array(digest));
   }
 
+  function randomB64u(byteLength = 32) {
+    const bytes = new Uint8Array(byteLength);
+    crypto.getRandomValues(bytes);
+    return bytesToBase64Url(bytes);
+  }
+
   function bindingPayload(binding) {
-    return [
+    const parts = [
       binding.protocol || '',
       binding.session_id || '',
       binding.daemon_public_key || '',
       String(binding.created_unix_ms || ''),
+      String(binding.expires_unix_ms || ''),
       binding.offer_sha256 || '',
       binding.answer_sha256 || '',
-    ].join('\n');
+    ];
+    if (binding.client_nonce) parts.push(binding.client_nonce);
+    if (binding.session_grant_sha256) parts.push(binding.session_grant_sha256);
+    return parts.join('\n');
   }
 
   async function verifyEd25519(publicKeyBytes, signatureBytes, payloadBytes) {
@@ -11480,13 +12269,26 @@ fn connect_bootstrap_html() -> String {
     return crypto.subtle.verify({ name: 'Ed25519' }, key, signatureBytes, payloadBytes);
   }
 
-  async function verifyBinding(binding, sessionId, offerSdp, answerSdp) {
+  async function verifyBinding(binding, sessionId, offerSdp, answerSdp, clientNonce = '') {
     if (!binding || typeof binding !== 'object') return { ok: false, error: 'missing binding' };
     if (binding.protocol !== 'intendant-dashboard-control-v1') return { ok: false, error: 'unexpected protocol' };
     if (String(binding.session_id || '') !== String(sessionId || '')) return { ok: false, error: 'session mismatch' };
     if (!crypto?.subtle) return { ok: false, error: 'WebCrypto unavailable' };
+    const createdUnixMs = Number(binding.created_unix_ms || 0);
+    const expiresUnixMs = Number(binding.expires_unix_ms || 0);
+    if (!Number.isFinite(createdUnixMs) || createdUnixMs <= 0) return { ok: false, error: 'missing binding creation time' };
+    if (!Number.isFinite(expiresUnixMs) || expiresUnixMs <= 0) return { ok: false, error: 'missing binding expiry' };
+    const nowUnixMs = Date.now();
+    if (expiresUnixMs + 30000 < nowUnixMs) return { ok: false, error: 'binding expired' };
+    if (createdUnixMs - 30000 > nowUnixMs) return { ok: false, error: 'binding timestamp from future' };
     if (binding.offer_sha256 !== await sha256B64u(offerSdp || '')) return { ok: false, error: 'offer hash mismatch' };
     if (binding.answer_sha256 !== await sha256B64u(answerSdp || '')) return { ok: false, error: 'answer hash mismatch' };
+    const nonce = String(clientNonce || '');
+    if (nonce) {
+      if (String(binding.client_nonce || '') !== nonce) return { ok: false, error: 'client nonce mismatch' };
+    } else if (binding.client_nonce) {
+      return { ok: false, error: 'unexpected client nonce binding' };
+    }
     const verified = await verifyEd25519(
       base64UrlToBytes(binding.daemon_public_key || ''),
       base64UrlToBytes(binding.signature || ''),
@@ -11496,7 +12298,9 @@ fn connect_bootstrap_html() -> String {
     return {
       ok: true,
       daemonPublicKey: binding.daemon_public_key,
-      createdUnixMs: Number(binding.created_unix_ms || 0),
+      createdUnixMs,
+      expiresUnixMs,
+      clientNonce: binding.client_nonce || '',
     };
   }
 
@@ -11506,23 +12310,27 @@ fn connect_bootstrap_html() -> String {
     sessionId: '',
     binding: null,
     verifiedBinding: null,
+    clientNonce: '',
+    expiresUnixMs: 0,
     localOfferSdp: '',
-    pendingIce: [],
-    pending: new Map(),
-    chunkedResponses: new Map(),
-    completedChunkedResponses: 0,
-    seq: 0,
-    started: false,
+	    pendingIce: [],
+	    pending: new Map(),
+	    chunkedResponses: new Map(),
+	    byteStreams: new Map(),
+	    completedChunkedResponses: 0,
+	    completedByteStreams: 0,
+	    seq: 0,
+	    started: false,
 
     async start() {
       if (this.started) return this.status();
       this.started = true;
-      this.pc = new RTCPeerConnection({});
-      this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
-      this.channel.onopen = () => {
-        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit'] });
-        paint(this.status(), 'ok');
-      };
+	      this.pc = new RTCPeerConnection({});
+	      this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
+	      this.channel.onopen = () => {
+	        this.sendFrame({ t: 'hello', id: this.nextId(), features: ['response_credit', 'byte_streams', 'upload_frames'] });
+	        paint(this.status(), 'ok');
+	      };
       this.channel.onmessage = ev => this.handleMessage(ev.data);
       this.channel.onclose = () => paint(this.status());
       this.pc.onconnectionstatechange = () => paint(this.status(), this.pc.connectionState === 'failed' ? 'err' : '');
@@ -11538,10 +12346,11 @@ fn connect_bootstrap_html() -> String {
       const offer = await this.pc.createOffer();
       await this.pc.setLocalDescription(offer);
       this.localOfferSdp = offer.sdp || '';
+      this.clientNonce = randomB64u(32);
       const answer = await fetch('/connect/dashboard/offer', {
         method: 'POST',
         headers: { 'content-type': 'application/json' },
-        body: JSON.stringify({ sdp: this.localOfferSdp }),
+        body: JSON.stringify({ sdp: this.localOfferSdp, client_nonce: this.clientNonce }),
       }).then(async resp => {
         const body = await resp.json().catch(() => ({}));
         if (!resp.ok) throw new Error(body.error || `HTTP ${resp.status}`);
@@ -11549,9 +12358,10 @@ fn connect_bootstrap_html() -> String {
       });
       this.sessionId = String(answer.session_id || '');
       this.binding = answer.binding || null;
-      const verified = await verifyBinding(this.binding, this.sessionId, this.localOfferSdp, answer.sdp || '');
+      const verified = await verifyBinding(this.binding, this.sessionId, this.localOfferSdp, answer.sdp || '', this.clientNonce);
       if (!verified.ok) throw new Error(`binding rejected: ${verified.error || 'unknown'}`);
       this.verifiedBinding = verified;
+      this.expiresUnixMs = verified.expiresUnixMs || 0;
       await this.pc.setRemoteDescription({ type: 'answer', sdp: answer.sdp });
       for (const candidate of this.pendingIce.splice(0)) await this.sendIce(candidate);
       paint(this.status(), 'ok');
@@ -11585,11 +12395,23 @@ fn connect_bootstrap_html() -> String {
         this.handleResponseChunk(msg);
         return;
       }
-      if (msg.t === 'response_end') {
-        this.handleResponseEnd(msg);
-        return;
-      }
-      if (msg.t !== 'pong' && msg.t !== 'response') return;
+	      if (msg.t === 'response_end') {
+	        this.handleResponseEnd(msg);
+	        return;
+	      }
+	      if (msg.t === 'byte_stream_start') {
+	        this.handleByteStreamStart(msg);
+	        return;
+	      }
+	      if (msg.t === 'byte_stream_chunk') {
+	        this.handleByteStreamChunk(msg);
+	        return;
+	      }
+	      if (msg.t === 'byte_stream_end') {
+	        this.handleByteStreamEnd(msg);
+	        return;
+	      }
+	      if (msg.t !== 'pong' && msg.t !== 'response') return;
       const pending = this.pending.get(msg.id);
       if (!pending) return;
       this.pending.delete(msg.id);
@@ -11710,17 +12532,216 @@ fn connect_bootstrap_html() -> String {
         this.pending.delete(id);
         pending.reject(new Error(message));
       }
-      paint(this.status(), 'err');
-    },
+	      paint(this.status(), 'err');
+	    },
 
-    request(method, params = {}, options = {}) {
-      if (options.signal?.aborted) return Promise.reject(abortError());
-      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard RPC is not connected'));
-      const id = this.nextId();
-      const promise = this.waitFor(id, options);
-      this.sendFrame({ t: 'request', id, method, params });
-      return promise;
-    },
+	    handleByteStreamStart(msg) {
+	      const id = String(msg.id || '');
+	      const streamId = String(msg.stream_id || id);
+	      if (!id || !streamId || !this.pending.has(id)) return;
+	      const totalBytes = Number(msg.total_bytes);
+	      const expectedChunks = Number(msg.chunks);
+	      if (
+	        msg.encoding !== 'base64' ||
+	        !Number.isSafeInteger(totalBytes) ||
+	        totalBytes < 0 ||
+	        totalBytes > MAX_BYTE_STREAM_BYTES ||
+	        !Number.isSafeInteger(expectedChunks) ||
+	        expectedChunks < 0
+	      ) {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream header', id);
+	        return;
+	      }
+	      this.byteStreams.set(streamId, {
+	        id,
+	        streamId,
+	        totalBytes,
+	        expectedChunks,
+	        receivedBytes: 0,
+	        chunks: new Map(),
+	        ended: false,
+	        result: null,
+	        contentType: String(msg.content_type || 'application/octet-stream'),
+	        filename: msg.filename ? String(msg.filename) : '',
+	      });
+	      paint(this.status(), 'ok');
+	    },
+
+	    handleByteStreamChunk(msg) {
+	      const id = String(msg.id || '');
+	      const streamId = String(msg.stream_id || id);
+	      const state = this.byteStreams.get(streamId);
+	      if (!state) return;
+	      const seq = Number(msg.seq);
+	      if (!Number.isSafeInteger(seq) || seq < 0 || seq >= state.expectedChunks) {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream chunk sequence');
+	        return;
+	      }
+	      if (state.chunks.has(seq)) return;
+	      let bytes;
+	      try {
+	        bytes = base64ToBytes(msg.data);
+	      } catch {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream encoding');
+	        return;
+	      }
+	      state.chunks.set(seq, bytes);
+	      state.receivedBytes += bytes.byteLength;
+	      if (state.receivedBytes > state.totalBytes) {
+	        this.rejectByteStream(streamId, 'connect dashboard byte stream exceeded declared size');
+	        return;
+	      }
+	      const completed = this.maybeCompleteByteStream(streamId);
+	      if (!completed && this.byteStreams.has(streamId)) {
+	        this.sendChunkCredit(id, 1, streamId === id ? null : streamId);
+	      }
+	      paint(this.status(), 'ok');
+	    },
+
+	    handleByteStreamEnd(msg) {
+	      const id = String(msg.id || '');
+	      const streamId = String(msg.stream_id || id);
+	      const state = this.byteStreams.get(streamId);
+	      if (!state) return;
+	      if (msg.ok === false) {
+	        this.rejectByteStream(streamId, msg.error || 'connect dashboard byte stream failed');
+	        return;
+	      }
+	      const finalChunks = Number(msg.chunks);
+	      if (!Number.isSafeInteger(finalChunks) || finalChunks !== state.expectedChunks) {
+	        this.rejectByteStream(streamId, 'invalid connect dashboard byte stream footer');
+	        return;
+	      }
+	      state.ended = true;
+	      state.result = msg.result || null;
+	      this.maybeCompleteByteStream(streamId);
+	      paint(this.status(), 'ok');
+	    },
+
+	    maybeCompleteByteStream(streamId) {
+	      const state = this.byteStreams.get(streamId);
+	      if (!state || !state.ended || state.chunks.size !== state.expectedChunks) return false;
+	      const merged = new Uint8Array(state.totalBytes);
+	      let offset = 0;
+	      for (let seq = 0; seq < state.expectedChunks; seq++) {
+	        const chunk = state.chunks.get(seq);
+	        if (!chunk) {
+	          this.rejectByteStream(streamId, 'connect dashboard byte stream missed a chunk');
+	          return false;
+	        }
+	        merged.set(chunk, offset);
+	        offset += chunk.byteLength;
+	      }
+	      if (offset !== state.totalBytes) {
+	        this.rejectByteStream(streamId, 'connect dashboard byte stream size mismatch');
+	        return false;
+	      }
+	      this.byteStreams.delete(streamId);
+	      const pending = this.pending.get(state.id);
+	      if (!pending) return true;
+	      const result = state.result && typeof state.result === 'object' && !Array.isArray(state.result)
+	        ? { ...state.result }
+	        : {};
+	      result.ok = result.ok !== false;
+	      result.bytes = merged;
+	      result.size = state.totalBytes;
+	      result.content_type = result.content_type || state.contentType;
+	      result.filename = result.filename || state.filename;
+	      result.stream_id = state.streamId;
+	      this.completedByteStreams += 1;
+	      this.pending.delete(state.id);
+	      this.chunkedResponses.delete(state.id);
+	      pending.resolve(result);
+	      paint(this.status(), 'ok');
+	      return true;
+	    },
+
+	    rejectByteStream(streamId, message, requestId = '') {
+	      const state = this.byteStreams.get(streamId);
+	      const id = state?.id || requestId || streamId;
+	      this.byteStreams.delete(streamId);
+	      const pending = this.pending.get(id);
+	      if (pending) {
+	        this.pending.delete(id);
+	        pending.reject(new Error(message));
+	      }
+	      paint(this.status(), 'err');
+	    },
+
+	    request(method, params = {}, options = {}) {
+	      if (options.signal?.aborted) return Promise.reject(abortError());
+	      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard RPC is not connected'));
+	      const id = this.nextId();
+	      const promise = this.waitFor(id, options);
+	      this.sendFrame({ t: 'request', id, method, params });
+	      return promise;
+	    },
+
+	    requestBytes(method, params = {}, options = {}) {
+	      if (options.signal?.aborted) return Promise.reject(abortError());
+	      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard byte stream is not connected'));
+	      const id = this.nextId();
+	      const promise = this.waitFor(id, options);
+	      this.sendFrame({ t: 'request', id, method, params, bytes: true });
+	      return promise;
+	    },
+
+	    async uploadBytes(method, params = {}, bytes, options = {}) {
+	      if (options.signal?.aborted) return Promise.reject(abortError());
+	      if (!this.canUseRpc()) return Promise.reject(new Error('connect dashboard upload is not connected'));
+	      const id = this.nextId();
+	      const totalBytes = Number(bytes?.size ?? bytes?.byteLength ?? bytes?.length ?? 0);
+	      const chunkSize = options.chunkBytes || UPLOAD_CHUNK_BYTES;
+	      const chunks = Math.ceil(totalBytes / chunkSize);
+	      const promise = this.waitFor(id, options);
+	      this.sendFrame({
+	        t: 'upload_start',
+	        id,
+	        method,
+	        params,
+	        encoding: 'base64',
+	        total_bytes: totalBytes,
+	        chunks,
+	      });
+	      try {
+	        for (let seq = 0, offset = 0; offset < totalBytes; seq += 1, offset += chunkSize) {
+	          if (options.signal?.aborted) throw abortError();
+	          if (!this.pending.has(id)) break;
+	          const end = Math.min(offset + chunkSize, totalBytes);
+	          let chunk;
+	          if (bytes instanceof Blob) {
+	            chunk = new Uint8Array(await bytes.slice(offset, end).arrayBuffer());
+	          } else if (bytes instanceof Uint8Array) {
+	            chunk = bytes.subarray(offset, end);
+	          } else {
+	            chunk = new Uint8Array(bytes.slice(offset, end));
+	          }
+	          this.sendFrame({
+	            t: 'upload_chunk',
+	            id,
+	            seq,
+	            data: bytesToBase64(chunk),
+	          });
+	          await this.waitForBufferedAmountLow(options.signal);
+	        }
+	        if (this.pending.has(id)) this.sendFrame({ t: 'upload_end', id, chunks });
+	      } catch (err) {
+	        if (this.pending.has(id)) this.sendFrame({ t: 'cancel', id });
+	        throw err;
+	      }
+	      return promise;
+	    },
+
+	    async waitForBufferedAmountLow(signal = null) {
+	      while (
+	        this.channel &&
+	        this.channel.readyState === 'open' &&
+	        this.channel.bufferedAmount > UPLOAD_BUFFER_HIGH_BYTES
+	      ) {
+	        if (signal?.aborted) throw abortError();
+	        await new Promise(resolve => setTimeout(resolve, 10));
+	      }
+	    },
 
     waitFor(id, options = {}) {
       return new Promise((resolve, reject) => {
@@ -11731,24 +12752,26 @@ fn connect_bootstrap_html() -> String {
           settled = true;
           clearTimeout(timer);
           if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
-          this.pending.delete(id);
-          this.chunkedResponses.delete(id);
-          if (cancel) this.sendFrame({ t: 'cancel', id });
-          reject(err);
-        };
+	          this.pending.delete(id);
+	          this.chunkedResponses.delete(id);
+	          this.deleteByteStreamsForRequest(id);
+	          if (cancel) this.sendFrame({ t: 'cancel', id });
+	          reject(err);
+	        };
         const abortHandler = signal ? () => fail(abortError(), true) : null;
         const timeoutMs = Number.isFinite(Number(options.timeoutMs)) ? Number(options.timeoutMs) : 10000;
         const timer = setTimeout(() => fail(new Error('connect dashboard request timed out'), true), timeoutMs);
         if (signal && abortHandler) signal.addEventListener('abort', abortHandler, { once: true });
         this.pending.set(id, {
-          resolve: value => {
-            if (settled) return;
-            settled = true;
-            clearTimeout(timer);
-            if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
-            this.chunkedResponses.delete(id);
-            resolve(value);
-          },
+	          resolve: value => {
+	            if (settled) return;
+	            settled = true;
+	            clearTimeout(timer);
+	            if (signal && abortHandler) signal.removeEventListener('abort', abortHandler);
+	            this.chunkedResponses.delete(id);
+	            this.deleteByteStreamsForRequest(id);
+	            resolve(value);
+	          },
           reject: err => fail(err),
         });
       });
@@ -11762,22 +12785,34 @@ fn connect_bootstrap_html() -> String {
       if (this.channel?.readyState === 'open') this.channel.send(JSON.stringify(frame));
     },
 
-    sendChunkCredit(id, chunks) {
-      this.sendFrame({ t: 'credit', id, chunks });
-    },
+	    sendChunkCredit(id, chunks, chunkId = null) {
+	      const frame = { t: 'credit', id, chunks };
+	      if (chunkId) frame.chunk_id = chunkId;
+	      this.sendFrame(frame);
+	    },
+
+	    deleteByteStreamsForRequest(id) {
+	      for (const [streamId, state] of this.byteStreams) {
+	        if (streamId === id || state?.id === id) this.byteStreams.delete(streamId);
+	      }
+	    },
 
     status() {
       return {
         connected: this.pc?.connectionState === 'connected',
         pcState: this.pc?.connectionState || '',
-        channelState: this.channel?.readyState || '',
-        sessionId: this.sessionId,
-        verifiedBinding: this.verifiedBinding,
-        pendingRequests: this.pending.size,
-        pendingChunkedResponses: this.chunkedResponses.size,
-        completedChunkedResponses: this.completedChunkedResponses,
-      };
-    },
+	        channelState: this.channel?.readyState || '',
+	        sessionId: this.sessionId,
+	        verifiedBinding: this.verifiedBinding,
+	        clientNonce: this.clientNonce,
+	        expiresUnixMs: this.expiresUnixMs,
+	        pendingRequests: this.pending.size,
+	        pendingChunkedResponses: this.chunkedResponses.size,
+	        pendingByteStreams: this.byteStreams.size,
+	        completedChunkedResponses: this.completedChunkedResponses,
+	        completedByteStreams: this.completedByteStreams,
+	      };
+	    },
 
     close() {
       if (this.sessionId) {
@@ -11786,9 +12821,10 @@ fn connect_bootstrap_html() -> String {
           headers: { 'content-type': 'application/json' },
           body: JSON.stringify({ session_id: this.sessionId }),
         }).catch(() => {});
-      }
-      this.chunkedResponses.clear();
-      try { this.channel?.close(); } catch {}
+	      }
+	      this.chunkedResponses.clear();
+	      this.byteStreams.clear();
+	      try { this.channel?.close(); } catch {}
       try { this.pc?.close(); } catch {}
     },
 
@@ -12508,11 +13544,9 @@ fn append_managed_context_fission_groups_from_dir(
         }
     } else {
         for session_id in session_ids {
-            if let Some(document) =
-                crate::fission_ledger::read_fission_ledger_document_for_session(
-                    log_dir, session_id,
-                )?
-            {
+            if let Some(document) = crate::fission_ledger::read_fission_ledger_document_for_session(
+                log_dir, session_id,
+            )? {
                 documents.push(document);
             }
         }
@@ -13459,7 +14493,7 @@ const SOURCE_VIEWER_JS: &str = r##"
 })();
 "##;
 
-fn expand_dashboard_fs_path(raw: &str) -> Result<PathBuf, String> {
+pub(crate) fn expand_dashboard_fs_path(raw: &str) -> Result<PathBuf, String> {
     let trimmed = raw.trim();
     let path = if trimmed.is_empty() || trimmed == "~" {
         dirs::home_dir().ok_or_else(|| "could not resolve home directory".to_string())?
@@ -13532,6 +14566,11 @@ fn inspect_dashboard_fs_path(raw: &str) -> Result<FsPathStatus, String> {
     })
 }
 
+pub(crate) fn dashboard_fs_stat_response_body(raw: &str) -> Result<String, String> {
+    inspect_dashboard_fs_path(raw)
+        .and_then(|status| serde_json::to_string(&status).map_err(|e| e.to_string()))
+}
+
 fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, String> {
     let path = expand_dashboard_fs_path(raw)?;
     let canonical = std::fs::canonicalize(&path)
@@ -13574,6 +14613,10 @@ fn list_dashboard_fs_dir(raw: &str) -> Result<serde_json::Value, String> {
     }))
 }
 
+pub(crate) fn dashboard_fs_list_response_body(raw: &str) -> Result<String, String> {
+    list_dashboard_fs_dir(raw).map(|body| body.to_string())
+}
+
 fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, String)> {
     let path = expand_dashboard_fs_path(raw).map_err(|e| ("400 Bad Request".to_string(), e))?;
     if path.exists() {
@@ -13605,6 +14648,13 @@ fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, Stri
         "already_exists": false,
         "path": display.to_string_lossy().to_string()
     }))
+}
+
+pub(crate) fn dashboard_fs_mkdir_response_body(raw: &str) -> (String, String) {
+    match mkdir_dashboard_fs_path(raw) {
+        Ok(body) => ("200 OK".to_string(), body.to_string()),
+        Err((status, message)) => (status, serde_json::json!({ "error": message }).to_string()),
+    }
 }
 
 /// Extract the `Content-Type` request header value, or a generic default.
@@ -13657,7 +14707,7 @@ fn ensure_idle(
 }
 
 /// GET /api/session/current/history — returns serialized `History` JSON.
-async fn handle_history_get(
+pub(crate) async fn handle_history_get(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
 ) -> (&'static str, String) {
     let Some(fw) = file_watcher else {
@@ -13691,7 +14741,7 @@ async fn handle_history_get(
 /// `AppEvent::ConversationRolledBack` is emitted when the work
 /// completes. The HTTP response does not wait for that completion —
 /// the dashboard observes the event stream.
-async fn handle_history_rollback(
+pub(crate) async fn handle_history_rollback(
     body_text: &str,
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
@@ -13836,7 +14886,7 @@ async fn handle_history_rollback(
 }
 
 /// POST /api/session/current/redo — no body. Advances `current_head_id`.
-async fn handle_history_redo(
+pub(crate) async fn handle_history_redo(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
     agent_state: Option<&Arc<Mutex<AgentStateSnapshot>>>,
 ) -> (&'static str, String) {
@@ -13868,7 +14918,7 @@ async fn handle_history_redo(
 
 /// POST /api/session/current/prune — drop abandoned branches and GC orphaned
 /// content-addressed blobs.
-async fn handle_history_prune(
+pub(crate) async fn handle_history_prune(
     file_watcher: Option<&crate::file_watcher::SharedFileWatcher>,
 ) -> (&'static str, String) {
     let Some(fw) = file_watcher else {
@@ -13896,7 +14946,7 @@ async fn handle_history_prune(
 
 /// Delete session data: entire session, media, recordings, frames, or turns.
 /// Returns a JSON result with `ok` and `bytes_freed`.
-fn delete_session_data(session_id: &str, target: &str) -> String {
+pub(crate) fn delete_session_data(session_id: &str, target: &str) -> String {
     // Path traversal protection
     if !session_lookup_id_is_safe(session_id) {
         return serde_json::json!({"ok": false, "error": "invalid session id"}).to_string();
@@ -14811,18 +15861,11 @@ pub fn spawn_web_gateway(
 ) -> tokio::task::JoinHandle<()> {
     let config_json = serde_json::to_string(&config).unwrap_or_else(|_| "{}".to_string());
     let peer_access_request_config = config.peer_access_requests.clone();
-    let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
-        config.clone(),
-        broadcast_tx.clone(),
-        bus.clone(),
-        peer_registry.clone(),
-        shared_session.clone(),
-        project_root.clone(),
-    ));
-    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
-        config.connect.clone(),
-        dashboard_control.clone(),
-    );
+    // Cache the most recent worktree inventory scan. Scanning can walk
+    // large worktree directories for disk-size accounting, so the
+    // dashboard explicitly triggers refreshes instead of doing it on
+    // every GET. Shared by HTTP and the dashboard WebRTC control tunnel.
+    let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     // Build the local Agent Card from live runtime state so
     // `/.well-known/agent-card.json` can serve it. The transport URLs
@@ -14844,6 +15887,9 @@ pub fn spawn_web_gateway(
     );
     let agent_card = build_local_agent_card(advertise_urls, local_card_auth);
     let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
+    let agent_card_value =
+        serde_json::to_value(&agent_card).unwrap_or_else(|_| serde_json::json!({}));
+    let bootstrap_caches = crate::dashboard_control::DashboardBootstrapCaches::default();
 
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {
@@ -14929,6 +15975,201 @@ pub fn spawn_web_gateway(
     let (authority_change_tx, _authority_change_rx0) =
         broadcast::channel::<DisplayInputAuthorityChange>(AUTHORITY_CHANGE_CAPACITY);
 
+    let (dashboard_authority_change_tx, _dashboard_authority_change_rx0) =
+        broadcast::channel::<u32>(AUTHORITY_CHANGE_CAPACITY);
+    {
+        let mut authority_change_rx = authority_change_tx.subscribe();
+        let dashboard_authority_change_tx = dashboard_authority_change_tx.clone();
+        tokio::spawn(async move {
+            loop {
+                match authority_change_rx.recv().await {
+                    Ok(change) => {
+                        let _ = dashboard_authority_change_tx.send(change.display_id);
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                }
+            }
+        });
+    }
+
+    let dashboard_display_authority = {
+        let snapshot_authority = Arc::clone(&display_input_authority);
+        let state_authority = Arc::clone(&display_input_authority);
+        let request_authority = Arc::clone(&display_input_authority);
+        let request_change_tx = authority_change_tx.clone();
+        let release_authority = Arc::clone(&display_input_authority);
+        let release_change_tx = authority_change_tx.clone();
+        let input_authority = Arc::clone(&display_input_authority);
+        let cleanup_authority = Arc::clone(&display_input_authority);
+        let cleanup_change_tx = authority_change_tx.clone();
+        let subscribe_tx = dashboard_authority_change_tx.clone();
+        crate::dashboard_control::DashboardDisplayAuthorityBridge::new(
+            move |session_id, display_ids| {
+                dashboard_control_authority_snapshot_frames(
+                    session_id,
+                    display_ids,
+                    &snapshot_authority,
+                )
+            },
+            move |session_id, display_id| {
+                Some(dashboard_control_authority_state_frame(
+                    session_id,
+                    display_id,
+                    &state_authority,
+                ))
+            },
+            move |session_id, display_id| {
+                apply_grant_input_authority_dashboard_control(
+                    display_id,
+                    session_id.to_string(),
+                    &request_authority,
+                    &request_change_tx,
+                );
+                vec![dashboard_control_authority_state_frame(
+                    session_id,
+                    display_id,
+                    &request_authority,
+                )]
+            },
+            move |session_id, display_id| {
+                apply_release_input_authority_dashboard_control(
+                    display_id,
+                    session_id,
+                    &release_authority,
+                    &release_change_tx,
+                );
+                vec![dashboard_control_authority_state_frame(
+                    session_id,
+                    display_id,
+                    &release_authority,
+                )]
+            },
+            move |session_id, display_id| {
+                dashboard_control_input_authorized(session_id, display_id, &input_authority)
+            },
+            move |session_id| {
+                apply_dashboard_control_close_input_authority(
+                    session_id,
+                    &cleanup_authority,
+                    &cleanup_change_tx,
+                );
+            },
+            move || subscribe_tx.subscribe(),
+        )
+    };
+
+    // Process-wide registry of standalone shell PTY sessions, keyed by
+    // (host_id, terminal_id). Lives as long as the web gateway task and
+    // is cloned into each per-connection handler so reconnects reattach
+    // to existing shells. Keyed on host_id even though there's only one
+    // host today so multi-host phase 1 can add siblings without refactor.
+    let terminal_registry: Arc<crate::terminal::TerminalRegistry> = Arc::new(
+        crate::terminal::TerminalRegistry::new(project_root.clone().unwrap_or_else(|| {
+            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
+        })),
+    );
+
+    let dashboard_presence = {
+        let connect_active_presence = active_presence.clone();
+        let connect_voice_debug = voice_debug.clone();
+        let connect_shared_session = shared_session.clone();
+        let connect_bus = bus.clone();
+        let connect_provider = config.provider.clone();
+        let connect_model = config.model.clone();
+
+        let disconnect_active_presence = active_presence.clone();
+        let disconnect_voice_debug = voice_debug.clone();
+        let disconnect_shared_session = shared_session.clone();
+        let disconnect_bus = bus.clone();
+
+        let make_active_presence = active_presence.clone();
+        let make_voice_debug = voice_debug.clone();
+        let make_shared_session = shared_session.clone();
+        let make_bus = bus.clone();
+        let make_provider = config.provider.clone();
+        let make_model = config.model.clone();
+
+        let cleanup_active_presence = active_presence.clone();
+        let cleanup_voice_debug = voice_debug.clone();
+        let cleanup_shared_session = shared_session.clone();
+        let cleanup_bus = bus.clone();
+
+        let log_voice_debug = voice_debug.clone();
+
+        crate::dashboard_control::DashboardPresenceBridge::new(
+            move |request| {
+                Box::pin(dashboard_control_presence_connect(
+                    request,
+                    connect_active_presence.clone(),
+                    connect_voice_debug.clone(),
+                    connect_shared_session.clone(),
+                    connect_bus.clone(),
+                    connect_provider.clone(),
+                    connect_model.clone(),
+                ))
+            },
+            move |request| {
+                Box::pin(dashboard_control_presence_disconnect(
+                    request,
+                    disconnect_active_presence.clone(),
+                    disconnect_voice_debug.clone(),
+                    disconnect_shared_session.clone(),
+                    disconnect_bus.clone(),
+                ))
+            },
+            move |request| {
+                Box::pin(dashboard_control_presence_make_active(
+                    request,
+                    make_active_presence.clone(),
+                    make_voice_debug.clone(),
+                    make_shared_session.clone(),
+                    make_bus.clone(),
+                    make_provider.clone(),
+                    make_model.clone(),
+                ))
+            },
+            move |session_id| {
+                Box::pin(dashboard_control_presence_cleanup(
+                    session_id,
+                    cleanup_active_presence.clone(),
+                    cleanup_voice_debug.clone(),
+                    cleanup_shared_session.clone(),
+                    cleanup_bus.clone(),
+                ))
+            },
+            move |text| {
+                let mut vd = log_voice_debug.lock().unwrap_or_else(|e| e.into_inner());
+                vd.voice_log_count += 1;
+                vd.last_voice_log = text;
+            },
+        )
+    };
+
+    let dashboard_control = Arc::new(crate::dashboard_control::DashboardControlRegistry::new(
+        config.clone(),
+        broadcast_tx.clone(),
+        bus.clone(),
+        peer_registry.clone(),
+        mcp_server.clone(),
+        shared_session.clone(),
+        project_root.clone(),
+        worktree_inventory_cache.clone(),
+        terminal_registry.clone(),
+        web_tui_tx.clone(),
+        task_tx.clone(),
+        agent_card_value,
+        bootstrap_caches.clone(),
+        Some(dashboard_display_authority),
+        Some(dashboard_presence),
+        ice_config.clone(),
+        Arc::clone(&tcp_peer_registry),
+    ));
+    let _connect_rendezvous_handle = crate::connect_rendezvous::spawn_connect_rendezvous_client(
+        config.connect.clone(),
+        dashboard_control.clone(),
+    );
+
     // F-1.3b3 federated authority subscribers. Federated counterpart
     // to local 5c's per-WS subscriber loop: federated browsers don't
     // share the local 5c WS path, so the gateway needs an explicit
@@ -14972,56 +16213,39 @@ pub fn spawn_web_gateway(
         });
     }
 
-    // Process-wide registry of standalone shell PTY sessions, keyed by
-    // (host_id, terminal_id). Lives as long as the web gateway task and
-    // is cloned into each per-connection handler so WS reconnects reattach
-    // to existing shells. Keyed on host_id even though there's only one
-    // host today so multi-host phase 1 can add siblings without refactor.
-    let terminal_registry: Arc<crate::terminal::TerminalRegistry> = Arc::new(
-        crate::terminal::TerminalRegistry::new(project_root.clone().unwrap_or_else(|| {
-            std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."))
-        })),
-    );
-
     // Cache the latest usage_update JSON so late-connecting browsers get it
     // without sending ControlMsg (which would pollute the event log).
-    let last_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_usage_json = bootstrap_caches.last_usage_json.clone();
     // Cache the latest live_usage_update JSON for late-connecting browsers.
-    let last_live_usage_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_live_usage_json = bootstrap_caches.last_live_usage_json.clone();
     // Cache the latest status event (has autonomy, session_id, task).
-    let last_status_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_status_json = bootstrap_caches.last_status_json.clone();
     // Cache standalone autonomy changes so reconnecting dashboards do not
     // fall back to the stale autonomy value in the latest status event.
-    let last_autonomy_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_autonomy_json = bootstrap_caches.last_autonomy_json.clone();
     // Cache the latest external_agent_changed event so a refreshed
     // browser learns the current value without having to re-fetch
     // settings. Without this the dashboard dropdown snaps back to
     // "None (internal agent)" on every page refresh even though the
     // daemon still has the value in memory.
-    let last_external_agent_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_external_agent_json = bootstrap_caches.last_external_agent_json.clone();
     // Cache all currently externally-attached sessions so refreshed browsers
     // can rehydrate every open Activity window with the same compact
     // transcript shown in the Sessions tab. This must be a set, not "last
     // attached", because multiple Codex/Claude/Gemini session windows may be
     // open at once.
-    let attached_external_sessions: Arc<Mutex<HashMap<String, String>>> =
-        Arc::new(Mutex::new(HashMap::new()));
+    let attached_external_sessions = bootstrap_caches.attached_external_sessions.clone();
     // Cache the latest user_display_granted event. The authoritative
     // state lives in AutonomyState.user_display_granted on the server,
     // but the dashboard only learns about it via the broadcast; without
     // this cache a refreshed browser shows "off" regardless of whether
     // the user has actually granted access. Cleared on user_display_revoked
     // so a stale grant doesn't get replayed after the user revokes.
-    let last_user_display_json: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let last_user_display_json = bootstrap_caches.last_user_display_json.clone();
     // Cache display_ready JSON per display_id for late-connecting browsers.
     // Using a HashMap so multiple concurrent display sessions are all replayed.
     let display_ready_cache: Arc<Mutex<HashMap<u32, String>>> =
         Arc::new(Mutex::new(HashMap::new()));
-    // Cache the most recent worktree inventory scan. Scanning can walk
-    // large worktree directories for disk-size accounting, so the
-    // dashboard explicitly triggers refreshes instead of doing it on
-    // every GET.
-    let worktree_inventory_cache: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     {
         let usage_cache = last_usage_json.clone();
         let live_usage_cache = last_live_usage_json.clone();
@@ -17386,6 +18610,11 @@ pub fn spawn_web_gateway(
                                         Some("dashboard_control_offer") => {
                                             let sdp =
                                                 json["sdp"].as_str().unwrap_or("").to_string();
+                                            let client_nonce = json["client_nonce"]
+                                                .as_str()
+                                                .map(str::trim)
+                                                .filter(|nonce| !nonce.is_empty())
+                                                .map(str::to_string);
                                             if sdp.is_empty() {
                                                 let msg = serde_json::json!({
                                                     "t": "dashboard_control_error",
@@ -17394,7 +18623,9 @@ pub fn spawn_web_gateway(
                                                 let _ = direct_tx_inbound.send(msg.to_string());
                                                 continue;
                                             }
-                                            match dashboard_control_inbound.answer_offer(sdp).await
+                                            match dashboard_control_inbound
+                                                .answer_offer(sdp, None, client_nonce)
+                                                .await
                                             {
                                                 Ok(answer) => {
                                                     dashboard_control_session_ids
@@ -18308,11 +19539,9 @@ pub fn spawn_web_gateway(
                         );
                         use tokio::io::AsyncWriteExt;
                         let _ = stream.write_all(&response).await;
-                    } else if let Some(asset) = static_asset_arm(
-                        req_method,
-                        req_path,
-                        &["/icon-128.png", "/favicon.ico"],
-                    ) {
+                    } else if let Some(asset) =
+                        static_asset_arm(req_method, req_path, &["/icon-128.png", "/favicon.ico"])
+                    {
                         let response = build_static_asset_response(
                             req_method,
                             &header_text,
@@ -18811,46 +20040,7 @@ pub fn spawn_web_gateway(
                         // GET /recordings — list all streams (session + daemon-scoped)
                         use tokio::io::AsyncWriteExt;
 
-                        let mut all_entries = Vec::new();
-
-                        // Session-scoped recordings (from RecordingRegistry)
-                        if let Some(ref rec_reg) = recording_registry {
-                            let reg = rec_reg.read().await;
-                            let streams = reg.all_streams();
-                            for name in &streams {
-                                let manifest = reg.manifest(name).unwrap_or(serde_json::json!({}));
-                                let segments = reg.segments(name);
-                                let total_duration =
-                                    segments.last().map(|s| s.end_secs).unwrap_or(0.0);
-                                let seg_json: Vec<serde_json::Value> = segments
-                                    .iter()
-                                    .map(|s| {
-                                        serde_json::json!({
-                                            "filename": s.filename,
-                                            "start_secs": s.start_secs,
-                                            "end_secs": s.end_secs,
-                                        })
-                                    })
-                                    .collect();
-                                let mut entry = manifest;
-                                entry["segments"] = serde_json::Value::Array(seg_json);
-                                entry["total_duration_secs"] = serde_json::json!(total_duration);
-                                all_entries.push(entry);
-                            }
-                        }
-
-                        // Daemon-scoped recordings (from ~/.intendant/recordings/)
-                        let daemon_dir = crate::debug::daemon_recordings_dir();
-                        let mut daemon_streams: std::collections::HashSet<String> =
-                            std::collections::HashSet::new();
-                        for entry in list_recording_streams(&daemon_dir) {
-                            if let Some(name) = entry["stream_name"].as_str() {
-                                daemon_streams.insert(name.to_string());
-                            }
-                            all_entries.push(entry);
-                        }
-
-                        let body = serde_json::to_string(&all_entries).unwrap_or("[]".to_string());
+                        let body = recordings_list_response_body(recording_registry.clone()).await;
                         let response = format!(
                             "HTTP/1.1 200 OK\r\n\
                              Content-Type: application/json\r\n\
@@ -19154,60 +20344,38 @@ pub fn spawn_web_gateway(
                     {
                         // DELETE /api/session/current/uploads/<id> — remove the file + sidecar.
                         use tokio::io::AsyncWriteExt;
-                        let response = 'del_upload: {
-                            let Some(ref root) = project_root_for_changes else {
-                                break 'del_upload upload_error_response(
-                                    "404 Not Found",
-                                    "no project root",
-                                );
-                            };
+                        let response = {
                             let session_dir = if let Some(ref slog) = session_log {
                                 match slog.lock() {
-                                    Ok(l) => l.dir().to_path_buf(),
-                                    Err(_) => {
-                                        break 'del_upload upload_error_response(
-                                            "500 Internal Server Error",
-                                            "session log lock poisoned",
-                                        );
-                                    }
+                                    Ok(l) => Ok(Some(l.dir().to_path_buf())),
+                                    Err(_) => Err("session log lock poisoned"),
                                 }
                             } else {
-                                pending_upload_session_dir(root)
+                                Ok(None)
                             };
-                            let path_and_q = request_line.split_whitespace().nth(1).unwrap_or("");
-                            let path = path_and_q.splitn(2, '?').next().unwrap_or("");
-                            let id = path
-                                .trim_start_matches("/api/session/current/uploads/")
-                                .trim_matches('/');
-                            if id.is_empty() {
-                                break 'del_upload upload_error_response(
-                                    "400 Bad Request",
-                                    "missing upload id",
-                                );
-                            }
-                            match crate::upload_store::delete_upload(id, &session_dir, root) {
-                                Ok(_) => {
-                                    bus.send(crate::event::AppEvent::UploadDeleted {
-                                        id: id.to_string(),
-                                    });
-                                    let body = serde_json::json!({"ok": true}).to_string();
-                                    format!(
-                                        "HTTP/1.1 200 OK\r\n\
-                                         Content-Type: application/json\r\n\
-                                         Content-Length: {}\r\n\
-                                         Cache-Control: no-cache\r\n\
-                                         Access-Control-Allow-Origin: *\r\n\
-                                         Connection: close\r\n\
-                                         \r\n\
-                                         {}",
-                                        body.len(),
-                                        body
-                                    )
-                                }
-                                Err(e) => upload_error_response(
+                            match session_dir {
+                                Err(error) => json_response(
                                     "500 Internal Server Error",
-                                    &format!("delete: {e}"),
+                                    serde_json::json!({ "error": error }).to_string(),
                                 ),
+                                Ok(session_dir) => {
+                                    let path_and_q =
+                                        request_line.split_whitespace().nth(1).unwrap_or("");
+                                    let path = path_and_q.splitn(2, '?').next().unwrap_or("");
+                                    let id = path
+                                        .trim_start_matches("/api/session/current/uploads/")
+                                        .trim_matches('/');
+                                    let (status, body, deleted_id) =
+                                        current_upload_delete_response_body(
+                                            project_root_for_changes.as_deref(),
+                                            session_dir.as_deref(),
+                                            id,
+                                        );
+                                    if let Some(id) = deleted_id {
+                                        bus.send(crate::event::AppEvent::UploadDeleted { id });
+                                    }
+                                    json_response(status, body)
+                                }
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
@@ -19603,16 +20771,10 @@ pub fn spawn_web_gateway(
                                 }
                             } else {
                                 // GET /api/session/{id}/recordings — list streams
-                                let body =
-                                    if let Some(session_dir) = resolve_session_dir(session_id) {
-                                        let recordings_dir = session_dir.join("recordings");
-                                        let entries = list_recording_streams(&recordings_dir);
-                                        serde_json::to_string(&entries).unwrap_or("[]".to_string())
-                                    } else {
-                                        "[]".to_string()
-                                    };
+                                let (status, body) =
+                                    session_recordings_list_response_body(session_id);
                                 let response = format!(
-                                    "HTTP/1.1 200 OK\r\n\
+                                    "HTTP/1.1 {status}\r\n\
                                      Content-Type: application/json\r\n\
                                      Content-Length: {}\r\n\
                                      Cache-Control: no-cache\r\n\
@@ -20279,8 +21441,8 @@ pub fn spawn_web_gateway(
                         let _ = stream_task.await;
                     } else if request_line.contains("/api/sessions/search") {
                         let query = query_param(request_line, "q").unwrap_or_default();
-                        let source_filter =
-                            query_param(request_line, "source").unwrap_or_else(|| "all".to_string());
+                        let source_filter = query_param(request_line, "source")
+                            .unwrap_or_else(|| "all".to_string());
                         let mode = query_param(request_line, "mode").unwrap_or_default();
                         let project_filter = session_project_filter_from_request(request_line);
                         let body = sessions_search_response_body(
@@ -21689,7 +22851,7 @@ struct PeerWebRtcSignalRequest {
 /// callers don't get the answer in this HTTP response, they
 /// observe it on the dashboard's primary `/ws` as a
 /// `PeerEventForwarded` whose payload is `PeerEvent::WebRtcSignal`.
-async fn peers_webrtc_signal(
+pub(crate) async fn peers_webrtc_signal(
     registry: &crate::peer::PeerRegistry,
     id: &str,
     body_text: &str,
@@ -23832,12 +24994,8 @@ mod tests {
             },
         )
         .unwrap();
-        crate::fission_ledger::detach_group(
-            dir.path(),
-            &detached.group_id,
-            "anchor rewound away",
-        )
-        .unwrap();
+        crate::fission_ledger::detach_group(dir.path(), &detached.group_id, "anchor rewound away")
+            .unwrap();
 
         let response = managed_context_fission_response_from_home(
             "GET /api/managed-context/fission?session_id=fission-web-parent HTTP/1.1",
@@ -23881,7 +25039,10 @@ mod tests {
             branch["changed_files"],
             serde_json::json!(["docs/src/a.md", "docs/src/b.md"])
         );
-        assert_eq!(branch["tests_run"], serde_json::json!(["cargo test --bins"]));
+        assert_eq!(
+            branch["tests_run"],
+            serde_json::json!(["cargo test --bins"])
+        );
 
         // A session id outside the connected component sees no groups.
         let unrelated = managed_context_fission_response_from_home(
@@ -25709,11 +26870,7 @@ mod tests {
                 + "\n",
         )
         .unwrap();
-        let wrapper_dir = home
-            .path()
-            .join(".intendant")
-            .join("logs")
-            .join(wrapper_id);
+        let wrapper_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
         std::fs::create_dir_all(&wrapper_dir).unwrap();
         std::fs::write(
             wrapper_dir.join("session_meta.json"),
@@ -29270,10 +30427,12 @@ mod tests {
             .expect("exact wasm path must serve the wasm");
         assert_eq!(asset.content_type, "application/wasm");
         assert_eq!(asset.body, WASM_STATION_BIN);
-        assert!(
-            static_asset_arm("HEAD", "/wasm-station/station_web_bg.wasm", STATION_WASM_ARM_PATHS)
-                .is_some()
-        );
+        assert!(static_asset_arm(
+            "HEAD",
+            "/wasm-station/station_web_bg.wasm",
+            STATION_WASM_ARM_PATHS
+        )
+        .is_some());
 
         // Non-GET/HEAD methods and superstring paths fall through.
         assert!(static_asset_arm(
@@ -29311,7 +30470,10 @@ mod tests {
         let icon = embedded_static_asset("/icon-128.png").unwrap();
         assert!(icon.gzip.is_none());
         // The favicon alias serves the same PNG.
-        assert_eq!(embedded_static_asset("/favicon.ico").unwrap().body, ICON_128_PNG);
+        assert_eq!(
+            embedded_static_asset("/favicon.ico").unwrap().body,
+            ICON_128_PNG
+        );
         // The gzip gate is size-based: tiny assets stay identity-only.
         let audio = embedded_static_asset("/audio-processor.js").unwrap();
         assert_eq!(audio.gzip.is_some(), audio.body.len() >= GZIP_MIN_BYTES);
@@ -29345,7 +30507,9 @@ mod tests {
         ));
         assert!(accept_encoding_allows_gzip("Accept-Encoding: GZIP"));
         assert!(accept_encoding_allows_gzip("accept-encoding: x-gzip;q=0.5"));
-        assert!(accept_encoding_allows_gzip("Accept-Encoding: br, gzip;q=0.8"));
+        assert!(accept_encoding_allows_gzip(
+            "Accept-Encoding: br, gzip;q=0.8"
+        ));
         assert!(!accept_encoding_allows_gzip("Accept-Encoding: br"));
         assert!(!accept_encoding_allows_gzip("Accept-Encoding: gzip;q=0"));
         assert!(!accept_encoding_allows_gzip("Accept-Encoding: gzip;q=0.0"));
@@ -29481,13 +30645,15 @@ mod tests {
         // `?v=wgpu29` station-wasm case) and none on another.
         let html = "<script src=\"/wasm-station/station_web.js?v=wgpu29\"></script>\n\
                     import('/wasm-station/station_web_bg.wasm');";
-        let rewritten =
-            rewrite_asset_url_with_version(html, "/wasm-station/station_web.js", v);
+        let rewritten = rewrite_asset_url_with_version(html, "/wasm-station/station_web.js", v);
         let rewritten =
             rewrite_asset_url_with_version(&rewritten, "/wasm-station/station_web_bg.wasm", v);
         assert!(rewritten.contains("/wasm-station/station_web.js?v=0123456789abcdef\""));
         assert!(rewritten.contains("/wasm-station/station_web_bg.wasm?v=0123456789abcdef'"));
-        assert!(!rewritten.contains("wgpu29"), "stale buster must be replaced");
+        assert!(
+            !rewritten.contains("wgpu29"),
+            "stale buster must be replaced"
+        );
         assert!(
             !rewritten.contains("?v=0123456789abcdef?v="),
             "never a malformed double query"
@@ -29495,8 +30661,7 @@ mod tests {
 
         // Idempotent: re-applying the rewrite changes nothing.
         let twice = rewrite_asset_url_with_version(&rewritten, "/wasm-station/station_web.js", v);
-        let twice =
-            rewrite_asset_url_with_version(&twice, "/wasm-station/station_web_bg.wasm", v);
+        let twice = rewrite_asset_url_with_version(&twice, "/wasm-station/station_web_bg.wasm", v);
         assert_eq!(twice, rewritten);
 
         // Multiple occurrences are all rewritten.
@@ -31804,7 +32969,10 @@ mod tests {
         let resp = http_request_bytes(port, &req).await;
         let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
         let head = String::from_utf8_lossy(&resp[..split]).into_owned();
-        assert!(head.starts_with("HTTP/1.1 304 Not Modified\r\n"), "got: {head}");
+        assert!(
+            head.starts_with("HTTP/1.1 304 Not Modified\r\n"),
+            "got: {head}"
+        );
         assert!(head.contains(&etag_line));
         assert!(head.contains("Access-Control-Allow-Origin: *\r\n"));
         assert_eq!(resp.len(), split, "304 must carry no body");
@@ -35133,6 +36301,77 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .get(&7)
             .is_none());
+    }
+
+    #[test]
+    fn dashboard_control_authority_grant_release_and_cleanup() {
+        let map = empty_authority_map();
+        let (auth_tx, mut auth_rx) = broadcast::channel::<DisplayInputAuthorityChange>(8);
+
+        apply_grant_input_authority_dashboard_control(
+            11,
+            "control-session-A".to_string(),
+            &map,
+            &auth_tx,
+        );
+        let grant = auth_rx.try_recv().expect("dashboard grant emitted");
+        assert_eq!(grant.display_id, 11);
+        assert!(
+            grant
+                .holder
+                .as_ref()
+                .map(|holder| holder.matches_dashboard_control("control-session-A"))
+                .unwrap_or(false),
+            "broadcast holder must identify the dashboard-control session"
+        );
+        assert!(dashboard_control_input_authorized(
+            "control-session-A",
+            11,
+            &map
+        ));
+        assert!(!dashboard_control_input_authorized(
+            "control-session-B",
+            11,
+            &map
+        ));
+        assert_eq!(
+            dashboard_control_authority_state_frame("control-session-A", 11, &map)["state"],
+            "you"
+        );
+        assert_eq!(
+            dashboard_control_authority_state_frame("control-session-B", 11, &map)["state"],
+            "other"
+        );
+
+        let released = apply_release_input_authority_dashboard_control(
+            11,
+            "control-session-B",
+            &map,
+            &auth_tx,
+        );
+        assert!(!released, "non-holder release should be a no-op");
+        assert!(auth_rx.try_recv().is_err(), "no-op release should not emit");
+
+        apply_grant_input_authority_dashboard_control(
+            12,
+            "control-session-A".to_string(),
+            &map,
+            &auth_tx,
+        );
+        let _ = auth_rx.try_recv().expect("second dashboard grant emitted");
+        let mut cleaned =
+            apply_dashboard_control_close_input_authority("control-session-A", &map, &auth_tx);
+        cleaned.sort_unstable();
+        assert_eq!(cleaned, vec![11, 12]);
+        let cleanup_a = auth_rx.try_recv().expect("first cleanup emitted");
+        let cleanup_b = auth_rx.try_recv().expect("second cleanup emitted");
+        assert!(cleanup_a.holder.is_none());
+        assert!(cleanup_b.holder.is_none());
+        assert!(dashboard_control_input_authorized(
+            "control-session-B",
+            11,
+            &map
+        ));
     }
 
     /// Release attempted by a non-holder is a no-op — prevents A from

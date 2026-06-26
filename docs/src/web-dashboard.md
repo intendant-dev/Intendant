@@ -115,8 +115,11 @@ target** snaps back to the current prompt target.
 For a live session the pane calls the per-session MCP `get_status` and renders
 a density card: managed/vanilla mode, pressure status, effective and hard-limit
 token usage with a colored pressure bar, the soft rewind-at threshold, and
-whether rewind-only gating is active. Historical sessions show `historical`
-status — records and anchors stay readable, but live actions are disabled.
+whether rewind-only gating is active. When the verified dashboard-control
+tunnel is connected, these dashboard-originated MCP `tools/call` requests use
+`api_mcp_tool_call`; otherwise they fall back to `/mcp?session_id=...`.
+Historical sessions show `historical` status — records and anchors stay
+readable, but live actions are disabled.
 Alerts flag non-Codex selections, sessions without managed mode, an
 insufficient last rewind, and a configured Codex command that doesn't look like
 the patched managed build.
@@ -209,7 +212,10 @@ control (see [Display Pipeline](./display-pipeline.md)):
 Displays appear automatically when the agent's first command triggers Xvfb
 auto-launch, or when access to the user's real session display is granted.
 WebRTC negotiation (SDP offer/answer + ICE candidates) is multiplexed over the
-existing dashboard WebSocket.
+existing dashboard WebSocket. When the verified dashboard-control DataChannel is
+connected, local display input authority requests and keyboard/mouse input can
+use that daemon-scoped control tunnel; video media still flows through the
+per-display WebRTC session.
 
 ### Station
 
@@ -431,32 +437,76 @@ control surface, see [Control Plane & Daemon](./control-plane-and-daemon.md).
 Intendant also has an experimental daemon-scoped WebRTC DataChannel transport
 for dashboard control traffic. It is not a replacement for dashboard
 authentication yet: today the browser still bootstraps from the normal dashboard
-origin and sends the WebRTC offer over the existing WebSocket. The point is to
-prove the future "public HTTPS bootstrap + direct local daemon data path" shape
-without weakening the current mTLS default.
+origin, then uses the daemon's local `/connect/dashboard/*` signaling endpoints
+to establish the DataChannel. The existing WebSocket signaling path remains as
+a compatibility fallback for older dashboard bundles. The point is to prove the
+future "public HTTPS bootstrap + direct local daemon data path" shape without
+weakening the current mTLS default.
 
 The handshake is bound to the daemon identity:
 
 - the browser creates a `intendant-dashboard-control` DataChannel and sends an
-  SDP offer over `/ws`;
+  SDP offer to `/connect/dashboard/offer`;
 - the daemon answers with SDP plus a signed binding over the offer hash, answer
   hash, session id, timestamp, and daemon Ed25519 public key;
 - the browser verifies that binding with WebCrypto before using the channel.
+- in Connect-rendezvous mode, the browser also requires the answer to carry the
+  daemon public key registered for the selected daemon id and rejects the tunnel
+  if that advertised key differs from the key inside the signed binding.
 
 When enabled with
 `localStorage.intendant_dashboard_transport = "webrtc-control"` (or
 `window.intendantDashboardControl.enable()`), dashboard JSON reads prefer the
 DataChannel and fall back to HTTP through the browser-side `DashboardTransport`
-boundary. Current tunneled reads include sessions, session detail, lazy
-command-output loads for the active session, deep session search, settings,
-API-key status, project root, display enumeration, and peer state.
+boundary. Current tunneled reads include the local Agent Card identity, sessions,
+session detail, lazy command-output loads for the active session,
+active-session timeline history, active-session changes/diffs, lazy exact
+context-snapshot loads, filesystem picker stat/list/mkdir operations, deep
+session search, settings, API-key status, server-side voice-session token
+minting, project root, display enumeration, recording metadata, worktree
+inventory, staged-upload descriptors, scoped recording asset byte streams,
+archived session frame image byte streams, bounded session-report zip downloads,
+and peer state.
 Managed-context history reads for records, anchors, and fission groups also use
-the tunnel. Current tunneled mutations include settings save, API-key
-save, peer add/remove, peer access-request pairing, peer message/task/approval
-actions, eligible-peer lookup, and coordinator routing.
+the tunnel.
+Current tunneled mutations include
+active-session rollback/redo/prune, session-data deletion, staged upload
+deletion, settings save, API-key save, peer add/remove, peer access-request
+pairing, peer message/task/approval actions, peer-display WebRTC signaling,
+eligible-peer lookup,
+visual-freshness diagnostics NDJSON appends, worktree scan/remove, dashboard
+managed-context MCP tool calls, coordinator routing, and dashboard
+session-control and dashboard-action controls. Annotation attach/save/send and
+clip creation use a dedicated dashboard media/editor protocol over the same
+verified channel: annotation image bytes travel as `upload_*` frames committed
+by `api_media_annotation_attach` or `api_media_annotation_submit`; clips use
+`api_media_clip_start`, ordered `api_media_clip_frame` uploads keyed by
+`clip_id`, then `api_media_clip_end` or `api_media_clip_cancel`.
+Allowlisted settings-style `ControlMsg`s, such as autonomy, approval-rule,
+external-agent, Codex, Gemini, and verbosity settings, can also dispatch over
+the DataChannel when it is verified. Display input authority uses dedicated
+DataChannel RPCs and a `display_input` frame rather than the generic
+`ControlMsg` allowlist. The standalone Shell terminal subtab uses dedicated
+`terminal_*` frames over the same verified channel. The server-side ratatui TUI
+subtab uses `tui_subscribe`, `tui_key`, `tui_resize`, `tui_unsubscribe`, and
+`tui_close` frames when the daemon has a live WebTui renderer; idle daemon
+launches that do not run WebTui advertise `tui_frames_available: false`. In
+daemon-origin dashboards the old WebSocket path remains the fallback TUI
+transport; in public-origin Connect mode the browser does not attempt that
+fallback. Session lifecycle,
+steering, approvals, interrupt, resume, stop/restart, rename, and launch-config
+changes use a separate
+`api_session_control_msg` RPC with its own allowlist instead of broadening the
+generic settings-style `api_control_msg`. Smaller dashboard action controls use
+`api_dashboard_action_msg`; this includes Codex/Gemini thread actions, display
+take/release/grant/revoke, the diagnostics visual-marker toggle, recording and
+debug toggles, and browser workspace create/acquire/close/release. It has its
+own allowlist and the same no-replay fallback rule as the other mutation RPCs.
 Mutation fallbacks are deliberately conservative: if a connected WebRTC RPC
 fails after it may have reached the daemon, the dashboard surfaces the error
-instead of repeating the write over HTTP.
+instead of repeating the write over HTTP. The visual-freshness sampler follows
+the same rule for NDJSON appends; it uses the legacy HTTP endpoint only when no
+verified DataChannel path is available.
 
 The tunnel mirrors HTTP JSON response semantics. Application errors travel as
 successful transport frames with `_httpStatus`/`_httpOk` metadata so existing UI
@@ -467,10 +517,11 @@ browser-side promise.
 Several paths intentionally stay outside this JSON tunnel:
 
 - static assets and WASM bundles;
-- frames, recordings, and file uploads;
-- MCP-over-HTTP;
-- diagnostics NDJSON uploads;
-- display WebRTC media/control channels and peer-display signaling;
+- native media fallback URLs and broad file-transfer bytes;
+- general filesystem mutations and broad/resumable file transfer;
+- generic MCP-over-HTTP for external clients;
+- non-allowlisted `ControlMsg` mutations;
+- display WebRTC media channels;
 - daemon-to-daemon federation authentication.
 
 Peer mTLS remains a separate trust boundary. The dashboard tunnel authenticates
@@ -485,7 +536,7 @@ dashboard:
 
 | Endpoint | mTLS? | Purpose |
 |----------|-------|---------|
-| `GET /connect/bootstrap` | not required | Minimal HTML bootstrap page for WebRTC dashboard-control testing |
+| `GET /connect/bootstrap` | not required | Minimal HTML bootstrap page for WebRTC dashboard-control transport testing |
 | `GET /connect/status` | not required | JSON health/capability probe for the bootstrap surface |
 | `POST /connect/dashboard/offer` | not required | Browser SDP offer -> daemon SDP answer plus signed binding |
 | `POST /connect/dashboard/ice` | not required | Browser trickle ICE candidate for a control session |
@@ -496,7 +547,13 @@ Those paths are deliberately allowlisted one by one. They do **not** make `/`,
 without the normal dashboard authentication. The bootstrap page exposes
 `window.intendantConnectDashboard` for tests and diagnostics; it verifies the
 same daemon-signed binding as the full dashboard control experiment, then uses
-the DataChannel RPC protocol directly.
+the DataChannel RPC protocol directly. Its small browser-side transport supports
+plain JSON requests, chunked JSON responses, bounded `byte_stream_*` downloads,
+and `upload_*` frames, so the local bootstrap check can cover both read-style
+artifacts and media/editor writes without making the full dashboard certless.
+These local endpoints are useful for same-origin dashboard experiments and
+diagnostics; by themselves they do not solve browser trust for a public page
+talking to a daemon HTTPS certificate the browser has not already accepted.
 
 Run the focused browser check against a local daemon with:
 
@@ -507,12 +564,25 @@ PLAYWRIGHT_NODE_PATH=/path/to/node_modules \
 
 The check intentionally uses no client certificate. It must see `/config`
 rejected with `401`, then prove that `/connect/bootstrap` can create a verified
-dashboard-control DataChannel and issue a few RPC requests over it.
+dashboard-control DataChannel, issue RPC requests, read a bounded byte stream,
+and commit media/editor uploads over the tunnel.
 
-This slice is a local stand-in for a future hosted Intendant Connect service. It
+To test the full dashboard bundle's local signaling path, run a loopback-only
+plaintext debug daemon through:
+
+```bash
+node scripts/validate-dashboard-control-local-signaling.cjs \
+  --dashboard-binary ./target/release/intendant \
+  --daemon-port 8877
+```
+
+That harness enables `window.intendantDashboardControl` in the real SPA and
+asserts that the verified DataChannel reports `signalingMode: "local-http"`.
+
+This slice is a local low-level harness for the dashboard-control tunnel. It
 does not implement account login, passkeys, daemon claiming, or a durable daemon
-registry. Its job is to make the signaling boundary concrete and testable before
-moving the real SPA and hosted account UX onto that boundary.
+registry. Its job is to keep the same-origin tunnel protocol easy to exercise
+while the hosted Connect service owns the account and daemon-claim UX.
 
 ### Local Rendezvous Emulator Slice
 
@@ -546,15 +616,144 @@ Chrome/Chromium through the DevTools Protocol. The fallback honors
 The validator starts a local rendezvous HTTP origin, launches a fresh daemon
 child with Connect env vars, verifies that
 `https://127.0.0.1:<daemon-port>/config` still rejects a certless request with
-`401`, then loads the browser from the rendezvous origin and drives `status`,
-`config`, `api_sessions`, streamed `api_sessions_stream` hydration, a chunked
-large `api_sessions_stream` event, a chunked large `api_sessions` response,
-active-session command-output lookup, and application error RPCs over the
-verified DataChannel.
+`401`, verifies that daemon rendezvous endpoints reject missing bearer auth, and
+then performs these browser passes:
 
-This still is not consumer Connect. It has no account, passkey, daemon claim,
-grant issuance, revocation, audit log, or hosted public HTTPS. It is the
-smallest complete signaling proof for the future hosted service boundary.
+1. It loads the minimal public bootstrap page from the rendezvous origin and
+   drives `status`, `config`, `api_sessions`, id-filtered `api_sessions`,
+   streamed `api_sessions_stream` hydration, a chunked large
+   `api_sessions_stream` event, a chunked large `api_sessions` response,
+   active-session command-output lookup, active-session timeline
+   lookup/validation, bounded byte streams, uploads, media/editor writes, and
+   application error RPCs over the verified DataChannel.
+2. It serves the real `static/app.html` bundle from the same public origin at
+   `/app?connect=1&daemon_id=...`, proves that it uses rendezvous signaling
+   (`signalingMode: "connect-rendezvous"`), and checks that first-load dashboard
+   data such as config, Agent Card identity, sessions, bootstrap frames, event
+   subscription, and visible transport status all arrive through
+   `window.intendantDashboardControl` instead of same-origin daemon HTTP/WSS.
+   It also asserts that the SPA's signed daemon binding key matches the daemon
+   public key registered with the rendezvous service for the selected daemon id.
+   It injects a synthetic `api_control_msg` failure in the connected SPA and
+   verifies that the generic settings-style write path does not replay the same
+   mutation over the legacy WebSocket.
+   This real-SPA pass also fails if the public-origin dashboard attempts daemon
+   REST/media/WebSocket fallback paths such as `/config`,
+   `/.well-known/agent-card.json`, `/api/...`, `/recordings`,
+   `/connect/dashboard/...`, or `/ws`.
+3. It opens the same real dashboard with an unregistered daemon id and asserts
+   that the UI reports a Connect failure while still avoiding those public-origin
+   REST/media/WebSocket fallbacks. This page must also stop daemon-dependent
+   startup hydrators such as settings, project-root, and recording refreshes so
+   the initial rendezvous failure does not cascade into unrelated errors.
+4. It opens the real dashboard with the same registered daemon id while the
+   emulator deliberately tampers with the advertised registry key for that offer.
+   The SPA must reject the tunnel before it stores a verified binding, report a
+   failed Connect transport, and still avoid daemon REST/media/WebSocket
+   fallbacks.
+5. It opens the real dashboard with the same registered daemon id while the
+   emulator deliberately tampers with the browser-visible session grant. The
+   daemon signs the grant hash it received in the offer event, so the SPA must
+   reject the answer before it stores a verified binding or grant hash.
+6. It opens the real dashboard while the emulator deliberately tampers with the
+   browser challenge nonce forwarded to the daemon. The daemon signs the nonce it
+   received, so the SPA must reject the answer before it stores a verified
+   binding or expiry.
+
+This is still a protocol emulator rather than the consumer Connect service. It
+has no account, passkey, daemon claim, revocation, audit log, or hosted public
+HTTPS. The emulator's grant is only an opaque per-offer session value used to
+prove that a Connect-issued grant can be carried through signaling and bound
+into the daemon-signed WebRTC session statement.
+
+### Hosted Connect MVP
+
+The first hosted-service slice is implemented as a separate binary,
+`intendant-connect`. It serves a public web origin, handles passkey-only account
+registration/login, lets a signed-in user claim a daemon with a short-lived code,
+and brokers dashboard WebRTC signaling without asking the browser to trust the
+daemon's private HTTPS certificate.
+
+In production, run it behind ordinary public TLS for a public origin such as
+`https://connect.intendant.dev`:
+
+```bash
+INTENDANT_CONNECT_TOKEN="$(openssl rand -base64 32)" \
+  ./target/release/intendant-connect \
+    --listen 127.0.0.1:9876 \
+    --origin https://connect.intendant.dev \
+    --rp-id intendant.dev \
+    --static-root static \
+    --data-file /var/lib/intendant-connect/state.json
+```
+
+The `--rp-id intendant.dev` value means passkeys are scoped to the owned
+Intendant domain while the actual UI can live on `connect.intendant.dev`.
+Browsers also allow `http://localhost:<port>` as a secure context for local
+development, so the same binary can be E2E-tested without public TLS.
+
+The daemon side still uses the normal `[connect]` outbound rendezvous client:
+
+```toml
+[connect]
+enabled = true
+rendezvous_url = "https://connect.intendant.dev"
+daemon_id = "vortex-deb-x11-intendant"
+auth_token = "same daemon token configured on intendant-connect"
+```
+
+The hosted MVP flow is:
+
+1. The daemon registers its `daemon_id` and persistent daemon identity public
+   key through `/api/daemon/register`.
+2. If the daemon is unclaimed, Connect returns a short-lived claim code and URL.
+3. The user opens Connect, signs in or registers with a passkey, and submits the
+   claim code.
+4. Connect sends a `claim_challenge` event to the daemon. The daemon signs that
+   challenge with its daemon identity key, and Connect verifies the signature
+   before assigning ownership.
+5. The user chooses the daemon in Connect and opens the dashboard. Connect
+   issues a short-lived opaque dashboard grant, forwards the browser SDP offer
+   to the daemon, and waits for the daemon answer.
+6. The daemon signs the same WebRTC binding used by the local/rendezvous paths,
+   including the offer hash, answer hash, browser nonce, expiry, daemon public
+   key, and hash of the Connect-issued grant.
+7. Connect validates that the answer came from the registered daemon key and
+   that the signed grant hash matches before returning the answer to the
+   browser. The browser independently verifies the daemon-signed binding before
+   sending dashboard RPC over the DataChannel.
+
+The state file durably stores users, passkeys, daemon ownership, hashed claim
+codes, and a capped audit log. Plain claim codes, WebAuthn challenge state,
+browser offers, and dashboard grants are memory-only. The service exposes a
+minimal account/daemon UI today: passkey registration/login, claim-code entry,
+daemon list, open dashboard, revoke ownership, and audit events.
+
+Current MVP limits:
+
+- one owner per daemon; no shared roles, teams, recovery, or account email flow;
+- one bearer token protects daemon service endpoints; production deployments
+  should put the service behind rate limits and normal reverse-proxy hardening;
+- revocation removes ownership and future dashboard grants but does not yet
+  forcibly close an already-open browser DataChannel;
+- no high-availability storage or database migrations; the state file is a
+  single-node MVP persistence layer;
+- no application-layer dashboard RPC relay; the default path is browser to
+  daemon WebRTC, with TURN/WebRTC relay remaining a transport-level option;
+- peer daemon-to-daemon mTLS remains separate from Connect account login.
+
+Run the hosted MVP E2E locally with:
+
+```bash
+cargo build --bin intendant-connect --bin intendant
+node scripts/validate-connect-hosted-mvp.cjs
+```
+
+That validator starts `intendant-connect`, launches a daemon with outbound
+Connect enabled, uses a browser virtual authenticator for passkey registration,
+claims the daemon, opens the real SPA in `connect=1` mode, verifies the
+daemon-signed binding and Connect grant hash, revokes the daemon, and checks the
+audit events.
 
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
@@ -615,10 +814,26 @@ The minimal trust model is:
   control-plane APIs over the DataChannel.
 
 The current experimental tunnel implements the daemon-signed binding locally: the
-daemon signs the SDP offer hash, SDP answer hash, WebRTC control session id,
-timestamp, and daemon Ed25519 public key, and the browser verifies the signature
-with WebCrypto before using the channel. A public bootstrap service should keep
-that daemon identity binding and add account/device grants around it.
+browser sends a fresh challenge nonce with its SDP offer, and the daemon signs
+the SDP offer hash, SDP answer hash, WebRTC control session id, creation time,
+expiry time, daemon Ed25519 public key, that browser challenge nonce, and, when
+rendezvous signaling supplies one, a Connect session-grant hash. The browser
+verifies the signature with WebCrypto, rejects expired bindings, checks that the
+signed nonce matches its own challenge, and checks that the visible grant hashes
+to the signed grant hash before using the channel. A public bootstrap service
+should keep that daemon identity binding and add account/device grants around it.
+
+The local Connect-rendezvous emulator now also models the registry side of that
+identity check: the daemon registers its public key for a daemon id, the browser
+offer answer carries that registered key, and the public-origin dashboard accepts
+the DataChannel only when the signed binding key matches the registered key. It
+also models grant binding with an opaque per-offer value and nonce binding with a
+browser-generated challenge: the browser accepts the answer only when that
+visible grant hashes to the daemon-signed grant hash and the signed nonce matches
+the nonce it put in the offer. This does not solve account ownership,
+authorization-grant issuance, revocation, or clone recovery; it prevents the
+browser from treating an arbitrary valid daemon signature, stale binding,
+mismatched grant, or mismatched browser challenge as the claimed session.
 
 This makes the security boundary explicit: Intendant Connect is in the trusted
 computing base for consumer dashboard access. A compromised Connect service or
@@ -690,9 +905,15 @@ messages. The first useful envelope set is:
 | `response` | daemon -> browser | Status, metadata, body, or application error for a request id |
 | `response_start` / `response_chunk` / `response_end` | daemon -> browser | Chunked delivery of an oversized JSON `response` frame |
 | `stream_start` / `stream_event` / `stream_end` | daemon -> browser | Ordered event stream for a long-lived request id |
+| `byte_stream_start` / `byte_stream_chunk` / `byte_stream_end` | daemon -> browser | Bounded raw-byte artifact transfer for a request id |
+| `upload_start` / `upload_chunk` / `upload_end` | browser -> daemon | Bounded raw-byte upload transfer for a request id |
+| `terminal_open` / `terminal_input` / `terminal_resize` / `terminal_close` | browser -> daemon | Standalone Shell PTY control for one terminal id |
+| `terminal_output` / `terminal_exited` / `terminal_opened` / `terminal_error` | daemon -> browser | Standalone Shell PTY data and lifecycle frames |
+| `tui_subscribe` / `tui_key` / `tui_resize` / `tui_unsubscribe` / `tui_close` | browser -> daemon | Server-side WebTui connection control when a WebTui renderer is available |
+| `tui_term` / `tui_error` | daemon -> browser | WebTui terminal bytes and errors for one dashboard-control connection id |
 | `event` | daemon -> browser | Control-plane event stream entry |
 | `cancel` | browser -> daemon | Cancel an in-flight request or stream |
-| `credit` | browser -> daemon | Backpressure for chunked responses or chunked stream events |
+| `credit` | browser -> daemon | Backpressure for chunked responses, chunked stream events, or bounded byte streams |
 | `ping` / `pong` | both | Liveness, latency, and reconnect diagnostics |
 
 Oversized DataChannel `response` and `stream_event` frames are split at the
@@ -700,36 +921,259 @@ transport layer. The daemon sends a `response_start` header, base64-encoded
 `response_chunk` frames containing the original JSON frame bytes, and a
 `response_end` marker. The browser reassembles and parses the original frame
 before handing it to existing request or stream code, so API semantics stay
-unchanged. Current browser clients advertise `response_credit` in `hello`; when
-that feature is negotiated, the daemon sends an initial chunk window and then
-waits for browser `credit` frames before releasing more chunks. Stream chunks
-carry a `chunk_id` so a large event inside a longer stream can be credited and
-cancelled without ending the whole request id. Older clients that do not
-advertise the feature still receive the legacy eager chunk burst. Resumable
-transfer semantics are still required before moving uploads, downloads,
-recordings, terminal streams, or file transfer.
+unchanged. Current browser clients advertise `response_credit`, `byte_streams`,
+`upload_frames`, `terminal_frames`, and `tui_frames` in `hello`; when
+`response_credit` is negotiated, the daemon sends an initial chunk window and
+then waits for browser `credit` frames before releasing more chunks. Stream
+chunks carry a `chunk_id` so a large event inside a longer stream can be
+credited and cancelled without ending the whole request id. Older clients that
+do not advertise the feature still receive the legacy eager chunk burst.
+
+Bounded artifact downloads use `byte_stream_start`, base64 `byte_stream_chunk`
+frames, and `byte_stream_end`. This avoids wrapping raw bytes inside a JSON
+result and reuses the same credit-window queue, but it is still an in-memory,
+single-shot transfer.
+
+Bounded dashboard uploads use `upload_start`, base64 `upload_chunk`, and
+`upload_end`. The daemon writes chunks into a tempfile and commits through the
+same upload store as `POST /api/session/current/uploads`, including the
+`UploadReady` broadcast. This is still a one-shot, ordered transfer with no
+resume token. Resumable/range semantics are still required before moving generic
+downloads, native media playback, or broad file transfer.
+
+Dashboard media/editor writes intentionally stay outside the generic
+`api_dashboard_action_msg` and `api_control_msg` allowlists. They use the
+dedicated media protocol instead: annotation attach/save/send commits use
+media-specific upload methods, and clip creation uses an operation id with
+ordered frame uploads plus commit/cancel. Older daemons that do not advertise the
+media protocol still receive the legacy `annotation_*` and `clip_*` WebSocket
+messages before any tunneled write is attempted.
+
+The standalone **Terminal -> Shell** subtab uses `terminal_*` frames when the
+verified tunnel advertises `terminal_frames`. The daemon attaches the tunnel to
+the same PTY registry used by the WebSocket path, so scrollback and reconnect
+behavior stay consistent. The server-side ratatui **TUI** subtab uses `tui_*`
+frames when the verified tunnel advertises `tui_frames`. The daemon creates a
+dashboard-control-owned WebTui connection, forwards WebTui's existing
+`{"t":"term","d":"..."}` output as `tui_term`, and removes the connection on
+`tui_close` or DataChannel cleanup. Idle daemon launches intentionally do not run
+WebTui, so they report `tui_frames_available: false` and the browser leaves that
+subtab on the existing WebSocket/fallback behavior only on daemon-origin pages.
+Public-origin Connect pages have no daemon WebSocket fallback, so TUI key,
+resize, and subscription attempts are dropped until `tui_frames` is advertised.
 
 The first streamed API on this substrate is `api_sessions_stream`, which mirrors
 the existing `/api/sessions/stream` NDJSON event shape (`start`, partial
 `session`, `phase`, final `replace`, `done`). When the verified DataChannel is
 connected, local dashboard session hydration uses that stream and falls back to
 the HTTP stream on safe errors. Peer session lists still use direct peer HTTP.
+The local daemon identity is available as `api_agent_card`, returning the same
+Agent Card shape served by `/.well-known/agent-card.json`; the HTTP endpoint
+remains the unauthenticated discovery surface.
+When the verified channel opens, the browser also applies `config` and
+`api_agent_card` results to the same runtime-config and self-identity state
+normally hydrated by `/config` and `/.well-known/agent-card.json`.
+`api_cached_bootstrap_events` returns the daemon's current non-personalized
+dashboard event cache (`usage`/`usage_update`, `live_usage_update`, `status`,
+`autonomy_changed`, `external_agent_changed`, and `user_display_granted` when
+present) as parsed JSON events. This cached-event RPC is intentionally narrower
+than the WebSocket open sequence, but the tunnel exposes the personalized
+bootstrap pieces as separate identity-aware APIs below. `api_dashboard_bootstrap`
+composes those pieces so a public-origin dashboard can hydrate without the
+primary daemon WebSocket.
+`api_browser_workspace_snapshot` returns the existing
+`browser_workspace_snapshot` message shape with active browser workspaces and
+lease state; callers can feed it through the same browser workspace handler that
+currently receives the WebSocket bootstrap message.
+`api_state_snapshot` returns the existing `state_snapshot` message shape with
+the current `AgentStateSnapshot`, dashboard config, daemon session id when known,
+and a DataChannel-scoped `connection_id`. The connection id is the WebRTC
+control session id, not the legacy WebSocket connection id.
+`api_display_bootstrap` returns a DataChannel-safe display bootstrap envelope
+whose `frames` array contains `display_ready` events for every active display
+session known to the daemon. Those frames use the same event shape as the
+WebSocket bootstrap (`event`, `display_id`, `width`, `height`), so browser code
+can feed them through the existing display-slot path. When the daemon exposes a
+dashboard-control display authority bridge, the envelope also includes
+personalized `display_input_authority_state` frames for the same active display
+ids; otherwise `display_input_authority_state` is listed in `omitted`.
+`api_display_input_authority_snapshot` returns just those personalized authority
+frames, while `api_display_input_authority_request` and
+`api_display_input_authority_release` claim or release the display for the
+current dashboard-control session and return fresh state frames for immediate UI
+application. The browser then sends local keyboard/mouse events as
+fire-and-forget `display_input` frames over the same daemon-scoped DataChannel.
+If the tunnel or authority bridge is unavailable, the dashboard falls back to
+the older WebSocket plus per-display input-channel path.
+Local display WebRTC signaling uses `api_display_webrtc_signal` when the
+verified tunnel advertises it. The browser sends the same `display_id`, offer
+SDP, and ICE candidate shapes that the legacy `display_offer`/`display_ice`
+WebSocket frames used; the offer RPC returns a `display_answer`, while daemon
+ICE candidates arrive later as `display_ice` event payloads over the control
+DataChannel. Daemon-origin dashboards may still fall back to the WebSocket when
+the tunnel is unavailable. Public-origin Connect mode does not attempt a daemon
+WebSocket fallback for local display signaling, so missing tunnel support fails
+the display slot visibly.
+`api_session_log_replay` returns the existing capped `log_replay` message shape
+used by late WebSocket joiners. When no active session log exists it returns an
+empty replay with `available: false`.
+`api_external_session_activity_replay` returns an envelope whose `frames` array
+contains compact external attached-session activity replay frames for currently
+attached Codex/Claude/Gemini sessions. It uses the same transcript payloads as
+WebSocket bootstrap. The combined bootstrap skips an attached external session
+when the active Intendant session log replay already names the same
+`external_session_id`, avoiding duplicate transcript hydration.
+`api_dashboard_bootstrap` composes the DataChannel-safe bootstrap pieces into an
+ordered `frames` array: state snapshot, cached dashboard events, browser
+workspace snapshot, active display `display_ready` frames, and capped session
+log replay, followed by active external attached-session activity replay frames.
+When the display authority bridge is available, it appends personalized
+`display_input_authority_state` frames as well so a refreshed public-origin
+dashboard can hydrate display control chips without the primary WebSocket.
 Lazy command-output expansion for finalized log command groups uses
 `api_session_current_agent_output`, preserving the same `_httpStatus`/`_httpOk`
 metadata as the existing HTTP endpoint.
+The active-session timeline uses `api_session_current_history`,
+`api_session_current_rollback`, `api_session_current_redo`, and
+`api_session_current_prune`; the mutation calls use the same no-replay fallback
+rule as other writes.
+Active-session change list/detail reads use `api_session_current_changes`,
+preserving the existing path validation and `_httpStatus`/`_httpOk` metadata.
+Live and per-session recording stream lists use `api_recordings` and
+`api_session_recordings`. Scoped recording asset reads use `api_recording_asset`
+and `api_session_recording_asset` for `segments`, `playlist.m3u8`, and validated
+`seg_*.mp4`/`seg_*.ts` filenames with optional `offset`/`length` ranges. The
+recording player uses these byte streams for segment lists and MP4 MSE buffers
+when the verified tunnel is available. The non-MSE MP4 fallback also reads the
+segment over the tunnel and assigns a local blob URL to the video element.
+HLS/`.ts` playback also prefers the tunnel when available: the browser reads
+`playlist.m3u8` and validated `.ts` segments with the same recording asset RPC,
+rewrites the playlist to local blob URLs, and points the native video element at
+that object URL. If the browser rejects the blob playlist, it falls back to the
+daemon-served `m3u8` URL only on a daemon-origin dashboard page; public-origin
+Connect mode does not attempt same-origin HTTP fallback for self-daemon media.
+Archived session frame images use `api_session_frame_asset` for validated `.jpg`
+and `.png` filenames under a resolved session's `frames/` directory. The session
+detail gallery renders returned bytes through browser blob URLs when the verified
+tunnel advertises byte streams, falling back to the existing HTTP image URL when
+the tunnel is unavailable or a tunneled image read fails.
+The Settings debug session-report download uses `api_session_report`, returning
+the same text-artifact zip as `/api/session/{id}/report` through bounded
+`byte_stream_*` frames. This is intentionally scoped to the diagnostic report;
+generic downloads still wait for resumable/range semantics.
+The task attachment upload path uses `api_session_current_upload` over
+`upload_*` frames when the verified tunnel advertises `upload_frames`; it falls
+back to `POST /api/session/current/uploads` only when the tunnel feature is not
+available. Failed tunneled uploads are not replayed over HTTP, to avoid creating
+duplicate attachments after an ambiguous partial transfer.
+Dashboard annotation media uses the same ordered `upload_*` frame substrate but
+commits to media-specific methods instead of the task attachment store:
+`api_media_annotation_attach` registers a pending annotation frame, and
+`api_media_annotation_submit` registers a saved annotation and optionally queues
+it for the live presence context. Clip creation is stateful: the browser first
+opens a `clip_id` operation with `api_media_clip_start`, uploads each JPEG frame
+with `api_media_clip_frame` in strict `frame_index` order, then commits with
+`api_media_clip_end` or discards with `api_media_clip_cancel`. The dashboard
+chooses the transport once per media operation. If the media protocol is not
+advertised before the first write, daemon-origin dashboards use the legacy
+WebSocket media messages. Public-origin Connect mode has no daemon WebSocket
+fallback, so annotation and clip writes fail visibly when the verified media
+tunnel is not available. After a tunneled media write is attempted, failures are
+surfaced and are not replayed over the WebSocket.
+Browser-side live voice keeps its provider WebSocket in the browser, but the
+daemon coordination side uses the Connect control tunnel. The WASM presence
+bridge can install a custom sender so its normal server messages route over the
+verified DataChannel instead of `/ws`: `presence_frame` carries
+`presence_connect`, `presence_disconnect`, `make_active`, `voice_log`,
+`presence_checkpoint`, `voice_diagnostic`, `live_usage_update`, `tool_request`,
+and `async_query`. Server responses such as `presence_welcome`,
+`force_disconnect_voice`, `active_granted`, `tool_response`, and
+`async_query_result` are delivered back to the same WASM callback router that
+the WebSocket path uses. HQ browser video/archive frames use
+`api_presence_video_frame` over the ordered `upload_*` substrate. Public-origin
+Connect pages therefore do not depend on the daemon-origin WebSocket for active
+voice handoff, voice event logging, live voice tool/query dispatch, or frame
+archival. Server-side transcription audio remains intentionally untunneled for
+now; Connect mode drops that optional audio stream rather than replaying it over
+the legacy bridge.
+Current-upload list reads use `api_session_current_uploads`, returning the same
+staged-upload descriptor array as `GET /api/session/current/uploads`.
+Current-upload raw reads use `api_session_current_upload_raw` over
+`byte_stream_*` frames. The request names an uploaded attachment id and may
+include `offset`/`length`; the response carries `range_start`, `range_end`,
+`total_size`, and `resumable: true` metadata with the returned bytes. This is a
+bounded ranged-read primitive for previews/tests and future resumable transfer
+work, not yet a general media/download adapter.
+Worktree cached inventory reads, explicit scans, and guarded removals use
+`api_worktrees`, `api_worktrees_scan`, and `api_worktrees_remove`; removal uses
+the same no-replay fallback rule as other writes.
+The filesystem picker's path checks, directory listings, and mkdir operation use
+`api_fs_stat`, `api_fs_list`, and `api_fs_mkdir`; mkdir uses the same no-replay
+fallback rule as other writes.
+Bounded filesystem file reads use `api_fs_read` when the verified tunnel
+advertises byte streams. The request uses the same absolute-path or `~/` path
+rules as the picker, rejects directories, accepts optional `offset`/`length`,
+and returns bytes plus `content_type`, `range_start`, `range_end`, `total_size`,
+and `resumable: true` metadata. This is a read-only preview/diagnostic
+primitive, not yet a general download or bidirectional file-transfer adapter.
+Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
+large raw request payloads out of ordinary session-detail hydration while still
+allowing the Context pane to fetch a single archived snapshot on demand.
+Staged upload deletion uses `api_session_current_upload_delete` so removing a
+pending attachment can travel over the verified control channel. Browser image
+chips now prefer `api_session_current_upload_raw` and render the returned bytes
+through a local blob URL, falling back to the legacy raw HTTP URL only when the
+tunnel is unavailable or preview loading fails.
+OpenAI browser live-audio token minting uses `api_voice_session`; it preserves
+the existing `/session` behavior and error envelope while avoiding a direct
+dashboard HTTPS POST when the verified control channel is available.
+Dashboard-originated managed-context MCP actions use `api_mcp_tool_call`, which
+wraps a single `tools/call` against the daemon's existing MCP server. These
+calls use the same no-replay fallback rule as other writes because tools such
+as `rewind_context`, `fission_control`, and `fission_spawn` mutate live session
+state.
+Confirmed session-data deletion uses `api_session_delete` with the same
+no-replay fallback rule as other writes; the dashboard still requires the
+existing confirmation modal before issuing the RPC.
+Peer-display WebRTC signaling uses `api_peer_webrtc_signal`, carrying the same
+`display_id`, `session_id`, and `signal` body as `POST /api/peers/{id}/webrtc`
+plus the target `peer_id`. Answers and remote ICE still arrive asynchronously
+through the normal peer-event path; the RPC only confirms that the signal was
+accepted for forwarding. Failed tunneled signaling requests are not replayed
+over HTTP after a verified tunnel attempt.
+Dashboard session-control actions use `api_session_control_msg`. This includes
+create/start/resume/stop/restart session, targeted follow-up, mid-turn steer,
+cancel queued steer/follow-up, edit user message, interrupt, approvals,
+session rename, and per-session launch-config persistence. The browser only
+falls back to the WebSocket before it has attempted the RPC; once a verified
+DataChannel write is sent, an error is surfaced to the operator instead of
+replaying a potentially duplicated action.
+Small dashboard action controls use `api_dashboard_action_msg`. This covers
+Codex/Gemini attached-thread actions, local display authority toggles, the
+diagnostics visual-marker toggle, recording and debug screen controls, and
+browser workspace create/acquire/close/release. The browser applies the same
+no-replay fallback rule: use the WebSocket only before a verified DataChannel
+request is attempted, then surface RPC failures instead of duplicating a
+potentially state-changing action. For `set_diagnostics_visual_marker`, the
+daemon applies the request directly to the active display registry when
+available, or records the desired state as a pending per-display default for
+the next display session.
 
-The first production APIs should be small and high value: `/config`, the main
-event stream, local session list hydration, peer access-request
-list/approve/deny, and a basic health endpoint. Uploads, downloads, recordings,
-terminal streams, and file transfer should move later after resumable stream and
-file-transfer semantics are settled.
+The remaining migration work is mostly byte-stream and file-transfer heavy:
+generic downloads, native media fallback URLs, broader/resumable file transfer,
+and any remaining non-allowlisted control mutations should move only after
+resumable stream/file-transfer semantics and per-action no-replay rules are
+settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
 shows `checking`, verified `WebRTC`, `relay` when browser ICE stats report a
 TURN-relayed candidate pair, or `failed` when signaling or daemon-binding
 verification fails. The tooltip carries the detailed state that is also exposed
-through `window.intendantDashboardControl.status()`.
+through `window.intendantDashboardControl.status()`. In public-origin Connect
+mode, the legacy `ws` indicator is relabeled to `events`; it turns green only
+after the verified DataChannel has hydrated dashboard bootstrap events, since no
+same-origin daemon WebSocket is expected in that mode.
 
 Peer access-request APIs now use the same transport boundary. The dashboard's
 pairing/request panes call `api_peer_pairing_requests`,
@@ -738,6 +1182,15 @@ list, and identity revoke over the DataChannel when it is connected. Mutating
 pairing operations deliberately fail rather than silently falling back after a
 WebRTC RPC error, so an operator does not approve or mint credentials over an
 unexpected transport.
+General peer and coordinator controls are covered by the same rule. Peer add,
+remove, eligibility discovery, per-peer message/task/approval, peer-display
+signaling, and coordinator route calls use `api_peer_add`, `api_peer_remove`,
+`api_peer_eligible`, `api_peer_message`, `api_peer_task`, `api_peer_approval`,
+`api_peer_webrtc_signal`, and `api_coordinator_route` over the verified tunnel.
+They preserve the existing HTTP endpoint metadata (`_httpStatus`/`_httpOk`) so
+the dashboard can render the same success and error states on either transport,
+but state-changing calls do not replay over HTTP once a verified DataChannel
+request has been attempted.
 
 #### Relationship to Existing Auth Modes
 
@@ -756,40 +1209,42 @@ trust model is deliberately redesigned. In user-facing copy, that should appear
 as "grant access to this daemon" and "revoke access," not as manual certificate
 management.
 
-#### Staged Rollout
+#### Status and Remaining Rollout
 
-Treat this as a staged target, not current behavior:
+The current implementation has crossed from protocol sketch into hosted MVP:
 
-1. Keep the current mTLS dashboard as the default and keep WebRTC dashboard
-   control opt-in.
-2. Define daemon identity keys, claim codes, Connect account binding, and
-   revocation semantics.
-3. Host a public static dashboard shell with a placeholder sign-in/device model.
-4. Add daemon outbound signaling to Intendant Connect. The local emulator now
-   exercises this shape without hosted auth.
-5. Add a signaling rendezvous API keyed by browser session and daemon id. The
-   local emulator implements the minimal offer/answer/ICE/close subset.
-6. Let a locally running daemon register/poll that rendezvous while it is online.
-   The daemon now has a disabled-by-default outbound polling client.
-7. Reuse the existing daemon binding and DataChannel RPC frame format. This is
-   shared by the direct local bootstrap and rendezvous-emulator slices.
-8. Add visible transport status: disconnected, mTLS HTTP fallback, WebRTC direct,
-   WebRTC relayed, failed verification, or application-proxied. The dashboard
-   now shows mTLS/HTTP, checking, verified WebRTC, TURN-relay, and failed states
-   for the current control transport.
-9. Carry peer access-request approve/deny over the DataChannel. The dashboard
-   now routes peer access-request list/decision and related pairing APIs through
-   the DataChannel transport boundary; hosted passkey step-up still belongs to
-   the future public Connect UI.
-10. Gradually migrate larger API surfaces. Managed-context history reads,
-    active-session command-output loads, and local session hydration now use the
-    tunnel, oversized JSON responses now use credit-windowed chunked response
-    framing, and the sessions stream uses explicit
-    `stream_start`/`stream_event`/`stream_end` frames.
-    Uploads, downloads, recordings, terminals, and file transfer still wait for
-    resumable stream/file-transfer semantics.
-11. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
-    throughout.
+1. Direct mTLS dashboard access remains the default local/offline path.
+2. The daemon has a persistent daemon identity key and can expose a
+   dashboard-control WebRTC DataChannel.
+3. The real SPA has a `connect=1` public-origin mode and a
+   `DashboardTransport` boundary for tunneled reads, streams, bounded byte
+   transfer, uploads, terminal/WebTui frames, selected control messages, peer
+   pairing actions, local display signaling, and media/editor writes.
+4. The daemon has a disabled-by-default outbound Connect polling client.
+5. `intendant-connect` provides the hosted MVP: passkey-only account sessions,
+   daemon registration, claim-code ownership proof, short-lived dashboard
+   grants, signaling, revoke, and audit.
+6. The browser and hosted service both verify that the daemon-signed WebRTC
+   binding matches the registered daemon identity and Connect-issued grant.
+7. Focused validators cover the local bootstrap, local rendezvous emulator, and
+   hosted Connect MVP paths.
+
+The remaining rollout work is production hardening and breadth, not proving the
+core browser-trust escape hatch:
+
+1. Deploy `connect.intendant.dev` behind public TLS and a normal reverse proxy.
+2. Add service-side rate limits, CSRF hardening, structured logs/metrics, backup
+   and restore guidance, and a database-backed store.
+3. Add account recovery, multi-device management, teams/roles, and optional
+   passkey step-up for sensitive actions.
+4. Add active-session revocation so a revoked daemon/account grant tears down
+   already-open dashboard DataChannels.
+5. Add daemon identity rotation/recovery semantics for VM clones, disk restore,
+   and deliberate transfer of ownership.
+6. Continue migrating remaining dashboard APIs only when the tunnel has the
+   required streaming, byte-range, resumable transfer, or media semantics.
+7. Keep direct mTLS dashboard access and peer daemon-to-daemon mTLS working
+   throughout.
 
 Non-goals for this path:
 
@@ -800,11 +1255,11 @@ Non-goals for this path:
 - no attempt to obtain public certificates for private VM IPs or `.local`
   names.
 
-Open design questions before implementation:
+Remaining design questions before production rollout:
 
-- Is Intendant Connect allowed to serve all dashboard JavaScript, or do we want
-  an additional app-integrity story such as signed static assets or a pinned web
-  bundle?
+- Do we need an additional app-integrity story such as signed static assets or a
+  pinned web bundle, even though the hosted MVP serves the dashboard JavaScript
+  from Intendant Connect?
 - How are daemon identity keys backed up, rotated, revoked, and recovered after
   VM cloning or disk restore?
 - What local policy does the daemon enforce when Connect says a signed-in user
@@ -831,7 +1286,7 @@ Open design questions before implementation:
 | `GET /api/session/{id}` | Session detail |
 | `GET /api/session/{id}/recordings/*` | Recording segments for a past session |
 | `GET /recordings/*` | Current-session recording segments |
-| `WS /` or `WS /ws` | Main WebSocket: events, terminal I/O, presence protocol, WebRTC signaling |
+| `WS /` or `WS /ws` | Main WebSocket: events, TUI terminal and fallback Shell terminal I/O, presence protocol, WebRTC signaling |
 
 The full WebSocket message protocol (inbound key/resize/presence/WebRTC frames,
 outbound term/state/log-replay/tool-response frames) and the gateway's internal
