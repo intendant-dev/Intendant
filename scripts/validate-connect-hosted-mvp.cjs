@@ -330,6 +330,18 @@ async function main() {
     assert.strictEqual(connected.byteStreamsAvailable, true, `Connect tunnel did not advertise byte streams: ${JSON.stringify(connected)}`);
     assert.strictEqual(connected.apiFsReadAvailable, true, `Connect tunnel did not advertise filesystem reads: ${JSON.stringify(connected)}`);
 
+    await click(page, '.tab-btn[data-tab="settings"]');
+    await click(page, '#tab-settings .subtab-btn[data-settings-tab="debug"]');
+    const healthPanel = await page.evaluate(() => window.intendantDashboardControl._debugProbeConnectHealthPanel());
+    assert.strictEqual(healthPanel.state.connectMode, true, `Connect health panel did not detect hosted Connect mode: ${JSON.stringify(healthPanel)}`);
+    assert.strictEqual(healthPanel.state.verifiedBindingOk, true, `Connect health panel did not show a verified binding: ${JSON.stringify(healthPanel)}`);
+    assert(healthPanel.summaryText.includes('Hosted Connect'), `Connect health summary missing hosted mode: ${JSON.stringify(healthPanel)}`);
+    assert.strictEqual(healthPanel.result.ok, true, `Connect health self-test failed: ${JSON.stringify(healthPanel.result)}`);
+    assert.strictEqual(healthPanel.result.failed, 0, `Connect health self-test had failures: ${JSON.stringify(healthPanel.result)}`);
+    assert.strictEqual(healthPanel.result.skipped, 0, `Connect health self-test skipped probes: ${JSON.stringify(healthPanel.result)}`);
+    assert(healthPanel.resultText.includes('pass'), `Connect health self-test did not render pass rows: ${JSON.stringify(healthPanel)}`);
+
+    await click(page, '.tab-btn[data-tab="terminal"]');
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="tui"]');
     await page.waitForFunction(() => {
       const el = document.getElementById('terminal-tui-unavailable');

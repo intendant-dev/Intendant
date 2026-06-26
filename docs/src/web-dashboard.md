@@ -738,6 +738,17 @@ The visible account identity is the globally unique account name/handle; the
 internal WebAuthn display-name field is derived from that handle and is not a
 separate user-facing profile field in the MVP UI.
 
+Inside the hosted dashboard, Settings -> Debug includes a **Connect Health**
+panel. It summarizes the active dashboard-control transport, daemon binding,
+ICE route, event stream, byte-stream support, terminal-frame support, and other
+advertised tunnel capabilities. Its self-test button runs the same safe
+browser-side probes used by the hosted E2E harness: no legacy HTTP/WebSocket
+fallback for Connect-only mutations, Shell input ordering, terminal-output
+dedupe behavior, display-control routing, and tunneled presence callbacks. It is
+not a file-transfer integrity test; the broad/resumable download checks still
+need a known fixture path and live in the validator until the downloads UI is
+expanded.
+
 Production-alpha hardening now includes:
 
 - cookie-backed user mutations require same-origin requests and a per-session

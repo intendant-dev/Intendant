@@ -661,6 +661,131 @@ html {
   width: 16px;
   height: 16px;
 }
+.connect-health-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin: 4px 0 12px;
+}
+.connect-health-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  min-height: 26px;
+  padding: 4px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--subtext1);
+  font-size: 12px;
+  line-height: 1.25;
+}
+.connect-health-badge strong {
+  color: var(--text);
+  font-size: 12px;
+}
+.connect-health-badge.ok { border-color: rgba(166, 227, 161, 0.45); }
+.connect-health-badge.warn { border-color: rgba(249, 226, 175, 0.45); }
+.connect-health-badge.err { border-color: rgba(243, 139, 168, 0.5); }
+.connect-health-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  margin: 0 0 12px;
+}
+.connect-health-item {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--surface0);
+}
+.connect-health-label {
+  color: var(--overlay1);
+  font-size: 11px;
+  line-height: 1.2;
+}
+.connect-health-value {
+  margin-top: 3px;
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.connect-health-item.ok .connect-health-value { color: var(--green); }
+.connect-health-item.warn .connect-health-value { color: var(--yellow); }
+.connect-health-item.err .connect-health-value { color: var(--red); }
+.connect-self-test-actions {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px;
+  margin-top: 4px;
+}
+.connect-self-test-actions button {
+  padding: 6px 16px;
+  border: none;
+  border-radius: 4px;
+  background: var(--blue);
+  color: var(--crust);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 13px;
+}
+.connect-self-test-actions button:disabled {
+  cursor: wait;
+  opacity: 0.65;
+}
+#connect-self-test-status {
+  color: var(--subtext0);
+  font-size: 12px;
+}
+#connect-self-test-status.ok { color: var(--green); }
+#connect-self-test-status.warn { color: var(--yellow); }
+#connect-self-test-status.err { color: var(--red); }
+.connect-self-test-results {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-top: 10px;
+}
+.connect-self-test-row {
+  display: grid;
+  grid-template-columns: 46px minmax(0, 1fr);
+  gap: 8px;
+  align-items: start;
+  padding: 6px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--mantle);
+  font-size: 12px;
+}
+.connect-self-test-row.pass { border-color: rgba(166, 227, 161, 0.35); }
+.connect-self-test-row.skip { border-color: rgba(249, 226, 175, 0.35); }
+.connect-self-test-row.fail { border-color: rgba(243, 139, 168, 0.45); }
+.connect-self-test-state {
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+.connect-self-test-row.pass .connect-self-test-state { color: var(--green); }
+.connect-self-test-row.skip .connect-self-test-state { color: var(--yellow); }
+.connect-self-test-row.fail .connect-self-test-state { color: var(--red); }
+.connect-self-test-name {
+  color: var(--text);
+  line-height: 1.3;
+}
+.connect-self-test-detail {
+  margin-top: 2px;
+  color: var(--subtext0);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
 
 /* ── Daemons (multi-host) ── */
 .daemons-list {
@@ -10569,6 +10694,16 @@ body.display-fullscreen-open {
                 <button id="settings-download-file-btn" type="button" onclick="openDownloadFilePicker()" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Choose file</button>
                 <span id="settings-download-file-status" style="font-size:12px;color:var(--subtext0)"></span>
               </div>
+            </fieldset>
+            <fieldset class="settings-group" id="connect-health-panel">
+              <legend>Connect Health</legend>
+              <div id="connect-health-summary" class="connect-health-badges"></div>
+              <div id="connect-health-grid" class="connect-health-grid"></div>
+              <div class="connect-self-test-actions">
+                <button id="connect-self-test-btn" type="button">Run self-test</button>
+                <span id="connect-self-test-status" aria-live="polite"></span>
+              </div>
+              <div id="connect-self-test-results" class="connect-self-test-results"></div>
             </fieldset>
             <div id="settings-env-overrides" class="hidden" style="margin:16px 0 0;padding:12px;background:var(--mantle);border-radius:6px">
               <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
@@ -37677,6 +37812,7 @@ function switchSettingsSubtab(name) {
     pane.classList.toggle('active', pane.id === `settings-pane-${name}`);
   });
   updateSettingsSaveRow();
+  if (name === 'debug') renderConnectHealthPanel();
 }
 
 // Apply the remembered sub-tab on initial render, before anything
@@ -37693,6 +37829,7 @@ function applyInitialSettingsSubtab() {
     pane.classList.toggle('active', pane.id === `settings-pane-${activeSettingsSubtab}`);
   });
   updateSettingsSaveRow();
+  if (activeSettingsSubtab === 'debug') renderConnectHealthPanel();
 }
 
 // The main Save/Reset row only actually saves the Agent sub-tab's
@@ -37912,18 +38049,20 @@ function dashboardUpdateTransportStatus() {
   const group = document.getElementById('sb-dashboard-transport');
   const dot = document.getElementById('sb-dashboard-transport-dot');
   const label = document.getElementById('sb-dashboard-transport-label');
-  if (!group || !dot || !label) {
-    syncTuiAvailabilityNotice();
-    maybeOpenShellAfterTransportReady();
-    return;
-  }
   const status = dashboardTransport?.status
     ? dashboardTransport.status()
     : { enabled: dashboardControlTransportEnabled(), connected: false };
   const summary = dashboardTransportStatusSummary(status);
+  if (!group || !dot || !label) {
+    renderConnectHealthPanel(status, summary);
+    syncTuiAvailabilityNotice();
+    maybeOpenShellAfterTransportReady();
+    return;
+  }
   dot.className = `conn-dot ${summary.kind}`;
   label.textContent = summary.label;
   group.title = summary.title;
+  renderConnectHealthPanel(status, summary);
   syncTuiAvailabilityNotice();
   maybeOpenShellAfterTransportReady();
 }
@@ -37975,6 +38114,370 @@ function dashboardTransportStatusSummary(status = {}) {
     label: 'checking',
     title: `Dashboard WebRTC control is ${phase}. Current state: pc=${pcState || 'new'}, channel=${channelState || 'new'}.`,
   };
+}
+
+function connectHealthKindForBoolean(value, falseKind = 'warn') {
+  if (value === true) return 'ok';
+  if (value === false) return falseKind;
+  return 'warn';
+}
+
+function connectHealthFeatureLabel(value) {
+  if (value === true) return 'available';
+  if (value === false) return 'unavailable';
+  return 'unknown';
+}
+
+function connectHealthShortValue(value, head = 10, tail = 6) {
+  const text = String(value || '').trim();
+  if (!text) return '';
+  if (text.length <= head + tail + 3) return text;
+  return `${text.slice(0, head)}...${text.slice(-tail)}`;
+}
+
+function connectHealthState(statusArg = null, summaryArg = null) {
+  const status = statusArg || (dashboardTransport?.status
+    ? dashboardTransport.status()
+    : { enabled: dashboardControlTransportEnabled(), connected: false });
+  const summary = summaryArg || dashboardTransportStatusSummary(status);
+  const channelState = String(status.channelState || '').toLowerCase();
+  const pcState = String(status.pcState || '').toLowerCase();
+  const verifiedBindingOk = Boolean(status.verifiedBinding?.ok);
+  const connected = Boolean(status.connected && verifiedBindingOk && channelState === 'open');
+  const connectMode = dashboardConnectModeEnabled();
+  const directMode = location.protocol === 'https:' ? 'mTLS' : 'HTTP';
+  const modeLabel = connectMode
+    ? 'Hosted Connect'
+    : (status.enabled ? 'Local WebRTC' : `Direct ${directMode}`);
+  const daemonPublicKey = String(
+    status.verifiedBinding?.daemonPublicKey ||
+    status.claimedDaemonPublicKey ||
+    ''
+  );
+  const features = [
+    { id: 'terminal', label: 'Terminal frames', value: status.terminalFramesAvailable },
+    { id: 'byte-streams', label: 'Byte streams', value: status.byteStreamsAvailable },
+    { id: 'uploads', label: 'Uploads', value: status.uploadFramesAvailable },
+    { id: 'fs-read', label: 'Filesystem read', value: status.apiFsReadAvailable },
+    { id: 'presence', label: 'Presence frames', value: status.presenceFramesAvailable },
+    { id: 'tui', label: 'TUI frames', value: status.tuiFramesAvailable },
+  ];
+  const rows = [
+    { label: 'Mode', value: modeLabel, kind: connectMode || status.enabled ? 'ok' : 'warn' },
+    { label: 'Signaling', value: status.signalingMode || (connectMode ? 'connect-rendezvous' : 'direct'), kind: status.enabled ? 'ok' : 'warn' },
+    { label: 'Daemon', value: DASHBOARD_CONNECT_DAEMON_ID || 'self', kind: DASHBOARD_CONNECT_DAEMON_ID || !connectMode ? 'ok' : 'warn' },
+    { label: 'Peer connection', value: pcState || 'n/a', kind: connected ? 'ok' : (status.enabled ? 'warn' : 'ok') },
+    { label: 'DataChannel', value: channelState || 'n/a', kind: channelState === 'open' ? 'ok' : (status.enabled ? 'warn' : 'ok') },
+    { label: 'Binding', value: verifiedBindingOk ? 'verified' : 'not verified', kind: verifiedBindingOk ? 'ok' : (status.enabled ? 'warn' : 'ok') },
+    { label: 'Events', value: status.eventsActive ? 'active' : 'inactive', kind: connectHealthKindForBoolean(status.eventsActive) },
+    { label: 'ICE route', value: status.iceRoute || 'unknown', kind: status.iceRoute === 'relay' ? 'warn' : (status.iceRoute ? 'ok' : 'warn') },
+    { label: 'Candidate pair', value: status.iceCandidatePair || 'unknown', kind: status.iceCandidatePair ? 'ok' : 'warn' },
+    { label: 'Pending RPC', value: String(Number(status.pendingRequests || 0)), kind: Number(status.pendingRequests || 0) === 0 ? 'ok' : 'warn' },
+    { label: 'Pending bytes', value: String(Number(status.pendingByteStreams || 0)), kind: Number(status.pendingByteStreams || 0) === 0 ? 'ok' : 'warn' },
+    { label: 'Completed bytes', value: String(Number(status.completedByteStreams || 0)), kind: 'ok' },
+    { label: 'Daemon key', value: connectHealthShortValue(daemonPublicKey) || 'unknown', kind: daemonPublicKey ? 'ok' : 'warn' },
+    { label: 'Grant hash', value: connectHealthShortValue(status.sessionGrantSha256) || 'unknown', kind: status.sessionGrantSha256 ? 'ok' : (connectMode ? 'warn' : 'ok') },
+    ...features.map(feature => ({
+      label: feature.label,
+      value: connectHealthFeatureLabel(feature.value),
+      kind: connectHealthKindForBoolean(feature.value),
+    })),
+  ];
+  return {
+    connectMode,
+    enabled: Boolean(status.enabled),
+    connected,
+    verifiedBindingOk,
+    summary,
+    status,
+    modeLabel,
+    daemonPublicKey,
+    rows,
+    badges: [
+      { label: 'Mode', value: modeLabel, kind: connectMode || status.enabled ? 'ok' : 'warn' },
+      { label: 'Transport', value: summary.label || 'unknown', kind: summary.kind || 'warn' },
+      { label: 'Binding', value: verifiedBindingOk ? 'verified' : 'pending', kind: verifiedBindingOk ? 'ok' : (status.enabled ? 'warn' : 'ok') },
+      { label: 'Events', value: status.eventsActive ? 'active' : 'inactive', kind: connectHealthKindForBoolean(status.eventsActive) },
+    ],
+  };
+}
+
+function renderConnectHealthPanel(statusArg = null, summaryArg = null) {
+  const summaryEl = document.getElementById('connect-health-summary');
+  const gridEl = document.getElementById('connect-health-grid');
+  if (!summaryEl || !gridEl) return null;
+  const state = connectHealthState(statusArg, summaryArg);
+  summaryEl.innerHTML = '';
+  for (const badge of state.badges) {
+    const el = document.createElement('span');
+    el.className = `connect-health-badge ${badge.kind || 'warn'}`;
+    const label = document.createElement('span');
+    label.textContent = `${badge.label}:`;
+    const value = document.createElement('strong');
+    value.textContent = badge.value || 'unknown';
+    el.append(label, value);
+    summaryEl.appendChild(el);
+  }
+  gridEl.innerHTML = '';
+  for (const row of state.rows) {
+    const item = document.createElement('div');
+    item.className = `connect-health-item ${row.kind || 'warn'}`;
+    const label = document.createElement('div');
+    label.className = 'connect-health-label';
+    label.textContent = row.label;
+    const value = document.createElement('div');
+    value.className = 'connect-health-value';
+    value.textContent = row.value || 'unknown';
+    item.append(label, value);
+    gridEl.appendChild(item);
+  }
+  return state;
+}
+
+function connectProbePairMatches(value, first, second, recentKeyCount) {
+  return Boolean(
+    value &&
+    value.first === first &&
+    value.second === second &&
+    value.recentKeyCount === recentKeyCount
+  );
+}
+
+function connectSelfTestSpecs() {
+  return [
+    {
+      id: 'control-no-replay',
+      label: 'Control RPC failures do not replay over WebSocket',
+      probe: '_debugProbeControlNoReplay',
+      pass: result => result.wsReplayCount === 0 && result.rpcAttempts >= 1 && result.rpcFailureWarnings >= 1,
+    },
+    {
+      id: 'control-unavailable',
+      label: 'Unavailable control mutations stay inside Connect',
+      probe: '_debugProbeControlUnavailableConnectNoLegacy',
+      pass: result => result.wsReplayCount === 0 && result.unavailableWarnings >= 3,
+    },
+    {
+      id: 'media-unavailable',
+      label: 'Unavailable media writes do not use legacy transport',
+      probe: '_debugProbeMediaConnectNoLegacy',
+      pass: result => result.threw === true && result.wsReplayCount === 0,
+    },
+    {
+      id: 'peer-mutations',
+      label: 'Peer mutations do not fall back to HTTP',
+      probe: '_debugProbePeerMutationConnectNoHttp',
+      pass: result => result.threw === true && result.rpcAttempts >= 1 && result.httpFallbackCount === 0,
+    },
+    {
+      id: 'diagnostics',
+      label: 'Diagnostics do not fall back to HTTP',
+      probe: '_debugProbeDiagnosticsConnectNoHttp',
+      pass: result => result.threw === true && result.httpFallbackCount === 0,
+    },
+    {
+      id: 'display-signal',
+      label: 'Display signaling does not use legacy fallback',
+      probe: '_debugProbeDisplaySignalConnectNoLegacy',
+      pass: result => result.wsReplayCount === 0 && result.httpFallbackCount === 0,
+    },
+    {
+      id: 'display-authority',
+      label: 'Display authority refuses unavailable legacy paths',
+      probe: '_debugProbeDisplayAuthorityConnectNoLegacy',
+      pass: result =>
+        result.requestResult === false &&
+        result.releaseResult === false &&
+        result.requestReplayCount === 0 &&
+        result.releaseReplayCount === 0,
+    },
+    {
+      id: 'tui',
+      label: 'TUI controls do not use WebSocket fallback',
+      probe: '_debugProbeTuiConnectNoLegacy',
+      pass: result =>
+        result.keyReplayCount === 0 &&
+        result.resizeReplayCount === 0 &&
+        result.wsReplayCount === 0 &&
+        result.subscriptionSent === false,
+    },
+    {
+      id: 'shell-open-ack',
+      label: 'Shell input waits for terminal_opened',
+      probe: '_debugProbeShellQueuesUntilOpened',
+      pass: result =>
+        JSON.stringify(result.framesBeforeAck) === JSON.stringify(['terminal_open']) &&
+        JSON.stringify(result.framesAfterAck) === JSON.stringify(['terminal_open', 'terminal_resize', 'terminal_input']) &&
+        result.queuedBeforeAck === 'queued-before-open' &&
+        result.queuedAfterAck === '' &&
+        result.ackedBeforeAck === false &&
+        result.ackedAfterAck === true,
+    },
+    {
+      id: 'terminal-output-dedupe',
+      label: 'Terminal output bypasses event dedupe',
+      probe: '_debugProbeTerminalOutputBypassesDedupe',
+      pass: result => result.writtenBytes === 2 && result.recentKeyCount === 0,
+    },
+    {
+      id: 'event-dedupe',
+      label: 'Event dedupe is limited to replay-safe events',
+      probe: '_debugProbeEventDedupeAllowlist',
+      pass: result =>
+        connectProbePairMatches(result.status, false, true, 1) &&
+        connectProbePairMatches(result.sessionIdentity, false, true, 1) &&
+        ['terminalOutput', 'displayIce', 'modelDelta', 'logEntry', 'peerEventForwarded', 'futureEvent']
+          .every(name => connectProbePairMatches(result[name], false, false, 0)),
+    },
+    {
+      id: 'duplicate-shell-input',
+      label: 'Duplicate Shell input frames are both sent',
+      probe: '_debugProbeDuplicateShellInputSends',
+      pass: result =>
+        JSON.stringify(result.inputFrames) === JSON.stringify(['eA==', 'eA==']) &&
+        result.queuedAfterSend === '',
+    },
+    {
+      id: 'presence-media',
+      label: 'Presence media uses Connect frames',
+      probe: '_debugProbePresenceMediaConnectNoLegacy',
+      pass: result =>
+        result.presenceFrameCount === 2 &&
+        result.uploadCount === 1 &&
+        result.legacyCount === 0,
+    },
+    {
+      id: 'presence-sender',
+      label: 'Presence server sender uses tunneled actions',
+      probe: '_debugProbePresenceServerSenderConnectNoLegacy',
+      pass: result => result.presenceFrameCount === 2 && result.actionRpcCount === 1,
+    },
+    {
+      id: 'presence-callback',
+      label: 'Tunneled presence callbacks reach the browser',
+      probe: '_debugProbeTunneledPresenceServerCallback',
+      pass: result => result.handled === true && result.diagnosticCount === 1,
+    },
+  ];
+}
+
+function connectSelfTestDetail(result) {
+  if (!result || typeof result !== 'object') return '';
+  const parts = [];
+  for (const [key, value] of Object.entries(result)) {
+    if (key === 'skipped' || value === null || value === undefined || typeof value === 'object') continue;
+    parts.push(`${key}=${String(value)}`);
+    if (parts.length >= 5) break;
+  }
+  const text = parts.join(' ');
+  return text.length > 180 ? `${text.slice(0, 177)}...` : text;
+}
+
+function setConnectSelfTestStatus(text, kind = '') {
+  const el = document.getElementById('connect-self-test-status');
+  if (!el) return;
+  el.className = kind || '';
+  el.textContent = text || '';
+}
+
+function renderConnectSelfTestResults(results = []) {
+  const container = document.getElementById('connect-self-test-results');
+  if (!container) return;
+  container.innerHTML = '';
+  for (const result of results) {
+    const row = document.createElement('div');
+    row.className = `connect-self-test-row ${result.status || 'skip'}`;
+    const state = document.createElement('div');
+    state.className = 'connect-self-test-state';
+    state.textContent = result.status === 'pass' ? 'pass' : (result.status === 'fail' ? 'fail' : 'warn');
+    const body = document.createElement('div');
+    body.className = 'connect-self-test-body';
+    const name = document.createElement('div');
+    name.className = 'connect-self-test-name';
+    name.textContent = result.label || result.id || 'Probe';
+    body.appendChild(name);
+    if (result.detail) {
+      const detail = document.createElement('div');
+      detail.className = 'connect-self-test-detail';
+      detail.textContent = result.detail;
+      body.appendChild(detail);
+    }
+    row.append(state, body);
+    container.appendChild(row);
+  }
+}
+
+async function runConnectSelfTests(options = {}) {
+  const render = options.render !== false;
+  const control = window.intendantDashboardControl || {};
+  const specs = connectSelfTestSpecs();
+  const button = document.getElementById('connect-self-test-btn');
+  if (render) {
+    renderConnectHealthPanel();
+    renderConnectSelfTestResults([]);
+    setConnectSelfTestStatus('Running...', 'warn');
+    if (button) button.disabled = true;
+  }
+  const results = [];
+  try {
+    for (const spec of specs) {
+      let raw = null;
+      let status = 'fail';
+      let detail = '';
+      if (typeof control[spec.probe] !== 'function') {
+        detail = 'probe=missing';
+      } else {
+        try {
+          raw = await control[spec.probe]();
+          if (raw?.skipped === true) {
+            status = 'skip';
+            detail = connectSelfTestDetail(raw) || 'skipped=true';
+          } else if (spec.pass(raw || {})) {
+            status = 'pass';
+            detail = connectSelfTestDetail(raw);
+          } else {
+            detail = connectSelfTestDetail(raw) || 'unexpected result';
+          }
+        } catch (err) {
+          detail = err?.message || String(err);
+        }
+      }
+      results.push({
+        id: spec.id,
+        label: spec.label,
+        probe: spec.probe,
+        status,
+        detail,
+        result: raw,
+      });
+      if (render) {
+        const passedSoFar = results.filter(item => item.status === 'pass').length;
+        setConnectSelfTestStatus(`${passedSoFar}/${specs.length} passed`, status === 'fail' ? 'err' : 'warn');
+        renderConnectSelfTestResults(results);
+      }
+    }
+  } finally {
+    if (render && button) button.disabled = false;
+  }
+  const passed = results.filter(item => item.status === 'pass').length;
+  const skipped = results.filter(item => item.status === 'skip').length;
+  const failed = results.filter(item => item.status === 'fail').length;
+  const summary = {
+    ok: failed === 0 && skipped === 0,
+    total: results.length,
+    passed,
+    skipped,
+    failed,
+    results,
+    state: connectHealthState(),
+  };
+  if (render) {
+    const kind = failed > 0 ? 'err' : (skipped > 0 ? 'warn' : 'ok');
+    const suffix = skipped > 0 ? `, ${skipped} skipped` : '';
+    setConnectSelfTestStatus(`${passed}/${results.length} passed${suffix}`, kind);
+    renderConnectHealthPanel();
+  }
+  return summary;
 }
 
 class DashboardTransport {
@@ -38275,6 +38778,24 @@ window.intendantDashboardControl = {
   },
   status() {
     return dashboardTransport.status();
+  },
+  connectHealth() {
+    return connectHealthState();
+  },
+  runConnectSelfTest(options = {}) {
+    return runConnectSelfTests(options);
+  },
+  async _debugProbeConnectHealthPanel(options = {}) {
+    const state = renderConnectHealthPanel();
+    const result = options.runSelfTest === false
+      ? null
+      : await runConnectSelfTests({ render: true });
+    return {
+      state,
+      result,
+      summaryText: document.getElementById('connect-health-summary')?.textContent || '',
+      resultText: document.getElementById('connect-self-test-results')?.textContent || '',
+    };
   },
   async _debugProbeControlNoReplay() {
     if (
@@ -45878,6 +46399,12 @@ async function saveSettings() {
 document.getElementById('settings-save-btn').addEventListener('click', saveSettings);
 document.getElementById('settings-reset-btn').addEventListener('click', () => { settingsLoaded = false; loadSettings(); });
 document.getElementById('download-session-report-btn')?.addEventListener('click', downloadSessionReportViaDashboardControl);
+document.getElementById('connect-self-test-btn')?.addEventListener('click', () => {
+  runConnectSelfTests().catch(err => {
+    console.error('Connect self-test failed:', err);
+    setConnectSelfTestStatus(err?.message || String(err), 'err');
+  });
+});
 
 // External agent dropdown is applied on Save click alongside other settings,
 // not on change — matches the rest of the Settings tab UX.
