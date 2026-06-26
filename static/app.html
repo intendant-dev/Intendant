@@ -6278,6 +6278,8 @@ body.context-focus-active {
   font-size: 12px;
 }
 .fs-picker-status.error { color: var(--red); }
+.fs-picker-status.ok { color: var(--green); }
+.fs-picker-status.warn { color: var(--yellow); }
 .fs-picker-list {
   height: min(420px, 54vh);
   overflow: auto;
@@ -10561,6 +10563,13 @@ body.display-fullscreen-open {
                 Download session report
               </a>
             </fieldset>
+            <fieldset class="settings-group">
+              <legend>File Download</legend>
+              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
+                <button id="settings-download-file-btn" type="button" onclick="openDownloadFilePicker()" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Choose file</button>
+                <span id="settings-download-file-status" style="font-size:12px;color:var(--subtext0)"></span>
+              </div>
+            </fieldset>
             <div id="settings-env-overrides" class="hidden" style="margin:16px 0 0;padding:12px;background:var(--mantle);border-radius:6px">
               <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
               <div id="settings-env-list" style="font-size:12px;color:var(--subtext0)"></div>
@@ -10637,6 +10646,7 @@ body.display-fullscreen-open {
     <div class="modal-actions">
       <button class="modal-cancel" type="button" onclick="closeFsPicker()">Cancel</button>
       <button class="modal-cancel" id="fs-picker-create-btn" type="button" onclick="createPickerDirectory()">Create directory</button>
+      <button class="modal-cancel hidden" id="fs-picker-download-cancel-btn" type="button" onclick="cancelFsPickerDownload()">Stop</button>
       <button class="modal-confirm" id="fs-picker-use-btn" type="button" onclick="useFsPickerSelection()">Use directory</button>
     </div>
   </div>
@@ -11148,6 +11158,8 @@ const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_CHUNK_BYTES = 16 * 1024;
 const DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
+const DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
+const DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024;
 const DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS = 30000;
 const dashboardRecentServerMessageKeys = new Map();
 const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
@@ -38410,6 +38422,59 @@ window.intendantDashboardControl = {
     }
     return { skipped: false, threw, error, rpcAttempts, httpFallbackCount };
   },
+  async _debugProbeResumableFsDownload(path, options = {}) {
+    if (
+      !dashboardConnectModeEnabled() ||
+      typeof dashboardFetchRangedBytes !== 'function' ||
+      !dashboardTransport ||
+      !dashboardControlTransport
+    ) {
+      return {
+        skipped: true,
+        connectMode: dashboardConnectModeEnabled(),
+        helperType: typeof dashboardFetchRangedBytes,
+        hasDashboardTransport: Boolean(dashboardTransport),
+        hasControlTransport: Boolean(dashboardControlTransport),
+        httpFallbackCount: 0,
+        rangeCount: 0,
+        size: 0,
+      };
+    }
+    const previousFetch = window.fetch;
+    let httpFallbackCount = 0;
+    const progress = [];
+    window.fetch = function(input, init) {
+      const url = typeof input === 'string' ? input : (input?.url || '');
+      if (String(url).includes('/api/fs')) {
+        httpFallbackCount += 1;
+      }
+      return previousFetch.call(this, input, init);
+    };
+    try {
+      const result = await dashboardFetchRangedBytes('api_fs_read', { path }, {
+        chunkBytes: Math.max(1, Number(options.chunkBytes) || 17),
+        maxBytes: Number(options.maxBytes) || 1024 * 1024,
+        onProgress: info => progress.push({
+          loaded: info.loaded,
+          total: info.total,
+          rangeCount: info.rangeCount,
+        }),
+      });
+      const text = new TextDecoder().decode(await result.blob.arrayBuffer());
+      return {
+        skipped: false,
+        httpFallbackCount,
+        rangeCount: result.range_count,
+        progressCount: progress.length,
+        filename: result.filename,
+        size: result.size,
+        totalSize: result.total_size,
+        text,
+      };
+    } finally {
+      window.fetch = previousFetch;
+    }
+  },
   async _debugProbeDiagnosticsConnectNoHttp() {
     if (
       !dashboardConnectModeEnabled() ||
@@ -40279,17 +40344,154 @@ function dashboardReportRpcAvailable() {
   );
 }
 
-function downloadDashboardBytes(bytes, filename, contentType) {
-  const blob = new Blob([bytes], { type: contentType || 'application/octet-stream' });
-  const url = URL.createObjectURL(blob);
+const DASHBOARD_BYTE_METHOD_AVAILABLE_FIELDS = {
+  api_fs_read: 'api_fs_read_available',
+  api_recording_asset: 'api_recording_asset_available',
+  api_session_recording_asset: 'api_session_recording_asset_available',
+  api_session_frame_asset: 'api_session_frame_asset_available',
+  api_session_current_upload_raw: 'api_session_current_upload_raw_available',
+  api_session_report: 'api_session_report_available',
+};
+
+function dashboardByteStreamMethodAvailable(method) {
+  const status = dashboardControlTransport?.lastStatus || {};
+  const field = DASHBOARD_BYTE_METHOD_AVAILABLE_FIELDS[method];
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    status.byte_streams_available === true &&
+    (!field || status[field] === true)
+  );
+}
+
+function downloadDashboardBlob(blob, filename, contentType) {
+  const finalBlob = blob instanceof Blob
+    ? blob
+    : new Blob([blob || new Uint8Array()], { type: contentType || 'application/octet-stream' });
+  const url = URL.createObjectURL(finalBlob);
   const link = document.createElement('a');
   link.href = url;
-  link.download = filename || 'intendant-session-report.zip';
+  link.download = filename || 'download.bin';
   link.style.display = 'none';
   document.body.appendChild(link);
   link.click();
   link.remove();
   setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+
+function downloadDashboardBytes(bytes, filename, contentType) {
+  downloadDashboardBlob(
+    new Blob([bytes], { type: contentType || 'application/octet-stream' }),
+    filename || 'intendant-session-report.zip',
+    contentType || 'application/octet-stream'
+  );
+}
+
+function rangedDownloadTimeoutMs(chunkBytes) {
+  const size = Number(chunkBytes) || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES;
+  return Math.max(30000, Math.ceil(size / (256 * 1024)) * 10000);
+}
+
+async function dashboardRequestBytesWithRetry(method, params, options = {}) {
+  const retries = Number.isFinite(Number(options.retries)) ? Math.max(0, Number(options.retries)) : 2;
+  let attempt = 0;
+  for (;;) {
+    if (options.signal?.aborted) throw dashboardControlAbortError();
+    try {
+      return await dashboardTransport.requestBytes(method, params, {
+        timeoutMs: options.timeoutMs,
+        signal: options.signal,
+      });
+    } catch (err) {
+      if (err?.name === 'AbortError' || attempt >= retries) throw err;
+      attempt += 1;
+      await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+    }
+  }
+}
+
+async function dashboardFetchRangedBytes(method, params = {}, options = {}) {
+  if (!dashboardByteStreamMethodAvailable(method)) {
+    throw new Error(`${method} byte stream is not available over the Connect dashboard tunnel`);
+  }
+  const chunkBytes = Math.max(1, Math.floor(Number(options.chunkBytes) || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES));
+  const maxBytes = Math.max(1, Math.floor(Number(options.maxBytes) || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES));
+  const startOffset = Math.max(0, Math.floor(Number(options.offset) || 0));
+  let offset = startOffset;
+  let totalSize = null;
+  let filename = String(options.filename || '').trim();
+  let contentType = String(options.contentType || '').trim() || 'application/octet-stream';
+  const parts = [];
+  let rangeCount = 0;
+  for (;;) {
+    if (options.signal?.aborted) throw dashboardControlAbortError();
+    const requested = totalSize == null
+      ? chunkBytes
+      : Math.min(chunkBytes, Math.max(0, totalSize - offset));
+    if (requested <= 0) break;
+    const result = await dashboardRequestBytesWithRetry(method, {
+      ...(params || {}),
+      offset,
+      length: requested,
+    }, {
+      signal: options.signal,
+      retries: options.retries,
+      timeoutMs: options.timeoutMs || rangedDownloadTimeoutMs(requested),
+    });
+    if (result?.ok === false || result?._httpOk === false) {
+      throw new Error(result.error || `${method} returned ${result._httpStatus || 'error'}`);
+    }
+    const bytes = result?.bytes instanceof Uint8Array
+      ? result.bytes
+      : dashboardControlBase64ToBytes(result?.data_base64 || '');
+    const rangeStart = Number(result?.range_start ?? result?.offset ?? offset);
+    const rangeEnd = Number(result?.range_end ?? (rangeStart + bytes.byteLength));
+    const declaredTotal = Number(result?.total_size ?? result?.totalSize ?? rangeEnd);
+    if (!Number.isSafeInteger(rangeStart) || rangeStart !== offset) {
+      throw new Error(`${method} returned unexpected range start`);
+    }
+    if (!Number.isSafeInteger(rangeEnd) || rangeEnd < rangeStart || rangeEnd - rangeStart !== bytes.byteLength) {
+      throw new Error(`${method} returned inconsistent range length`);
+    }
+    if (!Number.isSafeInteger(declaredTotal) || declaredTotal < rangeEnd) {
+      throw new Error(`${method} returned invalid total size`);
+    }
+    totalSize = declaredTotal;
+    if (totalSize - startOffset > maxBytes) {
+      throw new Error(`Download too large (${humanBytes(totalSize - startOffset)}; cap is ${humanBytes(maxBytes)})`);
+    }
+    if (!filename && result?.filename) filename = String(result.filename);
+    if (result?.content_type) contentType = String(result.content_type);
+    parts.push(bytes);
+    offset = rangeEnd;
+    rangeCount += 1;
+    if (typeof options.onProgress === 'function') {
+      options.onProgress({
+        loaded: offset - startOffset,
+        total: Math.max(0, totalSize - startOffset),
+        offset,
+        rangeCount,
+        filename,
+        contentType,
+      });
+    }
+    if (offset >= totalSize || bytes.byteLength === 0) break;
+  }
+  const blob = new Blob(parts, { type: contentType || 'application/octet-stream' });
+  return {
+    ok: true,
+    blob,
+    parts,
+    filename: filename || 'download.bin',
+    content_type: contentType,
+    size: blob.size,
+    total_size: totalSize ?? blob.size,
+    range_start: startOffset,
+    range_end: offset,
+    range_count: rangeCount,
+    resumable: true,
+  };
 }
 
 async function downloadSessionReportViaDashboardControl(event) {
@@ -47323,6 +47525,7 @@ let fsPickerCurrentPath = '';
 let fsPickerSelectedPath = '';
 let fsPickerMode = 'directory';
 let fsPickerTarget = 'project';
+let fsPickerDownloadAbort = null;
 
 function newSessionProjectInputValue() {
   return document.getElementById('new-session-project-root')?.value.trim() || '';
@@ -47512,6 +47715,19 @@ function setFsPickerStatus(kind, text) {
   el.textContent = text || '';
 }
 
+function setSettingsDownloadFileStatus(text, kind = '') {
+  const el = document.getElementById('settings-download-file-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.style.color = kind === 'error'
+    ? 'var(--red)'
+    : kind === 'ok'
+      ? 'var(--green)'
+      : kind === 'warn'
+        ? 'var(--yellow)'
+        : 'var(--subtext0)';
+}
+
 function fsPathLooksAbsolute(path) {
   const value = String(path || '').trim();
   return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
@@ -47522,15 +47738,18 @@ function configureFsPicker({ mode, target, title, placeholder, useLabel, showCre
   fsPickerTarget = target || 'project';
   fsPickerCurrentPath = '';
   fsPickerSelectedPath = '';
+  fsPickerDownloadAbort = null;
   const dialog = document.querySelector('#fs-picker-modal .fs-picker-dialog');
   const titleEl = document.getElementById('fs-picker-title');
   const pathInput = document.getElementById('fs-picker-path');
   const createBtn = document.getElementById('fs-picker-create-btn');
   const useBtn = document.getElementById('fs-picker-use-btn');
+  const downloadCancelBtn = document.getElementById('fs-picker-download-cancel-btn');
   if (dialog) dialog.classList.toggle('file-mode', fsPickerMode === 'file');
   if (titleEl) titleEl.textContent = title || 'Choose path';
   if (pathInput) pathInput.placeholder = placeholder || '/path';
   if (createBtn) createBtn.style.display = showCreate ? '' : 'none';
+  if (downloadCancelBtn) downloadCancelBtn.classList.add('hidden');
   if (useBtn) {
     useBtn.textContent = useLabel || 'Use path';
     useBtn.disabled = true;
@@ -47540,7 +47759,8 @@ function configureFsPicker({ mode, target, title, placeholder, useLabel, showCre
 function setFsPickerUseButtonState() {
   const useBtn = document.getElementById('fs-picker-use-btn');
   if (!useBtn) return;
-  useBtn.disabled = fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath;
+  const downloading = Boolean(fsPickerDownloadAbort);
+  useBtn.disabled = downloading || (fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath);
 }
 
 function selectFsPickerFile(path) {
@@ -47552,6 +47772,15 @@ function selectFsPickerFile(path) {
     btn.classList.toggle('selected', (btn.dataset.path || '') === fsPickerSelectedPath);
   });
   if (fsPickerSelectedPath) setFsPickerStatus('', 'File selected');
+}
+
+function setFsPickerDownloadBusy(busy) {
+  const useBtn = document.getElementById('fs-picker-use-btn');
+  const closeBtn = document.querySelector('#fs-picker-modal .fs-picker-close');
+  const cancelBtn = document.getElementById('fs-picker-download-cancel-btn');
+  if (useBtn) useBtn.disabled = busy || (fsPickerMode === 'file' ? !fsPickerSelectedPath : !fsPickerCurrentPath);
+  if (closeBtn) closeBtn.disabled = !!busy;
+  if (cancelBtn) cancelBtn.classList.toggle('hidden', !busy);
 }
 
 function renderFsPicker(data) {
@@ -47696,6 +47925,20 @@ function openAgentBinaryPicker() {
   loadFsPicker(fsPathLooksAbsolute(current) ? current : '~');
 }
 
+function openDownloadFilePicker() {
+  configureFsPicker({
+    mode: 'file',
+    target: 'downloadFile',
+    title: 'Download file',
+    placeholder: '/path/to/file',
+    useLabel: 'Download',
+    showCreate: false,
+  });
+  const modal = document.getElementById('fs-picker-modal');
+  if (modal) modal.style.display = 'flex';
+  loadFsPicker(dashboardProjectRoot || '~');
+}
+
 function openSessionConfigBinaryPicker() {
   if (!sessionConfigEditing) return;
   configureFsPicker({
@@ -47715,6 +47958,7 @@ function openSessionConfigBinaryPicker() {
 }
 
 function closeFsPicker() {
+  if (fsPickerDownloadAbort) return;
   const modal = document.getElementById('fs-picker-modal');
   if (modal) modal.style.display = 'none';
 }
@@ -47723,7 +47967,57 @@ function closeProjectDirectoryPicker() {
   closeFsPicker();
 }
 
+async function downloadFsPickerSelectedFile() {
+  const path = fsPickerSelectedPath || document.getElementById('fs-picker-path')?.value.trim() || '';
+  if (!path) return;
+  if (!dashboardByteStreamMethodAvailable('api_fs_read')) {
+    const message = 'File download requires the Connect dashboard tunnel';
+    setFsPickerStatus('error', message);
+    setSettingsDownloadFileStatus(message, 'error');
+    if (typeof showControlToast === 'function') showControlToast('error', message);
+    return;
+  }
+  const controller = new AbortController();
+  fsPickerDownloadAbort = controller;
+  setFsPickerDownloadBusy(true);
+  setFsPickerStatus('warn', 'Preparing download...');
+  setSettingsDownloadFileStatus('Downloading...', 'warn');
+  try {
+    const result = await dashboardFetchRangedBytes('api_fs_read', { path }, {
+      signal: controller.signal,
+      chunkBytes: DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+      onProgress: progress => {
+        const total = progress.total ? humanBytes(progress.total) : '?';
+        setFsPickerStatus('warn', `Downloading ${humanBytes(progress.loaded)} / ${total}`);
+        setSettingsDownloadFileStatus(`${humanBytes(progress.loaded)} / ${total}`, 'warn');
+      },
+    });
+    downloadDashboardBlob(result.blob, result.filename, result.content_type);
+    const done = `Downloaded ${result.filename} (${humanBytes(result.size)})`;
+    setFsPickerStatus('ok', done);
+    setSettingsDownloadFileStatus(done, 'ok');
+  } catch (err) {
+    const aborted = err?.name === 'AbortError';
+    const message = aborted ? 'Download stopped' : (err?.message || 'Download failed');
+    setFsPickerStatus(aborted ? 'warn' : 'error', message);
+    setSettingsDownloadFileStatus(message, aborted ? 'warn' : 'error');
+    if (!aborted && typeof showControlToast === 'function') showControlToast('error', message);
+  } finally {
+    fsPickerDownloadAbort = null;
+    setFsPickerDownloadBusy(false);
+    setFsPickerUseButtonState();
+  }
+}
+
+function cancelFsPickerDownload() {
+  fsPickerDownloadAbort?.abort();
+}
+
 function useFsPickerSelection() {
+  if (fsPickerTarget === 'downloadFile') {
+    downloadFsPickerSelectedFile();
+    return;
+  }
   if (fsPickerTarget === 'agentBinary') {
     if (!fsPickerSelectedPath) return;
     const input = document.getElementById('new-session-agent-command');
@@ -47795,6 +48089,8 @@ window.closeFsPicker = closeFsPicker;
 window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
+window.openDownloadFilePicker = openDownloadFilePicker;
+window.cancelFsPickerDownload = cancelFsPickerDownload;
 window.openSessionConfigBinaryPicker = openSessionConfigBinaryPicker;
 window.createPickerDirectory = createPickerDirectory;
 
@@ -49319,7 +49615,7 @@ document.getElementById('new-session-codex-fast')?.addEventListener('change', (e
 document.getElementById('fs-picker-path')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Enter') return;
   ev.preventDefault();
-  loadProjectDirectoryPickerPath();
+  loadFsPickerPath();
 });
 document.getElementById('sessions-search')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || !ev.currentTarget.value) return;

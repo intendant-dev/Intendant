@@ -203,6 +203,16 @@ async function main() {
   }
 
   try {
+    const genericDownloadText = [
+      'connect generic download fixture',
+      'range one',
+      'range two',
+      'range three',
+      'done',
+    ].join('\n');
+    const genericDownloadPath = path.join(tmp, 'connect-generic-download.txt');
+    fs.writeFileSync(genericDownloadPath, genericDownloadText);
+
     spawnLogged(options.connectBinary, [
       '--listen', `127.0.0.1:${options.connectPort}`,
       '--origin', connectOrigin,
@@ -317,6 +327,8 @@ async function main() {
     assert(connected.sessionGrantSha256, 'Connect dashboard did not bind a session grant');
     assert.strictEqual(connected.terminalFramesAvailable, true, `Connect tunnel did not advertise terminal frames: ${JSON.stringify(connected)}`);
     assert.strictEqual(connected.tuiFramesAvailable, false, `--no-tui daemon unexpectedly advertised TUI frames: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.byteStreamsAvailable, true, `Connect tunnel did not advertise byte streams: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.apiFsReadAvailable, true, `Connect tunnel did not advertise filesystem reads: ${JSON.stringify(connected)}`);
 
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="tui"]');
     await page.waitForFunction(() => {
@@ -398,6 +410,13 @@ async function main() {
     assert.strictEqual(probes._debugProbePresenceServerSenderConnectNoLegacy.actionRpcCount, 1, `presence server sender did not use action RPC: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeTunneledPresenceServerCallback.handled, true, `tunneled presence callback was not handled: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeTunneledPresenceServerCallback.diagnosticCount, 1, `tunneled presence callback did not emit diagnostic: ${JSON.stringify(probes)}`);
+
+    const fsDownloadProbe = await page.evaluate(`window.intendantDashboardControl._debugProbeResumableFsDownload(${JSON.stringify(genericDownloadPath)}, { chunkBytes: 11 })`);
+    assert.strictEqual(fsDownloadProbe.skipped, false, `resumable filesystem download probe skipped: ${JSON.stringify(fsDownloadProbe)}`);
+    assert.strictEqual(fsDownloadProbe.httpFallbackCount, 0, `resumable filesystem download used HTTP fallback: ${JSON.stringify(fsDownloadProbe)}`);
+    assert(fsDownloadProbe.rangeCount >= 2, `resumable filesystem download did not use multiple ranges: ${JSON.stringify(fsDownloadProbe)}`);
+    assert.strictEqual(fsDownloadProbe.text, genericDownloadText, `resumable filesystem download returned wrong bytes: ${JSON.stringify(fsDownloadProbe)}`);
+    assert.strictEqual(fsDownloadProbe.size, Buffer.byteLength(genericDownloadText), `resumable filesystem download returned wrong size: ${JSON.stringify(fsDownloadProbe)}`);
 
     const revoked = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};

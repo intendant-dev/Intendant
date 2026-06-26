@@ -981,8 +981,9 @@ do not advertise the feature still receive the legacy eager chunk burst.
 
 Bounded artifact downloads use `byte_stream_start`, base64 `byte_stream_chunk`
 frames, and `byte_stream_end`. This avoids wrapping raw bytes inside a JSON
-result and reuses the same credit-window queue, but it is still an in-memory,
-single-shot transfer.
+result and reuses the same credit-window queue. Individual byte streams remain
+bounded, but browser helpers can build resumable user-facing downloads by
+issuing repeated ranged requests and resuming from the last completed offset.
 
 Bounded dashboard uploads use `upload_start`, base64 `upload_chunk`, and
 `upload_end`. The daemon writes chunks into a tempfile and commits through the
@@ -1164,8 +1165,11 @@ Bounded filesystem file reads use `api_fs_read` when the verified tunnel
 advertises byte streams. The request uses the same absolute-path or `~/` path
 rules as the picker, rejects directories, accepts optional `offset`/`length`,
 and returns bytes plus `content_type`, `range_start`, `range_end`, `total_size`,
-and `resumable: true` metadata. This is a read-only preview/diagnostic
-primitive, not yet a general download or bidirectional file-transfer adapter.
+and `resumable: true` metadata. Settings -> Debug exposes this as a generic
+file download path: the browser file picker selects a file, then the dashboard
+downloads it through repeated `api_fs_read` ranges with progress and
+cancellation. Public-origin Connect mode does not fall back to daemon HTTP for
+this path.
 Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
 large raw request payloads out of ordinary session-detail hydration while still
 allowing the Context pane to fetch a single archived snapshot on demand.
@@ -1210,10 +1214,10 @@ available, or records the desired state as a pending per-display default for
 the next display session.
 
 The remaining migration work is mostly byte-stream and file-transfer heavy:
-generic downloads, native media fallback URLs, broader/resumable file transfer,
-and any remaining non-allowlisted control mutations should move only after
-resumable stream/file-transfer semantics and per-action no-replay rules are
-settled.
+native media fallback URLs, broader bidirectional file transfer, durable
+cross-refresh resume tokens, and any remaining non-allowlisted control
+mutations should move only after resumable stream/file-transfer semantics and
+per-action no-replay rules are settled.
 
 The dashboard status bar now exposes the selected control transport. Direct
 dashboard access shows the existing HTTP/mTLS path, while opt-in WebRTC control
