@@ -661,6 +661,95 @@ html {
   width: 16px;
   height: 16px;
 }
+.files-pane {
+  padding: 20px;
+  max-width: 820px;
+  overflow-y: auto;
+  flex: 1;
+}
+.files-tool {
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  padding: 14px 16px;
+  background: var(--base);
+}
+.files-tool h3 {
+  margin: 0 0 10px;
+  color: var(--text);
+  font-size: 15px;
+}
+.files-download-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto auto;
+  gap: 8px;
+  align-items: center;
+}
+.files-download-row input {
+  min-width: 0;
+  padding: 8px 10px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 12px;
+}
+.files-download-row input:focus {
+  outline: none;
+  border-color: var(--blue);
+}
+.files-download-row button {
+  min-height: 34px;
+  padding: 7px 13px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-weight: 600;
+  font-size: 12px;
+}
+.files-download-row button.primary {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--crust);
+}
+.files-download-row button.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.files-download-row button.hidden {
+  display: none;
+}
+.files-download-row button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+}
+.files-download-status {
+  min-height: 18px;
+  margin-top: 9px;
+  color: var(--subtext0);
+  font-size: 12px;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+.files-download-status.ok { color: var(--green); }
+.files-download-status.warn { color: var(--yellow); }
+.files-download-status.error { color: var(--red); }
+.files-download-meter {
+  height: 6px;
+  margin-top: 8px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--surface0);
+}
+.files-download-meter-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--blue), var(--green));
+  transition: width 0.12s ease;
+}
 .connect-health-badges {
   display: flex;
   flex-wrap: wrap;
@@ -8543,6 +8632,17 @@ body.display-fullscreen-open {
     width: 100%;
     box-sizing: border-box;
   }
+  .files-pane {
+    padding: 12px;
+    max-width: 100%;
+    box-sizing: border-box;
+  }
+  .files-download-row {
+    grid-template-columns: 1fr;
+  }
+  .files-download-row button {
+    width: 100%;
+  }
   .subtabs {
     overflow-x: auto;
     -webkit-overflow-scrolling: touch;
@@ -8994,6 +9094,7 @@ body.display-fullscreen-open {
     <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
     <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
     <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
+    <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon">Files</button>
     <button class="tab-btn" data-tab="debug" title="Daemon diagnostics and raw event streams">Debug</button>
     <button class="tab-btn" data-tab="settings" title="Account, agent, network daemons, and debug settings">Settings</button>
   </nav>
@@ -10242,6 +10343,25 @@ body.display-fullscreen-open {
       </div>
     </div>
 
+    <!-- Files Tab -->
+    <div id="tab-files" class="tab-pane">
+      <div class="files-pane">
+        <section class="files-tool" aria-labelledby="files-download-heading">
+          <h3 id="files-download-heading">Downloads</h3>
+          <div class="files-download-row">
+            <input id="files-download-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/file">
+            <button id="files-download-browse-btn" type="button" onclick="openFilesDownloadPicker()">Browse</button>
+            <button id="files-download-btn" class="primary" type="button" onclick="startFilesDownload()">Download</button>
+            <button id="files-download-stop-btn" class="danger hidden" type="button" onclick="cancelFilesDownload()">Stop</button>
+          </div>
+          <div id="files-download-status" class="files-download-status" aria-live="polite"></div>
+          <div class="files-download-meter" aria-hidden="true">
+            <div id="files-download-progress" class="files-download-meter-fill"></div>
+          </div>
+        </section>
+      </div>
+    </div>
+
     <!-- Debug Tab -->
     <div id="tab-debug" class="tab-pane">
       <div style="padding:20px">
@@ -10687,13 +10807,6 @@ body.display-fullscreen-open {
                  style="display:inline-block;padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);font-weight:600;font-size:13px;text-decoration:none">
                 Download session report
               </a>
-            </fieldset>
-            <fieldset class="settings-group">
-              <legend>File Download</legend>
-              <div style="display:flex;gap:8px;align-items:center;flex-wrap:wrap">
-                <button id="settings-download-file-btn" type="button" onclick="openDownloadFilePicker()" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Choose file</button>
-                <span id="settings-download-file-status" style="font-size:12px;color:var(--subtext0)"></span>
-              </div>
             </fieldset>
             <fieldset class="settings-group" id="connect-health-panel">
               <legend>Connect Health</legend>
@@ -11288,6 +11401,7 @@ let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
 let dashboardControlEventsActive = false;
 let dashboardControlLastError = '';
+let filesDownloadAbort = null;
 const DASHBOARD_EVENT_DEDUPE_MS = 2000;
 const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
@@ -36024,7 +36138,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 // We still use localStorage for preferences that aren't navigation
 // (verbosity, direct-mode, host filter, sessions filters).
 
-const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'debug', 'settings'];
+const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'sessions', 'files', 'debug', 'settings'];
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
@@ -36159,6 +36273,9 @@ function switchTab(tabId) {
   }
   if (tabId === 'stats') {
     renderStatsForActiveHost({ forceSessions: true });
+  }
+  if (tabId === 'files') {
+    refreshFilesDownloadAvailability();
   }
   if (tabId === 'settings' && !settingsLoaded) {
     loadSettings();
@@ -38055,6 +38172,7 @@ function dashboardUpdateTransportStatus() {
   const summary = dashboardTransportStatusSummary(status);
   if (!group || !dot || !label) {
     renderConnectHealthPanel(status, summary);
+    refreshFilesDownloadAvailability();
     syncTuiAvailabilityNotice();
     maybeOpenShellAfterTransportReady();
     return;
@@ -38063,6 +38181,7 @@ function dashboardUpdateTransportStatus() {
   label.textContent = summary.label;
   group.title = summary.title;
   renderConnectHealthPanel(status, summary);
+  refreshFilesDownloadAvailability();
   syncTuiAvailabilityNotice();
   maybeOpenShellAfterTransportReady();
 }
@@ -41210,18 +41329,16 @@ function dashboardReportRpcAvailable() {
   );
 }
 
-const DASHBOARD_BYTE_METHOD_AVAILABLE_FIELDS = {
-  api_fs_read: 'api_fs_read_available',
-  api_recording_asset: 'api_recording_asset_available',
-  api_session_recording_asset: 'api_session_recording_asset_available',
-  api_session_frame_asset: 'api_session_frame_asset_available',
-  api_session_current_upload_raw: 'api_session_current_upload_raw_available',
-  api_session_report: 'api_session_report_available',
-};
-
 function dashboardByteStreamMethodAvailable(method) {
   const status = dashboardControlTransport?.lastStatus || {};
-  const field = DASHBOARD_BYTE_METHOD_AVAILABLE_FIELDS[method];
+  const field = {
+    api_fs_read: 'api_fs_read_available',
+    api_recording_asset: 'api_recording_asset_available',
+    api_session_recording_asset: 'api_session_recording_asset_available',
+    api_session_frame_asset: 'api_session_frame_asset_available',
+    api_session_current_upload_raw: 'api_session_current_upload_raw_available',
+    api_session_report: 'api_session_report_available',
+  }[method];
   return Boolean(
     dashboardTransport &&
     dashboardTransport.canUseRpc &&
@@ -46405,6 +46522,12 @@ document.getElementById('connect-self-test-btn')?.addEventListener('click', () =
     setConnectSelfTestStatus(err?.message || String(err), 'err');
   });
 });
+document.getElementById('files-download-path')?.addEventListener('input', refreshFilesDownloadAvailability);
+document.getElementById('files-download-path')?.addEventListener('keydown', ev => {
+  if (ev.key !== 'Enter') return;
+  ev.preventDefault();
+  startFilesDownload();
+});
 
 // External agent dropdown is applied on Save click alongside other settings,
 // not on change — matches the rest of the Settings tab UX.
@@ -48600,6 +48723,123 @@ function setSettingsDownloadFileStatus(text, kind = '') {
         : 'var(--subtext0)';
 }
 
+function filesDownloadPathValue() {
+  return document.getElementById('files-download-path')?.value.trim() || '';
+}
+
+function setFilesDownloadPath(path) {
+  const input = document.getElementById('files-download-path');
+  if (!input) return;
+  input.value = String(path || '');
+  input.title = input.value;
+  refreshFilesDownloadAvailability();
+}
+
+function setFilesDownloadStatus(kind, text) {
+  const el = document.getElementById('files-download-status');
+  if (!el) return;
+  el.className = 'files-download-status' + (kind ? ` ${kind}` : '');
+  el.textContent = text || '';
+  el.title = text || '';
+}
+
+function setFilesDownloadProgress(loaded = 0, total = 0) {
+  const fill = document.getElementById('files-download-progress');
+  if (!fill) return;
+  const safeTotal = Number(total) > 0 ? Number(total) : 0;
+  const percent = safeTotal > 0
+    ? Math.max(0, Math.min(100, (Number(loaded) || 0) * 100 / safeTotal))
+    : 0;
+  fill.style.width = `${percent}%`;
+}
+
+function setFilesDownloadBusy(busy) {
+  const input = document.getElementById('files-download-path');
+  const browse = document.getElementById('files-download-browse-btn');
+  const download = document.getElementById('files-download-btn');
+  const stop = document.getElementById('files-download-stop-btn');
+  const hasPath = !!filesDownloadPathValue();
+  if (input) input.disabled = !!busy;
+  if (browse) browse.disabled = !!busy;
+  if (download) download.disabled = !!busy || !hasPath || !dashboardByteStreamMethodAvailable('api_fs_read');
+  if (stop) stop.classList.toggle('hidden', !busy);
+}
+
+function refreshFilesDownloadAvailability() {
+  if (filesDownloadAbort) {
+    setFilesDownloadBusy(true);
+    return;
+  }
+  const available = dashboardByteStreamMethodAvailable('api_fs_read');
+  setFilesDownloadBusy(false);
+  const statusEl = document.getElementById('files-download-status');
+  if (!available && statusEl && !statusEl.textContent) {
+    setFilesDownloadStatus('warn', 'File downloads require the Connect dashboard tunnel');
+  } else if (available && statusEl?.textContent === 'File downloads require the Connect dashboard tunnel') {
+    setFilesDownloadStatus('', '');
+  }
+}
+
+async function fetchDashboardFilesystemDownload(path, options = {}) {
+  const target = String(path || '').trim();
+  if (!target) throw new Error('Choose a file to download');
+  if (!dashboardByteStreamMethodAvailable('api_fs_read')) {
+    throw new Error('File download requires the Connect dashboard tunnel');
+  }
+  return dashboardFetchRangedBytes('api_fs_read', { path: target }, {
+    signal: options.signal,
+    chunkBytes: options.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+    maxBytes: options.maxBytes || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES,
+    retries: options.retries,
+    timeoutMs: options.timeoutMs,
+    onProgress: options.onProgress,
+  });
+}
+
+async function startFilesDownload(options = {}) {
+  if (filesDownloadAbort) return null;
+  const path = String(options.path || filesDownloadPathValue()).trim();
+  if (path) setFilesDownloadPath(path);
+  const controller = new AbortController();
+  filesDownloadAbort = controller;
+  setFilesDownloadBusy(true);
+  setFilesDownloadProgress(0, 0);
+  setFilesDownloadStatus('warn', 'Preparing download...');
+  try {
+    const result = await fetchDashboardFilesystemDownload(path, {
+      ...options,
+      signal: controller.signal,
+      onProgress: progress => {
+        const total = progress.total ? humanBytes(progress.total) : '?';
+        setFilesDownloadProgress(progress.loaded, progress.total);
+        setFilesDownloadStatus('warn', `Downloading ${humanBytes(progress.loaded)} / ${total}`);
+        if (typeof options.onProgress === 'function') options.onProgress(progress);
+      },
+    });
+    setFilesDownloadProgress(result.size, result.total_size || result.size);
+    if (!options.skipBrowserSave) {
+      downloadDashboardBlob(result.blob, result.filename, result.content_type);
+    }
+    const done = `Downloaded ${result.filename} (${humanBytes(result.size)})`;
+    setFilesDownloadStatus('ok', done);
+    return result;
+  } catch (err) {
+    const aborted = err?.name === 'AbortError';
+    const message = aborted ? 'Download stopped' : (err?.message || 'Download failed');
+    setFilesDownloadStatus(aborted ? 'warn' : 'error', message);
+    if (!aborted && typeof showControlToast === 'function') showControlToast('error', message);
+    if (options.throwOnError) throw err;
+    return null;
+  } finally {
+    filesDownloadAbort = null;
+    setFilesDownloadBusy(false);
+  }
+}
+
+function cancelFilesDownload() {
+  filesDownloadAbort?.abort();
+}
+
 function fsPathLooksAbsolute(path) {
   const value = String(path || '').trim();
   return value === '~' || value.startsWith('~/') || value.startsWith('/') || /^[A-Za-z]:[\\/]/.test(value);
@@ -48811,6 +49051,20 @@ function openDownloadFilePicker() {
   loadFsPicker(dashboardProjectRoot || '~');
 }
 
+function openFilesDownloadPicker() {
+  configureFsPicker({
+    mode: 'file',
+    target: 'filesDownload',
+    title: 'Choose file to download',
+    placeholder: '/path/to/file',
+    useLabel: 'Select file',
+    showCreate: false,
+  });
+  const modal = document.getElementById('fs-picker-modal');
+  if (modal) modal.style.display = 'flex';
+  loadFsPicker(filesDownloadPathValue() || dashboardProjectRoot || '~');
+}
+
 function openSessionConfigBinaryPicker() {
   if (!sessionConfigEditing) return;
   configureFsPicker({
@@ -48855,7 +49109,7 @@ async function downloadFsPickerSelectedFile() {
   setFsPickerStatus('warn', 'Preparing download...');
   setSettingsDownloadFileStatus('Downloading...', 'warn');
   try {
-    const result = await dashboardFetchRangedBytes('api_fs_read', { path }, {
+    const result = await fetchDashboardFilesystemDownload(path, {
       signal: controller.signal,
       chunkBytes: DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
       onProgress: progress => {
@@ -48888,6 +49142,14 @@ function cancelFsPickerDownload() {
 function useFsPickerSelection() {
   if (fsPickerTarget === 'downloadFile') {
     downloadFsPickerSelectedFile();
+    return;
+  }
+  if (fsPickerTarget === 'filesDownload') {
+    if (!fsPickerSelectedPath) return;
+    setFilesDownloadPath(fsPickerSelectedPath);
+    setFilesDownloadStatus('', 'Ready');
+    setFilesDownloadProgress(0, 0);
+    closeFsPicker();
     return;
   }
   if (fsPickerTarget === 'agentBinary') {
@@ -48962,9 +49224,49 @@ window.loadFsPickerPath = loadFsPickerPath;
 window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
 window.openDownloadFilePicker = openDownloadFilePicker;
+window.openFilesDownloadPicker = openFilesDownloadPicker;
+window.startFilesDownload = startFilesDownload;
+window.cancelFilesDownload = cancelFilesDownload;
 window.cancelFsPickerDownload = cancelFsPickerDownload;
 window.openSessionConfigBinaryPicker = openSessionConfigBinaryPicker;
 window.createPickerDirectory = createPickerDirectory;
+window.intendantDashboardFiles = {
+  async _debugProbeDownloadPath(path, options = {}) {
+    const progress = [];
+    setFilesDownloadPath(path);
+    const result = await startFilesDownload({
+      path,
+      chunkBytes: options.chunkBytes,
+      maxBytes: options.maxBytes,
+      skipBrowserSave: true,
+      throwOnError: true,
+      onProgress: item => {
+        progress.push({
+          loaded: item.loaded,
+          total: item.total,
+          rangeCount: item.rangeCount,
+        });
+      },
+    });
+    const bytes = new Uint8Array(await result.blob.arrayBuffer());
+    let text = '';
+    try {
+      text = new TextDecoder().decode(bytes);
+    } catch (_) {}
+    return {
+      ok: true,
+      path: filesDownloadPathValue(),
+      filename: result.filename,
+      size: result.size,
+      totalSize: result.total_size,
+      rangeCount: result.range_count,
+      progress,
+      statusText: document.getElementById('files-download-status')?.textContent || '',
+      progressWidth: document.getElementById('files-download-progress')?.style.width || '',
+      text,
+    };
+  },
+};
 
 function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';

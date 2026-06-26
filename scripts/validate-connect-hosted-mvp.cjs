@@ -341,6 +341,15 @@ async function main() {
     assert.strictEqual(healthPanel.result.skipped, 0, `Connect health self-test skipped probes: ${JSON.stringify(healthPanel.result)}`);
     assert(healthPanel.resultText.includes('pass'), `Connect health self-test did not render pass rows: ${JSON.stringify(healthPanel)}`);
 
+    await click(page, '.tab-btn[data-tab="files"]');
+    const filesDownloadPanel = await page.evaluate(`window.intendantDashboardFiles._debugProbeDownloadPath(${JSON.stringify(genericDownloadPath)}, { chunkBytes: 11 })`);
+    assert.strictEqual(filesDownloadPanel.path, genericDownloadPath, `Files tab did not keep selected path: ${JSON.stringify(filesDownloadPanel)}`);
+    assert(filesDownloadPanel.rangeCount >= 2, `Files tab download did not use multiple ranges: ${JSON.stringify(filesDownloadPanel)}`);
+    assert.strictEqual(filesDownloadPanel.text, genericDownloadText, `Files tab download returned wrong bytes: ${JSON.stringify(filesDownloadPanel)}`);
+    assert.strictEqual(filesDownloadPanel.size, Buffer.byteLength(genericDownloadText), `Files tab download returned wrong size: ${JSON.stringify(filesDownloadPanel)}`);
+    assert(filesDownloadPanel.statusText.includes('Downloaded'), `Files tab did not render completion status: ${JSON.stringify(filesDownloadPanel)}`);
+    assert.strictEqual(filesDownloadPanel.progressWidth, '100%', `Files tab did not render complete progress: ${JSON.stringify(filesDownloadPanel)}`);
+
     await click(page, '.tab-btn[data-tab="terminal"]');
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="tui"]');
     await page.waitForFunction(() => {

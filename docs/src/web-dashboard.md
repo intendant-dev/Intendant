@@ -745,9 +745,9 @@ advertised tunnel capabilities. Its self-test button runs the same safe
 browser-side probes used by the hosted E2E harness: no legacy HTTP/WebSocket
 fallback for Connect-only mutations, Shell input ordering, terminal-output
 dedupe behavior, display-control routing, and tunneled presence callbacks. It is
-not a file-transfer integrity test; the broad/resumable download checks still
-need a known fixture path and live in the validator until the downloads UI is
-expanded.
+not a file-transfer integrity test; the Files tab owns the user-facing ranged
+download flow, and the hosted validator still uses a known fixture path for
+byte-accurate transfer checks.
 
 Production-alpha hardening now includes:
 
@@ -812,9 +812,10 @@ over tunneled terminal frames, verifies that a `--no-tui` daemon renders an
 explicit TUI-unavailable state, and runs the SPA's no-legacy-transport probes
 for control actions, media/editor upload, visual-freshness diagnostics, display
 signaling, display input authority, peer mutation fallback, TUI input, presence
-media, presence server callbacks, generic ranged filesystem downloads, and
-uploaded-asset raw range reads. It then revokes the daemon while the tunnel is
-still open, waits for the tunnel to close, and checks the audit events.
+media, presence server callbacks, the Files tab's ranged filesystem download
+flow, the lower-level generic filesystem download probe, and uploaded-asset raw
+range reads. It then revokes the daemon while the tunnel is still open, waits
+for the tunnel to close, and checks the audit events.
 
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
@@ -1000,8 +1001,8 @@ Bounded dashboard uploads use `upload_start`, base64 `upload_chunk`, and
 `upload_end`. The daemon writes chunks into a tempfile and commits through the
 same upload store as `POST /api/session/current/uploads`, including the
 `UploadReady` broadcast. This is still a one-shot, ordered transfer with no
-resume token. Resumable/range semantics are still required before moving generic
-downloads, native media playback, or broad file transfer.
+resume token. Resume tokens and application-level restart semantics are still
+required before treating uploads as broad resumable file transfer.
 
 Dashboard media/editor writes intentionally stay outside the generic
 `api_dashboard_action_msg` and `api_control_msg` allowlists. They use the
@@ -1121,8 +1122,8 @@ tunnel advertises byte streams, falling back to the existing HTTP image URL when
 the tunnel is unavailable or a tunneled image read fails.
 The Settings debug session-report download uses `api_session_report`, returning
 the same text-artifact zip as `/api/session/{id}/report` through bounded
-`byte_stream_*` frames. This is intentionally scoped to the diagnostic report;
-generic downloads still wait for resumable/range semantics.
+`byte_stream_*` frames. This remains intentionally scoped to the diagnostic
+report; generic daemon file downloads use the Files tab and `api_fs_read`.
 The task attachment upload path uses `api_session_current_upload` over
 `upload_*` frames when the verified tunnel advertises `upload_frames`; it falls
 back to `POST /api/session/current/uploads` only when the tunnel feature is not
@@ -1176,9 +1177,9 @@ Bounded filesystem file reads use `api_fs_read` when the verified tunnel
 advertises byte streams. The request uses the same absolute-path or `~/` path
 rules as the picker, rejects directories, accepts optional `offset`/`length`,
 and returns bytes plus `content_type`, `range_start`, `range_end`, `total_size`,
-and `resumable: true` metadata. Settings -> Debug exposes this as a generic
-file download path: the browser file picker selects a file, then the dashboard
-downloads it through repeated `api_fs_read` ranges with progress and
+and `resumable: true` metadata. The Files tab exposes this as a generic file
+download path: users can type a path or browse with the filesystem picker, then
+the dashboard downloads through repeated `api_fs_read` ranges with progress and
 cancellation. Public-origin Connect mode does not fall back to daemon HTTP for
 this path.
 Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
