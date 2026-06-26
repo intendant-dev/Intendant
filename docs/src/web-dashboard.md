@@ -801,9 +801,9 @@ over tunneled terminal frames, verifies that a `--no-tui` daemon renders an
 explicit TUI-unavailable state, and runs the SPA's no-legacy-transport probes
 for control actions, media/editor upload, visual-freshness diagnostics, display
 signaling, display input authority, peer mutation fallback, TUI input, presence
-media, and presence server callbacks. It then revokes the daemon while the
-tunnel is still open, waits for the tunnel to close, and checks the audit
-events.
+media, presence server callbacks, generic ranged filesystem downloads, and
+uploaded-asset raw range reads. It then revokes the daemon while the tunnel is
+still open, waits for the tunnel to close, and checks the audit events.
 
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 

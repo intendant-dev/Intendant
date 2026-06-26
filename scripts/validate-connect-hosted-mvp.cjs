@@ -418,6 +418,52 @@ async function main() {
     assert.strictEqual(fsDownloadProbe.text, genericDownloadText, `resumable filesystem download returned wrong bytes: ${JSON.stringify(fsDownloadProbe)}`);
     assert.strictEqual(fsDownloadProbe.size, Buffer.byteLength(genericDownloadText), `resumable filesystem download returned wrong size: ${JSON.stringify(fsDownloadProbe)}`);
 
+    const uploadRawText = 'connect upload raw byte-stream fixture';
+    const uploadRawProbe = await page.evaluate(`(async () => {
+      const previousFetch = window.fetch;
+      let httpFallbackCount = 0;
+      window.fetch = function(input, init) {
+        const url = typeof input === 'string' ? input : (input && input.url || '');
+        if (String(url).includes('/api/session/current/uploads')) httpFallbackCount += 1;
+        return previousFetch.call(this, input, init);
+      };
+      try {
+        const ctl = window.intendantDashboardControl;
+        const text = ${JSON.stringify(uploadRawText)};
+        const bytes = new TextEncoder().encode(text);
+        const upload = await ctl.uploadBytes('api_session_current_upload', {
+          destination: 'task',
+          name: 'connect-upload-raw.txt',
+          mime: 'text/plain',
+        }, bytes, { timeoutMs: 120000 });
+        const raw = await ctl.requestBytes('api_session_current_upload_raw', {
+          id: upload.id,
+          offset: 8,
+          length: 10,
+        }, { timeoutMs: 120000 });
+        return {
+          httpFallbackCount,
+          uploadId: upload.id || '',
+          uploadName: upload.name || '',
+          rawText: new TextDecoder().decode(raw.bytes),
+          rawSize: raw.size,
+          rawTotalSize: raw.total_size,
+          rawRangeStart: raw.range_start,
+          rawRangeEnd: raw.range_end,
+        };
+      } finally {
+        window.fetch = previousFetch;
+      }
+    })()`);
+    assert(uploadRawProbe.uploadId, `upload did not return an id: ${JSON.stringify(uploadRawProbe)}`);
+    assert.strictEqual(uploadRawProbe.uploadName, 'connect-upload-raw.txt', `upload returned wrong descriptor: ${JSON.stringify(uploadRawProbe)}`);
+    assert.strictEqual(uploadRawProbe.httpFallbackCount, 0, `upload/raw path used HTTP fallback: ${JSON.stringify(uploadRawProbe)}`);
+    assert.strictEqual(uploadRawProbe.rawText, uploadRawText.slice(8, 18), `upload raw read returned wrong range: ${JSON.stringify(uploadRawProbe)}`);
+    assert.strictEqual(uploadRawProbe.rawSize, 10, `upload raw read returned wrong size: ${JSON.stringify(uploadRawProbe)}`);
+    assert.strictEqual(uploadRawProbe.rawTotalSize, Buffer.byteLength(uploadRawText), `upload raw read returned wrong total size: ${JSON.stringify(uploadRawProbe)}`);
+    assert.strictEqual(uploadRawProbe.rawRangeStart, 8, `upload raw read returned wrong start: ${JSON.stringify(uploadRawProbe)}`);
+    assert.strictEqual(uploadRawProbe.rawRangeEnd, 18, `upload raw read returned wrong end: ${JSON.stringify(uploadRawProbe)}`);
+
     const revoked = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};
       const me = await fetch('/api/me').then(r => r.json());
