@@ -11162,6 +11162,65 @@ const DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024;
 const DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS = 30000;
 const dashboardRecentServerMessageKeys = new Map();
+const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
+  // Idempotent lifecycle/state events that can arrive over both the legacy
+  // WebSocket and the Connect event stream during transport migration.
+  'turn_started',
+  'done_signal',
+  'task_complete',
+  'round_complete',
+  'session_started',
+  'session_identity',
+  'session_relationship',
+  'session_capabilities',
+  'session_goal',
+  'session_attached',
+  'session_ended',
+  'status',
+  'approval_required',
+  'approval_resolved',
+  'follow_up_status',
+  'steer_requested',
+  'steer_queued',
+  'steer_accepted',
+  'steer_delivered',
+  'steer_cancelled',
+  'display_ready',
+  'display_resize',
+  'display_capture_lost',
+  'display_approval_pending',
+  'user_display_granted',
+  'user_display_revoked',
+  'shared_view',
+  'recording_started',
+  'recording_stopped',
+  'recording_deleted',
+  'recording_error',
+  'external_agent_changed',
+  'autonomy_changed',
+  'codex_thread_action_result',
+  'session_rename_result',
+  'session_agent_config_result',
+  'codex_config_changed',
+  'gemini_config_changed',
+  'gemini_thread_action_result',
+  'usage',
+  'usage_update',
+  'presence_usage_update',
+  'live_usage_update',
+  'browser_workspace_changed',
+  'upload_ready',
+  'upload_deleted',
+  'file_changed',
+  'snapshot_created',
+  'rolled_back',
+  'redone',
+  'history_pruned',
+  'conversation_rolled_back',
+  'peer_added',
+  'peer_removed',
+  'peer_state_changed',
+]);
 const DASHBOARD_CONTROL_MSG_RPC_ACTIONS = new Set([
   'set_autonomy',
   'set_approval_rule',
@@ -37794,8 +37853,7 @@ function hasTurnInIceServers(iceServers) {
 function dashboardShouldDropDuplicateServerMessage(message) {
   if (!dashboardControlEventsActive) return false;
   if (!message || typeof message !== 'object') return false;
-  if (dashboardMessageBypassesDedupe(message)) return false;
-  if (String(message.t || '').startsWith('dashboard_control_')) return false;
+  if (!dashboardMessageCanBeDeduped(message)) return false;
   const key = dashboardServerMessageDedupeKey(message);
   if (!key) return false;
   const now = Date.now();
@@ -37809,16 +37867,14 @@ function dashboardShouldDropDuplicateServerMessage(message) {
   return false;
 }
 
-function dashboardMessageBypassesDedupe(message) {
-  const t = String(message?.t || '');
-  return (
-    t === 'terminal_output' ||
-    t === 'terminal_exited' ||
-    t === 'terminal_opened' ||
-    t === 'terminal_error' ||
-    t === 'tui_term' ||
-    t === 'tui_error'
-  );
+function dashboardMessageCanBeDeduped(message) {
+  if (!message || typeof message !== 'object') return false;
+  // Dedupe only serde-tagged OutboundEvent payloads. Transport/control frames
+  // use `t` and may be streams or signaling messages where identical payloads
+  // are meaningful.
+  if (message.t !== undefined) return false;
+  const eventName = String(message.event || '');
+  return DASHBOARD_DEDUPABLE_EVENT_NAMES.has(eventName);
 }
 
 function dashboardServerMessageDedupeKey(message) {
@@ -38876,6 +38932,41 @@ window.intendantDashboardControl = {
       shellOutputQueuedBytes = previousOutputQueuedBytes;
       shellOutputFlushScheduled = previousOutputFlushScheduled;
       window.requestAnimationFrame = previousRequestAnimationFrame;
+    }
+  },
+  _debugProbeEventDedupeAllowlist() {
+    if (typeof dashboardShouldDropDuplicateServerMessage !== 'function') {
+      return {
+        skipped: true,
+        dedupeType: typeof dashboardShouldDropDuplicateServerMessage,
+      };
+    }
+    const previousEventsActive = dashboardControlEventsActive;
+    const previousRecentKeys = new Map(dashboardRecentServerMessageKeys);
+    const check = (message) => {
+      dashboardRecentServerMessageKeys.clear();
+      const first = dashboardShouldDropDuplicateServerMessage(message);
+      const second = dashboardShouldDropDuplicateServerMessage(message);
+      const recentKeyCount = dashboardRecentServerMessageKeys.size;
+      return { first, second, recentKeyCount };
+    };
+    dashboardControlEventsActive = true;
+    try {
+      return {
+        skipped: false,
+        status: check({ event: 'status', session_id: 's', phase: 'Idle', turn: 1, autonomy: 'ask', task: '' }),
+        sessionIdentity: check({ event: 'session_identity', session_id: 's', source: 'codex', backend_session_id: 'thread' }),
+        terminalOutput: check({ t: 'terminal_output', host_id: 'local', terminal_id: 'shell-0', data: 'YQ==' }),
+        displayIce: check({ t: 'display_ice', display_id: 0, candidate: { candidate: 'candidate:debug' } }),
+        modelDelta: check({ event: 'model_response_delta', session_id: 's', text: 'x' }),
+        logEntry: check({ event: 'log_entry', level: 'info', source: 'test', content: 'repeat' }),
+        peerEventForwarded: check({ event: 'peer_event_forwarded', peer_id: 'p', payload: { event: 'log', message: 'repeat' } }),
+        futureEvent: check({ event: 'future_event_type', value: 'repeat' }),
+      };
+    } finally {
+      dashboardControlEventsActive = previousEventsActive;
+      dashboardRecentServerMessageKeys.clear();
+      for (const [key, value] of previousRecentKeys) dashboardRecentServerMessageKeys.set(key, value);
     }
   },
   _debugProbeDuplicateShellInputSends() {

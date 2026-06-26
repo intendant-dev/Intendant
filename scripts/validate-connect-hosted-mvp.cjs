@@ -370,6 +370,7 @@ async function main() {
         '_debugProbeTuiConnectNoLegacy',
         '_debugProbeShellQueuesUntilOpened',
         '_debugProbeTerminalOutputBypassesDedupe',
+        '_debugProbeEventDedupeAllowlist',
         '_debugProbeDuplicateShellInputSends',
         '_debugProbePresenceMediaConnectNoLegacy',
         '_debugProbePresenceServerSenderConnectNoLegacy',
@@ -414,6 +415,23 @@ async function main() {
     assert.strictEqual(probes._debugProbeShellQueuesUntilOpened.ackedAfterAck, true, `Shell did not mark ACKed after terminal_opened: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeTerminalOutputBypassesDedupe.writtenBytes, 2, `duplicate Shell output was deduped: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeTerminalOutputBypassesDedupe.recentKeyCount, 0, `terminal output polluted event dedupe state: ${JSON.stringify(probes)}`);
+    assert.deepStrictEqual(
+      probes._debugProbeEventDedupeAllowlist.status,
+      { first: false, second: true, recentKeyCount: 1 },
+      `dedupable status event was not deduped: ${JSON.stringify(probes)}`
+    );
+    assert.deepStrictEqual(
+      probes._debugProbeEventDedupeAllowlist.sessionIdentity,
+      { first: false, second: true, recentKeyCount: 1 },
+      `dedupable session identity event was not deduped: ${JSON.stringify(probes)}`
+    );
+    for (const name of ['terminalOutput', 'displayIce', 'modelDelta', 'logEntry', 'peerEventForwarded', 'futureEvent']) {
+      assert.deepStrictEqual(
+        probes._debugProbeEventDedupeAllowlist[name],
+        { first: false, second: false, recentKeyCount: 0 },
+        `${name} was incorrectly deduped: ${JSON.stringify(probes)}`
+      );
+    }
     assert.deepStrictEqual(probes._debugProbeDuplicateShellInputSends.inputFrames, ['eA==', 'eA=='], `duplicate Shell input was not sent twice: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbeDuplicateShellInputSends.queuedAfterSend, '', `duplicate Shell input was unexpectedly queued: ${JSON.stringify(probes)}`);
     assert.strictEqual(probes._debugProbePresenceMediaConnectNoLegacy.presenceFrameCount, 2, `presence frames did not use tunnel: ${JSON.stringify(probes)}`);
