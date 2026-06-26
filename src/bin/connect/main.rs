@@ -4,7 +4,7 @@ use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
-use bip39::Language;
+use bip39::Mnemonic;
 use passkey_auth::{
     AuthenticationResponse, AuthenticationState, CredentialId, PasskeyCredential,
     RegistrationResponse, RegistrationState, Webauthn,
@@ -29,7 +29,7 @@ const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const OFFER_TIMEOUT_MS: u64 = 30_000;
 const CLAIM_TIMEOUT_MS: u64 = 60_000;
 const CLAIM_CODE_TTL_MS: u64 = 10 * 60 * 1000;
-const CLAIM_CODE_WORDS: usize = 7;
+const CLAIM_CODE_ENTROPY_BYTES: usize = 16;
 const CLAIM_CODE_GENERATION_ATTEMPTS: usize = 32;
 const ACTIVE_DASHBOARD_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CSRF_HEADER: &str = "x-intendant-csrf";
@@ -1461,7 +1461,7 @@ fn ensure_claim_code(
         claim_codes.remove(&daemon.daemon_id);
     }
     for _ in 0..CLAIM_CODE_GENERATION_ATTEMPTS {
-        let code = generate_claim_code();
+        let code = generate_claim_code()?;
         let code_hash = claim_code_hash(&code);
         if active_claim_hashes.contains(&code_hash) {
             continue;
@@ -1474,16 +1474,12 @@ fn ensure_claim_code(
     Err(ApiError::internal("failed to generate a unique claim code"))
 }
 
-fn generate_claim_code() -> String {
-    let words = Language::English.word_list();
-    let mut rng = OsRng;
-    let mut out = Vec::with_capacity(CLAIM_CODE_WORDS);
-    debug_assert_eq!(words.len(), 2048);
-    for _ in 0..CLAIM_CODE_WORDS {
-        let index = (rng.next_u32() as usize) % words.len();
-        out.push(words[index]);
-    }
-    out.join("-")
+fn generate_claim_code() -> ApiResult<String> {
+    let mut entropy = [0u8; CLAIM_CODE_ENTROPY_BYTES];
+    OsRng.fill_bytes(&mut entropy);
+    let mnemonic = Mnemonic::from_entropy(&entropy)
+        .map_err(|e| ApiError::internal(format!("generate claim mnemonic: {e}")))?;
+    Ok(mnemonic.to_string().replace(' ', "-"))
 }
 
 fn active_claim_code_hashes(store: &Store, except_daemon_id: &str, now: u64) -> HashSet<String> {
@@ -2511,6 +2507,7 @@ refreshAll().catch(() => renderAuth());
 #[cfg(test)]
 mod tests {
     use super::*;
+    use bip39::Language;
 
     fn daemon_record(
         daemon_id: &str,
@@ -2532,15 +2529,18 @@ mod tests {
     }
 
     #[test]
-    fn generated_claim_code_is_word_phrase_with_77_bits_of_space() {
-        let code = generate_claim_code();
+    fn generated_claim_code_is_12_word_bip39_mnemonic() {
+        let code = generate_claim_code().unwrap();
         let parts: Vec<_> = code.split('-').collect();
         let words = Language::English.word_list();
-        assert_eq!(parts.len(), CLAIM_CODE_WORDS);
+        assert_eq!(parts.len(), 12);
         for part in &parts {
             assert!(words.contains(part), "unexpected claim word {part}");
         }
         assert_eq!(normalize_claim_code(&code), code);
+        let mnemonic = Mnemonic::parse_in_normalized(Language::English, &code.replace('-', " "))
+            .expect("generated phrase must be a valid BIP39 mnemonic");
+        assert_eq!(mnemonic.to_entropy().len(), CLAIM_CODE_ENTROPY_BYTES);
     }
 
     #[test]

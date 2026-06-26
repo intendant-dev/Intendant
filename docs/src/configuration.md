@@ -352,8 +352,8 @@ file durably stores users/passkeys, daemon ownership, labels, hashed claim
 phrases, and audit events. Plain claim phrases, WebAuthn challenge state,
 pending offers, issued dashboard grants, rate limits, web sessions, and active
 dashboard session tracking are memory-only. The claim API field remains named
-`claim_code` for compatibility, but newly generated claims are seven-word BIP39
-English phrases rather than short PIN-style codes.
+`claim_code` for compatibility, but newly generated claims are standard 12-word
+BIP39 English mnemonic phrases rather than short PIN-style codes.
 
 For production alpha, terminate public TLS at a reverse proxy and keep
 `intendant-connect` bound to `127.0.0.1`. The proxy should forward `Host`, set

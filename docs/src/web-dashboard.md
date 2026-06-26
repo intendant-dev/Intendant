@@ -707,9 +707,9 @@ The hosted MVP flow is:
 1. The daemon registers its `daemon_id` and persistent daemon identity public
    key through `/api/daemon/register`.
 2. If the daemon is unclaimed, Connect returns a short-lived claim phrase and
-   URL. The phrase is seven BIP39 English words (about 77 bits of space),
-   stored only as a hash at rest, and regenerated if it collides with another
-   active unclaimed daemon.
+   URL. The phrase is a standard 12-word BIP39 English mnemonic generated from
+   128 bits of entropy, stored only as a hash at rest, and regenerated if it
+   collides with another active unclaimed daemon.
 3. The user opens Connect, signs in or registers with a passkey, and submits the
    claim phrase.
 4. Connect sends a `claim_challenge` event to the daemon. The daemon signs that
