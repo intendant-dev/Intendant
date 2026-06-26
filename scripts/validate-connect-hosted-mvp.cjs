@@ -239,7 +239,6 @@ async function main() {
 
     await page.evaluate(() => {
       document.getElementById('account').value = `hosted-e2e-${Date.now()}`;
-      document.getElementById('display').value = 'Hosted E2E';
     });
     await click(page, '#register');
     await page.waitForFunction(() => !document.getElementById('manage').classList.contains('hidden'), {

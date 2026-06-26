@@ -2214,10 +2214,6 @@ fn connect_ui_html(origin: &str) -> String {
           <label for="account">Account name</label>
           <input id="account" autocomplete="username webauthn" placeholder="you">
         </div>
-        <div>
-          <label for="display">Display name</label>
-          <input id="display" autocomplete="name" placeholder="Your name">
-        </div>
         <div class="row">
           <button id="login">Sign In</button>
           <button id="register" class="secondary">Create Passkey</button>
@@ -2328,11 +2324,10 @@ function authenticationCredentialJSON(credential) {{
 
 async function createPasskey() {{
   const account = $('account').value.trim();
-  const display = $('display').value.trim();
   setStatus('auth-status', 'Waiting for passkey', '');
   const start = await api('/api/auth/register/start', {{
     method: 'POST',
-    body: JSON.stringify({{ account_name: account, display_name: display }}),
+    body: JSON.stringify({{ account_name: account }}),
   }});
   const credential = await navigator.credentials.create({{ publicKey: publicKeyOptions(start) }});
   const done = await api('/api/auth/register/finish', {{
@@ -2413,7 +2408,7 @@ function renderAuth() {{
   $('manage').classList.toggle('hidden', !authed);
   $('audit-section').classList.toggle('hidden', !authed);
   $('logout').classList.toggle('hidden', !authed);
-  $('who').textContent = authed ? `${{state.user.display_name || state.user.account_name}} (${{
+  $('who').textContent = authed ? `${{state.user.account_name}} (${{
     state.user.passkey_count
   }} passkey${{state.user.passkey_count === 1 ? '' : 's'}})` : '';
 }}

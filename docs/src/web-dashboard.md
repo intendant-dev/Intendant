@@ -731,6 +731,9 @@ phrases, and a capped audit log. Plain claim phrases, WebAuthn challenge state,
 browser offers, and dashboard grants are memory-only. The service exposes a
 minimal account/daemon UI today: passkey registration/login, claim-phrase entry,
 daemon list, daemon labels, open dashboard, revoke ownership, and audit events.
+The visible account identity is the globally unique account name/handle; the
+internal WebAuthn display-name field is derived from that handle and is not a
+separate user-facing profile field in the MVP UI.
 
 Production-alpha hardening now includes:
 
