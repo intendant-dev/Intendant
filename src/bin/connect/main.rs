@@ -1,6 +1,6 @@
 use axum::extract::{Path as AxumPath, Query, State};
 use axum::http::{header, HeaderMap, HeaderValue, StatusCode, Uri};
-use axum::response::{Html, IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Redirect, Response};
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use base64::Engine as _;
@@ -19,7 +19,7 @@ use std::path::{Component, Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tokio::sync::{oneshot, Mutex, Notify};
-use url::Url;
+use url::{form_urlencoded, Url};
 use uuid::Uuid;
 
 const PROTOCOL: &str = "intendant-connect-rendezvous-v1";
@@ -539,9 +539,28 @@ async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
     Html(connect_ui_html(&state.config.public_origin))
 }
 
-async fn app_html(State(state): State<Arc<AppState>>) -> ApiResult<Response> {
+async fn app_html(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {
+    if !valid_connect_app_query(uri.query()) {
+        return Ok(Redirect::to("/connect").into_response());
+    }
     let path = state.config.static_root.join("app.html");
     serve_file(&state.config.static_root, &path)
+}
+
+fn valid_connect_app_query(query: Option<&str>) -> bool {
+    let Some(query) = query else {
+        return false;
+    };
+    let mut connect_mode = false;
+    let mut daemon_id = false;
+    for (key, value) in form_urlencoded::parse(query.as_bytes()) {
+        match key.as_ref() {
+            "connect" => connect_mode = value == "1",
+            "daemon_id" => daemon_id = !value.trim().is_empty(),
+            _ => {}
+        }
+    }
+    connect_mode && daemon_id
 }
 
 async fn static_asset(State(state): State<Arc<AppState>>, uri: Uri) -> ApiResult<Response> {
@@ -2550,6 +2569,24 @@ mod tests {
             claim_code_hash(code),
             claim_code_hash("abandon ability able about above absent absorb")
         );
+    }
+
+    #[test]
+    fn app_route_requires_connect_mode_and_daemon_id() {
+        assert!(valid_connect_app_query(Some(
+            "connect=1&daemon_id=vortex-deb-x11-intendant"
+        )));
+        assert!(valid_connect_app_query(Some(
+            "daemon_id=vortex-deb-x11-intendant&connect=1"
+        )));
+        assert!(!valid_connect_app_query(None));
+        assert!(!valid_connect_app_query(Some("")));
+        assert!(!valid_connect_app_query(Some(
+            "daemon_id=vortex-deb-x11-intendant"
+        )));
+        assert!(!valid_connect_app_query(Some("connect=1")));
+        assert!(!valid_connect_app_query(Some("connect=0&daemon_id=daemon")));
+        assert!(!valid_connect_app_query(Some("connect=1&daemon_id=%20")));
     }
 
     #[test]
