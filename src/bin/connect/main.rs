@@ -28,6 +28,8 @@ const SESSION_TTL_MS: u64 = 30 * 24 * 60 * 60 * 1000;
 const OFFER_TIMEOUT_MS: u64 = 30_000;
 const CLAIM_TIMEOUT_MS: u64 = 60_000;
 const CLAIM_CODE_TTL_MS: u64 = 10 * 60 * 1000;
+const ACTIVE_DASHBOARD_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
+const CSRF_HEADER: &str = "x-intendant-csrf";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -50,6 +52,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         event_queues: Mutex::new(HashMap::new()),
         event_notify: Notify::new(),
         claim_codes: Mutex::new(HashMap::new()),
+        rate_limits: Mutex::new(HashMap::new()),
+        active_sessions: Mutex::new(HashMap::new()),
     });
 
     let app = Router::new()
@@ -57,6 +61,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/connect", get(connect_ui))
         .route("/app", get(app_html))
         .route("/healthz", get(healthz))
+        .route("/readyz", get(readyz))
         .route("/api/me", get(api_me))
         .route("/api/logout", post(api_logout))
         .route("/api/auth/register/start", post(auth_register_start))
@@ -65,6 +70,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/auth/login/finish", post(auth_login_finish))
         .route("/api/daemons", get(api_daemons))
         .route("/api/daemons/{daemon_id}/revoke", post(api_daemon_revoke))
+        .route("/api/daemons/{daemon_id}/label", post(api_daemon_label))
         .route("/api/claims/claim", post(api_claim_start))
         .route("/api/claims/{claim_id}", get(api_claim_status))
         .route("/api/audit", get(api_audit))
@@ -229,6 +235,8 @@ struct AppState {
     event_queues: Mutex<HashMap<String, VecDeque<RendezvousEvent>>>,
     event_notify: Notify,
     claim_codes: Mutex<HashMap<String, String>>,
+    rate_limits: Mutex<HashMap<String, RateLimitBucket>>,
+    active_sessions: Mutex<HashMap<String, ActiveDashboardSession>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
@@ -254,6 +262,8 @@ struct UserRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DaemonRecord {
     daemon_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    label: Option<String>,
     daemon_public_key: String,
     owner_user_id: Option<Uuid>,
     claim_code_hash: Option<String>,
@@ -276,7 +286,21 @@ struct AuditEvent {
 #[derive(Debug, Clone)]
 struct SessionRecord {
     user_id: Uuid,
+    csrf_token: String,
     expires_unix_ms: u64,
+}
+
+#[derive(Debug, Clone)]
+struct RateLimitBucket {
+    window_start_unix_ms: u64,
+    count: u32,
+}
+
+#[derive(Debug, Clone)]
+struct ActiveDashboardSession {
+    daemon_id: String,
+    session_id: String,
+    created_unix_ms: u64,
 }
 
 struct PendingRegistration {
@@ -352,6 +376,10 @@ impl ApiError {
 
     fn conflict(message: impl Into<String>) -> Self {
         Self::new(StatusCode::CONFLICT, message)
+    }
+
+    fn too_many_requests(message: impl Into<String>) -> Self {
+        Self::new(StatusCode::TOO_MANY_REQUESTS, message)
     }
 
     fn internal(message: impl Into<String>) -> Self {
@@ -443,6 +471,7 @@ fn daemon_view(daemon: &DaemonRecord) -> serde_json::Value {
     let now = now_unix_ms();
     json!({
         "daemon_id": daemon.daemon_id,
+        "label": daemon.label,
         "daemon_public_key": daemon.daemon_public_key,
         "claimed": daemon.owner_user_id.is_some(),
         "online": now.saturating_sub(daemon.last_seen_unix_ms) < 45_000,
@@ -475,6 +504,32 @@ fn audit(
 
 async fn healthz() -> impl IntoResponse {
     Json(json!({ "ok": true }))
+}
+
+async fn readyz(State(state): State<Arc<AppState>>) -> Response {
+    let app_html = state.config.static_root.join("app.html");
+    let static_ok = app_html.is_file();
+    let state_parent_ok = state
+        .config
+        .data_file
+        .parent()
+        .map(|parent| parent.exists() || std::fs::create_dir_all(parent).is_ok())
+        .unwrap_or(false);
+    let ok = static_ok && state_parent_ok;
+    let status = if ok {
+        StatusCode::OK
+    } else {
+        StatusCode::SERVICE_UNAVAILABLE
+    };
+    (
+        status,
+        Json(json!({
+            "ok": ok,
+            "static_app": static_ok,
+            "state_parent": state_parent_ok,
+        })),
+    )
+        .into_response()
 }
 
 async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -582,14 +637,16 @@ async fn require_user(state: &Arc<AppState>, headers: &HeaderMap) -> ApiResult<U
         .ok_or_else(|| ApiError::unauthorized("sign in required"))
 }
 
-async fn create_session(state: &Arc<AppState>, user_id: Uuid) -> String {
+async fn create_session(state: &Arc<AppState>, user_id: Uuid) -> (String, String) {
     let token = random_b64u(32);
+    let csrf_token = random_b64u(32);
     let session = SessionRecord {
         user_id,
+        csrf_token: csrf_token.clone(),
         expires_unix_ms: now_unix_ms().saturating_add(SESSION_TTL_MS),
     };
     state.sessions.lock().await.insert(token.clone(), session);
-    token
+    (token, csrf_token)
 }
 
 fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
@@ -610,18 +667,117 @@ fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     }
 }
 
+fn header_string(headers: &HeaderMap, name: &'static str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|h| h.to_str().ok())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+}
+
+fn client_rate_key(headers: &HeaderMap, scope: &str) -> String {
+    let peer = header_string(headers, "x-forwarded-for")
+        .and_then(|v| v.split(',').next().map(str::trim).map(str::to_string))
+        .filter(|v| !v.is_empty())
+        .or_else(|| header_string(headers, "x-real-ip"))
+        .unwrap_or_else(|| "unknown".to_string());
+    format!("{scope}:{peer}")
+}
+
+async fn check_rate_limit(
+    state: &AppState,
+    headers: &HeaderMap,
+    scope: &str,
+    limit: u32,
+    window_ms: u64,
+) -> ApiResult<()> {
+    let now = now_unix_ms();
+    let key = client_rate_key(headers, scope);
+    let mut buckets = state.rate_limits.lock().await;
+    let bucket = buckets.entry(key).or_insert(RateLimitBucket {
+        window_start_unix_ms: now,
+        count: 0,
+    });
+    if now.saturating_sub(bucket.window_start_unix_ms) > window_ms {
+        bucket.window_start_unix_ms = now;
+        bucket.count = 0;
+    }
+    bucket.count = bucket.count.saturating_add(1);
+    if bucket.count > limit {
+        return Err(ApiError::too_many_requests("rate limit exceeded"));
+    }
+    Ok(())
+}
+
+fn require_same_origin(config: &ServiceConfig, headers: &HeaderMap) -> ApiResult<()> {
+    let Some(origin) = header_string(headers, "origin") else {
+        return Ok(());
+    };
+    if trim_trailing_slash(&origin) == config.public_origin {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("request origin is not allowed"))
+    }
+}
+
+async fn require_csrf(state: &Arc<AppState>, headers: &HeaderMap) -> ApiResult<()> {
+    require_same_origin(&state.config, headers)?;
+    let expected = header_string(headers, CSRF_HEADER)
+        .ok_or_else(|| ApiError::forbidden("missing CSRF token"))?;
+    let session_token = cookie_value(headers, COOKIE_NAME)
+        .ok_or_else(|| ApiError::unauthorized("sign in required"))?;
+    let sessions = state.sessions.lock().await;
+    let session = sessions
+        .get(&session_token)
+        .ok_or_else(|| ApiError::unauthorized("sign in required"))?;
+    if session.expires_unix_ms <= now_unix_ms() {
+        return Err(ApiError::unauthorized("sign in required"));
+    }
+    if session.csrf_token == expected {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("invalid CSRF token"))
+    }
+}
+
+fn log_json(event: &str, detail: serde_json::Value) {
+    eprintln!(
+        "{}",
+        json!({
+            "component": "intendant-connect",
+            "event": event,
+            "unix_ms": now_unix_ms(),
+            "detail": detail,
+        })
+    );
+}
+
 async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
     let Some(user) = optional_user(&state, &headers).await else {
         return Ok(Json(json!({ "authenticated": false })).into_response());
     };
+    let csrf_token = if let Some(token) = cookie_value(&headers, COOKIE_NAME) {
+        state
+            .sessions
+            .lock()
+            .await
+            .get(&token)
+            .map(|session| session.csrf_token.clone())
+            .unwrap_or_default()
+    } else {
+        String::new()
+    };
     Ok(Json(json!({
         "authenticated": true,
         "user": user_view(&user),
+        "csrf_token": csrf_token,
     }))
     .into_response())
 }
 
-async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> Response {
+async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
+    require_csrf(&state, &headers).await?;
     if let Some(token) = cookie_value(&headers, COOKIE_NAME) {
         state.sessions.lock().await.remove(&token);
     }
@@ -629,7 +785,7 @@ async fn api_logout(State(state): State<Arc<AppState>>, headers: HeaderMap) -> R
     response
         .headers_mut()
         .insert(header::SET_COOKIE, clear_session_cookie(&state.config));
-    response
+    Ok(response)
 }
 
 #[derive(Debug, Deserialize)]
@@ -648,8 +804,11 @@ struct ChallengeStartResponse {
 
 async fn auth_register_start(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<RegisterStartRequest>,
 ) -> ApiResult<Json<ChallengeStartResponse>> {
+    require_same_origin(&state.config, &headers)?;
+    check_rate_limit(&state, &headers, "auth_register_start", 20, 60_000).await?;
     let account_name = normalize_account_name(&body.account_name);
     if account_name.is_empty() {
         return Err(ApiError::bad_request("account_name is required"));
@@ -708,8 +867,11 @@ struct RegisterFinishRequest {
 
 async fn auth_register_finish(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<RegisterFinishRequest>,
 ) -> ApiResult<Response> {
+    require_same_origin(&state.config, &headers)?;
+    check_rate_limit(&state, &headers, "auth_register_finish", 30, 60_000).await?;
     let pending = state
         .pending_registrations
         .lock()
@@ -763,10 +925,11 @@ async fn auth_register_finish(
             .cloned()
             .ok_or_else(|| ApiError::internal("created user missing"))?
     };
-    let token = create_session(&state, user.id).await;
+    let (token, csrf_token) = create_session(&state, user.id).await;
     let mut response = Json(json!({
         "ok": true,
         "user": user_view(&user),
+        "csrf_token": csrf_token,
     }))
     .into_response();
     response.headers_mut().insert(
@@ -783,8 +946,11 @@ struct LoginStartRequest {
 
 async fn auth_login_start(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<LoginStartRequest>,
 ) -> ApiResult<Json<ChallengeStartResponse>> {
+    require_same_origin(&state.config, &headers)?;
+    check_rate_limit(&state, &headers, "auth_login_start", 30, 60_000).await?;
     let account_name = normalize_account_name(&body.account_name);
     if account_name.is_empty() {
         return Err(ApiError::bad_request("account_name is required"));
@@ -828,8 +994,11 @@ struct LoginFinishRequest {
 
 async fn auth_login_finish(
     State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
     Json(body): Json<LoginFinishRequest>,
 ) -> ApiResult<Response> {
+    require_same_origin(&state.config, &headers)?;
+    check_rate_limit(&state, &headers, "auth_login_finish", 60, 60_000).await?;
     let pending = state
         .pending_authentications
         .lock()
@@ -870,10 +1039,11 @@ async fn auth_login_finish(
         persist_locked(&state, &store)?;
         user
     };
-    let token = create_session(&state, user.id).await;
+    let (token, csrf_token) = create_session(&state, user.id).await;
     let mut response = Json(json!({
         "ok": true,
         "user": user_view(&user),
+        "csrf_token": csrf_token,
     }))
     .into_response();
     response.headers_mut().insert(
@@ -907,12 +1077,22 @@ async fn api_daemon_revoke(
     AxumPath(daemon_id): AxumPath<String>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "daemon_revoke", 30, 60_000).await?;
+    let daemon_id = daemon_id.trim().to_string();
+    ensure_owned_daemon(&state, user.id, &daemon_id).await?;
+    let active_session_ids = active_dashboard_session_ids(&state, &daemon_id).await;
+    let closed_sessions = active_session_ids.len();
     let mut store = state.store.lock().await;
-    let daemon = store
+    let daemon_index = store
         .daemons
-        .iter_mut()
-        .find(|d| d.daemon_id == daemon_id && d.owner_user_id == Some(user.id))
+        .iter()
+        .position(|d| d.daemon_id == daemon_id)
         .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+    if store.daemons[daemon_index].owner_user_id != Some(user.id) {
+        return Err(ApiError::forbidden("daemon belongs to a different account"));
+    }
+    let daemon = &mut store.daemons[daemon_index];
     daemon.owner_user_id = None;
     daemon.claim_code_hash = None;
     daemon.claim_code_created_unix_ms = None;
@@ -922,11 +1102,68 @@ async fn api_daemon_revoke(
         "daemon_revoked",
         Some(user.id),
         Some(daemon_id.clone()),
-        json!({}),
+        json!({ "closed_sessions": closed_sessions }),
     );
     persist_locked(&state, &store)?;
     state.claim_codes.lock().await.remove(&daemon_id);
-    Ok(Json(json!({ "ok": true })))
+    drop(store);
+    close_active_dashboard_sessions(&state, &daemon_id, active_session_ids).await;
+    log_json(
+        "daemon_revoked",
+        json!({ "daemon_id": daemon_id, "closed_sessions": closed_sessions }),
+    );
+    Ok(Json(
+        json!({ "ok": true, "closed_sessions": closed_sessions }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct DaemonLabelRequest {
+    label: String,
+}
+
+async fn api_daemon_label(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    AxumPath(daemon_id): AxumPath<String>,
+    Json(body): Json<DaemonLabelRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "daemon_label", 60, 60_000).await?;
+    let daemon_id = daemon_id.trim().to_string();
+    let label = body.label.trim();
+    if label.len() > 80 {
+        return Err(ApiError::bad_request(
+            "label must be 80 characters or shorter",
+        ));
+    }
+    let mut store = state.store.lock().await;
+    let daemon_index = store
+        .daemons
+        .iter()
+        .position(|d| d.daemon_id == daemon_id)
+        .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+    if store.daemons[daemon_index].owner_user_id != Some(user.id) {
+        return Err(ApiError::forbidden("daemon belongs to a different account"));
+    }
+    let daemon = &mut store.daemons[daemon_index];
+    daemon.label = if label.is_empty() {
+        None
+    } else {
+        Some(label.to_string())
+    };
+    daemon.updated_unix_ms = now_unix_ms();
+    let view = daemon_view(daemon);
+    audit(
+        &mut store,
+        "daemon_label_updated",
+        Some(user.id),
+        Some(daemon_id.clone()),
+        json!({ "label": label }),
+    );
+    persist_locked(&state, &store)?;
+    Ok(Json(json!({ "ok": true, "daemon": view })))
 }
 
 #[derive(Debug, Deserialize)]
@@ -940,6 +1177,8 @@ async fn api_claim_start(
     Json(body): Json<ClaimStartRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "claim_start", 10, 60_000).await?;
     let code = body.claim_code.trim().replace(' ', "").to_ascii_uppercase();
     if code.is_empty() {
         return Err(ApiError::bad_request("claim_code is required"));
@@ -1061,7 +1300,7 @@ async fn api_status(
     Query(query): Query<StatusQuery>,
 ) -> Json<serde_json::Value> {
     let daemon_id = query.daemon_id.trim();
-    let (daemon, queued) = {
+    let (daemon, queued, active_sessions) = {
         let store = state.store.lock().await;
         let daemon = store
             .daemons
@@ -1075,15 +1314,32 @@ async fn api_status(
             .get(daemon_id)
             .map(|q| q.len())
             .unwrap_or(0);
-        (daemon, queued)
+        let active_sessions = state
+            .active_sessions
+            .lock()
+            .await
+            .values()
+            .filter(|session| session.daemon_id == daemon_id)
+            .count();
+        (daemon, queued, active_sessions)
     };
+    let now = now_unix_ms();
+    let claim_code_expires_unix_ms = daemon
+        .as_ref()
+        .and_then(|d| d.claim_code_created_unix_ms)
+        .map(|created| created.saturating_add(CLAIM_CODE_TTL_MS))
+        .filter(|expires| *expires > now);
     Json(json!({
         "ok": true,
         "daemon_id": daemon_id,
         "registered": daemon.is_some(),
         "claimed": daemon.as_ref().and_then(|d| d.owner_user_id).is_some(),
+        "label": daemon.as_ref().and_then(|d| d.label.as_deref()).unwrap_or(""),
         "daemon_public_key": daemon.as_ref().map(|d| d.daemon_public_key.as_str()).unwrap_or(""),
+        "last_seen_unix_ms": daemon.as_ref().map(|d| d.last_seen_unix_ms).unwrap_or(0),
+        "claim_code_expires_unix_ms": claim_code_expires_unix_ms,
         "queued": queued,
+        "active_sessions": active_sessions,
         "daemon_auth_required": state.config.daemon_token.is_some(),
     }))
 }
@@ -1101,6 +1357,7 @@ async fn daemon_register(
     Json(body): Json<DaemonRegisterRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     require_daemon_auth(&state, &headers)?;
+    check_rate_limit(&state, &headers, "daemon_register", 120, 60_000).await?;
     if body.protocol != PROTOCOL {
         return Err(ApiError::bad_request("unsupported protocol"));
     }
@@ -1134,6 +1391,7 @@ async fn daemon_register(
         } else {
             let mut record = DaemonRecord {
                 daemon_id: daemon_id.clone(),
+                label: None,
                 daemon_public_key: daemon_public_key.clone(),
                 owner_user_id: None,
                 claim_code_hash: None,
@@ -1153,7 +1411,10 @@ async fn daemon_register(
         .as_ref()
         .map(|code| format!("{}/connect?claim_code={code}", state.config.public_origin));
     if let Some(url) = claim_url.as_deref() {
-        eprintln!("[connect] daemon {daemon_id} awaiting claim: {url}");
+        log_json(
+            "daemon_awaiting_claim",
+            json!({ "daemon_id": daemon_id, "claim_url": url }),
+        );
     }
     Ok(Json(json!({
         "ok": true,
@@ -1210,6 +1471,7 @@ async fn daemon_next(
     Query(query): Query<DaemonNextQuery>,
 ) -> ApiResult<Response> {
     require_daemon_auth(&state, &headers)?;
+    check_rate_limit(&state, &headers, "daemon_next", 240, 60_000).await?;
     let daemon_id = query.daemon_id.trim().to_string();
     if daemon_id.is_empty() {
         return Err(ApiError::bad_request("daemon_id is required"));
@@ -1287,6 +1549,71 @@ async fn pop_event(state: &AppState, daemon_id: &str) -> Option<RendezvousEvent>
     event
 }
 
+async fn record_active_dashboard_session(state: &AppState, daemon_id: &str, session_id: &str) {
+    let now = now_unix_ms();
+    let mut sessions = state.active_sessions.lock().await;
+    sessions.retain(|_, session| {
+        now.saturating_sub(session.created_unix_ms) <= ACTIVE_DASHBOARD_SESSION_TTL_MS
+    });
+    sessions.insert(
+        session_id.to_string(),
+        ActiveDashboardSession {
+            daemon_id: daemon_id.to_string(),
+            session_id: session_id.to_string(),
+            created_unix_ms: now,
+        },
+    );
+}
+
+async fn active_dashboard_session_ids(state: &AppState, daemon_id: &str) -> Vec<String> {
+    let now = now_unix_ms();
+    let mut active = state.active_sessions.lock().await;
+    active.retain(|_, session| {
+        now.saturating_sub(session.created_unix_ms) <= ACTIVE_DASHBOARD_SESSION_TTL_MS
+    });
+    active
+        .values()
+        .filter(|session| session.daemon_id == daemon_id)
+        .map(|session| session.session_id.clone())
+        .collect()
+}
+
+async fn close_active_dashboard_sessions(
+    state: &AppState,
+    daemon_id: &str,
+    session_ids: Vec<String>,
+) -> usize {
+    let sessions = {
+        let mut active = state.active_sessions.lock().await;
+        let mut sessions = Vec::new();
+        for session_id in session_ids {
+            let belongs_to_daemon = active
+                .get(&session_id)
+                .is_some_and(|session| session.daemon_id == daemon_id);
+            if belongs_to_daemon {
+                active.remove(&session_id);
+                sessions.push(session_id);
+            }
+        }
+        sessions
+    };
+    let closed = sessions.len();
+    for session_id in sessions {
+        enqueue_event(
+            state,
+            daemon_id,
+            RendezvousEvent {
+                id: Uuid::new_v4().to_string(),
+                kind: "close".to_string(),
+                session_id: Some(session_id),
+                ..RendezvousEvent::default()
+            },
+        )
+        .await;
+    }
+    closed
+}
+
 #[derive(Debug, Deserialize)]
 struct DaemonAnswerRequest {
     daemon_id: String,
@@ -1333,9 +1660,17 @@ async fn daemon_answer(
         let _ = pending.response_tx.send(Err(error.clone()));
         return Err(ApiError::bad_request(error));
     }
+    let answer_session_id = body.session_id.trim().to_string();
+    if answer_session_id.is_empty() {
+        let _ = pending
+            .response_tx
+            .send(Err("daemon answer missing session_id".to_string()));
+        return Err(ApiError::bad_request("daemon answer missing session_id"));
+    }
+    record_active_dashboard_session(&state, &pending.daemon_id, &answer_session_id).await;
     let answer = BrowserAnswerResponse {
         ok: true,
-        session_id: body.session_id,
+        session_id: answer_session_id.clone(),
         sdp: body.sdp,
         binding: body.binding,
         daemon_public_key: pending.daemon_public_key,
@@ -1349,7 +1684,7 @@ async fn daemon_answer(
             "dashboard_grant_answered",
             Some(pending.user_id),
             Some(pending.daemon_id),
-            json!({ "request_id": body.request_id }),
+            json!({ "request_id": body.request_id, "session_id": answer_session_id }),
         );
         persist_locked(&state, &store)?;
     }
@@ -1554,6 +1889,8 @@ async fn browser_offer(
     Json(body): Json<BrowserOfferRequest>,
 ) -> ApiResult<Response> {
     let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "browser_offer", 60, 60_000).await?;
     let daemon_id = body.daemon_id.trim().to_string();
     let sdp = body.sdp;
     if daemon_id.is_empty() || sdp.trim().is_empty() {
@@ -1641,6 +1978,8 @@ async fn browser_ice(
     Json(body): Json<BrowserIceRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "browser_ice", 600, 60_000).await?;
     require_owned_daemon(&state, user.id, &body.daemon_id).await?;
     enqueue_event(
         &state,
@@ -1669,7 +2008,13 @@ async fn browser_close(
     Json(body): Json<BrowserCloseRequest>,
 ) -> ApiResult<Json<serde_json::Value>> {
     let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
     require_owned_daemon(&state, user.id, &body.daemon_id).await?;
+    state
+        .active_sessions
+        .lock()
+        .await
+        .remove(body.session_id.trim());
     enqueue_event(
         &state,
         body.daemon_id.trim(),
@@ -1689,6 +2034,7 @@ async fn require_owned_daemon(
     user_id: Uuid,
     daemon_id: &str,
 ) -> ApiResult<DaemonRecord> {
+    ensure_owned_daemon(state, user_id, daemon_id).await?;
     let store = state.store.lock().await;
     store
         .daemons
@@ -1696,6 +2042,21 @@ async fn require_owned_daemon(
         .find(|d| d.daemon_id == daemon_id.trim() && d.owner_user_id == Some(user_id))
         .cloned()
         .ok_or_else(|| ApiError::not_found("daemon not found"))
+}
+
+async fn ensure_owned_daemon(state: &AppState, user_id: Uuid, daemon_id: &str) -> ApiResult<()> {
+    let daemon_id = daemon_id.trim();
+    let store = state.store.lock().await;
+    let daemon = store
+        .daemons
+        .iter()
+        .find(|d| d.daemon_id == daemon_id)
+        .ok_or_else(|| ApiError::not_found("daemon not found"))?;
+    if daemon.owner_user_id == Some(user_id) {
+        Ok(())
+    } else {
+        Err(ApiError::forbidden("daemon belongs to a different account"))
+    }
 }
 
 fn connect_ui_html(origin: &str) -> String {
@@ -1820,7 +2181,7 @@ fn connect_ui_html(origin: &str) -> String {
   </main>
 <script>
 const $ = id => document.getElementById(id);
-const state = {{ user: null, daemons: [] }};
+const state = {{ user: null, daemons: [], csrfToken: '' }};
 
 function setStatus(id, text, kind = '') {{
   const el = $(id);
@@ -1829,12 +2190,16 @@ function setStatus(id, text, kind = '') {{
 }}
 
 async function api(path, options = {{}}) {{
+  const headers = {{
+    'content-type': 'application/json',
+    ...(options.headers || {{}}),
+  }};
+  if (state.csrfToken && !headers['x-intendant-csrf']) {{
+    headers['x-intendant-csrf'] = state.csrfToken;
+  }}
   const resp = await fetch(path, {{
     ...options,
-    headers: {{
-      'content-type': 'application/json',
-      ...(options.headers || {{}}),
-    }},
+    headers,
   }});
   const body = await resp.json().catch(() => ({{}}));
   if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${{resp.status}}`);
@@ -1903,6 +2268,7 @@ async function createPasskey() {{
     }}),
   }});
   state.user = done.user;
+  state.csrfToken = done.csrf_token || state.csrfToken;
   setStatus('auth-status', 'Signed in', 'ok');
   await refreshAll();
 }}
@@ -1923,6 +2289,7 @@ async function login() {{
     }}),
   }});
   state.user = done.user;
+  state.csrfToken = done.csrf_token || state.csrfToken;
   setStatus('auth-status', 'Signed in', 'ok');
   await refreshAll();
 }}
@@ -1953,6 +2320,7 @@ async function claimDaemon() {{
 
 async function refreshAll() {{
   const me = await api('/api/me');
+  state.csrfToken = me.csrf_token || '';
   state.user = me.authenticated ? me.user : null;
   renderAuth();
   if (!state.user) return;
@@ -1985,12 +2353,14 @@ function renderDaemons() {{
   for (const daemon of state.daemons) {{
     const tr = document.createElement('tr');
     const key = String(daemon.daemon_public_key || '');
+    const label = String(daemon.label || daemon.daemon_id || '');
     tr.innerHTML = `
-      <td><code>${{escapeHtml(daemon.daemon_id)}}</code></td>
+      <td><strong>${{escapeHtml(label)}}</strong><br><code>${{escapeHtml(daemon.daemon_id)}}</code></td>
       <td><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span></td>
       <td><code>${{escapeHtml(key.slice(0, 16))}}${{key.length > 16 ? '...' : ''}}</code></td>
       <td class="row">
         <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open</button>
+        <button class="secondary" data-label="${{escapeAttr(daemon.daemon_id)}}">Rename</button>
         <button class="danger" data-revoke="${{escapeAttr(daemon.daemon_id)}}">Revoke</button>
       </td>`;
     rows.appendChild(tr);
@@ -2005,6 +2375,19 @@ function renderDaemons() {{
     button.addEventListener('click', async () => {{
       const id = button.getAttribute('data-revoke');
       await api(`/api/daemons/${{encodeURIComponent(id)}}/revoke`, {{ method: 'POST', body: '{{}}' }});
+      await refreshAll();
+    }});
+  }});
+  rows.querySelectorAll('[data-label]').forEach(button => {{
+    button.addEventListener('click', async () => {{
+      const id = button.getAttribute('data-label');
+      const daemon = state.daemons.find(item => item.daemon_id === id) || {{}};
+      const next = prompt('Name this daemon', daemon.label || daemon.daemon_id || '');
+      if (next === null) return;
+      await api(`/api/daemons/${{encodeURIComponent(id)}}/label`, {{
+        method: 'POST',
+        body: JSON.stringify({{ label: next }}),
+      }});
       await refreshAll();
     }});
   }});
@@ -2035,7 +2418,7 @@ $('register').addEventListener('click', () => createPasskey().catch(err => setSt
 $('login').addEventListener('click', () => login().catch(err => setStatus('auth-status', err.message, 'err')));
 $('claim').addEventListener('click', () => claimDaemon().catch(err => setStatus('claim-status', err.message, 'err')));
 $('refresh').addEventListener('click', () => refreshAll().catch(err => setStatus('claim-status', err.message, 'err')));
-$('logout').addEventListener('click', async () => {{ await api('/api/logout', {{ method: 'POST', body: '{{}}' }}); state.user = null; renderAuth(); }});
+$('logout').addEventListener('click', async () => {{ await api('/api/logout', {{ method: 'POST', body: '{{}}' }}); state.user = null; state.csrfToken = ''; renderAuth(); }});
 
 const params = new URLSearchParams(location.search);
 if (params.get('claim_code')) $('claim-code').value = params.get('claim_code');

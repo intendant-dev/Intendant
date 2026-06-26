@@ -38597,6 +38597,7 @@ class DashboardControlTransport {
     this.completedChunkedResponses = 0;
     this.completedByteStreams = 0;
     this.signalingMode = '';
+    this.connectCsrfToken = '';
     this.seq = 0;
   }
 
@@ -39411,9 +39412,10 @@ class DashboardControlTransport {
   }
 
   async postConnectSignal(path, payload) {
+    const headers = await this.connectSignalHeaders();
     const resp = await fetch(dashboardConnectSignalUrl(path), {
       method: 'POST',
-      headers: { 'content-type': 'application/json' },
+      headers,
       body: JSON.stringify(payload),
     });
     const body = await resp.json().catch(() => ({}));
@@ -39421,6 +39423,17 @@ class DashboardControlTransport {
       throw new Error(body.error || `${path} returned ${resp.status}`);
     }
     return body;
+  }
+
+  async connectSignalHeaders() {
+    if (!this.connectCsrfToken) {
+      const resp = await fetch('/api/me');
+      const body = await resp.json().catch(() => ({}));
+      this.connectCsrfToken = String(body.csrf_token || '');
+    }
+    const headers = { 'content-type': 'application/json' };
+    if (this.connectCsrfToken) headers['x-intendant-csrf'] = this.connectCsrfToken;
+    return headers;
   }
 
   sendWsSignal(frame) {
@@ -39494,9 +39507,11 @@ class DashboardControlTransport {
   signalClose(sessionId) {
     if (!sessionId) return;
     if (this.signalingMode === 'connect-rendezvous') {
+      const headers = { 'content-type': 'application/json' };
+      if (this.connectCsrfToken) headers['x-intendant-csrf'] = this.connectCsrfToken;
       fetch(dashboardConnectSignalUrl('/api/browser/close'), {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers,
         body: JSON.stringify({
           daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
           session_id: sessionId,

@@ -346,10 +346,23 @@ INTENDANT_CONNECT_TOKEN="shared daemon bearer token" \
 
 `intendant-connect` is intended to sit behind public TLS for the configured
 origin. It handles passkey-only account sessions, claim-code ownership proof,
-daemon list/open/revoke UI, short-lived dashboard grants, WebRTC signaling, and
-a capped audit log. The state file durably stores users/passkeys, daemon
-ownership, hashed claim codes, and audit events. Plain claim codes, WebAuthn
-challenge state, pending offers, and issued dashboard grants are memory-only.
+daemon list/open/revoke/label UI, short-lived dashboard grants, WebRTC
+signaling, active-session close on revoke, and a capped audit log. The state
+file durably stores users/passkeys, daemon ownership, labels, hashed claim
+codes, and audit events. Plain claim codes, WebAuthn challenge state, pending
+offers, issued dashboard grants, rate limits, web sessions, and active dashboard
+session tracking are memory-only.
+
+For production alpha, terminate public TLS at a reverse proxy and keep
+`intendant-connect` bound to `127.0.0.1`. The proxy should forward `Host`, set
+`X-Forwarded-For`/`X-Real-IP`, and strip any inbound copies of those headers
+before setting them because the service uses them for simple rate-limit buckets.
+Use `/healthz` for liveness and `/readyz` for readiness. Back up the state file
+and store `INTENDANT_CONNECT_TOKEN` in the deployment secret store.
+
+Cookie-backed user mutations require a same-origin request and the per-session
+CSRF token returned by `/api/me`. The bundled Connect UI and dashboard
+`connect=1` mode set that header automatically.
 
 The service accepts equivalent environment variables:
 
@@ -372,7 +385,7 @@ INTENDANT_CONNECT_TOKEN=shared-dev-token \
   ./target/release/intendant --no-tui --web 8876
 ```
 
-There are two committed validators. The hosted MVP validator starts
+There are two committed validators. The hosted production-alpha validator starts
 `intendant-connect`, a daemon, and a browser virtual authenticator:
 
 ```bash

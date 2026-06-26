@@ -2891,6 +2891,7 @@ async function main() {
       if (method === 'POST' && allowedAppSignalPaths.has(pathname)) return true;
       if (method !== 'GET') return false;
       if (pathname === '/app') return true;
+      if (pathname === '/api/me') return true;
       if (pathname === '/config') return false;
       if (pathname === '/ws') return false;
       if (pathname === '/.well-known/agent-card.json') return false;

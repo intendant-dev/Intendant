@@ -252,6 +252,21 @@ async function main() {
     const daemons = await page.evaluate(async () => fetch('/api/daemons').then(r => r.json()));
     assert.strictEqual(daemons.daemons.length, 1, `expected one claimed daemon: ${JSON.stringify(daemons)}`);
     assert.strictEqual(daemons.daemons[0].daemon_id, options.daemonId);
+    const labelResult = await page.evaluate(`(async () => {
+      const daemonId = ${JSON.stringify(options.daemonId)};
+      const me = await fetch('/api/me').then(r => r.json());
+      const resp = await fetch('/api/daemons/' + encodeURIComponent(daemonId) + '/label', {
+        method: 'POST',
+        headers: {
+          'content-type': 'application/json',
+          'x-intendant-csrf': me.csrf_token || '',
+        },
+        body: JSON.stringify({ label: 'Hosted E2E Daemon' }),
+      });
+      return resp.json();
+    })()`);
+    assert.strictEqual(labelResult.ok, true, `label update failed: ${JSON.stringify(labelResult)}`);
+    assert.strictEqual(labelResult.daemon.label, 'Hosted E2E Daemon');
 
     await goto(page, `${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}`, {
       timeout: START_TIMEOUT_MS,
@@ -273,22 +288,32 @@ async function main() {
     assert.strictEqual(connected.verifiedBinding.daemonPublicKey, registered.daemon_public_key);
     assert(connected.sessionGrantSha256, 'Connect dashboard did not bind a session grant');
 
-    await goto(page, `${connectOrigin}/connect`, { timeout: START_TIMEOUT_MS });
     const revoked = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};
+      const me = await fetch('/api/me').then(r => r.json());
       const resp = await fetch('/api/daemons/' + encodeURIComponent(daemonId) + '/revoke', {
         method: 'POST',
-        headers: { 'content-type': 'application/json' },
+        headers: {
+          'content-type': 'application/json',
+          'x-intendant-csrf': me.csrf_token || '',
+        },
         body: '{}',
       });
       return resp.json();
     })()`);
     assert.strictEqual(revoked.ok, true, `revoke failed: ${JSON.stringify(revoked)}`);
+    assert(revoked.closed_sessions >= 1, `revoke did not close the active dashboard session: ${JSON.stringify(revoked)}`);
+    await waitFor(async () => {
+      const status = await page.evaluate(() => window.intendantDashboardControl?.status?.() || null);
+      if (!status) return null;
+      if (!status.connected || status.pcState === 'closed' || status.channelState === 'closed') return status;
+      return null;
+    }, START_TIMEOUT_MS, 'active dashboard session close after revoke');
     const afterRevoke = await page.evaluate(async () => fetch('/api/daemons').then(r => r.json()));
     assert.deepStrictEqual(afterRevoke.daemons, [], 'daemon remained visible after revoke');
     const audit = await page.evaluate(async () => fetch('/api/audit').then(r => r.json()));
     const eventNames = new Set((audit.events || []).map(event => event.event));
-    for (const name of ['passkey_registered', 'daemon_claimed', 'dashboard_grant_started', 'dashboard_grant_answered', 'daemon_revoked']) {
+    for (const name of ['passkey_registered', 'daemon_claimed', 'daemon_label_updated', 'dashboard_grant_started', 'dashboard_grant_answered', 'daemon_revoked']) {
       assert(eventNames.has(name), `missing audit event ${name}: ${JSON.stringify(audit)}`);
     }
 
