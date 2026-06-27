@@ -1430,6 +1430,21 @@ impl WireEventUpcaster {
                 signal: signal.clone(),
             }],
 
+            OutboundEvent::CodexThreadActionRequested {
+                action, session_id, ..
+            } => vec![log_event(
+                LogLevel::Info,
+                "codex-action",
+                format!(
+                    "/{} requested{}",
+                    action,
+                    session_id
+                        .as_deref()
+                        .map(|id| format!(" for {}", id))
+                        .unwrap_or_default()
+                ),
+            )],
+
             OutboundEvent::CodexThreadActionResult {
                 action,
                 success,

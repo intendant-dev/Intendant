@@ -11643,6 +11643,7 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'recording_error',
   'external_agent_changed',
   'autonomy_changed',
+  'codex_thread_action_requested',
   'codex_thread_action_result',
   'session_rename_result',
   'session_agent_config_result',
@@ -18848,6 +18849,9 @@ async function main() {
       if (d.event === 'session_agent_config_result') {
         handleSessionConfigResult(d);
       }
+      if (d.event === 'codex_thread_action_requested') {
+        handleCodexThreadActionRequested(d);
+      }
       if (d.event === 'follow_up_status') {
         handleFollowUpStatusUpdate(d);
         return;
@@ -19573,6 +19577,9 @@ function processCommands(cmds) {
         break;
       case 'codex_config_changed':
         applyCodexConfigChanged(c);
+        break;
+      case 'codex_thread_action_requested':
+        handleCodexThreadActionRequested(c);
         break;
       case 'codex_thread_action_result':
         handleCodexThreadActionResult(c);
@@ -21007,7 +21014,7 @@ function dispatchCodexThreadAction(op, params, sessionId = '', options = {}) {
   const payload = { action: 'codex_thread_action', op, params: params || {} };
   if (sid) payload.session_id = sid;
   dispatchControlMsg(payload);
-  stationUpsertCodexThreadActionActivity(op, sid, 'requested');
+  stationUpsertCodexThreadActionActivity(op, sid, 'requested', '', { renderLog: false });
   return true;
 }
 
@@ -21259,25 +21266,29 @@ function dispatchCodexSlashCommand(parsed) {
 }
 
 function markActionPending(op, sessionId = '') {
+  const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
+  if (!normalizedOp) return;
+  releaseActionPending(normalizedOp);
   // Codex + Gemini share the "new" op name. We mark whichever section is
   // currently visible — the one that was just clicked. querySelectorAll
   // finds both, then `offsetParent` filters to the visible one.
   const btns = Array.from(document.querySelectorAll(
-    `.control-action-btn[data-codex-action="${op}"], .control-action-btn[data-gemini-action="${op}"]`
+    `.control-action-btn[data-codex-action="${normalizedOp}"], .control-action-btn[data-gemini-action="${normalizedOp}"]`
   )).filter(el => el.offsetParent !== null);
   btns.forEach(btn => btn.classList.add('pending'));
   // Safety: if no result arrives, release the button ourselves but keep a
   // visible Activity row so the action does not silently disappear.
   const timeoutHandle = setTimeout(() => {
-    controlPendingActions.delete(op);
+    controlPendingActions.delete(normalizedOp);
     btns.forEach(btn => btn.classList.remove('pending'));
-    if (sessionId) stationUpsertCodexThreadActionActivity(op, sessionId, 'timeout');
+    if (sessionId) stationUpsertCodexThreadActionActivity(normalizedOp, sessionId, 'timeout');
   }, 60000);
-  controlPendingActions.set(op, { timeoutHandle, btnEls: btns, sessionId });
+  controlPendingActions.set(normalizedOp, { timeoutHandle, btnEls: btns, sessionId });
 }
 
 function releaseActionPending(op) {
-  const entry = controlPendingActions.get(op);
+  const normalizedOp = String(op || '').trim().toLowerCase().replace(/_/g, '-');
+  const entry = controlPendingActions.get(normalizedOp);
   if (!entry) return;
   clearTimeout(entry.timeoutHandle);
   // `btnEls` is the new field (plural, set by markActionPending); fall back
@@ -21287,7 +21298,7 @@ function releaseActionPending(op) {
   } else if (entry.btnEl) {
     entry.btnEl.classList.remove('pending');
   }
-  controlPendingActions.delete(op);
+  controlPendingActions.delete(normalizedOp);
 }
 
 function parseGoalElapsedText(text) {
@@ -21369,6 +21380,14 @@ function handleCodexThreadActionResult(evt) {
       ? successText
       : `/${evt.action} failed: ${evt.message}`
   );
+}
+
+function handleCodexThreadActionRequested(evt) {
+  const action = String(evt.action || '').trim().toLowerCase().replace(/_/g, '-');
+  const sid = String(evt.session_id || evt.sessionId || '').trim();
+  if (!action) return;
+  markActionPending(action, sid);
+  stationUpsertCodexThreadActionActivity(action, sid, 'requested');
 }
 
 function handleSessionRenameResult(evt) {

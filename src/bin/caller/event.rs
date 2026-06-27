@@ -2158,6 +2158,16 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
         AppEvent::AutonomyChanged { autonomy } => Some(OutboundEvent::AutonomyChanged {
             autonomy: autonomy.clone(),
         }),
+        AppEvent::CodexThreadActionRequested {
+            request_id,
+            session_id,
+            action,
+            ..
+        } => Some(OutboundEvent::CodexThreadActionRequested {
+            request_id: request_id.clone(),
+            session_id: session_id.clone(),
+            action: action.clone(),
+        }),
         AppEvent::CodexThreadActionResult {
             session_id,
             action,
@@ -2201,9 +2211,6 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             success: *success,
             message: message.clone(),
         }),
-        // The "requested" half is server-internal (daemon action watcher
-        // consumes it directly); browsers don't need it.
-        AppEvent::CodexThreadActionRequested { .. } => None,
         AppEvent::ExternalFollowUpRequested { .. } => None,
         AppEvent::CodexConfigChanged {
             command,
@@ -4203,6 +4210,22 @@ mod tests {
         let json = serde_json::to_string(&outbound).unwrap();
         assert!(json.contains("\"event\":\"codex_thread_action_result\""));
         assert!(json.contains("\"record_id\":\"rewind-abc123\""));
+    }
+
+    #[test]
+    fn outbound_codex_thread_action_requested_is_visible() {
+        let event = AppEvent::CodexThreadActionRequested {
+            request_id: "req-1".to_string(),
+            session_id: Some("codex-thread".to_string()),
+            action: "fork".to_string(),
+            params: serde_json::json!({}),
+            origin: None,
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"codex_thread_action_requested\""));
+        assert!(json.contains("\"request_id\":\"req-1\""));
+        assert!(json.contains("\"action\":\"fork\""));
     }
 
     #[test]

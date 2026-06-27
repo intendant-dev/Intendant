@@ -339,6 +339,14 @@ pub enum OutboundEvent {
     AutonomyChanged {
         autonomy: String,
     },
+    /// Delivered to browsers as soon as a Codex thread-level action is
+    /// accepted for dispatch, so long-running actions remain visible.
+    CodexThreadActionRequested {
+        request_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        action: String,
+    },
     /// Delivered to browsers when a Codex thread-level action finishes
     /// (compact, fork, side, side-close, rollback, review, rename, goal, init, memory-reset).
     /// `success` + `message` are surfaced as a dashboard toast and logged.

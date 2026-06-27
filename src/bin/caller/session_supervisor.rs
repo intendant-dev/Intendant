@@ -753,6 +753,10 @@ impl SessionSupervisor {
                 )
                 .await;
             }
+            event::ControlMsg::CodexThreadAction { session_id, op, .. } => {
+                self.report_unattached_codex_thread_action(session_id, op)
+                    .await;
+            }
             _ => {}
         }
     }
@@ -765,6 +769,7 @@ impl SessionSupervisor {
             event::ControlMsg::StopSession { .. } => true,
             event::ControlMsg::RenameSession { .. } => true,
             event::ControlMsg::ConfigureSessionAgent { .. } => true,
+            event::ControlMsg::CodexThreadAction { .. } => true,
             msg if control_msg_can_attach_unmanaged_session(msg) => true,
             _ => {
                 if let Some(session_id) = control_target_session_id(msg) {
@@ -773,6 +778,50 @@ impl SessionSupervisor {
                     false
                 }
             }
+        }
+    }
+
+    async fn report_unattached_codex_thread_action(&self, session_id: Option<String>, op: String) {
+        let Some(target_id) = session_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+
+        let failure = {
+            let state = self.state.lock().await;
+            match state.resolve_session_id(target_id) {
+                Some(managed_id) => match state.sessions.get(&managed_id) {
+                    Some(session) if session.source == "codex" => None,
+                    Some(session) => Some(format!(
+                        "target session {} is a {} session, not a live Codex session",
+                        short_session(target_id),
+                        session.source
+                    )),
+                    None => Some(format!(
+                        "target Codex session {} is not attached to this daemon; attach it before /{}",
+                        short_session(target_id),
+                        op
+                    )),
+                },
+                None => Some(format!(
+                    "target Codex session {} is not attached to this daemon; attach it before /{}",
+                    short_session(target_id),
+                    op
+                )),
+            }
+        };
+
+        if let Some(message) = failure {
+            self.config.bus.send(AppEvent::CodexThreadActionResult {
+                session_id,
+                action: op,
+                success: false,
+                message,
+                record_id: None,
+            });
         }
     }
 
@@ -4258,6 +4307,73 @@ mod tests {
                 .get("backend")
                 .map(|session| session.phase.as_str()),
             Some("done")
+        );
+    }
+
+    #[tokio::test]
+    async fn codex_thread_action_unattached_target_reports_failure() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::CodexThreadAction {
+                session_id: Some("019ee2e4".to_string()),
+                op: "fork".to_string(),
+                params: serde_json::json!({}),
+                origin: None,
+            })
+            .await;
+
+        let event = tokio::time::timeout(std::time::Duration::from_millis(200), rx.recv())
+            .await
+            .expect("expected failure event")
+            .expect("bus event");
+        match event {
+            AppEvent::CodexThreadActionResult {
+                session_id,
+                action,
+                success,
+                message,
+                ..
+            } => {
+                assert_eq!(session_id.as_deref(), Some("019ee2e4"));
+                assert_eq!(action, "fork");
+                assert!(!success);
+                assert!(message.contains("not attached to this daemon"));
+                assert!(message.contains("attach it before /fork"));
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_thread_action_live_target_is_not_rejected_by_supervisor() {
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state.sessions.insert(
+                "live-codex".to_string(),
+                managed_session("live-codex", "codex"),
+            );
+        }
+
+        supervisor
+            .handle_control_msg(event::ControlMsg::CodexThreadAction {
+                session_id: Some("live-codex".to_string()),
+                op: "fork".to_string(),
+                params: serde_json::json!({}),
+                origin: None,
+            })
+            .await;
+
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
+                .await
+                .is_err(),
+            "live Codex action should be handled by the external-agent watcher"
         );
     }
 
