@@ -3790,6 +3790,39 @@ fn parse_request_target(request_line: &str) -> (&str, &str, &str) {
     (method, path, query)
 }
 
+fn is_mcp_request_path(request_line: &str) -> bool {
+    let (_, path, _) = parse_request_target(request_line);
+    path == "/mcp"
+}
+
+fn http_header_present(header_text: &str, header_name: &str) -> bool {
+    header_text.lines().skip(1).any(|line| {
+        let Some((name, _)) = line.split_once(':') else {
+            return false;
+        };
+        name.trim().eq_ignore_ascii_case(header_name)
+    })
+}
+
+fn has_browser_origin_headers(header_text: &str) -> bool {
+    http_header_present(header_text, "origin")
+        || http_header_present(header_text, "sec-fetch-site")
+        || http_header_present(header_text, "sec-fetch-mode")
+        || http_header_present(header_text, "sec-fetch-dest")
+}
+
+fn is_loopback_cleartext_mcp_request(
+    remote_addr: std::net::SocketAddr,
+    is_tls: bool,
+    header_text: &str,
+) -> bool {
+    let request_line = header_text.lines().next().unwrap_or("");
+    !is_tls
+        && remote_addr.ip().is_loopback()
+        && is_mcp_request_path(request_line)
+        && !has_browser_origin_headers(header_text)
+}
+
 /// Whether the request head's `Accept-Encoding` admits gzip (tolerant:
 /// case-insensitive header name and token, `x-gzip` alias, `;q=0` rejects).
 fn accept_encoding_allows_gzip(header_text: &str) -> bool {
@@ -16760,6 +16793,14 @@ pub fn spawn_web_gateway(
                 let is_tls = tls_acceptor.is_some()
                     && crate::web_tls::looks_like_tls_client_hello(&buf[..peeked]);
 
+                let cleartext_header_text = if is_tls {
+                    String::new()
+                } else {
+                    String::from_utf8_lossy(&buf[..peeked]).to_string()
+                };
+                let allow_loopback_cleartext_mcp =
+                    is_loopback_cleartext_mcp_request(peer_addr, is_tls, &cleartext_header_text);
+
                 // Strict TLS: when a TLS acceptor is configured the dashboard
                 // is HTTPS/WSS-only. A connection that reaches this point is
                 // neither raw ICE-TCP (handled and returned above — that path
@@ -16768,12 +16809,12 @@ pub fn spawn_web_gateway(
                 // WebSocket client dialing the secure port in the clear.
                 // Opportunistic TLS — quietly serving such a client over plain
                 // HTTP — would undercut the project's "no unencrypted traffic"
-                // guarantee, so we refuse it: emit a one-line HTTP 426 "Upgrade
-                // Required" hint (best effort; a raw WebSocket client may not
-                // parse it, but a browser hitting `http://` shows the operator
-                // why) and close. When TLS is off this branch is skipped and
-                // cleartext is served exactly as before.
-                if tls_acceptor.is_some() && !is_tls {
+                // guarantee, so we refuse it. The one exception is the local
+                // loopback `/mcp` endpoint used by managed child CLIs: those
+                // clients cannot present the dashboard mTLS certificate, and
+                // their transport never leaves the host. Browser-originated
+                // requests do not qualify for that exception.
+                if tls_acceptor.is_some() && !is_tls && !allow_loopback_cleartext_mcp {
                     use tokio::io::AsyncWriteExt;
                     log_tls_failure_rate_limited(
                         &tls_failure_log_state,
@@ -19538,6 +19579,7 @@ pub fn spawn_web_gateway(
 
                     if tls_client_cert_required
                         && !tls_client_cert_present
+                        && !is_loopback_cleartext_mcp_request(peer_addr, is_tls, &header_text)
                         && !is_public_peer_access_request_path(request_line)
                         && !is_public_connect_bootstrap_path(request_line)
                     {
@@ -30263,6 +30305,50 @@ mod tests {
         assert_eq!(tool_profile, None);
     }
 
+    #[test]
+    fn loopback_cleartext_mcp_exception_is_narrow() {
+        use std::net::{Ipv4Addr, SocketAddr};
+
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 43210);
+        let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 50).into(), 43210);
+
+        assert!(is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            "POST /mcp?session_id=child HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            "POST /mcp-extra HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            lan,
+            false,
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            true,
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\n\r\n"
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nOrigin: https://example.test\r\n\r\n"
+        ));
+        assert!(!is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            "POST /mcp HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n"
+        ));
+    }
+
     /// A specific bind address is preserved verbatim in the
     /// advertised URL. The operator chose it; we trust them.
     #[test]
@@ -33263,6 +33349,13 @@ mod tests {
     async fn spawn_test_gateway_tls(
         bearer_token: Option<String>,
     ) -> (u16, tokio::task::JoinHandle<()>) {
+        spawn_test_gateway_tls_with_client_cert_requirement(bearer_token, false).await
+    }
+
+    async fn spawn_test_gateway_tls_with_client_cert_requirement(
+        bearer_token: Option<String>,
+        tls_client_cert_required: bool,
+    ) -> (u16, tokio::task::JoinHandle<()>) {
         let bus = EventBus::new();
         let (broadcast_tx, _) = broadcast::channel::<String>(16);
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -33289,7 +33382,7 @@ mod tests {
             Vec::new(),
             bearer_token,
             crate::peer::AuthRequirements::none(),
-            false,
+            tls_client_cert_required,
             Some(acceptor),
         );
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
@@ -33891,6 +33984,64 @@ mod tests {
         assert!(
             !resp.contains("101 Switching Protocols"),
             "must not upgrade a cleartext WS on the secure port, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    /// Managed child agents connect to Intendant's Streamable HTTP MCP
+    /// endpoint over loopback. That local control channel must continue to
+    /// work when the operator enables TLS/mTLS for the dashboard; otherwise
+    /// child CLIs cannot report tool calls or receive session-scoped MCP
+    /// context. The exception is path- and peer-scoped to loopback `/mcp`.
+    #[tokio::test]
+    async fn test_strict_tls_allows_loopback_cleartext_mcp_when_mtls_required() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let resp = http_request(
+            port,
+            "POST /mcp?session_id=child HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: 2\r\n\
+             \r\n\
+             {}",
+        )
+        .await;
+        assert!(
+            resp.contains("503 Service Unavailable"),
+            "loopback cleartext /mcp should reach the MCP handler, got: {resp}"
+        );
+        assert!(
+            !resp.contains("426"),
+            "loopback cleartext /mcp must not be rejected by strict TLS, got: {resp}"
+        );
+        assert!(
+            !resp.contains("mTLS client certificate required"),
+            "loopback cleartext /mcp must not be rejected by dashboard mTLS, got: {resp}"
+        );
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_strict_tls_rejects_browser_origin_cleartext_mcp() {
+        let (port, handle) = spawn_test_gateway_tls_with_client_cert_requirement(None, true).await;
+        let resp = http_request(
+            port,
+            "POST /mcp?session_id=child HTTP/1.1\r\n\
+             Host: localhost\r\n\
+             Origin: https://example.test\r\n\
+             Content-Type: text/plain\r\n\
+             Content-Length: 2\r\n\
+             \r\n\
+             {}",
+        )
+        .await;
+        assert!(
+            resp.contains("426"),
+            "browser-origin cleartext /mcp should stay on the strict TLS reject path, got: {resp}"
+        );
+        assert!(
+            !resp.contains("503 Service Unavailable"),
+            "browser-origin cleartext /mcp must not reach the MCP handler, got: {resp}"
         );
         handle.abort();
     }
