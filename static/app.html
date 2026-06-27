@@ -50309,15 +50309,33 @@ async function downloadFilesStagedUpload(id) {
       setFilesUploadStatus('ok', `Downloaded ${result.filename || name}`);
       return result;
     }
-    const result = await dashboardFetchRangedBytes('api_session_current_upload_raw', { id }, {
-      chunkBytes: DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+    if (dashboardConnectModeEnabled()) {
+      throw new Error('Staged upload download requires the Connect dashboard transfer tunnel');
+    }
+    const name = filesStagedDescriptorName(upload);
+    const resp = await authedFetch(`/api/session/current/uploads/${encodeURIComponent(id)}/raw`, {
+      cache: 'no-store',
     });
+    if (!resp.ok) {
+      const body = await resp.json().catch(() => ({}));
+      throw new Error(body.error || `staged upload download returned ${resp.status}`);
+    }
+    const blob = await resp.blob();
+    const result = {
+      ok: true,
+      blob,
+      filename: name,
+      content_type: resp.headers.get('content-type') || upload.mime || 'application/octet-stream',
+      size: blob.size,
+      total_size: blob.size,
+      range_count: 1,
+    };
     downloadDashboardBlob(
       result.blob,
-      result.filename || filesStagedDescriptorName(upload),
+      result.filename || name,
       result.content_type || upload.mime || 'application/octet-stream'
     );
-    setFilesUploadStatus('ok', `Downloaded ${result.filename || filesStagedDescriptorName(upload)}`);
+    setFilesUploadStatus('ok', `Downloaded ${result.filename || name}`);
     return result;
   } catch (err) {
     const message = err?.message || String(err);
