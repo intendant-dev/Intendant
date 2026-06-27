@@ -4643,10 +4643,14 @@ fn handle_message(
         .find_map(|(k, v)| (*v == cid).then(|| k.clone()));
     match label.as_deref() {
         Some("control") | Some("pointer") => {
-            if let Ok(text) = std::str::from_utf8(&data) {
-                if let Ok(evt) = serde_json::from_str::<InputEvent>(text) {
-                    input_handler(evt);
-                }
+            let label = label.as_deref().unwrap_or("unknown");
+            super::input_telemetry::record_data_channel_input(label, data.len());
+            match std::str::from_utf8(&data) {
+                Ok(text) => match serde_json::from_str::<InputEvent>(text) {
+                    Ok(evt) => input_handler(evt),
+                    Err(_) => super::input_telemetry::record_input_parse_error(),
+                },
+                Err(_) => super::input_telemetry::record_input_parse_error(),
             }
         }
         Some("clipboard") => {
