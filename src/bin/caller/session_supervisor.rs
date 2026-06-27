@@ -1980,6 +1980,7 @@ impl SessionSupervisor {
                         user_turn_index
                     ),
                 );
+                self.queue_edit_user_message_after_attach(lookup_id.clone(), request);
                 self.resume_session(
                     attach.source,
                     requested_id.clone(),
@@ -1996,7 +1997,6 @@ impl SessionSupervisor {
                     false,
                 )
                 .await;
-                self.queue_edit_user_message_after_attach(lookup_id, request);
                 return;
             }
         }
@@ -2196,7 +2196,7 @@ impl SessionSupervisor {
             );
         } else {
             self.emit_edit_user_message_status(
-                Some(target.managed_id.clone()),
+                Some(request.requested_id.clone()),
                 request.user_turn_index,
                 "queued",
                 format!(
@@ -2225,23 +2225,53 @@ impl SessionSupervisor {
         &self,
         requested_id: &str,
     ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
-        let state = self.state.lock().await;
-        let relation = state.related_sessions.get(requested_id).cloned();
-        let target_id = state
-            .resolve_session_id(requested_id)
-            .unwrap_or_else(|| requested_id.to_string());
-        let entry = state
-            .sessions
-            .get(&target_id)
-            .filter(|session| managed_session_accepts_external_input(session))
-            .map(|s| EditRouteTarget {
-                managed_id: s.session_id.clone(),
-                source: s.source.clone(),
-                project_root: s.project_root.clone(),
-                session_dir: s.session_dir.clone(),
-                follow_up_tx: s.follow_up_tx.clone(),
-            });
-        (target_id, entry, relation)
+        let home = crate::platform::home_dir();
+        self.lookup_edit_route_target_in_home(requested_id, &home)
+            .await
+    }
+
+    async fn lookup_edit_route_target_in_home(
+        &self,
+        requested_id: &str,
+        home: &Path,
+    ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
+        let initial = {
+            let state = self.state.lock().await;
+            lookup_edit_route_target_in_state(&state, requested_id)
+        };
+        if initial.1.is_some() {
+            return initial;
+        }
+
+        if let Some(target_id) = self
+            .resolve_indexed_external_wrapper_managed_id_in_home(home, requested_id)
+            .await
+        {
+            let state = self.state.lock().await;
+            let routed = lookup_edit_route_target_in_state(&state, &target_id);
+            if routed.1.is_some() {
+                return routed;
+            }
+        }
+
+        let mut fallback_candidates = vec![requested_id.to_string()];
+        if initial.0 != requested_id {
+            fallback_candidates.push(initial.0.clone());
+        }
+        for candidate in fallback_candidates {
+            if !may_be_persisted_external_wrapper_id(&candidate) {
+                continue;
+            }
+            if let Some(live_id) = self.resolve_persisted_external_managed_id(&candidate).await {
+                let state = self.state.lock().await;
+                let routed = lookup_edit_route_target_in_state(&state, &live_id);
+                if routed.1.is_some() {
+                    return routed;
+                }
+            }
+        }
+
+        initial
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
@@ -3184,6 +3214,47 @@ impl SessionSupervisor {
             .map(|session| session.session_id.clone())
     }
 
+    async fn resolve_indexed_external_wrapper_managed_id_in_home(
+        &self,
+        home: &Path,
+        backend_session_id: &str,
+    ) -> Option<String> {
+        let backend_session_id = backend_session_id.trim();
+        if backend_session_id.is_empty() {
+            return None;
+        }
+        let candidates = [external_agent::AgentBackend::Codex]
+            .into_iter()
+            .filter(|backend| {
+                backend.supports_user_message_rewind()
+                    && external_agent::source_session_id_is_canonical(
+                        backend.as_short_str(),
+                        backend_session_id,
+                    )
+            })
+            .flat_map(|backend| {
+                let source = backend.as_short_str().to_string();
+                crate::external_wrapper_index::wrappers_for(home, &source, backend_session_id)
+                    .into_iter()
+                    .map(move |record| (source.clone(), record.intendant_session_id))
+            })
+            .collect::<Vec<_>>();
+        if candidates.is_empty() {
+            return None;
+        }
+        let state = self.state.lock().await;
+        candidates.into_iter().find_map(|(source, wrapper_id)| {
+            let resolved_id = state.resolve_session_id(&wrapper_id)?;
+            state
+                .sessions
+                .get(&resolved_id)
+                .filter(|session| {
+                    session.source == source && managed_session_accepts_external_input(session)
+                })
+                .map(|session| session.session_id.clone())
+        })
+    }
+
     async fn clear_external_attach_request(&self, keys: &[String]) {
         if keys.is_empty() {
             return;
@@ -3406,6 +3477,32 @@ fn managed_session_accepts_external_input(session: &ManagedSession) -> bool {
         normalize_supervisor_phase(&session.phase).as_str(),
         "done" | "interrupted"
     )
+}
+
+fn lookup_edit_route_target_in_state(
+    state: &SupervisorState,
+    requested_id: &str,
+) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
+    let relation = state.related_sessions.get(requested_id).cloned();
+    let target_id = state
+        .resolve_session_id(requested_id)
+        .unwrap_or_else(|| requested_id.to_string());
+    let entry = state
+        .sessions
+        .get(&target_id)
+        .filter(|session| managed_session_accepts_external_input(session))
+        .map(|s| EditRouteTarget {
+            managed_id: s.session_id.clone(),
+            source: s.source.clone(),
+            project_root: s.project_root.clone(),
+            session_dir: s.session_dir.clone(),
+            follow_up_tx: s.follow_up_tx.clone(),
+        });
+    (target_id, entry, relation)
+}
+
+fn may_be_persisted_external_wrapper_id(session_id: &str) -> bool {
+    uuid::Uuid::parse_str(session_id.trim()).is_ok()
 }
 
 fn path_file_name(path: &std::path::Path) -> String {
@@ -5410,6 +5507,44 @@ mod tests {
         assert_eq!(msg.edit_user_turn_revision, Some(5));
         assert_eq!(msg.edit_original_text.as_deref(), Some("continue"));
         assert_eq!(msg.target_session_id, None);
+    }
+
+    #[tokio::test]
+    async fn edit_route_uses_wrapper_index_before_alias_event() {
+        let home = tempfile::tempdir().unwrap();
+        let backend_id = "019ea99e-af1d-7c23-a57a-55a89c77f90b";
+        let wrapper_id = "6036429e-54f9-4f93-b74d-04c060c79054";
+        let wrapper_dir = home.path().join(".intendant").join("logs").join(wrapper_id);
+        std::fs::create_dir_all(&wrapper_dir).unwrap();
+        crate::external_wrapper_index::upsert(
+            home.path(),
+            "codex",
+            backend_id,
+            wrapper_id,
+            &wrapper_dir,
+            None,
+        )
+        .unwrap();
+
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            state
+                .sessions
+                .insert(wrapper_id.to_string(), managed_session(wrapper_id, "codex"));
+        }
+
+        let (target_id, entry, relation) = supervisor
+            .lookup_edit_route_target_in_home(backend_id, home.path())
+            .await;
+
+        assert_eq!(target_id, wrapper_id);
+        assert_eq!(
+            entry.map(|target| target.managed_id).as_deref(),
+            Some(wrapper_id)
+        );
+        assert!(relation.is_none());
     }
 
     #[tokio::test]
