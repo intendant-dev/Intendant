@@ -11434,6 +11434,7 @@ let currentSessionFullId = '';
 let foregroundSessionFullId = '';
 let maximizedSessionWindowId = '';
 const sessionWindows = new Map();
+const recentSessionStatusPhases = new Map();
 const sessionRelationships = new Map();
 const sessionRelationshipHydrationInFlight = new Set();
 let processingLogReplay = false;
@@ -11467,6 +11468,7 @@ const SESSION_WINDOW_GRID_FIT_MIN_HEIGHT = 72;
 const CONCURRENT_LOG_MIN_HEIGHT = 180;
 const SESSION_WINDOW_GRID_DEFAULT_RATIO = 0.5;
 const SESSION_WINDOW_GRID_MAX_RATIO = 0.8;
+const SESSION_ATTACH_STATUS_FRESH_MS = 15000;
 const SESSION_RELATIONSHIP_KINDS = new Set(['side', 'fork', 'subagent']);
 const CONCURRENT_LOG_MODE_NORMAL = 'normal';
 const CONCURRENT_LOG_MODE_MINIMIZED = 'minimized';
@@ -18848,6 +18850,7 @@ async function main() {
         }
       }
       if (d.event === 'status' && d.session_id && d.phase) {
+        recordRecentSessionStatusPhase(d.session_id, d.phase);
         const sid = statusSessionWindowTarget(d.session_id);
         if (sid && shouldMaterializeStatusSessionWindow(sid)) {
           updateSessionWindow(sid, { phase: d.phase, ended: false });
@@ -19481,6 +19484,7 @@ function processCommands(cmds) {
         renderTurnSeparator(c.turn);
         break;
       case 'update_status_bar':
+        if (!processingLogReplay) recordRecentSessionStatusPhase(c.session_id, c.phase);
         pendingStatusPhaseGuard = { allow: shouldApplyStatusPhaseForSession(c.session_id) };
         updateStatusBar(c);
         stationScheduleUpdate();
@@ -23842,6 +23846,35 @@ function shouldApplyStatusPhaseForSession(sessionId) {
   return !!targetSid
     && shouldMaterializeStatusSessionWindow(targetSid)
     && targetSid === resolvePromptTargetSessionId();
+}
+
+function recordRecentSessionStatusPhase(sessionId, phase) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || sid === daemonSessionFullId || !phase) return;
+  const targetSid = statusSessionWindowTarget(sid) || sid;
+  const record = { phase: normalizeSessionPhase(phase), at: Date.now() };
+  recentSessionStatusPhases.set(sid, record);
+  if (targetSid && targetSid !== sid) recentSessionStatusPhases.set(targetSid, record);
+}
+
+function recentSessionStatusPhase(sessionId) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) return '';
+  const record = recentSessionStatusPhases.get(sid);
+  if (!record) return '';
+  if (Date.now() - record.at > SESSION_ATTACH_STATUS_FRESH_MS) {
+    recentSessionStatusPhases.delete(sid);
+    return '';
+  }
+  return record.phase || '';
+}
+
+function attachedSessionPhase(sessionId) {
+  return recentSessionStatusPhase(sessionId) || 'idle';
+}
+
+function hasSessionLifecycleTask(task) {
+  return String(task || '').trim().length > 0;
 }
 
 function focusSessionWindowFromLifecycle(sessionId, options = {}) {
@@ -48284,8 +48317,11 @@ function focusActivityForSessionEvent(options = {}) {
 // ── Session Lifecycle ──
 function onSessionStarted(sessionId, task) {
   const sid = String(sessionId || '').trim();
-  stationCurrentTask = compactSessionText(task);
-  stationCurrentApproval = null;
+  const hasTask = hasSessionLifecycleTask(task);
+  if (hasTask) {
+    stationCurrentTask = compactSessionText(task);
+    stationCurrentApproval = null;
+  }
   stationScheduleUpdate();
   const shouldFocusActivity = newSessionSpawnPending;
   const currentTarget = resolvePromptTargetSessionId();
@@ -48294,12 +48330,13 @@ function onSessionStarted(sessionId, task) {
   const visibleSessionId = alias?.backendSessionId || sid;
   if (visibleSessionId) {
     setSessionWindowDetached(visibleSessionId, false);
-    ensureSessionWindow(visibleSessionId, {
-      task: task || 'session',
-      phase: processingLogReplay ? 'idle' : 'thinking',
+    const meta = {
+      phase: processingLogReplay || !hasTask ? 'idle' : 'thinking',
       ended: false,
       ...(alias?.source ? { source: alias.source, backendSource: alias.source } : {}),
-    });
+    };
+    if (hasTask) meta.task = task;
+    ensureSessionWindow(visibleSessionId, meta);
     focusSessionWindowFromLifecycle(visibleSessionId, {
       force: shouldFocusActivity,
       currentTarget,
@@ -48328,11 +48365,11 @@ function onSessionAttached(sessionId, source) {
   const currentTarget = resolvePromptTargetSessionId();
   if (sessionId) {
     setSessionWindowDetached(sessionId, false);
-    const existingPhase = normalizeSessionPhase(sessionWindows.get(sessionId)?.phase || '');
-    const phase = existingPhase && existingPhase !== 'done'
-      ? existingPhase
-      : 'idle';
-    ensureSessionWindow(sessionId, { source: source || 'session', phase, ended: false });
+    ensureSessionWindow(sessionId, {
+      source: source || 'session',
+      phase: attachedSessionPhase(sessionId),
+      ended: false,
+    });
     focusSessionWindowFromLifecycle(sessionId, { currentTarget });
     flushPendingDetachedCodexThreadActions(sessionId);
   } else {
