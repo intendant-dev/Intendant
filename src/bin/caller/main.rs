@@ -57,6 +57,7 @@ mod tool_batch;
 mod tools;
 mod transcription;
 mod tui;
+mod transfer_store;
 mod types;
 mod upload_store;
 mod user_mode;

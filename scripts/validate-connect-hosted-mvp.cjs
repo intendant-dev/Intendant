@@ -231,7 +231,7 @@ async function main() {
     }, START_TIMEOUT_MS, 'intendant-connect health');
 
     spawnLogged(options.daemonBinary, ['--no-tui', '--web', String(options.daemonPort)], {
-      cwd: options.repoRoot,
+      cwd: tmp,
       env: {
         ...process.env,
         INTENDANT_CONNECT_RENDEZVOUS_URL: connectApi,
@@ -329,6 +329,34 @@ async function main() {
     assert.strictEqual(connected.tuiFramesAvailable, false, `--no-tui daemon unexpectedly advertised TUI frames: ${JSON.stringify(connected)}`);
     assert.strictEqual(connected.byteStreamsAvailable, true, `Connect tunnel did not advertise byte streams: ${JSON.stringify(connected)}`);
     assert.strictEqual(connected.apiFsReadAvailable, true, `Connect tunnel did not advertise filesystem reads: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.apiTransferJobsAvailable, true, `Connect tunnel did not advertise transfer jobs: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.apiTransferJobCreateAvailable, true, `Connect tunnel did not advertise transfer job creation: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.apiTransferDownloadReadAvailable, true, `Connect tunnel did not advertise transfer downloads: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.apiTransferUploadChunkAvailable, true, `Connect tunnel did not advertise transfer upload chunks: ${JSON.stringify(connected)}`);
+    assert.strictEqual(connected.apiTransferUploadCommitAvailable, true, `Connect tunnel did not advertise transfer upload commit: ${JSON.stringify(connected)}`);
+
+    async function waitForDashboardReconnect(label = 'hosted dashboard reconnect') {
+      return waitFor(async () => {
+        const status = await page.evaluate(() => window.intendantDashboardControl?.status?.() || null);
+        if (status?.connected && status?.verifiedBinding?.ok) return status;
+        return null;
+      }, CONNECT_TIMEOUT_MS, label);
+    }
+
+    async function reloadHostedFilesPage(label) {
+      const url = `${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.daemonId)}#files`;
+      await page.evaluate(`window.history.replaceState(null, '', ${JSON.stringify(url)})`);
+      if (typeof page.reload === 'function') {
+        await page.reload({ timeout: START_TIMEOUT_MS }).catch(() => {});
+      } else if (page.connection && page.sessionId) {
+        await page.connection.send('Page.reload', { ignoreCache: true }, page.sessionId, START_TIMEOUT_MS).catch(() => {});
+      } else {
+        await page.evaluate('window.location.reload()').catch(() => {});
+      }
+      await new Promise(resolve => setTimeout(resolve, 500));
+      await waitForDashboardReconnect(label);
+      await click(page, '.tab-btn[data-tab="files"]');
+    }
 
     await click(page, '.tab-btn[data-tab="settings"]');
     await click(page, '#tab-settings .subtab-btn[data-settings-tab="debug"]');
@@ -358,6 +386,19 @@ async function main() {
     assert(filesInterruptedDownload.finalRangeCount >= 2, `Files tab resumed download did not use multiple ranges: ${JSON.stringify(filesInterruptedDownload)}`);
     assert.strictEqual(filesInterruptedDownload.text, genericDownloadText, `Files tab resumed download returned wrong bytes: ${JSON.stringify(filesInterruptedDownload)}`);
     assert.strictEqual(filesInterruptedDownload.size, Buffer.byteLength(genericDownloadText), `Files tab resumed download returned wrong size: ${JSON.stringify(filesInterruptedDownload)}`);
+
+    const reloadDownloadStart = await page.evaluate(`window.intendantDashboardFiles._debugStartInterruptedDownload(${JSON.stringify(genericDownloadPath)}, { chunkBytes: 11 })`);
+    assert.strictEqual(reloadDownloadStart.status, 'failed', `Reload download setup did not fail first: ${JSON.stringify(reloadDownloadStart)}`);
+    assert(reloadDownloadStart.loaded > 0, `Reload download setup did not retain partial bytes: ${JSON.stringify(reloadDownloadStart)}`);
+    assert(reloadDownloadStart.snapshot?.resumeToken, `Reload download setup did not persist resume token: ${JSON.stringify(reloadDownloadStart)}`);
+    await reloadHostedFilesPage('hosted dashboard reconnect after download reload');
+    const reloadDownloadRestored = await page.evaluate(`window.intendantDashboardFiles._debugTransferSnapshot().find(item => item.id === ${JSON.stringify(reloadDownloadStart.transferId)}) || null`);
+    assert(reloadDownloadRestored, `Reload download transfer was not restored: ${JSON.stringify(reloadDownloadStart)}`);
+    assert.strictEqual(reloadDownloadRestored.resumeToken, reloadDownloadStart.snapshot.resumeToken, `Reload download resume token changed: ${JSON.stringify(reloadDownloadRestored)}`);
+    assert(reloadDownloadRestored.loaded > 0, `Reload download restored without partial progress: ${JSON.stringify(reloadDownloadRestored)}`);
+    const reloadDownloadResumed = await page.evaluate(`window.intendantDashboardFiles._debugResumeTransfer(${JSON.stringify(reloadDownloadStart.transferId)})`);
+    assert.strictEqual(reloadDownloadResumed.status, 'completed', `Reload download did not complete after resume: ${JSON.stringify(reloadDownloadResumed)}`);
+    assert.strictEqual(reloadDownloadResumed.rawText, genericDownloadText, `Reload download resume returned wrong bytes: ${JSON.stringify(reloadDownloadResumed)}`);
 
     await click(page, '.tab-btn[data-tab="terminal"]');
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="tui"]');
@@ -533,6 +574,32 @@ async function main() {
     assert.strictEqual(filesUploadProbe.rawText, uploadRawText, `Files tab upload raw read returned wrong bytes: ${JSON.stringify(filesUploadProbe)}`);
     assert(filesUploadProbe.rawRangeCount >= 2, `Files tab upload raw read did not use multiple ranges: ${JSON.stringify(filesUploadProbe)}`);
     assert(filesUploadProbe.statusText.includes('Uploaded'), `Files tab upload did not render completion status: ${JSON.stringify(filesUploadProbe)}`);
+
+    const filesystemUploadText = 'connect filesystem upload fixture';
+    const filesystemUploadPath = path.join(tmp, 'connect-filesystem-upload.txt');
+    const filesystemUploadProbe = await page.evaluate(`window.intendantDashboardFiles._debugProbeFilesystemUploadText(${JSON.stringify(filesystemUploadText)}, { destination: ${JSON.stringify(filesystemUploadPath)}, name: 'connect-filesystem-upload.txt', chunkBytes: 9 })`);
+    assert.strictEqual(filesystemUploadProbe.rawText, filesystemUploadText, `Files tab filesystem upload readback mismatch: ${JSON.stringify(filesystemUploadProbe)}`);
+    assert.strictEqual(filesystemUploadProbe.transferStatus, 'completed', `Files tab filesystem upload did not complete: ${JSON.stringify(filesystemUploadProbe)}`);
+    assert(filesystemUploadProbe.serverJobId, `Files tab filesystem upload did not keep server job id: ${JSON.stringify(filesystemUploadProbe)}`);
+    assert(filesystemUploadProbe.resumeToken, `Files tab filesystem upload did not keep resume token: ${JSON.stringify(filesystemUploadProbe)}`);
+    assert.strictEqual(fs.readFileSync(filesystemUploadPath, 'utf8'), filesystemUploadText, 'filesystem upload did not commit to daemon path');
+
+    const reloadUploadText = 'connect filesystem upload reload resume fixture';
+    const reloadUploadPath = path.join(tmp, 'connect-filesystem-upload-reload.txt');
+    const reloadUploadStart = await page.evaluate(`window.intendantDashboardFiles._debugStartInterruptedFilesystemUploadText(${JSON.stringify(reloadUploadText)}, { destination: ${JSON.stringify(reloadUploadPath)}, name: 'connect-filesystem-upload-reload.txt', chunkBytes: 9, failAfterChunks: 1 })`);
+    assert.strictEqual(reloadUploadStart.status, 'failed', `Reload upload setup did not fail first: ${JSON.stringify(reloadUploadStart)}`);
+    assert(reloadUploadStart.loaded > 0, `Reload upload setup did not retain partial bytes: ${JSON.stringify(reloadUploadStart)}`);
+    assert(reloadUploadStart.snapshot?.resumeToken, `Reload upload setup did not persist resume token: ${JSON.stringify(reloadUploadStart)}`);
+    assert.strictEqual(fs.existsSync(reloadUploadPath), false, 'interrupted upload committed before resume');
+    await reloadHostedFilesPage('hosted dashboard reconnect after upload reload');
+    const reloadUploadRestored = await page.evaluate(`window.intendantDashboardFiles._debugTransferSnapshot().find(item => item.id === ${JSON.stringify(reloadUploadStart.transferId)}) || null`);
+    assert(reloadUploadRestored, `Reload upload transfer was not restored: ${JSON.stringify(reloadUploadStart)}`);
+    assert.strictEqual(reloadUploadRestored.resumeToken, reloadUploadStart.snapshot.resumeToken, `Reload upload resume token changed: ${JSON.stringify(reloadUploadRestored)}`);
+    assert(reloadUploadRestored.uploadBlobStored, `Reload upload did not preserve local upload blob: ${JSON.stringify(reloadUploadRestored)}`);
+    const reloadUploadResumed = await page.evaluate(`window.intendantDashboardFiles._debugResumeTransfer(${JSON.stringify(reloadUploadStart.transferId)})`);
+    assert.strictEqual(reloadUploadResumed.status, 'completed', `Reload upload did not complete after resume: ${JSON.stringify(reloadUploadResumed)}`);
+    assert.strictEqual(reloadUploadResumed.rawText, reloadUploadText, `Reload upload resume returned wrong bytes: ${JSON.stringify(reloadUploadResumed)}`);
+    assert.strictEqual(fs.readFileSync(reloadUploadPath, 'utf8'), reloadUploadText, 'reload upload did not commit to daemon path');
 
     const revoked = await page.evaluate(`(async () => {
       const daemonId = ${JSON.stringify(options.daemonId)};

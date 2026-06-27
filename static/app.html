@@ -807,6 +807,9 @@ html {
   border-radius: 6px;
   background: var(--surface0);
 }
+.files-transfer-row.server {
+  background: color-mix(in srgb, var(--surface0) 88%, var(--blue) 12%);
+}
 .files-transfer-main,
 .files-staged-main {
   min-width: 0;
@@ -827,6 +830,19 @@ html {
   font-size: 11px;
   line-height: 1.35;
   overflow-wrap: anywhere;
+}
+.files-transfer-meter {
+  height: 5px;
+  margin-top: 7px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--base);
+}
+.files-transfer-meter-fill {
+  width: 0%;
+  height: 100%;
+  border-radius: inherit;
+  background: linear-gradient(90deg, var(--mauve), var(--green));
 }
 .files-transfer-row.running { border-color: rgba(137, 180, 250, 0.55); }
 .files-transfer-row.completed { border-color: rgba(166, 227, 161, 0.45); }
@@ -849,6 +865,38 @@ html {
 .files-upload-actions {
   justify-content: flex-start;
   margin-bottom: 9px;
+}
+.files-upload-config {
+  display: grid;
+  grid-template-columns: minmax(180px, 1fr) auto auto;
+  gap: 8px;
+  margin: 8px 0;
+}
+.files-upload-config input,
+.files-upload-config select {
+  min-height: 30px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--base);
+  color: var(--text);
+  font-size: 12px;
+  padding: 5px 8px;
+}
+.files-upload-dropzone {
+  min-height: 64px;
+  margin-top: 8px;
+  display: grid;
+  place-items: center;
+  border: 1px dashed var(--surface2);
+  border-radius: 6px;
+  background: var(--surface0);
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.files-upload-dropzone.dragover {
+  border-color: var(--blue);
+  color: var(--text);
+  background: color-mix(in srgb, var(--surface0) 82%, var(--blue) 18%);
 }
 .connect-health-badges {
   display: flex;
@@ -8740,6 +8788,9 @@ body.display-fullscreen-open {
   .files-download-row {
     grid-template-columns: 1fr;
   }
+  .files-upload-config {
+    grid-template-columns: 1fr;
+  }
   .files-download-row button {
     width: 100%;
   }
@@ -10469,17 +10520,30 @@ body.display-fullscreen-open {
         <section class="files-tool" aria-labelledby="files-transfers-heading">
           <div class="files-transfer-toolbar">
             <h3 id="files-transfers-heading">Transfers</h3>
-            <button id="files-transfer-clear-btn" type="button" onclick="clearFilesTransferHistory()">Clear finished</button>
+            <div class="files-transfer-actions">
+              <button id="files-transfer-refresh-btn" type="button" onclick="refreshFilesTransferJobs()">Refresh</button>
+              <button id="files-transfer-clear-btn" type="button" onclick="clearFilesTransferHistory()">Clear finished</button>
+            </div>
           </div>
           <div id="files-transfer-list" class="files-transfer-list"></div>
         </section>
         <section class="files-tool" aria-labelledby="files-upload-heading">
           <h3 id="files-upload-heading">Uploads</h3>
           <input id="files-upload-input" class="files-hidden-input" type="file" multiple>
+          <div class="files-upload-config">
+            <input id="files-upload-destination" type="text" autocomplete="off" spellcheck="false" placeholder="/destination/folder-or-file">
+            <button id="files-upload-destination-browse-btn" type="button" onclick="openFilesUploadDestinationPicker()">Browse</button>
+            <select id="files-upload-conflict" aria-label="Upload conflict policy">
+              <option value="fail">Fail on conflict</option>
+              <option value="rename">Rename</option>
+              <option value="overwrite">Overwrite</option>
+            </select>
+          </div>
           <div class="files-upload-actions">
             <button id="files-upload-choose-btn" type="button" onclick="chooseFilesForUpload()">Choose files</button>
             <button id="files-staged-refresh-btn" type="button" onclick="refreshFilesStagedUploads()">Refresh staged</button>
           </div>
+          <div id="files-upload-dropzone" class="files-upload-dropzone">Drop files</div>
           <div id="files-upload-status" class="files-download-status" aria-live="polite"></div>
           <div id="files-staged-list" class="files-staged-list"></div>
         </section>
@@ -11530,6 +11594,10 @@ let filesTransferSeq = 0;
 let filesTransferRunnerActive = false;
 const filesTransfers = [];
 const filesStagedUploads = new Map();
+let filesTransferDbPromise = null;
+const FILES_TRANSFER_STATE_KEY = 'intendant.files.transfers.v2';
+const FILES_TRANSFER_DB_NAME = 'intendant-files-transfers-v2';
+const FILES_TRANSFER_DB_VERSION = 1;
 const DASHBOARD_EVENT_DEDUPE_MS = 2000;
 const DASHBOARD_CONTROL_MAX_CHUNKED_RESPONSE_BYTES = 128 * 1024 * 1024;
 const DASHBOARD_CONTROL_MAX_BYTE_STREAM_BYTES = 128 * 1024 * 1024;
@@ -36405,6 +36473,7 @@ function switchTab(tabId) {
   if (tabId === 'files') {
     refreshFilesDownloadAvailability();
     renderFilesTransfers();
+    refreshFilesTransferJobs();
     renderFilesStagedUploads();
     refreshFilesStagedUploads();
   }
@@ -38304,6 +38373,7 @@ function dashboardUpdateTransportStatus() {
   if (!group || !dot || !label) {
     renderConnectHealthPanel(status, summary);
     refreshFilesDownloadAvailability();
+    if (activeTab === 'files') refreshFilesTransferJobs();
     syncTuiAvailabilityNotice();
     maybeOpenShellAfterTransportReady();
     return;
@@ -38313,6 +38383,7 @@ function dashboardUpdateTransportStatus() {
   group.title = summary.title;
   renderConnectHealthPanel(status, summary);
   refreshFilesDownloadAvailability();
+  if (activeTab === 'files') refreshFilesTransferJobs();
   syncTuiAvailabilityNotice();
   maybeOpenShellAfterTransportReady();
 }
@@ -41180,6 +41251,12 @@ class DashboardControlTransport {
       apiSessionCurrentUploadsAvailable: this.lastStatus?.api_session_current_uploads_available ?? null,
       apiSessionCurrentUploadRawAvailable: this.lastStatus?.api_session_current_upload_raw_available ?? null,
       apiSessionCurrentUploadDeleteAvailable: this.lastStatus?.api_session_current_upload_delete_available ?? null,
+      apiTransferJobsAvailable: this.lastStatus?.api_transfer_jobs_available ?? null,
+      apiTransferJobCreateAvailable: this.lastStatus?.api_transfer_job_create_available ?? null,
+      apiTransferJobDeleteAvailable: this.lastStatus?.api_transfer_job_delete_available ?? null,
+      apiTransferDownloadReadAvailable: this.lastStatus?.api_transfer_download_read_available ?? null,
+      apiTransferUploadChunkAvailable: this.lastStatus?.api_transfer_upload_chunk_available ?? null,
+      apiTransferUploadCommitAvailable: this.lastStatus?.api_transfer_upload_commit_available ?? null,
       apiMediaEditorAvailable: this.lastStatus?.api_media_editor_available ?? null,
       apiMediaAnnotationAttachAvailable: this.lastStatus?.api_media_annotation_attach_available ?? null,
       apiMediaAnnotationSubmitAvailable: this.lastStatus?.api_media_annotation_submit_available ?? null,
@@ -41274,6 +41351,12 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_worktrees_remove':
     case 'api_fs_mkdir':
     case 'api_fs_read':
+    case 'api_transfer_jobs':
+    case 'api_transfer_job_create':
+    case 'api_transfer_job_delete':
+    case 'api_transfer_download_read':
+    case 'api_transfer_upload_chunk':
+    case 'api_transfer_upload_commit':
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
@@ -41464,6 +41547,7 @@ function dashboardByteStreamMethodAvailable(method) {
   const status = dashboardControlTransport?.lastStatus || {};
   const field = {
     api_fs_read: 'api_fs_read_available',
+    api_transfer_download_read: 'api_transfer_download_read_available',
     api_recording_asset: 'api_recording_asset_available',
     api_session_recording_asset: 'api_session_recording_asset_available',
     api_session_frame_asset: 'api_session_frame_asset_available',
@@ -41476,6 +41560,25 @@ function dashboardByteStreamMethodAvailable(method) {
     dashboardTransport.canUseRpc() &&
     status.byte_streams_available === true &&
     (!field || status[field] === true)
+  );
+}
+
+function dashboardTransferDownloadAvailable() {
+  const status = dashboardControlTransport?.lastStatus || {};
+  return dashboardByteStreamMethodAvailable('api_transfer_download_read') &&
+    status.api_transfer_job_create_available === true;
+}
+
+function dashboardTransferUploadAvailable() {
+  const status = dashboardControlTransport?.lastStatus || {};
+  return Boolean(
+    dashboardTransport &&
+    dashboardTransport.canUseRpc &&
+    dashboardTransport.canUseRpc() &&
+    status.upload_frames_available === true &&
+    status.api_transfer_job_create_available === true &&
+    status.api_transfer_upload_chunk_available === true &&
+    status.api_transfer_upload_commit_available === true
   );
 }
 
@@ -41551,6 +41654,7 @@ function dashboardNormalizeByteRangeResult(method, result, expectedOffset) {
     totalSize: declaredTotal,
     filename: result?.filename ? String(result.filename) : '',
     contentType: result?.content_type ? String(result.content_type) : '',
+    job: result?.job && typeof result.job === 'object' ? result.job : null,
   };
 }
 
@@ -46678,6 +46782,29 @@ document.getElementById('files-upload-input')?.addEventListener('change', ev => 
   queueFilesUploads(files);
   ev.target.value = '';
 });
+document.getElementById('files-upload-destination')?.addEventListener('input', () => {
+  const input = document.getElementById('files-upload-destination');
+  if (input) input.title = input.value || '';
+});
+{
+  const dropzone = document.getElementById('files-upload-dropzone');
+  if (dropzone) {
+    dropzone.addEventListener('dragover', ev => {
+      ev.preventDefault();
+      dropzone.classList.add('dragover');
+      if (ev.dataTransfer) ev.dataTransfer.dropEffect = 'copy';
+    });
+    dropzone.addEventListener('dragleave', () => {
+      dropzone.classList.remove('dragover');
+    });
+    dropzone.addEventListener('drop', ev => {
+      ev.preventDefault();
+      dropzone.classList.remove('dragover');
+      const files = Array.from(ev.dataTransfer?.files || []);
+      queueFilesUploads(files);
+    });
+  }
+}
 
 // External agent dropdown is applied on Save click alongside other settings,
 // not on change — matches the rest of the Settings tab UX.
@@ -48877,6 +49004,251 @@ function filesDownloadPathValue() {
   return document.getElementById('files-download-path')?.value.trim() || '';
 }
 
+function filesUploadDestinationValue() {
+  return document.getElementById('files-upload-destination')?.value.trim() || '';
+}
+
+function filesUploadConflictPolicy() {
+  const value = document.getElementById('files-upload-conflict')?.value || 'fail';
+  return ['fail', 'rename', 'overwrite'].includes(value) ? value : 'fail';
+}
+
+function filesDownloadTunnelAvailable() {
+  return dashboardTransferDownloadAvailable() || dashboardByteStreamMethodAvailable('api_fs_read');
+}
+
+function filesTransferDb() {
+  if (!('indexedDB' in window)) return Promise.reject(new Error('IndexedDB is not available'));
+  if (filesTransferDbPromise) return filesTransferDbPromise;
+  filesTransferDbPromise = new Promise((resolve, reject) => {
+    const req = indexedDB.open(FILES_TRANSFER_DB_NAME, FILES_TRANSFER_DB_VERSION);
+    req.onupgradeneeded = () => {
+      const db = req.result;
+      if (!db.objectStoreNames.contains('downloadParts')) db.createObjectStore('downloadParts', { keyPath: 'key' });
+      if (!db.objectStoreNames.contains('uploadBlobs')) db.createObjectStore('uploadBlobs', { keyPath: 'id' });
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('open transfer database failed'));
+    req.onblocked = () => reject(new Error('transfer database upgrade blocked'));
+  }).catch(err => {
+    filesTransferDbPromise = null;
+    throw err;
+  });
+  return filesTransferDbPromise;
+}
+
+async function filesTransferStorePut(storeName, value) {
+  const db = await filesTransferDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).put(value);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error(`write ${storeName} failed`));
+  });
+}
+
+async function filesTransferStoreGet(storeName, key) {
+  const db = await filesTransferDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readonly');
+    const req = tx.objectStore(storeName).get(key);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error(`read ${storeName} failed`));
+  });
+}
+
+async function filesTransferStoreDelete(storeName, key) {
+  const db = await filesTransferDb();
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(storeName, 'readwrite');
+    tx.objectStore(storeName).delete(key);
+    tx.oncomplete = () => resolve(true);
+    tx.onerror = () => reject(tx.error || new Error(`delete ${storeName} failed`));
+  });
+}
+
+function filesTransferPartKey(id, seq) {
+  return `${String(id || '')}:${Number(seq) || 0}`;
+}
+
+async function filesTransferPutDownloadPart(transfer, seq, bytes) {
+  if (!transfer?.id || !(bytes instanceof Uint8Array)) return false;
+  try {
+    await filesTransferStorePut('downloadParts', {
+      key: filesTransferPartKey(transfer.id, seq),
+      transferId: transfer.id,
+      seq,
+      bytes,
+      createdAt: Date.now(),
+    });
+    return true;
+  } catch (err) {
+    console.warn('Persist download part failed:', err);
+    return false;
+  }
+}
+
+async function filesTransferLoadDownloadParts(transfer) {
+  if (!transfer?.id || !Number(transfer.rangeCount || 0)) return false;
+  const parts = [];
+  let loaded = 0;
+  try {
+    for (let seq = 0; seq < Number(transfer.rangeCount || 0); seq += 1) {
+      const record = await filesTransferStoreGet('downloadParts', filesTransferPartKey(transfer.id, seq));
+      if (!record?.bytes) return false;
+      const bytes = record.bytes instanceof Uint8Array ? record.bytes : new Uint8Array(record.bytes);
+      parts.push(bytes);
+      loaded += bytes.byteLength;
+    }
+    transfer.parts = parts;
+    transfer.loaded = loaded;
+    return true;
+  } catch (err) {
+    console.warn('Load download parts failed:', err);
+    return false;
+  }
+}
+
+async function filesTransferDeleteDownloadParts(id, count = 512) {
+  if (!id) return;
+  for (let seq = 0; seq < count; seq += 1) {
+    try {
+      await filesTransferStoreDelete('downloadParts', filesTransferPartKey(id, seq));
+    } catch (_) {
+      break;
+    }
+  }
+}
+
+async function filesTransferPutUploadBlob(transfer, file) {
+  if (!transfer?.id || !(file instanceof Blob)) return false;
+  try {
+    await filesTransferStorePut('uploadBlobs', {
+      id: transfer.id,
+      blob: file,
+      name: file.name || transfer.name || 'upload.bin',
+      type: file.type || transfer.mime || 'application/octet-stream',
+      size: Number(file.size || 0),
+      createdAt: Date.now(),
+    });
+    transfer.uploadBlobStored = true;
+    filesTransferPersistState();
+    return true;
+  } catch (err) {
+    console.warn('Persist upload blob failed:', err);
+    return false;
+  }
+}
+
+async function filesTransferGetUploadBlob(transfer) {
+  if (transfer?.file instanceof Blob) return transfer.file;
+  if (!transfer?.id) return null;
+  try {
+    const record = await filesTransferStoreGet('uploadBlobs', transfer.id);
+    if (!record?.blob) return null;
+    const blob = record.blob;
+    transfer.file = blob;
+    transfer.name = record.name || transfer.name || 'upload.bin';
+    transfer.mime = record.type || transfer.mime || blob.type || 'application/octet-stream';
+    transfer.totalSize = Number(record.size || blob.size || transfer.totalSize || 0);
+    return blob;
+  } catch (err) {
+    console.warn('Load upload blob failed:', err);
+    return null;
+  }
+}
+
+async function filesTransferDeleteUploadBlob(id) {
+  if (!id) return;
+  try {
+    await filesTransferStoreDelete('uploadBlobs', id);
+  } catch (_) {}
+}
+
+function filesTransferPersistable(transfer) {
+  if (!transfer?.id) return null;
+  if (transfer.kind === 'upload' && transfer.status === 'completed') return null;
+  if (transfer.status === 'cancelled') return null;
+  return {
+    id: transfer.id,
+    kind: transfer.kind,
+    status: ['running', 'queued'].includes(transfer.status) ? 'paused' : (transfer.status || 'queued'),
+    path: transfer.path || '',
+    name: transfer.name || transfer.file?.name || transfer.filename || '',
+    destination: transfer.destination || '',
+    conflictPolicy: transfer.conflictPolicy || 'fail',
+    loaded: Number(transfer.loaded || 0),
+    totalSize: Number(transfer.totalSize || transfer.file?.size || 0),
+    rangeCount: Number(transfer.rangeCount || 0),
+    filename: transfer.filename || '',
+    contentType: transfer.contentType || transfer.mime || 'application/octet-stream',
+    chunkBytes: Number(transfer.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES),
+    maxBytes: Number(transfer.maxBytes || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES),
+    skipBrowserSave: Boolean(transfer.skipBrowserSave),
+    serverJobId: transfer.serverJobId || transfer.serverJob?.id || '',
+    resumeToken: transfer.resumeToken || transfer.serverJob?.resume_token || '',
+    serverJob: transfer.serverJob || null,
+    uploadBlobStored: Boolean(transfer.uploadBlobStored || transfer.file instanceof Blob),
+    uploadChunkCount: Number(transfer.uploadChunkCount || 0),
+    error: transfer.error || '',
+  };
+}
+
+function filesTransferPersistState() {
+  try {
+    const state = filesTransfers
+      .map(filesTransferPersistable)
+      .filter(Boolean)
+      .slice(0, 50);
+    localStorage.setItem(FILES_TRANSFER_STATE_KEY, JSON.stringify(state));
+  } catch (err) {
+    console.warn('Persist transfer state failed:', err);
+  }
+}
+
+function restoreFilesTransferState() {
+  let state = [];
+  try {
+    state = JSON.parse(localStorage.getItem(FILES_TRANSFER_STATE_KEY) || '[]');
+  } catch (_) {
+    state = [];
+  }
+  if (!Array.isArray(state)) return;
+  for (const item of state) {
+    if (!item?.id || filesTransferById(item.id)) continue;
+    const transfer = {
+      id: String(item.id),
+      kind: item.kind === 'upload' ? 'upload' : 'download',
+      status: item.status || 'paused',
+      path: item.path || '',
+      name: item.name || '',
+      destination: item.destination || '',
+      conflictPolicy: item.conflictPolicy || 'fail',
+      loaded: Number(item.loaded || 0),
+      totalSize: Number(item.totalSize || 0),
+      parts: [],
+      rangeCount: Number(item.rangeCount || 0),
+      filename: item.filename || item.name || '',
+      contentType: item.contentType || 'application/octet-stream',
+      chunkBytes: Math.max(1, Number(item.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)),
+      maxBytes: Math.max(1, Number(item.maxBytes || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES)),
+      skipBrowserSave: Boolean(item.skipBrowserSave),
+      serverJobId: item.serverJobId || item.serverJob?.id || '',
+      resumeToken: item.resumeToken || item.serverJob?.resume_token || '',
+      serverJob: item.serverJob || null,
+      uploadBlobStored: Boolean(item.uploadBlobStored),
+      uploadChunkCount: Number(item.uploadChunkCount || 0),
+      result: null,
+      error: item.error || '',
+      pauseRequested: false,
+      cancelRequested: false,
+      abortController: null,
+    };
+    filesTransferCompletion(transfer);
+    filesTransfers.push(transfer);
+  }
+}
+
 function filesTransferById(id) {
   const key = String(id || '').trim();
   return filesTransfers.find(transfer => transfer.id === key) || null;
@@ -48915,7 +49287,7 @@ function setFilesDownloadBusy(busy) {
   const hasPath = !!filesDownloadPathValue();
   if (input) input.disabled = !!busy;
   if (browse) browse.disabled = !!busy;
-  if (download) download.disabled = !!busy || !hasPath || !dashboardByteStreamMethodAvailable('api_fs_read');
+  if (download) download.disabled = !!busy || !hasPath || !filesDownloadTunnelAvailable();
 }
 
 function refreshFilesDownloadAvailability() {
@@ -48923,7 +49295,7 @@ function refreshFilesDownloadAvailability() {
     setFilesDownloadBusy(true);
     return;
   }
-  const available = dashboardByteStreamMethodAvailable('api_fs_read');
+  const available = filesDownloadTunnelAvailable();
   setFilesDownloadBusy(false);
   const statusEl = document.getElementById('files-download-status');
   if (!available && statusEl && !statusEl.textContent) {
@@ -48936,7 +49308,7 @@ function refreshFilesDownloadAvailability() {
 async function fetchDashboardFilesystemDownload(path, options = {}) {
   const target = String(path || '').trim();
   if (!target) throw new Error('Choose a file to download');
-  if (!dashboardByteStreamMethodAvailable('api_fs_read')) {
+  if (!filesDownloadTunnelAvailable()) {
     throw new Error('File download requires the Connect dashboard tunnel');
   }
   return dashboardFetchRangedBytes('api_fs_read', { path: target }, {
@@ -48977,10 +49349,101 @@ function filesTransferStatusLabel(status) {
     queued: 'queued',
     running: 'running',
     paused: 'paused',
+    ready: 'ready',
     completed: 'done',
     failed: 'failed',
     cancelled: 'cancelled',
   }[status] || status || 'queued';
+}
+
+function filesTransferStatusFromJob(job) {
+  const status = String(job?.status || 'queued');
+  if (status === 'ready') return 'ready';
+  return ['queued', 'running', 'paused', 'completed', 'failed', 'cancelled'].includes(status)
+    ? status
+    : 'queued';
+}
+
+function filesTransferKindFromJob(job) {
+  return String(job?.kind || '').toLowerCase() === 'upload' ? 'upload' : 'download';
+}
+
+function filesTransferPathText(value) {
+  if (typeof value === 'string') return value;
+  if (value == null) return '';
+  return String(value);
+}
+
+function filesTransferMergeServerJob(job) {
+  if (!job || typeof job !== 'object') return null;
+  const jobId = String(job.id || '').trim();
+  const resumeToken = String(job.resume_token || '').trim();
+  const existing = filesTransfers.find(item =>
+    (jobId && (item.serverJobId === jobId || item.id === jobId)) ||
+    (resumeToken && item.resumeToken === resumeToken)
+  );
+  const kind = filesTransferKindFromJob(job);
+  const source = filesTransferPathText(job.source_path);
+  const destination = filesTransferPathText(job.destination_path || job.final_path);
+  const transfer = existing || {
+    id: `server-${jobId || resumeToken || Date.now()}`,
+    kind,
+    status: filesTransferStatusFromJob(job),
+    path: source,
+    name: job.original_name || job.filename || '',
+    destination,
+    conflictPolicy: job.conflict_policy || 'fail',
+    loaded: 0,
+    totalSize: 0,
+    parts: [],
+    rangeCount: 0,
+    filename: job.filename || '',
+    contentType: job.mime || 'application/octet-stream',
+    chunkBytes: DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+    maxBytes: DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES,
+    result: null,
+    error: '',
+    pauseRequested: false,
+    cancelRequested: false,
+    abortController: null,
+  };
+  transfer.kind = kind;
+  if (!existing || !['queued', 'running', 'paused', 'failed'].includes(existing.status || '')) {
+    transfer.status = filesTransferStatusFromJob(job);
+  }
+  transfer.path = transfer.path || source;
+  transfer.destination = transfer.destination || destination;
+  transfer.filename = transfer.filename || job.filename || '';
+  transfer.contentType = transfer.contentType || job.mime || 'application/octet-stream';
+  transfer.name = transfer.name || job.original_name || job.filename || '';
+  transfer.error = job.error || transfer.error || '';
+  filesTransferApplyServerJob(transfer, job);
+  if (!existing) {
+    filesTransferCompletion(transfer);
+    filesTransfers.unshift(transfer);
+  }
+  return transfer;
+}
+
+async function refreshFilesTransferJobs() {
+  if (dashboardControlTransport?.lastStatus?.api_transfer_jobs_available !== true) {
+    renderFilesTransfers();
+    return [];
+  }
+  try {
+    const result = await dashboardTransport.request('api_transfer_jobs', {}, { timeoutMs: 60000 });
+    if (result?.ok === false || result?._httpOk === false) {
+      throw new Error(result.error || `transfer jobs returned ${result._httpStatus || 'error'}`);
+    }
+    const jobs = Array.isArray(result.jobs) ? result.jobs : [];
+    for (const job of jobs) filesTransferMergeServerJob(job);
+    filesTransferPersistState();
+    renderFilesTransfers();
+    return jobs;
+  } catch (err) {
+    console.warn('Refresh transfer jobs failed:', err);
+    return [];
+  }
 }
 
 function renderFilesTransfers() {
@@ -48996,7 +49459,7 @@ function renderFilesTransfers() {
   }
   for (const transfer of filesTransfers) {
     const row = document.createElement('div');
-    row.className = `files-transfer-row ${transfer.status || 'queued'}`;
+    row.className = `files-transfer-row ${transfer.status || 'queued'}${transfer.serverJobId || transfer.resumeToken ? ' server' : ''}`;
     row.dataset.transferId = transfer.id;
     const main = document.createElement('div');
     main.className = 'files-transfer-main';
@@ -49011,8 +49474,18 @@ function renderFilesTransfers() {
       ? ` · ${transfer.rangeCount} range${transfer.rangeCount === 1 ? '' : 's'}`
       : '';
     const error = transfer.error ? ` · ${transfer.error}` : '';
-    meta.textContent = `${direction} · ${filesTransferStatusLabel(transfer.status)} · ${filesTransferProgressText(transfer)}${range}${error}`;
-    main.append(title, meta);
+    const destination = transfer.kind === 'upload' && transfer.destination ? ` · ${transfer.destination}` : '';
+    const source = transfer.kind === 'download' && transfer.path ? ` · ${transfer.path}` : '';
+    meta.textContent = `${direction} · ${filesTransferStatusLabel(transfer.status)} · ${filesTransferProgressText(transfer)}${range}${destination}${source}${error}`;
+    const meter = document.createElement('div');
+    meter.className = 'files-transfer-meter';
+    const fill = document.createElement('div');
+    fill.className = 'files-transfer-meter-fill';
+    const total = Number(transfer.totalSize || transfer.file?.size || 0);
+    const loaded = Number(transfer.loaded || 0);
+    fill.style.width = total > 0 ? `${Math.max(0, Math.min(100, loaded * 100 / total))}%` : '0%';
+    meter.appendChild(fill);
+    main.append(title, meta, meter);
     const actions = document.createElement('div');
     actions.className = 'files-transfer-actions';
     const addAction = (label, handler, className = '') => {
@@ -49023,14 +49496,17 @@ function renderFilesTransfers() {
       btn.addEventListener('click', () => handler(transfer.id));
       actions.appendChild(btn);
     };
+    const canResumeUpload = transfer.kind !== 'upload' || transfer.file || transfer.uploadBlobStored;
     if (transfer.status === 'running' && transfer.kind === 'download') addAction('Pause', pauseFilesTransfer);
     if (transfer.status === 'running') addAction('Cancel', cancelFilesTransfer, 'danger');
     if (transfer.status === 'queued') addAction('Cancel', cancelFilesTransfer, 'danger');
-    if (transfer.status === 'paused') addAction('Resume', resumeFilesTransfer);
+    if (transfer.status === 'paused' && canResumeUpload) addAction('Resume', resumeFilesTransfer);
     if (transfer.status === 'failed' && transfer.kind === 'download' && transfer.loaded > 0) addAction('Resume', resumeFilesTransfer);
     if (['failed', 'cancelled'].includes(transfer.status)) addAction('Retry', retryFilesTransfer);
     if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.result?.blob) {
       addAction('Save', () => downloadDashboardBlob(transfer.result.blob, transfer.result.filename, transfer.result.content_type));
+    } else if (transfer.status === 'completed' && transfer.kind === 'download' && transfer.rangeCount > 0) {
+      addAction('Save', saveCompletedFilesDownload);
     }
     row.append(main, actions);
     list.appendChild(row);
@@ -49052,6 +49528,7 @@ function filesUpdateActiveDownloadSummary(transfer = null) {
 function queueFilesTransfer(transfer) {
   filesTransferCompletion(transfer);
   filesTransfers.unshift(transfer);
+  filesTransferPersistState();
   renderFilesTransfers();
   pumpFilesTransfers();
   return transfer;
@@ -49079,11 +49556,11 @@ function queueFilesDownload(path, options = {}) {
     contentType: 'application/octet-stream',
     chunkBytes: Math.max(1, Math.floor(Number(options.chunkBytes) || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)),
     maxBytes: Math.max(1, Math.floor(Number(options.maxBytes) || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES)),
-	    retries: options.retries,
-	    timeoutMs: options.timeoutMs,
-	    onProgress: typeof options.onProgress === 'function' ? options.onProgress : null,
-	    skipBrowserSave: !!options.skipBrowserSave,
-	    debugFailAfterRanges: Math.max(0, Math.floor(Number(options.debugFailAfterRanges || options.failAfterRanges) || 0)),
+    retries: options.retries,
+    timeoutMs: options.timeoutMs,
+    onProgress: typeof options.onProgress === 'function' ? options.onProgress : null,
+    skipBrowserSave: !!options.skipBrowserSave,
+    debugFailAfterRanges: Math.max(0, Math.floor(Number(options.debugFailAfterRanges || options.failAfterRanges) || 0)),
     debugFailedOnce: false,
     result: null,
     error: '',
@@ -49107,10 +49584,36 @@ function resetFilesDownloadTransfer(transfer) {
   transfer.cancelRequested = false;
   transfer.abortController = null;
   transfer.debugFailedOnce = false;
+  filesTransferDeleteDownloadParts(transfer.id, 512);
+  filesTransferPersistState();
+}
+
+function filesTransferApplyServerJob(transfer, job) {
+  if (!transfer || !job || typeof job !== 'object') return;
+  transfer.serverJob = job;
+  transfer.serverJobId = String(job.id || transfer.serverJobId || '');
+  transfer.resumeToken = String(job.resume_token || transfer.resumeToken || '');
+  if (job.status) transfer.serverStatus = String(job.status);
+  if (job.total_size != null) transfer.totalSize = Number(job.total_size) || transfer.totalSize || 0;
+  if (job.completed_bytes != null) transfer.loaded = Math.max(Number(transfer.loaded || 0), Number(job.completed_bytes || 0));
+  if (job.filename && !transfer.filename) transfer.filename = String(job.filename);
+  if (job.mime && !transfer.contentType) transfer.contentType = String(job.mime);
+  if (job.source_path && !transfer.path) transfer.path = String(job.source_path);
+  if (job.destination_path && !transfer.destination) transfer.destination = String(job.destination_path);
+  for (let i = filesTransfers.length - 1; i >= 0; i -= 1) {
+    const other = filesTransfers[i];
+    if (other === transfer) continue;
+    const sameJob = transfer.serverJobId && other.serverJobId === transfer.serverJobId;
+    const sameToken = transfer.resumeToken && other.resumeToken === transfer.resumeToken;
+    if (sameJob || sameToken) {
+      filesTransfers.splice(i, 1);
+    }
+  }
 }
 
 async function runFilesDownloadTransfer(transfer) {
-  if (!dashboardByteStreamMethodAvailable('api_fs_read')) {
+  const useDurableTransfer = dashboardTransferDownloadAvailable();
+  if (!useDurableTransfer && !dashboardByteStreamMethodAvailable('api_fs_read')) {
     throw new Error('File download requires the Connect dashboard tunnel');
   }
   transfer.status = 'running';
@@ -49123,43 +49626,73 @@ async function runFilesDownloadTransfer(transfer) {
   renderFilesTransfers();
   filesUpdateActiveDownloadSummary(transfer);
   try {
+    if (transfer.loaded > 0 && (!Array.isArray(transfer.parts) || transfer.parts.length === 0)) {
+      const hydrated = await filesTransferLoadDownloadParts(transfer);
+      if (!hydrated) resetFilesDownloadTransfer(transfer);
+    }
+    if (useDurableTransfer && !transfer.resumeToken && !transfer.serverJobId) {
+      const created = await dashboardTransport.request('api_transfer_job_create', {
+        kind: 'download',
+        path: transfer.path,
+      }, {
+        timeoutMs: transfer.timeoutMs || 120000,
+        signal: controller.signal,
+      });
+      if (created?.ok === false || created?._httpOk === false) {
+        throw new Error(created.error || `transfer create returned ${created._httpStatus || 'error'}`);
+      }
+      filesTransferApplyServerJob(transfer, created.job);
+      filesTransferPersistState();
+    }
     for (;;) {
       if (transfer.pauseRequested) throw dashboardControlAbortError('download paused');
       if (transfer.cancelRequested) throw dashboardControlAbortError('download cancelled');
       const remaining = transfer.totalSize > 0 ? Math.max(0, transfer.totalSize - transfer.loaded) : transfer.chunkBytes;
       const requested = Math.min(transfer.chunkBytes, remaining || transfer.chunkBytes);
       if (requested <= 0) break;
-      const result = await dashboardRequestBytesWithRetry('api_fs_read', {
-        path: transfer.path,
-        offset: transfer.loaded,
-        length: requested,
-      }, {
+      const method = useDurableTransfer ? 'api_transfer_download_read' : 'api_fs_read';
+      const params = useDurableTransfer
+        ? {
+            id: transfer.serverJobId || undefined,
+            resume_token: transfer.resumeToken || undefined,
+            offset: transfer.loaded,
+            length: requested,
+          }
+        : {
+            path: transfer.path,
+            offset: transfer.loaded,
+            length: requested,
+          };
+      const result = await dashboardRequestBytesWithRetry(method, params, {
         signal: controller.signal,
         retries: transfer.retries,
         timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
       });
-      const range = dashboardNormalizeByteRangeResult('api_fs_read', result, transfer.loaded);
+      const range = dashboardNormalizeByteRangeResult(method, result, transfer.loaded);
+      if (range.job) filesTransferApplyServerJob(transfer, range.job);
       transfer.totalSize = range.totalSize;
       if (transfer.totalSize > transfer.maxBytes) {
         throw new Error(`Download too large (${humanBytes(transfer.totalSize)}; cap is ${humanBytes(transfer.maxBytes)})`);
       }
       if (!transfer.filename && range.filename) transfer.filename = range.filename;
       if (range.contentType) transfer.contentType = range.contentType;
+      await filesTransferPutDownloadPart(transfer, transfer.rangeCount, range.bytes);
       transfer.parts.push(range.bytes);
-	      transfer.loaded = range.rangeEnd;
-	      transfer.rangeCount += 1;
-	      if (typeof transfer.onProgress === 'function') {
-	        transfer.onProgress({
-	          loaded: transfer.loaded,
-	          total: transfer.totalSize,
-	          offset: transfer.loaded,
-	          rangeCount: transfer.rangeCount,
-	          filename: transfer.filename,
-	          contentType: transfer.contentType,
-	        });
-	      }
-	      renderFilesTransfers();
-	      filesUpdateActiveDownloadSummary(transfer);
+      transfer.loaded = range.rangeEnd;
+      transfer.rangeCount += 1;
+      filesTransferPersistState();
+      if (typeof transfer.onProgress === 'function') {
+        transfer.onProgress({
+          loaded: transfer.loaded,
+          total: transfer.totalSize,
+          offset: transfer.loaded,
+          rangeCount: transfer.rangeCount,
+          filename: transfer.filename,
+          contentType: transfer.contentType,
+        });
+      }
+      renderFilesTransfers();
+      filesUpdateActiveDownloadSummary(transfer);
       if (
         transfer.debugFailAfterRanges > 0 &&
         !transfer.debugFailedOnce &&
@@ -49186,6 +49719,7 @@ async function runFilesDownloadTransfer(transfer) {
     };
     transfer.result = result;
     transfer.status = 'completed';
+    filesTransferPersistState();
     setFilesDownloadProgress(result.size, result.total_size || result.size);
     setFilesDownloadStatus('ok', `Downloaded ${result.filename} (${humanBytes(result.size)})`);
     if (!transfer.skipBrowserSave) downloadDashboardBlob(result.blob, result.filename, result.content_type);
@@ -49195,16 +49729,19 @@ async function runFilesDownloadTransfer(transfer) {
     if (transfer.cancelRequested) {
       transfer.status = 'cancelled';
       transfer.error = '';
+      filesTransferPersistState();
       transfer.reject?.(err);
       setFilesDownloadStatus('warn', 'Download cancelled');
     } else if (transfer.pauseRequested || err?.name === 'AbortError') {
       transfer.status = 'paused';
       transfer.error = '';
+      filesTransferPersistState();
       transfer.reject?.(err);
       setFilesDownloadStatus('warn', `Paused at ${filesTransferProgressText(transfer)}`);
     } else {
       transfer.status = 'failed';
       transfer.error = message;
+      filesTransferPersistState();
       transfer.reject?.(err);
       setFilesDownloadStatus('error', message);
       if (typeof showControlToast === 'function') showControlToast('error', message);
@@ -49217,41 +49754,145 @@ async function runFilesDownloadTransfer(transfer) {
   }
 }
 
-async function runFilesUploadTransfer(transfer) {
-  if (!dashboardUploadRpcAvailable()) {
-    throw new Error('Upload requires the Connect dashboard upload tunnel');
+async function runFilesFilesystemUploadTransfer(transfer, controller) {
+  if (!dashboardTransferUploadAvailable()) {
+    throw new Error('Filesystem upload requires the durable transfer tunnel');
   }
-  if (!transfer.file) throw new Error('missing upload file');
-  if (transfer.file.size > UPLOAD_MAX_BYTES) {
-    throw new Error(`File too large (${humanBytes(transfer.file.size)}; cap is ${humanBytes(UPLOAD_MAX_BYTES)})`);
+  const file = await filesTransferGetUploadBlob(transfer);
+  if (!(file instanceof Blob)) {
+    throw new Error('Upload file is unavailable after reload');
+  }
+  if (file.size > UPLOAD_MAX_BYTES) {
+    throw new Error(`File too large (${humanBytes(file.size)}; cap is ${humanBytes(UPLOAD_MAX_BYTES)})`);
+  }
+  transfer.totalSize = Number(file.size || 0);
+  transfer.loaded = Number(transfer.loaded || 0);
+  transfer.mime = transfer.mime || file.type || 'application/octet-stream';
+  transfer.name = transfer.name || file.name || 'upload.bin';
+  if (!transfer.resumeToken && !transfer.serverJobId) {
+    const created = await dashboardTransport.request('api_transfer_job_create', {
+      kind: 'upload',
+      destination: transfer.destination,
+      name: transfer.name,
+      mime: transfer.mime,
+      total_size: transfer.totalSize,
+      conflict: transfer.conflictPolicy || 'fail',
+    }, {
+      timeoutMs: transfer.timeoutMs || 120000,
+      signal: controller.signal,
+    });
+    if (created?.ok === false || created?._httpOk === false) {
+      throw new Error(created.error || `transfer create returned ${created._httpStatus || 'error'}`);
+    }
+    filesTransferApplyServerJob(transfer, created.job);
+    filesTransferPersistState();
+  }
+  const chunkBytes = Math.max(1, Math.floor(Number(transfer.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)));
+  while (transfer.loaded < transfer.totalSize) {
+    if (transfer.pauseRequested) throw dashboardControlAbortError('upload paused');
+    if (transfer.cancelRequested) throw dashboardControlAbortError('upload cancelled');
+    const offset = Number(transfer.loaded || 0);
+    const end = Math.min(offset + chunkBytes, transfer.totalSize);
+    const chunk = file.slice(offset, end);
+    const result = await dashboardTransport.uploadBytes('api_transfer_upload_chunk', {
+      id: transfer.serverJobId || undefined,
+      resume_token: transfer.resumeToken || undefined,
+      offset,
+    }, chunk, {
+      timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(chunk.size || chunkBytes),
+      signal: controller.signal,
+    });
+    if (result?.ok === false || result?._httpOk === false) {
+      throw new Error(result.error || `upload chunk returned ${result._httpStatus || 'error'}`);
+    }
+    filesTransferApplyServerJob(transfer, result.job);
+    transfer.loaded = Math.max(Number(transfer.loaded || 0), end);
+    transfer.uploadChunkCount = Number(transfer.uploadChunkCount || 0) + 1;
+    filesTransferPersistState();
+    renderFilesTransfers();
+    setFilesUploadStatus('warn', `Uploading ${filesTransferProgressText(transfer)}`);
+    if (
+      transfer.debugFailAfterChunks > 0 &&
+      !transfer.debugFailedOnce &&
+      transfer.uploadChunkCount >= transfer.debugFailAfterChunks
+    ) {
+      transfer.debugFailedOnce = true;
+      throw new Error('synthetic upload interruption');
+    }
+  }
+  const committed = await dashboardTransport.request('api_transfer_upload_commit', {
+    id: transfer.serverJobId || undefined,
+    resume_token: transfer.resumeToken || undefined,
+  }, {
+    timeoutMs: transfer.timeoutMs || 120000,
+    signal: controller.signal,
+  });
+  if (committed?.ok === false || committed?._httpOk === false) {
+    throw new Error(committed.error || `upload commit returned ${committed._httpStatus || 'error'}`);
+  }
+  filesTransferApplyServerJob(transfer, committed.job);
+  transfer.loaded = transfer.totalSize;
+  transfer.descriptor = committed.job;
+  transfer.status = 'completed';
+  filesTransferPersistState();
+  await filesTransferDeleteUploadBlob(transfer.id);
+  setFilesUploadStatus('ok', `Uploaded ${transfer.name || 'upload.bin'}`);
+  transfer.resolve?.(committed.job);
+}
+
+function filesDeleteServerTransfer(transfer) {
+  if (!transfer?.serverJobId && !transfer?.resumeToken) return;
+  if (dashboardControlTransport?.lastStatus?.api_transfer_job_delete_available !== true) return;
+  dashboardTransport?.request?.('api_transfer_job_delete', {
+    id: transfer.serverJobId || undefined,
+    resume_token: transfer.resumeToken || undefined,
+  }, { timeoutMs: 30000 }).catch(() => {});
+}
+
+async function runFilesUploadTransfer(transfer) {
+  const filesystemUpload = Boolean(transfer.destination && transfer.destination !== 'task');
+  if (!transfer.file && !(filesystemUpload && transfer.uploadBlobStored)) {
+    throw new Error('missing upload file');
+  }
+  const initialSize = Number(transfer.file?.size || transfer.totalSize || 0);
+  if (initialSize > UPLOAD_MAX_BYTES) {
+    throw new Error(`File too large (${humanBytes(initialSize)}; cap is ${humanBytes(UPLOAD_MAX_BYTES)})`);
   }
   transfer.status = 'running';
   transfer.error = '';
-  transfer.loaded = 0;
-  transfer.totalSize = transfer.file.size;
+  transfer.loaded = Number(transfer.loaded || 0);
+  transfer.totalSize = initialSize;
   transfer.cancelRequested = false;
   const controller = new AbortController();
   transfer.abortController = controller;
   renderFilesTransfers();
   try {
-    const descriptor = await dashboardTransport.uploadBytes('api_session_current_upload', {
-      destination: transfer.destination || 'task',
-      name: transfer.file.name || 'upload.bin',
-      mime: transfer.file.type || 'application/octet-stream',
-    }, transfer.file, {
-      timeoutMs: transfer.timeoutMs || 120000,
-      signal: controller.signal,
-    });
-    if (descriptor?._httpOk === false) {
-      throw new Error(descriptor.error || `upload returned ${descriptor._httpStatus || 'error'}`);
+    if (filesystemUpload) {
+      await runFilesFilesystemUploadTransfer(transfer, controller);
+    } else {
+      if (!transfer.file) throw new Error('missing upload file');
+      if (!dashboardUploadRpcAvailable()) {
+        throw new Error('Upload requires the Connect dashboard upload tunnel');
+      }
+      const descriptor = await dashboardTransport.uploadBytes('api_session_current_upload', {
+        destination: 'task',
+        name: transfer.file.name || transfer.name || 'upload.bin',
+        mime: transfer.file.type || transfer.mime || 'application/octet-stream',
+      }, transfer.file, {
+        timeoutMs: transfer.timeoutMs || 120000,
+        signal: controller.signal,
+      });
+      if (descriptor?._httpOk === false) {
+        throw new Error(descriptor.error || `upload returned ${descriptor._httpStatus || 'error'}`);
+      }
+      transfer.loaded = transfer.file.size;
+      transfer.descriptor = descriptor;
+      transfer.status = 'completed';
+      filesStagedUploads.set(String(descriptor.id || transfer.id), descriptor);
+      setFilesUploadStatus('ok', `Uploaded ${descriptor.name || transfer.file.name || 'upload.bin'}`);
+      renderFilesStagedUploads();
+      transfer.resolve?.(descriptor);
     }
-    transfer.loaded = transfer.file.size;
-    transfer.descriptor = descriptor;
-    transfer.status = 'completed';
-    filesStagedUploads.set(String(descriptor.id || transfer.id), descriptor);
-    setFilesUploadStatus('ok', `Uploaded ${descriptor.name || transfer.file.name || 'upload.bin'}`);
-    renderFilesStagedUploads();
-    transfer.resolve?.(descriptor);
   } catch (err) {
     if (transfer.cancelRequested || err?.name === 'AbortError') {
       transfer.status = 'cancelled';
@@ -49261,9 +49902,11 @@ async function runFilesUploadTransfer(transfer) {
       transfer.error = err?.message || String(err);
       setFilesUploadStatus('error', transfer.error);
     }
+    filesTransferPersistState();
     transfer.reject?.(err);
   } finally {
     transfer.abortController = null;
+    filesTransferPersistState();
     renderFilesTransfers();
   }
 }
@@ -49299,6 +49942,7 @@ function pauseFilesTransfer(id) {
   if (!transfer) return;
   if (transfer.status === 'queued') {
     transfer.status = 'paused';
+    filesTransferPersistState();
     renderFilesTransfers();
     return;
   }
@@ -49311,11 +49955,15 @@ function cancelFilesTransfer(id) {
   const transfer = filesTransferById(id);
   if (!transfer) return;
   transfer.cancelRequested = true;
+  filesDeleteServerTransfer(transfer);
+  filesTransferDeleteDownloadParts(transfer.id, Number(transfer.rangeCount || 512));
+  filesTransferDeleteUploadBlob(transfer.id);
   if (transfer.status === 'running') {
     transfer.abortController?.abort();
   } else if (['queued', 'paused'].includes(transfer.status)) {
     transfer.status = 'cancelled';
     transfer.reject?.(new Error('transfer cancelled'));
+    filesTransferPersistState();
     renderFilesTransfers();
     pumpFilesTransfers();
   }
@@ -49329,6 +49977,7 @@ function resumeFilesTransfer(id) {
   transfer.pauseRequested = false;
   transfer.cancelRequested = false;
   filesTransferCompletion(transfer);
+  filesTransferPersistState();
   renderFilesTransfers();
   pumpFilesTransfers();
   return transfer.completion;
@@ -49343,6 +49992,7 @@ function retryFilesTransfer(id) {
   transfer.cancelRequested = false;
   transfer.pauseRequested = false;
   filesTransferCompletion(transfer);
+  filesTransferPersistState();
   renderFilesTransfers();
   pumpFilesTransfers();
   return transfer.completion;
@@ -49351,10 +50001,41 @@ function retryFilesTransfer(id) {
 function clearFilesTransferHistory() {
   for (let i = filesTransfers.length - 1; i >= 0; i -= 1) {
     if (['completed', 'failed', 'cancelled'].includes(filesTransfers[i].status)) {
+      filesTransferDeleteDownloadParts(filesTransfers[i].id, Number(filesTransfers[i].rangeCount || 512));
+      filesTransferDeleteUploadBlob(filesTransfers[i].id);
       filesTransfers.splice(i, 1);
     }
   }
+  filesTransferPersistState();
   renderFilesTransfers();
+}
+
+async function saveCompletedFilesDownload(id) {
+  const transfer = filesTransferById(id);
+  if (!transfer || transfer.kind !== 'download') return null;
+  if (!transfer.result?.blob) {
+    const hydrated = await filesTransferLoadDownloadParts(transfer);
+    if (!hydrated) {
+      transfer.status = 'failed';
+      transfer.error = 'download chunks are no longer available';
+      filesTransferPersistState();
+      renderFilesTransfers();
+      return null;
+    }
+    const blob = new Blob(transfer.parts || [], { type: transfer.contentType || 'application/octet-stream' });
+    transfer.result = {
+      ok: true,
+      blob,
+      filename: transfer.filename || 'download.bin',
+      content_type: transfer.contentType || 'application/octet-stream',
+      size: blob.size,
+      total_size: transfer.totalSize || blob.size,
+      range_count: transfer.rangeCount || transfer.parts.length,
+      resumable: true,
+    };
+  }
+  downloadDashboardBlob(transfer.result.blob, transfer.result.filename, transfer.result.content_type);
+  return transfer.result;
 }
 
 function cancelFilesDownload() {
@@ -49488,21 +50169,32 @@ async function deleteFilesStagedUpload(id) {
 
 function queueFilesUpload(file, options = {}) {
   if (!file) return null;
+  const destination = options.destination !== undefined
+    ? String(options.destination || '').trim()
+    : filesUploadDestinationValue();
   const transfer = {
     id: `upload-${Date.now()}-${++filesTransferSeq}`,
     kind: 'upload',
     status: 'queued',
     file,
     name: file.name || options.name || 'upload.bin',
-    destination: options.destination || 'task',
+    mime: file.type || options.mime || 'application/octet-stream',
+    destination: destination || 'task',
+    conflictPolicy: options.conflictPolicy || options.conflict || filesUploadConflictPolicy(),
     loaded: 0,
     totalSize: Number(file.size || 0),
+    chunkBytes: Math.max(1, Math.floor(Number(options.chunkBytes) || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES)),
+    debugFailAfterChunks: Math.max(0, Math.floor(Number(options.debugFailAfterChunks || options.failAfterChunks) || 0)),
+    debugFailedOnce: false,
     descriptor: null,
     error: '',
     cancelRequested: false,
     abortController: null,
     timeoutMs: options.timeoutMs,
   };
+  if (transfer.destination !== 'task') {
+    filesTransferPutUploadBlob(transfer, file);
+  }
   setFilesUploadStatus('warn', 'Queued upload');
   return queueFilesTransfer(transfer);
 }
@@ -49527,11 +50219,16 @@ function queueFilesUploads(files, options = {}) {
 	    status: transfer.status,
 	    name: filesTransferTitle(transfer),
 	    path: transfer.path || '',
+	    destination: transfer.destination || '',
+	    conflictPolicy: transfer.conflictPolicy || '',
 	    loaded: Number(transfer.loaded || 0),
 	    totalSize: Number(transfer.totalSize || transfer.file?.size || 0),
 	    rangeCount: Number(transfer.rangeCount || 0),
 	    error: transfer.error || '',
 	    uploadId: transfer.descriptor?.id || '',
+	    serverJobId: transfer.serverJobId || transfer.serverJob?.id || '',
+	    resumeToken: transfer.resumeToken || transfer.serverJob?.resume_token || '',
+	    uploadBlobStored: Boolean(transfer.uploadBlobStored),
 	  }));
 	}
 
@@ -49770,6 +50467,20 @@ function openFilesDownloadPicker() {
   loadFsPicker(filesDownloadPathValue() || dashboardProjectRoot || '~');
 }
 
+function openFilesUploadDestinationPicker() {
+  configureFsPicker({
+    mode: 'directory',
+    target: 'filesUploadDestination',
+    title: 'Choose upload destination',
+    placeholder: '/destination/folder-or-file',
+    useLabel: 'Use destination',
+    showCreate: true,
+  });
+  const modal = document.getElementById('fs-picker-modal');
+  if (modal) modal.style.display = 'flex';
+  loadFsPicker(filesUploadDestinationValue() || dashboardProjectRoot || '~');
+}
+
 function openSessionConfigBinaryPicker() {
   if (!sessionConfigEditing) return;
   configureFsPicker({
@@ -49857,6 +50568,15 @@ function useFsPickerSelection() {
     closeFsPicker();
     return;
   }
+  if (fsPickerTarget === 'filesUploadDestination') {
+    const input = document.getElementById('files-upload-destination');
+    if (input) {
+      input.value = fsPickerCurrentPath || fsPickerSelectedPath || '';
+      input.title = input.value;
+    }
+    closeFsPicker();
+    return;
+  }
   if (fsPickerTarget === 'agentBinary') {
     if (!fsPickerSelectedPath) return;
     const input = document.getElementById('new-session-agent-command');
@@ -49937,7 +50657,9 @@ window.openAgentBinaryPicker = openAgentBinaryPicker;
 	window.retryFilesTransfer = retryFilesTransfer;
 	window.cancelFilesTransfer = cancelFilesTransfer;
 	window.clearFilesTransferHistory = clearFilesTransferHistory;
+	window.refreshFilesTransferJobs = refreshFilesTransferJobs;
 	window.chooseFilesForUpload = chooseFilesForUpload;
+	window.openFilesUploadDestinationPicker = openFilesUploadDestinationPicker;
 	window.refreshFilesStagedUploads = refreshFilesStagedUploads;
 	window.downloadFilesStagedUpload = downloadFilesStagedUpload;
 	window.deleteFilesStagedUpload = deleteFilesStagedUpload;
@@ -49981,6 +50703,7 @@ window.openAgentBinaryPicker = openAgentBinaryPicker;
       totalSize: result.total_size,
       rangeCount: result.range_count,
       progress,
+      transfers: filesTransferSnapshot(),
       statusText: document.getElementById('files-download-status')?.textContent || '',
       progressWidth: document.getElementById('files-download-progress')?.style.width || '',
 	      text,
@@ -50026,6 +50749,30 @@ window.openAgentBinaryPicker = openAgentBinaryPicker;
 	      transfer: filesTransferSnapshot().find(item => item.id === transfer.id) || null,
 	      statusText: document.getElementById('files-download-status')?.textContent || '',
 	      progressWidth: document.getElementById('files-download-progress')?.style.width || '',
+	    };
+	  },
+	  async _debugStartInterruptedDownload(path, options = {}) {
+	    const transfer = queueFilesDownload(path, {
+	      chunkBytes: options.chunkBytes,
+	      maxBytes: options.maxBytes,
+	      skipBrowserSave: true,
+	      failAfterRanges: options.failAfterRanges || 1,
+	    });
+	    if (!transfer) throw new Error('download was not queued');
+	    let firstError = '';
+	    try {
+	      await transfer.completion;
+	    } catch (err) {
+	      firstError = err?.message || String(err);
+	    }
+	    return {
+	      ok: true,
+	      transferId: transfer.id,
+	      status: transfer.status,
+	      loaded: Number(transfer.loaded || 0),
+	      rangeCount: Number(transfer.rangeCount || 0),
+	      firstError,
+	      snapshot: filesTransferSnapshot().find(item => item.id === transfer.id) || null,
 	    };
 	  },
 	  async _debugProbeUploadText(text, options = {}) {
@@ -50075,7 +50822,116 @@ window.openAgentBinaryPicker = openAgentBinaryPicker;
 	      window.fetch = previousFetch;
 	    }
 	  },
+	  async _debugProbeFilesystemUploadText(text, options = {}) {
+	    const destination = String(options.destination || '').trim();
+	    if (!destination) throw new Error('destination is required');
+	    const bytes = new TextEncoder().encode(String(text || ''));
+	    const file = new File([bytes], options.name || 'connect-files-upload.txt', {
+	      type: options.mime || 'text/plain',
+	    });
+	    const transfer = queueFilesUpload(file, {
+	      destination,
+	      conflict: options.conflict || 'fail',
+	      timeoutMs: options.timeoutMs,
+	      chunkBytes: options.chunkBytes,
+	    });
+	    if (!transfer) throw new Error('upload was not queued');
+	    const job = await transfer.completion;
+	    const finalPath = String(job?.final_path || job?.destination_path || transfer.destination || '');
+	    const raw = await dashboardFetchRangedBytes('api_fs_read', { path: finalPath }, {
+	      chunkBytes: options.readChunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+	      maxBytes: options.maxBytes || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES,
+	    });
+	    const rawBytes = new Uint8Array(await raw.blob.arrayBuffer());
+	    let rawText = '';
+	    try {
+	      rawText = new TextDecoder().decode(rawBytes);
+	    } catch (_) {}
+	    return {
+	      ok: true,
+	      finalPath,
+	      rawText,
+	      rawSize: raw.size,
+	      transferId: transfer.id,
+	      transferStatus: transfer.status,
+	      serverJobId: transfer.serverJobId || '',
+	      resumeToken: transfer.resumeToken || '',
+	      transfer: filesTransferSnapshot().find(item => item.id === transfer.id) || null,
+	      statusText: document.getElementById('files-upload-status')?.textContent || '',
+	    };
+	  },
+	  async _debugStartInterruptedFilesystemUploadText(text, options = {}) {
+	    const destination = String(options.destination || '').trim();
+	    if (!destination) throw new Error('destination is required');
+	    const bytes = new TextEncoder().encode(String(text || ''));
+	    const file = new File([bytes], options.name || 'connect-files-upload.txt', {
+	      type: options.mime || 'text/plain',
+	    });
+	    const transfer = queueFilesUpload(file, {
+	      destination,
+	      conflict: options.conflict || 'fail',
+	      timeoutMs: options.timeoutMs,
+	      chunkBytes: options.chunkBytes,
+	      failAfterChunks: options.failAfterChunks || 1,
+	    });
+	    if (!transfer) throw new Error('upload was not queued');
+	    let firstError = '';
+	    try {
+	      await transfer.completion;
+	    } catch (err) {
+	      firstError = err?.message || String(err);
+	    }
+	    return {
+	      ok: true,
+	      transferId: transfer.id,
+	      status: transfer.status,
+	      loaded: Number(transfer.loaded || 0),
+	      totalSize: Number(transfer.totalSize || 0),
+	      uploadChunkCount: Number(transfer.uploadChunkCount || 0),
+	      firstError,
+	      snapshot: filesTransferSnapshot().find(item => item.id === transfer.id) || null,
+	    };
+	  },
+	  async _debugResumeTransfer(id, options = {}) {
+	    const transfer = filesTransferById(id);
+	    if (!transfer) throw new Error('transfer not found');
+	    const result = await resumeFilesTransfer(id);
+	    let rawText = '';
+	    let finalPath = '';
+	    if (transfer.kind === 'upload') {
+	      finalPath = String(result?.final_path || result?.destination_path || transfer.destination || '');
+	      const raw = await dashboardFetchRangedBytes('api_fs_read', { path: finalPath }, {
+	        chunkBytes: options.readChunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+	        maxBytes: options.maxBytes || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES,
+	      });
+	      const rawBytes = new Uint8Array(await raw.blob.arrayBuffer());
+	      try {
+	        rawText = new TextDecoder().decode(rawBytes);
+	      } catch (_) {}
+	    } else if (result?.blob) {
+	      const rawBytes = new Uint8Array(await result.blob.arrayBuffer());
+	      try {
+	        rawText = new TextDecoder().decode(rawBytes);
+	      } catch (_) {}
+	    }
+	    return {
+	      ok: true,
+	      transferId: transfer.id,
+	      kind: transfer.kind,
+	      status: transfer.status,
+	      loaded: Number(transfer.loaded || 0),
+	      totalSize: Number(transfer.totalSize || 0),
+	      rangeCount: Number(transfer.rangeCount || 0),
+	      uploadChunkCount: Number(transfer.uploadChunkCount || 0),
+	      finalPath,
+	      rawText,
+	      snapshot: filesTransferSnapshot().find(item => item.id === transfer.id) || null,
+	    };
+	  },
 	};
+
+restoreFilesTransferState();
+renderFilesTransfers();
 
 function normalizeContextArchiveMode(mode) {
   return ['summary', 'exact', 'off'].includes(mode) ? mode : 'summary';

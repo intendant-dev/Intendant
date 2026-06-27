@@ -100,6 +100,12 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_session_current_changes",
     "api_session_context_snapshot",
     "api_session_current_upload_delete",
+    "api_transfer_jobs",
+    "api_transfer_job_create",
+    "api_transfer_job_delete",
+    "api_transfer_download_read",
+    "api_transfer_upload_chunk",
+    "api_transfer_upload_commit",
     "api_fs_stat",
     "api_fs_list",
     "api_fs_mkdir",
@@ -1758,6 +1764,11 @@ fn control_frame_response(
                 | "api_session_current_uploads"
                 | "api_session_current_upload_raw"
                 | "api_session_current_upload_delete"
+                | "api_transfer_jobs"
+                | "api_transfer_job_create"
+                | "api_transfer_job_delete"
+                | "api_transfer_download_read"
+                | "api_transfer_upload_commit"
                 | "api_media_clip_start"
                 | "api_media_clip_end"
                 | "api_media_clip_cancel"
@@ -1895,6 +1906,7 @@ fn control_upload_start_frame(
     if !matches!(
         method,
         "api_session_current_upload"
+            | "api_transfer_upload_chunk"
             | "api_media_annotation_attach"
             | "api_media_annotation_submit"
             | "api_media_clip_frame"
@@ -2082,6 +2094,9 @@ fn control_upload_end_frame(
         let response = match upload.method.as_str() {
             "api_session_current_upload" => {
                 api_session_current_upload_task_response(id.clone(), upload, runtime).await
+            }
+            "api_transfer_upload_chunk" => {
+                api_transfer_upload_chunk_task_response(id.clone(), upload, runtime).await
             }
             "api_media_annotation_attach" => {
                 api_media_annotation_upload_task_response(id.clone(), upload, runtime, false).await
@@ -3274,6 +3289,30 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_current_upload_available", true),
         ("api_session_current_upload_raw_available", true),
         ("api_session_current_upload_delete_available", true),
+        (
+            "api_transfer_jobs_available",
+            runtime.project_root.is_some(),
+        ),
+        (
+            "api_transfer_job_create_available",
+            runtime.project_root.is_some(),
+        ),
+        (
+            "api_transfer_job_delete_available",
+            runtime.project_root.is_some(),
+        ),
+        (
+            "api_transfer_download_read_available",
+            runtime.project_root.is_some(),
+        ),
+        (
+            "api_transfer_upload_chunk_available",
+            runtime.project_root.is_some(),
+        ),
+        (
+            "api_transfer_upload_commit_available",
+            runtime.project_root.is_some(),
+        ),
         ("api_media_editor_available", true),
         ("api_media_annotation_attach_available", true),
         ("api_media_annotation_submit_available", true),
@@ -3359,6 +3398,10 @@ fn spawn_control_request(
                 api_session_frame_asset_task_response(id.clone(), params.as_ref()).await
             }
             "api_fs_read" => api_fs_read_task_response(id.clone(), params.as_ref()).await,
+            "api_transfer_download_read" => {
+                api_transfer_download_read_task_response(id.clone(), params.as_ref(), &runtime)
+                    .await
+            }
             _ => {
                 let frame =
                     control_request_response(id.clone(), method, params, runtime, cancel).await;
@@ -3443,6 +3486,16 @@ async fn control_request_response(
         "api_session_current_uploads" => api_session_current_uploads_response(id, &runtime).await,
         "api_session_current_upload_delete" => {
             api_session_current_upload_delete_response(id, params.as_ref(), &runtime).await
+        }
+        "api_transfer_jobs" => api_transfer_jobs_response(id, &runtime).await,
+        "api_transfer_job_create" => {
+            api_transfer_job_create_response(id, params.as_ref(), &runtime).await
+        }
+        "api_transfer_job_delete" => {
+            api_transfer_job_delete_response(id, params.as_ref(), &runtime).await
+        }
+        "api_transfer_upload_commit" => {
+            api_transfer_upload_commit_response(id, params.as_ref(), &runtime).await
         }
         "api_media_clip_start" => {
             api_media_clip_start_response(id, params.as_ref(), &runtime).await
@@ -5014,6 +5067,471 @@ async fn api_session_current_upload_delete_response(
             "ok": false,
             "error": format!("upload delete task failed: {e}"),
         }),
+    }
+}
+
+fn transfer_project_root(runtime: &ControlRuntime) -> Result<PathBuf, serde_json::Value> {
+    runtime.project_root.clone().ok_or_else(|| {
+        serde_json::json!({
+            "ok": false,
+            "error": "project root unavailable",
+        })
+    })
+}
+
+fn transfer_http_error_response(
+    id: String,
+    status: u16,
+    error: impl Into<String>,
+    label: &str,
+) -> serde_json::Value {
+    http_body_response(
+        id,
+        status,
+        serde_json::json!({
+            "ok": false,
+            "error": error.into(),
+        })
+        .to_string(),
+        label,
+    )
+}
+
+fn transfer_store_error_response(
+    id: String,
+    error: crate::transfer_store::TransferStoreError,
+    label: &str,
+) -> serde_json::Value {
+    transfer_http_error_response(id, error.status, error.message, label)
+}
+
+fn transfer_id_param(params: &serde_json::Value) -> String {
+    string_param(
+        params,
+        &[
+            "id",
+            "job_id",
+            "jobId",
+            "resume_token",
+            "resumeToken",
+            "token",
+        ],
+    )
+}
+
+async fn api_transfer_jobs_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
+    let project_root = match transfer_project_root(runtime) {
+        Ok(project_root) => project_root,
+        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer jobs"),
+    };
+    let result =
+        tokio::task::spawn_blocking(move || crate::transfer_store::list_jobs(&project_root)).await;
+    let jobs = match result {
+        Ok(jobs) => jobs,
+        Err(e) => {
+            return serde_json::json!({
+                "t": "response",
+                "id": id,
+                "ok": false,
+                "error": format!("transfer jobs task failed: {e}"),
+            });
+        }
+    };
+    http_body_response(
+        id,
+        200,
+        serde_json::json!({
+            "ok": true,
+            "jobs": jobs,
+        })
+        .to_string(),
+        "transfer jobs",
+    )
+}
+
+async fn api_transfer_job_create_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let project_root = match transfer_project_root(runtime) {
+        Ok(project_root) => project_root,
+        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer create"),
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let kind = string_param(&params, &["kind", "type"]);
+    let kind = match crate::transfer_store::TransferKind::from_str(&kind.to_ascii_lowercase()) {
+        Some(kind) => kind,
+        None => {
+            return transfer_http_error_response(
+                id,
+                400,
+                "transfer kind must be download or upload",
+                "transfer create",
+            );
+        }
+    };
+    let result = match kind {
+        crate::transfer_store::TransferKind::Download => {
+            let path = string_param(&params, &["path", "source_path", "sourcePath", "source"]);
+            if path.is_empty() {
+                return transfer_http_error_response(id, 400, "missing path", "transfer create");
+            }
+            tokio::task::spawn_blocking(move || {
+                crate::transfer_store::create_download_job(&project_root, &path)
+            })
+            .await
+        }
+        crate::transfer_store::TransferKind::Upload => {
+            let destination = string_param(
+                &params,
+                &["destination", "destination_path", "destinationPath", "path"],
+            );
+            if destination.is_empty() {
+                return transfer_http_error_response(
+                    id,
+                    400,
+                    "missing destination",
+                    "transfer create",
+                );
+            }
+            let original_name = optional_string_param(
+                &params,
+                &[
+                    "name",
+                    "filename",
+                    "file_name",
+                    "fileName",
+                    "original_name",
+                    "originalName",
+                ],
+            )
+            .unwrap_or_else(|| "upload.bin".to_string());
+            let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
+                .unwrap_or_else(|| "application/octet-stream".to_string());
+            let total_size = match optional_u64_param(
+                &params,
+                &["total_size", "totalSize", "total_bytes", "totalBytes", "size"],
+            ) {
+                Ok(value) => value,
+                Err(error) => return transfer_http_error_response(id, 400, error, "transfer create"),
+            };
+            let conflict = optional_string_param(
+                &params,
+                &["conflict", "conflict_policy", "conflictPolicy", "if_exists", "ifExists"],
+            )
+            .unwrap_or_else(|| "fail".to_string());
+            let conflict_policy =
+                match crate::transfer_store::TransferConflictPolicy::from_str(
+                    &conflict.to_ascii_lowercase(),
+                ) {
+                    Some(policy) => policy,
+                    None => {
+                        return transfer_http_error_response(
+                            id,
+                            400,
+                            "conflict policy must be fail, rename, or overwrite",
+                            "transfer create",
+                        );
+                    }
+                };
+            tokio::task::spawn_blocking(move || {
+                crate::transfer_store::create_upload_job(
+                    &project_root,
+                    &destination,
+                    &original_name,
+                    &mime,
+                    total_size,
+                    conflict_policy,
+                )
+            })
+            .await
+        }
+    };
+    match result {
+        Ok(Ok(job)) => http_body_response(
+            id,
+            200,
+            serde_json::json!({
+                "ok": true,
+                "job": job,
+            })
+            .to_string(),
+            "transfer create",
+        ),
+        Ok(Err(error)) => transfer_store_error_response(id, error, "transfer create"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("transfer create task failed: {e}"),
+        }),
+    }
+}
+
+async fn api_transfer_job_delete_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let project_root = match transfer_project_root(runtime) {
+        Ok(project_root) => project_root,
+        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer delete"),
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let job_id = transfer_id_param(&params);
+    if job_id.is_empty() {
+        return transfer_http_error_response(id, 400, "missing id", "transfer delete");
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        crate::transfer_store::delete_job(&project_root, &job_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(deleted)) => http_body_response(
+            id,
+            200,
+            serde_json::json!({
+                "ok": true,
+                "deleted": deleted,
+            })
+            .to_string(),
+            "transfer delete",
+        ),
+        Ok(Err(error)) => transfer_store_error_response(id, error, "transfer delete"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("transfer delete task failed: {e}"),
+        }),
+    }
+}
+
+async fn api_transfer_upload_commit_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let project_root = match transfer_project_root(runtime) {
+        Ok(project_root) => project_root,
+        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer upload commit"),
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let job_id = transfer_id_param(&params);
+    if job_id.is_empty() {
+        return transfer_http_error_response(id, 400, "missing id", "transfer upload commit");
+    }
+    let result = tokio::task::spawn_blocking(move || {
+        crate::transfer_store::commit_upload_job(&project_root, &job_id)
+    })
+    .await;
+    match result {
+        Ok(Ok(job)) => http_body_response(
+            id,
+            200,
+            serde_json::json!({
+                "ok": true,
+                "job": job,
+            })
+            .to_string(),
+            "transfer upload commit",
+        ),
+        Ok(Err(error)) => transfer_store_error_response(id, error, "transfer upload commit"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("transfer upload commit task failed: {e}"),
+        }),
+    }
+}
+
+async fn api_transfer_upload_chunk_task_response(
+    id: String,
+    upload: InboundUploadState,
+    runtime: ControlRuntime,
+) -> ControlTaskResponse {
+    let project_root = match transfer_project_root(&runtime) {
+        Ok(project_root) => project_root,
+        Err(body) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: http_body_response(id, 404, body.to_string(), "transfer upload chunk"),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let job_id = transfer_id_param(&upload.params);
+    if job_id.is_empty() {
+        return ControlTaskResponse {
+            id: id.clone(),
+            frame: transfer_http_error_response(id, 400, "missing id", "transfer upload chunk"),
+            byte_stream: None,
+            done: true,
+        };
+    }
+    let offset = match optional_u64_param(&upload.params, &["offset", "start"]) {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: transfer_http_error_response(id, 400, error, "transfer upload chunk"),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let chunk_len = upload.received_bytes as u64;
+    let result = tokio::task::spawn_blocking(move || {
+        crate::transfer_store::append_upload_tempfile(
+            &project_root,
+            &job_id,
+            offset,
+            upload.tmp,
+            chunk_len,
+        )
+    })
+    .await;
+    let frame = match result {
+        Ok(Ok(job)) => http_body_response(
+            id.clone(),
+            200,
+            serde_json::json!({
+                "ok": true,
+                "job": job,
+            })
+            .to_string(),
+            "transfer upload chunk",
+        ),
+        Ok(Err(error)) => transfer_store_error_response(id.clone(), error, "transfer upload chunk"),
+        Err(e) => serde_json::json!({
+            "t": "response",
+            "id": id,
+            "ok": false,
+            "error": format!("transfer upload chunk task failed: {e}"),
+        }),
+    };
+    ControlTaskResponse {
+        id,
+        frame,
+        byte_stream: None,
+        done: true,
+    }
+}
+
+async fn api_transfer_download_read_task_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> ControlTaskResponse {
+    let project_root = match transfer_project_root(runtime) {
+        Ok(project_root) => project_root,
+        Err(body) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: http_body_response(id, 404, body.to_string(), "transfer download"),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let job_id = transfer_id_param(&params);
+    if job_id.is_empty() {
+        return transfer_download_error_task_response(id, 400, "missing id");
+    }
+    let offset = match optional_u64_param(&params, &["offset", "start"]) {
+        Ok(value) => value.unwrap_or(0),
+        Err(error) => return transfer_download_error_task_response(id, 400, error),
+    };
+    let length = match optional_u64_param(&params, &["length", "limit"]) {
+        Ok(value) => value,
+        Err(error) => return transfer_download_error_task_response(id, 400, error),
+    };
+    let result = tokio::task::spawn_blocking(move || {
+        crate::transfer_store::read_download_range(
+            &project_root,
+            &job_id,
+            offset,
+            length,
+            crate::web_gateway::UPLOAD_MAX_BYTES as u64,
+        )
+    })
+    .await;
+    let (job, bytes, end) = match result {
+        Ok(Ok(value)) => value,
+        Ok(Err(error)) => {
+            return transfer_download_error_task_response(id, error.status, error.message);
+        }
+        Err(e) => {
+            return ControlTaskResponse {
+                id: id.clone(),
+                frame: serde_json::json!({
+                    "t": "response",
+                    "id": id,
+                    "ok": false,
+                    "error": format!("transfer download task failed: {e}"),
+                }),
+                byte_stream: None,
+                done: true,
+            };
+        }
+    };
+    let content_type = job
+        .mime
+        .clone()
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let filename = job.filename.clone();
+    let total_size = job.total_size.unwrap_or(bytes.len() as u64);
+    let size = bytes.len();
+    let source_path = job
+        .source_path
+        .as_ref()
+        .map(|path| path.to_string_lossy().to_string());
+    let job_value = serde_json::to_value(&job).unwrap_or_else(|_| serde_json::json!({}));
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: serde_json::Value::Null,
+        byte_stream: Some(ControlByteStream {
+            id: id.clone(),
+            stream_id: format!("{id}:transfer-download"),
+            content_type: content_type.clone(),
+            filename: filename.clone(),
+            bytes,
+            result: serde_json::json!({
+                "ok": true,
+                "id": job.id,
+                "resume_token": job.resume_token,
+                "path": source_path,
+                "filename": filename,
+                "content_type": content_type,
+                "size": size,
+                "total_size": total_size,
+                "offset": offset,
+                "range_start": offset,
+                "range_end": end,
+                "resumable": true,
+                "completed_bytes": job.completed_bytes,
+                "status": job.status,
+                "job": job_value,
+            }),
+        }),
+        done: true,
+    }
+}
+
+fn transfer_download_error_task_response(
+    id: String,
+    status: u16,
+    error: impl Into<String>,
+) -> ControlTaskResponse {
+    ControlTaskResponse {
+        id: id.clone(),
+        frame: transfer_http_error_response(id, status, error, "transfer download"),
+        byte_stream: None,
+        done: true,
     }
 }
 
@@ -8293,6 +8811,12 @@ mod tests {
             status["result"]["api_session_current_upload_delete_available"],
             true
         );
+        assert_eq!(status["result"]["api_transfer_jobs_available"], false);
+        assert_eq!(status["result"]["api_transfer_job_create_available"], false);
+        assert_eq!(status["result"]["api_transfer_job_delete_available"], false);
+        assert_eq!(status["result"]["api_transfer_download_read_available"], false);
+        assert_eq!(status["result"]["api_transfer_upload_chunk_available"], false);
+        assert_eq!(status["result"]["api_transfer_upload_commit_available"], false);
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
         assert_eq!(status["result"]["api_fs_mkdir_available"], true);
@@ -10256,6 +10780,185 @@ mod tests {
             .as_str()
             .unwrap_or("")
             .contains("not a regular file"));
+    }
+
+    #[tokio::test]
+    async fn transfer_download_job_persists_and_reads_byte_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let source = dir.path().join("fixture.txt");
+        std::fs::write(&source, b"durable download fixture").unwrap();
+
+        let mut rt = runtime();
+        rt.project_root = Some(project.clone());
+
+        let status = status_response_frame("transfer-status".to_string(), &rt);
+        assert_eq!(status["result"]["api_transfer_jobs_available"], true);
+        assert_eq!(status["result"]["api_transfer_job_create_available"], true);
+        assert_eq!(status["result"]["api_transfer_download_read_available"], true);
+
+        let create = api_transfer_job_create_response(
+            "transfer-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "download",
+                "path": source.to_string_lossy(),
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(create["t"], "response");
+        assert_eq!(create["ok"], true);
+        assert_eq!(create["result"]["ok"], true);
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+        let resume_token = create["result"]["job"]["resume_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let list = api_transfer_jobs_response("transfer-list".to_string(), &rt).await;
+        assert_eq!(list["result"]["jobs"].as_array().unwrap().len(), 1);
+        assert_eq!(list["result"]["jobs"][0]["id"], job_id);
+
+        let read = api_transfer_download_read_task_response(
+            "transfer-read".to_string(),
+            Some(&serde_json::json!({
+                "resume_token": resume_token,
+                "offset": 8,
+                "length": 8,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(read.done);
+        assert!(read.byte_stream.is_some());
+        let stream = read.byte_stream.unwrap();
+        assert_eq!(stream.id, "transfer-read");
+        assert_eq!(stream.stream_id, "transfer-read:transfer-download");
+        assert_eq!(stream.content_type, "text/plain; charset=utf-8");
+        assert_eq!(stream.filename.as_deref(), Some("fixture.txt"));
+        assert_eq!(stream.bytes, b"download");
+        assert_eq!(stream.result["ok"], true);
+        assert_eq!(stream.result["id"], job_id);
+        assert_eq!(stream.result["range_start"], 8);
+        assert_eq!(stream.result["range_end"], 16);
+        assert_eq!(stream.result["resumable"], true);
+        assert_eq!(
+            stream.result["total_size"].as_u64(),
+            Some("durable download fixture".len() as u64)
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_upload_chunks_commit_to_arbitrary_destination() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let dest_dir = dir.path().join("dest");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&dest_dir).unwrap();
+        let dest = dest_dir.join("out.txt");
+
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+
+        let create = api_transfer_job_create_response(
+            "upload-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "upload",
+                "destination": dest.to_string_lossy(),
+                "name": "out.txt",
+                "mime": "text/plain",
+                "total_size": 11,
+                "conflict": "fail",
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(create["result"]["ok"], true);
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+        let resume_token = create["result"]["job"]["resume_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let first = api_transfer_upload_chunk_task_response(
+            "upload-chunk-1".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({
+                    "id": job_id,
+                    "offset": 0,
+                }),
+                b"hello ",
+            ),
+            rt.clone(),
+        )
+        .await;
+        assert_eq!(first.frame["result"]["ok"], true);
+        assert_eq!(first.frame["result"]["job"]["completed_bytes"], 6);
+        assert_eq!(first.frame["result"]["job"]["status"], "running");
+
+        let second = api_transfer_upload_chunk_task_response(
+            "upload-chunk-2".to_string(),
+            test_upload_state(
+                "api_transfer_upload_chunk",
+                serde_json::json!({
+                    "resume_token": resume_token,
+                    "offset": 6,
+                }),
+                b"world",
+            ),
+            rt.clone(),
+        )
+        .await;
+        assert_eq!(second.frame["result"]["ok"], true);
+        assert_eq!(second.frame["result"]["job"]["completed_bytes"], 11);
+        assert_eq!(second.frame["result"]["job"]["status"], "ready");
+
+        let commit = api_transfer_upload_commit_response(
+            "upload-commit".to_string(),
+            Some(&serde_json::json!({ "id": job_id })),
+            &rt,
+        )
+        .await;
+        assert_eq!(commit["result"]["ok"], true);
+        assert_eq!(commit["result"]["job"]["status"], "completed");
+        assert_eq!(std::fs::read(&dest).unwrap(), b"hello world");
+    }
+
+    #[tokio::test]
+    async fn control_frame_routes_transfer_jobs_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+        let (tx, mut rx) = mpsc::channel::<ControlTaskResponse>(8);
+        let mut pending = HashMap::new();
+        let mut outbound = OutboundControlQueue::new();
+
+        let queued = test_control_frame_response(
+            r#"{"t":"request","id":"transfer-jobs-frame","method":"api_transfer_jobs"}"#,
+            &mut rt,
+            &tx,
+            &mut pending,
+            &mut outbound,
+        );
+        assert!(queued.is_none());
+        assert!(pending.contains_key("transfer-jobs-frame"));
+
+        let response = tokio::time::timeout(Duration::from_secs(1), rx.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(pending.remove(&response.id).is_some());
+        assert_eq!(response.id, "transfer-jobs-frame");
+        assert!(response.done);
+        assert_eq!(response.frame["t"], "response");
+        assert_eq!(response.frame["ok"], true);
+        assert_eq!(response.frame["result"]["ok"], true);
+        assert_eq!(response.frame["result"]["jobs"].as_array().unwrap().len(), 0);
     }
 
     #[test]

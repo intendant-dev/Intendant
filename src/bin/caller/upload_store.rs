@@ -225,7 +225,7 @@ fn append_intendant_ignore_rule(path: &Path) -> io::Result<()> {
 ///
 /// Prefer Git's local exclude file so Intendant does not modify tracked
 /// project metadata unless there is no Git metadata to attach to.
-fn ensure_project_uploads_ignored(project_root: &Path) -> io::Result<()> {
+pub(crate) fn ensure_project_uploads_ignored(project_root: &Path) -> io::Result<()> {
     let project_gitignore = project_root.join(".gitignore");
     if ignore_file_has_intendant_rule(&project_gitignore) {
         return Ok(());
