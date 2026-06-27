@@ -2478,6 +2478,7 @@ impl App {
             | AppEvent::StatusUpdate { .. }
             | AppEvent::LogEntry { .. }
             | AppEvent::UserMessageRewind { .. }
+            | AppEvent::UserMessageEditStatus { .. }
             | AppEvent::UserMessageLog { .. }
             | AppEvent::FollowUpStatus { .. }
             | AppEvent::LiveUsageUpdate { .. }

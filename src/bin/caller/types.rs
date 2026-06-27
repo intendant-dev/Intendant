@@ -767,6 +767,14 @@ pub enum OutboundEvent {
         #[serde(skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// Lifecycle status for replacing a previously rendered user message.
+    UserMessageEditStatus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        session_id: Option<String>,
+        user_turn_index: u32,
+        status: String,
+        message: String,
+    },
     // --- Peer registry push events ---
     //
     // Emitted by the gateway translator that subscribes to

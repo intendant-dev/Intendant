@@ -1447,13 +1447,21 @@ impl SessionSupervisor {
             .values()
             .find(|session| {
                 session.source == source
+                    && managed_session_accepts_external_input(session)
                     && (session.session_id == session_id || session.session_id == resume_token)
             })
             .map(|session| session.session_id.clone())
             .or_else(|| {
-                state
-                    .resolve_session_id(session_id)
-                    .or_else(|| state.resolve_session_id(resume_token))
+                [session_id, resume_token]
+                    .into_iter()
+                    .find_map(|candidate| {
+                        let resolved = state.resolve_session_id(candidate)?;
+                        state
+                            .sessions
+                            .get(&resolved)
+                            .filter(|session| managed_session_accepts_external_input(session))
+                            .map(|_| resolved)
+                    })
             })
     }
 
@@ -1925,10 +1933,23 @@ impl SessionSupervisor {
             let Some(requested_id) = requested_id else {
                 drop(state);
                 self.warn("Edit dropped: no active managed session");
+                self.emit_edit_user_message_status(
+                    None,
+                    user_turn_index,
+                    "failed",
+                    "no active managed session",
+                );
                 return;
             };
             requested_id
         };
+
+        self.emit_edit_user_message_status(
+            Some(requested_id.clone()),
+            user_turn_index,
+            "requested",
+            format!("edit requested for user turn {}", user_turn_index),
+        );
 
         let request = EditUserMessageRequest {
             requested_id: requested_id.clone(),
@@ -1948,6 +1969,17 @@ impl SessionSupervisor {
                     .filter(|id| !id.trim().is_empty())
                     .unwrap_or(&requested_id)
                     .to_string();
+                self.emit_edit_user_message_status(
+                    Some(requested_id.clone()),
+                    user_turn_index,
+                    "attaching",
+                    format!(
+                        "attaching {} session {} before editing user turn {}",
+                        attach.source,
+                        short_session(&lookup_id),
+                        user_turn_index
+                    ),
+                );
                 self.resume_session(
                     attach.source,
                     requested_id.clone(),
@@ -1974,10 +2006,31 @@ impl SessionSupervisor {
                 "Edit dropped: session {} is not managed by this daemon",
                 short_session(&target_id)
             ));
+            self.emit_edit_user_message_status(
+                Some(requested_id),
+                user_turn_index,
+                "failed",
+                "target session is not managed by this daemon",
+            );
             return;
         };
         self.deliver_edit_user_message(request, target, relation)
             .await;
+    }
+
+    fn emit_edit_user_message_status(
+        &self,
+        session_id: Option<String>,
+        user_turn_index: u32,
+        status: impl Into<String>,
+        message: impl Into<String>,
+    ) {
+        self.config.bus.send(AppEvent::UserMessageEditStatus {
+            session_id,
+            user_turn_index,
+            status: status.into(),
+            message: message.into(),
+        });
     }
 
     fn queue_edit_user_message_after_attach(
@@ -1995,6 +2048,12 @@ impl SessionSupervisor {
                     "Edit dropped: session {} was not routable after attach",
                     short_session(&target_id)
                 ));
+                supervisor.emit_edit_user_message_status(
+                    Some(request.requested_id),
+                    request.user_turn_index,
+                    "failed",
+                    "session was not routable after attach",
+                );
                 return;
             };
             supervisor
@@ -2041,6 +2100,12 @@ impl SessionSupervisor {
                 target.source,
                 short_session(&target.managed_id)
             ));
+            self.emit_edit_user_message_status(
+                Some(request.requested_id),
+                request.user_turn_index,
+                "failed",
+                format!("unknown external-agent source {}", target.source),
+            );
             return;
         };
         if !backend.supports_user_message_rewind() {
@@ -2049,6 +2114,12 @@ impl SessionSupervisor {
                 backend,
                 short_session(&target.managed_id)
             ));
+            self.emit_edit_user_message_status(
+                Some(request.requested_id),
+                request.user_turn_index,
+                "failed",
+                format!("{} does not support user-message rewind yet", backend),
+            );
             return;
         }
         if request.user_turn_index == 0 {
@@ -2057,6 +2128,12 @@ impl SessionSupervisor {
                 backend,
                 short_session(&target.managed_id)
             ));
+            self.emit_edit_user_message_status(
+                Some(request.requested_id),
+                request.user_turn_index,
+                "failed",
+                "invalid user turn index 0",
+            );
             return;
         }
         let Some(user_turn_revision) = request.user_turn_revision else {
@@ -2066,6 +2143,12 @@ impl SessionSupervisor {
                 short_session(&target.managed_id),
                 request.user_turn_index
             ));
+            self.emit_edit_user_message_status(
+                Some(request.requested_id),
+                request.user_turn_index,
+                "failed",
+                "missing active-message revision",
+            );
             return;
         };
 
@@ -2105,7 +2188,24 @@ impl SessionSupervisor {
                 short_session(&target.managed_id),
                 target.project_root.display()
             ));
+            self.emit_edit_user_message_status(
+                Some(request.requested_id),
+                request.user_turn_index,
+                "failed",
+                format!("{} session is not accepting input", backend),
+            );
         } else {
+            self.emit_edit_user_message_status(
+                Some(target.managed_id.clone()),
+                request.user_turn_index,
+                "queued",
+                format!(
+                    "edit queued for {} session {} user turn {}",
+                    backend,
+                    short_session(&target.managed_id),
+                    request.user_turn_index
+                ),
+            );
             self.config.bus.send(AppEvent::LogEntry {
                 session_id: Some(target.managed_id.clone()),
                 level: "info".to_string(),
@@ -2130,13 +2230,17 @@ impl SessionSupervisor {
         let target_id = state
             .resolve_session_id(requested_id)
             .unwrap_or_else(|| requested_id.to_string());
-        let entry = state.sessions.get(&target_id).map(|s| EditRouteTarget {
-            managed_id: s.session_id.clone(),
-            source: s.source.clone(),
-            project_root: s.project_root.clone(),
-            session_dir: s.session_dir.clone(),
-            follow_up_tx: s.follow_up_tx.clone(),
-        });
+        let entry = state
+            .sessions
+            .get(&target_id)
+            .filter(|session| managed_session_accepts_external_input(session))
+            .map(|s| EditRouteTarget {
+                managed_id: s.session_id.clone(),
+                source: s.source.clone(),
+                project_root: s.project_root.clone(),
+                session_dir: s.session_dir.clone(),
+                follow_up_tx: s.follow_up_tx.clone(),
+            });
         (target_id, entry, relation)
     }
 
@@ -3297,6 +3401,13 @@ fn normalize_supervisor_phase(phase: &str) -> String {
     }
 }
 
+fn managed_session_accepts_external_input(session: &ManagedSession) -> bool {
+    !matches!(
+        normalize_supervisor_phase(&session.phase).as_str(),
+        "done" | "interrupted"
+    )
+}
+
 fn path_file_name(path: &std::path::Path) -> String {
     path.file_name()
         .and_then(|name| name.to_str())
@@ -4384,6 +4495,47 @@ mod tests {
         assert_eq!(msg.text, "new prompt");
         assert_eq!(msg.edit_user_turn_index, Some(117));
         assert_eq!(msg.edit_user_turn_revision, Some(1));
+    }
+
+    #[tokio::test]
+    async fn done_external_session_is_not_reused_for_attach() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session("backend", "codex");
+            session.phase = "done".to_string();
+            state.sessions.insert("backend".to_string(), session);
+        }
+
+        let existing = supervisor
+            .find_managed_session_id("codex", "backend", "backend")
+            .await;
+
+        assert_eq!(existing, None);
+    }
+
+    #[tokio::test]
+    async fn done_external_session_does_not_swallow_pre_attach_edit() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        let (old_tx, _old_rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut session = managed_session("backend", "codex");
+            session.phase = "done".to_string();
+            session.follow_up_tx = old_tx;
+            state.sessions.insert("backend".to_string(), session);
+        }
+
+        let (target_id, entry, relation) = supervisor.lookup_edit_route_target("backend").await;
+
+        assert_eq!(target_id, "backend");
+        assert!(
+            entry.is_none(),
+            "terminal retained session should attach first"
+        );
+        assert!(relation.is_none());
     }
 
     #[tokio::test]

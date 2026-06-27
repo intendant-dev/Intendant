@@ -283,6 +283,15 @@ pub enum AppEvent {
         status: String,
         reason: Option<String>,
     },
+    /// User-message edit lifecycle for external sessions. This is separate
+    /// from ordinary follow-up status because edits target a specific active
+    /// user turn and may first need to attach an external backend.
+    UserMessageEditStatus {
+        session_id: Option<String>,
+        user_turn_index: u32,
+        status: String,
+        message: String,
+    },
     /// User/admin requested that a queued ordinary follow-up be cleared before
     /// the target session consumes it for the next turn.
     FollowUpCancelRequested {
@@ -1892,6 +1901,17 @@ pub fn app_event_to_outbound(event: &AppEvent) -> Option<crate::types::OutboundE
             text: text.clone(),
             status: status.clone(),
             reason: reason.clone(),
+        }),
+        AppEvent::UserMessageEditStatus {
+            session_id,
+            user_turn_index,
+            status,
+            message,
+        } => Some(OutboundEvent::UserMessageEditStatus {
+            session_id: session_id.clone(),
+            user_turn_index: *user_turn_index,
+            status: status.clone(),
+            message: message.clone(),
         }),
         AppEvent::FollowUpCancelRequested { .. } => None,
         AppEvent::SessionStarted { session_id, task } => Some(OutboundEvent::SessionStarted {
@@ -4361,6 +4381,23 @@ mod tests {
         assert!(json.contains("\"text\":\"next step\""));
         assert!(json.contains("\"status\":\"queued\""));
         assert!(json.contains("\"reason\":\"queued for next turn\""));
+    }
+
+    #[test]
+    fn outbound_user_message_edit_status_preserves_turn() {
+        let event = AppEvent::UserMessageEditStatus {
+            session_id: Some("codex-thread".to_string()),
+            user_turn_index: 117,
+            status: "attaching".to_string(),
+            message: "attaching Codex session before edit".to_string(),
+        };
+        let outbound = app_event_to_outbound(&event).unwrap();
+        let json = serde_json::to_string(&outbound).unwrap();
+        assert!(json.contains("\"event\":\"user_message_edit_status\""));
+        assert!(json.contains("\"session_id\":\"codex-thread\""));
+        assert!(json.contains("\"user_turn_index\":117"));
+        assert!(json.contains("\"status\":\"attaching\""));
+        assert!(json.contains("\"message\":\"attaching Codex session before edit\""));
     }
 
     #[test]

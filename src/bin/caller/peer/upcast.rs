@@ -297,6 +297,21 @@ impl AppEventUpcaster {
             | AppEvent::ConversationRollbackRequested { .. }
             | AppEvent::ConversationRolledBack { .. } => vec![],
 
+            AppEvent::UserMessageEditStatus {
+                user_turn_index,
+                status,
+                message,
+                ..
+            } => vec![log_event(
+                if status == "failed" {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Info
+                },
+                "edit",
+                format!("Edit user turn {user_turn_index} {status}: {message}"),
+            )],
+
             AppEvent::CodexThreadActionResult {
                 action,
                 success,
@@ -1409,6 +1424,21 @@ impl WireEventUpcaster {
             | OutboundEvent::PeerRemoved { .. }
             | OutboundEvent::PeerStateChanged { .. }
             | OutboundEvent::PeerEventForwarded { .. } => vec![],
+
+            OutboundEvent::UserMessageEditStatus {
+                user_turn_index,
+                status,
+                message,
+                ..
+            } => vec![log_event(
+                if status == "failed" {
+                    LogLevel::Error
+                } else {
+                    LogLevel::Info
+                },
+                "edit",
+                format!("Edit user turn {user_turn_index} {status}: {message}"),
+            )],
 
             // Peer-emitted WebRTC signaling. Upcasts 1:1 to the
             // matching `PeerEvent::WebRtcSignal` so the per-peer event

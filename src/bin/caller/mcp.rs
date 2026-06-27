@@ -5285,6 +5285,7 @@ pub fn spawn_event_listener(
                     AppEvent::Resize(_, _) => {}
                     AppEvent::LogEntry { .. }
                     | AppEvent::UserMessageRewind { .. }
+                    | AppEvent::UserMessageEditStatus { .. }
                     | AppEvent::UserMessageLog { .. }
                     | AppEvent::ExternalAgentChanged { .. }
                     | AppEvent::AutonomyChanged { .. }

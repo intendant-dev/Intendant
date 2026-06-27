@@ -30260,8 +30260,20 @@ async fn run_external_agent_mode(
 
         let mut replacement_for_user_turn_index = None;
         if let Some(user_turn_index) = edit_user_turn_index {
+            bus.send(AppEvent::UserMessageEditStatus {
+                session_id: live_session_id.clone(),
+                user_turn_index,
+                status: "running".to_string(),
+                message: format!("applying edit to user turn {}", user_turn_index),
+            });
             if !agent.supports_user_message_rewind() {
                 let message = format!("{} does not support user-message rewind", agent.name());
+                bus.send(AppEvent::UserMessageEditStatus {
+                    session_id: live_session_id.clone(),
+                    user_turn_index,
+                    status: "failed".to_string(),
+                    message: message.clone(),
+                });
                 emit_external_session_loop_error(
                     &bus,
                     &session_log,
@@ -30280,6 +30292,12 @@ async fn run_external_agent_mode(
                         .map(|sid| sid.chars().take(8).collect::<String>())
                         .unwrap_or_else(|| "unknown".to_string())
                 );
+                bus.send(AppEvent::UserMessageEditStatus {
+                    session_id: live_session_id.clone(),
+                    user_turn_index,
+                    status: "failed".to_string(),
+                    message: message.clone(),
+                });
                 emit_external_session_loop_error(
                     &bus,
                     &session_log,
@@ -30323,12 +30341,24 @@ async fn run_external_agent_mode(
                             "queued",
                             Some("created managed edit branch from archived context"),
                         );
+                        bus.send(AppEvent::UserMessageEditStatus {
+                            session_id: live_session_id.clone(),
+                            user_turn_index,
+                            status: "ok".to_string(),
+                            message,
+                        });
                         continue 'outer;
                     }
                     Ok(None) => {
                         archived_edit_branch_not_found = true;
                     }
                     Err(message) => {
+                        bus.send(AppEvent::UserMessageEditStatus {
+                            session_id: live_session_id.clone(),
+                            user_turn_index,
+                            status: "failed".to_string(),
+                            message: message.clone(),
+                        });
                         emit_external_session_loop_error(
                             &bus,
                             &session_log,
@@ -30351,6 +30381,12 @@ async fn run_external_agent_mode(
                         .unwrap_or_else(|| "unknown".to_string()),
                     round
                 );
+                bus.send(AppEvent::UserMessageEditStatus {
+                    session_id: live_session_id.clone(),
+                    user_turn_index,
+                    status: "failed".to_string(),
+                    message: message.clone(),
+                });
                 emit_external_session_loop_error(
                     &bus,
                     &session_log,
@@ -30370,6 +30406,12 @@ async fn run_external_agent_mode(
                 } else {
                     message
                 };
+                bus.send(AppEvent::UserMessageEditStatus {
+                    session_id: live_session_id.clone(),
+                    user_turn_index,
+                    status: "failed".to_string(),
+                    message: message.clone(),
+                });
                 emit_external_session_loop_error(
                     &bus,
                     &session_log,
@@ -30573,12 +30615,24 @@ async fn run_external_agent_mode(
                         user_turn_index,
                         turns_removed: turns_to_drop,
                     });
+                    bus.send(AppEvent::UserMessageEditStatus {
+                        session_id: live_session_id.clone(),
+                        user_turn_index,
+                        status: "ok".to_string(),
+                        message,
+                    });
                 }
                 Err(e) => {
                     let message = format!(
                         "Cannot edit user turn {} in {} session: {}",
                         user_turn_index, backend, e
                     );
+                    bus.send(AppEvent::UserMessageEditStatus {
+                        session_id: live_session_id.clone(),
+                        user_turn_index,
+                        status: "failed".to_string(),
+                        message: message.clone(),
+                    });
                     emit_external_session_loop_error(
                         &bus,
                         &session_log,

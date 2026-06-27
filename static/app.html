@@ -11632,6 +11632,8 @@ const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   'approval_required',
   'approval_resolved',
   'follow_up_status',
+  'user_message_edit_status',
+  'user_message_rewind',
   'steer_requested',
   'steer_queued',
   'steer_accepted',
@@ -18158,6 +18160,42 @@ function stationUpsertCodexThreadActionActivity(op, sessionId, status = 'request
   }, options);
 }
 
+function stationUserMessageEditActivityId(sessionId, userTurnIndex) {
+  const sid = String(sessionId || '').trim() || 'target';
+  const turn = Number(userTurnIndex || 0);
+  return `user-message-edit:${sid}:${Number.isFinite(turn) && turn > 0 ? turn : 'turn'}`;
+}
+
+function stationUserMessageEditActivityMessage(sessionId, userTurnIndex, status, message = '') {
+  const sid = String(sessionId || '').trim();
+  const turn = Number(userTurnIndex || 0);
+  const turnText = Number.isFinite(turn) && turn > 0 ? ` user turn ${turn}` : ' selected user turn';
+  const target = sid ? ` for ${shortSessionId(sid)}` : '';
+  const detail = compactSessionText(message || '').trim();
+  if (status === 'attaching') return `Edit waiting to attach${target} before${turnText}${detail ? `: ${detail}` : ''}`;
+  if (status === 'queued') return `Edit queued${target} for${turnText}${detail ? `: ${detail}` : ''}`;
+  if (status === 'running') return `Edit applying${target} to${turnText}${detail ? `: ${detail}` : ''}`;
+  if (status === 'ok') return `Edit applied${target} to${turnText}${detail ? `: ${detail}` : ''}`;
+  if (status === 'failed') return `Edit failed${target} for${turnText}${detail ? `: ${detail}` : ''}`;
+  return `Edit requested${target} for${turnText}${detail ? `: ${detail}` : ''}`;
+}
+
+function stationUpsertUserMessageEditActivity(sessionId, userTurnIndex, status = 'requested', message = '', options = {}) {
+  const sid = String(sessionId || '').trim();
+  const normalizedStatus = String(status || '').trim().toLowerCase() || 'requested';
+  const turn = Number(userTurnIndex || 0);
+  const level = normalizedStatus === 'failed' ? 'error' : 'info';
+  stationPublishActivityEvent({
+    id: stationUserMessageEditActivityId(sid, turn),
+    action: 'user_message_edit',
+    hostId: selfPeerId || 'local',
+    sessionId: sid,
+    level,
+    source: 'edit',
+    msg: stationUserMessageEditActivityMessage(sid, turn, normalizedStatus, message),
+  }, options);
+}
+
 function stationPushSessionRelationshipActivity(evt = {}, options = {}) {
   const parent = String(evt.parent_session_id || evt.parentSessionId || evt.parent_id || evt.parentId || '').trim();
   const child = String(evt.child_session_id || evt.childSessionId || evt.child_id || evt.childId || evt.session_id || evt.sessionId || '').trim();
@@ -18862,6 +18900,12 @@ async function main() {
       if (d.event === 'session_agent_config_result') {
         handleSessionConfigResult(d);
       }
+      if (d.event === 'user_message_edit_status') {
+        handleUserMessageEditStatus(d);
+      }
+      if (d.event === 'user_message_rewind') {
+        handleUserMessageRewind(d);
+      }
       if (d.event === 'codex_thread_action_requested') {
         handleCodexThreadActionRequested(d);
       }
@@ -19472,6 +19516,12 @@ function processCommands(cmds) {
       case 'mark_activity_context_rewind':
         flushLogReplayAppendBatch();
         markActivityContextRewind(c.session_id, c.user_turn_index, c.turns_removed);
+        break;
+      case 'user_message_edit_status':
+        handleUserMessageEditStatus(c);
+        break;
+      case 'user_message_rewind':
+        handleUserMessageRewind(c);
         break;
       case 'clear_logs':
         flushLogReplayAppendBatch();
@@ -21402,6 +21452,61 @@ function handleCodexThreadActionRequested(evt) {
   if (!action) return;
   markActionPending(action, sid);
   stationUpsertCodexThreadActionActivity(action, sid, 'requested');
+}
+
+function normalizeUserMessageEditStatus(status) {
+  const s = String(status || '').trim().toLowerCase().replace(/_/g, '-');
+  if (s === 'success' || s === 'succeeded' || s === 'applied') return 'ok';
+  if (s === 'error' || s === 'failure') return 'failed';
+  if (['requested', 'attaching', 'queued', 'running', 'ok', 'failed'].includes(s)) return s;
+  return 'requested';
+}
+
+function userMessageEditStatusIsTerminal(status) {
+  return status === 'ok' || status === 'failed';
+}
+
+function handleUserMessageEditStatus(evt = {}) {
+  const sid = String(evt.session_id || evt.sessionId || '').trim();
+  const turn = Number(evt.user_turn_index ?? evt.userTurnIndex ?? 0);
+  const status = normalizeUserMessageEditStatus(evt.status);
+  const message = String(evt.message || evt.reason || '').trim();
+  if (!sid && (!Number.isInteger(turn) || turn <= 0)) return;
+
+  stationUpsertUserMessageEditActivity(sid, turn, status, message, {
+    // submitEditedUserMessage renders the local "requested" row immediately.
+    renderLog: status !== 'requested',
+  });
+
+  if (sid && !processingLogReplay) {
+    if (userMessageEditStatusIsTerminal(status)) {
+      clearSessionWindowPendingActive(sid, 'idle');
+    } else {
+      markSessionWindowPendingActive(sid);
+    }
+  }
+  if (status === 'failed') {
+    const detail = compactSessionText(message || 'edit failed');
+    showControlToast('error', detail.toLowerCase().startsWith('edit failed') ? detail : `Edit failed: ${detail}`);
+  }
+}
+
+function handleUserMessageRewind(evt = {}) {
+  const sid = String(evt.session_id || evt.sessionId || '').trim();
+  const turn = Number(evt.user_turn_index ?? evt.userTurnIndex ?? 0);
+  const turnsRemoved = Number(evt.turns_removed ?? evt.turnsRemoved ?? 0);
+  if (sid && Number.isInteger(turn) && turn > 0) {
+    markActivityContextRewind(sid, turn, turnsRemoved);
+    stationUpsertUserMessageEditActivity(
+      sid,
+      turn,
+      'ok',
+      turnsRemoved > 0
+        ? `rewound ${turnsRemoved} turn${turnsRemoved === 1 ? '' : 's'}`
+        : 'rewound existing context',
+      { renderLog: false }
+    );
+  }
 }
 
 function handleSessionRenameResult(evt) {
@@ -48585,6 +48690,11 @@ function submitEditedUserMessage(input, text) {
   if (attachments.length > 0) msg.attachments = attachments;
   if (!dispatchSessionControlMsg(msg)) return false;
   markSessionWindowPendingActive(targetSessionId);
+  stationUpsertUserMessageEditActivity(
+    targetSessionId,
+    editMessageDraft.userTurnIndex,
+    'requested'
+  );
   if (attachments.length > 0) {
     renderAttachmentReceipt(text, attachmentReceipt, 'Edited', targetSessionId);
     clearPendingAttachments({ retainPreviewUrls: true });
