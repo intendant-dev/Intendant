@@ -575,6 +575,24 @@ async function main() {
     assert(filesUploadProbe.rawRangeCount >= 2, `Files tab upload raw read did not use multiple ranges: ${JSON.stringify(filesUploadProbe)}`);
     assert(filesUploadProbe.statusText.includes('Uploaded'), `Files tab upload did not render completion status: ${JSON.stringify(filesUploadProbe)}`);
 
+    const stagedArtifactProbe = await page.evaluate(`window.intendantDashboardFiles._debugProbeArtifactDownload({
+      type: 'staged_upload',
+      id: ${JSON.stringify(filesUploadProbe.uploadId)}
+    }, {
+      sourceLabel: 'Staged upload: connect-files-upload.txt',
+      filename: 'connect-files-upload.txt',
+      contentType: 'text/plain',
+      chunkBytes: 9
+    })`);
+    assert.strictEqual(stagedArtifactProbe.text, uploadRawText, `Staged upload artifact transfer returned wrong bytes: ${JSON.stringify(stagedArtifactProbe)}`);
+    assert(stagedArtifactProbe.rangeCount >= 2, `Staged upload artifact transfer did not use multiple ranges: ${JSON.stringify(stagedArtifactProbe)}`);
+    assert(stagedArtifactProbe.transfer?.serverJobId, `Staged upload artifact transfer did not keep server job id: ${JSON.stringify(stagedArtifactProbe)}`);
+    assert(stagedArtifactProbe.transfer?.resumeToken, `Staged upload artifact transfer did not keep resume token: ${JSON.stringify(stagedArtifactProbe)}`);
+    assert.strictEqual(stagedArtifactProbe.transfer?.sourceKind, 'staged_upload', `Staged upload artifact transfer kept wrong source kind: ${JSON.stringify(stagedArtifactProbe)}`);
+    assert.strictEqual(stagedArtifactProbe.transfer?.sourceLabel, 'Staged upload: connect-files-upload.txt', `Staged upload artifact transfer kept wrong source label: ${JSON.stringify(stagedArtifactProbe)}`);
+    assert.strictEqual(stagedArtifactProbe.transfer?.artifact?.type, 'staged_upload', `Staged upload artifact transfer did not persist artifact descriptor: ${JSON.stringify(stagedArtifactProbe)}`);
+    assert(stagedArtifactProbe.statusText.includes('Downloaded'), `Staged upload artifact transfer did not render completion status: ${JSON.stringify(stagedArtifactProbe)}`);
+
     const filesystemUploadText = 'connect filesystem upload fixture';
     const filesystemUploadPath = path.join(tmp, 'connect-filesystem-upload.txt');
     const filesystemUploadProbe = await page.evaluate(`window.intendantDashboardFiles._debugProbeFilesystemUploadText(${JSON.stringify(filesystemUploadText)}, { destination: ${JSON.stringify(filesystemUploadPath)}, name: 'connect-filesystem-upload.txt', chunkBytes: 9 })`);

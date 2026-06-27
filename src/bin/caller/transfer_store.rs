@@ -70,6 +70,14 @@ pub struct TransferJob {
     #[serde(default)]
     pub source_path: Option<PathBuf>,
     #[serde(default)]
+    pub source_kind: Option<String>,
+    #[serde(default)]
+    pub source_label: Option<String>,
+    #[serde(default)]
+    pub artifact: Option<serde_json::Value>,
+    #[serde(default)]
+    pub managed_source: bool,
+    #[serde(default)]
     pub destination_path: Option<PathBuf>,
     #[serde(default)]
     pub final_path: Option<PathBuf>,
@@ -124,6 +132,10 @@ pub fn transfer_root(project_root: &Path) -> PathBuf {
 
 fn jobs_dir(project_root: &Path) -> PathBuf {
     transfer_root(project_root).join("jobs")
+}
+
+fn artifacts_dir(project_root: &Path) -> PathBuf {
+    transfer_root(project_root).join("artifacts")
 }
 
 fn job_path(project_root: &Path, id: &str) -> PathBuf {
@@ -234,6 +246,26 @@ pub fn create_download_job(
 ) -> Result<TransferJob, TransferStoreError> {
     let path = crate::web_gateway::expand_dashboard_fs_path(raw_path)
         .map_err(|e| TransferStoreError::new(400, e))?;
+    create_download_job_from_path(
+        project_root,
+        path,
+        None,
+        None,
+        Some("filesystem".to_string()),
+        None,
+        None,
+    )
+}
+
+pub fn create_download_job_from_path(
+    project_root: &Path,
+    path: PathBuf,
+    filename: Option<String>,
+    mime: Option<String>,
+    source_kind: Option<String>,
+    source_label: Option<String>,
+    artifact: Option<serde_json::Value>,
+) -> Result<TransferJob, TransferStoreError> {
     let metadata = fs::metadata(&path)
         .map_err(|e| TransferStoreError::new(404, format!("file not accessible: {e}")))?;
     if !metadata.is_file() {
@@ -242,10 +274,14 @@ pub fn create_download_job(
     let display_path = fs::canonicalize(&path).unwrap_or(path);
     let now = now_unix();
     let id = uuid::Uuid::new_v4().to_string();
-    let filename = display_path
+    let fallback_filename = display_path
         .file_name()
         .map(|value| value.to_string_lossy().to_string())
         .filter(|value| !value.is_empty());
+    let filename = filename
+        .map(|value| crate::upload_store::sanitize_name(&value))
+        .filter(|value| !value.is_empty())
+        .or(fallback_filename);
     let job = TransferJob {
         id,
         resume_token: uuid::Uuid::new_v4().to_string(),
@@ -254,13 +290,67 @@ pub fn create_download_job(
         created_at: now,
         updated_at: now,
         source_path: Some(display_path.clone()),
+        source_kind,
+        source_label,
+        artifact,
+        managed_source: false,
         destination_path: None,
         final_path: None,
         temp_path: None,
         original_name: filename.clone(),
         filename,
-        mime: Some(content_type_for_path(&display_path)),
+        mime: Some(mime.unwrap_or_else(|| content_type_for_path(&display_path))),
         total_size: Some(metadata.len()),
+        completed_bytes: 0,
+        error: None,
+        conflict_policy: TransferConflictPolicy::Fail,
+    };
+    save_job(project_root, &job)?;
+    Ok(job)
+}
+
+pub fn create_download_job_from_bytes(
+    project_root: &Path,
+    bytes: Vec<u8>,
+    filename: &str,
+    mime: &str,
+    source_kind: impl Into<String>,
+    source_label: Option<String>,
+    artifact: Option<serde_json::Value>,
+) -> Result<TransferJob, TransferStoreError> {
+    crate::upload_store::ensure_project_uploads_ignored(project_root).map_err(|e| {
+        TransferStoreError::new(500, format!("ensure transfer metadata ignored: {e}"))
+    })?;
+    let id = uuid::Uuid::new_v4().to_string();
+    let safe_name = crate::upload_store::sanitize_name(filename);
+    let artifact_path = artifacts_dir(project_root).join(format!("{id}-{safe_name}"));
+    crate::file_watcher::atomic_write(&artifact_path, &bytes)
+        .map_err(|e| TransferStoreError::new(500, format!("write transfer artifact: {e}")))?;
+    let now = now_unix();
+    let mime = if mime.trim().is_empty() {
+        "application/octet-stream".to_string()
+    } else {
+        mime.trim().to_string()
+    };
+    let job = TransferJob {
+        id,
+        resume_token: uuid::Uuid::new_v4().to_string(),
+        kind: TransferKind::Download,
+        status: TransferStatus::Queued,
+        created_at: now,
+        updated_at: now,
+        source_path: Some(artifact_path),
+        source_kind: Some(source_kind.into()),
+        source_label,
+        artifact,
+        managed_source: true,
+        destination_path: None,
+        final_path: None,
+        temp_path: None,
+        original_name: Some(safe_name.clone()),
+        filename: Some(safe_name),
+        mime: Some(mime),
+        total_size: Some(bytes.len() as u64),
         completed_bytes: 0,
         error: None,
         conflict_policy: TransferConflictPolicy::Fail,
@@ -389,6 +479,10 @@ pub fn create_upload_job(
         created_at: now,
         updated_at: now,
         source_path: None,
+        source_kind: None,
+        source_label: None,
+        artifact: None,
+        managed_source: false,
         destination_path: Some(final_path.clone()),
         final_path: None,
         temp_path: Some(temp_path),
@@ -626,6 +720,11 @@ pub fn delete_job(project_root: &Path, id_or_token: &str) -> Result<bool, Transf
     if let Some(temp_path) = job.temp_path.take() {
         let _ = fs::remove_file(temp_path);
     }
+    if job.managed_source {
+        if let Some(source_path) = job.source_path.take() {
+            let _ = fs::remove_file(source_path);
+        }
+    }
     job.status = TransferStatus::Cancelled;
     job.updated_at = now_unix();
     let _ = save_job(project_root, &job);
@@ -674,6 +773,42 @@ mod tests {
         assert_eq!(end, 14);
         assert_eq!(updated.status, TransferStatus::Completed);
         assert_eq!(updated.completed_bytes, 14);
+    }
+
+    #[test]
+    fn generated_download_job_materializes_and_cleans_up_artifact() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        fs::create_dir_all(&project).unwrap();
+
+        let job = create_download_job_from_bytes(
+            &project,
+            b"generated report bytes".to_vec(),
+            "report.zip",
+            "application/zip",
+            "session_report",
+            Some("Session report".to_string()),
+            Some(serde_json::json!({
+                "type": "session_report",
+                "session_id": "current",
+            })),
+        )
+        .unwrap();
+        assert_eq!(job.kind, TransferKind::Download);
+        assert_eq!(job.source_kind.as_deref(), Some("session_report"));
+        assert_eq!(job.source_label.as_deref(), Some("Session report"));
+        assert_eq!(job.filename.as_deref(), Some("report.zip"));
+        assert_eq!(job.mime.as_deref(), Some("application/zip"));
+        assert!(job.managed_source);
+        let source_path = job.source_path.clone().unwrap();
+        assert!(source_path.exists());
+
+        let (_, bytes, end) = read_download_range(&project, &job.id, 10, Some(6), 100).unwrap();
+        assert_eq!(&bytes, b"report");
+        assert_eq!(end, 16);
+
+        assert!(delete_job(&project, &job.id).unwrap());
+        assert!(!source_path.exists());
     }
 
     #[test]

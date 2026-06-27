@@ -5119,6 +5119,391 @@ fn transfer_id_param(params: &serde_json::Value) -> String {
     )
 }
 
+fn transfer_store_task_error(
+    error: tokio::task::JoinError,
+    label: &str,
+) -> crate::transfer_store::TransferStoreError {
+    crate::transfer_store::TransferStoreError::new(500, format!("{label} task failed: {error}"))
+}
+
+fn transfer_json_error_message(body: &serde_json::Value) -> String {
+    body.get("error")
+        .and_then(|value| value.as_str())
+        .map(ToString::to_string)
+        .unwrap_or_else(|| body.to_string())
+}
+
+fn transfer_artifact_type(artifact: &serde_json::Value) -> String {
+    string_param(artifact, &["type", "kind", "source_kind", "sourceKind"]).to_ascii_lowercase()
+}
+
+async fn transfer_create_download_job_from_params(
+    project_root: PathBuf,
+    params: serde_json::Value,
+    runtime: &ControlRuntime,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    if let Some(artifact) = params
+        .get("artifact")
+        .filter(|value| value.is_object())
+        .cloned()
+    {
+        return transfer_create_artifact_download_job(project_root, artifact, runtime).await;
+    }
+    let path = string_param(&params, &["path", "source_path", "sourcePath", "source"]);
+    if path.is_empty() {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "missing path",
+        ));
+    }
+    tokio::task::spawn_blocking(move || {
+        crate::transfer_store::create_download_job(&project_root, &path)
+    })
+    .await
+    .map_err(|e| transfer_store_task_error(e, "transfer create"))?
+}
+
+async fn transfer_create_upload_job_from_params(
+    project_root: PathBuf,
+    params: serde_json::Value,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    let destination = string_param(
+        &params,
+        &["destination", "destination_path", "destinationPath", "path"],
+    );
+    if destination.is_empty() {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "missing destination",
+        ));
+    }
+    let original_name = optional_string_param(
+        &params,
+        &[
+            "name",
+            "filename",
+            "file_name",
+            "fileName",
+            "original_name",
+            "originalName",
+        ],
+    )
+    .unwrap_or_else(|| "upload.bin".to_string());
+    let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
+        .unwrap_or_else(|| "application/octet-stream".to_string());
+    let total_size = optional_u64_param(
+        &params,
+        &[
+            "total_size",
+            "totalSize",
+            "total_bytes",
+            "totalBytes",
+            "size",
+        ],
+    )
+    .map_err(|error| crate::transfer_store::TransferStoreError::new(400, error))?;
+    let conflict = optional_string_param(
+        &params,
+        &[
+            "conflict",
+            "conflict_policy",
+            "conflictPolicy",
+            "if_exists",
+            "ifExists",
+        ],
+    )
+    .unwrap_or_else(|| "fail".to_string());
+    let conflict_policy =
+        crate::transfer_store::TransferConflictPolicy::from_str(&conflict.to_ascii_lowercase())
+            .ok_or_else(|| {
+                crate::transfer_store::TransferStoreError::new(
+                    400,
+                    "conflict policy must be fail, rename, or overwrite",
+                )
+            })?;
+    tokio::task::spawn_blocking(move || {
+        crate::transfer_store::create_upload_job(
+            &project_root,
+            &destination,
+            &original_name,
+            &mime,
+            total_size,
+            conflict_policy,
+        )
+    })
+    .await
+    .map_err(|e| transfer_store_task_error(e, "transfer create"))?
+}
+
+async fn transfer_create_artifact_download_job(
+    project_root: PathBuf,
+    artifact: serde_json::Value,
+    runtime: &ControlRuntime,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    match transfer_artifact_type(&artifact).as_str() {
+        "session_report" | "session-report" => {
+            transfer_create_session_report_download_job(project_root, artifact, runtime).await
+        }
+        "staged_upload" | "staged-upload" | "upload" => {
+            transfer_create_staged_upload_download_job(project_root, artifact, runtime).await
+        }
+        "recording_asset" | "recording-asset" => {
+            transfer_create_recording_asset_download_job(project_root, artifact, runtime, false)
+                .await
+        }
+        "session_recording_asset" | "session-recording-asset" => {
+            transfer_create_recording_asset_download_job(project_root, artifact, runtime, true)
+                .await
+        }
+        "session_frame_asset" | "session-frame-asset" | "frame_asset" | "frame-asset" => {
+            transfer_create_session_frame_download_job(project_root, artifact).await
+        }
+        "" => Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "missing artifact type",
+        )),
+        other => Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            format!("unsupported transfer artifact type: {other}"),
+        )),
+    }
+}
+
+async fn transfer_create_session_report_download_job(
+    project_root: PathBuf,
+    artifact: serde_json::Value,
+    runtime: &ControlRuntime,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    let session_id = optional_string_param(&artifact, &["session_id", "sessionId", "id"])
+        .unwrap_or_else(|| "current".to_string());
+    let (session_log, query_ctx) = {
+        let session = runtime.shared_session.read().await;
+        (session.session_log.clone(), session.query_ctx.clone())
+    };
+    let report = tokio::task::spawn_blocking({
+        let session_id = session_id.clone();
+        move || {
+            crate::web_gateway::session_report_zip_for_request(
+                &session_id,
+                session_log.as_ref(),
+                query_ctx.as_ref(),
+            )
+        }
+    })
+    .await
+    .map_err(|e| transfer_store_task_error(e, "session report transfer"))?
+    .map_err(|err| {
+        let (status, message) = match err {
+            crate::web_gateway::SessionReportZipError::InvalidSessionId => {
+                (400, "invalid session id".to_string())
+            }
+            crate::web_gateway::SessionReportZipError::NotFound => {
+                (404, "Session not found".to_string())
+            }
+            crate::web_gateway::SessionReportZipError::Build(error) => {
+                (500, format!("Failed to build report: {error}"))
+            }
+        };
+        crate::transfer_store::TransferStoreError::new(status, message)
+    })?;
+    tokio::task::spawn_blocking(move || {
+        crate::transfer_store::create_download_job_from_bytes(
+            &project_root,
+            report.bytes,
+            &report.filename,
+            "application/zip",
+            "session_report",
+            Some("Session report".to_string()),
+            Some(artifact),
+        )
+    })
+    .await
+    .map_err(|e| transfer_store_task_error(e, "session report transfer"))?
+}
+
+async fn transfer_create_staged_upload_download_job(
+    project_root: PathBuf,
+    artifact: serde_json::Value,
+    runtime: &ControlRuntime,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    let upload_id = transfer_id_param(&artifact);
+    if upload_id.is_empty() {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "missing upload id",
+        ));
+    }
+    let (upload_root, session_dir) = active_upload_handles(runtime)
+        .await
+        .map_err(|error| crate::transfer_store::TransferStoreError::new(500, error))?;
+    let upload_root = upload_root.unwrap_or_else(|| project_root.clone());
+    let session_dir =
+        session_dir.unwrap_or_else(|| crate::web_gateway::pending_upload_session_dir(&upload_root));
+    tokio::task::spawn_blocking(move || {
+        let descriptor = crate::upload_store::find_upload(&upload_id, &session_dir, &upload_root)
+            .ok_or_else(|| {
+            crate::transfer_store::TransferStoreError::new(404, "upload not found")
+        })?;
+        crate::transfer_store::create_download_job_from_path(
+            &project_root,
+            descriptor.path.clone(),
+            Some(descriptor.name.clone()),
+            Some(descriptor.mime.clone()),
+            Some("staged_upload".to_string()),
+            Some(format!("Staged upload {}", descriptor.name)),
+            Some(artifact),
+        )
+    })
+    .await
+    .map_err(|e| transfer_store_task_error(e, "staged upload transfer"))?
+}
+
+async fn transfer_create_recording_asset_download_job(
+    project_root: PathBuf,
+    artifact: serde_json::Value,
+    runtime: &ControlRuntime,
+    session_scoped: bool,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    let stream_name = optional_string_param(&artifact, &["stream_name", "streamName", "stream"])
+        .ok_or_else(|| {
+            crate::transfer_store::TransferStoreError::new(400, "missing stream_name")
+        })?;
+    if !recording_stream_name_is_safe(&stream_name) {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "invalid stream_name",
+        ));
+    }
+    let asset =
+        optional_string_param(&artifact, &["asset", "filename", "path"]).ok_or_else(|| {
+            crate::transfer_store::TransferStoreError::new(400, "missing recording asset")
+        })?;
+    if !recording_asset_name_is_safe(&asset) {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "invalid recording asset",
+        ));
+    }
+    let resolved = if session_scoped {
+        let session_id = string_param(&artifact, &["session_id", "sessionId", "id"]);
+        if !crate::web_gateway::session_lookup_id_is_safe(&session_id) {
+            return Err(crate::transfer_store::TransferStoreError::new(
+                400,
+                "invalid session id",
+            ));
+        }
+        let session_dir = crate::web_gateway::resolve_session_dir(&session_id);
+        resolve_session_recording_asset(session_dir, &stream_name, &asset)
+    } else {
+        let Some(registry) = active_recording_registry(runtime).await else {
+            return Err(crate::transfer_store::TransferStoreError::new(
+                404,
+                "recording registry unavailable",
+            ));
+        };
+        resolve_live_recording_asset(registry, &stream_name, &asset).await
+    }
+    .map_err(|(status, body)| {
+        crate::transfer_store::TransferStoreError::new(status, transfer_json_error_message(&body))
+    })?;
+    transfer_create_recording_asset_job(project_root, artifact, stream_name, asset, resolved).await
+}
+
+async fn transfer_create_recording_asset_job(
+    project_root: PathBuf,
+    artifact: serde_json::Value,
+    stream_name: String,
+    asset: String,
+    resolved: RecordingAsset,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    match resolved {
+        RecordingAsset::Bytes {
+            bytes,
+            content_type,
+            filename,
+        } => tokio::task::spawn_blocking(move || {
+            crate::transfer_store::create_download_job_from_bytes(
+                &project_root,
+                bytes,
+                &filename,
+                content_type,
+                "recording_asset",
+                Some(format!("{stream_name} {asset}")),
+                Some(artifact),
+            )
+        })
+        .await
+        .map_err(|e| transfer_store_task_error(e, "recording artifact transfer"))?,
+        RecordingAsset::File {
+            path,
+            content_type,
+            filename,
+        } => tokio::task::spawn_blocking(move || {
+            crate::transfer_store::create_download_job_from_path(
+                &project_root,
+                path,
+                Some(filename),
+                Some(content_type.to_string()),
+                Some("recording_asset".to_string()),
+                Some(format!("{stream_name} {asset}")),
+                Some(artifact),
+            )
+        })
+        .await
+        .map_err(|e| transfer_store_task_error(e, "recording artifact transfer"))?,
+    }
+}
+
+async fn transfer_create_session_frame_download_job(
+    project_root: PathBuf,
+    artifact: serde_json::Value,
+) -> Result<crate::transfer_store::TransferJob, crate::transfer_store::TransferStoreError> {
+    let session_id = string_param(&artifact, &["session_id", "sessionId", "id"]);
+    if !crate::web_gateway::session_lookup_id_is_safe(&session_id) {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "invalid session id",
+        ));
+    }
+    let filename = optional_string_param(&artifact, &["filename", "frame", "asset", "name"])
+        .ok_or_else(|| {
+            crate::transfer_store::TransferStoreError::new(400, "missing frame filename")
+        })?;
+    if !session_frame_filename_is_safe(&filename) {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            400,
+            "invalid frame filename",
+        ));
+    }
+    let session_dir = crate::web_gateway::resolve_session_dir(&session_id)
+        .ok_or_else(|| crate::transfer_store::TransferStoreError::new(404, "session not found"))?;
+    let path = session_dir.join("frames").join(&filename);
+    if !path.exists() {
+        return Err(crate::transfer_store::TransferStoreError::new(
+            404,
+            "frame not found",
+        ));
+    }
+    let content_type = if filename.ends_with(".png") {
+        "image/png"
+    } else {
+        "image/jpeg"
+    };
+    tokio::task::spawn_blocking(move || {
+        crate::transfer_store::create_download_job_from_path(
+            &project_root,
+            path,
+            Some(filename.clone()),
+            Some(content_type.to_string()),
+            Some("session_frame_asset".to_string()),
+            Some(format!("{session_id} {filename}")),
+            Some(artifact),
+        )
+    })
+    .await
+    .map_err(|e| transfer_store_task_error(e, "session frame transfer"))?
+}
+
 async fn api_transfer_jobs_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {
     let project_root = match transfer_project_root(runtime) {
         Ok(project_root) => project_root,
@@ -5173,83 +5558,14 @@ async fn api_transfer_job_create_response(
     };
     let result = match kind {
         crate::transfer_store::TransferKind::Download => {
-            let path = string_param(&params, &["path", "source_path", "sourcePath", "source"]);
-            if path.is_empty() {
-                return transfer_http_error_response(id, 400, "missing path", "transfer create");
-            }
-            tokio::task::spawn_blocking(move || {
-                crate::transfer_store::create_download_job(&project_root, &path)
-            })
-            .await
+            transfer_create_download_job_from_params(project_root, params, runtime).await
         }
         crate::transfer_store::TransferKind::Upload => {
-            let destination = string_param(
-                &params,
-                &["destination", "destination_path", "destinationPath", "path"],
-            );
-            if destination.is_empty() {
-                return transfer_http_error_response(
-                    id,
-                    400,
-                    "missing destination",
-                    "transfer create",
-                );
-            }
-            let original_name = optional_string_param(
-                &params,
-                &[
-                    "name",
-                    "filename",
-                    "file_name",
-                    "fileName",
-                    "original_name",
-                    "originalName",
-                ],
-            )
-            .unwrap_or_else(|| "upload.bin".to_string());
-            let mime = optional_string_param(&params, &["mime", "content_type", "contentType"])
-                .unwrap_or_else(|| "application/octet-stream".to_string());
-            let total_size = match optional_u64_param(
-                &params,
-                &["total_size", "totalSize", "total_bytes", "totalBytes", "size"],
-            ) {
-                Ok(value) => value,
-                Err(error) => return transfer_http_error_response(id, 400, error, "transfer create"),
-            };
-            let conflict = optional_string_param(
-                &params,
-                &["conflict", "conflict_policy", "conflictPolicy", "if_exists", "ifExists"],
-            )
-            .unwrap_or_else(|| "fail".to_string());
-            let conflict_policy =
-                match crate::transfer_store::TransferConflictPolicy::from_str(
-                    &conflict.to_ascii_lowercase(),
-                ) {
-                    Some(policy) => policy,
-                    None => {
-                        return transfer_http_error_response(
-                            id,
-                            400,
-                            "conflict policy must be fail, rename, or overwrite",
-                            "transfer create",
-                        );
-                    }
-                };
-            tokio::task::spawn_blocking(move || {
-                crate::transfer_store::create_upload_job(
-                    &project_root,
-                    &destination,
-                    &original_name,
-                    &mime,
-                    total_size,
-                    conflict_policy,
-                )
-            })
-            .await
+            transfer_create_upload_job_from_params(project_root, params).await
         }
     };
     match result {
-        Ok(Ok(job)) => http_body_response(
+        Ok(job) => http_body_response(
             id,
             200,
             serde_json::json!({
@@ -5259,13 +5575,7 @@ async fn api_transfer_job_create_response(
             .to_string(),
             "transfer create",
         ),
-        Ok(Err(error)) => transfer_store_error_response(id, error, "transfer create"),
-        Err(e) => serde_json::json!({
-            "t": "response",
-            "id": id,
-            "ok": false,
-            "error": format!("transfer create task failed: {e}"),
-        }),
+        Err(error) => transfer_store_error_response(id, error, "transfer create"),
     }
 }
 
@@ -5315,7 +5625,9 @@ async fn api_transfer_upload_commit_response(
 ) -> serde_json::Value {
     let project_root = match transfer_project_root(runtime) {
         Ok(project_root) => project_root,
-        Err(body) => return http_body_response(id, 404, body.to_string(), "transfer upload commit"),
+        Err(body) => {
+            return http_body_response(id, 404, body.to_string(), "transfer upload commit")
+        }
     };
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let job_id = transfer_id_param(&params);
@@ -8814,9 +9126,18 @@ mod tests {
         assert_eq!(status["result"]["api_transfer_jobs_available"], false);
         assert_eq!(status["result"]["api_transfer_job_create_available"], false);
         assert_eq!(status["result"]["api_transfer_job_delete_available"], false);
-        assert_eq!(status["result"]["api_transfer_download_read_available"], false);
-        assert_eq!(status["result"]["api_transfer_upload_chunk_available"], false);
-        assert_eq!(status["result"]["api_transfer_upload_commit_available"], false);
+        assert_eq!(
+            status["result"]["api_transfer_download_read_available"],
+            false
+        );
+        assert_eq!(
+            status["result"]["api_transfer_upload_chunk_available"],
+            false
+        );
+        assert_eq!(
+            status["result"]["api_transfer_upload_commit_available"],
+            false
+        );
         assert_eq!(status["result"]["api_fs_stat_available"], true);
         assert_eq!(status["result"]["api_fs_list_available"], true);
         assert_eq!(status["result"]["api_fs_mkdir_available"], true);
@@ -10796,7 +11117,10 @@ mod tests {
         let status = status_response_frame("transfer-status".to_string(), &rt);
         assert_eq!(status["result"]["api_transfer_jobs_available"], true);
         assert_eq!(status["result"]["api_transfer_job_create_available"], true);
-        assert_eq!(status["result"]["api_transfer_download_read_available"], true);
+        assert_eq!(
+            status["result"]["api_transfer_download_read_available"],
+            true
+        );
 
         let create = api_transfer_job_create_response(
             "transfer-create".to_string(),
@@ -10847,6 +11171,265 @@ mod tests {
             stream.result["total_size"].as_u64(),
             Some("durable download fixture".len() as u64)
         );
+    }
+
+    #[tokio::test]
+    async fn transfer_session_report_artifact_materializes_and_reads_byte_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let session_dir = dir.path().join("session-report");
+        std::fs::create_dir_all(&project).unwrap();
+        let log = crate::session_log::SessionLog::open(session_dir.clone()).unwrap();
+        std::fs::write(session_dir.join("summary.json"), "{\"ok\":true}\n").unwrap();
+        std::fs::create_dir_all(session_dir.join("turns")).unwrap();
+        std::fs::write(
+            session_dir.join("turns").join("turn_001_stdout.txt"),
+            "hello\n",
+        )
+        .unwrap();
+
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+        {
+            let mut session = rt.shared_session.write().await;
+            session.session_log = Some(Arc::new(std::sync::Mutex::new(log)));
+        }
+
+        let create = api_transfer_job_create_response(
+            "report-transfer-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "download",
+                "artifact": {
+                    "type": "session_report",
+                    "session_id": "current",
+                },
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(create["result"]["ok"], true);
+        assert_eq!(create["result"]["job"]["source_kind"], "session_report");
+        assert_eq!(create["result"]["job"]["source_label"], "Session report");
+        assert_eq!(create["result"]["job"]["managed_source"], true);
+        assert_eq!(
+            create["result"]["job"]["artifact"]["type"],
+            "session_report"
+        );
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+        let total_size = create["result"]["job"]["total_size"].as_u64().unwrap();
+
+        let read = api_transfer_download_read_task_response(
+            "report-transfer-read".to_string(),
+            Some(&serde_json::json!({
+                "id": job_id,
+                "offset": 0,
+                "length": total_size,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(read.done);
+        let stream = read.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "application/zip");
+        assert!(stream.filename.as_deref().unwrap_or("").ends_with(".zip"));
+        let mut zip = zip::ZipArchive::new(std::io::Cursor::new(stream.bytes)).unwrap();
+        assert!(zip.by_name("summary.json").is_ok());
+        assert!(zip.by_name("turns/turn_001_stdout.txt").is_ok());
+    }
+
+    #[tokio::test]
+    async fn transfer_staged_upload_artifact_reads_byte_stream() {
+        let project = tempfile::tempdir().unwrap();
+        let mut rt = runtime();
+        rt.project_root = Some(project.path().to_path_buf());
+        let bytes = b"dashboard raw upload bytes";
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(tmp.path(), bytes).unwrap();
+
+        let (status, body) = crate::web_gateway::current_upload_commit_response_body(
+            Some(project.path()),
+            None,
+            Some(rt.session_id.as_str()),
+            "raw.txt",
+            "text/plain",
+            crate::upload_store::UploadDestination::Task,
+            tmp,
+            bytes.len(),
+            &rt.bus,
+        );
+        assert_eq!(status, "200 OK");
+        let descriptor: crate::upload_store::UploadDescriptor =
+            serde_json::from_str(&body).unwrap();
+
+        let create = api_transfer_job_create_response(
+            "staged-transfer-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "download",
+                "artifact": {
+                    "type": "staged_upload",
+                    "id": descriptor.id,
+                },
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(create["result"]["ok"], true);
+        assert_eq!(create["result"]["job"]["source_kind"], "staged_upload");
+        assert_eq!(
+            create["result"]["job"]["source_label"],
+            "Staged upload raw.txt"
+        );
+        assert_eq!(create["result"]["job"]["filename"], "raw.txt");
+        assert_eq!(create["result"]["job"]["managed_source"], false);
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+
+        let read = api_transfer_download_read_task_response(
+            "staged-transfer-read".to_string(),
+            Some(&serde_json::json!({
+                "id": job_id,
+                "offset": 10,
+                "length": 6,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(read.done);
+        let stream = read.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "text/plain");
+        assert_eq!(stream.filename.as_deref(), Some("raw.txt"));
+        assert_eq!(stream.bytes, &bytes[10..16]);
+        assert_eq!(stream.result["resumable"], true);
+    }
+
+    #[tokio::test]
+    async fn transfer_recording_asset_artifact_reads_byte_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        let session_dir = dir.path().join("recording-session");
+        let stream_dir = session_dir.join("recordings").join("display_0");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&stream_dir).unwrap();
+        std::fs::write(stream_dir.join("segments.csv"), "seg_00000.mp4,0,1.25\n").unwrap();
+        let media = b"recording segment bytes";
+        std::fs::write(stream_dir.join("seg_00000.mp4"), media).unwrap();
+
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+        {
+            let mut session = rt.shared_session.write().await;
+            session.recording_registry = Some(Arc::new(tokio::sync::RwLock::new(
+                crate::recording::RecordingRegistry::new(
+                    &session_dir,
+                    crate::project::RecordingConfig::default(),
+                ),
+            )));
+        }
+
+        let create = api_transfer_job_create_response(
+            "recording-transfer-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "download",
+                "artifact": {
+                    "type": "recording_asset",
+                    "stream_name": "display_0",
+                    "asset": "seg_00000.mp4",
+                },
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(create["result"]["ok"], true);
+        assert_eq!(create["result"]["job"]["source_kind"], "recording_asset");
+        assert_eq!(
+            create["result"]["job"]["source_label"],
+            "display_0 seg_00000.mp4"
+        );
+        assert_eq!(create["result"]["job"]["managed_source"], false);
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+
+        let read = api_transfer_download_read_task_response(
+            "recording-transfer-read".to_string(),
+            Some(&serde_json::json!({
+                "id": job_id,
+                "offset": 10,
+                "length": 7,
+            })),
+            &rt,
+        )
+        .await;
+        assert!(read.done);
+        let stream = read.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "video/mp4");
+        assert_eq!(stream.filename.as_deref(), Some("seg_00000.mp4"));
+        assert_eq!(stream.bytes, b"segment");
+        assert_eq!(stream.result["range_start"], 10);
+        assert_eq!(stream.result["range_end"], 17);
+    }
+
+    #[tokio::test]
+    async fn transfer_session_frame_artifact_reads_byte_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let project = dir.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let session_id = format!(
+            "dashboard-frame-transfer-test-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let session_dir = crate::platform::home_dir()
+            .join(".intendant")
+            .join("logs")
+            .join(&session_id);
+        let frames_dir = session_dir.join("frames");
+        std::fs::create_dir_all(&frames_dir).unwrap();
+        let frame_bytes = b"dashboard frame bytes";
+        std::fs::write(frames_dir.join("ann-test.png"), frame_bytes).unwrap();
+
+        let mut rt = runtime();
+        rt.project_root = Some(project);
+
+        let create = api_transfer_job_create_response(
+            "frame-transfer-create".to_string(),
+            Some(&serde_json::json!({
+                "kind": "download",
+                "artifact": {
+                    "type": "session_frame_asset",
+                    "session_id": &session_id,
+                    "filename": "ann-test.png",
+                },
+            })),
+            &rt,
+        )
+        .await;
+        assert_eq!(create["result"]["ok"], true);
+        assert_eq!(
+            create["result"]["job"]["source_kind"],
+            "session_frame_asset"
+        );
+        assert_eq!(create["result"]["job"]["filename"], "ann-test.png");
+        assert_eq!(create["result"]["job"]["managed_source"], false);
+        let job_id = create["result"]["job"]["id"].as_str().unwrap().to_string();
+
+        let read = api_transfer_download_read_task_response(
+            "frame-transfer-read".to_string(),
+            Some(&serde_json::json!({
+                "id": job_id,
+                "offset": 10,
+                "length": 5,
+            })),
+            &rt,
+        )
+        .await;
+        let _ = std::fs::remove_dir_all(&session_dir);
+        assert!(read.done);
+        let stream = read.byte_stream.unwrap();
+        assert_eq!(stream.content_type, "image/png");
+        assert_eq!(stream.filename.as_deref(), Some("ann-test.png"));
+        assert_eq!(stream.bytes, b"frame");
+        assert_eq!(stream.result["range_start"], 10);
+        assert_eq!(stream.result["range_end"], 15);
     }
 
     #[tokio::test]
@@ -10958,7 +11541,10 @@ mod tests {
         assert_eq!(response.frame["t"], "response");
         assert_eq!(response.frame["ok"], true);
         assert_eq!(response.frame["result"]["ok"], true);
-        assert_eq!(response.frame["result"]["jobs"].as_array().unwrap().len(), 0);
+        assert_eq!(
+            response.frame["result"]["jobs"].as_array().unwrap().len(),
+            0
+        );
     }
 
     #[test]
