@@ -14617,6 +14617,86 @@ pub(crate) fn dashboard_fs_list_response_body(raw: &str) -> Result<String, Strin
     list_dashboard_fs_dir(raw).map(|body| body.to_string())
 }
 
+#[derive(Debug)]
+struct DashboardFsReadResponse {
+    filename: String,
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+fn dashboard_fs_content_type(path: &Path) -> String {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("css") => "text/css; charset=utf-8",
+        Some("csv") => "text/csv; charset=utf-8",
+        Some("html") | Some("htm") => "text/html; charset=utf-8",
+        Some("json") => "application/json",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("md") | Some("markdown") | Some("txt") | Some("toml") | Some("yaml") | Some("yml") => {
+            "text/plain; charset=utf-8"
+        }
+        Some("png") => "image/png",
+        Some("jpg") | Some("jpeg") => "image/jpeg",
+        Some("gif") => "image/gif",
+        Some("svg") => "image/svg+xml",
+        Some("webp") => "image/webp",
+        Some("wasm") => "application/wasm",
+        Some("zip") => "application/zip",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+fn dashboard_fs_io_status(error: &std::io::Error) -> &'static str {
+    match error.kind() {
+        std::io::ErrorKind::NotFound => "404 Not Found",
+        std::io::ErrorKind::PermissionDenied => "403 Forbidden",
+        _ => "500 Internal Server Error",
+    }
+}
+
+fn dashboard_fs_read_file(raw: &str) -> Result<DashboardFsReadResponse, (String, String)> {
+    let path = expand_dashboard_fs_path(raw).map_err(|e| ("400 Bad Request".to_string(), e))?;
+    let canonical = std::fs::canonicalize(&path).map_err(|e| {
+        (
+            dashboard_fs_io_status(&e).to_string(),
+            format!("{} is not accessible: {}", path.display(), e),
+        )
+    })?;
+    let metadata = std::fs::metadata(&canonical).map_err(|e| {
+        (
+            dashboard_fs_io_status(&e).to_string(),
+            format!("{} is not accessible: {}", canonical.display(), e),
+        )
+    })?;
+    if !metadata.is_file() {
+        return Err((
+            "400 Bad Request".to_string(),
+            format!("{} is not a file", canonical.display()),
+        ));
+    }
+    let bytes = std::fs::read(&canonical).map_err(|e| {
+        (
+            dashboard_fs_io_status(&e).to_string(),
+            format!("could not read {}: {}", canonical.display(), e),
+        )
+    })?;
+    let raw_name = canonical
+        .file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| "download.bin".to_string());
+    let filename = crate::upload_store::sanitize_name(&raw_name);
+    Ok(DashboardFsReadResponse {
+        filename,
+        content_type: dashboard_fs_content_type(&canonical),
+        bytes,
+    })
+}
+
 fn mkdir_dashboard_fs_path(raw: &str) -> Result<serde_json::Value, (String, String)> {
     let path = expand_dashboard_fs_path(raw).map_err(|e| ("400 Bad Request".to_string(), e))?;
     if path.exists() {
@@ -19630,6 +19710,34 @@ pub fn spawn_web_gateway(
                             Err(e) => json_error("400 Bad Request", e),
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("GET")
+                        && request_line.contains(" /api/fs/read")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let path = query_param(&request_line, "path").unwrap_or_default();
+                        match dashboard_fs_read_file(&path) {
+                            Ok(file) => {
+                                let header = format!(
+                                    "HTTP/1.1 200 OK\r\n\
+                                     Content-Type: {}\r\n\
+                                     Content-Length: {}\r\n\
+                                     Content-Disposition: attachment; filename=\"{}\"\r\n\
+                                     Cache-Control: no-cache\r\n\
+                                     Access-Control-Allow-Origin: *\r\n\
+                                     Connection: close\r\n\
+                                     \r\n",
+                                    file.content_type,
+                                    file.bytes.len(),
+                                    file.filename.replace('"', ""),
+                                );
+                                let _ = stream.write_all(header.as_bytes()).await;
+                                let _ = stream.write_all(&file.bytes).await;
+                            }
+                            Err((status, message)) => {
+                                let response = json_error(&status, message);
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                        }
                     } else if request_line.starts_with("POST")
                         && request_line.contains(" /api/fs/mkdir")
                     {
@@ -25255,6 +25363,28 @@ mod tests {
 
         assert_eq!(result["created"], false);
         assert_eq!(result["already_exists"], true);
+    }
+
+    #[test]
+    fn dashboard_fs_read_file_returns_attachment_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("hello.txt");
+        std::fs::write(&file, b"hello over mtls").unwrap();
+
+        let result = dashboard_fs_read_file(file.to_str().unwrap()).unwrap();
+
+        assert_eq!(result.filename, "hello.txt");
+        assert_eq!(result.content_type, "text/plain; charset=utf-8");
+        assert_eq!(result.bytes, b"hello over mtls");
+    }
+
+    #[test]
+    fn dashboard_fs_read_file_rejects_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = dashboard_fs_read_file(dir.path().to_str().unwrap()).unwrap_err();
+
+        assert_eq!(err.0, "400 Bad Request");
+        assert!(err.1.contains("is not a file"));
     }
 
     #[test]
@@ -33006,6 +33136,35 @@ mod tests {
         let head = String::from_utf8_lossy(&resp[..split]).into_owned();
         assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "got: {head}");
         assert_eq!(resp.len(), split, "HEAD must carry no body");
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_dashboard_fs_read_serves_file_bytes() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("download.txt");
+        std::fs::write(&file, b"download through dashboard").unwrap();
+        let req = format!(
+            "GET /api/fs/read?path={} HTTP/1.1\r\nHost: localhost\r\n\r\n",
+            file.display()
+        );
+
+        let resp = http_request_bytes(port, &req).await;
+        let split = resp.windows(4).position(|w| w == b"\r\n\r\n").unwrap() + 4;
+        let head = String::from_utf8_lossy(&resp[..split]).into_owned();
+
+        assert!(head.starts_with("HTTP/1.1 200 OK\r\n"), "got: {head}");
+        assert!(
+            head.contains("Content-Type: text/plain; charset=utf-8\r\n"),
+            "got: {head}"
+        );
+        assert!(
+            head.contains("Content-Disposition: attachment; filename=\"download.txt\"\r\n"),
+            "got: {head}"
+        );
+        assert_eq!(&resp[split..], b"download through dashboard");
 
         handle.abort();
     }
