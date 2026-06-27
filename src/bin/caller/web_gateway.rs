@@ -94,6 +94,55 @@ static INTENDANT_SESSION_LIST_CACHE: OnceLock<
     Mutex<HashMap<String, IntendantSessionListCacheEntry>>,
 > = OnceLock::new();
 
+const TLS_FAILURE_LOG_INTERVAL_SECS: u64 = 30;
+
+#[derive(Debug)]
+struct TlsFailureLogEntry {
+    last_logged: std::time::Instant,
+    suppressed: u64,
+}
+
+type TlsFailureLogState = Arc<Mutex<HashMap<String, TlsFailureLogEntry>>>;
+
+fn log_tls_failure_rate_limited(state: &TlsFailureLogState, peer: &str, kind: &str, detail: &str) {
+    let now = std::time::Instant::now();
+    let key = format!("{kind}|{peer}|{detail}");
+    let mut map = state.lock().unwrap_or_else(|e| e.into_inner());
+    match map.get_mut(&key) {
+        Some(entry)
+            if now.duration_since(entry.last_logged)
+                < std::time::Duration::from_secs(TLS_FAILURE_LOG_INTERVAL_SECS) =>
+        {
+            entry.suppressed = entry.suppressed.saturating_add(1);
+        }
+        Some(entry) => {
+            let suppressed = entry.suppressed;
+            entry.last_logged = now;
+            entry.suppressed = 0;
+            drop(map);
+            if suppressed > 0 {
+                eprintln!(
+                    "[web_gateway] {kind} from {peer}: {detail} \
+                     (suppressed {suppressed} repeats in the last {TLS_FAILURE_LOG_INTERVAL_SECS}s)"
+                );
+            } else {
+                eprintln!("[web_gateway] {kind} from {peer}: {detail}");
+            }
+        }
+        None => {
+            map.insert(
+                key,
+                TlsFailureLogEntry {
+                    last_logged: now,
+                    suppressed: 0,
+                },
+            );
+            drop(map);
+            eprintln!("[web_gateway] {kind} from {peer}: {detail}");
+        }
+    }
+}
+
 const EXTERNAL_SESSION_SCAN_LIMIT: usize = 2_000;
 const EXTERNAL_SESSION_READ_LIMIT: u64 = 512 * 1024;
 const CODEX_SESSION_INDEX_TAIL_READ_LIMIT: u64 = 2 * 1024 * 1024;
@@ -16510,6 +16559,7 @@ pub fn spawn_web_gateway(
     // rewritten HTML is gateway-scoped (unlike the `include_*!` constants
     // behind `embedded_static_asset`), so its cache lives here.
     let app_html_cache: Arc<OnceLock<(String, Vec<u8>)>> = Arc::new(OnceLock::new());
+    let tls_failure_log_state: TlsFailureLogState = Arc::new(Mutex::new(HashMap::new()));
 
     tokio::spawn(async move {
         let port = listener.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -16563,6 +16613,7 @@ pub fn spawn_web_gateway(
             let worktree_inventory_cache = worktree_inventory_cache.clone();
             let tls_client_cert_required = tls_client_cert_required;
             let source_hint = peer_addr.ip().to_string();
+            let tls_failure_log_state = Arc::clone(&tls_failure_log_state);
             // `TlsAcceptor` wraps an `Arc<ServerConfig>`, so cloning is cheap
             // (one Arc bump). `None` when TLS is disabled.
             let tls_acceptor = tls_acceptor.clone();
@@ -16724,13 +16775,11 @@ pub fn spawn_web_gateway(
                 // cleartext is served exactly as before.
                 if tls_acceptor.is_some() && !is_tls {
                     use tokio::io::AsyncWriteExt;
-                    let peer = raw_stream
-                        .peer_addr()
-                        .map(|a| a.to_string())
-                        .unwrap_or_else(|_| "<unknown>".to_string());
-                    eprintln!(
-                        "[web_gateway] strict TLS: rejecting cleartext HTTP/WS connection from \
-                         {peer} (dashboard is HTTPS/WSS-only when --tls is enabled)"
+                    log_tls_failure_rate_limited(
+                        &tls_failure_log_state,
+                        &source_hint,
+                        "strict TLS cleartext reject",
+                        "dashboard is HTTPS/WSS-only; use https:// or wss://",
                     );
                     let body = "This endpoint requires TLS. Use https:// (or wss://) instead of \
                                 http:// / ws://.\n";
@@ -16762,7 +16811,12 @@ pub fn spawn_web_gateway(
                     let mut tls_stream = match acceptor.accept(raw_stream).await {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("[web_gateway] TLS handshake failed: {e}");
+                            log_tls_failure_rate_limited(
+                                &tls_failure_log_state,
+                                &source_hint,
+                                "TLS handshake failed",
+                                &e.to_string(),
+                            );
                             return;
                         }
                     };

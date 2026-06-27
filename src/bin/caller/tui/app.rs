@@ -1223,7 +1223,10 @@ impl App {
                     .unwrap_or("(cleared — managed falls back to vanilla command)");
                 self.log(
                     LogLevel::Info,
-                    format!("Codex managed-fork command → {} (applies on next task)", label),
+                    format!(
+                        "Codex managed-fork command → {} (applies on next task)",
+                        label
+                    ),
                 );
             }
             ControlMsg::SetCodexSandbox { ref mode } => {

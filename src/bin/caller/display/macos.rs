@@ -292,7 +292,7 @@ impl DisplayBackend for MacOSBackend {
                         .map_err(|()| CallerError::Display("CGEvent keyboard failed".into()))?;
                     let flags = build_modifier_flags(shift, ctrl, alt, meta);
                     ev.set_flags(flags);
-                    ev.post(CGEventTapLocation::HID);
+                    post_cg_event(&ev);
                 }
             }
             InputEvent::KeyUp {
@@ -308,7 +308,7 @@ impl DisplayBackend for MacOSBackend {
                         .map_err(|()| CallerError::Display("CGEvent keyboard failed".into()))?;
                     let flags = build_modifier_flags(shift, ctrl, alt, meta);
                     ev.set_flags(flags);
-                    ev.post(CGEventTapLocation::HID);
+                    post_cg_event(&ev);
                 }
             }
             InputEvent::MouseMove { x, y, buttons } => {
@@ -324,7 +324,7 @@ impl DisplayBackend for MacOSBackend {
                 };
                 let ev = CGEvent::new_mouse_event(source, event_type, point, button)
                     .map_err(|()| CallerError::Display("CGEvent mouse move failed".into()))?;
-                ev.post(CGEventTapLocation::HID);
+                post_cg_event(&ev);
             }
             InputEvent::MouseDown { x, y, b } => {
                 let point = CGPoint::new(x * width, y * height);
@@ -338,7 +338,7 @@ impl DisplayBackend for MacOSBackend {
                         2,
                     );
                 }
-                ev.post(CGEventTapLocation::HID);
+                post_cg_event(&ev);
             }
             InputEvent::MouseUp { x, y, b } => {
                 let point = CGPoint::new(x * width, y * height);
@@ -351,7 +351,7 @@ impl DisplayBackend for MacOSBackend {
                         2,
                     );
                 }
-                ev.post(CGEventTapLocation::HID);
+                post_cg_event(&ev);
             }
             InputEvent::Scroll { dx, dy, .. } => {
                 // CGEvent scroll: positive dy scrolls up (opposite of browser convention)
@@ -367,7 +367,7 @@ impl DisplayBackend for MacOSBackend {
                         0,
                     )
                     .map_err(|()| CallerError::Display("CGEvent scroll failed".into()))?;
-                    ev.post(CGEventTapLocation::HID);
+                    post_cg_event(&ev);
                 }
             }
         }
@@ -384,6 +384,12 @@ impl DisplayBackend for MacOSBackend {
     fn kind(&self) -> &'static str {
         "macos"
     }
+}
+
+fn post_cg_event(event: &CGEvent) {
+    let started = std::time::Instant::now();
+    event.post(CGEventTapLocation::HID);
+    super::input_telemetry::record_macos_cgevent_post(started.elapsed());
 }
 
 /// Build CGEventFlags from the modifier booleans.

@@ -153,11 +153,7 @@ pub(crate) fn hex_color(css: &str) -> Option<Color> {
         return None;
     }
     let channel = |range: std::ops::Range<usize>| u8::from_str_radix(hex.get(range)?, 16).ok();
-    Some(Color::rgb(
-        channel(0..2)?,
-        channel(2..4)?,
-        channel(4..6)?,
-    ))
+    Some(Color::rgb(channel(0..2)?, channel(2..4)?, channel(4..6)?))
 }
 
 pub(crate) fn percent(value: f32, max: f32) -> f32 {

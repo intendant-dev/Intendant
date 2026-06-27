@@ -8297,7 +8297,8 @@ impl IntendantServer {
         // markers and branch charters are visible in the status payload; the
         // wire shape stays back-compatible because `ext` serializes only when
         // non-empty.
-        if let Some(document) = merged_fission_ledger_document_for_session(&ledger_dirs, &session_id)
+        if let Some(document) =
+            merged_fission_ledger_document_for_session(&ledger_dirs, &session_id)
         {
             if let Some(obj) = value.as_object_mut() {
                 obj.insert(
@@ -9430,7 +9431,12 @@ impl IntendantServer {
                 // Waiting without a branch watches for ANY branch of the
                 // group to become terminal.
                 return self
-                    .fission_control_wait(group_id, None, params.timeout_s, params.session_id.as_deref())
+                    .fission_control_wait(
+                        group_id,
+                        None,
+                        params.timeout_s,
+                        params.session_id.as_deref(),
+                    )
                     .await;
             }
             return format!("fission_control op={op} requires branch_session_id");
@@ -12501,10 +12507,13 @@ mod tests {
                 .expect("rewind_context description");
             assert!(rewind_description.contains("routine noise-triggered hygiene"));
             assert!(rewind_description.contains("at any pressure including ok"));
-            assert!(rewind_description.contains("crystallizing its durable facts in the primer itself"));
+            assert!(
+                rewind_description.contains("crystallizing its durable facts in the primer itself")
+            );
             assert!(rewind_description.contains("rewind in the same turn"));
-            assert!(rewind_description
-                .contains("do not use during ordinary startup/search work when nothing noisy happened"));
+            assert!(rewind_description.contains(
+                "do not use during ordinary startup/search work when nothing noisy happened"
+            ));
             assert!(!rewind_description.contains("ordinary low-pressure"));
         });
     }
@@ -12517,7 +12526,10 @@ mod tests {
         let mut manual = Vec::new();
         append_manual_http_tool_definitions(&mut manual, true, None);
         for (name, attr) in [
-            ("rewind_context", IntendantServer::rewind_context_tool_attr()),
+            (
+                "rewind_context",
+                IntendantServer::rewind_context_tool_attr(),
+            ),
             (
                 "list_rewind_anchors",
                 IntendantServer::list_rewind_anchors_tool_attr(),
@@ -16495,10 +16507,20 @@ mod tests {
 
     #[test]
     fn fission_tool_profile_gating_matrix() {
-        for name in ["fission_spawn", "fission_control", "claim_fission_canonical"] {
+        for name in [
+            "fission_spawn",
+            "fission_control",
+            "claim_fission_canonical",
+        ] {
             // Hidden everywhere while managed context is off, including the
             // permissive default/full/unknown profiles.
-            for profile in [None, Some("full"), Some("core"), Some("screen"), Some("managed")] {
+            for profile in [
+                None,
+                Some("full"),
+                Some("core"),
+                Some("screen"),
+                Some("managed"),
+            ] {
                 assert!(
                     !tool_allowed_for_profile(name, false, profile),
                     "{name} must be hidden when unmanaged (profile {profile:?})"
@@ -16545,7 +16567,11 @@ mod tests {
                     .iter()
                     .filter_map(|tool| tool["name"].as_str())
                     .collect();
-                for name in ["fission_spawn", "fission_control", "claim_fission_canonical"] {
+                for name in [
+                    "fission_spawn",
+                    "fission_control",
+                    "claim_fission_canonical",
+                ] {
                     assert!(
                         names.contains(&name),
                         "{name} missing from managed `{profile}` profile listing"
@@ -16561,7 +16587,11 @@ mod tests {
                     .iter()
                     .filter_map(|tool| tool["name"].as_str())
                     .collect();
-                for name in ["fission_spawn", "fission_control", "claim_fission_canonical"] {
+                for name in [
+                    "fission_spawn",
+                    "fission_control",
+                    "claim_fission_canonical",
+                ] {
                     assert!(
                         !unmanaged_names.contains(&name),
                         "{name} must be hidden from unmanaged `{profile}` profile listing"
@@ -16710,7 +16740,10 @@ mod tests {
             let branches = params["branches"].as_array().expect("branches array");
             assert_eq!(branches.len(), 2);
             assert_eq!(branches[0]["objective"], "refactor parser");
-            assert_eq!(branches[0]["write_scope"], serde_json::json!(["src/parser.rs"]));
+            assert_eq!(
+                branches[0]["write_scope"],
+                serde_json::json!(["src/parser.rs"])
+            );
             assert_eq!(branches[0]["name"], "parser");
             assert_eq!(branches[1]["objective"], "survey docs");
             assert!(branches[1].get("write_scope").is_none());
@@ -16823,12 +16856,8 @@ mod tests {
         assert!(message.contains("rewind_backout"));
         assert!(message.contains("raw_log"));
 
-        let missing_group = render_fission_wait_outcome(
-            WaitOutcome::GroupNotFound,
-            "fission-missing",
-            None,
-            60,
-        );
+        let missing_group =
+            render_fission_wait_outcome(WaitOutcome::GroupNotFound, "fission-missing", None, 60);
         assert!(missing_group.starts_with("fission_control wait failed"));
         assert!(missing_group.contains("`fission-missing` was not found"));
 
@@ -16851,8 +16880,13 @@ mod tests {
             .unwrap();
         rt.block_on(async {
             let dir = tempdir().unwrap();
-            let group_id =
-                seed_fission_group(dir.path(), "fsb-wait-parent", "call-1", "fsb-wait-child", "completed");
+            let group_id = seed_fission_group(
+                dir.path(),
+                "fsb-wait-parent",
+                "call-1",
+                "fsb-wait-child",
+                "completed",
+            );
             let detached_group_id = seed_fission_group(
                 dir.path(),
                 "fsb-wait-parent",
@@ -17321,9 +17355,7 @@ mod tests {
             // document `ext` state (the spawn-time charter).
             assert_eq!(
                 value.pointer("/fission_ledger/groups/0/branches/0/session_id"),
-                Some(&serde_json::Value::String(
-                    "fsb-status-branch".to_string()
-                ))
+                Some(&serde_json::Value::String("fsb-status-branch".to_string()))
             );
             assert_eq!(
                 value.pointer("/fission_ledger/ext/groups/0/branches/0/charter/objective"),
@@ -17334,9 +17366,7 @@ mod tests {
             // Lineage ledger merged from the same non-primary dir.
             assert_eq!(
                 value.pointer("/lineage_ledger/groups/0/branches/0/session_id"),
-                Some(&serde_json::Value::String(
-                    "fsb-status-branch".to_string()
-                ))
+                Some(&serde_json::Value::String("fsb-status-branch".to_string()))
             );
 
             match prior_home {

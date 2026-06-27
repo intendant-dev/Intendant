@@ -716,14 +716,7 @@ mod tests {
 
         let mut glow_ring = GpuFrame::default();
         let mut identity = |v: Vec3| Some((Vec2::new(v.x, v.y), 1.0));
-        glow_ring.add_glow_ring(
-            &mut identity,
-            Vec3::ZERO,
-            1.0,
-            color,
-            Plane::XY,
-            0.01,
-        );
+        glow_ring.add_glow_ring(&mut identity, Vec3::ZERO, 1.0, color, Plane::XY, 0.01);
         assert_eq!(glow_ring.line_vertices.len(), 128);
         assert_eq!(glow_ring.tri_vertices.len(), 64 * 6);
     }

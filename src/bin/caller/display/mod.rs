@@ -37,6 +37,7 @@ pub mod capture;
 pub mod clipboard;
 pub mod encode;
 pub mod forward;
+pub mod input_telemetry;
 pub mod keymap;
 #[cfg(target_os = "macos")]
 pub mod macos;
@@ -251,6 +252,19 @@ pub enum InputEvent {
     },
     #[serde(rename = "sc")]
     Scroll { x: f64, y: f64, dx: f64, dy: f64 },
+}
+
+impl InputEvent {
+    pub(crate) fn wire_tag(&self) -> &'static str {
+        match self {
+            Self::KeyDown { .. } => "kd",
+            Self::KeyUp { .. } => "ku",
+            Self::MouseDown { .. } => "md",
+            Self::MouseUp { .. } => "mu",
+            Self::MouseMove { .. } => "mm",
+            Self::Scroll { .. } => "sc",
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -2816,6 +2830,7 @@ pub(crate) fn gated_input_handler(
     input_authorized: Arc<dyn Fn() -> bool + Send + Sync>,
 ) -> Arc<dyn Fn(InputEvent) + Send + Sync> {
     Arc::new(move |event: InputEvent| {
+        let kind = event.wire_tag();
         // Phase 5a.1 authority gate: silent drop when the per-peer
         // closure says no, matching the `/ws display_input` gate
         // convention (no per-message denial feedback; the browser
@@ -2824,12 +2839,19 @@ pub(crate) fn gated_input_handler(
         // and "this peer holds it" both resolve to `true` — see the
         // closure builder in `web_gateway::spawn_web_gateway`.
         if !input_authorized() {
+            input_telemetry::record_authority_drop(kind);
             return;
         }
+        input_telemetry::record_inject_started(kind);
         let backend = Arc::clone(&backend);
         tokio::spawn(async move {
-            if let Err(e) = backend.inject_input(event).await {
-                eprintln!("[display] input injection failed: {e}");
+            let started = std::time::Instant::now();
+            match backend.inject_input(event).await {
+                Ok(()) => input_telemetry::record_inject_completed(started.elapsed()),
+                Err(e) => {
+                    input_telemetry::record_inject_failed(started.elapsed());
+                    eprintln!("[display] input injection failed: {e}");
+                }
             }
         });
     })
@@ -2957,6 +2979,71 @@ mod tests {
             }
             other => panic!("expected MouseMove, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn input_event_wire_tags_match_protocol_tags() {
+        assert_eq!(
+            InputEvent::KeyDown {
+                code: "KeyA".into(),
+                key: "a".into(),
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+            }
+            .wire_tag(),
+            "kd"
+        );
+        assert_eq!(
+            InputEvent::KeyUp {
+                code: "KeyA".into(),
+                key: "a".into(),
+                shift: false,
+                ctrl: false,
+                alt: false,
+                meta: false,
+            }
+            .wire_tag(),
+            "ku"
+        );
+        assert_eq!(
+            InputEvent::MouseDown {
+                x: 0.1,
+                y: 0.2,
+                b: 0
+            }
+            .wire_tag(),
+            "md"
+        );
+        assert_eq!(
+            InputEvent::MouseUp {
+                x: 0.1,
+                y: 0.2,
+                b: 0
+            }
+            .wire_tag(),
+            "mu"
+        );
+        assert_eq!(
+            InputEvent::MouseMove {
+                x: 0.1,
+                y: 0.2,
+                buttons: 0,
+            }
+            .wire_tag(),
+            "mm"
+        );
+        assert_eq!(
+            InputEvent::Scroll {
+                x: 0.1,
+                y: 0.2,
+                dx: 0.0,
+                dy: 1.0,
+            }
+            .wire_tag(),
+            "sc"
+        );
     }
 
     #[test]

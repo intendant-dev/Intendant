@@ -1912,8 +1912,20 @@ default_backend = "codex"
         assert_eq!(normalize_codex_managed_context("managd"), "vanilla");
 
         for value in [
-            "managed", "patched", "intendant", "on", "true", "enabled", "1", "vanilla", "off",
-            "false", "disabled", "0", "", "  Vanilla  ",
+            "managed",
+            "patched",
+            "intendant",
+            "on",
+            "true",
+            "enabled",
+            "1",
+            "vanilla",
+            "off",
+            "false",
+            "disabled",
+            "0",
+            "",
+            "  Vanilla  ",
         ] {
             assert!(
                 codex_managed_context_is_recognized(value),

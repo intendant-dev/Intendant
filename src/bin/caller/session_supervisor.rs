@@ -2105,6 +2105,19 @@ impl SessionSupervisor {
                 short_session(&target.managed_id),
                 target.project_root.display()
             ));
+        } else {
+            self.config.bus.send(AppEvent::LogEntry {
+                session_id: Some(target.managed_id.clone()),
+                level: "info".to_string(),
+                source: "session-supervisor".to_string(),
+                content: format!(
+                    "Edit queued for {} session {} user turn {}",
+                    backend,
+                    short_session(&target.managed_id),
+                    request.user_turn_index
+                ),
+                turn: None,
+            });
         }
     }
 
@@ -2889,7 +2902,7 @@ impl SessionSupervisor {
                     .get(&backend_session_id)
                     .and_then(|session| session.name.clone())
             } else if state.sessions.contains_key(&backend_session_id) {
-                let name = state
+                let existing_name = state
                     .sessions
                     .get(&backend_session_id)
                     .and_then(|session| session.name.clone())
@@ -2899,13 +2912,37 @@ impl SessionSupervisor {
                             .get(&current_key)
                             .and_then(|session| session.name.clone())
                     });
-                state
-                    .session_aliases
-                    .insert(session_id.clone(), backend_session_id.clone());
-                state
-                    .session_aliases
-                    .insert(current_key, backend_session_id.clone());
-                if state.active_session_id.as_deref() == Some(&session_id) {
+                let name = if let Some(mut session) = state.sessions.remove(&current_key) {
+                    if session.name.is_none() {
+                        session.name = existing_name.clone();
+                    }
+                    let name = session.name.clone();
+                    session.session_id = backend_session_id.clone();
+                    session.source = source.clone();
+                    state.sessions.insert(backend_session_id.clone(), session);
+                    state.session_aliases.retain(|alias, target| {
+                        alias != &backend_session_id && target != &current_key
+                    });
+                    state
+                        .session_aliases
+                        .insert(session_id.clone(), backend_session_id.clone());
+                    state
+                        .session_aliases
+                        .insert(current_key.clone(), backend_session_id.clone());
+                    name
+                } else {
+                    state
+                        .session_aliases
+                        .insert(session_id.clone(), backend_session_id.clone());
+                    state
+                        .session_aliases
+                        .insert(current_key.clone(), backend_session_id.clone());
+                    existing_name
+                };
+                if state.active_session_id.as_deref() == Some(&session_id)
+                    || state.active_session_id.as_deref() == Some(&current_key)
+                    || state.active_session_id.as_deref() == Some(&backend_session_id)
+                {
                     state.active_session_id = Some(backend_session_id.clone());
                 }
                 name
@@ -4279,6 +4316,77 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn external_identity_replaces_stale_backend_entry_with_new_wrapper() {
+        let bus = EventBus::new();
+        let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
+        let (old_tx, mut old_rx) = mpsc::channel(1);
+        let (new_tx, mut new_rx) = mpsc::channel(1);
+        {
+            let mut state = supervisor.state.lock().await;
+            let mut old_session = managed_session("backend", "codex");
+            old_session.name = Some("saved name".to_string());
+            old_session.phase = "done".to_string();
+            old_session.follow_up_tx = old_tx;
+            old_session.instance_id = 1;
+            state.sessions.insert("backend".to_string(), old_session);
+
+            let mut new_session = managed_session("wrapper-new", "codex");
+            new_session.phase = "idle".to_string();
+            new_session.follow_up_tx = new_tx;
+            new_session.instance_id = 2;
+            state
+                .sessions
+                .insert("wrapper-new".to_string(), new_session);
+            state.active_session_id = Some("wrapper-new".to_string());
+        }
+
+        supervisor
+            .apply_session_identity(
+                "wrapper-new".to_string(),
+                "codex".to_string(),
+                "backend".to_string(),
+            )
+            .await;
+
+        {
+            let state = supervisor.state.lock().await;
+            assert!(!state.sessions.contains_key("wrapper-new"));
+            assert_eq!(
+                state.resolve_session_id("wrapper-new").as_deref(),
+                Some("backend")
+            );
+            let session = state.sessions.get("backend").expect("backend session");
+            assert_eq!(session.phase, "idle");
+            assert_eq!(session.instance_id, 2);
+            assert_eq!(session.name.as_deref(), Some("saved name"));
+            assert_eq!(state.active_session_id.as_deref(), Some("backend"));
+        }
+
+        supervisor
+            .route_edit_user_message(
+                Some("backend".to_string()),
+                None,
+                None,
+                None,
+                Some(true),
+                117,
+                Some(1),
+                Some("old prompt".to_string()),
+                "new prompt".to_string(),
+                Vec::new(),
+            )
+            .await;
+
+        assert!(old_rx.try_recv().is_err());
+        let msg = new_rx
+            .try_recv()
+            .expect("edit should route to the newly attached wrapper");
+        assert_eq!(msg.text, "new prompt");
+        assert_eq!(msg.edit_user_turn_index, Some(117));
+        assert_eq!(msg.edit_user_turn_revision, Some(1));
+    }
+
+    #[tokio::test]
     async fn session_ended_marks_managed_session_done() {
         let bus = EventBus::new();
         let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus);
@@ -5465,7 +5573,13 @@ mod tests {
     /// binary path without permanently pinning vanilla into the session.
     #[test]
     fn session_codex_managed_context_inherit_means_no_override() {
-        for sentinel in [Some("inherit"), Some("default"), Some("global"), Some(""), None] {
+        for sentinel in [
+            Some("inherit"),
+            Some("default"),
+            Some("global"),
+            Some(""),
+            None,
+        ] {
             assert_eq!(
                 normalize_session_codex_managed_context(sentinel),
                 None,

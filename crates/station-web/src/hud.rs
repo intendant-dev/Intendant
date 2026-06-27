@@ -611,7 +611,15 @@ impl StationInner {
             if ax < x + w * 0.48 {
                 break;
             }
-            self.pill_at(ax, ay, action.width, 23.0, action.label, action.color, false);
+            self.pill_at(
+                ax,
+                ay,
+                action.width,
+                23.0,
+                action.label,
+                action.color,
+                false,
+            );
             self.hit_zones
                 .push(HitZone::new(ax, ay, action.width, 23.0, action.hit));
             ax -= 8.0;
@@ -1103,27 +1111,29 @@ impl StationInner {
             // Tall actionable surface: anchored under the command deck,
             // down to the activity lane — rows scroll inside it.
             let command_h = if h < 640.0 { 78.0 } else { 92.0 };
-            let top = if w < 820.0 { 120.0 } else { 58.0 + command_h + 16.0 };
+            let top = if w < 820.0 {
+                120.0
+            } else {
+                58.0 + command_h + 16.0
+            };
             let panel_h = (activity_lane_y - 12.0 - top).max(220.0);
             let y = top;
             self.rows_panel(
-                id,
-                &title,
-                color,
-                &value,
-                &detail,
-                surface,
-                x,
-                y,
-                panel_w,
-                panel_h,
+                id, &title, color, &value, &detail, surface, x, y, panel_w, panel_h,
             );
             return;
         }
         let panel_h = 112.0;
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         self.focus_panel_frame(x, y, panel_w, panel_h, "Selection", C_BLUE_CSS);
-        self.text(&truncate(id, 52), x + 16.0, y + 68.0, 11.0, C_TEXT_CSS, "normal");
+        self.text(
+            &truncate(id, 52),
+            x + 16.0,
+            y + 68.0,
+            11.0,
+            C_TEXT_CSS,
+            "normal",
+        );
         self.text(
             "scene node selected",
             x + 16.0,
@@ -1185,22 +1195,34 @@ impl StationInner {
                 id: sid.clone(),
             });
             if target.can_focus {
-                row = row.pill("focus", C_PEACH_CSS, HitAction::SessionAction {
-                    action: "focus".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "focus",
+                    C_PEACH_CSS,
+                    HitAction::SessionAction {
+                        action: "focus".into(),
+                        id: sid.clone(),
+                    },
+                );
             }
             if target.can_attach {
-                row = row.pill("attach", C_TEAL_CSS, HitAction::SessionAction {
-                    action: "attach".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "attach",
+                    C_TEAL_CSS,
+                    HitAction::SessionAction {
+                        action: "attach".into(),
+                        id: sid.clone(),
+                    },
+                );
             }
             if target.can_stop {
-                row = row.pill("stop", C_RED_CSS, HitAction::SessionAction {
-                    action: "stop".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "stop",
+                    C_RED_CSS,
+                    HitAction::SessionAction {
+                        action: "stop".into(),
+                        id: sid.clone(),
+                    },
+                );
             }
             surface.rows.push(row);
         }
@@ -1216,39 +1238,59 @@ impl StationInner {
                 id: sid.clone(),
             });
             if session.can_focus {
-                row = row.pill("focus", C_PEACH_CSS, HitAction::SessionAction {
-                    action: "focus".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "focus",
+                    C_PEACH_CSS,
+                    HitAction::SessionAction {
+                        action: "focus".into(),
+                        id: sid.clone(),
+                    },
+                );
             }
             if session.can_resume {
-                row = row.pill("resume", C_GREEN_CSS, HitAction::SessionAction {
-                    action: "resume".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "resume",
+                    C_GREEN_CSS,
+                    HitAction::SessionAction {
+                        action: "resume".into(),
+                        id: sid.clone(),
+                    },
+                );
             }
             // `stop` ends the session gracefully AFTER the current turn;
             // `interrupt` aborts the turn itself. Mid-turn both intents
             // matter, so offer both pills when both capabilities exist.
             if session.can_interrupt {
-                row = row.pill("halt", C_YELLOW_CSS, HitAction::SessionAction {
-                    action: "interrupt".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "halt",
+                    C_YELLOW_CSS,
+                    HitAction::SessionAction {
+                        action: "interrupt".into(),
+                        id: sid.clone(),
+                    },
+                );
             }
             if session.can_stop {
-                row = row.pill("stop", C_RED_CSS, HitAction::SessionAction {
-                    action: "stop".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "stop",
+                    C_RED_CSS,
+                    HitAction::SessionAction {
+                        action: "stop".into(),
+                        id: sid.clone(),
+                    },
+                );
             } else if session.can_fork {
                 // Codex threads: fork when no lifecycle pill needs the slot
                 // (running sessions keep stop; /fork via the composer covers
                 // them).
-                row = row.pill("fork", C_MAUVE_CSS, HitAction::SessionAction {
-                    action: "fork".into(),
-                    id: sid.clone(),
-                });
+                row = row.pill(
+                    "fork",
+                    C_MAUVE_CSS,
+                    HitAction::SessionAction {
+                        action: "fork".into(),
+                        id: sid.clone(),
+                    },
+                );
             }
             surface.rows.push(row);
         }
@@ -1287,10 +1329,14 @@ impl StationInner {
                     action: "worktree".into(),
                     id: path.clone(),
                 })
-                .pill("copy", C_BLUE_CSS, HitAction::SessionAction {
-                    action: "worktree-copy".into(),
-                    id: path,
-                }),
+                .pill(
+                    "copy",
+                    C_BLUE_CSS,
+                    HitAction::SessionAction {
+                        action: "worktree-copy".into(),
+                        id: path,
+                    },
+                ),
             );
         }
         surface
@@ -1346,20 +1392,28 @@ impl StationInner {
                 truncate(&event.msg, 200),
                 color,
             )
-            .pill("copy", C_BLUE_CSS, HitAction::ActivityAction {
-                action: "copy-event".into(),
-                id: event.id.clone(),
-            });
+            .pill(
+                "copy",
+                C_BLUE_CSS,
+                HitAction::ActivityAction {
+                    action: "copy-event".into(),
+                    id: event.id.clone(),
+                },
+            );
             if !event.session_id.is_empty() {
                 row = row
                     .click(HitAction::SessionAction {
                         action: "station-log".into(),
                         id: event.session_id.clone(),
                     })
-                    .pill("log", C_TEAL_CSS, HitAction::SessionAction {
-                        action: "station-log".into(),
-                        id: event.session_id.clone(),
-                    });
+                    .pill(
+                        "log",
+                        C_TEAL_CSS,
+                        HitAction::SessionAction {
+                            action: "station-log".into(),
+                            id: event.session_id.clone(),
+                        },
+                    );
             }
             surface.rows.push(row);
         }
@@ -1430,7 +1484,12 @@ impl StationInner {
         for cat in context.top_categories.iter() {
             surface.rows.push(PanelRow::new(
                 truncate(&cat.label, 16),
-                format!("{} tok / {} / {}", fmt_compact(cat.value), cat.count, cat.detail),
+                format!(
+                    "{} tok / {} / {}",
+                    fmt_compact(cat.value),
+                    cat.count,
+                    cat.detail
+                ),
                 C_BLUE_CSS,
             ));
         }
@@ -1441,10 +1500,14 @@ impl StationInner {
                     format!("{} / {}", item.value, item.detail),
                     tone_color_css(&item.tone),
                 )
-                .pill("copy", C_BLUE_CSS, HitAction::ContextAction {
-                    action: "copy-part".into(),
-                    id: item.id.clone(),
-                }),
+                .pill(
+                    "copy",
+                    C_BLUE_CSS,
+                    HitAction::ContextAction {
+                        action: "copy-part".into(),
+                        id: item.id.clone(),
+                    },
+                ),
             );
         }
         surface
@@ -1521,14 +1584,22 @@ impl StationInner {
                     action: "record-inspect".into(),
                     id: rid.clone(),
                 })
-                .pill("fork", C_TEAL_CSS, HitAction::ManagedAction {
-                    action: "record-fork".into(),
-                    id: rid.clone(),
-                })
-                .pill("restore", C_YELLOW_CSS, HitAction::ManagedAction {
-                    action: "record-restore".into(),
-                    id: rid,
-                }),
+                .pill(
+                    "fork",
+                    C_TEAL_CSS,
+                    HitAction::ManagedAction {
+                        action: "record-fork".into(),
+                        id: rid.clone(),
+                    },
+                )
+                .pill(
+                    "restore",
+                    C_YELLOW_CSS,
+                    HitAction::ManagedAction {
+                        action: "record-restore".into(),
+                        id: rid,
+                    },
+                ),
             );
         }
         surface
@@ -1569,14 +1640,22 @@ impl StationInner {
                     action: "station-diff".into(),
                     path: path.clone(),
                 })
-                .pill("diff", C_TEAL_CSS, HitAction::ChangesAction {
-                    action: "station-diff".into(),
-                    path: path.clone(),
-                })
-                .pill("copy", C_BLUE_CSS, HitAction::ChangesAction {
-                    action: "copy-diff".into(),
-                    path,
-                }),
+                .pill(
+                    "diff",
+                    C_TEAL_CSS,
+                    HitAction::ChangesAction {
+                        action: "station-diff".into(),
+                        path: path.clone(),
+                    },
+                )
+                .pill(
+                    "copy",
+                    C_BLUE_CSS,
+                    HitAction::ChangesAction {
+                        action: "copy-diff".into(),
+                        path,
+                    },
+                ),
             );
         }
         surface
@@ -1635,7 +1714,11 @@ impl StationInner {
             let mut row = PanelRow::new(
                 tag.to_string(),
                 format!("{} / {} / {}", lane.title, lane.meta, lane.detail),
-                if lane.selected { C_BLUE_CSS } else { C_PEACH_CSS },
+                if lane.selected {
+                    C_BLUE_CSS
+                } else {
+                    C_PEACH_CSS
+                },
             );
             if !lane.id.is_empty() {
                 row = row
@@ -1643,19 +1726,31 @@ impl StationInner {
                         action: default_op.into(),
                         lane_id: lane.id.clone(),
                     })
-                    .pill("open", C_PEACH_CSS, HitAction::RunwayAction {
-                        action: "open".into(),
-                        lane_id: lane.id.clone(),
-                    })
-                    .pill("copy", C_BLUE_CSS, HitAction::RunwayAction {
-                        action: "copy".into(),
-                        lane_id: lane.id.clone(),
-                    });
+                    .pill(
+                        "open",
+                        C_PEACH_CSS,
+                        HitAction::RunwayAction {
+                            action: "open".into(),
+                            lane_id: lane.id.clone(),
+                        },
+                    )
+                    .pill(
+                        "copy",
+                        C_BLUE_CSS,
+                        HitAction::RunwayAction {
+                            action: "copy".into(),
+                            lane_id: lane.id.clone(),
+                        },
+                    );
                 if !lane.session_id.is_empty() {
-                    row = row.pill("log", C_TEAL_CSS, HitAction::SessionAction {
-                        action: "station-log".into(),
-                        id: lane.session_id.clone(),
-                    });
+                    row = row.pill(
+                        "log",
+                        C_TEAL_CSS,
+                        HitAction::SessionAction {
+                            action: "station-log".into(),
+                            id: lane.session_id.clone(),
+                        },
+                    );
                 }
             }
             surface.rows.push(row);
@@ -1668,8 +1763,16 @@ impl StationInner {
         let queue = &self.snapshot.attention_queue;
         let mut surface = PanelSurface {
             header: vec![
-                HeaderPill::new("compose", C_BLUE_CSS, HitAction::Composer { op: "open-send" }),
-                HeaderPill::new("launch", C_TEAL_CSS, HitAction::Composer { op: "open-launch" }),
+                HeaderPill::new(
+                    "compose",
+                    C_BLUE_CSS,
+                    HitAction::Composer { op: "open-send" },
+                ),
+                HeaderPill::new(
+                    "launch",
+                    C_TEAL_CSS,
+                    HitAction::Composer { op: "open-launch" },
+                ),
             ],
             empty: "",
             ..Default::default()
@@ -1819,14 +1922,24 @@ impl StationInner {
             C_TEAL_CSS,
             vec![
                 (
-                    if controls.mic_active { "mic on" } else { "mic off" }.to_string(),
+                    if controls.mic_active {
+                        "mic on"
+                    } else {
+                        "mic off"
+                    }
+                    .to_string(),
                     controls.mic_active,
                     HitAction::ControlsAction {
                         action: "voice-toggle".into(),
                     },
                 ),
                 (
-                    if controls.video_active { "cam on" } else { "cam off" }.to_string(),
+                    if controls.video_active {
+                        "cam on"
+                    } else {
+                        "cam off"
+                    }
+                    .to_string(),
                     controls.video_active,
                     HitAction::ControlsAction {
                         action: "video-toggle".into(),
@@ -1847,12 +1960,20 @@ impl StationInner {
                 format!("share: {}", nonempty(&controls.display_access, "off")),
                 C_PEACH_CSS,
             )
-            .pill("toggle", C_PEACH_CSS, HitAction::ControlsAction {
-                action: "display-toggle".into(),
-            })
-            .pill("list", C_BLUE_CSS, HitAction::ControlsAction {
-                action: "display-list".into(),
-            }),
+            .pill(
+                "toggle",
+                C_PEACH_CSS,
+                HitAction::ControlsAction {
+                    action: "display-toggle".into(),
+                },
+            )
+            .pill(
+                "list",
+                C_BLUE_CSS,
+                HitAction::ControlsAction {
+                    action: "display-list".into(),
+                },
+            ),
         );
 
         // Browser workspaces.
@@ -1861,30 +1982,50 @@ impl StationInner {
             format!(
                 "{} workspace{} / {}",
                 controls.browser_workspaces,
-                if controls.browser_workspaces == 1 { "" } else { "s" },
+                if controls.browser_workspaces == 1 {
+                    ""
+                } else {
+                    "s"
+                },
                 nonempty(&controls.browser_workspace_status, "idle")
             ),
             C_BLUE_CSS,
         );
         if controls.browser_workspace_can_create {
-            browser_row = browser_row.pill("create", C_GREEN_CSS, HitAction::ControlsAction {
-                action: "browser-create".into(),
-            });
+            browser_row = browser_row.pill(
+                "create",
+                C_GREEN_CSS,
+                HitAction::ControlsAction {
+                    action: "browser-create".into(),
+                },
+            );
         }
         if controls.browser_workspace_can_acquire {
-            browser_row = browser_row.pill("acquire", C_TEAL_CSS, HitAction::ControlsAction {
-                action: "browser-acquire".into(),
-            });
+            browser_row = browser_row.pill(
+                "acquire",
+                C_TEAL_CSS,
+                HitAction::ControlsAction {
+                    action: "browser-acquire".into(),
+                },
+            );
         }
         if controls.browser_workspace_can_close {
-            browser_row = browser_row.pill("close", C_RED_CSS, HitAction::ControlsAction {
-                action: "browser-close".into(),
-            });
+            browser_row = browser_row.pill(
+                "close",
+                C_RED_CSS,
+                HitAction::ControlsAction {
+                    action: "browser-close".into(),
+                },
+            );
         }
         if !controls.browser_workspace_url.is_empty() {
-            browser_row = browser_row.pill("copy", C_BLUE_CSS, HitAction::ControlsAction {
-                action: "browser-copy".into(),
-            });
+            browser_row = browser_row.pill(
+                "copy",
+                C_BLUE_CSS,
+                HitAction::ControlsAction {
+                    action: "browser-copy".into(),
+                },
+            );
         }
         surface.rows.push(browser_row);
 
@@ -1895,20 +2036,35 @@ impl StationInner {
                 if controls.active_recording.is_empty() {
                     format!("{} stored", controls.recordings)
                 } else {
-                    format!("recording {} / {} stored", controls.active_recording, controls.recordings)
+                    format!(
+                        "recording {} / {} stored",
+                        controls.active_recording, controls.recordings
+                    )
                 },
-                if controls.debug_recording { C_RED_CSS } else { C_OVERLAY1_CSS },
+                if controls.debug_recording {
+                    C_RED_CSS
+                } else {
+                    C_OVERLAY1_CSS
+                },
             )
             .pill(
-                if controls.debug_recording { "stop rec" } else { "record" },
+                if controls.debug_recording {
+                    "stop rec"
+                } else {
+                    "record"
+                },
                 C_RED_CSS,
                 HitAction::ControlsAction {
                     action: "debug-record".into(),
                 },
             )
-            .pill("screen", C_BLUE_CSS, HitAction::ControlsAction {
-                action: "debug-screen".into(),
-            }),
+            .pill(
+                "screen",
+                C_BLUE_CSS,
+                HitAction::ControlsAction {
+                    action: "debug-screen".into(),
+                },
+            ),
         );
         for stream in controls.recording_streams.iter() {
             let name = nonempty(&stream.action_id, &stream.label);
@@ -1921,9 +2077,13 @@ impl StationInner {
                 .click(HitAction::ControlsAction {
                     action: format!("recording-open:{name}"),
                 })
-                .pill("play", C_TEAL_CSS, HitAction::ControlsAction {
-                    action: format!("recording-open:{name}"),
-                }),
+                .pill(
+                    "play",
+                    C_TEAL_CSS,
+                    HitAction::ControlsAction {
+                        action: format!("recording-open:{name}"),
+                    },
+                ),
             );
         }
 
@@ -1952,12 +2112,36 @@ impl StationInner {
         title: &str,
         color: &str,
     ) {
-        self.glass_panel(x, y, w, h, 10.0, hex_color(color).unwrap_or(C_BLUE), 1.5, 1.1);
+        self.glass_panel(
+            x,
+            y,
+            w,
+            h,
+            10.0,
+            hex_color(color).unwrap_or(C_BLUE),
+            1.5,
+            1.1,
+        );
         self.hit_zones
             .push(HitZone::new(x, y, w, h, HitAction::Noop));
         self.text("FOCUS", x + 16.0, y + 23.0, 10.0, C_OVERLAY1_CSS, "bold");
-        self.text(&truncate(title, 34), x + 16.0, y + 47.0, 14.0, color, "bold");
-        self.pill_at(x + w - 70.0, y + 13.0, 50.0, 23.0, "close", C_OVERLAY1_CSS, false);
+        self.text(
+            &truncate(title, 34),
+            x + 16.0,
+            y + 47.0,
+            14.0,
+            color,
+            "bold",
+        );
+        self.pill_at(
+            x + w - 70.0,
+            y + 13.0,
+            50.0,
+            23.0,
+            "close",
+            C_OVERLAY1_CSS,
+            false,
+        );
         self.hit_zones.push(HitZone::new(
             x + w - 70.0,
             y + 13.0,
@@ -2059,12 +2243,25 @@ impl StationInner {
             });
             if hovered {
                 hovered_row = Some(idx);
-                self.rounded_path(x + 8.0, ry + 1.0, w - 8.0 - right_pad + 4.0, PANEL_ROW_H - 3.0, 6.0);
+                self.rounded_path(
+                    x + 8.0,
+                    ry + 1.0,
+                    w - 8.0 - right_pad + 4.0,
+                    PANEL_ROW_H - 3.0,
+                    6.0,
+                );
                 self.hud.set_fill("rgba(137,180,250,0.10)");
                 ctx.fill();
             }
             // Label column.
-            self.text(&truncate(&row.label, 17), x + 16.0, ry + 19.0, 9.0, row.color, "bold");
+            self.text(
+                &truncate(&row.label, 17),
+                x + 16.0,
+                ry + 19.0,
+                9.0,
+                row.color,
+                "bold",
+            );
             // Right-aligned pills; the value text yields to them.
             let mut pill_x = x + w - right_pad;
             for pill in row.pills.iter().rev() {
@@ -2101,7 +2298,15 @@ impl StationInner {
                     if cx + cw > pill_x - 6.0 {
                         break;
                     }
-                    self.pill_at(cx, ry + 4.5, cw, 21.0, label, if *selected { row.color } else { C_OVERLAY1_CSS }, *selected);
+                    self.pill_at(
+                        cx,
+                        ry + 4.5,
+                        cw,
+                        21.0,
+                        label,
+                        if *selected { row.color } else { C_OVERLAY1_CSS },
+                        *selected,
+                    );
                     self.hit_zones
                         .push(HitZone::new(cx, ry + 4.5, cw, 21.0, action.clone()));
                     cx += cw + 6.0;
@@ -2160,7 +2365,11 @@ impl StationInner {
     /// vertical space when both are open).
     pub(crate) fn composer_rect(&self, w: f32, h: f32) -> (f32, f32, f32, f32) {
         let lane_y = (h - lane_metrics(self.density, h).2 - 24.0).max(282.0);
-        let strip_h = if self.composer_mode == "launch" { 96.0 } else { 56.0 };
+        let strip_h = if self.composer_mode == "launch" {
+            96.0
+        } else {
+            56.0
+        };
         let sw = (w * 0.52).clamp(320.0, 660.0);
         (24.0, lane_y - strip_h - 12.0, sw, strip_h)
     }
@@ -2184,10 +2393,7 @@ impl StationInner {
                 format!("LAUNCH NEW SESSION — needs {}", truncate(missing, 28))
             }
         } else {
-            format!(
-                "COMPOSE → {}",
-                truncate(&self.station_target_label(), 36)
-            )
+            format!("COMPOSE → {}", truncate(&self.station_target_label(), 36))
         };
         self.text(&kicker, x + 16.0, y + 16.0, 8.0, C_BLUE_CSS, "bold");
         self.text(
@@ -2214,7 +2420,15 @@ impl StationInner {
 
         let send_x = slot_x + slot_w + 10.0;
         if launch {
-            self.pill_at(send_x, slot_y + 1.0, action_w, 22.0, "launch", C_TEAL_CSS, true);
+            self.pill_at(
+                send_x,
+                slot_y + 1.0,
+                action_w,
+                22.0,
+                "launch",
+                C_TEAL_CSS,
+                true,
+            );
             self.hit_zones.push(HitZone::new(
                 send_x,
                 slot_y + 1.0,
@@ -2223,8 +2437,20 @@ impl StationInner {
                 HitAction::Composer { op: "launch" },
             ));
         } else {
-            let label = if controls.prompt_mode == "steer" { "steer" } else { "send" };
-            self.pill_at(send_x, slot_y + 1.0, action_w, 22.0, label, C_BLUE_CSS, true);
+            let label = if controls.prompt_mode == "steer" {
+                "steer"
+            } else {
+                "send"
+            };
+            self.pill_at(
+                send_x,
+                slot_y + 1.0,
+                action_w,
+                22.0,
+                label,
+                C_BLUE_CSS,
+                true,
+            );
             self.hit_zones.push(HitZone::new(
                 send_x,
                 slot_y + 1.0,
@@ -2251,7 +2477,15 @@ impl StationInner {
                     break;
                 }
                 let active = selected_agent == id;
-                self.pill_at(cx, y + 58.0, cw, 21.0, label, if active { C_TEAL_CSS } else { C_OVERLAY1_CSS }, active);
+                self.pill_at(
+                    cx,
+                    y + 58.0,
+                    cw,
+                    21.0,
+                    label,
+                    if active { C_TEAL_CSS } else { C_OVERLAY1_CSS },
+                    active,
+                );
                 self.hit_zones.push(HitZone::new(
                     cx,
                     y + 58.0,
@@ -2285,7 +2519,15 @@ impl StationInner {
         } else {
             // Target chip: click opens the sessions panel to retarget.
             let chip_w = 70.0;
-            self.pill_at(x + sw - 78.0 - action_w, y + 1.0, chip_w, 18.0, "target", C_PEACH_CSS, false);
+            self.pill_at(
+                x + sw - 78.0 - action_w,
+                y + 1.0,
+                chip_w,
+                18.0,
+                "target",
+                C_PEACH_CSS,
+                false,
+            );
             self.hit_zones.push(HitZone::new(
                 x + sw - 78.0 - action_w,
                 y + 1.0,
@@ -2316,7 +2558,16 @@ impl StationInner {
         let diff = transcript.mode == "diff";
         let accent = if diff { C_YELLOW_CSS } else { C_TEAL_CSS };
 
-        self.glass_panel(x, top, tw, th, 12.0, hex_color(accent).unwrap_or(C_TEAL), 1.4, 1.06);
+        self.glass_panel(
+            x,
+            top,
+            tw,
+            th,
+            12.0,
+            hex_color(accent).unwrap_or(C_TEAL),
+            1.4,
+            1.06,
+        );
         self.hit_zones
             .push(HitZone::new(x, top, tw, th, HitAction::Noop));
         self.text(
@@ -2335,7 +2586,15 @@ impl StationInner {
             accent,
             "bold",
         );
-        self.pill_at(x + tw - 66.0, top + 12.0, 50.0, 22.0, "close", C_OVERLAY1_CSS, false);
+        self.pill_at(
+            x + tw - 66.0,
+            top + 12.0,
+            50.0,
+            22.0,
+            "close",
+            C_OVERLAY1_CSS,
+            false,
+        );
         self.hit_zones.push(HitZone::new(
             x + tw - 66.0,
             top + 12.0,
@@ -2356,11 +2615,7 @@ impl StationInner {
             )]
         } else {
             vec![
-                (
-                    "steer",
-                    C_BLUE_CSS,
-                    HitAction::Composer { op: "open-send" },
-                ),
+                ("steer", C_BLUE_CSS, HitAction::Composer { op: "open-send" }),
                 (
                     "focus",
                     C_PEACH_CSS,
@@ -2382,7 +2637,8 @@ impl StationInner {
         for (label, color, action) in header_pills {
             let pw = label.chars().count() as f32 * 6.1 + 18.0;
             self.pill_at(hx, top + 52.0, pw, 22.0, label, color, false);
-            self.hit_zones.push(HitZone::new(hx, top + 52.0, pw, 22.0, action));
+            self.hit_zones
+                .push(HitZone::new(hx, top + 52.0, pw, 22.0, action));
             hx += pw + 8.0;
         }
         self.text(
@@ -2468,7 +2724,14 @@ impl StationInner {
             if line.first && !diff {
                 self.text(&truncate(&line.kind, 9), x + 16.0, ly, 8.0, color, "bold");
                 if !line.ts.is_empty() {
-                    self.text(&truncate(&line.ts, 8), x + 16.0, ly + 9.0, 6.5, C_OVERLAY1_CSS, "normal");
+                    self.text(
+                        &truncate(&line.ts, 8),
+                        x + 16.0,
+                        ly + 9.0,
+                        6.5,
+                        C_OVERLAY1_CSS,
+                        "normal",
+                    );
                 }
             }
             self.text(
@@ -2476,8 +2739,18 @@ impl StationInner {
                 x + gutter,
                 ly,
                 9.5,
-                if diff { color } else if line.kind == "user" { C_TEXT_CSS } else { color },
-                if line.first && line.kind == "user" { "bold" } else { "normal" },
+                if diff {
+                    color
+                } else if line.kind == "user" {
+                    C_TEXT_CSS
+                } else {
+                    color
+                },
+                if line.first && line.kind == "user" {
+                    "bold"
+                } else {
+                    "normal"
+                },
             );
         }
         self.transcript_layout = Some(layout);
@@ -2521,10 +2794,12 @@ impl StationInner {
                     .hosts
                     .first()
                     .is_some_and(|h| h.id == agent.host_id)
-                || agent.approval_id.as_deref().is_some_and(|id| !id.is_empty()));
-        let rows = 5
-            + usize::from(!agent.worktree.trim().is_empty())
-            + if approval { 2 } else { 0 };
+                || agent
+                    .approval_id
+                    .as_deref()
+                    .is_some_and(|id| !id.is_empty()));
+        let rows =
+            5 + usize::from(!agent.worktree.trim().is_empty()) + if approval { 2 } else { 0 };
         let panel_h = 74.0 + rows as f32 * 17.0 + if approval { 30.0 } else { 6.0 };
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
         let phase = phase_color_css(&agent.phase);
@@ -2539,7 +2814,15 @@ impl StationInner {
         );
         // Direct line to the worker: open the composer targeted at the
         // current prompt target (the dashboard resolves the routing).
-        self.pill_at(x + panel_w - 132.0, y + 13.0, 54.0, 23.0, "steer", C_BLUE_CSS, false);
+        self.pill_at(
+            x + panel_w - 132.0,
+            y + 13.0,
+            54.0,
+            23.0,
+            "steer",
+            C_BLUE_CSS,
+            false,
+        );
         self.hit_zones.push(HitZone::new(
             x + panel_w - 132.0,
             y + 13.0,
@@ -2624,7 +2907,14 @@ impl StationInner {
         }
         row_y = self.focus_row(x, row_y, panel_w, "usage", &usage, C_LAVENDER_CSS);
         if !agent.worktree.trim().is_empty() {
-            row_y = self.focus_row(x, row_y, panel_w, "worktree", agent.worktree.trim(), C_MAUVE_CSS);
+            row_y = self.focus_row(
+                x,
+                row_y,
+                panel_w,
+                "worktree",
+                agent.worktree.trim(),
+                C_MAUVE_CSS,
+            );
         }
 
         if approval {
@@ -2728,7 +3018,11 @@ impl StationInner {
                 "fov",
                 format!("{}°", self.fov_deg.round() as i32),
             ),
-            (ViewSliderKey::Motion, "motion", format!("{:.1}x", self.motion)),
+            (
+                ViewSliderKey::Motion,
+                "motion",
+                format!("{:.1}x", self.motion),
+            ),
             (
                 ViewSliderKey::Ar,
                 "ar tilt",
@@ -2805,14 +3099,26 @@ impl StationInner {
     ) {
         let panel_h = 74.0 + 4.0 * 17.0 + 6.0;
         let y = (activity_lane_y - panel_h - 12.0).max(58.0);
-        let color = if host.connected { C_PEACH_CSS } else { C_RED_CSS };
+        let color = if host.connected {
+            C_PEACH_CSS
+        } else {
+            C_RED_CSS
+        };
         self.focus_panel_frame(x, y, panel_w, panel_h, &host.name, color);
         self.text(
-            if host.connected { "connected" } else { "offline" },
+            if host.connected {
+                "connected"
+            } else {
+                "offline"
+            },
             x + 96.0,
             y + 23.0,
             9.0,
-            if host.connected { C_GREEN_CSS } else { C_RED_CSS },
+            if host.connected {
+                C_GREEN_CSS
+            } else {
+                C_RED_CSS
+            },
             "bold",
         );
         let mut row_y = y + 70.0;
@@ -3281,9 +3587,7 @@ impl StationInner {
         self.hud.set_fill("rgba(13,14,24,0.55)");
         self.hud.ctx.fill();
         self.hud.set_stroke(&css_rgba(
-            C_LAVENDER
-                .with_alpha(0.40 * self.mood.glass())
-                .into(),
+            C_LAVENDER.with_alpha(0.40 * self.mood.glass()).into(),
         ));
         self.hud.ctx.stroke();
         let angle = -self.yaw as f64;
@@ -3361,8 +3665,14 @@ impl StationInner {
         // Dark translucent capsule base.
         self.rounded_path(x, y, w, h, r);
         let base = ctx.create_linear_gradient(x as f64, y as f64, x as f64, (y + h) as f64);
-        let _ = base.add_color_stop(0.0, &css_rgba(Color::rgb(42, 44, 66).with_alpha(0.52).into()));
-        let _ = base.add_color_stop(1.0, &css_rgba(Color::rgb(13, 14, 24).with_alpha(0.68).into()));
+        let _ = base.add_color_stop(
+            0.0,
+            &css_rgba(Color::rgb(42, 44, 66).with_alpha(0.52).into()),
+        );
+        let _ = base.add_color_stop(
+            1.0,
+            &css_rgba(Color::rgb(13, 14, 24).with_alpha(0.68).into()),
+        );
         ctx.set_fill_style_canvas_gradient(&base);
         self.hud.note_fill_unknown();
         ctx.fill();
@@ -3386,7 +3696,8 @@ impl StationInner {
             0.38
         } * a;
         self.rounded_path(x, y, w, h, r);
-        self.hud.set_stroke(&css_rgba(accent.with_alpha(border).into()));
+        self.hud
+            .set_stroke(&css_rgba(accent.with_alpha(border).into()));
         ctx.stroke();
         self.text(label, x + 8.0, y + h * 0.65, 10.0, color, "bold");
     }
@@ -3446,9 +3757,18 @@ impl StationInner {
         // Body: deep dark vertical gradient (lighter up top, denser below).
         self.rounded_path(x, y, w, h, r);
         let body = ctx.create_linear_gradient(x as f64, y as f64, x as f64, (y + h) as f64);
-        let _ = body.add_color_stop(0.0, &css_rgba(Color::rgb(38, 40, 60).with_alpha(0.62 * tint).into()));
-        let _ = body.add_color_stop(0.45, &css_rgba(Color::rgb(21, 22, 34).with_alpha(0.74 * tint).into()));
-        let _ = body.add_color_stop(1.0, &css_rgba(Color::rgb(12, 12, 20).with_alpha(0.85 * tint).into()));
+        let _ = body.add_color_stop(
+            0.0,
+            &css_rgba(Color::rgb(38, 40, 60).with_alpha(0.62 * tint).into()),
+        );
+        let _ = body.add_color_stop(
+            0.45,
+            &css_rgba(Color::rgb(21, 22, 34).with_alpha(0.74 * tint).into()),
+        );
+        let _ = body.add_color_stop(
+            1.0,
+            &css_rgba(Color::rgb(12, 12, 20).with_alpha(0.85 * tint).into()),
+        );
         ctx.set_fill_style_canvas_gradient(&body);
         self.hud.note_fill_unknown();
         ctx.fill();
@@ -3472,11 +3792,13 @@ impl StationInner {
         // 1px luminous border.
         let border = ((0.26 + 0.26 * emphasis) * a).min(0.92);
         self.rounded_path(x, y, w, h, r);
-        self.hud.set_stroke(&css_rgba(accent.with_alpha(border).into()));
+        self.hud
+            .set_stroke(&css_rgba(accent.with_alpha(border).into()));
         ctx.stroke();
         // Corner glow: brighter quarter-arcs hugging each rounded corner.
         let glow = (0.55 * emphasis * a).min(0.95);
-        self.hud.set_stroke(&css_rgba(accent.with_alpha(glow).into()));
+        self.hud
+            .set_stroke(&css_rgba(accent.with_alpha(glow).into()));
         let cr = r.max(2.0).min(w * 0.5).min(h * 0.5) as f64;
         let half_pi = std::f64::consts::FRAC_PI_2;
         for (cx, cy, start) in [
@@ -3896,7 +4218,10 @@ mod tests {
     fn wrap_line_wraps_words_and_hard_breaks_long_tokens() {
         assert_eq!(wrap_line("short line", 20), vec!["short line"]);
         let wrapped = wrap_line("alpha beta gamma delta epsilon", 11);
-        assert!(wrapped.iter().all(|l| l.chars().count() <= 11), "{wrapped:?}");
+        assert!(
+            wrapped.iter().all(|l| l.chars().count() <= 11),
+            "{wrapped:?}"
+        );
         assert_eq!(wrapped.join(" "), "alpha beta gamma delta epsilon");
         // Overlong tokens hard-break instead of overflowing the panel.
         let token = "a".repeat(30);
@@ -3920,7 +4245,8 @@ mod tests {
                 crate::model::StationTranscriptRow {
                     kind: "model".into(),
                     ts: "12:01".into(),
-                    text: "first paragraph that is long enough to wrap across lines\nsecond line".into(),
+                    text: "first paragraph that is long enough to wrap across lines\nsecond line"
+                        .into(),
                 },
             ],
             ..Default::default()
@@ -3951,8 +4277,18 @@ mod tests {
     #[test]
     fn transcript_kind_colors_cover_the_vocabulary() {
         for kind in [
-            "user", "model", "assistant", "agent", "tool", "error", "warn", "diff-add",
-            "diff-del", "diff-meta", "info", "",
+            "user",
+            "model",
+            "assistant",
+            "agent",
+            "tool",
+            "error",
+            "warn",
+            "diff-add",
+            "diff-del",
+            "diff-meta",
+            "info",
+            "",
         ] {
             assert!(!transcript_kind_color(kind).is_empty());
         }

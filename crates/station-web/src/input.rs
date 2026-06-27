@@ -330,7 +330,10 @@ impl StationInner {
                     e.prevent_default();
                     s.mark_input();
                 }
-                (used, outbound.map(|action| (action, s.action_callback.clone())))
+                (
+                    used,
+                    outbound.map(|action| (action, s.action_callback.clone())),
+                )
             };
             if used {
                 StationInner::schedule_frame(&key_inner);
@@ -721,11 +724,9 @@ impl StationInner {
     /// Scrollbar drag descriptor when the press sits on a panel's
     /// scrollbar gutter (the right edge strip of a scrollable zone).
     pub(crate) fn scrollbar_drag_at(&self, x: f32, y: f32) -> Option<ScrollDrag> {
-        let zone = self
-            .scroll_zones
-            .iter()
-            .rev()
-            .find(|z| y >= z.y && y <= z.y + z.h && x >= z.x + z.w - SCROLLBAR_GUTTER && x <= z.x + z.w + 2.0)?;
+        let zone = self.scroll_zones.iter().rev().find(|z| {
+            y >= z.y && y <= z.y + z.h && x >= z.x + z.w - SCROLLBAR_GUTTER && x <= z.x + z.w + 2.0
+        })?;
         let max = (zone.content_h - zone.h).max(0.0);
         if max <= 0.0 {
             return None;
@@ -803,25 +804,47 @@ pub(crate) enum HitAction {
     /// Close the transcript/diff viewer (it floats independently of the
     /// focus-panel selection).
     CloseTranscript,
-    ActivityAction { action: String, id: String },
-    ControlsAction { action: String },
+    ActivityAction {
+        action: String,
+        id: String,
+    },
+    ControlsAction {
+        action: String,
+    },
     /// Session row / pill ops, emitted as the dashboard's existing
     /// `{type:'session_action', action, session_id}` shape
     /// (stationHandleSessionAction: focus/resume/stop/copy/fork/...).
-    SessionAction { action: String, id: String },
+    SessionAction {
+        action: String,
+        id: String,
+    },
     /// Managed-context record ops (`{type:'managed_action', action, id}`).
-    ManagedAction { action: String, id: String },
+    ManagedAction {
+        action: String,
+        id: String,
+    },
     /// Changed-file ops (`{type:'changes_action', action, path}`).
-    ChangesAction { action: String, path: String },
+    ChangesAction {
+        action: String,
+        path: String,
+    },
     /// Context part/replay ops (`{type:'context_action', action, id}`).
-    ContextAction { action: String, id: String },
+    ContextAction {
+        action: String,
+        id: String,
+    },
     /// Display-runway lane ops (`{type:'display_runway_action', action,
     /// lane_id}`), routed by the dashboard per lane type.
-    RunwayAction { action: String, lane_id: String },
+    RunwayAction {
+        action: String,
+        lane_id: String,
+    },
     /// Composer surface ops. open-send/open-launch/close mutate local
     /// state and notify the dashboard (which owns the DOM input overlay);
     /// send/launch/target pass through for the dashboard to submit.
-    Composer { op: &'static str },
+    Composer {
+        op: &'static str,
+    },
     /// Approve/deny pill in the agent focus panel. Emits the dashboard's
     /// existing `{type:'approval', host_id, approval_id, decision}` action
     /// (handleStationAction routes local approvals to `app.send_approval`
@@ -842,7 +865,9 @@ pub(crate) enum HitAction {
     /// is the track geometry; pointer x within it maps onto the key's
     /// range. Scrubbing applies locally per move; the final value is
     /// emitted as `{type:'view_set', ...}` on pointer-up.
-    ViewSlider { key: ViewSliderKey },
+    ViewSlider {
+        key: ViewSliderKey,
+    },
 }
 
 /// The continuously adjustable view settings exposed as slider tracks in
@@ -1069,7 +1094,11 @@ pub(crate) fn scrollbar_thumb(
     let visible = (viewport_h / content_h.max(1.0)).clamp(0.05, 1.0);
     let thumb_h = (track_h * visible).max(22.0).min(track_h);
     let max = (content_h - viewport_h).max(0.0);
-    let t = if max > 0.0 { (offset / max).clamp(0.0, 1.0) } else { 0.0 };
+    let t = if max > 0.0 {
+        (offset / max).clamp(0.0, 1.0)
+    } else {
+        0.0
+    };
     (thumb_h, (track_h - thumb_h) * t)
 }
 
@@ -1097,7 +1126,10 @@ mod tests {
             zone_name(&HitAction::Select("system:peers".into())).as_deref(),
             Some("system:peers")
         );
-        assert_eq!(zone_name(&HitAction::ClosePanel).as_deref(), Some("close-panel"));
+        assert_eq!(
+            zone_name(&HitAction::ClosePanel).as_deref(),
+            Some("close-panel")
+        );
         assert_eq!(
             zone_name(&HitAction::ActivityAction {
                 action: "copy-visible".into(),
@@ -1216,7 +1248,10 @@ mod tests {
             approval_id: "ap-42".into(),
             decision: "approve",
         };
-        assert_eq!(zone_name(&with_id).as_deref(), Some("approval:approve:ap-42"));
+        assert_eq!(
+            zone_name(&with_id).as_deref(),
+            Some("approval:approve:ap-42")
+        );
         assert_eq!(zone_kind(&with_id), "approval");
         // Local primary approvals carry no id; the host disambiguates.
         let local = HitAction::Approval {
@@ -1230,7 +1265,10 @@ mod tests {
         assert!(hotspot_rects_from_zones(&zones).is_empty());
         assert!(matches!(
             zone_action_by_name(&zones, "approval:approve:ap-42"),
-            Some(HitAction::Approval { decision: "approve", .. })
+            Some(HitAction::Approval {
+                decision: "approve",
+                ..
+            })
         ));
     }
 
@@ -1255,7 +1293,9 @@ mod tests {
         assert!(hotspot_rects_from_zones(&zones).is_empty());
         assert!(matches!(
             zone_action_by_name(&zones, "view:fov"),
-            Some(HitAction::ViewSlider { key: ViewSliderKey::Fov })
+            Some(HitAction::ViewSlider {
+                key: ViewSliderKey::Fov
+            })
         ));
     }
 
@@ -1286,17 +1326,17 @@ mod tests {
     #[test]
     fn hotspot_rects_filter_and_dedupe_last_wins() {
         let zones = vec![
-            HitZone::new(96.0, 10.0, 78.0, 23.0, HitAction::Layout(LayoutName::Orbital)),
+            HitZone::new(
+                96.0,
+                10.0,
+                78.0,
+                23.0,
+                HitAction::Layout(LayoutName::Orbital),
+            ),
             // Inert and non-system zones are not overlay hotspots.
             HitZone::new(0.0, 0.0, 10.0, 10.0, HitAction::Noop),
             HitZone::new(0.0, 0.0, 10.0, 10.0, HitAction::ClosePanel),
-            HitZone::new(
-                1.0,
-                1.0,
-                10.0,
-                10.0,
-                HitAction::Select("host:alpha".into()),
-            ),
+            HitZone::new(1.0, 1.0, 10.0, 10.0, HitAction::Select("host:alpha".into())),
             // The orbital node zone is superseded by the matrix zone for
             // the same target, mirroring click precedence.
             HitZone::new(
@@ -1327,7 +1367,13 @@ mod tests {
     #[test]
     fn zone_action_lookup_resolves_names_and_rejects_unknown() {
         let zones = vec![
-            HitZone::new(0.0, 0.0, 10.0, 10.0, HitAction::Select("system:view".into())),
+            HitZone::new(
+                0.0,
+                0.0,
+                10.0,
+                10.0,
+                HitAction::Select("system:view".into()),
+            ),
             HitZone::new(
                 5.0,
                 5.0,
