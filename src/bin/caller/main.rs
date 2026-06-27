@@ -56,8 +56,8 @@ mod terminal;
 mod tool_batch;
 mod tools;
 mod transcription;
-mod tui;
 mod transfer_store;
+mod tui;
 mod types;
 mod upload_store;
 mod user_mode;
@@ -3729,7 +3729,11 @@ fn list_context_rewind_anchors_from_rollout(
             notice: None,
             anchors: page,
         };
-        annotate_compact_catalog_repeats_and_dead_ends(&mut compact, trailing_listing_calls, reverse);
+        annotate_compact_catalog_repeats_and_dead_ends(
+            &mut compact,
+            trailing_listing_calls,
+            reverse,
+        );
         return serialize_context_rewind_anchor_compact_catalog(compact, filtered_total);
     }
     let mut page = anchors
@@ -4028,7 +4032,8 @@ fn scan_context_rewind_anchor_catalog(
             continue;
         };
         let line_number = line_index.saturating_add(1);
-        if let Some(mut usage) = context_rewind_backend_usage_from_rollout_entry(line_number, &entry)
+        if let Some(mut usage) =
+            context_rewind_backend_usage_from_rollout_entry(line_number, &entry)
         {
             usage.response_start_line = current_model_response_start.unwrap_or(line_number);
             usage.measures_prefix_exactly =
@@ -4069,8 +4074,7 @@ fn scan_context_rewind_anchor_catalog(
                         .collect()
                 })
                 .unwrap_or_default();
-            if let (Some(&group_first), Some(&group_last)) =
-                (live_lines.first(), live_lines.last())
+            if let (Some(&group_first), Some(&group_last)) = (live_lines.first(), live_lines.last())
             {
                 let cut_start = match position {
                     external_agent::RollbackAnchorPosition::Before => group_first,
@@ -4332,11 +4336,13 @@ fn scan_context_rewind_anchor_catalog(
         // recovery — the veto is anchor-level (managed.md), not per-position:
         // recovery should move to a different anchor instead of retrying the
         // same cut point one notch harder.
-        let anchor_rewind_outcome = match (latest_rewind_before_outcome, latest_rewind_after_outcome)
-        {
-            (Some(before), Some(after)) => Some(context_rewind_worse_usage(Some(before), after)),
-            (before, after) => before.or(after),
-        };
+        let anchor_rewind_outcome =
+            match (latest_rewind_before_outcome, latest_rewind_after_outcome) {
+                (Some(before), Some(after)) => {
+                    Some(context_rewind_worse_usage(Some(before), after))
+                }
+                (before, after) => before.or(after),
+            };
         let after_density_eligible = context_rewind_anchor_position_density_eligible(
             anchor,
             external_agent::RollbackAnchorPosition::After,
@@ -4652,10 +4658,12 @@ fn context_rewind_anchor_is_management_tool(anchor: &ContextRewindAnchorCatalogE
 
 /// True when `anchor` is a `list_rewind_anchors` (or legacy alias) call.
 fn context_rewind_anchor_is_listing_call(anchor: &ContextRewindAnchorCatalogEntry) -> bool {
-    anchor
-        .names
-        .iter()
-        .any(|name| matches!(name.as_str(), "list_rewind_anchors" | "context_rewind_anchors"))
+    anchor.names.iter().any(|name| {
+        matches!(
+            name.as_str(),
+            "list_rewind_anchors" | "context_rewind_anchors"
+        )
+    })
 }
 
 /// Number of `list_rewind_anchors` calls in the trailing management-only run
@@ -6492,8 +6500,7 @@ fn managed_context_surgical_anchor_choice(
     anchors
         .iter()
         .filter(|anchor| {
-            anchor.recovery_eligible.is_none()
-                && !context_rewind_anchor_is_management_tool(anchor)
+            anchor.recovery_eligible.is_none() && !context_rewind_anchor_is_management_tool(anchor)
         })
         .map(|anchor| (anchor, external_agent::RollbackAnchorPosition::After))
         .min_by_key(|(anchor, position)| {
@@ -7944,12 +7951,16 @@ async fn apply_fission_import_action(
             "branch `{branch_session_id}` is not part of fission group `{group_id}`"
         ));
     };
-    let payload = fission_import_payload(group, branch, document.branch_ext(&group_id, &branch_session_id));
+    let payload = fission_import_payload(
+        group,
+        branch,
+        document.branch_ext(&group_id, &branch_session_id),
+    );
 
     // Inject into the thread the action targets (the caller's continuation);
     // default to the group's recorded parent.
-    let parent_thread_id = thread_id_from_action_params(params)
-        .unwrap_or_else(|| group.parent_session_id.clone());
+    let parent_thread_id =
+        thread_id_from_action_params(params).unwrap_or_else(|| group.parent_session_id.clone());
     agent
         .inject_thread_developer_message(&parent_thread_id, &payload)
         .await
@@ -14296,7 +14307,10 @@ mod tests {
         ));
         // Rewind-only stays stricter: fission is blocked there with every
         // other ordinary tool — the parent must shrink first.
-        assert!(!managed_context_rewind_only_tool_allowed("fission_spawn", ""));
+        assert!(!managed_context_rewind_only_tool_allowed(
+            "fission_spawn",
+            ""
+        ));
         assert!(!managed_context_rewind_only_tool_allowed(
             "fission_control",
             ""
@@ -16192,7 +16206,8 @@ mod tests {
         assert!(pending.is_empty());
 
         // No held replay → the rewind's automatic resume.
-        let continuation = managed_context_surgical_recovery_continuation(&mut pending, Some(automatic));
+        let continuation =
+            managed_context_surgical_recovery_continuation(&mut pending, Some(automatic));
         assert_eq!(continuation.text, "<context_rewind_resumed/>");
 
         // Defensive total fallback keeps the session moving even if the
@@ -18660,18 +18675,16 @@ mod tests {
     }
 
     fn rollout_call_lines(name: &str, call_id: &str, with_output: bool) -> Vec<String> {
-        let mut lines = vec![
-            serde_json::json!({
-                "type": "response_item",
-                "payload": {
-                    "type": "function_call",
-                    "name": name,
-                    "call_id": call_id,
-                    "arguments": "{}"
-                }
-            })
-            .to_string(),
-        ];
+        let mut lines = vec![serde_json::json!({
+            "type": "response_item",
+            "payload": {
+                "type": "function_call",
+                "name": name,
+                "call_id": call_id,
+                "arguments": "{}"
+            }
+        })
+        .to_string()];
         if with_output {
             lines.push(
                 serde_json::json!({
@@ -18705,7 +18718,11 @@ mod tests {
         }
         // First listing call of the stall (persisted before its output, like
         // the live backend does for the in-flight call).
-        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", false));
+        lines.extend(rollout_call_lines(
+            "list_rewind_anchors",
+            "call_list_1",
+            false,
+        ));
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         let first_raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
@@ -18731,17 +18748,27 @@ mod tests {
             .to_string(),
         );
         lines.extend(rollout_call_lines("get_status", "call_status_1", true));
-        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        lines.extend(rollout_call_lines(
+            "list_rewind_anchors",
+            "call_list_2",
+            false,
+        ));
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         let second_raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
             .expect("second listing");
         let second: serde_json::Value = serde_json::from_str(&second_raw).unwrap();
 
-        assert_eq!(first["total"], second["total"], "total must not count management churn");
+        assert_eq!(
+            first["total"], second["total"],
+            "total must not count management churn"
+        );
         assert_eq!(second["total"].as_u64(), Some(6));
         assert_eq!(first["filtered_total"], second["filtered_total"]);
-        assert_eq!(first["anchors"], second["anchors"], "page rows must be identical");
+        assert_eq!(
+            first["anchors"], second["anchors"],
+            "page rows must be identical"
+        );
         let ordinals = |catalog: &serde_json::Value| {
             catalog["anchors"]
                 .as_array()
@@ -18755,7 +18782,10 @@ mod tests {
         assert!(first.get("repeat_listing").is_none());
         assert_eq!(second["repeat_listing"].as_bool(), Some(true));
         let notice = second["notice"].as_str().unwrap_or_default();
-        assert!(notice.contains("Do not call list_rewind_anchors again"), "got: {notice}");
+        assert!(
+            notice.contains("Do not call list_rewind_anchors again"),
+            "got: {notice}"
+        );
         assert!(notice.contains("rewind_context"), "got: {notice}");
     }
 
@@ -18803,8 +18833,16 @@ mod tests {
                 true,
             ));
         }
-        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", true));
-        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        lines.extend(rollout_call_lines(
+            "list_rewind_anchors",
+            "call_list_1",
+            true,
+        ));
+        lines.extend(rollout_call_lines(
+            "list_rewind_anchors",
+            "call_list_2",
+            false,
+        ));
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         // Paging to the next offset is deliberate progress, not a repeat.
@@ -18848,10 +18886,18 @@ mod tests {
         let path = dir.path().join("rollout.jsonl");
         let mut lines = Vec::new();
         lines.extend(rollout_call_lines("exec_command", "call_sub_0", true));
-        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", true));
+        lines.extend(rollout_call_lines(
+            "list_rewind_anchors",
+            "call_list_1",
+            true,
+        ));
         // Substantive work after the earlier listing ends the stall.
         lines.extend(rollout_call_lines("exec_command", "call_sub_1", true));
-        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_2", false));
+        lines.extend(rollout_call_lines(
+            "list_rewind_anchors",
+            "call_list_2",
+            false,
+        ));
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
@@ -18868,7 +18914,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("rollout.jsonl");
         let mut lines = rollout_call_lines("get_status", "call_status", true);
-        lines.extend(rollout_call_lines("list_rewind_anchors", "call_list_1", false));
+        lines.extend(rollout_call_lines(
+            "list_rewind_anchors",
+            "call_list_1",
+            false,
+        ));
         std::fs::write(&path, lines.join("\n")).unwrap();
 
         let raw = list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({}))
@@ -18882,9 +18932,15 @@ mod tests {
             Some("no_eligible_anchors")
         );
         let notice = catalog["notice"].as_str().unwrap_or_default();
-        assert!(notice.contains("no eligible rewind anchors remain"), "got: {notice}");
+        assert!(
+            notice.contains("no eligible rewind anchors remain"),
+            "got: {notice}"
+        );
         assert!(notice.contains("manual recovery path"), "got: {notice}");
-        assert!(notice.contains("do not call list_rewind_anchors again"), "got: {notice}");
+        assert!(
+            notice.contains("do not call list_rewind_anchors again"),
+            "got: {notice}"
+        );
 
         // A density-only listing in the same state directs continuing the
         // task instead of ending the session.
@@ -18920,18 +18976,25 @@ mod tests {
         )
         .expect("query listing");
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(catalog["empty_page_reason"].as_str(), Some("query_unmatched"));
+        assert_eq!(
+            catalog["empty_page_reason"].as_str(),
+            Some("query_unmatched")
+        );
         assert!(catalog.get("no_eligible_anchors").is_none());
         let notice = catalog["notice"].as_str().unwrap_or_default();
-        assert!(notice.contains("re-list once without a query"), "got: {notice}");
+        assert!(
+            notice.contains("re-list once without a query"),
+            "got: {notice}"
+        );
 
-        let raw = list_context_rewind_anchors_from_rollout(
-            &path,
-            &serde_json::json!({ "offset": 13 }),
-        )
-        .expect("past-end listing");
+        let raw =
+            list_context_rewind_anchors_from_rollout(&path, &serde_json::json!({ "offset": 13 }))
+                .expect("past-end listing");
         let catalog: serde_json::Value = serde_json::from_str(&raw).unwrap();
-        assert_eq!(catalog["empty_page_reason"].as_str(), Some("offset_past_end"));
+        assert_eq!(
+            catalog["empty_page_reason"].as_str(),
+            Some("offset_past_end")
+        );
         assert!(catalog.get("no_eligible_anchors").is_none());
         let notice = catalog["notice"].as_str().unwrap_or_default();
         assert!(notice.contains("past the end"), "got: {notice}");
@@ -20390,15 +20453,8 @@ Also: {"source": "bare"}"#;
     fn startup_resume_overlay_is_found_by_wrapper_session_id_too() {
         let home = tempfile::tempdir().unwrap();
         let mut project = default_codex_project();
-        let persisted = session_config::from_wire(
-            Some("codex"),
-            None,
-            None,
-            None,
-            Some("managed"),
-            None,
-            None,
-        );
+        let persisted =
+            session_config::from_wire(Some("codex"), None, None, None, Some("managed"), None, None);
         // Overlay keyed by the wrapper/intendant session id, not the backend
         // thread id — `load_for_resume` must check both.
         session_config::write_external_overlay(home.path(), "codex", "wrapper-session", &persisted)
@@ -20482,15 +20538,8 @@ Also: {"source": "bare"}"#;
     fn startup_without_resume_token_never_loads_persisted_config() {
         let home = tempfile::tempdir().unwrap();
         let mut project = default_codex_project();
-        let persisted = session_config::from_wire(
-            Some("codex"),
-            None,
-            None,
-            None,
-            Some("managed"),
-            None,
-            None,
-        );
+        let persisted =
+            session_config::from_wire(Some("codex"), None, None, None, Some("managed"), None, None);
         session_config::write_external_overlay(home.path(), "codex", "wrapper-session", &persisted)
             .unwrap();
 
@@ -22467,8 +22516,7 @@ Also: {"source": "bare"}"#;
 
         assert!(fission_spawn_branch_specs_from_params(&serde_json::json!({})).is_err());
         assert!(
-            fission_spawn_branch_specs_from_params(&serde_json::json!({ "branches": [] }))
-                .is_err()
+            fission_spawn_branch_specs_from_params(&serde_json::json!({ "branches": [] })).is_err()
         );
         assert!(fission_spawn_branch_specs_from_params(&serde_json::json!({
             "branches": [{}, {}, {}, {}, {}]
@@ -22511,7 +22559,9 @@ Also: {"source": "bare"}"#;
         let mut active = HashSet::new();
         let mut previews = HashMap::new();
         let mut seq = HashMap::new();
-        let mut add = |id: &str, preview: &str, order: u64,
+        let mut add = |id: &str,
+                       preview: &str,
+                       order: u64,
                        active: &mut HashSet<String>,
                        previews: &mut HashMap<String, String>,
                        seq: &mut HashMap<String, u64>| {
@@ -22658,7 +22708,10 @@ Also: {"source": "bare"}"#;
     }
 
     fn catalog_item_ids(anchors: &[ContextRewindAnchorCatalogEntry]) -> Vec<String> {
-        anchors.iter().map(|anchor| anchor.item_id.clone()).collect()
+        anchors
+            .iter()
+            .map(|anchor| anchor.item_id.clone())
+            .collect()
     }
 
     #[test]
@@ -23086,7 +23139,9 @@ Also: {"source": "bare"}"#;
         assert!(injected[0].1.contains("owned write scope: src/parser.rs"));
         assert!(injected[0].1.contains("worktree: "));
         assert!(injected[0].1.contains("claim_fission_canonical"));
-        assert!(injected[0].1.contains("end your turn with a concise outcome summary"));
+        assert!(injected[0]
+            .1
+            .contains("end your turn with a concise outcome summary"));
         assert!(injected[1].1.contains("owned write scope: read-only"));
         assert!(!injected[1].1.contains("worktree: "));
 
@@ -23108,7 +23163,10 @@ Also: {"source": "bare"}"#;
             .find(|branch| branch.session_id == "spawnA-child-1")
             .expect("branch 1");
         assert_eq!(branch_1.status, "running");
-        assert_eq!(branch_1.worktree_path.as_deref(), Some(worktree_path.as_path()));
+        assert_eq!(
+            branch_1.worktree_path.as_deref(),
+            Some(worktree_path.as_path())
+        );
         assert_eq!(
             branch_1.task.as_deref(),
             Some("Begin your fission charter: fix the parser")
@@ -23878,7 +23936,9 @@ Also: {"source": "bare"}"#;
         assert_eq!(injected.len(), 1);
         assert_eq!(injected[0].0, "surgical-thread");
         assert!(injected[0].1.starts_with("<model_context_rewind_primer>"));
-        assert!(injected[0].1.contains(MANAGED_CONTEXT_SURGICAL_RECOVERY_REASON));
+        assert!(injected[0]
+            .1
+            .contains(MANAGED_CONTEXT_SURGICAL_RECOVERY_REASON));
 
         // Held user follow-up resumes first (wrapped as a replay), not the
         // generic auto-resume.
@@ -24038,11 +24098,7 @@ Also: {"source": "bare"}"#;
         // observable only post-rollback by construction of the mock).
         assert_eq!(
             rollbacks.lock().unwrap().as_slice(),
-            &[(
-                "rewind-thread".to_string(),
-                "call_mid".to_string(),
-                "after"
-            )]
+            &[("rewind-thread".to_string(), "call_mid".to_string(), "after")]
         );
 
         // Ledger: the late-anchored group is detached, the early one is not.
@@ -24111,10 +24167,7 @@ Also: {"source": "bare"}"#;
         let log_dir = dir.path().join("logs");
         std::fs::create_dir_all(&log_dir).unwrap();
         let rollout = dir.path().join("rollout.jsonl");
-        write_fission_test_rollout(
-            &rollout,
-            &[("call_mid", "shell"), ("call_late", "shell")],
-        );
+        write_fission_test_rollout(&rollout, &[("call_mid", "shell"), ("call_late", "shell")]);
 
         let bus = EventBus::new();
         let mut rx = bus.subscribe();
@@ -24168,9 +24221,10 @@ Also: {"source": "bare"}"#;
             require_density_improvement: false,
             surgical: false,
         };
-        let err = apply_external_context_rewind(&mut agent, "rewind-thread-fail", &request, &config)
-            .await
-            .expect_err("rollback failure surfaces");
+        let err =
+            apply_external_context_rewind(&mut agent, "rewind-thread-fail", &request, &config)
+                .await
+                .expect_err("rollback failure surfaces");
         assert!(err.contains("thread rollback failed"), "error: {err}");
 
         // Detach never ran: ledger untouched, route intact, no record, no
@@ -27527,9 +27581,10 @@ async fn run_with_presence(
                 let startup_resume = startup_resume_session.take();
                 let startup_overrides = if startup_resume.is_some() {
                     startup_resume_session_config.take().filter(|config| {
-                        config.source.as_deref().is_none_or(|source| {
-                            source == backend.as_short_str()
-                        })
+                        config
+                            .source
+                            .as_deref()
+                            .is_none_or(|source| source == backend.as_short_str())
                     })
                 } else {
                     None
@@ -31385,9 +31440,8 @@ async fn run_external_agent_mode(
                                 }
                                 slog(&session_log, |l| l.warn(&message));
                                 bus.send(AppEvent::LoopError(message));
-                                stats.terminal_outcome = Some(
-                                    "managed Codex context pressure unresolved".to_string(),
-                                );
+                                stats.terminal_outcome =
+                                    Some("managed Codex context pressure unresolved".to_string());
                                 break;
                             }
                             if let Some(pressure) = managed_context_density_pressure(&snapshot) {

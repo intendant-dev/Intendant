@@ -558,7 +558,11 @@ mod tests {
         assert!(matches!(outcome, WaitOutcome::GroupNotFound));
     }
 
-    fn branch_snapshot(log_dir: &Path, group_id: &str, session: &str) -> fission_ledger::FissionBranch {
+    fn branch_snapshot(
+        log_dir: &Path,
+        group_id: &str,
+        session: &str,
+    ) -> fission_ledger::FissionBranch {
         let document = fission_ledger::read_fission_ledger_document(log_dir)
             .unwrap()
             .expect("ledger document");
@@ -680,7 +684,10 @@ mod tests {
             &mut state,
         );
         let branch = branch_snapshot(dir.path(), &failed_group, "lw-child-fail");
-        assert_eq!(fission_ledger::normalize_branch_status(&branch.status), "failed");
+        assert_eq!(
+            fission_ledger::normalize_branch_status(&branch.status),
+            "failed"
+        );
         assert_eq!(branch.summary.as_deref(), Some("error: backend exploded"));
 
         // Plain teardown → ended (normalizes to completed).

@@ -11454,6 +11454,11 @@ const SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX = 64;
 const SESSION_WINDOW_STATE_KEY = 'intendant_session_windows_v1';
 const SESSION_WINDOW_RESTORE_LIMIT = 6;
 const SESSION_WINDOW_RESTORE_LOG_LIMIT = 250;
+const SESSION_TEXT_SIGNATURE_CHAR_LIMIT = 8192;
+const SESSION_RENDERED_SIGNATURE_CHAR_LIMIT = 4096;
+const STATION_ACTIVITY_TEXT_CHAR_LIMIT = 1200;
+const STATION_ANCHOR_DETAIL_CHAR_LIMIT = 2000;
+const COMMAND_OUTPUT_EAGER_RENDER_CHAR_LIMIT = 24000;
 const SESSION_PENDING_ACTIVE_MS = 30000;
 const SESSION_METADATA_REFRESH_MS = 15000;
 const SESSION_WINDOW_GRID_HEIGHT_KEY = 'intendant_session_window_grid_height_v3';
@@ -12460,9 +12465,11 @@ function stationLogEventId(c, fallbackIndex = '') {
   if (explicit) return explicit;
   const ts = String(c?.ts || c?.timestamp || '');
   const source = String(c?.source || c?.level || c?.event || '');
-  const content = compactSessionText(c?.content || c?.msg || c?.message || '')
-    .replace(/\s+/g, ' ')
-    .trim()
+  const content = compactSessionTextBounded(
+    c?.content || c?.msg || c?.message || '',
+    STATION_ACTIVITY_TEXT_CHAR_LIMIT,
+    { suffix: false }
+  )
     .slice(0, 80);
   const parts = [hostId, sessionId, ts, source, content, String(fallbackIndex || '')].filter(Boolean);
   return parts.length ? parts.join(':') : `event:${Date.now()}`;
@@ -12482,7 +12489,7 @@ function stationSessionWindowHistoryEvent(item, win, index) {
     source,
     content,
   });
-  const msg = compactSessionText(content).replace(/\s+/g, ' ').trim();
+  const msg = compactSessionTextBounded(content, STATION_ACTIVITY_TEXT_CHAR_LIMIT);
   return {
     id: eventId,
     action: 'log',
@@ -18069,7 +18076,10 @@ function stationUpsertActivityEvent(event) {
     ts: event.ts || stationActivityTimestampLabel(),
     level: event.level || 'info',
     source: event.source || event.event || event.level || 'info',
-    msg: event.msg || event.content || event.message || '',
+    msg: compactSessionTextBounded(
+      event.msg || event.content || event.message || '',
+      STATION_ACTIVITY_TEXT_CHAR_LIMIT
+    ),
   };
   const existingIndex = stationLogEvents.findIndex(row => stationActivityEventKey(row) === id);
   if (existingIndex >= 0) stationLogEvents[existingIndex] = { ...stationLogEvents[existingIndex], ...next };
@@ -18105,7 +18115,7 @@ function stationPushLogEvent(c) {
     ts: (c.ts || new Date().toTimeString()).substring(0, 8),
     level: c.level || 'info',
     source: c.source || c.event || c.level || 'info',
-    msg: c.content || c.source || c.event || '',
+    msg: compactSessionTextBounded(c.content || c.source || c.event || '', STATION_ACTIVITY_TEXT_CHAR_LIMIT),
   });
   stationTrimActivityEvents();
   stationTrackLogAnchor(c);
@@ -18175,7 +18185,7 @@ function stationTrackLogAnchorRow(itemId, sessionId, detail, value = 'log') {
     id,
     sessionId: sid,
     value: value || 'log',
-    detail: detail || '',
+    detail: compactSessionTextBounded(detail || '', STATION_ANCHOR_DETAIL_CHAR_LIMIT),
     seq: isNew ? ++stationLogAnchorSeq : (stationLogAnchorRows.get(key)?.seq ?? ++stationLogAnchorSeq),
   };
   stationLogAnchorRows.set(key, row);
@@ -23432,6 +23442,7 @@ function renderTurnSeparator(turn) {
 
 // Stores base64 image data keyed by DOM element — lazy-loaded on expand
 const _logImageStore = new WeakMap();
+const _deferredCommandOutputStore = new WeakMap();
 const _wiredCollapsibleLogEntries = new WeakSet();
 const _wiredCommandOutputLogEntries = new WeakSet();
 const _wiredDiffLogEntries = new WeakSet();
@@ -24185,6 +24196,50 @@ function compactSessionText(value) {
     return '';
   }
   return String(value || '').replace(/\s+/g, ' ').trim();
+}
+
+function compactSessionTextBounded(value, limit = SESSION_TEXT_SIGNATURE_CHAR_LIMIT, options = {}) {
+  if (value === null || value === undefined) return '';
+  if (value instanceof Element) return compactSessionTextBounded(value.textContent || '', limit, options);
+  if (typeof value === 'object') {
+    for (const key of ['text', 'content', 'message', 'task', 'title', 'name']) {
+      const candidate = value[key];
+      if (typeof candidate === 'string' && /\S/.test(candidate)) {
+        return compactSessionTextBounded(candidate, limit, options);
+      }
+    }
+    return '';
+  }
+  const raw = String(value || '');
+  const safeLimit = Math.max(0, Number(limit) || 0);
+  const truncated = safeLimit > 0 && raw.length > safeLimit;
+  const src = truncated ? raw.slice(0, safeLimit) : raw;
+  const compact = src.replace(/\s+/g, ' ').trim();
+  if (!truncated || options.suffix === false) return compact;
+  const suffix = options.signature ? ` [len:${raw.length}]` : `... (${raw.length} chars)`;
+  return compact ? `${compact}${suffix}` : suffix.trim();
+}
+
+function utf8ByteLength(value) {
+  const s = String(value || '');
+  let bytes = 0;
+  for (let i = 0; i < s.length; i++) {
+    const code = s.charCodeAt(i);
+    if (code < 0x80) bytes += 1;
+    else if (code < 0x800) bytes += 2;
+    else if (code >= 0xd800 && code <= 0xdbff && i + 1 < s.length) {
+      const next = s.charCodeAt(i + 1);
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4;
+        i += 1;
+      } else {
+        bytes += 3;
+      }
+    } else {
+      bytes += 3;
+    }
+  }
+  return bytes;
 }
 
 function sessionIdentityParts(sessionId) {
@@ -24969,14 +25024,15 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
 }
 
 function sessionWindowTranscriptSignatureContent(value) {
-  return String(value || '')
-    .trim()
-    .replace(/\s+/g, ' ');
+  return compactSessionTextBounded(value, SESSION_TEXT_SIGNATURE_CHAR_LIMIT, { signature: true });
 }
 
 function sessionWindowTranscriptRenderedContentForRecord(record = {}) {
   const raw = String(record.content || record.summary || record.message || '');
   if (!raw) return '';
+  if (raw.length > SESSION_RENDERED_SIGNATURE_CHAR_LIMIT || isSessionWindowCommandOutputRecord(record)) {
+    return '';
+  }
   try {
     const cnt = document.createElement('span');
     cnt.className = 'log-content';
@@ -25005,15 +25061,17 @@ function sessionWindowTranscriptSignatureParts(record = {}, fallbackSessionId = 
   const sessionId = String(record.session_id || record.sessionId || fallbackSessionId || '').trim();
   const contentAliases = sessionWindowTranscriptContentAliasesForRecord(record);
   const content = contentAliases[0] || '';
-  if (!sessionId || !content) return null;
+  const itemId = String(record.item_id || record.itemId || '').trim();
+  const outputId = String(record.output_id || record.outputId || '').trim();
+  if (!sessionId || (!content && !itemId && !outputId)) return null;
   return {
     sessionId,
     ts: String(record.ts || record.timestamp || '').trim(),
     level: String(record.level || '').trim().toLowerCase(),
     source: String(record.source || '').trim().toLowerCase(),
     kind: String(record.kind || '').trim().toLowerCase(),
-    itemId: String(record.item_id || record.itemId || '').trim(),
-    outputId: String(record.output_id || record.outputId || '').trim(),
+    itemId,
+    outputId,
     userTurnIndex: record.user_turn_index ?? record.userTurnIndex ?? '',
     userTurnRevision: record.user_turn_revision ?? record.userTurnRevision ?? '',
     replacementTurnIndex: record.replacement_for_user_turn_index ?? record.replacementForUserTurnIndex ?? '',
@@ -25093,7 +25151,10 @@ function sessionWindowTranscriptContentForNode(node) {
 
 function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') {
   if (!node) return [];
-  const content = sessionWindowTranscriptContentForNode(node);
+  const isCommandOutput = !!node.dataset?.outputId || node.dataset?.kind === 'agent_output';
+  const content = isCommandOutput
+    ? (node.querySelector?.('.command-output-summary')?.textContent || '')
+    : sessionWindowTranscriptContentForNode(node);
   const parts = sessionWindowTranscriptSignatureParts({
     session_id: node.dataset?.sessionId || fallbackSessionId,
     ts: node.querySelector?.('.log-ts')?.title || node.querySelector?.('.log-ts')?.textContent || '',
@@ -25101,6 +25162,7 @@ function sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId = '') 
     source: node.querySelector?.('.log-level')?.textContent || '',
     kind: node.dataset?.kind || '',
     item_id: node.dataset?.itemId || '',
+    output_id: node.dataset?.outputId || '',
     user_turn_index: node.dataset?.userTurnIndex,
     user_turn_revision: node.dataset?.userTurnRevision,
     replacement_for_user_turn_index: node.dataset?.replacementForUserTurnIndex,
@@ -26820,7 +26882,7 @@ function buildSessionWindowCommandOutputEntry(c) {
     bytes: stats.bytes,
     warns: String(c?.level || '').toLowerCase() === 'warn' ? 1 : 0,
   });
-  if (content) appendCommandOutputText(body, content);
+  if (content) setDeferredCommandOutputText(entry, body, content, stats);
   const toggle = document.createElement('span');
   toggle.className = 'collapse-toggle';
   toggle.innerHTML = '<span class="arrow">\u25B8 output</span><span class="arrow-up">\u25BE hide</span>';
@@ -26829,7 +26891,9 @@ function buildSessionWindowCommandOutputEntry(c) {
   appendCopyLogEntryButton(entry, content);
   entry.addEventListener('click', (event) => {
     if (event.target?.closest?.('a, button')) return;
-    entry.classList.toggle('expanded');
+    const expanded = !entry.classList.contains('expanded');
+    entry.classList.toggle('expanded', expanded);
+    if (expanded) renderDeferredCommandOutputText(entry);
   });
   return entry;
 }
@@ -29243,8 +29307,12 @@ function highlightCommandOutput(text) {
 function commandOutputStats(text) {
   const s = String(text || '');
   if (!s) return { lines: 0, bytes: 0 };
-  const lines = s.endsWith('\n') ? s.split('\n').length - 1 : s.split('\n').length;
-  return { lines, bytes: new Blob([s]).size };
+  let newlines = 0;
+  for (let i = 0; i < s.length; i++) {
+    if (s.charCodeAt(i) === 10) newlines += 1;
+  }
+  const lines = s.endsWith('\n') ? newlines : newlines + 1;
+  return { lines, bytes: utf8ByteLength(s) };
 }
 
 function formatCompactBytes(bytes) {
@@ -29512,6 +29580,27 @@ function appendCommandOutputText(body, text) {
   code.innerHTML = highlightCommandOutput(text);
   pre.appendChild(code);
   body.appendChild(pre);
+}
+
+function setDeferredCommandOutputText(entry, body, text, stats = null) {
+  if (!entry || !body) return;
+  const outputText = String(text || '');
+  if (!outputText) return;
+  const outputStats = stats || commandOutputStats(outputText);
+  if (outputText.length <= COMMAND_OUTPUT_EAGER_RENDER_CHAR_LIMIT) {
+    appendCommandOutputText(body, outputText);
+    return;
+  }
+  body.textContent = `Output is ${formatCompactBytes(outputStats.bytes)} across ${outputStats.lines} line${outputStats.lines === 1 ? '' : 's'}; expand to render it.`;
+  _deferredCommandOutputStore.set(entry, { body, text: outputText, rendered: false });
+}
+
+function renderDeferredCommandOutputText(entry) {
+  const state = entry ? _deferredCommandOutputStore.get(entry) : null;
+  if (!state || state.rendered || !state.body) return;
+  state.rendered = true;
+  state.body.innerHTML = '';
+  appendCommandOutputText(state.body, state.text);
 }
 
 function wireCommandOutputGroupClone(clone, sourceEntry) {
