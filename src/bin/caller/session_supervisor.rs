@@ -2042,6 +2042,17 @@ impl SessionSupervisor {
         lookup_id: String,
         request: EditUserMessageRequest,
     ) {
+        self.config.bus.send(AppEvent::LogEntry {
+            session_id: Some(request.requested_id.clone()),
+            level: "info".to_string(),
+            source: "session-supervisor".to_string(),
+            content: format!(
+                "Edit waiting for session {} to become routable before user turn {}",
+                short_session(&lookup_id),
+                request.user_turn_index
+            ),
+            turn: None,
+        });
         let supervisor = self.clone();
         let mut attach_rx = self.config.bus.subscribe();
         tokio::spawn(async move {
@@ -2078,55 +2089,37 @@ impl SessionSupervisor {
         attach_rx: &mut tokio::sync::broadcast::Receiver<AppEvent>,
     ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
         let started_at = std::time::Instant::now();
-        let mut attached = false;
         loop {
-            if attached {
-                let primary = self
-                    .lookup_edit_route_target_in_current_state(primary_id)
-                    .await;
-                if primary.1.is_some() {
-                    return primary;
-                }
+            let primary = self.lookup_edit_route_target(primary_id).await;
+            if primary.1.is_some() {
+                return primary;
+            }
 
-                if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
-                    let fallback = self
-                        .lookup_edit_route_target_in_current_state(fallback_id)
-                        .await;
-                    if fallback.1.is_some() {
-                        return fallback;
-                    }
+            if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
+                let fallback = self.lookup_edit_route_target(fallback_id).await;
+                if fallback.1.is_some() {
+                    return fallback;
                 }
             }
 
             if started_at.elapsed() >= EDIT_ATTACH_ROUTE_TIMEOUT {
-                return if attached {
-                    let primary = self
-                        .lookup_edit_route_target_in_current_state(primary_id)
-                        .await;
-                    if primary.1.is_some() {
-                        primary
-                    } else if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
-                        self.lookup_edit_route_target_in_current_state(fallback_id)
-                            .await
+                return if let Some(fallback_id) = fallback_id.filter(|id| *id != primary_id) {
+                    let fallback = self.lookup_edit_route_target(fallback_id).await;
+                    if fallback.1.is_some() {
+                        fallback
                     } else {
                         primary
                     }
                 } else {
-                    (primary_id.to_string(), None, None)
+                    primary
                 };
             }
 
             tokio::select! {
                 event = attach_rx.recv() => {
                     match event {
-                        Ok(event) => {
-                            if edit_attach_event_matches(&event, primary_id, fallback_id) {
-                                attached = true;
-                            }
-                        }
-                        Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {
-                            attached = true;
-                        }
+                        Ok(event) if edit_attach_event_matches(&event, primary_id, fallback_id) => {}
+                        Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
                         Err(tokio::sync::broadcast::error::RecvError::Closed) => {}
                     }
                 }
@@ -2336,14 +2329,6 @@ impl SessionSupervisor {
         }
 
         initial
-    }
-
-    async fn lookup_edit_route_target_in_current_state(
-        &self,
-        requested_id: &str,
-    ) -> (String, Option<EditRouteTarget>, Option<RelatedSession>) {
-        let state = self.state.lock().await;
-        lookup_edit_route_target_in_state(&state, requested_id)
     }
 
     async fn route_interrupt(&self, session_id: Option<String>) {
@@ -5597,7 +5582,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_queued_after_attach_waits_for_ready_signal() {
+    async fn edit_queued_after_attach_polls_for_routable_session() {
         let bus = EventBus::new();
         let supervisor = test_supervisor(PathBuf::from("/tmp/project"), bus.clone());
         let (tx, mut rx) = mpsc::channel(1);
@@ -5633,20 +5618,9 @@ mod tests {
             );
         }
 
-        tokio::time::sleep(EDIT_ATTACH_ROUTE_POLL_INTERVAL * 2).await;
-        assert!(
-            rx.try_recv().is_err(),
-            "edit should wait for attach-ready event before delivery"
-        );
-
-        bus.send(AppEvent::SessionAttached {
-            session_id: "codex-thread".to_string(),
-            source: "codex".to_string(),
-        });
-
         let msg = tokio::time::timeout(std::time::Duration::from_millis(300), rx.recv())
             .await
-            .expect("queued edit should deliver after attach-ready event")
+            .expect("queued edit should deliver once the live route exists")
             .expect("follow-up channel should stay open");
         assert_eq!(msg.text, "edited continue");
         assert_eq!(msg.edit_user_turn_index, Some(2));
