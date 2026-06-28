@@ -796,9 +796,10 @@ Current alpha limits:
   single-node alpha persistence layer;
 - no application-layer dashboard RPC relay; the default path is browser to
   daemon WebRTC, with TURN/WebRTC relay remaining a transport-level option;
-- Files transfer history and resumed download offsets are browser-session state;
-  they are not durable across reloads yet, and uploads are current-session staged
-  attachments rather than arbitrary daemon filesystem writes;
+- Files transfer history and resumed download offsets are browser-local state
+  (`localStorage` plus IndexedDB parts), not server-side durable state shared
+  across browsers; uploads are current-session staged attachments rather than
+  arbitrary daemon filesystem writes;
 - peer daemon-to-daemon mTLS remains separate from Connect account login.
 
 Run the hosted MVP E2E locally with:
@@ -1192,7 +1193,17 @@ of its transfer center: users can type a path or browse with the filesystem
 picker, queue downloads, pause/cancel/retry, and resume from completed ranges
 inside the current browser session. Public-origin Connect mode does not fall
 back to daemon HTTP for this path. The queue/history and partially completed
-ranges are not persisted across page reloads yet.
+ranges are browser-local state, not daemon-side transfer records.
+
+Daemon-origin dashboards reached directly over native mTLS use the same Files
+transfer center but read arbitrary files through `GET /api/fs/read?path=...`
+with ordinary HTTP `Range` requests. The endpoint follows the same path rules,
+rejects directories, advertises `Accept-Ranges: bytes`, returns `206 Partial
+Content` plus `Content-Range` for ranged reads, and returns `416 Range Not
+Satisfiable` with `Content-Range: bytes */total` for invalid ranges. This keeps
+direct mTLS downloads resumable without routing them through the Connect
+DataChannel. Connect dashboards intentionally keep using `api_fs_read` over the
+verified tunnel and never fall back to daemon-origin HTTP.
 Lazy exact context-snapshot loads use `api_session_context_snapshot`, keeping
 large raw request payloads out of ordinary session-detail hydration while still
 allowing the Context pane to fetch a single archived snapshot on demand.
