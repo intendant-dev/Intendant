@@ -23571,6 +23571,7 @@ function renderTurnSeparator(turn) {
 // Stores base64 image data keyed by DOM element — lazy-loaded on expand
 const _logImageStore = new WeakMap();
 const _deferredCommandOutputStore = new WeakMap();
+const _lazyCommandOutputStore = new WeakMap();
 const _wiredCollapsibleLogEntries = new WeakSet();
 const _wiredCommandOutputLogEntries = new WeakSet();
 const _wiredDiffLogEntries = new WeakSet();
@@ -25082,6 +25083,13 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
     replacement_for_user_turn_index: entry.replacement_for_user_turn_index ?? entry.replacementForUserTurnIndex,
     superseded: !!entry.superseded,
     superseded_reason: entry.superseded_reason || entry.supersededReason || '',
+    full_output_available: !!(entry.full_output_available ?? entry.fullOutputAvailable),
+    full_output_bytes: entry.full_output_bytes ?? entry.fullOutputBytes,
+    full_output_lines: entry.full_output_lines ?? entry.fullOutputLines,
+    text_truncated: !!(entry.text_truncated ?? entry.textTruncated),
+    truncated_fields: entry.truncated_fields || entry.truncatedFields || [],
+    output_session_id: entry.output_session_id || entry.outputSessionId || entry.session_id || entry.sessionId || fallbackSessionId,
+    output_source: entry.output_source || entry.outputSource || entry.source || '',
   };
   let content = String(entry.content || entry.summary || entry.message || '').trim();
   let level = String(entry.level || '').trim();
@@ -25091,7 +25099,7 @@ function sessionWindowRecordFromReplayEntry(entry = {}, fallbackSessionId = '') 
   if (event === 'replay_start' || event === 'context_snapshot') return null;
   if (event === 'log_entry' || !event) {
     if (!content) return null;
-    return { ...base, level: level || 'info', source: source || 'system', content, kind };
+    return { ...base, level: level || 'info', source: source || 'system', content, kind, output_id: entry.output_id || entry.outputId || '' };
   }
   if (event === 'model_response') {
     if (!content) {
@@ -27055,6 +27063,74 @@ function isSessionWindowCommandOutputRecord(c) {
   return !!c && (c.kind === 'agent_output' || !!c.output_id);
 }
 
+function commandOutputRecordOutputIds(c = {}) {
+  const ids = [];
+  const add = (value) => {
+    const id = String(value || '').trim();
+    if (id && !ids.includes(id)) ids.push(id);
+  };
+  add(c.output_id || c.outputId);
+  if (Array.isArray(c.output_ids || c.outputIds)) {
+    for (const id of (c.output_ids || c.outputIds)) add(id);
+  }
+  return ids;
+}
+
+function commandOutputRecordFetchSessionId(c = {}) {
+  return String(c.output_session_id || c.outputSessionId || c.session_id || c.sessionId || '').trim();
+}
+
+function commandOutputRecordFetchSource(c = {}) {
+  return normalizeAgentId(c.output_source || c.outputSource || c.source || '') || 'intendant';
+}
+
+function commandOutputRecordHasFullFetch(c = {}) {
+  return !!(
+    (c.full_output_available ?? c.fullOutputAvailable) ||
+    (c.text_truncated ?? c.textTruncated) ||
+    (Array.isArray(c.truncated_fields || c.truncatedFields) && (c.truncated_fields || c.truncatedFields).length > 0)
+  ) && commandOutputRecordOutputIds(c).length > 0;
+}
+
+function commandOutputRecordStats(c = {}, content = '') {
+  const stats = commandOutputStats(content);
+  const bytes = Number(c.full_output_bytes ?? c.fullOutputBytes);
+  const lines = Number(c.full_output_lines ?? c.fullOutputLines);
+  return {
+    bytes: Number.isFinite(bytes) && bytes > 0 ? bytes : stats.bytes,
+    lines: Number.isFinite(lines) && lines > 0 ? lines : stats.lines,
+  };
+}
+
+async function loadReplayCommandOutputIntoBody(c, body, copyRef = null) {
+  const ids = commandOutputRecordOutputIds(c);
+  const sessionId = commandOutputRecordFetchSessionId(c);
+  const source = commandOutputRecordFetchSource(c);
+  if (!ids.length || !sessionId) {
+    body.textContent = 'Full output is not available for lazy loading.';
+    return;
+  }
+  const json = await fetchSessionAgentOutputPayload(sessionId, {
+    source,
+    ids,
+    cache: 'no-store',
+  });
+  if (json?.error) throw new Error(json.error);
+  const outputs = Array.isArray(json.outputs) ? json.outputs : [];
+  body.innerHTML = '';
+  const chunks = [];
+  for (const out of outputs) {
+    const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');
+    if (!text) continue;
+    chunks.push(text);
+    await appendCommandOutputTextProgressive(body, text);
+  }
+  if (copyRef && chunks.length) copyRef.text = chunks.join('\n');
+  if (!body.childElementCount) {
+    body.textContent = 'No persisted output found.';
+  }
+}
+
 function buildSessionWindowCommandOutputEntry(c) {
   const content = String(c?.content || '');
   const { entry } = createLogScaffold(c, 'command-output-group finalized');
@@ -27066,25 +27142,50 @@ function buildSessionWindowCommandOutputEntry(c) {
   body.className = 'command-output-body';
   wrap.appendChild(summary);
   wrap.appendChild(body);
-  const stats = commandOutputStats(content);
+  const stats = commandOutputRecordStats(c, content);
+  const canFetchFull = commandOutputRecordHasFullFetch(c);
   summary.innerHTML = commandOutputSummaryHtml({
     chunks: 1,
     lines: stats.lines,
     bytes: stats.bytes,
     warns: String(c?.level || '').toLowerCase() === 'warn' ? 1 : 0,
   });
-  if (content) setDeferredCommandOutputText(entry, body, content, stats);
+  if (content && !canFetchFull) {
+    setDeferredCommandOutputText(entry, body, content, stats);
+  } else if (canFetchFull) {
+    body.textContent = content
+      ? 'Preview loaded; expand to fetch full output.'
+      : 'Expand to fetch full output.';
+    _lazyCommandOutputStore.set(entry, { c, body, loaded: false, loading: false });
+  }
   const toggle = document.createElement('span');
   toggle.className = 'collapse-toggle';
   toggle.innerHTML = '<span class="arrow">\u25B8 output</span><span class="arrow-up">\u25BE hide</span>';
   entry.appendChild(wrap);
   entry.appendChild(toggle);
-  appendCopyLogEntryButton(entry, content);
-  entry.addEventListener('click', (event) => {
+  const copyRef = setLogEntryCopyText(entry, content);
+  appendCopyLogEntryButton(entry);
+  entry.addEventListener('click', async (event) => {
     if (event.target?.closest?.('a, button')) return;
     const expanded = !entry.classList.contains('expanded');
     entry.classList.toggle('expanded', expanded);
-    if (expanded) renderDeferredCommandOutputText(entry);
+    if (!expanded) return;
+    const lazy = _lazyCommandOutputStore.get(entry);
+    if (lazy) {
+      if (lazy.loaded || lazy.loading) return;
+      lazy.loading = true;
+      body.textContent = 'Loading full output...';
+      try {
+        await loadReplayCommandOutputIntoBody(c, body, copyRef);
+        lazy.loaded = true;
+      } catch (err) {
+        body.textContent = 'Could not load full output: ' + (err?.message || err);
+      } finally {
+        lazy.loading = false;
+      }
+      return;
+    }
+    renderDeferredCommandOutputText(entry);
   });
   return entry;
 }
@@ -29177,6 +29278,13 @@ function sessionWindowRecordFromLogCommand(c) {
     content,
     kind: c?.kind || '',
     output_id: c?.output_id || c?.outputId || '',
+    output_session_id: c?.output_session_id || c?.outputSessionId || sid,
+    output_source: c?.output_source || c?.outputSource || c?.source || '',
+    full_output_available: !!(c?.full_output_available ?? c?.fullOutputAvailable),
+    full_output_bytes: c?.full_output_bytes ?? c?.fullOutputBytes,
+    full_output_lines: c?.full_output_lines ?? c?.fullOutputLines,
+    text_truncated: !!(c?.text_truncated ?? c?.textTruncated),
+    truncated_fields: c?.truncated_fields || c?.truncatedFields || [],
     item_id: c?.item_id || c?.itemId || '',
     user_turn_index: c?.user_turn_index ?? c?.userTurnIndex,
     user_turn_revision: c?.user_turn_revision ?? c?.userTurnRevision,
@@ -29841,6 +29949,19 @@ function appendCommandOutputText(body, text) {
   body.appendChild(pre);
 }
 
+async function appendCommandOutputTextProgressive(body, text, chunkChars = 65536) {
+  if (!body || !text) return;
+  const output = String(text || '');
+  if (output.length <= chunkChars) {
+    appendCommandOutputText(body, output);
+    return;
+  }
+  for (let offset = 0; offset < output.length; offset += chunkChars) {
+    appendCommandOutputText(body, output.slice(offset, offset + chunkChars));
+    await new Promise(resolve => requestAnimationFrame(resolve));
+  }
+}
+
 function setDeferredCommandOutputText(entry, body, text, stats = null) {
   if (!entry || !body) return;
   const outputText = String(text || '');
@@ -30058,7 +30179,7 @@ async function loadCommandOutputIntoBody(group, body) {
   body.innerHTML = '';
   for (const out of (json.outputs || [])) {
     const text = [out.stdout || '', out.stderr || ''].filter(Boolean).join(out.stdout && out.stderr ? '\n' : '');
-    appendCommandOutputText(body, text);
+    await appendCommandOutputTextProgressive(body, text);
   }
   if (!body.childElementCount) {
     body.textContent = 'No persisted output found.';
@@ -40508,6 +40629,9 @@ window.intendantDashboardControl = {
   sessionDetail(sessionId, params = {}) {
     return dashboardTransport.request('api_session_detail', { session_id: sessionId, ...params });
   },
+  sessionAgentOutput(sessionId, ids = [], params = {}, options = {}) {
+    return dashboardTransport.request('api_session_agent_output', { session_id: sessionId, ids, ...params }, options);
+  },
   sessionDelete(sessionId, target = 'session', options = {}) {
     return dashboardTransport.request('api_session_delete', { session_id: sessionId, target }, options);
   },
@@ -41640,6 +41764,7 @@ class DashboardControlTransport {
       apiSessionDetailAvailable: this.lastStatus?.api_session_detail_available ?? null,
       apiSessionReportAvailable: this.lastStatus?.api_session_report_available ?? null,
       apiSessionDeleteAvailable: this.lastStatus?.api_session_delete_available ?? null,
+      apiSessionAgentOutputAvailable: this.lastStatus?.api_session_agent_output_available ?? null,
       apiSessionCurrentAgentOutputAvailable: this.lastStatus?.api_session_current_agent_output_available ?? null,
       apiSessionCurrentHistoryAvailable: this.lastStatus?.api_session_current_history_available ?? null,
       apiSessionCurrentRollbackAvailable: this.lastStatus?.api_session_current_rollback_available ?? null,
@@ -41757,6 +41882,7 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_transfer_download_read':
     case 'api_transfer_upload_chunk':
     case 'api_transfer_upload_commit':
+    case 'api_session_agent_output':
     case 'api_managed_context_records':
     case 'api_managed_context_anchors':
     case 'api_managed_context_fission':
@@ -41886,6 +42012,41 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
     data._httpStatus = resp.status;
     return data;
   }, 'api_session_detail', { signal: options.signal });
+}
+
+async function fetchSessionAgentOutputPayload(sessionId, options = {}) {
+  const sid = String(sessionId || '').trim();
+  if (!sid) throw new Error('missing session id');
+  const source = String(options.source || 'intendant').trim() || 'intendant';
+  const ids = Array.isArray(options.ids)
+    ? options.ids.map(id => String(id || '').trim()).filter(Boolean)
+    : [];
+  if (!ids.length) throw new Error('missing output ids');
+  const params = { session_id: sid, source, ids };
+  return dashboardTransport.rpcOrHttp('api_session_agent_output', params, async () => {
+    const query = new URLSearchParams();
+    query.set('source', source);
+    const fetchOptions = {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ ids }),
+    };
+    if (options.signal) fetchOptions.signal = options.signal;
+    if (options.cache) fetchOptions.cache = options.cache;
+    const resp = await fetch(`/api/session/${encodeURIComponent(sid)}/agent-output?${query.toString()}`, fetchOptions);
+    let data = {};
+    try {
+      data = await resp.json();
+    } catch {
+      data = {};
+    }
+    if (!resp.ok && !data.error) {
+      data.error = resp.statusText || `HTTP ${resp.status}`;
+    }
+    data._httpStatus = resp.status;
+    data._httpOk = resp.ok;
+    return data;
+  }, 'api_session_agent_output', { signal: options.signal });
 }
 
 async function fetchSessionsSearchPayload(options = {}) {
@@ -55630,7 +55791,7 @@ function buildSessionDetailRows(entries) {
     if (!sessionDetailEntryMatchesLogFilter(e)) continue;
     const source = e.source || '';
     const displaySource = sessionDetailSourceLabels[source] || source || '\u2139';
-    const content = e.content || e.summary || e.message || '';
+    const content = e.content || e.summary || e.message || e.stdout || e.stderr || '';
     if (!String(content).trim()) continue;
     const detailRecord = {
       ...e,
@@ -55829,6 +55990,13 @@ function materializeSessionDetailRow(view, row, index) {
   if (row.kind !== 'entry') return null;
 
   const e = row.record;
+  if (isSessionWindowCommandOutputRecord(e)) {
+    const outputEntry = buildSessionWindowCommandOutputEntry(e);
+    if (!outputEntry) return null;
+    outputEntry.dataset.detailRowIndex = String(index);
+    return outputEntry;
+  }
+
   const entry = document.createElement('div');
   entry.className = 'log-entry level-' + e.level;
   entry.dataset.detailRowIndex = String(index);

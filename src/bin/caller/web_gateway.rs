@@ -2897,6 +2897,13 @@ fn compact_replay_entry_text_fields_for_websocket(entry: &mut serde_json::Value)
     let Some(obj) = entry.as_object_mut() else {
         return;
     };
+    let is_agent_output = obj.get("event").and_then(|v| v.as_str()) == Some("agent_output")
+        || obj.get("kind").and_then(|v| v.as_str()) == Some("agent_output")
+        || obj.contains_key("output_id")
+        || obj.contains_key("outputId");
+    let mut truncated_fields = Vec::new();
+    let mut full_output_bytes = 0usize;
+    let mut full_output_lines = 0usize;
     for key in [
         "content",
         "stdout",
@@ -2913,10 +2920,38 @@ fn compact_replay_entry_text_fields_for_websocket(entry: &mut serde_json::Value)
             continue;
         };
         if text.len() > WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES {
+            truncated_fields.push(key);
+            if is_agent_output && matches!(key, "content" | "stdout" | "stderr") {
+                full_output_bytes = full_output_bytes.saturating_add(text.len());
+                full_output_lines = full_output_lines.saturating_add(text.lines().count().max(1));
+            }
             *value = serde_json::Value::String(truncate_string_to_utf8_byte_limit(
                 text,
                 WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES,
             ));
+        }
+    }
+    if truncated_fields.is_empty() {
+        return;
+    }
+    obj.insert("text_truncated".to_string(), serde_json::json!(true));
+    obj.insert(
+        "truncated_fields".to_string(),
+        serde_json::json!(truncated_fields),
+    );
+    if is_agent_output {
+        obj.insert("full_output_available".to_string(), serde_json::json!(true));
+        if full_output_bytes > 0 {
+            obj.insert(
+                "full_output_bytes".to_string(),
+                serde_json::json!(full_output_bytes),
+            );
+        }
+        if full_output_lines > 0 {
+            obj.insert(
+                "full_output_lines".to_string(),
+                serde_json::json!(full_output_lines),
+            );
         }
     }
 }
@@ -3278,6 +3313,112 @@ fn agent_output_ids_from_json_body(body: &str) -> Result<Vec<String>, String> {
 pub(crate) fn current_agent_output_post_response(body: &str, log_dir: &Path) -> String {
     match agent_output_ids_from_json_body(body) {
         Ok(ids) => current_agent_output_response_for_ids(ids, log_dir),
+        Err(e) => upload_error_response("400 Bad Request", &e),
+    }
+}
+
+fn json_response_body(body: String) -> String {
+    format!(
+        "HTTP/1.1 200 OK\r\n\
+         Content-Type: application/json\r\n\
+         Content-Length: {}\r\n\
+         Cache-Control: no-cache\r\n\
+         Access-Control-Allow-Origin: *\r\n\
+         Connection: close\r\n\
+         \r\n\
+         {}",
+        body.len(),
+        body
+    )
+}
+
+fn external_agent_output_response_for_ids(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    ids: Vec<String>,
+) -> String {
+    let Some(entries) = external_session_entries_from_home(home, source, session_id) else {
+        return upload_error_response("404 Not Found", "session not found");
+    };
+    let wanted: HashSet<&str> = ids.iter().map(String::as_str).collect();
+    let mut found: HashMap<String, serde_json::Value> = HashMap::new();
+    for entry in entries {
+        let output_id = entry
+            .get("output_id")
+            .or_else(|| entry.get("outputId"))
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .trim();
+        if output_id.is_empty() || !wanted.contains(output_id) {
+            continue;
+        }
+        if entry.get("event").and_then(|v| v.as_str()) != Some("agent_output")
+            && entry.get("kind").and_then(|v| v.as_str()) != Some("agent_output")
+        {
+            continue;
+        }
+        found.entry(output_id.to_string()).or_insert_with(|| {
+            serde_json::json!({
+                "output_id": output_id,
+                "session_id": session_id,
+                "source": source,
+                "stdout": entry.get("stdout").and_then(|v| v.as_str()).unwrap_or(""),
+                "stderr": entry.get("stderr").and_then(|v| v.as_str()).unwrap_or(""),
+            })
+        });
+    }
+    let outputs: Vec<_> = ids.iter().filter_map(|id| found.remove(id)).collect();
+    let output_ids: HashSet<&str> = outputs
+        .iter()
+        .filter_map(|output| output.get("output_id").and_then(|v| v.as_str()))
+        .collect();
+    let missing: Vec<&str> = ids
+        .iter()
+        .map(String::as_str)
+        .filter(|id| !output_ids.contains(id))
+        .collect();
+    json_response_body(
+        serde_json::json!({
+            "outputs": outputs,
+            "missing": missing,
+        })
+        .to_string(),
+    )
+}
+
+fn session_agent_output_response_for_ids(
+    home: &Path,
+    session_id: &str,
+    source: &str,
+    ids: Vec<String>,
+) -> String {
+    let source = crate::session_names::normalize_source(source);
+    if source == "intendant" {
+        let Some(session_dir) = resolve_session_dir_from_home(home, session_id) else {
+            return upload_error_response("404 Not Found", "session not found");
+        };
+        return current_agent_output_response_for_ids(ids, &session_dir);
+    }
+    external_agent_output_response_for_ids(home, &source, session_id, ids)
+}
+
+pub(crate) fn session_agent_output_post_response(
+    body: &str,
+    session_id: &str,
+    source: &str,
+) -> String {
+    let session_id = session_id.trim();
+    if !session_lookup_id_is_safe(session_id) {
+        return upload_error_response("400 Bad Request", "invalid session id");
+    }
+    match agent_output_ids_from_json_body(body) {
+        Ok(ids) => session_agent_output_response_for_ids(
+            &crate::platform::home_dir(),
+            session_id,
+            source,
+            ids,
+        ),
         Err(e) => upload_error_response("400 Bad Request", &e),
     }
 }
@@ -8760,14 +8901,7 @@ fn external_session_activity_replay_from_home_with_attach(
         if content.is_empty() {
             continue;
         }
-        let content = if compact_for_websocket
-            && content.len() > WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES
-        {
-            truncate_string_to_utf8_byte_limit(content, WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES)
-        } else {
-            content.to_string()
-        };
-        entries.push(serde_json::json!({
+        let mut replay_entry = serde_json::json!({
             "event": "log_entry",
             "session_id": session_id,
             "ts": entry.get("ts").and_then(|v| v.as_str()).unwrap_or(""),
@@ -8798,7 +8932,11 @@ fn external_session_activity_replay_from_home_with_attach(
             "rollback_anchor_position": entry
                 .get("rollback_anchor_position")
                 .and_then(|v| v.as_str()),
-        }));
+        });
+        if compact_for_websocket {
+            compact_replay_entry_text_fields_for_websocket(&mut replay_entry);
+        }
+        entries.push(replay_entry);
     }
     if include_context_snapshots {
         append_external_context_snapshot_replay_entries(home, &source, session_id, &mut entries);
@@ -20444,6 +20582,31 @@ pub fn spawn_web_gateway(
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.starts_with("POST")
+                        && request_line.contains(" /api/session/")
+                        && request_line.contains("/agent-output")
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let rest = request_line
+                            .split("/api/session/")
+                            .nth(1)
+                            .and_then(|r| r.split_whitespace().next())
+                            .unwrap_or("");
+                        let path = rest.split('?').next().unwrap_or(rest);
+                        let rest_parts: Vec<&str> =
+                            path.split('/').filter(|s| !s.is_empty()).collect();
+                        let session_id = rest_parts.first().copied().unwrap_or("");
+                        let is_agent_output_route =
+                            rest_parts.get(1).copied() == Some("agent-output");
+                        let source = query_param(request_line, "source")
+                            .unwrap_or_else(|| "intendant".to_string());
+                        let body_text = read_post_body(&header_text, &mut stream).await;
+                        let response = if is_agent_output_route {
+                            session_agent_output_post_response(&body_text, session_id, &source)
+                        } else {
+                            upload_error_response("404 Not Found", "unknown session output route")
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.starts_with("POST")
                         && request_line.contains(" /api/session/current/uploads")
                     {
                         // POST /api/session/current/uploads?name=<fn>&destination=task|workspace
@@ -29897,6 +30060,17 @@ mod tests {
             WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + "...".len()
         );
         assert!(content.ends_with("..."));
+        let replay_output = replay["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|entry| entry["event"] == "log_entry" && entry["kind"] == "agent_output")
+            .expect("large tool output should replay");
+        assert_eq!(replay_output["full_output_available"], true);
+        assert_eq!(
+            replay_output["full_output_bytes"],
+            WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 100
+        );
     }
 
     #[test]
@@ -29958,6 +30132,65 @@ mod tests {
             WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + "...".len()
         );
         assert!(stdout.ends_with("..."));
+        let output = entries
+            .last()
+            .expect("large tool output entry should be retained");
+        assert_eq!(output["full_output_available"], true);
+        assert_eq!(
+            output["full_output_bytes"],
+            WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 100
+        );
+    }
+
+    #[test]
+    fn session_agent_output_response_loads_full_external_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-full-output-fetch";
+        let large_output = "x".repeat(WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 100);
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            [
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:48:52Z",
+                    "type": "session_meta",
+                    "payload": { "id": session_id }
+                }),
+                serde_json::json!({
+                    "timestamp": "2026-05-17T16:49:00Z",
+                    "type": "response_item",
+                    "payload": {
+                        "type": "function_call_output",
+                        "call_id": "call_large",
+                        "output": large_output
+                    }
+                }),
+            ]
+            .into_iter()
+            .map(|v| v.to_string())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        )
+        .unwrap();
+
+        let response = session_agent_output_response_for_ids(
+            dir.path(),
+            session_id,
+            "codex",
+            vec!["call_large".to_string()],
+        );
+        assert!(response.starts_with("HTTP/1.1 200 OK"));
+        let body = response.split("\r\n\r\n").nth(1).unwrap();
+        let json: serde_json::Value = serde_json::from_str(body).unwrap();
+        assert_eq!(json["missing"].as_array().unwrap().len(), 0);
+        let stdout = json["outputs"][0]["stdout"].as_str().unwrap();
+        assert_eq!(
+            stdout.len(),
+            WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + 100
+        );
+        assert!(!stdout.ends_with("..."));
     }
 
     #[test]
