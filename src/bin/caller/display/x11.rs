@@ -122,6 +122,9 @@ pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
             width,
             height,
             is_primary: true,
+            kind: super::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
         }];
     }
 
@@ -180,6 +183,9 @@ fn parse_xrandr_output(text: &str) -> Vec<super::DisplayInfo> {
             width,
             height,
             is_primary,
+            kind: super::DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
         });
     }
 
@@ -787,6 +793,7 @@ fn run_shm_capture(
                     height,
                     stride,
                     timestamp: std::time::Instant::now(),
+                    dirty_rects: None,
                 };
 
                 frame_count += 1;
@@ -905,6 +912,7 @@ fn run_getimage_capture(
                     height,
                     stride,
                     timestamp: std::time::Instant::now(),
+                    dirty_rects: None,
                 };
 
                 frame_count += 1;

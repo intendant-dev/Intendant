@@ -79,6 +79,24 @@ pub struct DisplayInfo {
     pub height: u32,
     /// Whether this display is the primary / main display.
     pub is_primary: bool,
+    /// What this entry captures. Most platforms currently expose physical
+    /// displays; macOS also exposes individual native windows.
+    #[serde(default)]
+    pub kind: DisplayInfoKind,
+    /// Owning application for window entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub application_name: Option<String>,
+    /// Native window title for window entries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum DisplayInfoKind {
+    #[default]
+    Display,
+    Window,
 }
 
 /// Enumerate displays available on the current platform.
@@ -107,6 +125,9 @@ pub async fn enumerate_displays() -> Vec<DisplayInfo> {
                 width: 1920,
                 height: 1080,
                 is_primary: true,
+                kind: DisplayInfoKind::Display,
+                application_name: None,
+                window_title: None,
             }]
         } else {
             retry
@@ -184,6 +205,11 @@ pub struct Frame {
     pub height: u32,
     pub stride: u32,
     pub timestamp: Instant,
+    /// Platform-native damage metadata for this exact frame, when available.
+    ///
+    /// ScreenCaptureKit delivers dirty rects alongside the sample buffer; the
+    /// tile bridge consumes them before falling back to polling/frame-diff.
+    pub dirty_rects: Option<Vec<capture::damage::Rect>>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -2083,27 +2109,31 @@ impl DisplaySession {
                             last_cursor = cursor_pos;
                         }
 
-                        let mut rects = match damage.capability() {
-                            capture::damage::DamageCapability::OsLevel => {
-                                match damage.poll_damage() {
-                                    Ok(rects) => rects,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[display/tile] display {display_id} damage poll failed: {e}"
-                                        );
-                                        Vec::new()
+                        let mut rects = if let Some(rects) = frame.dirty_rects.clone() {
+                            rects
+                        } else {
+                            match damage.capability() {
+                                capture::damage::DamageCapability::OsLevel => {
+                                    match damage.poll_damage() {
+                                        Ok(rects) => rects,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[display/tile] display {display_id} damage poll failed: {e}"
+                                            );
+                                            Vec::new()
+                                        }
                                     }
                                 }
-                            }
-                            capture::damage::DamageCapability::FrameDiff
-                            | capture::damage::DamageCapability::None => {
-                                match frame_diff.diff_frame(&frame) {
-                                    Ok(rects) => rects,
-                                    Err(e) => {
-                                        eprintln!(
-                                            "[display/tile] display {display_id} frame-diff failed: {e}"
-                                        );
-                                        Vec::new()
+                                capture::damage::DamageCapability::FrameDiff
+                                | capture::damage::DamageCapability::None => {
+                                    match frame_diff.diff_frame(&frame) {
+                                        Ok(rects) => rects,
+                                        Err(e) => {
+                                            eprintln!(
+                                                "[display/tile] display {display_id} frame-diff failed: {e}"
+                                            );
+                                            Vec::new()
+                                        }
                                     }
                                 }
                             }
@@ -3114,6 +3144,9 @@ mod tests {
             width: 1920,
             height: 1080,
             is_primary: true,
+            kind: DisplayInfoKind::Display,
+            application_name: None,
+            window_title: None,
         };
         let json = serde_json::to_string(&info).unwrap();
         let back: DisplayInfo = serde_json::from_str(&json).unwrap();
@@ -3122,6 +3155,7 @@ mod tests {
         assert!(back.is_primary);
         assert_eq!(back.width, 1920);
         assert_eq!(back.height, 1080);
+        assert_eq!(back.kind, DisplayInfoKind::Display);
     }
 
     #[test]
@@ -4017,6 +4051,7 @@ mod tests {
             height,
             stride: width * 4,
             timestamp: Instant::now(),
+            dirty_rects: None,
         }
     }
 

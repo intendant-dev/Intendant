@@ -133,6 +133,7 @@ mod tests {
             height,
             stride,
             timestamp: Instant::now(),
+            dirty_rects: None,
         }
     }
 

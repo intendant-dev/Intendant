@@ -20571,6 +20571,7 @@ Also: {"source": "bare"}"#;
             height: 4,
             stride: 16,
             timestamp: std::time::Instant::now(),
+            dirty_rects: None,
         };
 
         assert!(!frame_has_visible_rgb(&frame));
@@ -20588,6 +20589,7 @@ Also: {"source": "bare"}"#;
             height: 4,
             stride: 16,
             timestamp: std::time::Instant::now(),
+            dirty_rects: None,
         };
 
         assert!(frame_has_visible_rgb(&frame));
@@ -32382,11 +32384,23 @@ async fn activate_user_display(
     #[cfg(target_os = "macos")]
     {
         // If a specific display was requested, resolve its platform_id (CGDisplayID)
-        // from the enumerated list; otherwise use the default (first available).
+        // from the enumerated list; macOS window entries are synthetic display
+        // IDs whose platform_id is the CGWindowID.
         let backend = if target_display_id != 0 {
             let displays = display::enumerate_displays().await;
             if let Some(info) = displays.iter().find(|d| d.id == target_display_id) {
-                display::macos::MacOSBackend::with_display_id(info.platform_id as u32)
+                match info.kind {
+                    display::DisplayInfoKind::Display => {
+                        display::macos::MacOSBackend::with_display_id(info.platform_id as u32)
+                    }
+                    display::DisplayInfoKind::Window => {
+                        display::macos::MacOSBackend::with_window_id(info.platform_id as u32)
+                    }
+                }
+            } else if let Some(window_id) =
+                display::macos::window_id_from_display_id(target_display_id)
+            {
+                display::macos::MacOSBackend::with_window_id(window_id)
             } else {
                 report_user_display_capture_unavailable(
                     bus,

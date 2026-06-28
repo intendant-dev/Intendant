@@ -32952,7 +32952,7 @@ function normalizeSharedViewDisplayId(evt) {
 function sharedViewDisplayLabel(displayId, displayTarget) {
   if (displayId !== null && displayId !== undefined) {
     const n = Number(displayId);
-    if (Number.isFinite(n)) return n === 0 ? 'primary display' : `display ${n}`;
+    if (Number.isFinite(n)) return displayLabel(n, false);
   }
   const target = String(displayTarget || '').trim();
   if (!target) return 'display';
@@ -32963,12 +32963,29 @@ function sharedViewDisplayLabel(displayId, displayTarget) {
     : target.startsWith('display_') ? target.slice('display_'.length)
     : target;
   const n = Number(stripped);
-  if (Number.isFinite(n)) return n === 0 ? 'primary display' : `display ${n}`;
+  if (Number.isFinite(n)) return displayLabel(n, false);
   return target;
+}
+
+function displayInfoForId(displayId) {
+  const n = Number(displayId);
+  if (!Number.isFinite(n)) return null;
+  const lists = [cachedDisplays, stationLocalDisplays];
+  for (const list of lists) {
+    if (!Array.isArray(list)) continue;
+    const match = list.find(d => Number(d?.id) === n);
+    if (match) return match;
+  }
+  return null;
 }
 
 function displayLabel(displayId, compact = false) {
   const n = Number(displayId);
+  const info = displayInfoForId(n);
+  if (info?.kind === 'window') {
+    if (compact) return info.application_name || info.window_title || 'Window';
+    return info.name || info.window_title || info.application_name || 'Window';
+  }
   if (Number.isFinite(n)) {
     if (n === 0) return compact ? 'Primary' : 'Primary display';
     return compact ? `Display ${n}` : `Display ${n}`;
@@ -55862,7 +55879,7 @@ function updateDisplayMetrics(d) {
 let userDisplayGranted = false;
 let grantedDisplayId = 0;
 let displayPickerVisible = false;
-let cachedDisplays = null;
+var cachedDisplays = null;
 
 function hideDisplayPicker() {
   const picker = document.getElementById('display-picker');
@@ -55882,6 +55899,11 @@ function showDisplayPicker(displays) {
       const badge = document.createElement('span');
       badge.className = 'dp-primary';
       badge.textContent = 'primary';
+      item.appendChild(badge);
+    } else if (d.kind === 'window') {
+      const badge = document.createElement('span');
+      badge.className = 'dp-primary';
+      badge.textContent = 'window';
       item.appendChild(badge);
     }
     item.addEventListener('click', (e) => {

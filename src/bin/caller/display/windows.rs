@@ -353,6 +353,9 @@ fn enumerate_displays_blocking() -> Vec<super::DisplayInfo> {
                     width,
                     height,
                     is_primary,
+                    kind: super::DisplayInfoKind::Display,
+                    application_name: None,
+                    window_title: None,
                 });
             }
             output_ordinal += 1;
@@ -1191,6 +1194,7 @@ fn acquire_and_copy(dup: &mut Duplication, timeout_ms: u32) -> Result<Option<Fra
             // width*4 regardless of the source RowPitch padding.
             stride: row_bytes as u32,
             timestamp: std::time::Instant::now(),
+            dirty_rects: None,
         })
     })();
 
@@ -1213,6 +1217,7 @@ fn clone_frame(f: &Frame) -> Frame {
         height: f.height,
         stride: f.stride,
         timestamp: f.timestamp,
+        dirty_rects: f.dirty_rects.clone(),
     }
 }
 
@@ -1610,6 +1615,7 @@ impl GdiCapture {
             height: self.height,
             stride: row_bytes as u32,
             timestamp: std::time::Instant::now(),
+            dirty_rects: None,
         })
     }
 

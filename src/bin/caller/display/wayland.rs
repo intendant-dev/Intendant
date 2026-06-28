@@ -28,6 +28,9 @@ pub async fn enumerate_displays() -> Vec<super::DisplayInfo> {
         width: 1920,
         height: 1080,
         is_primary: true,
+        kind: super::DisplayInfoKind::Display,
+        application_name: None,
+        window_title: None,
     }]
 }
 
@@ -747,6 +750,7 @@ fn run_pipewire_capture(
                             height: frame_h,
                             stride,
                             timestamp: std::time::Instant::now(),
+                            dirty_rects: None,
                         };
 
                         // Backpressure: drop frame if channel is full.

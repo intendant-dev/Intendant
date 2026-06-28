@@ -286,13 +286,14 @@ per-tile staleness check.
 ### Tiles, damage, and fallback
 
 - **Tiles** are **64×64 px** (`TILE_STREAM_TILE_SIZE_PX`).
-- **Damage** comes from a `DamageBackend`. On **X11**, XDamage
+- **Damage** comes from platform metadata when possible. On **X11**, XDamage
   (`display/capture/x11_damage.rs`) reports real OS-level dirty rects
-  (`ReportLevel::BoundingBox`). On non-X11 platforms there is a CPU-bound
-  **frame-diff fallback** (`display/capture/frame_diff.rs`) that hashes every tile
-  and emits the ones whose hash changed; where neither is available the capability
-  reports `None` and the policy forces video mode, so the platform keeps the
-  proven VP8 path until its damage backend lands.
+  (`ReportLevel::BoundingBox`). On **macOS**, ScreenCaptureKit dirty rects are
+  attached to captured frames and consumed before frame-diff. Other paths use a
+  CPU-bound **frame-diff fallback** (`display/capture/frame_diff.rs`) that hashes
+  every tile and emits the ones whose hash changed; where neither is available
+  the capability reports `None` and the policy forces video mode, so the platform
+  keeps the proven VP8 path until its damage backend lands.
 - **Tile ↔ video fallback policy** (`display/tile/policy.rs`) switches to
   whole-frame video on high-motion content and back to tiles when motion subsides,
   with hysteresis to prevent flapping: **enter video at 25% dirty fraction
@@ -421,16 +422,17 @@ Rates are computed over the elapsed window and counters reset on read.
 ## Known Limitations
 
 - **Physical-key-only input** breaks non-US keyboard layouts (Phase 1).
-- **Tile streaming is X11-first.** Wayland and macOS use the CPU-bound frame-diff
-  damage backend (or force video mode where unavailable); only X11 has true
-  OS-level damage.
+- **Tile streaming still depends on data-channel viewers.** X11 uses XDamage;
+  macOS uses ScreenCaptureKit dirty rects when present and frame-diff when
+  metadata is unavailable; Wayland currently uses the CPU-bound frame-diff path.
 - **Wayland enumeration is portal-limited** — true multi-monitor identity before
   a session opens is not available.
 - **`rtc` 0.9 doesn't surface TWCC or populate RR stats**, hence the interceptor
   tap and the `bytes_sent`-delta bitrate estimate; per-RID RR-driven layer policy
   is inert on this stack.
 - **No virtual-display equivalent on macOS or Windows** — capture targets the real
-  session only.
+  session only. macOS can expose a single real native window as a capture target,
+  but that window still belongs to the user's logged-in desktop session.
 
 ## See Also
 
