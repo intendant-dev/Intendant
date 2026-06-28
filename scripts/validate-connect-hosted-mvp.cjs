@@ -87,6 +87,21 @@ async function waitFor(fn, timeoutMs, label) {
   throw new Error(`timed out waiting for ${label}${lastError ? `: ${lastError.message}` : ''}`);
 }
 
+async function waitBounded(promise, timeoutMs) {
+  let timer = null;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise(resolve => {
+        timer = setTimeout(() => resolve(undefined), timeoutMs);
+        if (typeof timer.unref === 'function') timer.unref();
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
 async function addVirtualAuthenticator(browser, page) {
   if (browser.kind === 'playwright' && page.context) {
     const client = await page.context().newCDPSession(page);
@@ -656,7 +671,7 @@ async function main() {
       audit_events: Array.from(eventNames).sort(),
     }, null, 2));
   } finally {
-    if (browser) await browser.close().catch(() => {});
+    if (browser) await waitBounded(browser.close().catch(() => {}), 5000);
     for (const child of children.reverse()) {
       if (child.exitCode === null && !child.killed) child.kill('SIGTERM');
     }
@@ -668,7 +683,9 @@ async function main() {
   }
 }
 
-main().catch(err => {
-  console.error(err && err.stack || err);
-  process.exit(1);
-});
+main()
+  .then(() => process.exit(0))
+  .catch(err => {
+    console.error(err && err.stack || err);
+    process.exit(1);
+  });
