@@ -3807,8 +3807,14 @@ async fn api_session_detail_response(
         source
     };
     let limit = control_session_detail_limit(&params);
+    let before = control_session_detail_before(&params);
     let body = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::session_detail_response_body(&session_id, &source, limit)
+        crate::web_gateway::session_detail_response_body_with_page(
+            &session_id,
+            &source,
+            limit,
+            before,
+        )
     })
     .await;
     let body = match body {
@@ -8484,6 +8490,29 @@ fn control_session_detail_limit(params: &serde_json::Value) -> Option<usize> {
             .filter(|limit| *limit > 0),
         _ => None,
     }
+}
+
+fn control_session_detail_before(params: &serde_json::Value) -> Option<usize> {
+    for name in ["before", "page_before", "pageBefore"] {
+        let Some(value) = params.get(name) else {
+            continue;
+        };
+        if value.is_null() {
+            return None;
+        }
+        if let Some(number) = value.as_u64() {
+            return usize::try_from(number).ok();
+        }
+        if let Some(text) = value.as_str() {
+            let text = text.trim();
+            if text.is_empty() {
+                return None;
+            }
+            return text.parse::<usize>().ok();
+        }
+        return None;
+    }
+    None
 }
 
 fn control_project_filter(params: &serde_json::Value) -> Vec<String> {

@@ -25180,6 +25180,28 @@ function renderRestoredSessionWindowEntries(win, entries, fallbackSessionId) {
   return records.length;
 }
 
+function updateSessionWindowRemotePageState(win, data = {}, source = '', sessionId = '') {
+  if (!win || !data || data.error) return;
+  const pageStart = Number(data.page_start ?? data.pageStart);
+  const pageEnd = Number(data.page_end ?? data.pageEnd);
+  const totalEntries = Number(data.total_entries ?? data.totalEntries);
+  if (!Number.isFinite(pageStart) || pageStart < 0) return;
+  win.remoteSource = normalizeAgentId(source || win.remoteSource || win.source || '');
+  win.remoteSessionId = String(sessionId || win.remoteSessionId || win.sessionId || '').trim();
+  win.remotePageStart = Number.isFinite(win.remotePageStart)
+    ? Math.min(win.remotePageStart, pageStart)
+    : pageStart;
+  if (Number.isFinite(pageEnd) && pageEnd >= 0) {
+    win.remotePageEnd = Number.isFinite(win.remotePageEnd)
+      ? Math.max(win.remotePageEnd, pageEnd)
+      : pageEnd;
+  }
+  if (Number.isFinite(totalEntries) && totalEntries >= 0) {
+    win.remoteTotalEntries = totalEntries;
+  }
+  win.remoteHasOlder = win.remotePageStart > 0;
+}
+
 function sessionWindowTranscriptSignatureContent(value) {
   return compactSessionTextBounded(value, SESSION_TEXT_SIGNATURE_CHAR_LIMIT, { signature: true });
 }
@@ -25333,6 +25355,16 @@ function sessionWindowTranscriptSignaturesForHistoryItem(item, fallbackSessionId
   if (node) return sessionWindowTranscriptSignaturesForNode(node, fallbackSessionId);
   const record = sessionWindowHistoryRecord(item);
   return record ? sessionWindowTranscriptSignaturesForRecord(record, fallbackSessionId, options) : [];
+}
+
+function findSessionWindowHistoryIndexBySignatures(history, signatures, fallbackSessionId = '') {
+  if (!Array.isArray(history) || !Array.isArray(signatures) || signatures.length === 0) return -1;
+  const wanted = new Set(signatures);
+  for (let i = 0; i < history.length; i++) {
+    const itemSignatures = sessionWindowTranscriptSignaturesForHistoryItem(history[i], fallbackSessionId);
+    if (itemSignatures.some(signature => wanted.has(signature))) return i;
+  }
+  return -1;
 }
 
 function sessionWindowTranscriptTimestampMs(value) {
@@ -25518,6 +25550,7 @@ async function syncExternalSessionWindowTranscript(sessionId) {
     applySessionGoalsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(record.sessionId) || record.sessionId;
     const targetWin = sessionWindows.get(targetSid) || record.win;
+    updateSessionWindowRemotePageState(targetWin, data, record.source, record.sessionId);
     const rendered = appendMissingRestoredSessionWindowEntries(targetWin, entries, targetSid);
     if (rendered > 0) stationScheduleUpdate();
   } catch (err) {
@@ -25570,6 +25603,7 @@ async function hydrateRestoredSessionWindow(win, record) {
     applySessionGoalsFromReplayEntries(entries);
     const targetSid = sessionWindowTargetForLogSession(sid) || sid;
     const targetWin = sessionWindows.get(targetSid) || (win.el?.isConnected ? win : null);
+    updateSessionWindowRemotePageState(targetWin, data, source, sid);
     const rendered = renderRestoredSessionWindowEntries(targetWin, entries, targetSid);
     if (rendered > 0) {
       updateSessionWindow(targetSid, { phase: 'idle', ended: false });
@@ -27341,14 +27375,82 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
 function loadOlderSessionWindowEntries(win) {
   if (!win || !win.log) return false;
   const history = ensureSessionWindowHistory(win);
-  if (win.renderStart <= 0 || history.length === 0) return false;
   if (win.log.scrollTop > SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX) return false;
+  if (win.renderStart <= 0) {
+    loadOlderRemoteSessionWindowEntries(win);
+    return !!win.remoteLoadingOlder;
+  }
+  if (history.length === 0) return false;
   const anchorIndex = win.renderStart;
   const anchor = win.log.querySelector(`[data-history-index="${anchorIndex}"]`);
   const anchorTop = anchor ? anchor.offsetTop - win.log.scrollTop : 0;
   renderSessionWindowRange(win, Math.max(0, win.renderStart - SESSION_WINDOW_PREPEND_CHUNK));
   const nextAnchor = win.log.querySelector(`[data-history-index="${anchorIndex}"]`);
   if (nextAnchor) win.log.scrollTop = Math.max(0, nextAnchor.offsetTop - anchorTop);
+  return true;
+}
+
+function loadOlderRemoteSessionWindowEntries(win) {
+  if (!win || !win.log || win.remoteLoadingOlder) return false;
+  const before = Number(win.remotePageStart);
+  if (!Number.isFinite(before) || before <= 0) {
+    win.remoteHasOlder = false;
+    return false;
+  }
+  const source = normalizeAgentId(win.remoteSource || externalSourceForSessionWindow(win.sessionId, win) || win.source || '');
+  const sessionId = String(win.remoteSessionId || win.sessionId || '').trim();
+  if (!source || !sessionId) return false;
+
+  const history = ensureSessionWindowHistory(win);
+  const anchorIndex = Math.max(0, win.renderStart);
+  const anchorItem = history[anchorIndex] || history[0] || null;
+  const anchorSignatures = anchorItem
+    ? sessionWindowTranscriptSignaturesForHistoryItem(anchorItem, win.sessionId)
+    : [];
+  const anchor = win.log.querySelector(`[data-history-index="${anchorIndex}"]`);
+  const anchorTop = anchor ? anchor.offsetTop - win.log.scrollTop : 0;
+
+  win.remoteLoadingOlder = true;
+  fetchSessionDetailPayload(sessionId, {
+    source,
+    limit: SESSION_WINDOW_RESTORE_LOG_LIMIT,
+    before,
+    cache: 'no-store',
+  })
+    .then(data => {
+      if (!win || !sessionWindows.has(win.sessionId) || data?.error) return;
+      updateSessionWindowRemotePageState(win, data, source, sessionId);
+      const entries = Array.isArray(data.entries) ? data.entries : [];
+      if (!entries.length) return;
+      applySessionIdentitiesFromReplayEntries(entries);
+      applyExternalIdentitiesFromLogEntries(entries);
+      applySessionGoalsFromReplayEntries(entries);
+      const records = entries
+        .map(entry => sessionWindowRecordFromReplayEntry(entry, win.sessionId))
+        .filter(Boolean);
+      if (!records.length) return;
+      insertSessionWindowHistoryRecords(win, records, false);
+      const nextHistory = ensureSessionWindowHistory(win);
+      const nextAnchorIndex = findSessionWindowHistoryIndexBySignatures(
+        nextHistory,
+        anchorSignatures,
+        win.sessionId
+      );
+      if (nextAnchorIndex >= 0) {
+        renderSessionWindowRange(win, Math.max(0, nextAnchorIndex - SESSION_WINDOW_PREPEND_CHUNK));
+        const nextAnchor = win.log.querySelector(`[data-history-index="${nextAnchorIndex}"]`);
+        if (nextAnchor) win.log.scrollTop = Math.max(0, nextAnchor.offsetTop - anchorTop);
+      } else {
+        renderSessionWindowRange(win, 0);
+      }
+      stationScheduleUpdate();
+    })
+    .catch(err => {
+      console.warn('Failed to load older session window transcript page', sessionId, err);
+    })
+    .finally(() => {
+      if (win) win.remoteLoadingOlder = false;
+    });
   return true;
 }
 
@@ -41756,11 +41858,17 @@ async function fetchSessionDetailPayload(sessionId, options = {}) {
   if (options.limit !== undefined && options.limit !== null) {
     params.limit = options.limit;
   }
+  if (options.before !== undefined && options.before !== null) {
+    params.before = options.before;
+  }
   return dashboardTransport.rpcOrHttp('api_session_detail', params, async () => {
     const query = new URLSearchParams();
     query.set('source', source);
     if (options.limit !== undefined && options.limit !== null) {
       query.set('limit', String(options.limit));
+    }
+    if (options.before !== undefined && options.before !== null) {
+      query.set('before', String(options.before));
     }
     const fetchOptions = {};
     if (options.signal) fetchOptions.signal = options.signal;
@@ -54913,7 +55021,7 @@ function openSessionDetail(sessionOrId, taskArg) {
 
   const detailSessionId = sessionId;
   const detailSource = source;
-  fetchSessionDetailPayload(detailSessionId, { source: detailSource })
+  fetchSessionDetailPayload(detailSessionId, { source: detailSource, limit: SESSION_DETAIL_PAGE_LIMIT })
     .then(data => {
       if (data.error) {
         logsEl.innerHTML = '<div class="empty-state">' + data.error + '</div>';
@@ -54922,8 +55030,15 @@ function openSessionDetail(sessionOrId, taskArg) {
       const entries = data.entries || [];
       applySessionIdentitiesFromReplayEntries(entries);
       applySessionGoalsFromReplayEntries(entries);
-      renderSessionDetailLogs(entries, logsEl);
-      document.getElementById('sd-logs-badge').textContent = entries.length + ' entries';
+      renderSessionDetailLogs(entries, logsEl, {
+        sessionId: detailSessionId,
+        source: detailSource,
+        pageStart: data.page_start ?? data.pageStart,
+        pageEnd: data.page_end ?? data.pageEnd,
+        totalEntries: data.total_entries ?? data.totalEntries,
+        hasOlder: data.has_older ?? data.hasOlder,
+      });
+      updateSessionDetailLogsBadge(sessionDetailLogView, entries.length);
 
       // Render frames gallery
       const frames = data.frames || [];
@@ -55230,6 +55345,7 @@ window.intendantSessionFrameRenderer = {
 const SESSION_DETAIL_RENDER_LIMIT = 600;
 const SESSION_DETAIL_SCROLL_CHUNK = 300;
 const SESSION_DETAIL_SCROLL_THRESHOLD_PX = 64;
+const SESSION_DETAIL_PAGE_LIMIT = 1000;
 let detailVerbosity = 'normal';
 let detailLogFilter = 'all';
 let detailExpandAll = false;
@@ -55244,9 +55360,113 @@ function makeSessionDetailLogButton(label, title, onClick) {
   return btn;
 }
 
-function renderSessionDetailLogs(entries, el) {
+function sessionDetailNumberOrNull(value) {
+  const number = Number(value);
+  return Number.isFinite(number) && number >= 0 ? number : null;
+}
+
+function sessionDetailPageInfoFromView(view) {
+  if (!view) return {};
+  return {
+    sessionId: view.sessionId,
+    source: view.source,
+    pageStart: view.pageStart,
+    pageEnd: view.pageEnd,
+    totalEntries: view.totalEntries,
+    hasOlder: view.hasOlder,
+  };
+}
+
+function updateSessionDetailViewPageState(view, info = {}) {
+  if (!view) return;
+  view.sessionId = String(
+    info.sessionId ||
+    view.sessionId ||
+    currentSessionDetail?.session_id ||
+    currentSessionDetail?.resume_id ||
+    ''
+  ).trim();
+  view.source = normalizeAgentId(info.source || view.source || currentSessionDetail?.source || 'intendant') || 'intendant';
+
+  const pageStart = sessionDetailNumberOrNull(info.pageStart ?? info.page_start);
+  if (pageStart !== null) {
+    view.pageStart = Number.isFinite(view.pageStart) ? Math.min(view.pageStart, pageStart) : pageStart;
+  }
+  const pageEnd = sessionDetailNumberOrNull(info.pageEnd ?? info.page_end);
+  if (pageEnd !== null) {
+    view.pageEnd = Number.isFinite(view.pageEnd) ? Math.max(view.pageEnd, pageEnd) : pageEnd;
+  }
+  const totalEntries = sessionDetailNumberOrNull(info.totalEntries ?? info.total_entries);
+  if (totalEntries !== null) view.totalEntries = totalEntries;
+  view.hasOlder = Boolean(info.hasOlder ?? info.has_older) ||
+    (Number.isFinite(view.pageStart) && view.pageStart > 0);
+}
+
+function sessionDetailEntryMergeKey(entry = {}) {
+  if (!entry || typeof entry !== 'object') return '';
+  const content = compactSessionTextBounded(
+    entry.content ?? entry.summary ?? entry.message ?? entry.text ?? entry.stdout ?? entry.stderr ?? entry.data?.message ?? '',
+    SESSION_TEXT_SIGNATURE_CHAR_LIMIT,
+    { signature: true }
+  );
+  return [
+    entry.event || entry.type || '',
+    entry.ts || entry.timestamp || entry.time || '',
+    entry.session_id || entry.sessionId || '',
+    entry.source || '',
+    entry.level || '',
+    entry.item_id || entry.itemId || '',
+    entry.output_id || entry.outputId || '',
+    entry.user_turn_index ?? entry.userTurnIndex ?? '',
+    entry.user_turn_revision ?? entry.userTurnRevision ?? '',
+    entry.turn ?? '',
+    content,
+  ].join('\u001f');
+}
+
+function mergeSessionDetailEntries(view, incoming, prepend = true) {
+  if (!view || !Array.isArray(incoming) || incoming.length === 0) return 0;
+  if (!Array.isArray(view.entries)) view.entries = [];
+  const existingKeys = new Set(
+    view.entries.map(entry => sessionDetailEntryMergeKey(entry)).filter(Boolean)
+  );
+  const unique = [];
+  for (const entry of incoming) {
+    const key = sessionDetailEntryMergeKey(entry);
+    if (key && existingKeys.has(key)) continue;
+    unique.push(entry);
+    if (key) existingKeys.add(key);
+  }
+  if (!unique.length) return 0;
+  view.entries = prepend ? unique.concat(view.entries) : view.entries.concat(unique);
+  return unique.length;
+}
+
+function rebuildSessionDetailViewRows(view) {
+  if (!view) return;
+  view.rows = buildSessionDetailRows(view.entries || []);
+  view.entryCount = countSessionDetailEntries(view.rows, 0, view.rows.length);
+  view.expandableRowCount = countSessionDetailExpandableRows(view.rows);
+  view.expandedRows = new Set();
+  if (detailExpandAll) setSessionDetailRowsExpanded(view, true);
+}
+
+function updateSessionDetailLogsBadge(view, fallbackCount = 0) {
+  const badge = document.getElementById('sd-logs-badge');
+  if (!badge) return;
+  const loaded = Array.isArray(view?.entries)
+    ? view.entries.length
+    : Math.max(0, Number(fallbackCount) || 0);
+  const totalEntries = sessionDetailNumberOrNull(view?.totalEntries);
+  badge.textContent = totalEntries !== null && totalEntries > loaded
+    ? `${loaded}/${totalEntries} entries`
+    : `${loaded} entries`;
+}
+
+function renderSessionDetailLogs(entries, el, pageInfo = {}) {
   el.innerHTML = '';
   sessionDetailLogView = null;
+  const initialEntries = Array.isArray(entries) ? entries : [];
 
   const toolbar = document.createElement('div');
   toolbar.className = 'session-detail-log-toolbar';
@@ -55256,10 +55476,20 @@ function renderSessionDetailLogs(entries, el) {
   const controls = document.createElement('div');
   controls.className = 'session-detail-log-actions';
   const firstBtn = makeSessionDetailLogButton('First', 'Show earliest loaded entries', () => {
-    setSessionDetailLogRange(sessionDetailLogView, 0);
+    const view = sessionDetailLogView;
+    if (view?.renderStart > 0) {
+      setSessionDetailLogRange(view, 0);
+    } else if (view?.hasOlder) {
+      loadOlderSessionDetailRows(view, { forceRemote: true });
+    }
   });
   const prevBtn = makeSessionDetailLogButton('Prev', 'Show previous entries', () => {
-    setSessionDetailLogRange(sessionDetailLogView, (sessionDetailLogView?.renderStart || 0) - SESSION_DETAIL_RENDER_LIMIT);
+    const view = sessionDetailLogView;
+    if (view?.renderStart <= 0 && view?.hasOlder) {
+      loadOlderSessionDetailRows(view, { forceRemote: true });
+    } else {
+      setSessionDetailLogRange(view, (view?.renderStart || 0) - SESSION_DETAIL_RENDER_LIMIT);
+    }
   });
   const jumpInput = document.createElement('input');
   jumpInput.className = 'session-detail-log-jump';
@@ -55311,7 +55541,14 @@ function renderSessionDetailLogs(entries, el) {
   el.appendChild(logsContainer);
 
   const pagerControls = { firstBtn, prevBtn, nextBtn, latestBtn, expandAllBtn, jumpInput };
-  const renderCurrent = () => renderSessionDetailEntries(entries, logsContainer, status, pagerControls);
+  const renderCurrent = () => {
+    const currentEntries = sessionDetailLogView?.entries || initialEntries;
+    const currentPageInfo = sessionDetailLogView
+      ? sessionDetailPageInfoFromView(sessionDetailLogView)
+      : pageInfo;
+    renderSessionDetailEntries(currentEntries, logsContainer, status, pagerControls, currentPageInfo);
+    updateSessionDetailLogsBadge(sessionDetailLogView, currentEntries.length);
+  };
   filterSelect.addEventListener('change', () => {
     detailLogFilter = filterSelect.value;
     renderCurrent();
@@ -55418,9 +55655,10 @@ function buildSessionDetailRows(entries) {
   return rows;
 }
 
-function renderSessionDetailEntries(entries, el, statusEl = null, pagerControls = null) {
+function renderSessionDetailEntries(entries, el, statusEl = null, pagerControls = null, pageInfo = {}) {
   const view = {
-    rows: buildSessionDetailRows(entries),
+    entries: Array.isArray(entries) ? entries.slice() : [],
+    rows: [],
     scroller: el,
     statusEl,
     pagerControls,
@@ -55429,9 +55667,8 @@ function renderSessionDetailEntries(entries, el, statusEl = null, pagerControls 
     expandedRows: new Set(),
     pendingScrollFrame: 0,
   };
-  view.entryCount = countSessionDetailEntries(view.rows, 0, view.rows.length);
-  view.expandableRowCount = countSessionDetailExpandableRows(view.rows);
-  if (detailExpandAll) setSessionDetailRowsExpanded(view, true);
+  updateSessionDetailViewPageState(view, pageInfo);
+  rebuildSessionDetailViewRows(view);
   sessionDetailLogView = view;
   el._sessionDetailView = view;
   if (el._sessionDetailScrollHandler) {
@@ -55504,15 +55741,20 @@ function renderSessionDetailRange(view, start) {
 function updateSessionDetailLogStatus(view) {
   if (!view) return;
   const total = view.entryCount || 0;
+  const loadSuffix = sessionDetailLoadedRawSuffix(view);
   if (total === 0) {
-    if (view.statusEl) view.statusEl.textContent = `0 ${sessionDetailLogFilterLabel()}`;
+    if (view.statusEl) {
+      const loading = view.loadingOlder ? 'Loading older entries...' : `0 ${sessionDetailLogFilterLabel()}`;
+      view.statusEl.textContent = `${loading}${loadSuffix}`;
+    }
     updateSessionDetailLogPager(view, 0, 0, total);
     return;
   }
   const before = countSessionDetailEntries(view.rows, 0, view.renderStart);
   const current = countSessionDetailEntries(view.rows, view.renderStart, view.renderEnd);
   if (view.statusEl) {
-    view.statusEl.textContent = `Showing ${before + 1}-${before + current} of ${total} ${sessionDetailLogFilterLabel()}`;
+    const prefix = view.loadingOlder ? 'Loading older entries; ' : '';
+    view.statusEl.textContent = `${prefix}Showing ${before + 1}-${before + current} of ${total} ${sessionDetailLogFilterLabel()}${loadSuffix}`;
   }
   updateSessionDetailLogPager(view, before, current, total);
 }
@@ -55521,6 +55763,15 @@ function sessionDetailLogFilterLabel() {
   if (detailLogFilter === 'user') return 'user entries';
   if (detailLogFilter === 'non-user') return 'non-user entries';
   return 'entries';
+}
+
+function sessionDetailLoadedRawSuffix(view) {
+  const totalEntries = sessionDetailNumberOrNull(view?.totalEntries);
+  const loaded = Array.isArray(view?.entries) ? view.entries.length : 0;
+  if (totalEntries !== null && totalEntries > loaded) {
+    return ` (${loaded}/${totalEntries} raw loaded)`;
+  }
+  return '';
 }
 
 function countSessionDetailExpandableRows(rows) {
@@ -55535,7 +55786,9 @@ function updateSessionDetailLogPager(view, before, current, total) {
   const controls = view?.pagerControls;
   if (!controls) return;
   const hasRows = total > 0 && view.rows.length > 0;
-  controls.firstBtn.disabled = !hasRows || view.renderStart <= 0;
+  const canMoveOlder = hasRows && view.renderStart > 0;
+  const canLoadOlder = Boolean(view.hasOlder);
+  controls.firstBtn.disabled = (!canMoveOlder && !canLoadOlder) || view.loadingOlder;
   controls.prevBtn.disabled = controls.firstBtn.disabled;
   controls.nextBtn.disabled = !hasRows || view.renderEnd >= view.rows.length;
   controls.latestBtn.disabled = controls.nextBtn.disabled;
@@ -55688,16 +55941,122 @@ function handleSessionDetailLogScroll(view) {
   });
 }
 
-function loadOlderSessionDetailRows(view) {
+function sessionDetailRowSignatures(row, fallbackSessionId = '') {
+  if (!row || row.kind !== 'entry') return [];
+  return sessionWindowTranscriptSignaturesForRecord(row.record || {}, fallbackSessionId);
+}
+
+function findSessionDetailRowIndexBySignatures(rows, signatures, fallbackSessionId = '') {
+  if (!Array.isArray(rows) || !Array.isArray(signatures) || signatures.length === 0) return -1;
+  const wanted = new Set(signatures);
+  for (let i = 0; i < rows.length; i++) {
+    const rowSignatures = sessionDetailRowSignatures(rows[i], fallbackSessionId);
+    if (rowSignatures.some(signature => wanted.has(signature))) return i;
+  }
+  return -1;
+}
+
+function sessionDetailAnchorRow(view) {
+  if (!view || !Array.isArray(view.rows)) return null;
+  const start = Math.max(0, view.renderStart || 0);
+  if (view.rows[start]?.kind === 'entry') return view.rows[start];
+  for (let i = start; i < view.rows.length; i++) {
+    if (view.rows[i]?.kind === 'entry') return view.rows[i];
+  }
+  for (let i = start - 1; i >= 0; i--) {
+    if (view.rows[i]?.kind === 'entry') return view.rows[i];
+  }
+  return null;
+}
+
+function loadOlderSessionDetailRows(view, options = {}) {
   const scroller = view?.scroller;
-  if (!scroller || view.renderStart <= 0 || view.rows.length === 0) return false;
-  if (scroller.scrollTop > SESSION_DETAIL_SCROLL_THRESHOLD_PX) return false;
+  if (!scroller) return false;
+  if (!options.forceRemote && scroller.scrollTop > SESSION_DETAIL_SCROLL_THRESHOLD_PX) return false;
+  if (view.renderStart <= 0) {
+    return loadOlderRemoteSessionDetailRows(view);
+  }
+  if (view.rows.length === 0) return false;
   const anchorIndex = view.renderStart;
   const anchor = scroller.querySelector(`[data-detail-row-index="${anchorIndex}"]`);
   const anchorTop = anchor ? anchor.offsetTop - scroller.scrollTop : 0;
   renderSessionDetailRange(view, Math.max(0, view.renderStart - SESSION_DETAIL_SCROLL_CHUNK));
   const nextAnchor = scroller.querySelector(`[data-detail-row-index="${anchorIndex}"]`);
   if (nextAnchor) scroller.scrollTop = Math.max(0, nextAnchor.offsetTop - anchorTop);
+  return true;
+}
+
+function loadOlderRemoteSessionDetailRows(view) {
+  if (!view || view.loadingOlder) return false;
+  const before = Number(view.pageStart);
+  if (!Number.isFinite(before) || before <= 0) {
+    view.hasOlder = false;
+    updateSessionDetailLogStatus(view);
+    return false;
+  }
+  const sessionId = String(
+    view.sessionId ||
+    currentSessionDetail?.session_id ||
+    currentSessionDetail?.resume_id ||
+    ''
+  ).trim();
+  const source = normalizeAgentId(view.source || currentSessionDetail?.source || 'intendant') || 'intendant';
+  if (!sessionId || !source) return false;
+
+  const scroller = view.scroller;
+  const anchorIndex = Math.max(0, view.renderStart || 0);
+  const anchorSignatures = sessionDetailRowSignatures(sessionDetailAnchorRow(view), sessionId);
+  const anchor = scroller?.querySelector(`[data-detail-row-index="${anchorIndex}"]`);
+  const anchorTop = anchor ? anchor.offsetTop - scroller.scrollTop : 0;
+
+  view.loadingOlder = true;
+  updateSessionDetailLogStatus(view);
+  fetchSessionDetailPayload(sessionId, {
+    source,
+    limit: SESSION_DETAIL_PAGE_LIMIT,
+    before,
+    cache: 'no-store',
+  })
+    .then(data => {
+      if (sessionDetailLogView !== view || view.scroller?._sessionDetailView !== view || data?.error) return;
+      updateSessionDetailViewPageState(view, {
+        sessionId,
+        source,
+        pageStart: data.page_start ?? data.pageStart,
+        pageEnd: data.page_end ?? data.pageEnd,
+        totalEntries: data.total_entries ?? data.totalEntries,
+        hasOlder: data.has_older ?? data.hasOlder,
+      });
+      const entries = Array.isArray(data.entries) ? data.entries : [];
+      if (entries.length) {
+        applySessionIdentitiesFromReplayEntries(entries);
+        applySessionGoalsFromReplayEntries(entries);
+        mergeSessionDetailEntries(view, entries, true);
+      }
+      rebuildSessionDetailViewRows(view);
+      const nextAnchorIndex = findSessionDetailRowIndexBySignatures(
+        view.rows,
+        anchorSignatures,
+        sessionId
+      );
+      if (nextAnchorIndex >= 0) {
+        renderSessionDetailRange(view, Math.max(0, nextAnchorIndex - SESSION_DETAIL_SCROLL_CHUNK));
+        const nextAnchor = scroller?.querySelector(`[data-detail-row-index="${nextAnchorIndex}"]`);
+        if (nextAnchor) scroller.scrollTop = Math.max(0, nextAnchor.offsetTop - anchorTop);
+      } else {
+        renderSessionDetailRange(view, 0);
+      }
+      updateSessionDetailLogsBadge(view);
+    })
+    .catch(err => {
+      console.warn('Failed to load older session detail page', sessionId, err);
+    })
+    .finally(() => {
+      if (sessionDetailLogView === view) {
+        view.loadingOlder = false;
+        updateSessionDetailLogStatus(view);
+      }
+    });
   return true;
 }
 

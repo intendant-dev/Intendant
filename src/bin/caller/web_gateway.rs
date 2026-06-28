@@ -3006,15 +3006,51 @@ fn limited_session_detail_entries(
     entries: Vec<serde_json::Value>,
     limit: Option<usize>,
 ) -> Vec<serde_json::Value> {
+    session_detail_page_entries(entries, limit, None).entries
+}
+
+struct SessionDetailPageEntries {
+    entries: Vec<serde_json::Value>,
+    total_entries: usize,
+    page_start: usize,
+    page_end: usize,
+}
+
+fn session_detail_page_entries(
+    entries: Vec<serde_json::Value>,
+    limit: Option<usize>,
+    before: Option<usize>,
+) -> SessionDetailPageEntries {
+    let total_entries = entries.len();
     let Some(limit) = limit else {
-        return entries;
+        if before.is_none() {
+            return SessionDetailPageEntries {
+                entries,
+                total_entries,
+                page_start: 0,
+                page_end: total_entries,
+            };
+        }
+        let end = before.unwrap_or(total_entries).min(total_entries);
+        return SessionDetailPageEntries {
+            entries: entries.into_iter().take(end).collect(),
+            total_entries,
+            page_start: 0,
+            page_end: end,
+        };
     };
     let limit = limit.clamp(1, SESSION_DETAIL_ENTRY_LIMIT_MAX);
-    if entries.len() <= limit {
-        return entries;
+    let page_end = before.unwrap_or(total_entries).min(total_entries);
+    let page_start = page_end.saturating_sub(limit);
+    if total_entries <= limit && before.is_none() {
+        return SessionDetailPageEntries {
+            entries,
+            total_entries,
+            page_start: 0,
+            page_end: total_entries,
+        };
     }
 
-    let tail_start = entries.len().saturating_sub(limit);
     let mut keep = BTreeSet::new();
     let mut latest_goal_by_session: HashMap<String, usize> = HashMap::new();
     for (idx, entry) in entries.iter().enumerate() {
@@ -3038,13 +3074,20 @@ fn limited_session_detail_entries(
         }
     }
     keep.extend(latest_goal_by_session.into_values());
-    keep.extend(tail_start..entries.len());
+    keep.extend(page_start..page_end);
 
-    entries
+    let entries = entries
         .into_iter()
         .enumerate()
         .filter_map(|(idx, entry)| keep.contains(&idx).then_some(entry))
-        .collect()
+        .collect();
+
+    SessionDetailPageEntries {
+        entries,
+        total_entries,
+        page_start,
+        page_end,
+    }
 }
 
 fn session_detail_entry_limit_from_request(request_line: &str) -> Option<usize> {
@@ -3053,6 +3096,13 @@ fn session_detail_entry_limit_from_request(request_line: &str) -> Option<usize> 
         .and_then(|raw| raw.trim().parse::<usize>().ok())
         .filter(|limit| *limit > 0)
         .map(|limit| limit.min(SESSION_DETAIL_ENTRY_LIMIT_MAX))
+}
+
+fn session_detail_before_from_request(request_line: &str) -> Option<usize> {
+    query_param(request_line, "before")
+        .or_else(|| query_param(request_line, "page_before"))
+        .or_else(|| query_param(request_line, "pageBefore"))
+        .and_then(|raw| raw.trim().parse::<usize>().ok())
 }
 
 fn replay_session_id_from_dir(log_dir: &std::path::Path) -> Option<String> {
@@ -4604,10 +4654,11 @@ fn get_session_detail_from_home(home: &Path, session_id: &str) -> String {
     get_session_detail_from_home_with_limit(home, session_id, None)
 }
 
-pub(crate) fn session_detail_response_body(
+pub(crate) fn session_detail_response_body_with_page(
     session_id: &str,
     source: &str,
     limit: Option<usize>,
+    before: Option<usize>,
 ) -> String {
     let session_id = session_id.trim();
     if !session_lookup_id_is_safe(session_id) {
@@ -4621,9 +4672,9 @@ pub(crate) fn session_detail_response_body(
     };
     let home = crate::platform::home_dir();
     if source == "intendant" {
-        get_session_detail_from_home_with_limit(&home, session_id, limit)
+        get_session_detail_from_home_with_page(&home, session_id, limit, before)
     } else {
-        external_session_detail_from_home_with_limit(&home, source, session_id, limit)
+        external_session_detail_from_home_with_page(&home, source, session_id, limit, before)
             .unwrap_or_else(|| serde_json::json!({"error": "session not found"}).to_string())
     }
 }
@@ -4632,6 +4683,15 @@ fn get_session_detail_from_home_with_limit(
     home: &Path,
     session_id: &str,
     limit: Option<usize>,
+) -> String {
+    get_session_detail_from_home_with_page(home, session_id, limit, None)
+}
+
+fn get_session_detail_from_home_with_page(
+    home: &Path,
+    session_id: &str,
+    limit: Option<usize>,
+    before: Option<usize>,
 ) -> String {
     let session_dir = match resolve_session_dir_from_home(home, session_id) {
         Some(d) => d,
@@ -4642,7 +4702,8 @@ fn get_session_detail_from_home_with_limit(
         .map(|(entries, _)| entries)
         .unwrap_or_default();
     compact_context_snapshot_entries_for_replay(&mut entries);
-    entries = limited_session_detail_entries(entries, limit);
+    let page = session_detail_page_entries(entries, limit, before);
+    let entries = page.entries;
 
     // Check for screenshot frames
     let frames_dir = session_dir.join("frames");
@@ -4662,6 +4723,10 @@ fn get_session_detail_from_home_with_limit(
     serde_json::json!({
         "session_id": session_dir.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default(),
         "entries": entries,
+        "total_entries": page.total_entries,
+        "page_start": page.page_start,
+        "page_end": page.page_end,
+        "has_older": page.page_start > 0,
         "frames": frames,
         "relationships": session_relationships_from_log_dir(&session_dir),
     }).to_string()
@@ -8071,18 +8136,34 @@ fn external_session_detail_from_home_with_limit(
     session_id: &str,
     limit: Option<usize>,
 ) -> Option<String> {
+    external_session_detail_from_home_with_page(home, source, session_id, limit, None)
+}
+
+fn external_session_detail_from_home_with_page(
+    home: &Path,
+    source: &str,
+    session_id: &str,
+    limit: Option<usize>,
+    before: Option<usize>,
+) -> Option<String> {
     let mut entries = external_session_entries_from_home(home, source, session_id)?;
     let effective_limit = limit.or(Some(EXTERNAL_SESSION_DETAIL_DEFAULT_ENTRY_LIMIT));
-    entries = limited_session_detail_entries(entries, effective_limit);
+    let mut page = session_detail_page_entries(entries, effective_limit, before);
+    entries = page.entries;
     for entry in &mut entries {
         compact_replay_entry_text_fields_for_websocket(entry);
     }
+    page.entries = entries;
 
     Some(
         serde_json::json!({
             "session_id": session_id,
             "transcript_semantics": EXTERNAL_TRANSCRIPT_SEMANTICS,
-            "entries": entries,
+            "entries": page.entries,
+            "total_entries": page.total_entries,
+            "page_start": page.page_start,
+            "page_end": page.page_end,
+            "has_older": page.page_start > 0,
             "frames": [],
         })
         .to_string(),
@@ -21220,6 +21301,7 @@ pub fn spawn_web_gateway(
                             let source = query_param(request_line, "source")
                                 .unwrap_or_else(|| "intendant".to_string());
                             let entry_limit = session_detail_entry_limit_from_request(request_line);
+                            let entry_before = session_detail_before_from_request(request_line);
                             let session_id_owned = session_id.to_string();
                             let source_owned = source.clone();
                             let body =
@@ -21229,17 +21311,19 @@ pub fn spawn_web_gateway(
                                     match tokio::task::spawn_blocking(move || {
                                         let home = crate::platform::home_dir();
                                         if source_owned == "intendant" {
-                                            get_session_detail_from_home_with_limit(
+                                            get_session_detail_from_home_with_page(
                                                 &home,
                                                 &session_id_owned,
                                                 entry_limit,
+                                                entry_before,
                                             )
                                         } else {
-                                            external_session_detail_from_home_with_limit(
+                                            external_session_detail_from_home_with_page(
                                                 &home,
                                                 &source_owned,
                                                 &session_id_owned,
                                                 entry_limit,
+                                                entry_before,
                                             )
                                             .unwrap_or_else(|| {
                                                 serde_json::json!({
@@ -29874,6 +29958,99 @@ mod tests {
             WEBSOCKET_BOOTSTRAP_REPLAY_TEXT_LIMIT_BYTES + "...".len()
         );
         assert!(stdout.ends_with("..."));
+    }
+
+    #[test]
+    fn external_session_detail_pages_before_tail() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions_dir = dir.path().join(".codex").join("sessions");
+        std::fs::create_dir_all(&sessions_dir).unwrap();
+
+        let session_id = "019e37b2-page-before";
+        let mut lines = vec![serde_json::json!({
+            "timestamp": "2026-05-17T16:48:52Z",
+            "type": "session_meta",
+            "payload": { "id": session_id }
+        })];
+        for n in 1..=12 {
+            lines.push(serde_json::json!({
+                "timestamp": format!("2026-05-17T16:49:{n:02}Z"),
+                "type": "response_item",
+                "payload": {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{ "type": "input_text", "text": format!("paged message {n}") }]
+                }
+            }));
+        }
+        std::fs::write(
+            sessions_dir.join(format!("rollout-2026-05-17T16-48-52-{session_id}.jsonl")),
+            lines
+                .into_iter()
+                .map(|v| v.to_string())
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+
+        let tail = external_session_detail_from_home_with_page(
+            dir.path(),
+            "codex",
+            session_id,
+            Some(5),
+            None,
+        )
+        .expect("tail page should load");
+        let tail: serde_json::Value = serde_json::from_str(&tail).unwrap();
+        assert_eq!(tail["total_entries"], 12);
+        assert_eq!(tail["page_start"], 7);
+        assert_eq!(tail["page_end"], 12);
+        assert_eq!(tail["has_older"], true);
+        let tail_contents: Vec<_> = tail["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+        assert_eq!(
+            tail_contents,
+            vec![
+                "paged message 8",
+                "paged message 9",
+                "paged message 10",
+                "paged message 11",
+                "paged message 12"
+            ]
+        );
+
+        let previous = external_session_detail_from_home_with_page(
+            dir.path(),
+            "codex",
+            session_id,
+            Some(5),
+            Some(7),
+        )
+        .expect("previous page should load");
+        let previous: serde_json::Value = serde_json::from_str(&previous).unwrap();
+        assert_eq!(previous["page_start"], 2);
+        assert_eq!(previous["page_end"], 7);
+        assert_eq!(previous["has_older"], true);
+        let previous_contents: Vec<_> = previous["entries"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+        assert_eq!(
+            previous_contents,
+            vec![
+                "paged message 3",
+                "paged message 4",
+                "paged message 5",
+                "paged message 6",
+                "paged message 7"
+            ]
+        );
     }
 
     #[test]
