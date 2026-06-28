@@ -288,8 +288,9 @@ per-tile staleness check.
 - **Tiles** are **64×64 px** (`TILE_STREAM_TILE_SIZE_PX`).
 - **Damage** comes from platform metadata when possible. On **X11**, XDamage
   (`display/capture/x11_damage.rs`) reports real OS-level dirty rects
-  (`ReportLevel::BoundingBox`). On **macOS**, ScreenCaptureKit dirty rects are
-  attached to captured frames and consumed before frame-diff. Other paths use a
+  (`ReportLevel::BoundingBox`). On **macOS**, ScreenCaptureKit dirty rect
+  extraction is implemented but opt-in via `INTENDANT_MACOS_SCK_DIRTY_RECTS=1`
+  while the full-display WebRTC hot path is being validated. Other paths use a
   CPU-bound **frame-diff fallback** (`display/capture/frame_diff.rs`) that hashes
   every tile and emits the ones whose hash changed; where neither is available
   the capability reports `None` and the policy forces video mode, so the platform
@@ -423,8 +424,9 @@ Rates are computed over the elapsed window and counters reset on read.
 
 - **Physical-key-only input** breaks non-US keyboard layouts (Phase 1).
 - **Tile streaming still depends on data-channel viewers.** X11 uses XDamage;
-  macOS uses ScreenCaptureKit dirty rects when present and frame-diff when
-  metadata is unavailable; Wayland currently uses the CPU-bound frame-diff path.
+  macOS can use ScreenCaptureKit dirty rects when
+  `INTENDANT_MACOS_SCK_DIRTY_RECTS=1` is set and otherwise falls back to
+  frame-diff; Wayland currently uses the CPU-bound frame-diff path.
 - **Wayland enumeration is portal-limited** — true multi-monitor identity before
   a session opens is not available.
 - **`rtc` 0.9 doesn't surface TWCC or populate RR stats**, hence the interceptor

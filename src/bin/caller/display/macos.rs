@@ -280,6 +280,20 @@ fn sample_dirty_rects(sample: &CMSampleBuffer, frame_w: u32, frame_h: u32) -> Op
     Some(rects)
 }
 
+fn sck_dirty_rects_enabled() -> bool {
+    std::env::var("INTENDANT_MACOS_SCK_DIRTY_RECTS")
+        .map(|raw| sck_dirty_rects_enabled_value(&raw))
+        .unwrap_or(false)
+}
+
+fn sck_dirty_rects_enabled_value(raw: &str) -> bool {
+    let value = raw.trim();
+    value == "1"
+        || value.eq_ignore_ascii_case("true")
+        || value.eq_ignore_ascii_case("yes")
+        || value.eq_ignore_ascii_case("on")
+}
+
 fn dirty_rect_scale(sample: &CMSampleBuffer, rects: &[ScRect], frame_w: u32, frame_h: u32) -> f64 {
     let scale = sample
         .content_scale()
@@ -506,6 +520,7 @@ impl DisplayBackend for MacOSBackend {
         let shared_h = Arc::clone(&self.height);
         let input_geometry = Arc::clone(&self.input_geometry);
         let is_window_capture = resolved.is_window;
+        let dirty_rects_enabled = sck_dirty_rects_enabled();
 
         let mut stream = SCStream::new(&resolved.filter, &config);
         stream.add_output_handler(
@@ -557,7 +572,11 @@ impl DisplayBackend for MacOSBackend {
                         prev_w, prev_h, w, h,
                     );
                 }
-                let dirty_rects = sample_dirty_rects(&sample, w, h);
+                let dirty_rects = if dirty_rects_enabled {
+                    sample_dirty_rects(&sample, w, h)
+                } else {
+                    None
+                };
 
                 let frame = Frame {
                     data: pixels.to_vec(),
@@ -794,5 +813,15 @@ mod tests {
         let point = geometry.point(0.5, 0.25);
         assert_eq!(point.x, 250.0);
         assert_eq!(point.y, 300.0);
+    }
+
+    #[test]
+    fn dirty_rect_env_parser_accepts_common_truthy_values() {
+        for value in ["1", "true", "TRUE", "yes", "on", " on "] {
+            assert!(sck_dirty_rects_enabled_value(value), "{value}");
+        }
+        for value in ["", "0", "false", "no", "off", "enabled"] {
+            assert!(!sck_dirty_rects_enabled_value(value), "{value}");
+        }
     }
 }
