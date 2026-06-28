@@ -1,0 +1,4 @@
+interface:
+  display_name: "Intendant Log Search"
+  short_description: "Find and interpret Intendant session logs"
+  default_prompt: "Use $intendant-log-search to investigate what happened in an Intendant session."
