@@ -543,7 +543,7 @@ pub fn inject_relay_tcp_candidate(sdp: &str, primary_addr: SocketAddr) -> String
 /// Generic over the read source so we can reuse it for a `TcpStream`
 /// (during dispatcher probe) and an `OwnedReadHalf` (inside the per-peer
 /// reader task after `into_split`).
-async fn read_rfc4571_frame<R>(r: &mut R) -> std::io::Result<Vec<u8>>
+pub(crate) async fn read_rfc4571_frame<R>(r: &mut R) -> std::io::Result<Vec<u8>>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -574,7 +574,7 @@ pub async fn read_rfc4571_frame_pub(stream: &mut TcpStream) -> std::io::Result<V
 
 /// Write one RFC 4571 framed payload: prepend a 2-byte BE length header,
 /// then the payload bytes.
-async fn write_rfc4571_frame<W: AsyncWriteExt + Unpin>(
+pub(crate) async fn write_rfc4571_frame<W: AsyncWriteExt + Unpin>(
     w: &mut W,
     payload: &[u8],
 ) -> std::io::Result<()> {

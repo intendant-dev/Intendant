@@ -252,6 +252,15 @@ pub enum UiCommand {
         session_id: String,
         signal: serde_json::Value,
     },
+    /// One leg of a direct peer file-transfer WebRTC signaling exchange.
+    /// Unlike display WebRTC, this is daemon-scoped rather than display-scoped,
+    /// so JS routes by `(host_id, session_id)`.
+    #[serde(rename = "peer_file_transfer_signal")]
+    PeerFileTransferSignal {
+        host_id: String,
+        session_id: String,
+        signal: serde_json::Value,
+    },
     /// A Codex thread action (/compact, /fork, /undo, /review, /init,
     /// /memory-reset, /new) finished. `success` + `message` drive a
     /// dashboard toast and the Activity log entry.
@@ -3282,6 +3291,28 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
             }]
         }
 
+        // Direct browser-to-peer file-transfer signaling. This mirrors
+        // `webrtc_signal` but omits display_id because file transfer is
+        // daemon-scoped.
+        "peer_file_transfer_signal" => {
+            let session_id = payload["session_id"].as_str().unwrap_or("").to_string();
+            let signal = payload["signal"].clone();
+            if session_id.is_empty() {
+                return vec![UiCommand::PeerLog {
+                    host_id: host,
+                    ts: now,
+                    level: "warn".to_string(),
+                    source: "peer-file-transfer".to_string(),
+                    content: format!("Peer file-transfer signal missing session_id: {payload}"),
+                }];
+            }
+            vec![UiCommand::PeerFileTransferSignal {
+                host_id: host,
+                session_id,
+                signal,
+            }]
+        }
+
         // Unknown / forward-compat: render as a debug log so the user
         // can see something arrived rather than dropping silently.
         other => vec![UiCommand::PeerLog {
@@ -5632,8 +5663,52 @@ mod tests {
             Some("peer_webrtc_signal"),
             "PeerWebRtcSignal must serialize cmd=\"peer_webrtc_signal\" \
              (without the rename, snake_case would mangle to \
-             peer_web_rtc_signal and JS dispatch would silently miss)"
+            peer_web_rtc_signal and JS dispatch would silently miss)"
         );
+    }
+
+    /// `peer_file_transfer_signal` renders as a typed
+    /// `PeerFileTransferSignal` carrying the original host/session
+    /// identifiers plus the opaque signal body JS feeds to the
+    /// daemon-scoped RTCPeerConnection.
+    #[test]
+    fn peer_event_forwarded_file_transfer_signal_targets_session() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "peer_file_transfer_signal",
+                "session_id": "file-session-uuid",
+                "signal": {"kind": "answer", "sdp": "v=0\r\n..."},
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        let sig = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerFileTransferSignal {
+                host_id,
+                session_id,
+                signal,
+            } => Some((host_id, session_id, signal)),
+            _ => None,
+        });
+        let (host_id, session_id, signal) = sig.expect("PeerFileTransferSignal emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(session_id, "file-session-uuid");
+        assert_eq!(signal["kind"], "answer");
+        assert_eq!(signal["sdp"], "v=0\r\n...");
+    }
+
+    /// The JS dispatch in `static/app.html` matches this exact string.
+    #[test]
+    fn peer_file_transfer_signal_wire_name() {
+        let cmd = UiCommand::PeerFileTransferSignal {
+            host_id: "intendant:alpha".to_string(),
+            session_id: "file-session-uuid".to_string(),
+            signal: json!({"kind": "answer", "sdp": ""}),
+        };
+        let v = serde_json::to_value(&cmd).expect("serialize");
+        assert_eq!(v["cmd"].as_str(), Some("peer_file_transfer_signal"));
     }
 
     /// `webrtc_signal` without a session_id can't route to any

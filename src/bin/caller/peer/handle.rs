@@ -355,6 +355,31 @@ impl PeerHandle {
         }
     }
 
+    /// Send one leg of a direct browser-to-peer file-transfer WebRTC signaling
+    /// exchange to this peer. The peer's answer and trickled ICE candidates
+    /// flow back asynchronously as PeerEvent::PeerFileTransferSignal.
+    pub async fn peer_file_transfer_signal(
+        &self,
+        session_id: WebRtcSessionId,
+        signal: WebRtcSignal,
+    ) -> Result<(), PeerError> {
+        if !self.features().file_transfer_signal {
+            return Err(PeerError::UnsupportedCapability(
+                "peer_file_transfer_signal".into(),
+            ));
+        }
+        match self
+            .exec(PeerOp::PeerFileTransferSignal { session_id, signal })
+            .await?
+        {
+            PeerOpAck::Ok => Ok(()),
+            other => Err(PeerError::Transport(format!(
+                "expected Ok ack, got {}",
+                other.name()
+            ))),
+        }
+    }
+
     /// Request explicit disconnect. Awaits until the actor has
     /// transitioned to [`ConnectionState::Disconnected`] so callers
     /// know the transport is actually torn down when this returns.

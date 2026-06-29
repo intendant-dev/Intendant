@@ -50,7 +50,10 @@ async function launchBrowser(opts = {}) {
 }
 
 async function launchPlaywrightBrowser(playwright, opts) {
-  const browser = await playwright.chromium.launch({ headless: opts.headless !== false });
+  const browser = await playwright.chromium.launch({
+    headless: opts.headless !== false,
+    args: Array.isArray(opts.browserArgs) ? opts.browserArgs : [],
+  });
   const context = await browser.newContext({ ignoreHTTPSErrors: Boolean(opts.ignoreHTTPSErrors) });
   return {
     kind: 'playwright',

@@ -1557,6 +1557,13 @@ pub enum ControlMsg {
     ReleaseDisplayInputAuthority {
         display_id: u32,
     },
+    /// One leg of a direct browser-to-peer file-transfer WebRTC signaling
+    /// exchange. The primary daemon forwards browser offers/ICE to the peer;
+    /// the peer emits answers/ICE back as OutboundEvent::PeerFileTransferSignal.
+    PeerFileTransferSignal {
+        session_id: String,
+        signal: crate::peer::WebRtcSignal,
+    },
     CreateBrowserWorkspace {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,

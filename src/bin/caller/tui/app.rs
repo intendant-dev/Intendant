@@ -1801,6 +1801,11 @@ impl App {
                 // web gateway's WS handler, not the TUI control command
                 // path. The TUI doesn't drive WebRTC sessions; no-op.
             }
+            ControlMsg::PeerFileTransferSignal { .. } => {
+                // Direct peer file-transfer signaling is handled by the
+                // web gateway's WS handler and a browser DataChannel.
+                // The TUI has no DataChannel leg; no-op.
+            }
             ControlMsg::RequestDisplayInputAuthority { .. }
             | ControlMsg::ReleaseDisplayInputAuthority { .. } => {
                 // Per-display input authority is a browser-WS concept

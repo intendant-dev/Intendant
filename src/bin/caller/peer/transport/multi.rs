@@ -164,6 +164,7 @@ fn union_features(candidates: &[Box<dyn PeerTransport>]) -> TransportFeatures {
         u.invoke_capability |= f.invoke_capability;
         u.resolve_approval |= f.resolve_approval;
         u.webrtc_signal |= f.webrtc_signal;
+        u.file_transfer_signal |= f.file_transfer_signal;
     }
     u
 }

@@ -681,6 +681,34 @@ html {
 .files-tool + .files-tool {
   margin-top: 14px;
 }
+.files-download-host-row {
+  display: grid;
+  grid-template-columns: auto minmax(0, 260px);
+  align-items: center;
+  justify-content: start;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+.files-download-host-row label {
+  color: var(--subtext0);
+  font-size: 12px;
+  font-weight: 600;
+}
+.files-download-host-row select {
+  min-height: 32px;
+  min-width: 0;
+  padding: 6px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+}
+.files-download-host-row select:focus {
+  outline: none;
+  border-color: var(--blue);
+}
 .files-download-row {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto auto;
@@ -8788,6 +8816,9 @@ body.display-fullscreen-open {
   .files-download-row {
     grid-template-columns: 1fr;
   }
+  .files-download-host-row {
+    grid-template-columns: 1fr;
+  }
   .files-upload-config {
     grid-template-columns: 1fr;
   }
@@ -9253,7 +9284,7 @@ body.display-fullscreen-open {
     <button class="tab-btn" data-tab="displays" title="Live display streams — local screens and connected peers">Video</button>
     <button class="tab-btn" data-tab="station" title="Station — the rendered control center (WebGPU canvas)">Station</button>
     <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
-    <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon">Files</button>
+    <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon or a peer">Files</button>
     <button class="tab-btn" data-tab="debug" title="Daemon diagnostics and raw event streams">Debug</button>
     <button class="tab-btn" data-tab="settings" title="Account, agent, network daemons, and debug settings">Settings</button>
   </nav>
@@ -10507,6 +10538,12 @@ body.display-fullscreen-open {
       <div class="files-pane">
         <section class="files-tool" aria-labelledby="files-download-heading">
           <h3 id="files-download-heading">Downloads</h3>
+          <div class="files-download-host-row">
+            <label for="files-download-host">Source</label>
+            <select id="files-download-host" onchange="onFilesDownloadHostChanged()">
+              <option value="">This daemon</option>
+            </select>
+          </div>
           <div class="files-download-row">
             <input id="files-download-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/file">
             <button id="files-download-browse-btn" type="button" onclick="openFilesDownloadPicker()">Browse</button>
@@ -11601,6 +11638,7 @@ let filesTransferSeq = 0;
 let filesTransferRunnerActive = false;
 const filesTransfers = [];
 const filesStagedUploads = new Map();
+const peerFileTransferConnections = new Map();
 let filesTransferDbPromise = null;
 const FILES_TRANSFER_STATE_KEY = 'intendant.files.transfers.v2';
 const FILES_TRANSFER_DB_NAME = 'intendant-files-transfers-v2';
@@ -19734,6 +19772,9 @@ function processCommands(cmds) {
         // and start receiving the peer's display directly. See
         // PeerDisplayConnection / handlePeerWebRtcSignal below.
         handlePeerWebRtcSignal(c.host_id, c.display_id, c.session_id, c.signal);
+        break;
+      case 'peer_file_transfer_signal':
+        handlePeerFileTransferSignal(c.host_id, c.session_id, c.signal);
         break;
       }
     }
@@ -39393,6 +39434,13 @@ class DashboardTransport {
     );
   }
 
+  canUsePeerFileTransferSignal() {
+    return Boolean(
+      this.canUseRpc() &&
+      dashboardControlTransport?.lastStatus?.api_peer_file_transfer_signal_available === true
+    );
+  }
+
   request(method, params = {}, options = {}) {
     if (!this.canUseRpc()) {
       return Promise.reject(new Error('dashboard control RPC is not connected'));
@@ -39487,6 +39535,21 @@ class DashboardTransport {
       params,
       options
     );
+  }
+
+  peerFileTransferSignal(peerId, params = {}, options = {}) {
+    const id = String(peerId || '').trim();
+    if (!id) return Promise.reject(new Error('peer id is required'));
+    const body = { peer_id: id, ...params };
+    return this.jsonFetch('api_peer_file_transfer_signal', body, () => authedFetch(
+      `/api/peers/${encodeURIComponent(id)}/file-transfer-webrtc`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: options.signal,
+      }
+    ), 'api_peer_file_transfer_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {
@@ -40706,6 +40769,9 @@ window.intendantDashboardControl = {
   },
   peerWebRtcSignal(peerId, params = {}, options = {}) {
     return dashboardTransport.request('api_peer_webrtc_signal', { peer_id: peerId, ...params }, options);
+  },
+  peerFileTransferSignal(peerId, params = {}, options = {}) {
+    return dashboardTransport.peerFileTransferSignal(peerId, params, options);
   },
 };
 
@@ -42921,6 +42987,9 @@ function renderDaemonsList() {
 
   // Same for the Stats tab host picker.
   refreshStatsHostPicker();
+
+  // Same for the Files tab download source selector.
+  refreshFilesDownloadHostOptions();
 
   // Refresh the aggregate connection dot in the status bar.
   updateHostsAggregateDot();
@@ -46159,6 +46228,366 @@ function handlePeerWebRtcSignal(hostId, displayId, sessionId, signal) {
 function reapplyPeerDisplayPanes() {
   for (const conn of peerDisplayConnections.values()) {
     conn.attachToDom();
+  }
+}
+
+class PeerFileTransferConnection {
+  constructor(hostId, sessionId) {
+    this.hostId = String(hostId || '').trim();
+    this.sessionId = String(sessionId || generateSessionId());
+    this.advertiseTcpViaUrl = '';
+    this.pc = null;
+    this.channel = null;
+    this.connectPromise = null;
+    this._answerApplied = false;
+    this._pendingCandidates = [];
+    this._readyResolve = null;
+    this._readyReject = null;
+    this._activeReadId = '';
+    this._pendingReads = new Map();
+  }
+
+  sessionKey() {
+    return `${this.hostId}|${this.sessionId}`;
+  }
+
+  connect(options = {}) {
+    if (this.connectPromise) return this.connectPromise;
+    this.connectPromise = this._connect(options);
+    return this.connectPromise;
+  }
+
+  async _connect(options = {}) {
+    if (!this.hostId) throw new Error('peer id is required');
+    if (!window.RTCPeerConnection) throw new Error('RTCPeerConnection is unavailable');
+    peerFileTransferConnections.set(this.sessionKey(), this);
+    const peer = daemons.find(d => String(d.host_id || '') === this.hostId);
+    this.advertiseTcpViaUrl = peer ? resolveBrowserTcpViaUrl(peer) : '';
+    const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
+    this.pc = new RTCPeerConnection({ iceServers });
+    this.channel = this.pc.createDataChannel('intendant-peer-file-transfer', { ordered: true });
+    this.channel.binaryType = 'arraybuffer';
+    const ready = new Promise((resolve, reject) => {
+      this._readyResolve = resolve;
+      this._readyReject = reject;
+    });
+    this.channel.onopen = () => {
+      this._log('info', 'data channel open');
+      this._readyResolve?.(true);
+    };
+    this.channel.onclose = () => {
+      this._log('debug', 'data channel closed');
+    };
+    this.channel.onerror = () => {
+      const err = new Error('peer file-transfer DataChannel error');
+      this._readyReject?.(err);
+      this._rejectAll(err);
+    };
+    this.channel.onmessage = (event) => {
+      this._handleMessage(event.data).catch((err) => {
+        this._log('warn', `message handling failed: ${err.message}`);
+      });
+    };
+    this.pc.onicecandidate = (event) => {
+      if (!event.candidate) {
+        this._log('debug', 'local ICE gathering complete (null candidate)');
+        return;
+      }
+      const candidate = event.candidate.toJSON ? event.candidate.toJSON() : event.candidate;
+      this._log('debug', `local ICE candidate: ${this._describeCandidate(candidate)}`);
+      this._sendSignal({
+        kind: 'ice_candidate',
+        candidate_json: JSON.stringify(candidate),
+      }, options).catch((err) => this._log('warn', `ICE signal failed: ${err.message}`));
+    };
+    this.pc.onconnectionstatechange = () => {
+      const state = this.pc?.connectionState || 'closed';
+      this._log(state === 'failed' ? 'warn' : 'debug', `connectionState=${state}`);
+      if (state === 'failed') {
+        const err = new Error('peer file-transfer WebRTC connection failed');
+        this._readyReject?.(err);
+        this._rejectAll(err);
+      }
+    };
+    this.pc.oniceconnectionstatechange = () => {
+      this._log('debug', `iceConnectionState=${this.pc?.iceConnectionState || 'closed'}`);
+    };
+    const offer = await this.pc.createOffer();
+    await this.pc.setLocalDescription(offer);
+    const offerSignal = {
+      kind: 'offer',
+      sdp: this.pc.localDescription?.sdp || offer.sdp || '',
+    };
+    if (this.advertiseTcpViaUrl) {
+      offerSignal.advertise_tcp_via_url = this.advertiseTcpViaUrl;
+    }
+    this._log('debug', `offer advertiseTcpViaUrl=${this.advertiseTcpViaUrl || '(none)'}`);
+    await this._sendSignal(offerSignal, options);
+    await this._waitForReady(ready, options);
+    return true;
+  }
+
+  async _waitForReady(ready, options = {}) {
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs || 30000));
+    let timeoutId = null;
+    let abortHandler = null;
+    const timeout = new Promise((_, reject) => {
+      timeoutId = window.setTimeout(
+        () => reject(new Error('peer file-transfer connection timed out')),
+        timeoutMs
+      );
+    });
+    const abort = new Promise((_, reject) => {
+      const signal = options.signal;
+      if (!signal) return;
+      abortHandler = () => reject(dashboardControlAbortError('peer file-transfer connection aborted'));
+      if (signal.aborted) abortHandler();
+      else signal.addEventListener('abort', abortHandler, { once: true });
+    });
+    try {
+      await Promise.race([ready, timeout, abort]);
+    } finally {
+      if (timeoutId) window.clearTimeout(timeoutId);
+      if (options.signal && abortHandler) options.signal.removeEventListener('abort', abortHandler);
+    }
+  }
+
+  async _sendSignal(signal, options = {}) {
+    const resp = await dashboardTransport.peerFileTransferSignal(this.hostId, {
+      session_id: this.sessionId,
+      signal,
+    }, {
+      signal: options.signal,
+    });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(`peer file-transfer signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+    }
+  }
+
+  handleAnswer(sdp) {
+    if (!this.pc) return;
+    this._log('debug', 'answer received');
+    this.pc.setRemoteDescription({ type: 'answer', sdp: String(sdp || '') })
+      .then(() => {
+        this._answerApplied = true;
+        this._log('debug', `answer applied, flushing ${this._pendingCandidates.length} buffered ICE candidate(s)`);
+        for (const candidate of this._pendingCandidates) {
+          this.pc.addIceCandidate(candidate).catch((err) =>
+            this._log('warn', `buffered addIceCandidate failed: ${err.message}`)
+          );
+        }
+        this._pendingCandidates = [];
+      })
+      .catch((err) => {
+        this._readyReject?.(err);
+        this._rejectAll(err);
+      });
+  }
+
+  handleIceCandidate(candidateJson) {
+    if (!candidateJson || !this.pc) return;
+    let candidate;
+    try {
+      candidate = typeof candidateJson === 'string' ? JSON.parse(candidateJson) : candidateJson;
+    } catch (err) {
+      this._log('warn', `remote ICE JSON parse failed: ${err.message}`);
+      return;
+    }
+    if (!this._answerApplied) {
+      this._log('debug', `buffering remote ICE candidate: ${this._describeCandidate(candidate)}`);
+      this._pendingCandidates.push(candidate);
+      return;
+    }
+    this._log('debug', `remote ICE candidate: ${this._describeCandidate(candidate)}`);
+    this.pc.addIceCandidate(candidate).catch((err) =>
+      this._log('warn', `addIceCandidate failed: ${err.message}`)
+    );
+  }
+
+  async readRange(path, offset, length, options = {}) {
+    if (!this.channel || this.channel.readyState !== 'open') {
+      await this.connect(options);
+    }
+    if (this._activeReadId) {
+      throw new Error('peer file-transfer channel already has an active read');
+    }
+    if (options.signal?.aborted) throw dashboardControlAbortError('peer file-transfer read aborted');
+    const id = `read-${Date.now().toString(36)}-${dashboardRandomBase64Url(8)}`;
+    this._activeReadId = id;
+    const request = {
+      t: 'read',
+      id,
+      path: String(path || ''),
+      offset: Math.max(0, Math.floor(Number(offset) || 0)),
+      length: Math.max(1, Math.floor(Number(length) || 1)),
+    };
+    return new Promise((resolve, reject) => {
+      let timeoutId = null;
+      let abortHandler = null;
+      const cleanup = () => {
+        if (timeoutId) window.clearTimeout(timeoutId);
+        if (options.signal && abortHandler) options.signal.removeEventListener('abort', abortHandler);
+        this._pendingReads.delete(id);
+        if (this._activeReadId === id) this._activeReadId = '';
+      };
+      const fail = (err) => {
+        cleanup();
+        reject(err);
+      };
+      const timeoutMs = Math.max(1000, Number(options.timeoutMs || rangedDownloadTimeoutMs(request.length)));
+      timeoutId = window.setTimeout(
+        () => fail(new Error('peer file-transfer read timed out')),
+        timeoutMs
+      );
+      if (options.signal) {
+        abortHandler = () => {
+          try {
+            if (this.channel?.readyState === 'open') {
+              this.channel.send(JSON.stringify({ t: 'cancel', id }));
+            }
+          } catch {}
+          fail(dashboardControlAbortError('peer file-transfer read aborted'));
+        };
+        if (options.signal.aborted) {
+          abortHandler();
+          return;
+        }
+        options.signal.addEventListener('abort', abortHandler, { once: true });
+      }
+      this._pendingReads.set(id, {
+        id,
+        request,
+        chunks: [],
+        start: null,
+        resolve: (value) => {
+          cleanup();
+          resolve(value);
+        },
+        reject: fail,
+      });
+      try {
+        this.channel.send(JSON.stringify(request));
+      } catch (err) {
+        fail(err);
+      }
+    });
+  }
+
+  async _handleMessage(data) {
+    if (typeof data === 'string') {
+      this._handleTextFrame(data);
+      return;
+    }
+    let bytes;
+    if (data instanceof Blob) {
+      bytes = new Uint8Array(await data.arrayBuffer());
+    } else if (data instanceof ArrayBuffer) {
+      bytes = new Uint8Array(data);
+    } else if (ArrayBuffer.isView(data)) {
+      bytes = new Uint8Array(data.buffer, data.byteOffset, data.byteLength);
+    } else {
+      return;
+    }
+    const pending = this._activeReadId ? this._pendingReads.get(this._activeReadId) : null;
+    if (!pending) return;
+    pending.chunks.push(bytes);
+  }
+
+  _handleTextFrame(text) {
+    let frame;
+    try {
+      frame = JSON.parse(text);
+    } catch (err) {
+      this._log('warn', `JSON frame parse failed: ${err.message}`);
+      return;
+    }
+    const id = String(frame?.id || '');
+    const pending = id ? this._pendingReads.get(id) : null;
+    if (!pending) return;
+    if (frame.t === 'start') {
+      pending.start = frame;
+      return;
+    }
+    if (frame.t === 'error') {
+      pending.reject(new Error(String(frame.error || 'peer file-transfer read failed')));
+      return;
+    }
+    if (frame.t !== 'end') return;
+    const byteLength = pending.chunks.reduce((sum, chunk) => sum + chunk.byteLength, 0);
+    const bytes = new Uint8Array(byteLength);
+    let cursor = 0;
+    for (const chunk of pending.chunks) {
+      bytes.set(chunk, cursor);
+      cursor += chunk.byteLength;
+    }
+    const start = pending.start || {};
+    const rangeStart = Number(start.offset ?? pending.request.offset);
+    const totalSize = Number(start.total_size ?? frame.total_size ?? (rangeStart + byteLength));
+    pending.resolve({
+      bytes,
+      rangeStart,
+      rangeEnd: rangeStart + byteLength,
+      totalSize,
+      filename: start.filename ? String(start.filename) : filesDownloadFilenameFromPath(pending.request.path),
+      contentType: start.content_type ? String(start.content_type) : 'application/octet-stream',
+    });
+  }
+
+  async close() {
+    peerFileTransferConnections.delete(this.sessionKey());
+    await this._sendSignal({ kind: 'close' }).catch(() => {});
+    const err = dashboardControlAbortError('peer file-transfer connection closed');
+    this._rejectAll(err);
+    if (this.pc) {
+      try { this.pc.close(); } catch {}
+      this.pc = null;
+    }
+    this.channel = null;
+  }
+
+  _rejectAll(err) {
+    for (const pending of this._pendingReads.values()) {
+      pending.reject(err);
+    }
+    this._pendingReads.clear();
+    this._activeReadId = '';
+  }
+
+  _log(level, message) {
+    const prefix = `[peer-file-transfer ${this.hostId}/${this.sessionId}]`;
+    const fn = level === 'error' ? console.error
+      : level === 'warn' ? console.warn
+      : level === 'info' ? console.info
+      : console.debug;
+    fn(`${prefix} ${message}`);
+  }
+
+  _describeCandidate(candidate) {
+    const s = candidate && (candidate.candidate || JSON.stringify(candidate));
+    if (!s) return '(empty)';
+    const m = s.match(/candidate:\S+\s+\d+\s+(\S+)\s+\S+\s+(\S+)\s+(\d+)\s+typ\s+(\S+)/);
+    if (m) return `${m[4]} ${m[1]} ${m[2]}:${m[3]}`;
+    return s;
+  }
+}
+
+function handlePeerFileTransferSignal(hostId, sessionId, signal) {
+  const sessionKey = `${hostId}|${sessionId}`;
+  const conn = peerFileTransferConnections.get(sessionKey);
+  const kind = signal && signal.kind;
+  if (!conn) {
+    console.debug(`[peer-file-transfer ${hostId}] received ${kind || '(no-kind)'} for unknown session ${sessionId}`);
+    return;
+  }
+  if (kind === 'answer') {
+    conn.handleAnswer(signal.sdp || '');
+  } else if (kind === 'ice_candidate') {
+    conn.handleIceCandidate(signal.candidate_json || '');
+  } else if (kind === 'close') {
+    conn.close().catch(() => {});
+  } else {
+    console.debug(`[peer-file-transfer ${hostId}] unknown signal kind=${kind || '(none)'} for session ${sessionId}`);
   }
 }
 
@@ -49630,6 +50059,78 @@ function filesDownloadPathValue() {
   return document.getElementById('files-download-path')?.value.trim() || '';
 }
 
+function filesDownloadSelectedPeerId() {
+  return document.getElementById('files-download-host')?.value.trim() || '';
+}
+
+function filesDownloadSelectedPeer() {
+  const id = filesDownloadSelectedPeerId();
+  if (!id) return null;
+  return daemons.find(d => d.host_id === id) || null;
+}
+
+function filesDownloadPeerLabel(peerId = filesDownloadSelectedPeerId()) {
+  const id = String(peerId || '').trim();
+  if (!id) return 'This daemon';
+  const peer = daemons.find(d => d.host_id === id);
+  return peer?.label || id;
+}
+
+function peerFileTransferSignalAvailable(peerId = filesDownloadSelectedPeerId()) {
+  const id = String(peerId || '').trim();
+  if (!id) return false;
+  if (!window.RTCPeerConnection) return false;
+  const peer = daemons.find(d => d.host_id === id);
+  if (!peer || peer.connected === false) return false;
+  if (dashboardConnectModeEnabled()) {
+    return Boolean(
+      dashboardTransport?.canUseRpc?.() &&
+      dashboardControlTransport?.lastStatus?.api_peer_file_transfer_signal_available === true
+    );
+  }
+  return true;
+}
+
+function refreshFilesDownloadHostOptions() {
+  const select = document.getElementById('files-download-host');
+  if (!select) return;
+  const previous = select.value || '';
+  const options = [{ id: '', label: 'This daemon', connected: true }];
+  for (const peer of daemons) {
+    options.push({
+      id: peer.host_id,
+      label: peer.label || peer.host_id,
+      connected: peer.connected !== false,
+    });
+  }
+  select.innerHTML = '';
+  for (const option of options) {
+    const el = document.createElement('option');
+    el.value = option.id;
+    el.textContent = option.connected ? option.label : `${option.label} (offline)`;
+    select.appendChild(el);
+  }
+  const stillPresent = options.some(option => option.id === previous);
+  select.value = stillPresent ? previous : '';
+  onFilesDownloadHostChanged({ preserveStatus: true });
+}
+
+function onFilesDownloadHostChanged(options = {}) {
+  const browse = document.getElementById('files-download-browse-btn');
+  const selectedPeer = filesDownloadSelectedPeerId();
+  if (browse) {
+    browse.disabled = Boolean(filesDownloadAbort || selectedPeer);
+    browse.title = selectedPeer
+      ? 'Remote peer browsing is not available yet; enter a full path'
+      : 'Choose a local file to download';
+  }
+  refreshFilesDownloadAvailability();
+  if (!options.preserveStatus) {
+    setFilesDownloadStatus('', selectedPeer ? 'Enter a full path on the selected peer' : 'Ready');
+    setFilesDownloadProgress(0, 0);
+  }
+}
+
 function filesUploadDestinationValue() {
   return document.getElementById('files-upload-destination')?.value.trim() || '';
 }
@@ -49640,12 +50141,24 @@ function filesUploadConflictPolicy() {
 }
 
 function filesDownloadTunnelAvailable() {
+  const peerId = filesDownloadSelectedPeerId();
+  if (peerId) return peerFileTransferSignalAvailable(peerId);
   return dashboardTransferDownloadAvailable() ||
     dashboardByteStreamMethodAvailable('api_fs_read') ||
     !dashboardConnectModeEnabled();
 }
 
-function filesDownloadUnavailableMessage() {
+function filesDownloadUnavailableMessage(peerIdOverride = undefined) {
+  const peerId = peerIdOverride === undefined ? filesDownloadSelectedPeerId() : String(peerIdOverride || '').trim();
+  if (peerId) {
+    if (!window.RTCPeerConnection) return 'Peer downloads require WebRTC support in this browser';
+    const peer = daemons.find(d => d.host_id === peerId);
+    if (!peer) return 'Selected peer is no longer configured';
+    if (peer.connected === false) return 'Selected peer is not connected';
+    return dashboardConnectModeEnabled()
+      ? 'Peer downloads require the Connect dashboard tunnel'
+      : 'Peer downloads are not available from this dashboard';
+  }
   return dashboardConnectModeEnabled()
     ? 'File downloads require the Connect dashboard tunnel'
     : 'File downloads are not available from this dashboard';
@@ -49862,6 +50375,8 @@ function filesTransferPersistable(transfer) {
     sourceLabel: transfer.sourceLabel || '',
     directMethod: transfer.directMethod || '',
     directParams: transfer.directParams && typeof transfer.directParams === 'object' ? transfer.directParams : null,
+    peerId: transfer.peerId || '',
+    peerLabel: transfer.peerLabel || '',
     loaded: Number(transfer.loaded || 0),
     totalSize: Number(transfer.totalSize || transfer.file?.size || 0),
     rangeCount: Number(transfer.rangeCount || 0),
@@ -49914,6 +50429,8 @@ function restoreFilesTransferState() {
       sourceLabel: item.sourceLabel || '',
       directMethod: item.directMethod || '',
       directParams: item.directParams && typeof item.directParams === 'object' ? item.directParams : null,
+      peerId: item.peerId || '',
+      peerLabel: item.peerLabel || '',
       loaded: Number(item.loaded || 0),
       totalSize: Number(item.totalSize || 0),
       parts: [],
@@ -49974,9 +50491,12 @@ function setFilesDownloadBusy(busy) {
   const input = document.getElementById('files-download-path');
   const browse = document.getElementById('files-download-browse-btn');
   const download = document.getElementById('files-download-btn');
+  const host = document.getElementById('files-download-host');
+  const peerSelected = !!filesDownloadSelectedPeerId();
   const hasPath = !!filesDownloadPathValue();
   if (input) input.disabled = !!busy;
-  if (browse) browse.disabled = !!busy;
+  if (host) host.disabled = !!busy;
+  if (browse) browse.disabled = !!busy || peerSelected;
   if (download) download.disabled = !!busy || !hasPath || !filesDownloadTunnelAvailable();
 }
 
@@ -50070,9 +50590,51 @@ async function dashboardFetchHttpRangeBytesWithRetry(path, offset, length, optio
   }
 }
 
+async function dashboardFetchPeerFileRangeBytesWithRetry(connection, path, offset, length, options = {}) {
+  if (!connection || typeof connection.readRange !== 'function') {
+    throw new Error('peer file-transfer connection is not available');
+  }
+  if (options.signal?.aborted) throw dashboardControlAbortError('peer file-transfer read aborted');
+  const range = await connection.readRange(path, offset, length, options);
+  if (!Number.isSafeInteger(range.rangeStart) || range.rangeStart !== offset) {
+    throw new Error('peer file-transfer returned unexpected range start');
+  }
+  if (!Number.isSafeInteger(range.rangeEnd) || range.rangeEnd < range.rangeStart || range.rangeEnd - range.rangeStart !== range.bytes.byteLength) {
+    throw new Error('peer file-transfer returned inconsistent range length');
+  }
+  if (!Number.isSafeInteger(range.totalSize) || range.totalSize < range.rangeEnd) {
+    throw new Error('peer file-transfer returned invalid total size');
+  }
+  return range;
+}
+
 async function fetchDashboardFilesystemDownload(path, options = {}) {
   const target = String(path || '').trim();
   if (!target) throw new Error('Choose a file to download');
+  const peerId = options.peerId !== undefined ? String(options.peerId || '').trim() : filesDownloadSelectedPeerId();
+  if (peerId) {
+    const transfer = queueFilesDownload(target, {
+      signal: options.signal,
+      chunkBytes: options.chunkBytes || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES,
+      maxBytes: options.maxBytes || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES,
+      retries: options.retries,
+      timeoutMs: options.timeoutMs,
+      onProgress: options.onProgress,
+      skipBrowserSave: true,
+      peerId,
+      peerLabel: options.peerLabel || filesDownloadPeerLabel(peerId),
+    });
+    if (!transfer) throw new Error('download was not queued');
+    if (options.signal) {
+      const abortQueuedTransfer = () => {
+        transfer.cancelRequested = true;
+        transfer.abortController?.abort();
+      };
+      if (options.signal.aborted) abortQueuedTransfer();
+      else options.signal.addEventListener('abort', abortQueuedTransfer, { once: true });
+    }
+    return transfer.completion;
+  }
   if (dashboardTransferDownloadAvailable()) {
     const transfer = queueFilesDownload(target, {
       signal: options.signal,
@@ -50355,6 +50917,8 @@ function queueFilesDownload(path, options = {}) {
     setFilesDownloadStatus('error', 'Choose a file to download');
     return null;
   }
+  const peerId = String(options.peerId || '').trim();
+  const peerLabel = peerId ? String(options.peerLabel || filesDownloadPeerLabel(peerId)).trim() : '';
   setFilesDownloadPath(target);
   setFilesDownloadStatus('warn', 'Queued download');
   setFilesDownloadProgress(0, 0);
@@ -50363,6 +50927,9 @@ function queueFilesDownload(path, options = {}) {
     kind: 'download',
     status: 'queued',
     path: target,
+    peerId,
+    peerLabel,
+    sourceLabel: peerId ? `${peerLabel || peerId}:${target}` : '',
     loaded: 0,
     totalSize: 0,
     parts: [],
@@ -50471,15 +51038,21 @@ function filesTransferApplyServerJob(transfer, job) {
 }
 
 async function runFilesDownloadTransfer(transfer) {
-  const useDurableTransfer = dashboardTransferDownloadAvailable();
+  const peerId = String(transfer.peerId || '').trim();
+  const usePeerFileTransfer = Boolean(peerId);
+  const useDurableTransfer = !usePeerFileTransfer && dashboardTransferDownloadAvailable();
   const hasArtifact = Boolean(transfer.artifact && typeof transfer.artifact === 'object');
   const fallbackMethod = String(transfer.directMethod || (!hasArtifact ? 'api_fs_read' : '')).trim();
-  const canUseFallbackMethod = Boolean(fallbackMethod && dashboardByteStreamMethodAvailable(fallbackMethod));
+  const canUseFallbackMethod = !usePeerFileTransfer && Boolean(fallbackMethod && dashboardByteStreamMethodAvailable(fallbackMethod));
   const useHttpFilesystemFallback = !useDurableTransfer &&
     !canUseFallbackMethod &&
+    !usePeerFileTransfer &&
     !hasArtifact &&
     !dashboardConnectModeEnabled();
-  if (!useDurableTransfer && !canUseFallbackMethod && !useHttpFilesystemFallback) {
+  if (usePeerFileTransfer && !peerFileTransferSignalAvailable(peerId)) {
+    throw new Error(filesDownloadUnavailableMessage(peerId));
+  }
+  if (!usePeerFileTransfer && !useDurableTransfer && !canUseFallbackMethod && !useHttpFilesystemFallback) {
     throw new Error(hasArtifact
       ? 'Artifact download requires the durable transfer tunnel'
       : filesDownloadUnavailableMessage());
@@ -50493,10 +51066,19 @@ async function runFilesDownloadTransfer(transfer) {
   filesDownloadAbort = controller;
   renderFilesTransfers();
   filesUpdateActiveDownloadSummary(transfer);
+  let peerConnection = null;
   try {
     if (transfer.loaded > 0 && (!Array.isArray(transfer.parts) || transfer.parts.length === 0)) {
       const hydrated = await filesTransferLoadDownloadParts(transfer);
       if (!hydrated) resetFilesDownloadTransfer(transfer);
+    }
+    if (usePeerFileTransfer) {
+      peerConnection = new PeerFileTransferConnection(peerId, generateSessionId());
+      transfer.peerTransferSessionId = peerConnection.sessionId;
+      await peerConnection.connect({
+        signal: controller.signal,
+        timeoutMs: transfer.timeoutMs || 30000,
+      });
     }
     if (useDurableTransfer && !transfer.resumeToken && !transfer.serverJobId) {
       const payload = hasArtifact
@@ -50528,6 +51110,12 @@ async function runFilesDownloadTransfer(transfer) {
       let range;
       if (useHttpFilesystemFallback) {
         range = await dashboardFetchHttpRangeBytesWithRetry(transfer.path, transfer.loaded, requested, {
+          signal: controller.signal,
+          retries: transfer.retries,
+          timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
+        });
+      } else if (usePeerFileTransfer) {
+        range = await dashboardFetchPeerFileRangeBytesWithRetry(peerConnection, transfer.path, transfer.loaded, requested, {
           signal: controller.signal,
           retries: transfer.retries,
           timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
@@ -50631,6 +51219,7 @@ async function runFilesDownloadTransfer(transfer) {
       if (typeof showControlToast === 'function') showControlToast('error', message);
     }
   } finally {
+    if (peerConnection) await peerConnection.close().catch(() => {});
     transfer.abortController = null;
     if (filesDownloadAbort === controller) filesDownloadAbort = null;
     renderFilesTransfers();
@@ -50814,7 +51403,12 @@ async function pumpFilesTransfers() {
 }
 
 async function startFilesDownload(options = {}) {
-  const transfer = queueFilesDownload(options.path || filesDownloadPathValue(), options);
+  const selectedPeerId = options.peerId !== undefined ? String(options.peerId || '').trim() : filesDownloadSelectedPeerId();
+  const transfer = queueFilesDownload(options.path || filesDownloadPathValue(), {
+    ...options,
+    peerId: selectedPeerId,
+    peerLabel: selectedPeerId ? (options.peerLabel || filesDownloadPeerLabel(selectedPeerId)) : '',
+  });
   if (!transfer) return null;
   return options.awaitCompletion || options.skipBrowserSave || options.throwOnError
     ? transfer.completion
@@ -51140,6 +51734,8 @@ function queueFilesUploads(files, options = {}) {
 	    path: transfer.path || '',
 	    sourceKind: transfer.sourceKind || '',
 	    sourceLabel: transfer.sourceLabel || '',
+	    peerId: transfer.peerId || '',
+	    peerLabel: transfer.peerLabel || '',
 	    artifact: transfer.artifact || null,
 	    destination: transfer.destination || '',
 	    conflictPolicy: transfer.conflictPolicy || '',
@@ -51376,6 +51972,10 @@ function openDownloadFilePicker() {
 }
 
 function openFilesDownloadPicker() {
+  if (filesDownloadSelectedPeerId()) {
+    setFilesDownloadStatus('warn', 'Peer browsing is not available yet; enter a full path');
+    return;
+  }
   configureFsPicker({
     mode: 'file',
     target: 'filesDownload',
@@ -51572,6 +52172,7 @@ window.useFsPickerSelection = useFsPickerSelection;
 window.openAgentBinaryPicker = openAgentBinaryPicker;
 	window.openDownloadFilePicker = openDownloadFilePicker;
 	window.openFilesDownloadPicker = openFilesDownloadPicker;
+	window.onFilesDownloadHostChanged = onFilesDownloadHostChanged;
 	window.startFilesDownload = startFilesDownload;
 	window.cancelFilesDownload = cancelFilesDownload;
 	window.pauseFilesTransfer = pauseFilesTransfer;
@@ -51629,6 +52230,62 @@ window.openAgentBinaryPicker = openAgentBinaryPicker;
       statusText: document.getElementById('files-download-status')?.textContent || '',
       progressWidth: document.getElementById('files-download-progress')?.style.width || '',
 	      text,
+	    };
+	  },
+	  async _debugRefreshPeerList() {
+	    if (typeof refreshPeersFromApi === 'function') {
+	      await refreshPeersFromApi();
+	    }
+	    refreshFilesDownloadHostOptions();
+	    return daemons.map(peer => ({
+	      id: String(peer.host_id || ''),
+	      label: String(peer.label || ''),
+	      connected: peer.connected !== false,
+	      url: peer.url || null,
+	    }));
+	  },
+	  async _debugProbePeerDownloadPath(peerId, path, options = {}) {
+	    const progress = [];
+	    const select = document.getElementById('files-download-host');
+	    if (select) {
+	      refreshFilesDownloadHostOptions();
+	      select.value = String(peerId || '');
+	      onFilesDownloadHostChanged({ preserveStatus: true });
+	    }
+	    setFilesDownloadPath(path);
+	    const result = await startFilesDownload({
+	      path,
+	      peerId,
+	      peerLabel: options.peerLabel,
+	      chunkBytes: options.chunkBytes,
+	      maxBytes: options.maxBytes,
+	      skipBrowserSave: true,
+	      throwOnError: true,
+	      onProgress: item => {
+	        progress.push({
+	          loaded: item.loaded,
+	          total: item.total,
+	          rangeCount: item.rangeCount,
+	        });
+	      },
+	    });
+	    const bytes = new Uint8Array(await result.blob.arrayBuffer());
+	    let text = '';
+	    try {
+	      text = new TextDecoder().decode(bytes);
+	    } catch (_) {}
+	    return {
+	      ok: true,
+	      peerId,
+	      path,
+	      filename: result.filename,
+	      size: result.size,
+	      totalSize: result.total_size,
+	      rangeCount: result.range_count,
+	      progress,
+	      text,
+	      transfer: filesTransferSnapshot().find(item => item.peerId === String(peerId || '') && item.path === path) || null,
+	      statusText: document.getElementById('files-download-status')?.textContent || '',
 	    };
 	  },
 	  async _debugProbeArtifactDownload(artifact, options = {}) {

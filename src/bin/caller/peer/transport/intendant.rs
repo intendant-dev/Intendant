@@ -449,6 +449,7 @@ impl PeerTransport for IntendantWsTransport {
             invoke_capability: false,
             resolve_approval: true,
             webrtc_signal: true,
+            file_transfer_signal: true,
         }
     }
 
@@ -567,6 +568,14 @@ impl PeerTransport for IntendantWsTransport {
                 // Fire-and-forget: peer responds asynchronously via
                 // `OutboundEvent::WebRtcSignal` → `PeerEvent::WebRtcSignal`,
                 // which the actor pushes onto the per-peer event stream.
+                Ok(PeerOpAck::Ok)
+            }
+            PeerOp::PeerFileTransferSignal { session_id, signal } => {
+                self.write_control_msg(&ControlMsg::PeerFileTransferSignal {
+                    session_id: session_id.0,
+                    signal,
+                })
+                .await?;
                 Ok(PeerOpAck::Ok)
             }
             // check_feature rejects the other variants before they

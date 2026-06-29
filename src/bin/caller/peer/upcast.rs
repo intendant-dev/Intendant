@@ -1460,6 +1460,13 @@ impl WireEventUpcaster {
                 signal: signal.clone(),
             }],
 
+            OutboundEvent::PeerFileTransferSignal { session_id, signal } => {
+                vec![PeerEvent::PeerFileTransferSignal {
+                    session_id: crate::peer::WebRtcSessionId(session_id.clone()),
+                    signal: signal.clone(),
+                }]
+            }
+
             OutboundEvent::CodexThreadActionRequested {
                 action, session_id, ..
             } => vec![log_event(

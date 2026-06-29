@@ -5162,6 +5162,12 @@ async fn handle_control_command_mcp(
             // streams; this variant is a no-op here.
             None
         }
+        ControlMsg::PeerFileTransferSignal { .. } => {
+            // Direct peer file-transfer signaling is also handled by the
+            // web gateway's per-peer WS dispatcher. MCP has no browser
+            // DataChannel leg to bind this to, so it is a no-op here.
+            None
+        }
         ControlMsg::RequestDisplayInputAuthority { .. }
         | ControlMsg::ReleaseDisplayInputAuthority { .. } => {
             // Per-display input authority is a WebSocket-connection-

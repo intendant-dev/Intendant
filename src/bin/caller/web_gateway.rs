@@ -45,6 +45,7 @@ struct PeerConnectionIdentity {
     fingerprint: String,
     label: String,
     profile: String,
+    filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
 }
 
 /// Finalize a one-shot HTTP response on a demuxed stream before it drops.
@@ -14992,7 +14993,7 @@ struct DashboardByteRange {
     end: u64,
 }
 
-fn dashboard_fs_content_type(path: &Path) -> String {
+pub(crate) fn dashboard_fs_content_type(path: &Path) -> String {
     match path
         .extension()
         .and_then(|extension| extension.to_str())
@@ -16476,6 +16477,12 @@ pub fn spawn_web_gateway(
     } else {
         None
     };
+    let peer_file_transfer_registry =
+        Arc::new(crate::peer_file_transfer::PeerFileTransferRegistry::new(
+            ice_config.clone(),
+            bus.clone(),
+            Arc::clone(&tcp_peer_registry),
+        ));
 
     // Slice 3b: TCP relay registry for primary-as-media-relay. When
     // a federated WebRTC `Answer` flows from a peer back to the
@@ -17013,6 +17020,7 @@ pub fn spawn_web_gateway(
             let peer_access_request_config = peer_access_request_config.clone();
             let peer_registry = peer_registry.clone();
             let dashboard_control = Arc::clone(&dashboard_control);
+            let peer_file_transfer_registry = Arc::clone(&peer_file_transfer_registry);
             let ice_config = ice_config.clone();
             let tcp_peer_registry = Arc::clone(&tcp_peer_registry);
             let tcp_relay_registry = Arc::clone(&tcp_relay_registry);
@@ -17413,6 +17421,7 @@ pub fn spawn_web_gateway(
                     let peer_label_for_ws = peer_connection_identity
                         .as_ref()
                         .map(|identity| identity.label.clone());
+                    let peer_identity_for_ws = peer_connection_identity.clone();
                     let ws_stream = match tokio_tungstenite::accept_async(stream).await {
                         Ok(ws) => ws,
                         Err(_) => return,
@@ -17730,8 +17739,11 @@ pub fn spawn_web_gateway(
                     let task_tx_inbound = task_tx.clone();
                     let terminal_registry_inbound = terminal_registry.clone();
                     let dashboard_control_inbound = Arc::clone(&dashboard_control);
+                    let peer_file_transfer_registry_inbound =
+                        Arc::clone(&peer_file_transfer_registry);
                     let peer_profile_inbound = peer_profile_for_ws.clone();
                     let peer_label_inbound = peer_label_for_ws.clone();
+                    let peer_identity_inbound = peer_identity_for_ws.clone();
                     let inbound = tokio::spawn(async move {
                         // Track whether this connection has an active presence model,
                         // so we can auto-send PresenceDisconnected if the WebSocket drops
@@ -19549,7 +19561,24 @@ pub fn spawn_web_gateway(
                                                         authority_change_tx_inbound.clone(),
                                                         Arc::clone(&federated_authority_subscribers_inbound),
                                                         federated_display_input_allowed,
-                                                    ).await;
+                                                    )
+                                                    .await;
+                                                }
+                                                Ok(ControlMsg::PeerFileTransferSignal {
+                                                    session_id,
+                                                    signal,
+                                                }) => {
+                                                    handle_peer_file_transfer_signal(
+                                                        session_id,
+                                                        signal,
+                                                        Arc::clone(
+                                                            &peer_file_transfer_registry_inbound,
+                                                        ),
+                                                        peer_identity_inbound.clone(),
+                                                        direct_tx_inbound.clone(),
+                                                        &bus_inbound,
+                                                    )
+                                                    .await;
                                                 }
                                                 Ok(ControlMsg::RequestDisplayInputAuthority {
                                                     display_id,
@@ -20002,6 +20031,23 @@ pub fn spawn_web_gateway(
                         return;
                     }
 
+                    if let Some((op, kind)) = peer_filesystem_query_request(req_method, req_path) {
+                        let path = query_param(request_line, "path").unwrap_or_default();
+                        if let Err(message) = authorize_peer_filesystem_access(
+                            peer_connection_identity.as_ref(),
+                            op,
+                            kind,
+                            &path,
+                            &bus,
+                        ) {
+                            use tokio::io::AsyncWriteExt;
+                            let response = json_error("403 Forbidden", message);
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    }
+
                     // Federation auth enforcement. Applied before any
                     // federation API branch in the dispatch chain
                     // below; non-federation paths (WASM, frames,
@@ -20280,9 +20326,18 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
-                            Ok(req) => match mkdir_dashboard_fs_path(&req.path) {
-                                Ok(body) => json_ok(body),
-                                Err((status, message)) => json_error(&status, message),
+                            Ok(req) => match authorize_peer_filesystem_access(
+                                peer_connection_identity.as_ref(),
+                                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+                                crate::peer::access_policy::FilesystemAccessKind::Write,
+                                &req.path,
+                                &bus,
+                            ) {
+                                Ok(()) => match mkdir_dashboard_fs_path(&req.path) {
+                                    Ok(body) => json_ok(body),
+                                    Err((status, message)) => json_error(&status, message),
+                                },
+                                Err(message) => json_error("403 Forbidden", message),
                             },
                             Err(e) => json_error("400 Bad Request", format!("invalid JSON: {e}")),
                         };
@@ -21909,23 +21964,29 @@ pub fn spawn_web_gateway(
                                 Some(registry)
                                     if segments.len() == 2 && request_line.starts_with("POST") =>
                                 {
-                                    let id = segments[0];
+                                    let id = url_path_decode(segments[0]);
                                     let op = segments[1];
                                     let body_text =
                                         read_request_body(&mut stream, &header_text).await;
                                     match op {
                                         "message" => {
-                                            peers_send_message(registry, id, &body_text).await
+                                            peers_send_message(registry, &id, &body_text).await
                                         }
                                         "task" => {
-                                            peers_delegate_task(registry, id, &body_text).await
+                                            peers_delegate_task(registry, &id, &body_text).await
                                         }
                                         "approval" => {
-                                            peers_resolve_approval(registry, id, &body_text).await
+                                            peers_resolve_approval(registry, &id, &body_text).await
                                         }
                                         "webrtc" => {
-                                            peers_webrtc_signal(registry, id, &body_text, &bus)
+                                            peers_webrtc_signal(registry, &id, &body_text, &bus)
                                                 .await
+                                        }
+                                        "file-transfer-webrtc" => {
+                                            peers_file_transfer_signal(
+                                                registry, &id, &body_text, &bus,
+                                            )
+                                            .await
                                         }
                                         other => (
                                             404,
@@ -23513,6 +23574,12 @@ struct PeerWebRtcSignalRequest {
     signal: crate::peer::WebRtcSignal,
 }
 
+#[derive(Deserialize)]
+struct PeerFileTransferSignalRequest {
+    session_id: String,
+    signal: crate::peer::WebRtcSignal,
+}
+
 /// Handle `POST /api/peers/{id}/webrtc`. Routes a WebRTC signaling
 /// frame from the browser to the named peer over the federation
 /// transport. Returns `200 {"ok": true}` on accepted dispatch, or
@@ -23640,6 +23707,59 @@ pub(crate) async fn peers_webrtc_signal(
             });
             (500, serde_json::json!({"error": e.to_string()}).to_string())
         }
+    }
+}
+
+pub(crate) async fn peers_file_transfer_signal(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    body_text: &str,
+    bus: &EventBus,
+) -> (u16, String) {
+    const LOG_SOURCE: &str = "peer-file-transfer";
+    let req: PeerFileTransferSignalRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!("rejecting file-transfer signal from browser: {e}"),
+                turn: None,
+            });
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    let peer_id = crate::peer::PeerId(id.to_string());
+    let handle = match registry.get(&peer_id) {
+        Some(h) => h,
+        None => {
+            return (
+                404,
+                serde_json::json!({"error": "peer not found"}).to_string(),
+            );
+        }
+    };
+    match handle
+        .peer_file_transfer_signal(crate::peer::WebRtcSessionId(req.session_id), req.signal)
+        .await
+    {
+        Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
+        Err(crate::peer::PeerError::NotConnected) => (
+            502,
+            serde_json::json!({"error": "peer is not connected"}).to_string(),
+        ),
+        Err(crate::peer::PeerError::UnsupportedCapability(_)) => (
+            502,
+            serde_json::json!({
+                "error": "peer's transport does not support direct file-transfer signaling"
+            })
+            .to_string(),
+        ),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
     }
 }
 
@@ -23846,40 +23966,176 @@ async fn resolve_url_to_socket_addr(url: &str) -> Option<std::net::SocketAddr> {
     tokio::net::lookup_host(authority).await.ok()?.next()
 }
 
-/// Handle a federation-driven WebRTC signal arriving on this peer's
-/// WebSocket inside a [`crate::event::ControlMsg::WebRtcSignal`].
+/// Handle direct browser-to-peer file-transfer signaling on the peer daemon.
 ///
-/// Routes the signal to the matching `DisplaySession` method and
-/// emits responses back over the connection's `direct_tx` as
-/// [`crate::types::OutboundEvent::WebRtcSignal`] frames:
-///
-/// - `Offer` → `DisplaySession::handle_offer` → emit `Answer` + drain
-///   the per-session ICE channel emitting `IceCandidate`s as they arrive.
-/// - `IceCandidate` → `DisplaySession::add_ice_candidate`. No response.
-/// - `Close` → `DisplaySession::remove_peer`. No response.
-/// - `Answer` → protocol error (this side is the offer-receiver, not
-///   the offer-sender). Logged and ignored.
-/// - `Unknown` → forward-compat fallback. Ignored.
-///
-/// Slice 3a.2 threads the browser's view of the peer's HTTP port
-/// through as the ICE-TCP candidate the peer advertises, multiplexed
-/// onto its own `TcpPeerRegistry` (same mechanism as the local
-/// browser↔daemon display path). When the Offer carries an
-/// `advertise_tcp_via_url`, the peer advertises both its UDP host
-/// candidates and a TCP candidate at the resolved address — which
-/// enables federation WebRTC through any tunnel / port-forward /
-/// Tailscale path the operator has already made reachable from the
-/// browser. Without the hint (or when the URL can't be resolved),
-/// the peer falls back to UDP host candidates only — the 3a baseline.
-/// Slice 3b layers primary-as-media-relay on top for the browser-
-/// cannot-reach-peer-at-all case.
-///
-/// `session_id` is round-tripped verbatim into the response so the
-/// browser's per-(peer, session_id) `RTCPeerConnection` map can match
-/// the answer/candidates back to the right pending session. The local
-/// [`crate::display::PeerId`] used as the `WebRtcPeer` key is derived
-/// by hashing `session_id` — same string hashes to the same u64, so
-/// later `IceCandidate` / `Close` signals route to the same peer.
+/// The primary daemon forwards the browser's offer/ICE/close frames over the
+/// already-authenticated peer federation transport. This peer daemon answers
+/// only if that federation connection has an approved client certificate, then
+/// enforces that certificate's peer profile and filesystem roots when the
+/// browser asks the resulting DataChannel to read a file.
+async fn handle_peer_file_transfer_signal(
+    session_id: String,
+    signal: crate::peer::WebRtcSignal,
+    registry: Arc<crate::peer_file_transfer::PeerFileTransferRegistry>,
+    identity: Option<PeerConnectionIdentity>,
+    direct_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    bus: &EventBus,
+) {
+    const LOG_SOURCE: &str = "peer-file-transfer";
+    let signal_kind = match &signal {
+        crate::peer::WebRtcSignal::Offer { .. } => "offer",
+        crate::peer::WebRtcSignal::Answer { .. } => "answer",
+        crate::peer::WebRtcSignal::IceCandidate { .. } => "ice_candidate",
+        crate::peer::WebRtcSignal::Close => "close",
+        crate::peer::WebRtcSignal::Unknown => "unknown",
+    };
+    bus.send(AppEvent::LogEntry {
+        session_id: None,
+        level: "debug".to_string(),
+        source: LOG_SOURCE.to_string(),
+        content: format!("received {signal_kind} from connector (session={session_id})"),
+        turn: None,
+    });
+
+    match signal {
+        crate::peer::WebRtcSignal::Offer {
+            sdp,
+            advertise_tcp_via_url,
+        } => {
+            let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
+                Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
+                _ => None,
+            };
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "debug".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "file-transfer offer resolved advertise_tcp_via_url={:?} -> tcp_candidate={:?}",
+                    advertise_tcp_via_url.as_deref().unwrap_or(""),
+                    tcp_advertised_addr
+                ),
+                turn: None,
+            });
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping file-transfer offer without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
+            let authorization = crate::peer_file_transfer::PeerFileTransferAuthorization {
+                fingerprint: identity.fingerprint,
+                label: identity.label,
+                profile: identity.profile,
+                filesystem: identity.filesystem,
+            };
+            match registry
+                .answer_offer(session_id.clone(), sdp, authorization, tcp_advertised_addr)
+                .await
+            {
+                Ok(answer_sdp) => {
+                    let answer = crate::types::OutboundEvent::PeerFileTransferSignal {
+                        session_id: session_id.clone(),
+                        signal: crate::peer::WebRtcSignal::Answer { sdp: answer_sdp },
+                    };
+                    match serde_json::to_string(&answer) {
+                        Ok(s) => {
+                            if direct_tx.send(s).is_err() {
+                                bus.send(AppEvent::LogEntry {
+                                    session_id: None,
+                                    level: "warn".to_string(),
+                                    source: LOG_SOURCE.to_string(),
+                                    content: format!(
+                                        "failed to send file-transfer answer to connector (session={session_id})"
+                                    ),
+                                    turn: None,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            bus.send(AppEvent::LogEntry {
+                                session_id: None,
+                                level: "error".to_string(),
+                                source: LOG_SOURCE.to_string(),
+                                content: format!(
+                                    "failed to serialize file-transfer answer (session={session_id}): {e}"
+                                ),
+                                turn: None,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!("file-transfer offer failed (session={session_id}): {e}"),
+                        turn: None,
+                    });
+                }
+            }
+        }
+        crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
+            match registry
+                .add_ice_candidate(&session_id, &candidate_json)
+                .await
+            {
+                Ok(true) => {}
+                Ok(false) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "debug".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "dropping file-transfer ICE for unknown session {session_id}"
+                        ),
+                        turn: None,
+                    });
+                }
+                Err(e) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!("file-transfer ICE failed (session={session_id}): {e}"),
+                        turn: None,
+                    });
+                }
+            }
+        }
+        crate::peer::WebRtcSignal::Close => {
+            registry.close(&session_id).await;
+        }
+        crate::peer::WebRtcSignal::Answer { .. } => {
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "unexpected file-transfer Answer received on peer side (session={session_id})"
+                ),
+                turn: None,
+            });
+        }
+        crate::peer::WebRtcSignal::Unknown => {
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!("unknown file-transfer signal (session={session_id})"),
+                turn: None,
+            });
+        }
+    }
+}
+
 async fn handle_federated_webrtc_signal(
     display_id: u32,
     session_id: String,
@@ -24587,6 +24843,87 @@ fn is_federation_path(request_line: &str) -> bool {
         || request_line.contains(" /api/worktrees")
 }
 
+fn peer_filesystem_query_request(
+    req_method: &str,
+    req_path: &str,
+) -> Option<(
+    crate::peer::access_policy::PeerOperation,
+    crate::peer::access_policy::FilesystemAccessKind,
+)> {
+    match (req_method, req_path) {
+        ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => Some((
+            crate::peer::access_policy::PeerOperation::FilesystemRead,
+            crate::peer::access_policy::FilesystemAccessKind::Read,
+        )),
+        _ => None,
+    }
+}
+
+fn authorize_peer_filesystem_access(
+    identity: Option<&PeerConnectionIdentity>,
+    op: crate::peer::access_policy::PeerOperation,
+    kind: crate::peer::access_policy::FilesystemAccessKind,
+    raw_path: &str,
+    bus: &EventBus,
+) -> Result<(), String> {
+    let Some(identity) = identity else {
+        return Ok(());
+    };
+
+    let denied = |message: String| {
+        audit_peer_filesystem_access(bus, identity, op, raw_path, false, &message);
+        Err(message)
+    };
+
+    if !crate::peer::access_policy::profile_allows_operation(&identity.profile, op) {
+        return denied(format!(
+            "peer profile {} does not allow {:?}",
+            identity.profile, op
+        ));
+    }
+
+    let path = match expand_dashboard_fs_path(raw_path) {
+        Ok(path) => path,
+        Err(e) => return denied(e),
+    };
+
+    match crate::peer::access_policy::filesystem_access_allowed(&identity.filesystem, kind, &path) {
+        Ok(()) => {
+            audit_peer_filesystem_access(bus, identity, op, raw_path, true, "allowed");
+            Ok(())
+        }
+        Err(e) => denied(e),
+    }
+}
+
+fn audit_peer_filesystem_access(
+    bus: &EventBus,
+    identity: &PeerConnectionIdentity,
+    op: crate::peer::access_policy::PeerOperation,
+    raw_path: &str,
+    allowed: bool,
+    detail: &str,
+) {
+    bus.send(AppEvent::PresenceLog {
+        message: format!(
+            "[peer-fs] {} peer={} fingerprint={} profile={} op={:?} path={} detail={}",
+            if allowed { "allowed" } else { "denied" },
+            identity.label,
+            identity.fingerprint,
+            identity.profile,
+            op,
+            raw_path,
+            detail,
+        ),
+        level: Some(if allowed {
+            LogLevel::Info
+        } else {
+            LogLevel::Warn
+        }),
+        turn: None,
+    });
+}
+
 fn is_public_peer_access_request_path(request_line: &str) -> bool {
     let Some(path) = request_line.split_whitespace().nth(1) else {
         return false;
@@ -24668,6 +25005,7 @@ fn resolve_peer_connection_identity_from_cert_dir(
                 fingerprint: record.fingerprint,
                 label: record.label,
                 profile: record.profile,
+                filesystem: record.filesystem,
             }))
         }
         Some(record) => Err((
@@ -35432,6 +35770,28 @@ mod tests {
             parsed["message_id"].as_str().is_some(),
             "expected message_id in response: {resp_body}"
         );
+
+        target_handle.abort();
+        dash_handle.abort();
+    }
+
+    /// Peer ids contain `:` and browsers commonly percent-encode
+    /// path segments (`intendant:e2e` -> `intendant%3Ae2e`). The
+    /// shared `/api/peers/{id}/{op}` route must decode the id before
+    /// looking it up in the registry.
+    #[tokio::test]
+    async fn test_api_peers_encoded_peer_id_returns_200() {
+        let (dash_port, peer_id, target_handle, dash_handle) = setup_peer_op_test().await;
+
+        let encoded_peer_id = peer_id.replace(':', "%3A");
+        let body = serde_json::json!({"text": "hello encoded peer"}).to_string();
+        let req = format!(
+            "POST /api/peers/{encoded_peer_id}/message HTTP/1.1\r\nHost: localhost\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            body
+        );
+        let resp = http_request(dash_port, &req).await;
+        assert!(resp.contains("200 OK"), "encoded peer id failed: {resp}");
 
         target_handle.abort();
         dash_handle.abort();

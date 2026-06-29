@@ -34,9 +34,25 @@ pub struct PeerIdentityRecord {
     pub card_url: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub request_id: Option<String>,
+    #[serde(default, skip_serializing_if = "FilesystemAccessPolicy::is_empty")]
+    pub filesystem: FilesystemAccessPolicy,
     pub created_at_unix: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at_unix: Option<i64>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FilesystemAccessPolicy {
+    #[serde(default)]
+    pub read_roots: Vec<PathBuf>,
+    #[serde(default)]
+    pub write_roots: Vec<PathBuf>,
+}
+
+impl FilesystemAccessPolicy {
+    pub fn is_empty(&self) -> bool {
+        self.read_roots.is_empty() && self.write_roots.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -45,6 +61,8 @@ pub enum ProfileClass {
     Stats,
     ReadOnlyDisplay,
     SharedSessionSpectator,
+    FileReader,
+    FileOperator,
     TaskRunner,
     Operator,
     AdminPeer,
@@ -63,6 +81,14 @@ pub enum PeerOperation {
     SessionManage,
     Settings,
     RuntimeControl,
+    FilesystemRead,
+    FilesystemWrite,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FilesystemAccessKind {
+    Read,
+    Write,
 }
 
 pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
@@ -92,6 +118,8 @@ pub fn profile_class(profile: &str) -> ProfileClass {
         "stats" | "stats-only" => ProfileClass::Stats,
         "read-only-display" | "display-read-only" => ProfileClass::ReadOnlyDisplay,
         "shared-session-spectator" | "spectator" => ProfileClass::SharedSessionSpectator,
+        "file-reader" | "files-read" | "filesystem-read-only" => ProfileClass::FileReader,
+        "file-operator" | "files" | "filesystem-operator" => ProfileClass::FileOperator,
         "task-runner" => ProfileClass::TaskRunner,
         "operator" => ProfileClass::Operator,
         "admin-peer" | "admin" | DEFAULT_PROFILE => ProfileClass::AdminPeer,
@@ -108,6 +136,11 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
         Stats => matches!(op, PresenceRead | StatsRead),
         ReadOnlyDisplay => matches!(op, PresenceRead | StatsRead | DisplayView),
         SharedSessionSpectator => matches!(op, PresenceRead | StatsRead | DisplayView),
+        FileReader => matches!(op, PresenceRead | StatsRead | FilesystemRead),
+        FileOperator => matches!(
+            op,
+            PresenceRead | StatsRead | FilesystemRead | FilesystemWrite
+        ),
         TaskRunner => matches!(op, PresenceRead | StatsRead | Message | Task),
         Operator => matches!(
             op,
@@ -127,6 +160,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         ControlMsg::Status { .. } => PeerOperation::PresenceRead,
         ControlMsg::Usage => PeerOperation::StatsRead,
         ControlMsg::WebRtcSignal { .. } => PeerOperation::DisplayView,
+        ControlMsg::PeerFileTransferSignal { .. } => PeerOperation::FilesystemRead,
         ControlMsg::RequestDisplayInputAuthority { .. }
         | ControlMsg::ReleaseDisplayInputAuthority { .. }
         | ControlMsg::TakeDisplay { .. }
@@ -207,6 +241,52 @@ pub fn profile_allows_federated_display_input(profile: &str) -> bool {
     profile_allows_operation(profile, PeerOperation::DisplayInput)
 }
 
+pub fn filesystem_access_allowed(
+    policy: &FilesystemAccessPolicy,
+    kind: FilesystemAccessKind,
+    path: &Path,
+) -> Result<(), String> {
+    let root_candidates: Vec<&PathBuf> = match kind {
+        FilesystemAccessKind::Read => policy
+            .read_roots
+            .iter()
+            .chain(policy.write_roots.iter())
+            .collect(),
+        FilesystemAccessKind::Write => policy.write_roots.iter().collect(),
+    };
+    if root_candidates.is_empty() {
+        return Err(match kind {
+            FilesystemAccessKind::Read => "peer identity has no filesystem read roots".to_string(),
+            FilesystemAccessKind::Write => {
+                "peer identity has no filesystem write roots".to_string()
+            }
+        });
+    }
+
+    let access_subject = match kind {
+        FilesystemAccessKind::Read => path.to_path_buf(),
+        FilesystemAccessKind::Write => nearest_existing_path(path)
+            .ok_or_else(|| format!("{} has no existing parent", path.display()))?,
+    };
+    let canonical_subject = std::fs::canonicalize(&access_subject)
+        .map_err(|e| format!("{} is not accessible: {e}", access_subject.display()))?;
+
+    for root in root_candidates {
+        let canonical_root = match std::fs::canonicalize(root) {
+            Ok(root) => root,
+            Err(_) => continue,
+        };
+        if canonical_subject == canonical_root || canonical_subject.starts_with(&canonical_root) {
+            return Ok(());
+        }
+    }
+
+    Err(format!(
+        "{} is outside this peer identity's filesystem roots",
+        canonical_subject.display()
+    ))
+}
+
 pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool {
     if request_line.contains(" /api/peers/pairing/") {
         return profile_allows_operation(profile, PeerOperation::PeerManage);
@@ -244,6 +324,7 @@ pub fn write_approved_identity(
         status: PeerIdentityStatus::Approved,
         card_url: card_url.map(str::to_string),
         request_id: request_id.map(str::to_string),
+        filesystem: FilesystemAccessPolicy::default(),
         created_at_unix: crate::peer::pairing::unix_timestamp(),
         revoked_at_unix: None,
     };
@@ -359,6 +440,18 @@ fn identity_path(cert_dir: &Path, fingerprint: &str) -> PathBuf {
     identities_dir(cert_dir).join(format!("{fingerprint}.json"))
 }
 
+fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
+    let mut current = path.to_path_buf();
+    loop {
+        if current.exists() {
+            return Some(current);
+        }
+        if !current.pop() {
+            return None;
+        }
+    }
+}
+
 fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
     let fp = raw
         .trim()
@@ -432,9 +525,83 @@ mod tests {
 
         let loaded = lookup_identity(tmp.path(), fp).unwrap().unwrap();
         assert_eq!(loaded.profile, "operator");
+        assert!(loaded.filesystem.is_empty());
 
         let revoked = revoke_identity(tmp.path(), "peer-a").unwrap();
         assert_eq!(revoked.status, PeerIdentityStatus::Revoked);
         assert!(revoked.revoked_at_unix.is_some());
+    }
+
+    #[test]
+    fn filesystem_access_requires_explicit_roots() {
+        assert!(profile_allows_operation(
+            "admin-peer",
+            PeerOperation::FilesystemRead
+        ));
+        let tmp = tempfile::TempDir::new().unwrap();
+        let policy = FilesystemAccessPolicy::default();
+        let denied =
+            filesystem_access_allowed(&policy, FilesystemAccessKind::Read, tmp.path()).unwrap_err();
+        assert!(denied.contains("no filesystem read roots"));
+    }
+
+    #[test]
+    fn filesystem_access_allows_canonical_child() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let root = tmp.path().join("allowed");
+        let child = root.join("nested").join("file.txt");
+        std::fs::create_dir_all(child.parent().unwrap()).unwrap();
+        std::fs::write(&child, b"ok").unwrap();
+
+        let policy = FilesystemAccessPolicy {
+            read_roots: vec![root],
+            write_roots: Vec::new(),
+        };
+        filesystem_access_allowed(&policy, FilesystemAccessKind::Read, &child).unwrap();
+    }
+
+    #[test]
+    fn filesystem_access_rejects_dotdot_escape() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let allowed = tmp.path().join("allowed");
+        let secret = tmp.path().join("secret");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        let escaped = allowed.join("..").join("secret").join("file.txt");
+        std::fs::write(secret.join("file.txt"), b"secret").unwrap();
+
+        let policy = FilesystemAccessPolicy {
+            read_roots: vec![allowed],
+            write_roots: Vec::new(),
+        };
+        let denied =
+            filesystem_access_allowed(&policy, FilesystemAccessKind::Read, &escaped).unwrap_err();
+        assert!(denied.contains("outside"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_access_rejects_symlink_escape() {
+        use std::os::unix::fs::symlink;
+
+        let tmp = tempfile::TempDir::new().unwrap();
+        let allowed = tmp.path().join("allowed");
+        let secret = tmp.path().join("secret");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&secret).unwrap();
+        std::fs::write(secret.join("file.txt"), b"secret").unwrap();
+        symlink(&secret, allowed.join("secret-link")).unwrap();
+
+        let policy = FilesystemAccessPolicy {
+            read_roots: vec![allowed.clone()],
+            write_roots: Vec::new(),
+        };
+        let denied = filesystem_access_allowed(
+            &policy,
+            FilesystemAccessKind::Read,
+            &allowed.join("secret-link").join("file.txt"),
+        )
+        .unwrap_err();
+        assert!(denied.contains("outside"));
     }
 }

@@ -195,6 +195,13 @@ pub enum PeerEvent {
         session_id: WebRtcSessionId,
         signal: WebRtcSignal,
     },
+    /// One leg of a direct browser-to-peer file-transfer WebRTC signaling
+    /// exchange. Primary acts only as signaling coordinator; file bytes flow
+    /// through the resulting browser↔peer DataChannel.
+    PeerFileTransferSignal {
+        session_id: WebRtcSessionId,
+        signal: WebRtcSignal,
+    },
 }
 
 /// Browser-generated UUID identifying one WebRTC session to one peer's
