@@ -5,35 +5,46 @@
 #
 set -euo pipefail
 
-CONNECT_HOST="${CONNECT_HOST:-16.171.75.210}"
-CONNECT_SSH_USER="${CONNECT_SSH_USER:-ubuntu}"
-CONNECT_SSH_KEY="${CONNECT_SSH_KEY:-$HOME/.ssh/intendant-connect-prod-alpha-ec2}"
-CONNECT_REMOTE_STATE="${CONNECT_REMOTE_STATE:-/var/lib/intendant-connect/state.json}"
-CONNECT_SERVICE="${CONNECT_SERVICE:-intendant-connect}"
-CONNECT_REMOTE_READYZ_URL="${CONNECT_REMOTE_READYZ_URL:-http://127.0.0.1:8787/readyz}"
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf ':: %s\n' "$*"; }
+warn() { printf 'warning: %s\n' "$*" >&2; }
+
+CONNECT_OPS_ENV="${CONNECT_OPS_ENV:-}"
+if [[ -n "$CONNECT_OPS_ENV" ]]; then
+    [[ -f "$CONNECT_OPS_ENV" ]] || die "CONNECT_OPS_ENV not found: $CONNECT_OPS_ENV"
+    set -a
+    # shellcheck disable=SC1090
+    source "$CONNECT_OPS_ENV"
+    set +a
+fi
+
+CONNECT_HOST="${CONNECT_HOST:-}"
+CONNECT_SSH_USER="${CONNECT_SSH_USER:-}"
+CONNECT_SSH_KEY="${CONNECT_SSH_KEY:-}"
+CONNECT_REMOTE_STATE="${CONNECT_REMOTE_STATE:-}"
+CONNECT_SERVICE="${CONNECT_SERVICE:-}"
+CONNECT_REMOTE_READYZ_URL="${CONNECT_REMOTE_READYZ_URL:-}"
 
 PASSPHRASE_FILE="${CONNECT_BACKUP_PASSPHRASE_FILE:-}"
 YES=false
 BACKUP_FILE=""
-
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-info() { printf ':: %s\n' "$*"; }
-warn() { printf 'warning: %s\n' "$*" >&2; }
 
 usage() {
     cat <<EOF
 Usage: scripts/connect-state-restore.sh --yes [options] <backup.json|backup.json.enc>
 
 Options:
-  --host <host>                SSH host. Default: $CONNECT_HOST
-  --ssh-user <user>            SSH user. Default: $CONNECT_SSH_USER
-  --ssh-key <path>             SSH key. Default: $CONNECT_SSH_KEY
-  --remote-state <path>        Remote state file. Default: $CONNECT_REMOTE_STATE
-  --service <name>             systemd service. Default: $CONNECT_SERVICE
-  --remote-readyz-url <url>    Remote readiness URL. Default: $CONNECT_REMOTE_READYZ_URL
+  --host <host>                SSH host. Required unless CONNECT_HOST is set
+  --ssh-user <user>            SSH user. Required unless CONNECT_SSH_USER is set
+  --ssh-key <path>             SSH key. Required unless CONNECT_SSH_KEY is set
+  --remote-state <path>        Remote state file. Required unless CONNECT_REMOTE_STATE is set
+  --service <name>             systemd service. Required unless CONNECT_SERVICE is set
+  --remote-readyz-url <url>    Remote readiness URL. Required unless CONNECT_REMOTE_READYZ_URL is set
   --passphrase-file <path>     Required for .enc backups
   --yes                        Confirm replacement of remote state
   -h, --help                   Show this help
+
+CONNECT_OPS_ENV may point to a private env file containing these CONNECT_* values.
 EOF
 }
 
@@ -60,6 +71,12 @@ done
 [[ "$YES" == true ]] || die "restore replaces remote state; pass --yes to continue"
 [[ -n "$BACKUP_FILE" ]] || die "backup file is required"
 [[ -f "$BACKUP_FILE" ]] || die "backup file not found: $BACKUP_FILE"
+[[ -n "$CONNECT_HOST" ]] || die "--host is required"
+[[ -n "$CONNECT_SSH_USER" ]] || die "--ssh-user is required"
+[[ -n "$CONNECT_REMOTE_STATE" ]] || die "--remote-state is required"
+[[ -n "$CONNECT_SERVICE" ]] || die "--service is required"
+[[ -n "$CONNECT_REMOTE_READYZ_URL" ]] || die "--remote-readyz-url is required"
+[[ -n "$CONNECT_SSH_KEY" ]] || die "--ssh-key is required"
 [[ -f "$CONNECT_SSH_KEY" ]] || die "SSH key not found: $CONNECT_SSH_KEY"
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 command -v scp >/dev/null 2>&1 || die "scp is required"

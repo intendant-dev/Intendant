@@ -76,9 +76,10 @@ terminal — then the TUI takes the foreground. See [TUI & Autonomy](./tui.md).
 
 ## Tabs
 
-The top tab bar has eight tabs: **Activity**, **Stats**, **Terminal**,
-**Video**, **Station**, **Sessions**, **Debug**, **Settings**. New events
-arriving while you are on another tab raise a notification badge.
+The top tab bar has ten tabs: **Activity**, **Stats**, **Terminal**,
+**Video**, **Station**, **Sessions**, **Files**, **Access**, **Debug**, and
+**Settings**. New events arriving while you are on another tab raise a
+notification badge.
 
 ### Activity
 
@@ -272,6 +273,31 @@ rollout containing the clicked message, rolls that child back to the selected
 turn, and sends the replacement there. The edit chip labels this as branching so
 the active compacted session is not mistaken for the target of the mutation.
 
+### Files
+
+Browse staged uploads and download files from the local daemon or a configured
+peer target. The target summary uses the same access abstraction as Terminal:
+local/mTLS, hosted Connect, and peer dashboard-control routes are shown as
+targets with their available capabilities rather than as transport internals.
+
+### Access
+
+Unified administration for how dashboards and daemons reach each other:
+
+- **Targets** lists this daemon and configured peer daemons, with direct jumps
+  to Stats, Files, and Shell for each target. It also hosts the coordinator
+  controls for capability-based peer discovery and task routing.
+- **Grants** shows current browser ownership, outbound peer target count, and
+  inbound peer identities this daemon accepts, including their granted
+  role/profile.
+- **Invitations** contains peer onboarding flows: Grant Invite, Join Invite,
+  Request Access, Manual Add, and inbound access requests.
+- **Public Shares** is the placeholder surface for future explicit public or
+  hosted-service grants; by default nothing is shared publicly.
+- **Diagnostics** owns dashboard route health, including hosted Connect,
+  local/mTLS, local WebRTC control, event delivery, byte streams, uploads, and
+  self-tests.
+
 ### Debug
 
 A raw view of internal state — the same data as the `GET /debug` endpoint
@@ -285,20 +311,10 @@ system Chrome/Chromium apps require choosing `system_cdp` or setting
 
 ### Settings
 
-The configuration panel for the current session. **Network → Daemons** is the
-dashboard entry point for peer relationships:
-
-- **Grant Invite / Join Invite** handles the direct secret handoff flow.
-- **Request Access** lets this daemon ask another daemon for a peer-scoped mTLS
-  identity without receiving a private-key-bearing invite.
-- **Inbound Access Requests** shows doorbell requests from other daemons and
-  lets the local operator approve or deny them.
-- **Inbound Access Grants** lists client identities this daemon will accept
-  from other daemons, including the granted role/profile.
-
-The panel keeps the manual URL add path for already-enrolled peers, tunnels, and
-local/debug daemons. Manual additions are runtime-only unless **Save to
-intendant.toml** is checked.
+The configuration panel for the current session: API keys, external-agent
+backend settings, computer-use/provider options, presence, transcription,
+recording, and live audio. Peer/network administration moved to **Access**.
+Old `#settings/network` deep links are redirected to `#access/targets`.
 
 ## Late-join and session replay
 
@@ -685,7 +701,7 @@ INTENDANT_CONNECT_TOKEN="$(openssl rand -base64 32)" \
     --origin https://connect.intendant.dev \
     --rp-id intendant.dev \
     --static-root static \
-    --data-file /var/lib/intendant-connect/state.json
+    --data-file <state-file>
 ```
 
 The `--rp-id intendant.dev` value means passkeys are scoped to the owned
@@ -767,24 +783,40 @@ The reverse proxy in front of `intendant-connect` must terminate public TLS for
 `connect.intendant.dev`, forward `Host`, set `X-Forwarded-For`/`X-Real-IP`, and
 strip any inbound copies of those client-IP headers before setting them. Keep
 the service bound to `127.0.0.1`, keep `INTENDANT_CONNECT_TOKEN` in a secret
-store, and back up `/var/lib/intendant-connect/state.json`; that file is the
-current account/passkey/device ownership database.
+store, and back up the configured state file; that file is the current
+account/passkey/device ownership database.
 
-The production-alpha operator path is captured in scripts:
+The production-alpha operator path is captured in scripts, but live target
+details are not stored in the public repository. Provide them through a private
+env file or command-line flags:
 
 ```bash
-scripts/deploy-connect-prod-alpha.sh
-scripts/connect-state-backup.sh --passphrase-file ~/.config/intendant/connect-backup.passphrase
-scripts/connect-state-restore.sh --yes \
+cat > ~/.config/intendant/connect-prod-alpha.env <<'EOF'
+CONNECT_HOST=<ssh-host>
+CONNECT_SSH_USER=<ssh-user>
+CONNECT_SSH_KEY=<private-ssh-key-path>
+CONNECT_REMOTE_SOURCE=<remote-source-directory>
+CONNECT_SERVICE=<systemd-service-name>
+CONNECT_REMOTE_READYZ_URL=<local-readiness-url>
+CONNECT_REMOTE_STATE=<remote-state-json-path>
+CONNECT_PUBLIC_ORIGIN=https://connect.intendant.dev
+EOF
+
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/deploy-connect-prod-alpha.sh
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/connect-state-backup.sh --passphrase-file ~/.config/intendant/connect-backup.passphrase
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/connect-state-restore.sh --yes \
   --passphrase-file ~/.config/intendant/connect-backup.passphrase \
   ~/.local/share/intendant/connect-backups/intendant-connect-state-YYYYMMDDTHHMMSSZ.json.enc
 ```
 
-The deploy script syncs the current worktree to the EC2 source directory,
-builds on the host, restarts the systemd service, and checks both the local
-readiness URL and the public `connect.intendant.dev` readiness URL. Backup and
-restore default to encrypted state snapshots and require an explicit plaintext
-flag for diagnostics.
+The deploy script syncs the current worktree to the configured remote source
+directory, builds on the host, restarts the configured systemd service, and
+checks both the configured local readiness URL and the public
+`connect.intendant.dev` readiness URL. Backup and restore default to encrypted
+state snapshots and require an explicit plaintext flag for diagnostics.
 
 Current alpha limits:
 

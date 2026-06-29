@@ -341,7 +341,7 @@ INTENDANT_CONNECT_TOKEN="shared daemon bearer token" \
     --origin https://connect.intendant.dev \
     --rp-id intendant.dev \
     --static-root static \
-    --data-file /var/lib/intendant-connect/state.json
+    --data-file <state-file>
 ```
 
 `intendant-connect` is intended to sit behind public TLS for the configured
@@ -373,22 +373,31 @@ Cookie-backed user mutations require a same-origin request and the per-session
 CSRF token returned by `/api/me`. The bundled Connect UI and dashboard
 `connect=1` mode set that header automatically.
 
-Production-alpha operations are intentionally boring and repeatable. The current
-deployment script syncs this repository to the EC2 host, builds
-`intendant-connect` on the host, restarts the systemd unit, and verifies both
-local and public readiness:
+Production-alpha operations are intentionally boring and repeatable, but live
+target details are intentionally not tracked in this public repository. Keep the
+host, SSH user, key path, remote source directory, systemd service name, state
+file, and local readiness URL in a private operator env file or pass them with
+the matching command-line flags:
 
 ```bash
-scripts/deploy-connect-prod-alpha.sh
+cat > ~/.config/intendant/connect-prod-alpha.env <<'EOF'
+CONNECT_HOST=<ssh-host>
+CONNECT_SSH_USER=<ssh-user>
+CONNECT_SSH_KEY=<private-ssh-key-path>
+CONNECT_REMOTE_SOURCE=<remote-source-directory>
+CONNECT_SERVICE=<systemd-service-name>
+CONNECT_REMOTE_READYZ_URL=<local-readiness-url>
+CONNECT_REMOTE_STATE=<remote-state-json-path>
+CONNECT_PUBLIC_ORIGIN=https://connect.intendant.dev
+EOF
+
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/deploy-connect-prod-alpha.sh
 ```
 
-The script defaults to the current alpha service:
-`ubuntu@16.171.75.210`, `/opt/intendant/source`,
-`intendant-connect.service`, and `https://connect.intendant.dev`. Override
-those with `CONNECT_HOST`, `CONNECT_SSH_USER`, `CONNECT_SSH_KEY`,
-`CONNECT_REMOTE_SOURCE`, `CONNECT_SERVICE`, or the matching command-line flags.
-It does not copy or print the daemon bearer token; the token remains in the
-remote systemd environment.
+The deploy script refuses to run without the private target values. It does not
+copy or print the daemon bearer token; the token remains in the remote systemd
+environment.
 
 Backups should be encrypted because the state file is the authoritative account
 and device registry. It stores account handles, passkey public-key records,
@@ -398,7 +407,8 @@ pending offers, dashboard grants, or rate-limit buckets. Create an encrypted
 backup with:
 
 ```bash
-scripts/connect-state-backup.sh \
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/connect-state-backup.sh \
   --passphrase-file ~/.config/intendant/connect-backup.passphrase
 ```
 
@@ -549,7 +559,7 @@ is required.
 | Key | Type | Default | Description |
 |-----|------|---------|-------------|
 | `card_url` | string | (required) | URL of the peer's Agent Card (`.../.well-known/agent-card.json`) |
-| `label` | string | from card | Display label override in the dashboard's Daemons panel |
+| `label` | string | from card | Display label override in the dashboard's Access targets |
 | `bearer_token` | string | none | Legacy/advanced outbound token for peers that still require `[server.auth] bearer_token` |
 | `via_urls` | array | `[]` | Connecting-side WebSocket URL overrides; when set, these replace the transports advertised by the peer's Agent Card |
 | `client_cert` | string | installed access client cert when present | Peer-issued client certificate PEM for outbound mTLS; must be paired with `client_key` |
