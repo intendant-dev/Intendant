@@ -1,5 +1,6 @@
 .DS_Store
 target/
+node_modules/
 __pycache__/
 *.py[cod]
 # Ignore runtime state in any .intendant/ dir, but track the repo's
