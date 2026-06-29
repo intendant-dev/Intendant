@@ -2267,7 +2267,7 @@ fn connect_ui_html(origin: &str) -> String {
       tr {{ padding: 12px 0; border-bottom: 1px solid var(--line); }}
       tr:last-child {{ border-bottom: 0; }}
       td {{ border-bottom: 0; padding: 7px 0; }}
-      td::before {{ content: attr(data-label); display: block; color: var(--muted-2); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }}
+      td::before {{ content: attr(data-cell-label); display: block; color: var(--muted-2); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }}
       .action-cell::before {{ display: none; }}
       .action-cell .actions {{ justify-content: stretch; flex-wrap: wrap; }}
       .action-cell button {{ flex: 1 1 92px; }}
@@ -2570,12 +2570,12 @@ function renderDaemons() {{
     const label = String(daemon.label || daemon.daemon_id || '');
     const lastSeen = formatRelative(daemon.last_seen_unix_ms);
     tr.innerHTML = `
-      <td data-label="Daemon"><div class="daemon-name"><strong>${{escapeHtml(label)}}</strong><code>${{escapeHtml(daemon.daemon_id)}}</code></div></td>
-      <td data-label="Activity"><div class="daemon-activity"><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span><span class="sub">${{escapeHtml(lastSeen)}}</span></div></td>
-      <td data-label="Public key"><code title="${{escapeAttr(key)}}">${{escapeHtml(compactKey(key))}}</code></td>
-      <td class="action-cell" data-label="Actions"><div class="actions">
+      <td data-cell-label="Daemon"><div class="daemon-name"><strong>${{escapeHtml(label)}}</strong><code>${{escapeHtml(daemon.daemon_id)}}</code></div></td>
+      <td data-cell-label="Activity"><div class="daemon-activity"><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span><span class="sub">${{escapeHtml(lastSeen)}}</span></div></td>
+      <td data-cell-label="Public key"><code title="${{escapeAttr(key)}}">${{escapeHtml(compactKey(key))}}</code></td>
+      <td class="action-cell" data-cell-label="Actions"><div class="actions">
         <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open</button>
-        <button class="secondary" data-label="${{escapeAttr(daemon.daemon_id)}}">Rename</button>
+        <button class="secondary" data-rename="${{escapeAttr(daemon.daemon_id)}}">Rename</button>
         <button class="danger" data-revoke="${{escapeAttr(daemon.daemon_id)}}">Revoke</button>
       </div></td>`;
     rows.appendChild(tr);
@@ -2594,9 +2594,9 @@ function renderDaemons() {{
       await refreshAll();
     }});
   }});
-  rows.querySelectorAll('[data-label]').forEach(button => {{
+  rows.querySelectorAll('[data-rename]').forEach(button => {{
     button.addEventListener('click', async () => {{
-      const id = button.getAttribute('data-label');
+      const id = button.getAttribute('data-rename');
       const daemon = state.daemons.find(item => item.daemon_id === id) || {{}};
       const next = prompt('Name this daemon', daemon.label || daemon.daemon_id || '');
       if (next === null) return;
