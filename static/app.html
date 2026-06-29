@@ -11973,6 +11973,11 @@ let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
 let dashboardControlEventsActive = false;
 let dashboardControlLastError = '';
+let dashboardConnectReconnectTimer = null;
+let dashboardConnectReconnectAttempt = 0;
+let dashboardConnectReconnectInFlight = false;
+let dashboardConnectReconnectReason = '';
+let dashboardConnectReconnectNextUnixMs = 0;
 let filesDownloadAbort = null;
 let filesTransferSeq = 0;
 let filesTransferRunnerActive = false;
@@ -11993,6 +11998,8 @@ const DASHBOARD_CONTROL_UPLOAD_BUFFER_HIGH_BYTES = 1024 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES = 2 * 1024 * 1024;
 const DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES = 512 * 1024 * 1024;
 const DASHBOARD_CONTROL_BINDING_CLOCK_SKEW_MS = 30000;
+const DASHBOARD_CONNECT_RECONNECT_MIN_MS = 1000;
+const DASHBOARD_CONNECT_RECONNECT_MAX_MS = 15000;
 const dashboardRecentServerMessageKeys = new Map();
 const DASHBOARD_DEDUPABLE_EVENT_NAMES = new Set([
   // Idempotent lifecycle/state events that can arrive over both the legacy
@@ -19720,6 +19727,7 @@ async function main() {
       dashboardSetControlLastError(err?.message || String(err));
       dashboardUpdateTransportStatus();
       setConnectEventStatus('err', 'Hosted Connect dashboard events failed');
+      scheduleDashboardConnectReconnect(err?.message || String(err), { delayMs: 1000 });
     }
   } else {
     // Connect to server over the normal daemon-origin WebSocket.
@@ -40001,6 +40009,14 @@ function dashboardTransportStatusSummary(status = {}) {
   const pcState = String(status.pcState || '').toLowerCase();
   const channelState = String(status.channelState || '').toLowerCase();
   const lastError = String(status.lastError || status.error || '').trim();
+  if (status.reconnecting) {
+    const reason = String(status.reconnectReason || '').trim();
+    return {
+      kind: 'warn',
+      label: 'reconnecting',
+      title: `Dashboard access is reconnecting${reason ? `: ${reason}` : ''}. Open Connection Diagnostics for transport details.`,
+    };
+  }
   if (lastError || pcState === 'failed' || pcState === 'closed' || channelState === 'closed') {
     return {
       kind: 'err',
@@ -40439,10 +40455,12 @@ class DashboardTransport {
   }
 
   status() {
+    const reconnect = dashboardConnectReconnectStatus();
     return dashboardControlTransport?.debugStatus() || {
       enabled: this.enabled(),
       connected: false,
       lastError: dashboardControlLastError,
+      ...reconnect,
     };
   }
 
@@ -40724,6 +40742,75 @@ async function hydrateDashboardFromControl() {
     if (dashboardServerMessageDispatcher) dashboardServerMessageDispatcher(frame);
   }
   dashboardUpdateTransportStatus();
+}
+
+function dashboardConnectReconnectStatus() {
+  return {
+    reconnecting: dashboardConnectReconnectInFlight || Boolean(dashboardConnectReconnectTimer),
+    reconnectAttempt: dashboardConnectReconnectAttempt,
+    reconnectReason: dashboardConnectReconnectReason,
+    reconnectNextUnixMs: dashboardConnectReconnectNextUnixMs,
+  };
+}
+
+function scheduleDashboardConnectReconnect(reason = 'dashboard transport disconnected', options = {}) {
+  if (!dashboardConnectModeEnabled()) return;
+  if (dashboardConnectReconnectTimer) return;
+  const attempt = dashboardConnectReconnectAttempt;
+  const backoffMs = Math.min(
+    DASHBOARD_CONNECT_RECONNECT_MAX_MS,
+    DASHBOARD_CONNECT_RECONNECT_MIN_MS * Math.pow(2, Math.min(attempt, 5))
+  );
+  const delayMs = Math.max(0, Number(options.delayMs ?? backoffMs) || 0);
+  dashboardConnectReconnectAttempt = attempt + 1;
+  dashboardConnectReconnectReason = String(reason || 'dashboard transport disconnected');
+  dashboardConnectReconnectNextUnixMs = Date.now() + delayMs;
+  dashboardSetControlLastError('');
+  setConnectEventStatus('warn', 'Reconnecting dashboard events through Hosted Connect');
+  dashboardUpdateTransportStatus();
+  dashboardConnectReconnectTimer = window.setTimeout(() => {
+    dashboardConnectReconnectTimer = null;
+    dashboardConnectReconnectNextUnixMs = 0;
+    runDashboardConnectReconnect(dashboardConnectReconnectReason).catch(err => {
+      console.warn('[dashboard-control] Hosted Connect reconnect task failed', err);
+    });
+  }, delayMs);
+}
+
+async function runDashboardConnectReconnect(reason = 'dashboard transport disconnected') {
+  if (!dashboardConnectModeEnabled() || dashboardConnectReconnectInFlight) return;
+  dashboardConnectReconnectInFlight = true;
+  dashboardConnectReconnectReason = String(reason || 'dashboard transport disconnected');
+  let retryReason = '';
+  dashboardSetControlLastError('');
+  setConnectEventStatus('warn', 'Reconnecting dashboard events through Hosted Connect');
+  dashboardUpdateTransportStatus();
+  try {
+    const previous = dashboardControlTransport;
+    if (previous) {
+      previous.suppressReconnect = true;
+      previous.close({ signalRemote: true, suppressReconnect: true });
+    }
+    dashboardControlTransport = null;
+    if (dashboardTransport) dashboardTransport.controlStartPromise = null;
+    await maybeStartDashboardControlTransport();
+    await waitForDashboardControlReady(30000);
+    await hydrateDashboardFromControl();
+    dashboardConnectReconnectAttempt = 0;
+    dashboardConnectReconnectReason = '';
+    dashboardConnectReconnectNextUnixMs = 0;
+    dashboardSetControlLastError('');
+    setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
+  } catch (err) {
+    retryReason = err?.message || String(err);
+    console.warn('[dashboard-control] Hosted Connect reconnect failed', err);
+    dashboardSetControlLastError(retryReason);
+    setConnectEventStatus('err', 'Hosted Connect dashboard reconnect failed');
+  } finally {
+    dashboardConnectReconnectInFlight = false;
+    dashboardUpdateTransportStatus();
+    if (retryReason) scheduleDashboardConnectReconnect(retryReason);
+  }
 }
 
 window.intendantDashboardControl = {
@@ -41971,6 +42058,8 @@ class DashboardControlTransport {
     this.signalingMode = '';
     this.connectCsrfToken = '';
     this.seq = 0;
+    this.primaryDashboardControl = true;
+    this.suppressReconnect = false;
   }
 
   async connect() {
@@ -41986,12 +42075,14 @@ class DashboardControlTransport {
       console.info('[dashboard-control] channel closed');
       dashboardUpdateTransportStatus();
       updateTermSubscription(true);
+      this.scheduleReconnect('DataChannel closed', { delayMs: 1000 });
     };
     this.channel.onerror = () => {
       this.lastError = 'DataChannel error';
       dashboardSetControlLastError(this.lastError);
       dashboardUpdateTransportStatus();
       updateTermSubscription(true);
+      this.scheduleReconnect(this.lastError, { delayMs: 1000 });
     };
     this.pc.onicecandidate = ev => {
       if (!ev.candidate) return;
@@ -42003,9 +42094,15 @@ class DashboardControlTransport {
       this.sendIce(candidate).catch(err => console.warn('[dashboard-control] ICE signal failed', err));
     };
     this.pc.onconnectionstatechange = () => {
-      console.info('[dashboard-control] pc state', this.pc.connectionState);
+      const state = this.pc?.connectionState || 'closed';
+      console.info('[dashboard-control] pc state', state);
       this.refreshIceRoute().catch(err => console.debug('[dashboard-control] route stats failed', err));
       dashboardUpdateTransportStatus();
+      if (state === 'failed' || state === 'closed') {
+        this.scheduleReconnect(`WebRTC ${state}`, { delayMs: 1000 });
+      } else if (state === 'disconnected') {
+        this.scheduleReconnect('WebRTC disconnected', { delayMs: 3000 });
+      }
     };
     this.pc.oniceconnectionstatechange = () => {
       this.refreshIceRoute().catch(err => console.debug('[dashboard-control] ICE route stats failed', err));
@@ -42088,6 +42185,12 @@ class DashboardControlTransport {
     dashboardSetControlLastError(this.lastError);
     dashboardUpdateTransportStatus();
     this.close();
+    this.scheduleReconnect(this.lastError, { delayMs: 1000 });
+  }
+
+  scheduleReconnect(reason, options = {}) {
+    if (!this.primaryDashboardControl || this.suppressReconnect || !dashboardConnectModeEnabled()) return;
+    scheduleDashboardConnectReconnect(reason, options);
   }
 
   handleOpen() {
@@ -42945,14 +43048,15 @@ class DashboardControlTransport {
     dashboardUpdateTransportStatus();
   }
 
-  close() {
+  close(options = {}) {
+    if (options.suppressReconnect) this.suppressReconnect = true;
     for (const pending of this.pending.values()) {
       pending.reject(new Error('dashboard control transport closed'));
     }
     this.pending.clear();
     this.chunkedResponses.clear();
     this.byteStreams.clear();
-    if (this.sessionId) {
+    if (this.sessionId && options.signalRemote !== false) {
       this.signalClose(this.sessionId);
     }
     dashboardControlEventsActive = false;
@@ -43067,6 +43171,7 @@ class DashboardControlTransport {
       pendingByteStreams: this.byteStreams.size,
       completedChunkedResponses: this.completedChunkedResponses,
       completedByteStreams: this.completedByteStreams,
+      ...dashboardConnectReconnectStatus(),
     };
   }
 
@@ -43079,6 +43184,7 @@ class DashboardControlTransport {
 class PeerDashboardControlConnection extends DashboardControlTransport {
   constructor(hostId, sessionId = '') {
     super();
+    this.primaryDashboardControl = false;
     this.hostId = String(hostId || '').trim();
     this.sessionId = String(sessionId || generateSessionId());
     this.signalingMode = 'peer-primary';
