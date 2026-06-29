@@ -5,47 +5,57 @@
 # This script intentionally does not manage secrets. The deployed service should
 # already have its daemon token and other runtime environment in systemd.
 #
-# Defaults match the current production-alpha instance:
-#   https://connect.intendant.dev -> ubuntu@16.171.75.210
+# Target details are intentionally not stored in this public repository. Pass
+# them with CONNECT_* environment variables, command-line flags, or a private
+# env file referenced by CONNECT_OPS_ENV.
 #
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-CONNECT_HOST="${CONNECT_HOST:-16.171.75.210}"
-CONNECT_SSH_USER="${CONNECT_SSH_USER:-ubuntu}"
-CONNECT_SSH_KEY="${CONNECT_SSH_KEY:-$HOME/.ssh/intendant-connect-prod-alpha-ec2}"
-CONNECT_REMOTE_SOURCE="${CONNECT_REMOTE_SOURCE:-/opt/intendant/source}"
-CONNECT_SERVICE="${CONNECT_SERVICE:-intendant-connect}"
+die() { printf 'error: %s\n' "$*" >&2; exit 1; }
+info() { printf ':: %s\n' "$*"; }
+
+CONNECT_OPS_ENV="${CONNECT_OPS_ENV:-}"
+if [[ -n "$CONNECT_OPS_ENV" ]]; then
+    [[ -f "$CONNECT_OPS_ENV" ]] || die "CONNECT_OPS_ENV not found: $CONNECT_OPS_ENV"
+    set -a
+    # shellcheck disable=SC1090
+    source "$CONNECT_OPS_ENV"
+    set +a
+fi
+
+CONNECT_HOST="${CONNECT_HOST:-}"
+CONNECT_SSH_USER="${CONNECT_SSH_USER:-}"
+CONNECT_SSH_KEY="${CONNECT_SSH_KEY:-}"
+CONNECT_REMOTE_SOURCE="${CONNECT_REMOTE_SOURCE:-}"
+CONNECT_SERVICE="${CONNECT_SERVICE:-}"
 CONNECT_PUBLIC_ORIGIN="${CONNECT_PUBLIC_ORIGIN:-https://connect.intendant.dev}"
-CONNECT_REMOTE_READYZ_URL="${CONNECT_REMOTE_READYZ_URL:-http://127.0.0.1:8787/readyz}"
+CONNECT_REMOTE_READYZ_URL="${CONNECT_REMOTE_READYZ_URL:-}"
 CONNECT_PUBLIC_READYZ_URL="${CONNECT_PUBLIC_READYZ_URL:-$CONNECT_PUBLIC_ORIGIN/readyz}"
 
 SKIP_BUILD=false
 SKIP_RESTART=false
-
-die() { printf 'error: %s\n' "$*" >&2; exit 1; }
-info() { printf ':: %s\n' "$*"; }
 
 usage() {
     cat <<EOF
 Usage: scripts/deploy-connect-prod-alpha.sh [options]
 
 Options:
-  --host <host>              SSH host. Default: $CONNECT_HOST
-  --ssh-user <user>          SSH user. Default: $CONNECT_SSH_USER
-  --ssh-key <path>           SSH key. Default: $CONNECT_SSH_KEY
-  --remote-source <path>     Remote source directory. Default: $CONNECT_REMOTE_SOURCE
-  --service <name>           systemd service. Default: $CONNECT_SERVICE
+  --host <host>              SSH host. Required unless CONNECT_HOST is set
+  --ssh-user <user>          SSH user. Required unless CONNECT_SSH_USER is set
+  --ssh-key <path>           SSH key. Required unless CONNECT_SSH_KEY is set
+  --remote-source <path>     Remote source directory. Required unless CONNECT_REMOTE_SOURCE is set
+  --service <name>           systemd service. Required unless CONNECT_SERVICE is set
   --public-origin <url>      Public origin. Default: $CONNECT_PUBLIC_ORIGIN
-  --remote-readyz-url <url>  Remote readiness URL. Default: $CONNECT_REMOTE_READYZ_URL
+  --remote-readyz-url <url>  Remote readiness URL. Required unless CONNECT_REMOTE_READYZ_URL is set
   --public-readyz-url <url>  Public readiness URL. Default: $CONNECT_PUBLIC_READYZ_URL
   --skip-build               Sync source and restart without cargo build
   --skip-restart             Sync/build only
   -h, --help                 Show this help
 
-Environment variables with the same CONNECT_* names override defaults.
+CONNECT_OPS_ENV may point to a private env file containing these CONNECT_* values.
 EOF
 }
 
@@ -70,6 +80,8 @@ done
 [[ -n "$CONNECT_SSH_USER" ]] || die "--ssh-user is required"
 [[ -n "$CONNECT_REMOTE_SOURCE" ]] || die "--remote-source is required"
 [[ -n "$CONNECT_SERVICE" ]] || die "--service is required"
+[[ -n "$CONNECT_REMOTE_READYZ_URL" ]] || die "--remote-readyz-url is required"
+[[ -n "$CONNECT_SSH_KEY" ]] || die "--ssh-key is required"
 [[ -f "$CONNECT_SSH_KEY" ]] || die "SSH key not found: $CONNECT_SSH_KEY"
 command -v ssh >/dev/null 2>&1 || die "ssh is required"
 command -v tar >/dev/null 2>&1 || die "tar is required"

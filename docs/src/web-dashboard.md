@@ -701,7 +701,7 @@ INTENDANT_CONNECT_TOKEN="$(openssl rand -base64 32)" \
     --origin https://connect.intendant.dev \
     --rp-id intendant.dev \
     --static-root static \
-    --data-file /var/lib/intendant-connect/state.json
+    --data-file <state-file>
 ```
 
 The `--rp-id intendant.dev` value means passkeys are scoped to the owned
@@ -783,24 +783,40 @@ The reverse proxy in front of `intendant-connect` must terminate public TLS for
 `connect.intendant.dev`, forward `Host`, set `X-Forwarded-For`/`X-Real-IP`, and
 strip any inbound copies of those client-IP headers before setting them. Keep
 the service bound to `127.0.0.1`, keep `INTENDANT_CONNECT_TOKEN` in a secret
-store, and back up `/var/lib/intendant-connect/state.json`; that file is the
-current account/passkey/device ownership database.
+store, and back up the configured state file; that file is the current
+account/passkey/device ownership database.
 
-The production-alpha operator path is captured in scripts:
+The production-alpha operator path is captured in scripts, but live target
+details are not stored in the public repository. Provide them through a private
+env file or command-line flags:
 
 ```bash
-scripts/deploy-connect-prod-alpha.sh
-scripts/connect-state-backup.sh --passphrase-file ~/.config/intendant/connect-backup.passphrase
-scripts/connect-state-restore.sh --yes \
+cat > ~/.config/intendant/connect-prod-alpha.env <<'EOF'
+CONNECT_HOST=<ssh-host>
+CONNECT_SSH_USER=<ssh-user>
+CONNECT_SSH_KEY=<private-ssh-key-path>
+CONNECT_REMOTE_SOURCE=<remote-source-directory>
+CONNECT_SERVICE=<systemd-service-name>
+CONNECT_REMOTE_READYZ_URL=<local-readiness-url>
+CONNECT_REMOTE_STATE=<remote-state-json-path>
+CONNECT_PUBLIC_ORIGIN=https://connect.intendant.dev
+EOF
+
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/deploy-connect-prod-alpha.sh
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/connect-state-backup.sh --passphrase-file ~/.config/intendant/connect-backup.passphrase
+CONNECT_OPS_ENV=~/.config/intendant/connect-prod-alpha.env \
+  scripts/connect-state-restore.sh --yes \
   --passphrase-file ~/.config/intendant/connect-backup.passphrase \
   ~/.local/share/intendant/connect-backups/intendant-connect-state-YYYYMMDDTHHMMSSZ.json.enc
 ```
 
-The deploy script syncs the current worktree to the EC2 source directory,
-builds on the host, restarts the systemd service, and checks both the local
-readiness URL and the public `connect.intendant.dev` readiness URL. Backup and
-restore default to encrypted state snapshots and require an explicit plaintext
-flag for diagnostics.
+The deploy script syncs the current worktree to the configured remote source
+directory, builds on the host, restarts the configured systemd service, and
+checks both the configured local readiness URL and the public
+`connect.intendant.dev` readiness URL. Backup and restore default to encrypted
+state snapshots and require an explicit plaintext flag for diagnostics.
 
 Current alpha limits:
 
