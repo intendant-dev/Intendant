@@ -450,6 +450,7 @@ impl PeerTransport for IntendantWsTransport {
             resolve_approval: true,
             webrtc_signal: true,
             file_transfer_signal: true,
+            dashboard_control_signal: true,
         }
     }
 
@@ -572,6 +573,14 @@ impl PeerTransport for IntendantWsTransport {
             }
             PeerOp::PeerFileTransferSignal { session_id, signal } => {
                 self.write_control_msg(&ControlMsg::PeerFileTransferSignal {
+                    session_id: session_id.0,
+                    signal,
+                })
+                .await?;
+                Ok(PeerOpAck::Ok)
+            }
+            PeerOp::PeerDashboardControlSignal { session_id, signal } => {
+                self.write_control_msg(&ControlMsg::PeerDashboardControlSignal {
                     session_id: session_id.0,
                     signal,
                 })
@@ -803,6 +812,7 @@ mod tests {
                 signal: crate::peer::WebRtcSignal::Offer {
                     sdp: "v=0\r\nm=video".into(),
                     advertise_tcp_via_url: None,
+                    client_nonce: None,
                 },
             })
             .await

@@ -163,6 +163,27 @@ async function click(page, selector) {
   }, page.sessionId);
 }
 
+async function dashboardAccessUi(page) {
+  return page.evaluate(() => {
+    const normalizedText = el => String(el?.textContent || '').replace(/\s+/g, ' ').trim();
+    const read = selector => {
+      const el = document.querySelector(selector);
+      return {
+        text: normalizedText(el),
+        className: String(el?.className || ''),
+        title: String(el?.title || ''),
+      };
+    };
+    return {
+      status: read('#sb-dashboard-transport'),
+      statusLabel: normalizedText(document.querySelector('#sb-dashboard-transport-label')),
+      diagnosticsLegend: normalizedText(document.querySelector('#connect-health-panel legend')),
+      files: read('#files-target-summary'),
+      shell: read('#shell-target-summary'),
+    };
+  });
+}
+
 async function typeText(page, text) {
   if (page.keyboard?.type) {
     await page.keyboard.type(text);
@@ -385,6 +406,17 @@ async function main() {
     assert(healthPanel.resultText.includes('pass'), `Connect health self-test did not render pass rows: ${JSON.stringify(healthPanel)}`);
 
     await click(page, '.tab-btn[data-tab="files"]');
+    const filesAccessUi = await dashboardAccessUi(page);
+    assert(
+      ['Ready', 'Relay'].includes(filesAccessUi.statusLabel),
+      `dashboard access status should be user-facing: ${JSON.stringify(filesAccessUi)}`
+    );
+    assert.strictEqual(filesAccessUi.diagnosticsLegend, 'Connection Diagnostics', `debug panel should own transport details: ${JSON.stringify(filesAccessUi)}`);
+    assert(filesAccessUi.files.text.includes('This daemon'), `Files target summary did not identify the local daemon: ${JSON.stringify(filesAccessUi)}`);
+    assert(filesAccessUi.files.text.includes('Hosted Connect'), `Files target summary did not name Hosted Connect mode: ${JSON.stringify(filesAccessUi)}`);
+    assert(filesAccessUi.files.text.includes('full dashboard access'), `Files target summary did not summarize access: ${JSON.stringify(filesAccessUi)}`);
+    assert(filesAccessUi.files.text.includes('Files'), `Files target summary did not include the Files capability: ${JSON.stringify(filesAccessUi)}`);
+    assert(!/\b(DataChannel|dashboard-control|tunnel|mTLS|ICE)\b/i.test(`${filesAccessUi.statusLabel} ${filesAccessUi.files.text}`), `Files target summary leaked protocol wording: ${JSON.stringify(filesAccessUi)}`);
     const filesDownloadPanel = await page.evaluate(`window.intendantDashboardFiles._debugProbeDownloadPath(${JSON.stringify(genericDownloadPath)}, { chunkBytes: 11 })`);
     assert.strictEqual(filesDownloadPanel.path, genericDownloadPath, `Files tab did not keep selected path: ${JSON.stringify(filesDownloadPanel)}`);
     assert(filesDownloadPanel.rangeCount >= 2, `Files tab download did not use multiple ranges: ${JSON.stringify(filesDownloadPanel)}`);
@@ -430,6 +462,11 @@ async function main() {
 
     const shellToken = `connect_shell_${Date.now()}`;
     await click(page, '#tab-terminal .subtab-btn[data-term-tab="shell"]');
+    const shellAccessUi = await dashboardAccessUi(page);
+    assert(shellAccessUi.shell.text.includes('This daemon'), `Shell target summary did not identify the local daemon: ${JSON.stringify(shellAccessUi)}`);
+    assert(shellAccessUi.shell.text.includes('Hosted Connect'), `Shell target summary did not name Hosted Connect mode: ${JSON.stringify(shellAccessUi)}`);
+    assert(shellAccessUi.shell.text.includes('Shell'), `Shell target summary did not include the Shell capability: ${JSON.stringify(shellAccessUi)}`);
+    assert(!/\b(DataChannel|dashboard-control|tunnel|mTLS|ICE)\b/i.test(shellAccessUi.shell.text), `Shell target summary leaked protocol wording: ${JSON.stringify(shellAccessUi)}`);
     await page.waitForFunction(() => Boolean(document.querySelector('#term-pane-shell.active #shell-container .xterm')), {
       timeout: START_TIMEOUT_MS,
     });

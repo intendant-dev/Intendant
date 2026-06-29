@@ -1467,6 +1467,13 @@ impl WireEventUpcaster {
                 }]
             }
 
+            OutboundEvent::PeerDashboardControlSignal { session_id, signal } => {
+                vec![PeerEvent::PeerDashboardControlSignal {
+                    session_id: crate::peer::WebRtcSessionId(session_id.clone()),
+                    signal: signal.clone(),
+                }]
+            }
+
             OutboundEvent::CodexThreadActionRequested {
                 action, session_id, ..
             } => vec![log_event(
@@ -3679,6 +3686,7 @@ mod tests {
             session_id: "sess-uuid".into(),
             signal: crate::peer::WebRtcSignal::Answer {
                 sdp: "v=0\r\nm=video".into(),
+                binding: None,
             },
         };
         let events = u.upcast(&out);
@@ -3692,7 +3700,7 @@ mod tests {
                 assert_eq!(*display_id, 42);
                 assert_eq!(session_id.0, "sess-uuid");
                 match signal {
-                    crate::peer::WebRtcSignal::Answer { sdp } => {
+                    crate::peer::WebRtcSignal::Answer { sdp, .. } => {
                         assert_eq!(sdp, "v=0\r\nm=video");
                     }
                     other => panic!("expected Answer, got {other:?}"),

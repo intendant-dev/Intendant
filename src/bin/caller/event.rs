@@ -1564,6 +1564,13 @@ pub enum ControlMsg {
         session_id: String,
         signal: crate::peer::WebRtcSignal,
     },
+    /// One leg of a direct browser-to-peer dashboard-control WebRTC signaling
+    /// exchange. The primary daemon forwards browser offers/ICE to the peer;
+    /// the peer emits answers/ICE back as OutboundEvent::PeerDashboardControlSignal.
+    PeerDashboardControlSignal {
+        session_id: String,
+        signal: crate::peer::WebRtcSignal,
+    },
     CreateBrowserWorkspace {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,

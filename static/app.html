@@ -185,7 +185,7 @@ html {
   display: inline-block;
   color: var(--overlay0);
   font-size: 11px;
-  max-width: 68px;
+  max-width: 112px;
   vertical-align: bottom;
 }
 .status-bar .autonomy { font-weight: 600; }
@@ -677,6 +677,111 @@ html {
   margin: 0 0 10px;
   color: var(--text);
   font-size: 15px;
+}
+.target-summary {
+  --target-accent: var(--blue);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px 12px;
+  align-items: center;
+  min-height: 44px;
+  margin: 2px 0 10px;
+  padding: 9px 0;
+  border-top: 1px solid rgba(88, 91, 112, 0.42);
+  border-bottom: 1px solid rgba(88, 91, 112, 0.42);
+}
+.target-summary.ok { --target-accent: var(--green); }
+.target-summary.warn { --target-accent: var(--yellow); }
+.target-summary.err { --target-accent: var(--red); }
+.target-summary.checking { --target-accent: var(--blue); }
+.target-summary-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 8px;
+  min-width: 0;
+  align-items: center;
+}
+.target-summary-dot {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--target-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--target-accent) 16%, transparent);
+  grid-row: 1 / span 2;
+}
+.target-summary-name-row {
+  display: flex;
+  align-items: baseline;
+  gap: 7px;
+  min-width: 0;
+}
+.target-summary-name {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 700;
+}
+.target-summary-kind {
+  flex: 0 0 auto;
+  color: var(--overlay0);
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+.target-summary-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.target-summary-chips {
+  display: flex;
+  flex-wrap: wrap;
+  justify-content: flex-end;
+  gap: 5px;
+}
+.target-chip {
+  min-height: 22px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  color: var(--overlay0);
+  background: rgba(49, 50, 68, 0.35);
+  font-size: 11px;
+  line-height: 1;
+  white-space: nowrap;
+}
+.target-chip::before {
+  content: '';
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--overlay0);
+}
+.target-chip.ok {
+  border-color: rgba(166, 227, 161, 0.35);
+  color: var(--green);
+}
+.target-chip.ok::before { background: var(--green); }
+.target-chip.ready {
+  border-color: rgba(137, 180, 250, 0.35);
+  color: var(--blue);
+}
+.target-chip.ready::before { background: var(--blue); }
+.target-chip.warn {
+  border-color: rgba(249, 226, 175, 0.38);
+  color: var(--yellow);
+}
+.target-chip.warn::before { background: var(--yellow); }
+.target-chip.off {
+  opacity: 0.72;
 }
 .files-tool + .files-tool {
   margin-top: 14px;
@@ -7343,6 +7448,57 @@ body.context-focus-active {
   text-align: center;
 }
 
+.shell-toolbar {
+  flex-shrink: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 8px;
+  background: var(--mantle);
+  border-bottom: 1px solid var(--surface0);
+}
+.shell-toolbar .target-summary {
+  flex: 1 1 auto;
+  min-width: 260px;
+  margin: 0 0 0 4px;
+  padding: 0 0 0 12px;
+  border-top: 0;
+  border-bottom: 0;
+  border-left: 1px solid var(--surface1);
+}
+.shell-toolbar .target-summary-detail {
+  max-width: 38vw;
+}
+.shell-toolbar label {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.shell-toolbar select {
+  min-width: 180px;
+  max-width: min(360px, 50vw);
+  background: var(--surface0);
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 8px;
+}
+.shell-host-status {
+  min-width: 0;
+  color: var(--subtext0);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.shell-host-status.error { color: var(--red); }
+.shell-host-status.warn { color: var(--yellow); }
+.shell-host-status.ok { color: var(--green); }
+
 /* ── Shell key bar (mobile + optional desktop) ── */
 .shell-keybar {
   display: none;
@@ -8819,6 +8975,27 @@ body.display-fullscreen-open {
   .files-download-host-row {
     grid-template-columns: 1fr;
   }
+  .target-summary,
+  .shell-toolbar .target-summary {
+    grid-template-columns: 1fr;
+    align-items: start;
+  }
+  .target-summary-chips {
+    justify-content: flex-start;
+  }
+  .shell-toolbar {
+    flex-wrap: wrap;
+  }
+  .shell-toolbar .target-summary {
+    min-width: 100%;
+    margin-left: 0;
+    padding: 8px 0 0;
+    border-left: 0;
+    border-top: 1px solid var(--surface1);
+  }
+  .shell-toolbar .target-summary-detail {
+    max-width: none;
+  }
   .files-upload-config {
     grid-template-columns: 1fr;
   }
@@ -9215,10 +9392,10 @@ body.display-fullscreen-open {
       <span class="field-label" id="sb-conn-label">ws</span>
       <span class="conn-dot err" id="sb-conn"></span>
     </span>
-    <span class="sb-dot-group" id="sb-dashboard-transport" title="Dashboard control transport">
-      <span class="field-label">dashboard</span>
+    <span class="sb-dot-group" id="sb-dashboard-transport" title="Dashboard access">
+      <span class="field-label">access</span>
       <span class="conn-dot ok" id="sb-dashboard-transport-dot"></span>
-      <span id="sb-dashboard-transport-label">mTLS</span>
+      <span id="sb-dashboard-transport-label">Ready</span>
     </span>
     <span class="sb-dot-group" title="Live model connection (voice + video — Gemini Live / OpenAI Realtime)">
       <span class="field-label">live</span>
@@ -10045,6 +10222,12 @@ body.display-fullscreen-open {
           <div class="terminal-unavailable hidden" id="terminal-tui-unavailable" role="status" aria-live="polite"></div>
         </div>
         <div class="subtab-pane" id="term-pane-shell">
+          <div class="shell-toolbar">
+            <label for="shell-host-select">Target</label>
+            <select id="shell-host-select" title="Shell target"></select>
+            <span class="shell-host-status" id="shell-host-status"></span>
+            <div id="shell-target-summary" class="target-summary" aria-live="polite"></div>
+          </div>
           <div class="terminal-container" id="shell-container"></div>
           <div class="shell-keybar" id="shell-keybar">
             <button class="shell-key" data-key="esc">Esc</button>
@@ -10540,11 +10723,12 @@ body.display-fullscreen-open {
         <section class="files-tool" aria-labelledby="files-download-heading">
           <h3 id="files-download-heading">Downloads</h3>
           <div class="files-download-host-row">
-            <label for="files-download-host">Source</label>
+            <label for="files-download-host">Target</label>
             <select id="files-download-host" onchange="onFilesDownloadHostChanged()">
               <option value="">This daemon</option>
             </select>
           </div>
+          <div id="files-target-summary" class="target-summary" aria-live="polite"></div>
           <div class="files-download-row">
             <input id="files-download-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/file">
             <button id="files-download-browse-btn" type="button" onclick="openFilesDownloadPicker()">Browse</button>
@@ -10904,6 +11088,8 @@ body.display-fullscreen-open {
                     <div class="daemon-pairing-row">
                       <select id="daemon-request-profile">
                         <option value="operator" title="Display input, messages, tasks, and approvals.">Operator</option>
+                        <option value="terminal-operator" title="Session reading plus interactive shell access.">Terminal operator</option>
+                        <option value="session-reader" title="Presence, stats, and session history. No shell, task, settings, or display input.">Session reader</option>
                         <option value="read-only-display" title="Presence, stats, and display viewing. No input control.">Read-only display</option>
                         <option value="shared-session-spectator" title="Presence, stats, and display viewing. No input control.">Spectator</option>
                         <option value="task-runner" title="Presence, stats, messages, and task delegation.">Task runner</option>
@@ -11035,7 +11221,7 @@ body.display-fullscreen-open {
               </a>
             </fieldset>
             <fieldset class="settings-group" id="connect-health-panel">
-              <legend>Connect Health</legend>
+              <legend>Connection Diagnostics</legend>
               <div id="connect-health-summary" class="connect-health-badges"></div>
               <div id="connect-health-grid" class="connect-health-grid"></div>
               <div class="connect-self-test-actions">
@@ -11640,6 +11826,8 @@ let filesTransferRunnerActive = false;
 const filesTransfers = [];
 const filesStagedUploads = new Map();
 const peerFileTransferConnections = new Map();
+const peerDashboardControlConnections = new Map(); // hostId|sessionId -> PeerDashboardControlConnection
+const peerDashboardControlConnectionsByHost = new Map(); // hostId -> PeerDashboardControlConnection
 let filesTransferDbPromise = null;
 const FILES_TRANSFER_STATE_KEY = 'intendant.files.transfers.v2';
 const FILES_TRANSFER_DB_NAME = 'intendant-files-transfers-v2';
@@ -11782,7 +11970,7 @@ const DASHBOARD_ACTION_MSG_RPC_ACTIONS = new Set([
 
 function dashboardConnectMutationUnavailable(action, label = 'Dashboard control request', options = {}) {
   const actionLabel = action ? ` ${action}` : '';
-  const message = `${label}${actionLabel} is unavailable until the Connect dashboard tunnel is ready`;
+  const message = `${label}${actionLabel} is unavailable until dashboard access is ready`;
   console.warn(`[dashboard-control] ${message}`);
   const err = new Error(message);
   if (typeof options.onError === 'function') {
@@ -11897,6 +12085,7 @@ let shellOpenSent = false;
 let shellOpenAcked = false;
 const SHELL_HOST_ID = 'local';
 const SHELL_TERMINAL_ID = 'shell-0';
+let selectedShellHostId = SHELL_HOST_ID;
 let shellOutputQueue = [];
 let shellOutputQueuedBytes = 0;
 let shellOutputFlushScheduled = false;
@@ -19013,25 +19202,25 @@ async function main() {
       // dispatch these through set_on_terminal_output/exited below so they
       // don't take the generic raw-message bridge.
       if (d.t === 'terminal_output') {
-        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
           handleShellOutput(d.data);
         }
         return;
       }
       if (d.t === 'terminal_exited') {
-        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
           handleShellExited(d.status);
         }
         return;
       }
       if (d.t === 'terminal_opened') {
-        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
           handleShellOpened();
         }
         return;
       }
       if (d.t === 'terminal_error') {
-        if (d.terminal_id === SHELL_TERMINAL_ID && d.host_id === SHELL_HOST_ID) {
+        if (shellFrameMatchesCurrent(d.host_id, d.terminal_id)) {
           handleShellError(d.error);
         }
         return;
@@ -19122,7 +19311,7 @@ async function main() {
 
   if (app.set_on_terminal_output) {
     app.set_on_terminal_output((hostId, terminalId, data) => {
-      if (terminalId === SHELL_TERMINAL_ID && hostId === SHELL_HOST_ID) {
+      if (shellFrameMatchesCurrent(hostId, terminalId)) {
         handleShellOutput(data);
       }
     });
@@ -19130,7 +19319,7 @@ async function main() {
 
   if (app.set_on_terminal_exited) {
     app.set_on_terminal_exited((hostId, terminalId, status) => {
-      if (terminalId === SHELL_TERMINAL_ID && hostId === SHELL_HOST_ID) {
+      if (shellFrameMatchesCurrent(hostId, terminalId)) {
         handleShellExited(status);
       }
     });
@@ -19366,18 +19555,18 @@ async function main() {
 
   let connectBootstrapReady = !dashboardConnectModeEnabled();
   if (dashboardConnectModeEnabled()) {
-    setConnectEventStatus('warn', 'Connecting dashboard events over the Connect WebRTC tunnel');
+    setConnectEventStatus('warn', 'Connecting dashboard events through Hosted Connect');
     try {
       await maybeStartDashboardControlTransport();
       await waitForDashboardControlReady(30000);
       await hydrateDashboardFromControl();
       connectBootstrapReady = true;
-      setConnectEventStatus('ok', 'Dashboard events are arriving over the verified Connect WebRTC tunnel; no same-origin WebSocket is used');
+      setConnectEventStatus('ok', 'Dashboard events are live through verified Hosted Connect');
     } catch (err) {
       console.warn('[dashboard-control] Connect dashboard bootstrap failed', err);
       dashboardSetControlLastError(err?.message || String(err));
       dashboardUpdateTransportStatus();
-      setConnectEventStatus('err', 'Connect dashboard event tunnel failed');
+      setConnectEventStatus('err', 'Hosted Connect dashboard events failed');
     }
   } else {
     // Connect to server over the normal daemon-origin WebSocket.
@@ -19776,6 +19965,9 @@ function processCommands(cmds) {
         break;
       case 'peer_file_transfer_signal':
         handlePeerFileTransferSignal(c.host_id, c.session_id, c.signal);
+        break;
+      case 'peer_dashboard_control_signal':
+        handlePeerDashboardControlSignal(c.host_id, c.session_id, c.signal);
         break;
       }
     }
@@ -31161,6 +31353,288 @@ function handleTermData(base64data) {
   }
 }
 
+function currentShellHostId() {
+  return String(selectedShellHostId || SHELL_HOST_ID).trim() || SHELL_HOST_ID;
+}
+
+function shellFrameMatchesCurrent(hostId, terminalId) {
+  return String(terminalId || '') === SHELL_TERMINAL_ID &&
+    String(hostId || SHELL_HOST_ID) === currentShellHostId();
+}
+
+function shellHostLabel(hostId = currentShellHostId()) {
+  const id = String(hostId || SHELL_HOST_ID).trim() || SHELL_HOST_ID;
+  if (id === SHELL_HOST_ID || id === selfPeerId) return 'This daemon';
+  const peer = daemons.find(d => d.host_id === id);
+  return peer?.label || id;
+}
+
+function dashboardTargetIsLocal(hostId) {
+  const id = String(hostId || '').trim();
+  return !id || id === SHELL_HOST_ID || id === selfPeerId;
+}
+
+function dashboardTargetLabel(hostId) {
+  if (dashboardTargetIsLocal(hostId)) return selfHostLabel || 'This daemon';
+  const peer = daemons.find(d => d.host_id === String(hostId || '').trim());
+  return peer?.label || String(hostId || '').trim();
+}
+
+function dashboardProfileLabel(profile) {
+  const key = String(profile || '').trim().toLowerCase().replace(/_/g, '-');
+  return {
+    'peer-daemon': 'Admin peer',
+    operator: 'Operator',
+    'terminal-operator': 'Terminal operator',
+    terminal: 'Terminal operator',
+    shell: 'Terminal operator',
+    'session-reader': 'Session reader',
+    'sessions-read': 'Session reader',
+    'session-inspect': 'Session reader',
+    'shared-session-spectator': 'Session spectator',
+    spectator: 'Session spectator',
+    'read-only-display': 'Read-only display',
+    'task-runner': 'Task runner',
+    stats: 'Stats only',
+    'presence-only': 'Presence only',
+  }[key] || (key ? key.replace(/-/g, ' ') : 'Peer access');
+}
+
+function dashboardCapabilityState(available, ready = false) {
+  if (available === true) return 'ok';
+  if (ready === true) return 'ready';
+  return 'off';
+}
+
+function dashboardTargetFeatureChips(hostId, context = '') {
+  const local = dashboardTargetIsLocal(hostId);
+  const raw = local
+    ? (dashboardControlTransport?.lastStatus || {})
+    : (peerDashboardControlConnectionsByHost.get(String(hostId || '').trim())?.lastStatus || {});
+  const directLocalFallback = local && !dashboardConnectModeEnabled();
+  if (local) {
+    return [
+      {
+        label: 'Sessions',
+        state: dashboardCapabilityState(raw.api_sessions_available === true || directLocalFallback),
+      },
+      {
+        label: 'Files',
+        state: dashboardCapabilityState(
+          raw.api_fs_read_available === true ||
+          dashboardByteStreamMethodAvailable('api_fs_read') ||
+          directLocalFallback
+        ),
+      },
+      {
+        label: 'Shell',
+        state: dashboardCapabilityState(raw.terminal_frames_available === true || directLocalFallback),
+      },
+    ];
+  }
+
+  const peerId = String(hostId || '').trim();
+  const peer = daemons.find(d => d.host_id === peerId);
+  const online = Boolean(peer && peer.connected !== false);
+  const controlReady = online && peerDashboardControlSignalAvailable(peerId);
+  const fileReady = online && (controlReady || peerFileTransferSignalAvailable(peerId));
+  const chips = [
+    {
+      label: context === 'files' ? 'Files' : 'Sessions',
+      state: context === 'files'
+        ? dashboardCapabilityState(raw.api_fs_read_available === true, fileReady)
+        : dashboardCapabilityState(raw.api_sessions_available === true, controlReady),
+    },
+    {
+      label: context === 'files' ? 'Sessions' : 'Shell',
+      state: context === 'files'
+        ? dashboardCapabilityState(raw.api_sessions_available === true, controlReady)
+        : dashboardCapabilityState(raw.terminal_frames_available === true, controlReady),
+    },
+    {
+      label: context === 'files' ? 'Shell' : 'Files',
+      state: context === 'files'
+        ? dashboardCapabilityState(raw.terminal_frames_available === true, controlReady)
+        : dashboardCapabilityState(raw.api_fs_read_available === true, fileReady),
+    },
+  ];
+  if (peer && peerCanShareDisplay(peer)) chips.push({ label: 'Video', state: online ? 'ok' : 'off' });
+  return chips;
+}
+
+function dashboardTargetSummary(hostId, context = '') {
+  const local = dashboardTargetIsLocal(hostId);
+  if (local) {
+    const status = dashboardTransport?.status
+      ? dashboardTransport.status()
+      : { enabled: dashboardControlTransportEnabled(), connected: false };
+    const transport = dashboardTransportStatusSummary(status);
+    const connected = !status.enabled || Boolean(status.connected && status.verifiedBinding?.ok);
+    const mode = dashboardConnectModeEnabled()
+      ? 'Hosted Connect'
+      : (!status.enabled ? (location.protocol === 'https:' ? 'Trusted browser access' : 'Local browser access') : 'Local verified access');
+    const detail = connected
+      ? `${mode} · full dashboard access`
+      : `${mode} · ${transport.label || 'connecting'}`;
+    return {
+      state: transport.kind === 'err' ? 'err' : (connected ? 'ok' : 'checking'),
+      name: dashboardTargetLabel(''),
+      kind: 'This daemon',
+      detail,
+      chips: dashboardTargetFeatureChips('', context),
+      title: transport.title || detail,
+    };
+  }
+
+  const peerId = String(hostId || '').trim();
+  const peer = daemons.find(d => d.host_id === peerId);
+  if (!peer) {
+    return {
+      state: 'err',
+      name: peerId || 'Unknown peer',
+      kind: 'Peer',
+      detail: 'This peer is no longer configured',
+      chips: dashboardTargetFeatureChips(peerId, context),
+      title: 'The selected peer was removed from this daemon.',
+    };
+  }
+  const online = peer.connected !== false;
+  const conn = peerDashboardControlConnectionsByHost.get(peerId);
+  const status = conn?.lastStatus || {};
+  const profile = status.grant_profile || '';
+  const grantKind = status.grant_kind || '';
+  const hasExactGrant = Boolean(profile || grantKind);
+  const access = hasExactGrant
+    ? `Grant: ${dashboardProfileLabel(profile)}`
+    : (online ? 'Approved peer access · connects when needed' : 'Peer offline');
+  const via = conn?.canUseRpc?.()
+    ? 'direct browser access'
+    : (online ? 'ready for direct browser access' : 'not reachable');
+  return {
+    state: online ? (conn?.canUseRpc?.() ? 'ok' : 'checking') : 'err',
+    name: dashboardTargetLabel(peerId),
+    kind: 'Peer daemon',
+    detail: `${access} · ${via}`,
+    chips: dashboardTargetFeatureChips(peerId, context),
+    title: online
+      ? `${access}. ${peer.url || peer.ws_url || ''}`.trim()
+      : 'The peer is configured but not connected.',
+  };
+}
+
+function renderDashboardTargetSummary(elementId, hostId, context = '') {
+  const el = document.getElementById(elementId);
+  if (!el) return;
+  const summary = dashboardTargetSummary(hostId, context);
+  el.className = `target-summary ${summary.state || 'checking'}`;
+  el.title = summary.title || summary.detail || '';
+  el.innerHTML = '';
+
+  const main = document.createElement('div');
+  main.className = 'target-summary-main';
+  const dot = document.createElement('span');
+  dot.className = 'target-summary-dot';
+  dot.setAttribute('aria-hidden', 'true');
+  const row = document.createElement('div');
+  row.className = 'target-summary-name-row';
+  const name = document.createElement('span');
+  name.className = 'target-summary-name';
+  name.textContent = summary.name || 'Target';
+  const kind = document.createElement('span');
+  kind.className = 'target-summary-kind';
+  kind.textContent = summary.kind || '';
+  row.append(name, kind);
+  const detail = document.createElement('div');
+  detail.className = 'target-summary-detail';
+  detail.textContent = summary.detail || '';
+  main.append(dot, row, detail);
+
+  const chips = document.createElement('div');
+  chips.className = 'target-summary-chips';
+  for (const chip of summary.chips || []) {
+    const item = document.createElement('span');
+    item.className = `target-chip ${chip.state || 'off'}`;
+    item.textContent = chip.label || '';
+    chips.appendChild(item);
+  }
+  el.append(main, chips);
+}
+
+function renderDashboardTargetSummaries() {
+  renderDashboardTargetSummary('files-target-summary', filesDownloadSelectedPeerId(), 'files');
+  renderDashboardTargetSummary('shell-target-summary', currentShellHostId(), 'shell');
+}
+
+function setShellHostStatus(text = '', kind = '') {
+  const el = document.getElementById('shell-host-status');
+  if (!el) return;
+  el.textContent = text || '';
+  el.className = 'shell-host-status' + (kind ? ` ${kind}` : '');
+  renderDashboardTargetSummary('shell-target-summary', currentShellHostId(), 'shell');
+}
+
+function resetShellConnectionStateForHostChange() {
+  shellOpenSent = false;
+  shellOpenAcked = false;
+  shellQueuedInput = '';
+  shellWaitingNoticeShown = false;
+  shellPendingResize = null;
+  shellOutputQueue = [];
+  shellOutputQueuedBytes = 0;
+}
+
+function refreshShellHostOptions() {
+  const select = document.getElementById('shell-host-select');
+  if (!select) return;
+  const previous = currentShellHostId();
+  const options = [{ id: SHELL_HOST_ID, label: 'This daemon', connected: true }];
+  for (const peer of daemons) {
+    options.push({
+      id: peer.host_id,
+      label: peer.label || peer.host_id,
+      connected: peer.connected !== false,
+    });
+  }
+  select.innerHTML = '';
+  for (const option of options) {
+    const el = document.createElement('option');
+    el.value = option.id;
+    el.textContent = option.connected ? option.label : `${option.label} (offline)`;
+    select.appendChild(el);
+  }
+  const stillPresent = options.some(option => option.id === previous);
+  selectedShellHostId = stillPresent ? previous : SHELL_HOST_ID;
+  select.value = selectedShellHostId;
+  setShellHostStatus(selectedShellHostId === SHELL_HOST_ID ? '' : `Target: ${shellHostLabel(selectedShellHostId)}`, '');
+  renderDashboardTargetSummary('shell-target-summary', currentShellHostId(), 'shell');
+}
+
+function setShellHost(hostId) {
+  const next = String(hostId || SHELL_HOST_ID).trim() || SHELL_HOST_ID;
+  if (next === currentShellHostId()) return;
+  if (currentShellHostId() !== SHELL_HOST_ID) {
+    const existing = peerDashboardControlConnectionsByHost.get(currentShellHostId());
+    existing?.terminalFrame?.({
+      t: 'terminal_close',
+      host_id: currentShellHostId(),
+      terminal_id: SHELL_TERMINAL_ID,
+    });
+  } else if (shellOpenSent) {
+    sendShellMessage({ t: 'terminal_close', host_id: SHELL_HOST_ID, terminal_id: SHELL_TERMINAL_ID });
+  }
+  selectedShellHostId = next;
+  resetShellConnectionStateForHostChange();
+  if (shellTerm) {
+    shellTerm.reset();
+    shellTerm.write(`\x1b[90m[Shell target: ${shellHostLabel(next)}]\x1b[0m\r\n`);
+  }
+  setShellHostStatus(next === SHELL_HOST_ID ? '' : `Target: ${shellHostLabel(next)}`, '');
+  renderDashboardTargetSummary('shell-target-summary', next, 'shell');
+  if (activeTab === 'terminal' && activeTermSubtab === 'shell') {
+    openShellSessionIfPossible(true);
+  }
+}
+
 // ── Standalone shell output handler ──
 // Called when the server sends {"t":"terminal_output", "data":"<base64>"}
 // for this host/terminal pair.
@@ -31207,6 +31681,7 @@ function handleShellExited(status) {
   if (!shellTerm) return;
   flushShellOutput();
   shellTerm.write(`\r\n\x1b[33m[shell exited with status ${status}]\x1b[0m\r\n`);
+  setShellHostStatus(`Shell exited on ${shellHostLabel()}`, 'warn');
   shellOpenSent = false;
   shellOpenAcked = false;
   shellQueuedInput = '';
@@ -31222,6 +31697,7 @@ function handleShellOpened() {
     rows: shellTerm?.rows || 24,
   };
   shellPendingResize = null;
+  setShellHostStatus(`Connected to ${shellHostLabel()}`, 'ok');
   sendShellResize(resize.cols, resize.rows, { allowBeforeAck: true });
   flushQueuedShellInput();
 }
@@ -31229,6 +31705,7 @@ function handleShellOpened() {
 function handleShellError(error) {
   shellOpenSent = false;
   shellOpenAcked = false;
+  setShellHostStatus(String(error || 'shell unavailable'), 'error');
   if (shellTerm) {
     const message = String(error || 'shell unavailable');
     shellTerm.write(`\r\n\x1b[31m[shell error: ${message}]\x1b[0m\r\n`);
@@ -31236,9 +31713,12 @@ function handleShellError(error) {
 }
 
 function showShellWaitingNotice() {
-  if (!dashboardConnectModeEnabled() || shellWaitingNoticeShown || !shellTerm) return;
+  if (shellWaitingNoticeShown || !shellTerm) return;
   shellWaitingNoticeShown = true;
-  shellTerm.write('\r\n\x1b[90m[waiting for Connect terminal tunnel]\x1b[0m\r\n');
+  const label = currentShellHostId() === SHELL_HOST_ID
+    ? 'shell access'
+    : `${shellHostLabel()} shell access`;
+  shellTerm.write(`\r\n\x1b[90m[waiting for ${label}]\x1b[0m\r\n`);
 }
 
 function setTerminalPaneAccessible(pane, active) {
@@ -31254,7 +31734,7 @@ function setTerminalPaneAccessible(pane, active) {
 
 function tuiAvailabilityNoticeText() {
   if (!dashboardConnectModeEnabled() || dashboardTuiFramesAvailable()) return '';
-  if (!dashboardTransport?.canUseRpc?.()) return 'Checking TUI tunnel...';
+  if (!dashboardTransport?.canUseRpc?.()) return 'Checking TUI access...';
   if (dashboardControlTransport?.lastStatus?.tui_frames_available === false) {
     return 'TUI unavailable for this daemon';
   }
@@ -31338,7 +31818,7 @@ function sendDashboardPresenceFrame(frame, fallback = null, label = frame?.t || 
   if (dashboardConnectModeEnabled()) {
     dashboardWarnPresenceOnce(
       `presence:${label}`,
-      `[dashboard-control] ${label} unavailable without the Connect presence tunnel`
+      `[dashboard-control] ${label} unavailable until dashboard access reconnects`
     );
     return false;
   }
@@ -31397,7 +31877,7 @@ function dashboardControlServerSender(message) {
     if (!dashboardTransport || !dashboardTransport.canUseRpc || !dashboardTransport.canUseRpc()) {
       dashboardWarnPresenceOnce(
         'control_action',
-        '[dashboard-control] voice action unavailable without the Connect control tunnel'
+        '[dashboard-control] voice action unavailable until dashboard access reconnects'
       );
       return false;
     }
@@ -31531,7 +32011,7 @@ async function sendDashboardVideoFrameToServer(base64Jpeg, frameId, stream) {
   if (dashboardConnectModeEnabled()) {
     dashboardWarnPresenceOnce(
       'video_frame_unavailable',
-      '[dashboard-control] video frame archival unavailable without the Connect media tunnel'
+      '[dashboard-control] video frame archival unavailable until dashboard access reconnects'
     );
     return false;
   }
@@ -31568,7 +32048,7 @@ function dashboardMediaTransferFailed(err, label) {
 }
 
 function dashboardMediaTunnelUnavailableError(label) {
-  return new Error(`dashboard Connect media tunnel is not available for ${label || 'media transfer'}`);
+  return new Error(`Media access is unavailable for ${label || 'this transfer'}`);
 }
 
 async function uploadDashboardMediaTunnel(method, params, bytes, label, options = {}) {
@@ -31606,6 +32086,29 @@ function sendLegacyMediaEditorMessage(obj) {
 }
 
 function sendShellMessage(obj) {
+  const hostId = String(obj?.host_id || currentShellHostId()).trim() || SHELL_HOST_ID;
+  if (hostId !== SHELL_HOST_ID && hostId !== selfPeerId) {
+    if (!peerDashboardControlSignalAvailable(hostId)) {
+      setShellHostStatus('Shell access is unavailable for the selected peer', 'error');
+      if (obj?.t === 'terminal_open') showShellWaitingNotice();
+      return false;
+    }
+    peerDashboardControlConnectionForHost(hostId, { timeoutMs: 30000 })
+      .then(conn => {
+        if (conn.lastStatus?.terminal_frames_available === false) {
+          throw new Error('selected peer does not allow terminal frames');
+        }
+        if (!conn.terminalFrame({ ...obj, host_id: hostId })) {
+          throw new Error('Peer shell access is not connected');
+        }
+        setShellHostStatus(`Connected to ${shellHostLabel(hostId)}`, 'ok');
+      })
+      .catch(err => {
+        setShellHostStatus(err?.message || String(err), 'error');
+        handleShellError(err?.message || String(err));
+      });
+    return true;
+  }
   if (dashboardTerminalFramesAvailable() && dashboardTransport.terminalFrame(obj)) {
     return true;
   }
@@ -31619,7 +32122,7 @@ function sendShellMessage(obj) {
 function shellOpenFrame() {
   return {
     t: 'terminal_open',
-    host_id: SHELL_HOST_ID,
+    host_id: currentShellHostId(),
     terminal_id: SHELL_TERMINAL_ID,
     cols: shellTerm?.cols || 80,
     rows: shellTerm?.rows || 24,
@@ -31677,7 +32180,7 @@ function sendShellResize(cols, rows, options = {}) {
   }
   return sendShellMessage({
     t: 'terminal_resize',
-    host_id: SHELL_HOST_ID,
+    host_id: currentShellHostId(),
     terminal_id: SHELL_TERMINAL_ID,
     cols: next.cols,
     rows: next.rows,
@@ -31969,7 +32472,7 @@ function sendShellBytes(bytes) {
   }
   const sent = sendShellMessage({
     t: 'terminal_input',
-    host_id: SHELL_HOST_ID,
+    host_id: currentShellHostId(),
     terminal_id: SHELL_TERMINAL_ID,
     data: utf8ToBase64(bytes),
   });
@@ -32079,7 +32582,10 @@ function wireShellKeybar() {
 // Wire on DOM load so the click handler is live even before the user
 // has ever opened the Terminal tab.
 document.addEventListener('DOMContentLoaded', wireShellKeybar);
-document.addEventListener('DOMContentLoaded', syncTerminalPaneAccessibility);
+document.addEventListener('DOMContentLoaded', () => {
+  syncTerminalPaneAccessibility();
+  refreshShellHostOptions();
+});
 document.addEventListener('DOMContentLoaded', () => {
   document.querySelectorAll('[data-shared-view-close]').forEach(btn => {
     btn.addEventListener('click', hideSharedView);
@@ -32131,7 +32637,7 @@ async function requestDisplayInputAuthorityForSlot(displayId) {
   }
   if (dashboardConnectModeEnabled()) {
     if (typeof showControlToast === 'function') {
-      showControlToast('error', 'Display input authority requires the Connect tunnel');
+      showControlToast('error', 'Display input is unavailable until dashboard access reconnects');
     }
     return false;
   }
@@ -32165,7 +32671,7 @@ async function releaseDisplayInputAuthorityForSlot(displayId) {
   }
   if (dashboardConnectModeEnabled()) {
     if (typeof showControlToast === 'function') {
-      showControlToast('error', 'Display input authority release requires the Connect tunnel');
+      showControlToast('error', 'Display input release is unavailable until dashboard access reconnects');
     }
     return false;
   }
@@ -33838,7 +34344,7 @@ class RecordingPlayer {
       console.warn('[dashboard-control] recording segments RPC failed', err);
     }
     if (dashboardConnectModeEnabled()) {
-      throw new Error('recording segments are unavailable without the Connect tunnel');
+      throw new Error('Recording segments are unavailable until dashboard access reconnects');
     }
     const resp = await fetch(`${this.baseUrl}/${this.streamName}/segments`);
     return resp.json();
@@ -33854,7 +34360,7 @@ class RecordingPlayer {
       }
     }
     if (dashboardConnectModeEnabled()) {
-      throw new Error('recording segment bytes are unavailable without the Connect tunnel');
+      throw new Error('Recording segment bytes are unavailable until dashboard access reconnects');
     }
     const url = `${this.baseUrl}/${this.streamName}/${filename}`;
     const resp = await fetch(url, { cache: 'no-store', ...fetchOptions });
@@ -35274,7 +35780,7 @@ async function uploadOneFile(file, destination) {
       }
     } else {
       if (dashboardConnectModeEnabled()) {
-        logErrorToActivity(`Upload failed (${file.name}): Connect upload tunnel is unavailable.`);
+        logErrorToActivity(`Upload failed (${file.name}): Hosted Connect upload access is unavailable.`);
         return null;
       }
       const resp = await fetch(`/api/session/current/uploads?${q}`, {
@@ -36620,7 +37126,7 @@ async function submitClip(action) {
   const sentFrames = []; // { frameId, dataUrl } for 'attach'
   if (!useMediaTunnel && dashboardConnectModeEnabled()) {
     progress.classList.add('hidden');
-    status.textContent = 'Media tunnel unavailable';
+    status.textContent = 'Media access unavailable';
     status.style.color = 'var(--red)';
     setTimeout(() => { status.textContent = ''; status.style.color = ''; }, 5000);
     dashboardMediaTransferFailed(dashboardMediaTunnelUnavailableError('clip creation'), 'clip creation');
@@ -36910,6 +37416,9 @@ document.querySelectorAll('.tab-btn').forEach(btn => {
 // Terminal sub-tab switching (TUI | Shell).
 document.querySelectorAll('#tab-terminal .subtab-btn[data-term-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('terminal', btn.dataset.termTab));
+});
+document.getElementById('shell-host-select')?.addEventListener('change', ev => {
+  setShellHost(ev.target?.value || SHELL_HOST_ID);
 });
 
 // Settings sub-tab switching (Account | Agent | Network | Debug).
@@ -38985,6 +39494,7 @@ function dashboardUpdateTransportStatus() {
   const summary = dashboardTransportStatusSummary(status);
   if (!group || !dot || !label) {
     renderConnectHealthPanel(status, summary);
+    renderDashboardTargetSummaries();
     refreshFilesDownloadAvailability();
     if (activeTab === 'files') refreshFilesTransferJobs();
     syncTuiAvailabilityNotice();
@@ -38995,6 +39505,7 @@ function dashboardUpdateTransportStatus() {
   label.textContent = summary.label;
   group.title = summary.title;
   renderConnectHealthPanel(status, summary);
+  renderDashboardTargetSummaries();
   refreshFilesDownloadAvailability();
   if (activeTab === 'files') refreshFilesTransferJobs();
   syncTuiAvailabilityNotice();
@@ -39003,11 +39514,10 @@ function dashboardUpdateTransportStatus() {
 
 function dashboardTransportStatusSummary(status = {}) {
   if (!status.enabled) {
-    const directMode = location.protocol === 'https:' ? 'mTLS' : 'HTTP';
     return {
       kind: 'ok',
-      label: directMode,
-      title: `Dashboard control uses direct ${directMode} REST/WebSocket transport. WebRTC control is disabled.`,
+      label: 'Ready',
+      title: 'Dashboard access is ready. Open Connection Diagnostics for transport details.',
     };
   }
 
@@ -39015,28 +39525,20 @@ function dashboardTransportStatusSummary(status = {}) {
   const channelState = String(status.channelState || '').toLowerCase();
   const lastError = String(status.lastError || status.error || '').trim();
   if (lastError || pcState === 'failed' || pcState === 'closed' || channelState === 'closed') {
-    const fallback = dashboardConnectModeEnabled()
-      ? 'No same-origin HTTP/WebSocket fallback is available in Connect mode.'
-      : 'HTTP/mTLS fallback remains available for supported calls.';
     return {
       kind: 'err',
       label: 'failed',
-      title: `Dashboard WebRTC control failed${lastError ? `: ${lastError}` : ''}. ${fallback}`,
+      title: `Dashboard access failed${lastError ? `: ${lastError}` : ''}. Open Connection Diagnostics for transport details.`,
     };
   }
 
   if (status.connected && status.verifiedBinding?.ok && channelState === 'open') {
     const route = String(status.iceRoute || status.route || '').toLowerCase();
     const relayed = route === 'relay';
-    const connectMode = status.signalingMode === 'connect-rendezvous' || dashboardConnectModeEnabled();
-    const routeLabel = relayed ? 'relay' : (connectMode ? 'Connect' : 'WebRTC');
-    const routeDetail = route
-      ? `ICE route: ${route}${status.iceCandidatePair ? ` (${status.iceCandidatePair})` : ''}.`
-      : 'ICE route not reported by browser stats.';
     return {
       kind: relayed ? 'warn' : 'ok',
-      label: routeLabel,
-      title: `Dashboard RPC uses verified ${connectMode ? 'Connect-rendezvous ' : ''}${relayed ? 'TURN-relayed' : 'direct'} WebRTC DataChannel. ${routeDetail} Events ${status.eventsActive ? 'active' : 'not active'}.`,
+      label: relayed ? 'Relay' : 'Ready',
+      title: `Dashboard access is ready${relayed ? ' through a relay' : ''}. Events ${status.eventsActive ? 'active' : 'not active'}. Open Connection Diagnostics for transport details.`,
     };
   }
 
@@ -39046,7 +39548,7 @@ function dashboardTransportStatusSummary(status = {}) {
   return {
     kind: 'warn',
     label: 'checking',
-    title: `Dashboard WebRTC control is ${phase}. Current state: pc=${pcState || 'new'}, channel=${channelState || 'new'}.`,
+    title: `Dashboard access is ${phase}. Open Connection Diagnostics for transport details.`,
   };
 }
 
@@ -39492,6 +39994,13 @@ class DashboardTransport {
     );
   }
 
+  canUsePeerDashboardControlSignal() {
+    return Boolean(
+      this.canUseRpc() &&
+      dashboardControlTransport?.lastStatus?.api_peer_dashboard_control_signal_available === true
+    );
+  }
+
   request(method, params = {}, options = {}) {
     if (!this.canUseRpc()) {
       return Promise.reject(new Error('dashboard control RPC is not connected'));
@@ -39601,6 +40110,21 @@ class DashboardTransport {
         signal: options.signal,
       }
     ), 'api_peer_file_transfer_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
+  }
+
+  peerDashboardControlSignal(peerId, params = {}, options = {}) {
+    const id = String(peerId || '').trim();
+    if (!id) return Promise.reject(new Error('peer id is required'));
+    const body = { peer_id: id, ...params };
+    return this.jsonFetch('api_peer_dashboard_control_signal', body, () => authedFetch(
+      `/api/peers/${encodeURIComponent(id)}/dashboard-control-webrtc`,
+      {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(body),
+        signal: options.signal,
+      }
+    ), 'api_peer_dashboard_control_signal', { fallbackAfterRpcFailure: false, signal: options.signal });
   }
 
   stream(method, params = {}, options = {}, onEvent = {}) {
@@ -39741,6 +40265,122 @@ window.intendantDashboardControl = {
   runConnectSelfTest(options = {}) {
     return runConnectSelfTests(options);
   },
+  async _debugProbePeerDashboardControl(peerId, options = {}) {
+    const id = String(peerId || '').trim();
+    if (!id) throw new Error('peer id is required');
+    const conn = await peerDashboardControlConnectionForHost(id, {
+      timeoutMs: options.timeoutMs || 60000,
+    });
+    const status = await conn.request('status', {}, { timeoutMs: options.timeoutMs || 60000 });
+    const sessions = await fetchSessionsForHost(id, {
+      force: true,
+      limit: options.limit || 2,
+      cacheSessionMetadata: false,
+    });
+    const streamEvents = [];
+    const streamedSessions = await streamSessionsForHost(id, { limit: options.limit || 2 }, {
+      sessions(rows, partial) {
+        streamEvents.push(partial ? 'session_partial' : 'session');
+      },
+      replace(rows) {
+        streamEvents.push('replace');
+      },
+      phase(phase) {
+        streamEvents.push('phase:' + String(phase || ''));
+      },
+      done() {
+        streamEvents.push('done');
+      },
+    });
+
+    const terminal = options.terminal === false ? { skipped: true } : await (async () => {
+      const terminalId = `peer-dashboard-terminal-${Date.now()}`;
+      const token = 'peer_dashboard_terminal_e2e';
+      const frames = [];
+      const handler = event => frames.push(event.detail || {});
+      const waitForFrame = (predicate, label) => new Promise((resolve, reject) => {
+        const started = Date.now();
+        const tick = () => {
+          const found = frames.find(predicate);
+          if (found) {
+            resolve(found);
+            return;
+          }
+          if (Date.now() - started > (options.timeoutMs || 60000)) {
+            reject(new Error(`peer terminal ${label} timed out`));
+            return;
+          }
+          setTimeout(tick, 25);
+        };
+        tick();
+      });
+      window.addEventListener('intendant-dashboard-terminal-frame', handler);
+      try {
+        if (!conn.terminalFrame({
+          t: 'terminal_open',
+          host_id: id,
+          terminal_id: terminalId,
+          cols: 80,
+          rows: 24,
+        })) {
+          throw new Error('peer terminal_open was not sent');
+        }
+        await waitForFrame(frame => (
+          frame.t === 'terminal_opened' &&
+          frame.host_id === id &&
+          frame.terminal_id === terminalId
+        ), 'open');
+        if (!conn.terminalFrame({
+          t: 'terminal_input',
+          host_id: id,
+          terminal_id: terminalId,
+          data: btoa(`printf '${token}\\n'\r`),
+        })) {
+          throw new Error('peer terminal_input was not sent');
+        }
+        const output = await waitForFrame(frame => {
+          if (
+            frame.t !== 'terminal_output' ||
+            frame.host_id !== id ||
+            frame.terminal_id !== terminalId
+          ) {
+            return false;
+          }
+          return atob(String(frame.data || '')).includes(token);
+        }, 'output');
+        conn.terminalFrame({
+          t: 'terminal_close',
+          host_id: id,
+          terminal_id: terminalId,
+        });
+        return {
+          opened: true,
+          sawToken: true,
+          terminalId,
+          outputBytes: atob(String(output.data || '')).length,
+        };
+      } finally {
+        window.removeEventListener('intendant-dashboard-terminal-frame', handler);
+      }
+    })();
+
+    return {
+      connected: conn.canUseRpc(),
+      sessionId: conn.sessionId,
+      verifiedBindingOk: conn.verifiedBinding?.ok === true,
+      status: {
+        apiSessionsAvailable: status?.api_sessions_available === true,
+        apiSessionsStreamAvailable: status?.api_sessions_stream_available === true,
+        terminalFramesAvailable: status?.terminal_frames_available === true,
+        grantKind: status?.grant_kind || '',
+        grantProfile: status?.grant_profile || '',
+      },
+      sessionsCount: Array.isArray(sessions) ? sessions.length : -1,
+      streamEvents,
+      streamedSessionsCount: Array.isArray(streamedSessions) ? streamedSessions.length : -1,
+      terminal,
+    };
+  },
   async _debugProbeConnectHealthPanel(options = {}) {
     const state = renderConnectHealthPanel();
     const result = options.runSelfTest === false
@@ -39851,7 +40491,7 @@ window.intendantDashboardControl = {
       api_dashboard_action_msg_available: false,
     };
     console.warn = function(...args) {
-      if (String(args[0] || '').includes('unavailable until the Connect dashboard tunnel is ready')) {
+      if (String(args[0] || '').includes('unavailable until dashboard access is ready')) {
         unavailableWarnings += 1;
       }
       return previousWarn.apply(this, args);
@@ -40824,6 +41464,9 @@ window.intendantDashboardControl = {
   peerFileTransferSignal(peerId, params = {}, options = {}) {
     return dashboardTransport.peerFileTransferSignal(peerId, params, options);
   },
+  peerDashboardControlSignal(peerId, params = {}, options = {}) {
+    return dashboardTransport.peerDashboardControlSignal(peerId, params, options);
+  },
 };
 
 class DashboardControlTransport {
@@ -41037,20 +41680,24 @@ class DashboardControlTransport {
       try {
         window.dispatchEvent(new CustomEvent('intendant-dashboard-terminal-frame', { detail: msg }));
       } catch (_) {}
-      if (msg.t === 'terminal_opened' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
+      if (msg.t === 'terminal_opened' && shellFrameMatchesCurrent(msg.host_id, msg.terminal_id)) {
         handleShellOpened();
         return;
       }
-      if (msg.t === 'terminal_error' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
+      if (msg.t === 'terminal_error' && shellFrameMatchesCurrent(msg.host_id, msg.terminal_id)) {
         handleShellError(msg.error);
+        return;
+      }
+      if (msg.t === 'terminal_output' && shellFrameMatchesCurrent(msg.host_id, msg.terminal_id)) {
+        handleShellOutput(msg.data);
+        return;
+      }
+      if (msg.t === 'terminal_exited' && shellFrameMatchesCurrent(msg.host_id, msg.terminal_id)) {
+        handleShellExited(msg.status);
         return;
       }
       if (dashboardServerMessageDispatcher) {
         dashboardServerMessageDispatcher(JSON.stringify(msg));
-      } else if (msg.t === 'terminal_output' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
-        handleShellOutput(msg.data);
-      } else if (msg.t === 'terminal_exited' && msg.terminal_id === SHELL_TERMINAL_ID && msg.host_id === SHELL_HOST_ID) {
-        handleShellExited(msg.status);
       }
       return;
     }
@@ -41935,6 +42582,8 @@ class DashboardControlTransport {
       apiPeerMutationsAvailable: this.lastStatus?.api_peer_mutations_available ?? null,
       apiPeerPairingAvailable: this.lastStatus?.api_peer_pairing_available ?? null,
       apiPeerWebRtcSignalAvailable: this.lastStatus?.api_peer_webrtc_signal_available ?? null,
+      apiPeerFileTransferSignalAvailable: this.lastStatus?.api_peer_file_transfer_signal_available ?? null,
+      apiPeerDashboardControlSignalAvailable: this.lastStatus?.api_peer_dashboard_control_signal_available ?? null,
       apiCoordinatorAvailable: this.lastStatus?.api_coordinator_available ?? null,
       pendingRequests: this.pending.size,
       pendingChunkedResponses: this.chunkedResponses.size,
@@ -41947,6 +42596,298 @@ class DashboardControlTransport {
   nextId() {
     this.seq += 1;
     return `dc-${Date.now()}-${this.seq}`;
+  }
+}
+
+class PeerDashboardControlConnection extends DashboardControlTransport {
+  constructor(hostId, sessionId = '') {
+    super();
+    this.hostId = String(hostId || '').trim();
+    this.sessionId = String(sessionId || generateSessionId());
+    this.signalingMode = 'peer-primary';
+    this.connectPromise = null;
+    this._readyResolve = null;
+    this._readyReject = null;
+  }
+
+  sessionKey() {
+    return `${this.hostId}|${this.sessionId}`;
+  }
+
+  connect(options = {}) {
+    if (this.connectPromise) return this.connectPromise;
+    this.connectPromise = this._connect(options).catch(err => {
+      this.lastError = err?.message || String(err);
+      this.close({ signalRemote: false });
+      throw err;
+    });
+    return this.connectPromise;
+  }
+
+  async _connect(options = {}) {
+    if (!this.hostId) throw new Error('peer id is required');
+    if (!window.RTCPeerConnection) throw new Error('RTCPeerConnection is unavailable');
+    const peer = daemons.find(d => String(d.host_id || '') === this.hostId);
+    if (!peer) throw new Error('Unknown daemon host');
+    if (peer.connected === false) throw new Error('Selected peer is not connected');
+    this.advertiseTcpViaUrl = resolveBrowserTcpViaUrl(peer) || '';
+
+    peerDashboardControlConnections.set(this.sessionKey(), this);
+    peerDashboardControlConnectionsByHost.set(this.hostId, this);
+
+    const iceServers = buildIceServersFromGatewayConfig(gatewayConfig);
+    this.pc = new RTCPeerConnection({ iceServers });
+    this.channel = this.pc.createDataChannel('intendant-dashboard-control', { ordered: true });
+    const ready = this.waitForReady(options);
+
+    this.channel.onopen = () => this.handleOpen();
+    this.channel.onmessage = ev => this.handleMessage(ev.data);
+    this.channel.onclose = () => {
+      console.debug(`[peer-dashboard-control ${this.hostId}] channel closed`);
+    };
+    this.channel.onerror = () => {
+      const err = new Error('peer dashboard-control DataChannel error');
+      this.lastError = err.message;
+      this._readyReject?.(err);
+    };
+    this.pc.onicecandidate = ev => {
+      if (!ev.candidate) {
+        console.debug(`[peer-dashboard-control ${this.hostId}] local ICE gathering complete`);
+        return;
+      }
+      const candidate = ev.candidate.toJSON ? ev.candidate.toJSON() : ev.candidate;
+      console.debug(`[peer-dashboard-control ${this.hostId}] local ICE candidate: ${this.describeCandidate(candidate)}`);
+      this.sendIce(candidate).catch(err =>
+        console.warn(`[peer-dashboard-control ${this.hostId}] ICE signal failed`, err)
+      );
+    };
+    this.pc.onconnectionstatechange = () => {
+      const state = this.pc?.connectionState || 'closed';
+      console.debug(`[peer-dashboard-control ${this.hostId}] pc state ${state}`);
+      this.refreshIceRoute().catch(() => {});
+      if (state === 'failed') {
+        const err = new Error('peer dashboard-control WebRTC connection failed');
+        this.lastError = err.message;
+        this._readyReject?.(err);
+      }
+    };
+    this.pc.oniceconnectionstatechange = () => {
+      console.debug(`[peer-dashboard-control ${this.hostId}] iceConnectionState=${this.pc?.iceConnectionState || 'closed'}`);
+      this.refreshIceRoute().catch(() => {});
+    };
+
+    this.clientNonce = dashboardRandomBase64Url(32);
+    const offer = await this.pc.createOffer();
+    await this.pc.setLocalDescription(offer);
+    this.localOfferSdp = offer.sdp || '';
+    console.debug(`[peer-dashboard-control ${this.hostId}] offer advertiseTcpViaUrl=${this.advertiseTcpViaUrl || '(none)'}`);
+    await this.sendOffer(this.localOfferSdp, options);
+    await ready;
+    return true;
+  }
+
+  waitForReady(options = {}) {
+    const timeoutMs = Math.max(1000, Number(options.timeoutMs || 30000));
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let abortHandler = null;
+      const finish = (fn, value) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeoutId);
+        if (options.signal && abortHandler) {
+          options.signal.removeEventListener('abort', abortHandler);
+        }
+        fn(value);
+      };
+      const timeoutId = window.setTimeout(
+        () => finish(reject, new Error('peer dashboard-control connection timed out')),
+        timeoutMs
+      );
+      abortHandler = () => finish(
+        reject,
+        dashboardControlAbortError('peer dashboard-control connection aborted')
+      );
+      if (options.signal) {
+        if (options.signal.aborted) {
+          abortHandler();
+        } else {
+          options.signal.addEventListener('abort', abortHandler, { once: true });
+        }
+      }
+      this._readyResolve = value => finish(resolve, value);
+      this._readyReject = err => finish(reject, err);
+    });
+  }
+
+  handleOpen() {
+    this.lastError = '';
+    this.refreshIceRoute().catch(() => {});
+    this.sendFrame({
+      t: 'hello',
+      id: this.nextId(),
+      features: ['response_credit', 'byte_streams', 'upload_frames', 'terminal_frames'],
+    });
+    this.ping().catch(() => {});
+    this.request('status').then(status => {
+      if (status && typeof status === 'object') {
+        this.lastStatus = status;
+        console.info(`[peer-dashboard-control ${this.hostId}] status RPC ok`, status.session_id || '');
+        renderDashboardTargetSummaries();
+      }
+    }).catch(err => console.warn(`[peer-dashboard-control ${this.hostId}] status RPC failed`, err));
+    this._readyResolve?.(true);
+  }
+
+  async sendOffer(sdp, options = {}) {
+    const signal = {
+      kind: 'offer',
+      sdp,
+      client_nonce: this.clientNonce,
+    };
+    if (this.advertiseTcpViaUrl) {
+      signal.advertise_tcp_via_url = this.advertiseTcpViaUrl;
+    }
+    await this.sendSignal(signal, options);
+    return null;
+  }
+
+  async sendIce(candidate) {
+    if (!this.sessionId) return;
+    await this.sendSignal({
+      kind: 'ice_candidate',
+      candidate_json: JSON.stringify(candidate || {}),
+    });
+  }
+
+  async sendSignal(signal, options = {}) {
+    const resp = await dashboardTransport.peerDashboardControlSignal(this.hostId, {
+      session_id: this.sessionId,
+      signal,
+    }, {
+      signal: options.signal,
+    });
+    if (!resp.ok) {
+      const detail = await resp.json().catch(() => ({}));
+      throw new Error(`peer dashboard-control signal failed (${resp.status}): ${detail.error || 'unknown'}`);
+    }
+  }
+
+  signalClose(sessionId) {
+    if (!sessionId) return;
+    this.sendSignal({ kind: 'close' }).catch(() => {});
+  }
+
+  async handleSignalAnswer(signal) {
+    const sdp = signal?.sdp || '';
+    console.debug(`[peer-dashboard-control ${this.hostId}] answer received`);
+    await this.handleAnswer({
+      session_id: this.sessionId,
+      sdp,
+      binding: signal?.binding || null,
+    });
+  }
+
+  handleSignalIce(candidateJson) {
+    if (!candidateJson) return;
+    let candidate = candidateJson;
+    if (typeof candidateJson === 'string') {
+      try {
+        candidate = JSON.parse(candidateJson);
+      } catch (err) {
+        console.warn(`[peer-dashboard-control ${this.hostId}] remote ICE JSON parse failed`, err);
+        return;
+      }
+    }
+    this.handleIceCandidate(candidate);
+  }
+
+  close(options = {}) {
+    const key = this.sessionKey();
+    if (peerDashboardControlConnections.get(key) === this) {
+      peerDashboardControlConnections.delete(key);
+    }
+    if (peerDashboardControlConnectionsByHost.get(this.hostId) === this) {
+      peerDashboardControlConnectionsByHost.delete(this.hostId);
+    }
+    for (const pending of this.pending.values()) {
+      pending.reject(new Error('peer dashboard-control transport closed'));
+    }
+    this.pending.clear();
+    this.chunkedResponses.clear();
+    this.byteStreams.clear();
+    if (options.signalRemote !== false && this.sessionId) {
+      this.signalClose(this.sessionId);
+    }
+    try { this.channel?.close(); } catch {}
+    try { this.pc?.close(); } catch {}
+    this.channel = null;
+    this.pc = null;
+  }
+
+  describeCandidate(candidate) {
+    const line = String(candidate?.candidate || '').trim();
+    const parts = line.split(/\s+/);
+    const protocol = (parts[2] || '').toLowerCase();
+    const address = parts[4] || '';
+    const port = parts[5] || '';
+    const typeIndex = parts.indexOf('typ');
+    const type = typeIndex >= 0 ? parts[typeIndex + 1] : '';
+    const tcpTypeIndex = parts.indexOf('tcptype');
+    const tcpType = tcpTypeIndex >= 0 ? ` ${parts[tcpTypeIndex + 1] || ''}` : '';
+    return `${type || 'candidate'} ${protocol} ${address}:${port}${tcpType}`.trim();
+  }
+}
+
+function peerDashboardControlSignalAvailable(peerId) {
+  const id = String(peerId || '').trim();
+  if (!id) return false;
+  if (!window.RTCPeerConnection) return false;
+  const peer = daemons.find(d => d.host_id === id);
+  if (!peer || peer.connected === false) return false;
+  if (dashboardConnectModeEnabled()) {
+    return Boolean(
+      dashboardTransport?.canUseRpc?.() &&
+      dashboardControlTransport?.lastStatus?.api_peer_dashboard_control_signal_available === true
+    );
+  }
+  return true;
+}
+
+async function peerDashboardControlConnectionForHost(hostId, options = {}) {
+  const id = String(hostId || '').trim();
+  if (!id || id === selfPeerId) return null;
+  if (!peerDashboardControlSignalAvailable(id)) {
+    throw new Error('peer dashboard-control signaling is not available');
+  }
+  const existing = peerDashboardControlConnectionsByHost.get(id);
+  if (existing && existing.canUseRpc()) return existing;
+  if (existing) existing.close({ signalRemote: true });
+  const conn = new PeerDashboardControlConnection(id);
+  await conn.connect(options);
+  return conn;
+}
+
+function handlePeerDashboardControlSignal(hostId, sessionId, signal) {
+  const sessionKey = `${hostId}|${sessionId}`;
+  const conn = peerDashboardControlConnections.get(sessionKey);
+  const kind = signal && signal.kind;
+  if (!conn) {
+    console.debug(`[peer-dashboard-control ${hostId}] received ${kind || '(no-kind)'} for unknown session ${sessionId}`);
+    return;
+  }
+  if (kind === 'answer') {
+    conn.handleSignalAnswer(signal).catch(err => {
+      conn.lastError = err?.message || String(err);
+      console.warn(`[peer-dashboard-control ${hostId}] answer failed`, err);
+      conn.close({ signalRemote: false });
+    });
+  } else if (kind === 'ice_candidate') {
+    conn.handleSignalIce(signal.candidate_json || '');
+  } else if (kind === 'close') {
+    conn.close({ signalRemote: false });
+  } else {
+    console.debug(`[peer-dashboard-control ${hostId}] unknown signal kind=${kind || '(none)'} for session ${sessionId}`);
   }
 }
 
@@ -42266,6 +43207,32 @@ function dashboardTransferUploadAvailable() {
   );
 }
 
+async function ensureDashboardTransferUploadAvailable(options = {}) {
+  if (dashboardTransferUploadAvailable()) return true;
+  if (
+    !dashboardTransport ||
+    !dashboardTransport.canUseRpc ||
+    !dashboardTransport.canUseRpc() ||
+    !dashboardControlTransport
+  ) {
+    return false;
+  }
+  try {
+    const status = await dashboardTransport.request('status', {}, {
+      timeoutMs: options.timeoutMs || 15000,
+      signal: options.signal,
+    });
+    if (status && typeof status === 'object') {
+      dashboardControlTransport.lastStatus = status;
+      dashboardUpdateTransportStatus();
+    }
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    console.warn('[dashboard-control] transfer upload status refresh failed', err);
+  }
+  return dashboardTransferUploadAvailable();
+}
+
 function downloadDashboardBlob(blob, filename, contentType) {
   const finalBlob = blob instanceof Blob
     ? blob
@@ -42344,7 +43311,7 @@ function dashboardNormalizeByteRangeResult(method, result, expectedOffset) {
 
 async function dashboardFetchRangedBytes(method, params = {}, options = {}) {
   if (!dashboardByteStreamMethodAvailable(method)) {
-    throw new Error(`${method} byte stream is not available over the Connect dashboard tunnel`);
+    throw new Error(`${method} byte stream is not available through this dashboard connection`);
   }
   const chunkBytes = Math.max(1, Math.floor(Number(options.chunkBytes) || DASHBOARD_RANGED_DOWNLOAD_CHUNK_BYTES));
   const maxBytes = Math.max(1, Math.floor(Number(options.maxBytes) || DASHBOARD_RANGED_DOWNLOAD_MAX_BYTES));
@@ -42450,7 +43417,7 @@ async function downloadSessionReportViaDashboardControl(event) {
     if (dashboardConnectModeEnabled()) {
       event.preventDefault();
       if (typeof showControlToast === 'function') {
-        showControlToast('error', 'Session report requires the Connect tunnel');
+        showControlToast('error', 'Session report is unavailable until dashboard access reconnects');
       }
     }
     return;
@@ -42879,7 +43846,7 @@ async function refreshPeersFromApi() {
       }
     }
     if (!data && dashboardConnectModeEnabled()) {
-      throw new Error('peer list is unavailable without the Connect tunnel');
+      throw new Error('Peer list is unavailable until dashboard access reconnects');
     }
     if (!data) {
       const resp = await authedFetch('/api/peers');
@@ -43041,6 +44008,13 @@ function renderDaemonsList() {
 
   // Same for the Files tab download source selector.
   refreshFilesDownloadHostOptions();
+
+  // Same for the Terminal Shell target selector.
+  refreshShellHostOptions();
+
+  // Target summaries reuse the same daemon list and should track
+  // add/remove/offline transitions immediately.
+  renderDashboardTargetSummaries();
 
   // Refresh the aggregate connection dot in the status bar.
   updateHostsAggregateDot();
@@ -43530,7 +44504,7 @@ async function postVisualFreshnessDiagnostics(sessionId, ndjson) {
     return result;
   }
   if (dashboardConnectModeEnabled()) {
-    throw new Error('dashboard Connect visual freshness tunnel is not available');
+    throw new Error('Hosted Connect visual diagnostics are not available');
   }
   const url = `/api/diagnostics/visual-freshness?session_id=${encodeURIComponent(sessionId)}`;
   const resp = await authedFetch(url, {
@@ -47194,7 +48168,7 @@ async function addDaemon() {
         return;
       }
       const hint = baseUrl.startsWith('https://')
-        ? 'Is the mTLS client cert for this daemon installed on this server?'
+        ? 'This daemon may not have a trusted client certificate for that peer yet.'
         : 'Is the remote daemon running and reachable?';
       setDaemonsStatus(`Failed to add outbound connection: ${errorText}. ${hint}`, 'error');
       return;
@@ -48017,7 +48991,26 @@ function fetchSessionsForHost(hostId, options = {}) {
       }
     }
     if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-      throw new Error('session list is unavailable without the Connect tunnel');
+      throw new Error('Session list is unavailable until dashboard access reconnects');
+    }
+    if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
+      try {
+        const conn = await peerDashboardControlConnectionForHost(hostId, {
+          signal: options.signal,
+          timeoutMs: 30000,
+        });
+        return await conn.request('api_sessions', { limit }, {
+          signal: options.signal,
+          timeoutMs: 60000,
+        });
+      } catch (err) {
+        if (err?.name === 'AbortError') throw err;
+        if (dashboardConnectModeEnabled()) throw err;
+        console.warn('[peer-dashboard-control] api_sessions RPC failed, falling back to direct peer HTTP', err);
+      }
+    }
+    if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+      throw new Error('Peer sessions are unavailable for this target');
     }
     const r = await (hostId === selfPeerId ? authedFetch(url) : fetch(url));
     if (!r.ok) throw new Error(`/api/sessions returned ${r.status}`);
@@ -48106,7 +49099,32 @@ async function streamSessionsForHost(hostId, options = {}, onEvent = {}) {
     }
   }
   if (hostId === selfPeerId && dashboardConnectModeEnabled()) {
-    throw new Error('session stream is unavailable without the Connect tunnel');
+    throw new Error('Session stream is unavailable until dashboard access reconnects');
+  }
+  if (hostId !== selfPeerId && peerDashboardControlSignalAvailable(hostId)) {
+    const state = { finalSessions: null };
+    try {
+      const conn = await peerDashboardControlConnectionForHost(hostId, {
+        signal: options.signal,
+        timeoutMs: 30000,
+      });
+      await conn.stream('api_sessions_stream', { limit }, {
+        signal: options.signal,
+        timeoutMs: 120000,
+      }, {
+        event(event) {
+          handleSessionStreamEvent(event, onEvent, state);
+        },
+      });
+      return state.finalSessions;
+    } catch (err) {
+      if (err?.name === 'AbortError') throw err;
+      if (dashboardConnectModeEnabled()) throw err;
+      console.warn('[peer-dashboard-control] api_sessions_stream RPC failed, falling back to direct peer HTTP stream', err);
+    }
+  }
+  if (hostId !== selfPeerId && dashboardConnectModeEnabled()) {
+    throw new Error('Peer session updates are unavailable for this target');
   }
   const url = sessionListStreamUrl(baseUrl, limit);
   const request = hostId === selfPeerId
@@ -50164,6 +51182,7 @@ function refreshFilesDownloadHostOptions() {
   const stillPresent = options.some(option => option.id === previous);
   select.value = stillPresent ? previous : '';
   onFilesDownloadHostChanged({ preserveStatus: true });
+  renderDashboardTargetSummary('files-target-summary', filesDownloadSelectedPeerId(), 'files');
 }
 
 function onFilesDownloadHostChanged(options = {}) {
@@ -50175,9 +51194,10 @@ function onFilesDownloadHostChanged(options = {}) {
       ? 'Remote peer browsing is not available yet; enter a full path'
       : 'Choose a local file to download';
   }
+  renderDashboardTargetSummary('files-target-summary', selectedPeer, 'files');
   refreshFilesDownloadAvailability();
   if (!options.preserveStatus) {
-    setFilesDownloadStatus('', selectedPeer ? 'Enter a full path on the selected peer' : 'Ready');
+    setFilesDownloadStatus('', selectedPeer ? 'Enter a full path on the selected target' : 'Ready');
     setFilesDownloadProgress(0, 0);
   }
 }
@@ -50193,7 +51213,7 @@ function filesUploadConflictPolicy() {
 
 function filesDownloadTunnelAvailable() {
   const peerId = filesDownloadSelectedPeerId();
-  if (peerId) return peerFileTransferSignalAvailable(peerId);
+  if (peerId) return peerDashboardControlSignalAvailable(peerId) || peerFileTransferSignalAvailable(peerId);
   return dashboardTransferDownloadAvailable() ||
     dashboardByteStreamMethodAvailable('api_fs_read') ||
     !dashboardConnectModeEnabled();
@@ -50207,11 +51227,11 @@ function filesDownloadUnavailableMessage(peerIdOverride = undefined) {
     if (!peer) return 'Selected peer is no longer configured';
     if (peer.connected === false) return 'Selected peer is not connected';
     return dashboardConnectModeEnabled()
-      ? 'Peer downloads require the Connect dashboard tunnel'
-      : 'Peer downloads are not available from this dashboard';
+      ? 'Peer file access is unavailable until this dashboard reconnects'
+      : 'Peer file access is unavailable for this target';
   }
   return dashboardConnectModeEnabled()
-    ? 'File downloads require the Connect dashboard tunnel'
+    ? 'File access is unavailable until the dashboard reconnects'
     : 'File downloads are not available from this dashboard';
 }
 
@@ -50558,6 +51578,7 @@ function refreshFilesDownloadAvailability() {
   }
   const available = filesDownloadTunnelAvailable();
   setFilesDownloadBusy(false);
+  renderDashboardTargetSummary('files-target-summary', filesDownloadSelectedPeerId(), 'files');
   const statusEl = document.getElementById('files-download-status');
   if (!available && statusEl && !statusEl.textContent) {
     setFilesDownloadStatus('warn', filesDownloadUnavailableMessage());
@@ -50655,6 +51676,45 @@ async function dashboardFetchPeerFileRangeBytesWithRetry(connection, path, offse
   }
   if (!Number.isSafeInteger(range.totalSize) || range.totalSize < range.rangeEnd) {
     throw new Error('peer file-transfer returned invalid total size');
+  }
+  return range;
+}
+
+async function dashboardFetchPeerDashboardRangeBytesWithRetry(connection, path, offset, length, options = {}) {
+  if (!connection || typeof connection.requestBytes !== 'function') {
+    throw new Error('peer dashboard-control connection is not available');
+  }
+  if (options.signal?.aborted) throw dashboardControlAbortError('peer dashboard-control read aborted');
+  const retries = Number.isFinite(Number(options.retries)) ? Math.max(0, Number(options.retries)) : 2;
+  let attempt = 0;
+  let raw;
+  for (;;) {
+    if (options.signal?.aborted) throw dashboardControlAbortError('peer dashboard-control read aborted');
+    try {
+      raw = await connection.requestBytes('api_fs_read', {
+        path,
+        offset,
+        length,
+      }, {
+        signal: options.signal,
+        timeoutMs: options.timeoutMs || rangedDownloadTimeoutMs(length),
+      });
+      break;
+    } catch (err) {
+      if (err?.name === 'AbortError' || attempt >= retries) throw err;
+      attempt += 1;
+      await new Promise(resolve => setTimeout(resolve, 200 * attempt));
+    }
+  }
+  const range = dashboardNormalizeByteRangeResult('api_fs_read', raw, offset);
+  if (!Number.isSafeInteger(range.rangeStart) || range.rangeStart !== offset) {
+    throw new Error('peer dashboard-control returned unexpected range start');
+  }
+  if (!Number.isSafeInteger(range.rangeEnd) || range.rangeEnd < range.rangeStart || range.rangeEnd - range.rangeStart !== range.bytes.byteLength) {
+    throw new Error('peer dashboard-control returned inconsistent range length');
+  }
+  if (!Number.isSafeInteger(range.totalSize) || range.totalSize < range.rangeEnd) {
+    throw new Error('peer dashboard-control returned invalid total size');
   }
   return range;
 }
@@ -51090,22 +52150,23 @@ function filesTransferApplyServerJob(transfer, job) {
 
 async function runFilesDownloadTransfer(transfer) {
   const peerId = String(transfer.peerId || '').trim();
-  const usePeerFileTransfer = Boolean(peerId);
-  const useDurableTransfer = !usePeerFileTransfer && dashboardTransferDownloadAvailable();
+  let usePeerDashboardControl = Boolean(peerId) && peerDashboardControlSignalAvailable(peerId);
+  let usePeerFileTransfer = Boolean(peerId) && !usePeerDashboardControl;
+  const useDurableTransfer = !peerId && dashboardTransferDownloadAvailable();
   const hasArtifact = Boolean(transfer.artifact && typeof transfer.artifact === 'object');
   const fallbackMethod = String(transfer.directMethod || (!hasArtifact ? 'api_fs_read' : '')).trim();
-  const canUseFallbackMethod = !usePeerFileTransfer && Boolean(fallbackMethod && dashboardByteStreamMethodAvailable(fallbackMethod));
+  const canUseFallbackMethod = !peerId && Boolean(fallbackMethod && dashboardByteStreamMethodAvailable(fallbackMethod));
   const useHttpFilesystemFallback = !useDurableTransfer &&
     !canUseFallbackMethod &&
-    !usePeerFileTransfer &&
+    !peerId &&
     !hasArtifact &&
     !dashboardConnectModeEnabled();
-  if (usePeerFileTransfer && !peerFileTransferSignalAvailable(peerId)) {
+  if (peerId && !usePeerDashboardControl && !peerFileTransferSignalAvailable(peerId)) {
     throw new Error(filesDownloadUnavailableMessage(peerId));
   }
-  if (!usePeerFileTransfer && !useDurableTransfer && !canUseFallbackMethod && !useHttpFilesystemFallback) {
+  if (!peerId && !useDurableTransfer && !canUseFallbackMethod && !useHttpFilesystemFallback) {
     throw new Error(hasArtifact
-      ? 'Artifact download requires the durable transfer tunnel'
+      ? 'Artifact download is unavailable until resumable file access is ready'
       : filesDownloadUnavailableMessage());
   }
   transfer.status = 'running';
@@ -51114,17 +52175,35 @@ async function runFilesDownloadTransfer(transfer) {
   transfer.cancelRequested = false;
   const controller = new AbortController();
   transfer.abortController = controller;
+  transfer.transport = '';
   filesDownloadAbort = controller;
   renderFilesTransfers();
   filesUpdateActiveDownloadSummary(transfer);
   let peerConnection = null;
+  let peerDashboardConnection = null;
   try {
     if (transfer.loaded > 0 && (!Array.isArray(transfer.parts) || transfer.parts.length === 0)) {
       const hydrated = await filesTransferLoadDownloadParts(transfer);
       if (!hydrated) resetFilesDownloadTransfer(transfer);
     }
+    if (usePeerDashboardControl) {
+      try {
+        peerDashboardConnection = await peerDashboardControlConnectionForHost(peerId, {
+          signal: controller.signal,
+          timeoutMs: transfer.timeoutMs || 30000,
+        });
+        transfer.transport = 'peer-dashboard-control';
+        transfer.peerDashboardControlSessionId = peerDashboardConnection.sessionId;
+      } catch (err) {
+        if (!peerFileTransferSignalAvailable(peerId)) throw err;
+        console.warn('[peer-dashboard-control] file download tunnel failed, falling back to peer file-transfer', err);
+        usePeerDashboardControl = false;
+        usePeerFileTransfer = true;
+      }
+    }
     if (usePeerFileTransfer) {
       peerConnection = new PeerFileTransferConnection(peerId, generateSessionId());
+      transfer.transport = 'peer-file-transfer';
       transfer.peerTransferSessionId = peerConnection.sessionId;
       await peerConnection.connect({
         signal: controller.signal,
@@ -51132,6 +52211,7 @@ async function runFilesDownloadTransfer(transfer) {
       });
     }
     if (useDurableTransfer && !transfer.resumeToken && !transfer.serverJobId) {
+      transfer.transport = 'durable-transfer';
       const payload = hasArtifact
         ? {
             kind: 'download',
@@ -51160,18 +52240,28 @@ async function runFilesDownloadTransfer(transfer) {
       const method = useDurableTransfer ? 'api_transfer_download_read' : fallbackMethod;
       let range;
       if (useHttpFilesystemFallback) {
+        transfer.transport = transfer.transport || 'http-filesystem';
         range = await dashboardFetchHttpRangeBytesWithRetry(transfer.path, transfer.loaded, requested, {
           signal: controller.signal,
           retries: transfer.retries,
           timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
         });
+      } else if (usePeerDashboardControl) {
+        transfer.transport = transfer.transport || 'peer-dashboard-control';
+        range = await dashboardFetchPeerDashboardRangeBytesWithRetry(peerDashboardConnection, transfer.path, transfer.loaded, requested, {
+          signal: controller.signal,
+          retries: transfer.retries,
+          timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
+        });
       } else if (usePeerFileTransfer) {
+        transfer.transport = transfer.transport || 'peer-file-transfer';
         range = await dashboardFetchPeerFileRangeBytesWithRetry(peerConnection, transfer.path, transfer.loaded, requested, {
           signal: controller.signal,
           retries: transfer.retries,
           timeoutMs: transfer.timeoutMs || rangedDownloadTimeoutMs(requested),
         });
       } else {
+        transfer.transport = transfer.transport || 'dashboard-control';
         const params = useDurableTransfer
           ? {
               id: transfer.serverJobId || undefined,
@@ -51279,8 +52369,8 @@ async function runFilesDownloadTransfer(transfer) {
 }
 
 async function runFilesFilesystemUploadTransfer(transfer, controller) {
-  if (!dashboardTransferUploadAvailable()) {
-    throw new Error('Filesystem upload requires the durable transfer tunnel');
+  if (!await ensureDashboardTransferUploadAvailable({ signal: controller.signal })) {
+    throw new Error('Filesystem upload is unavailable until file-write access is ready');
   }
   const file = await filesTransferGetUploadBlob(transfer);
   if (!(file instanceof Blob)) {
@@ -51375,6 +52465,14 @@ function filesDeleteServerTransfer(transfer) {
 
 async function runFilesUploadTransfer(transfer) {
   const filesystemUpload = Boolean(transfer.destination && transfer.destination !== 'task');
+  if (filesystemUpload && transfer.uploadBlobPersistPromise) {
+    setFilesUploadStatus('warn', `Preparing ${transfer.name || 'upload.bin'}`);
+    const persisted = await transfer.uploadBlobPersistPromise;
+    transfer.uploadBlobPersistPromise = null;
+    if (!persisted) {
+      throw new Error('Browser storage is unavailable for resumable uploads');
+    }
+  }
   if (!transfer.file && !(filesystemUpload && transfer.uploadBlobStored)) {
     throw new Error('missing upload file');
   }
@@ -51396,7 +52494,7 @@ async function runFilesUploadTransfer(transfer) {
     } else {
       if (!transfer.file) throw new Error('missing upload file');
       if (!dashboardUploadRpcAvailable()) {
-        throw new Error('Upload requires the Connect dashboard upload tunnel');
+        throw new Error('Upload is unavailable until dashboard access reconnects');
       }
       const descriptor = await dashboardTransport.uploadBytes('api_session_current_upload', {
         destination: 'task',
@@ -51640,7 +52738,7 @@ async function refreshFilesStagedUploads() {
     ) {
       uploads = await dashboardTransport.request('api_session_current_uploads', {}, { timeoutMs: 60000 });
     } else {
-      if (dashboardConnectModeEnabled()) throw new Error('Staged uploads require the Connect dashboard tunnel');
+      if (dashboardConnectModeEnabled()) throw new Error('Staged uploads are unavailable until dashboard access reconnects');
       const resp = await fetch('/api/session/current/uploads');
       uploads = await resp.json().catch(() => []);
       if (!resp.ok) throw new Error(`staged uploads returned ${resp.status}`);
@@ -51681,7 +52779,7 @@ async function downloadFilesStagedUpload(id) {
       return result;
     }
     if (dashboardConnectModeEnabled()) {
-      throw new Error('Staged upload download requires the Connect dashboard transfer tunnel');
+      throw new Error('Staged upload download is unavailable until file access is ready');
     }
     const name = filesStagedDescriptorName(upload);
     const resp = await authedFetch(`/api/session/current/uploads/${encodeURIComponent(id)}/raw`, {
@@ -51757,7 +52855,7 @@ function queueFilesUpload(file, options = {}) {
     timeoutMs: options.timeoutMs,
   };
   if (transfer.destination !== 'task') {
-    filesTransferPutUploadBlob(transfer, file);
+    transfer.uploadBlobPersistPromise = filesTransferPutUploadBlob(transfer, file);
   }
   setFilesUploadStatus('warn', 'Queued upload');
   return queueFilesTransfer(transfer);
@@ -51785,6 +52883,7 @@ function queueFilesUploads(files, options = {}) {
 	    path: transfer.path || '',
 	    sourceKind: transfer.sourceKind || '',
 	    sourceLabel: transfer.sourceLabel || '',
+	    transport: transfer.transport || '',
 	    peerId: transfer.peerId || '',
 	    peerLabel: transfer.peerLabel || '',
 	    artifact: transfer.artifact || null,

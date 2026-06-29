@@ -19580,6 +19580,20 @@ pub fn spawn_web_gateway(
                                                     )
                                                     .await;
                                                 }
+                                                Ok(ControlMsg::PeerDashboardControlSignal {
+                                                    session_id,
+                                                    signal,
+                                                }) => {
+                                                    handle_peer_dashboard_control_signal(
+                                                        session_id,
+                                                        signal,
+                                                        Arc::clone(&dashboard_control_inbound),
+                                                        peer_identity_inbound.clone(),
+                                                        direct_tx_inbound.clone(),
+                                                        &bus_inbound,
+                                                    )
+                                                    .await;
+                                                }
                                                 Ok(ControlMsg::RequestDisplayInputAuthority {
                                                     display_id,
                                                 }) => {
@@ -21988,6 +22002,12 @@ pub fn spawn_web_gateway(
                                             )
                                             .await
                                         }
+                                        "dashboard-control-webrtc" => {
+                                            peers_dashboard_control_signal(
+                                                registry, &id, &body_text, &bus,
+                                            )
+                                            .await
+                                        }
                                         other => (
                                             404,
                                             serde_json::json!({
@@ -23580,6 +23600,12 @@ struct PeerFileTransferSignalRequest {
     signal: crate::peer::WebRtcSignal,
 }
 
+#[derive(Deserialize)]
+struct PeerDashboardControlSignalRequest {
+    session_id: String,
+    signal: crate::peer::WebRtcSignal,
+}
+
 /// Handle `POST /api/peers/{id}/webrtc`. Routes a WebRTC signaling
 /// frame from the browser to the named peer over the federation
 /// transport. Returns `200 {"ok": true}` on accepted dispatch, or
@@ -23763,6 +23789,59 @@ pub(crate) async fn peers_file_transfer_signal(
     }
 }
 
+pub(crate) async fn peers_dashboard_control_signal(
+    registry: &crate::peer::PeerRegistry,
+    id: &str,
+    body_text: &str,
+    bus: &EventBus,
+) -> (u16, String) {
+    const LOG_SOURCE: &str = "peer-dashboard-control";
+    let req: PeerDashboardControlSignalRequest = match serde_json::from_str(body_text) {
+        Ok(r) => r,
+        Err(e) => {
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!("rejecting dashboard-control signal from browser: {e}"),
+                turn: None,
+            });
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    let peer_id = crate::peer::PeerId(id.to_string());
+    let handle = match registry.get(&peer_id) {
+        Some(h) => h,
+        None => {
+            return (
+                404,
+                serde_json::json!({"error": "peer not found"}).to_string(),
+            );
+        }
+    };
+    match handle
+        .peer_dashboard_control_signal(crate::peer::WebRtcSessionId(req.session_id), req.signal)
+        .await
+    {
+        Ok(()) => (200, serde_json::json!({"ok": true}).to_string()),
+        Err(crate::peer::PeerError::NotConnected) => (
+            502,
+            serde_json::json!({"error": "peer is not connected"}).to_string(),
+        ),
+        Err(crate::peer::PeerError::UnsupportedCapability(_)) => (
+            502,
+            serde_json::json!({
+                "error": "peer's transport does not support dashboard-control signaling"
+            })
+            .to_string(),
+        ),
+        Err(e) => (500, serde_json::json!({"error": e.to_string()}).to_string()),
+    }
+}
+
 /// Slice 3b: rewrite an outgoing federated `WebRtcSignal::Answer` to
 /// (a) register the peer's ICE ufrag in the relay registry and
 /// (b) inject a TCP candidate pointing at the primary's own address
@@ -23797,7 +23876,7 @@ async fn maybe_rewrite_federated_answer(
         crate::peer::PeerEvent::WebRtcSignal {
             display_id,
             session_id,
-            signal: crate::peer::WebRtcSignal::Answer { sdp },
+            signal: crate::peer::WebRtcSignal::Answer { sdp, .. },
         } => (*display_id, session_id.clone(), sdp.clone()),
         _ => return event,
     };
@@ -23923,7 +24002,10 @@ async fn maybe_rewrite_federated_answer(
     crate::peer::PeerEvent::WebRtcSignal {
         display_id,
         session_id,
-        signal: crate::peer::WebRtcSignal::Answer { sdp: rewritten_sdp },
+        signal: crate::peer::WebRtcSignal::Answer {
+            sdp: rewritten_sdp,
+            binding: None,
+        },
     }
 }
 
@@ -24001,6 +24083,7 @@ async fn handle_peer_file_transfer_signal(
         crate::peer::WebRtcSignal::Offer {
             sdp,
             advertise_tcp_via_url,
+            ..
         } => {
             let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
                 Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
@@ -24042,7 +24125,10 @@ async fn handle_peer_file_transfer_signal(
                 Ok(answer_sdp) => {
                     let answer = crate::types::OutboundEvent::PeerFileTransferSignal {
                         session_id: session_id.clone(),
-                        signal: crate::peer::WebRtcSignal::Answer { sdp: answer_sdp },
+                        signal: crate::peer::WebRtcSignal::Answer {
+                            sdp: answer_sdp,
+                            binding: None,
+                        },
                     };
                     match serde_json::to_string(&answer) {
                         Ok(s) => {
@@ -24130,6 +24216,204 @@ async fn handle_peer_file_transfer_signal(
                 level: "warn".to_string(),
                 source: LOG_SOURCE.to_string(),
                 content: format!("unknown file-transfer signal (session={session_id})"),
+                turn: None,
+            });
+        }
+    }
+}
+
+/// Handle browser-to-peer dashboard-control signaling on the peer daemon.
+///
+/// This is the shared tunnel path for peer session inspection, files, terminal,
+/// and future dashboard RPC. The federation transport authenticates the primary
+/// daemon; the resulting DataChannel runtime then enforces that primary's
+/// approved peer profile and filesystem roots per frame/method.
+async fn handle_peer_dashboard_control_signal(
+    session_id: String,
+    signal: crate::peer::WebRtcSignal,
+    registry: Arc<crate::dashboard_control::DashboardControlRegistry>,
+    identity: Option<PeerConnectionIdentity>,
+    direct_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    bus: &EventBus,
+) {
+    const LOG_SOURCE: &str = "peer-dashboard-control";
+    let signal_kind = match &signal {
+        crate::peer::WebRtcSignal::Offer { .. } => "offer",
+        crate::peer::WebRtcSignal::Answer { .. } => "answer",
+        crate::peer::WebRtcSignal::IceCandidate { .. } => "ice_candidate",
+        crate::peer::WebRtcSignal::Close => "close",
+        crate::peer::WebRtcSignal::Unknown => "unknown",
+    };
+    bus.send(AppEvent::LogEntry {
+        session_id: None,
+        level: "debug".to_string(),
+        source: LOG_SOURCE.to_string(),
+        content: format!("received {signal_kind} from connector (session={session_id})"),
+        turn: None,
+    });
+
+    match signal {
+        crate::peer::WebRtcSignal::Offer {
+            sdp,
+            advertise_tcp_via_url,
+            client_nonce,
+        } => {
+            let tcp_advertised_addr = match advertise_tcp_via_url.as_deref() {
+                Some(url) if !url.is_empty() => resolve_url_to_socket_addr(url).await,
+                _ => None,
+            };
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "debug".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "dashboard-control offer resolved advertise_tcp_via_url={:?} -> tcp_candidate={:?}",
+                    advertise_tcp_via_url.as_deref().unwrap_or(""),
+                    tcp_advertised_addr
+                ),
+                turn: None,
+            });
+            let Some(identity) = identity else {
+                bus.send(AppEvent::LogEntry {
+                    session_id: None,
+                    level: "warn".to_string(),
+                    source: LOG_SOURCE.to_string(),
+                    content: format!(
+                        "dropping dashboard-control offer without approved peer identity (session={session_id})"
+                    ),
+                    turn: None,
+                });
+                return;
+            };
+            let grant = crate::dashboard_control::DashboardControlGrant::Peer {
+                fingerprint: identity.fingerprint,
+                label: identity.label,
+                profile: identity.profile,
+                filesystem: identity.filesystem,
+            };
+            match registry
+                .answer_offer_with_session_id_grant_and_tcp(
+                    session_id.clone(),
+                    sdp,
+                    None,
+                    client_nonce,
+                    grant,
+                    tcp_advertised_addr,
+                )
+                .await
+            {
+                Ok(answer) => {
+                    let binding = serde_json::to_value(answer.binding)
+                        .unwrap_or_else(|e| serde_json::json!({"error": e.to_string()}));
+                    let response = crate::types::OutboundEvent::PeerDashboardControlSignal {
+                        session_id: answer.session_id,
+                        signal: crate::peer::WebRtcSignal::Answer {
+                            sdp: answer.sdp,
+                            binding: Some(binding),
+                        },
+                    };
+                    match serde_json::to_string(&response) {
+                        Ok(s) => {
+                            if direct_tx.send(s).is_err() {
+                                bus.send(AppEvent::LogEntry {
+                                    session_id: None,
+                                    level: "warn".to_string(),
+                                    source: LOG_SOURCE.to_string(),
+                                    content: format!(
+                                        "failed to send dashboard-control answer to connector (session={session_id})"
+                                    ),
+                                    turn: None,
+                                });
+                            }
+                        }
+                        Err(e) => {
+                            bus.send(AppEvent::LogEntry {
+                                session_id: None,
+                                level: "error".to_string(),
+                                source: LOG_SOURCE.to_string(),
+                                content: format!(
+                                    "failed to serialize dashboard-control answer (session={session_id}): {e}"
+                                ),
+                                turn: None,
+                            });
+                        }
+                    }
+                }
+                Err(e) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "dashboard-control offer failed (session={session_id}): {e}"
+                        ),
+                        turn: None,
+                    });
+                }
+            }
+        }
+        crate::peer::WebRtcSignal::IceCandidate { candidate_json } => {
+            let candidate = match serde_json::from_str::<serde_json::Value>(&candidate_json) {
+                Ok(candidate) => candidate,
+                Err(e) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "dropping invalid dashboard-control ICE candidate (session={session_id}): {e}"
+                        ),
+                        turn: None,
+                    });
+                    return;
+                }
+            };
+            match registry.add_ice_candidate(&session_id, &candidate).await {
+                Ok(true) => {}
+                Ok(false) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "debug".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "dropping dashboard-control ICE for unknown session {session_id}"
+                        ),
+                        turn: None,
+                    });
+                }
+                Err(e) => {
+                    bus.send(AppEvent::LogEntry {
+                        session_id: None,
+                        level: "warn".to_string(),
+                        source: LOG_SOURCE.to_string(),
+                        content: format!(
+                            "dashboard-control ICE failed (session={session_id}): {e}"
+                        ),
+                        turn: None,
+                    });
+                }
+            }
+        }
+        crate::peer::WebRtcSignal::Close => {
+            registry.close(&session_id).await;
+        }
+        crate::peer::WebRtcSignal::Answer { .. } => {
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!(
+                    "unexpected dashboard-control Answer received on peer side (session={session_id})"
+                ),
+                turn: None,
+            });
+        }
+        crate::peer::WebRtcSignal::Unknown => {
+            bus.send(AppEvent::LogEntry {
+                session_id: None,
+                level: "warn".to_string(),
+                source: LOG_SOURCE.to_string(),
+                content: format!("unknown dashboard-control signal (session={session_id})"),
                 turn: None,
             });
         }
@@ -24229,6 +24513,7 @@ async fn handle_federated_webrtc_signal(
         crate::peer::WebRtcSignal::Offer {
             sdp,
             advertise_tcp_via_url,
+            ..
         } => {
             // Resolve the browser-supplied URL hint to a SocketAddr.
             // Unreachable hostnames / malformed URLs / missing hint
@@ -24373,7 +24658,10 @@ async fn handle_federated_webrtc_signal(
                     let answer = crate::types::OutboundEvent::WebRtcSignal {
                         display_id,
                         session_id: session_id.clone(),
-                        signal: crate::peer::WebRtcSignal::Answer { sdp: answer_sdp },
+                        signal: crate::peer::WebRtcSignal::Answer {
+                            sdp: answer_sdp,
+                            binding: None,
+                        },
                     };
                     match serde_json::to_string(&answer) {
                         Ok(s) => {

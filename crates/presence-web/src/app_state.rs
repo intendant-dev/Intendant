@@ -261,6 +261,17 @@ pub enum UiCommand {
         session_id: String,
         signal: serde_json::Value,
     },
+    /// One leg of the shared browser-to-peer dashboard-control WebRTC
+    /// exchange. Same daemon-scoped routing shape as file transfer; the
+    /// JS connection uses the resulting DataChannel for peer session
+    /// loading, stats, file bytes, terminal frames, and future dashboard
+    /// RPC.
+    #[serde(rename = "peer_dashboard_control_signal")]
+    PeerDashboardControlSignal {
+        host_id: String,
+        session_id: String,
+        signal: serde_json::Value,
+    },
     /// A Codex thread action (/compact, /fork, /undo, /review, /init,
     /// /memory-reset, /new) finished. `success` + `message` drive a
     /// dashboard toast and the Activity log entry.
@@ -3313,6 +3324,30 @@ pub fn render_peer_event(host_id: &str, payload: &serde_json::Value) -> Vec<UiCo
             }]
         }
 
+        // Shared browser-to-peer dashboard-control signaling. This
+        // intentionally mirrors file-transfer signaling; both are
+        // daemon-scoped RTCPeerConnections routed by host/session.
+        "peer_dashboard_control_signal" => {
+            let session_id = payload["session_id"].as_str().unwrap_or("").to_string();
+            let signal = payload["signal"].clone();
+            if session_id.is_empty() {
+                return vec![UiCommand::PeerLog {
+                    host_id: host,
+                    ts: now,
+                    level: "warn".to_string(),
+                    source: "peer-dashboard-control".to_string(),
+                    content: format!(
+                        "Peer dashboard-control signal missing session_id: {payload}"
+                    ),
+                }];
+            }
+            vec![UiCommand::PeerDashboardControlSignal {
+                host_id: host,
+                session_id,
+                signal,
+            }]
+        }
+
         // Unknown / forward-compat: render as a debug log so the user
         // can see something arrived rather than dropping silently.
         other => vec![UiCommand::PeerLog {
@@ -5709,6 +5744,57 @@ mod tests {
         };
         let v = serde_json::to_value(&cmd).expect("serialize");
         assert_eq!(v["cmd"].as_str(), Some("peer_file_transfer_signal"));
+    }
+
+    /// `peer_dashboard_control_signal` renders as a typed command
+    /// carrying the original host/session identifiers plus the opaque
+    /// signal body JS feeds to the shared dashboard-control tunnel.
+    #[test]
+    fn peer_event_forwarded_dashboard_control_signal_targets_session() {
+        let mut s = AppState::new();
+        let msg = json!({
+            "event": "peer_event_forwarded",
+            "peer_id": "intendant:alpha",
+            "payload": {
+                "event": "peer_dashboard_control_signal",
+                "session_id": "dash-session-uuid",
+                "signal": {
+                    "kind": "answer",
+                    "sdp": "v=0\r\n...",
+                    "binding": {"ok": true}
+                },
+            },
+        });
+        let cmds = s.handle_message(&msg);
+        let sig = cmds.iter().find_map(|c| match c {
+            UiCommand::PeerDashboardControlSignal {
+                host_id,
+                session_id,
+                signal,
+            } => Some((host_id, session_id, signal)),
+            _ => None,
+        });
+        let (host_id, session_id, signal) = sig.expect("PeerDashboardControlSignal emitted");
+        assert_eq!(host_id, "intendant:alpha");
+        assert_eq!(session_id, "dash-session-uuid");
+        assert_eq!(signal["kind"], "answer");
+        assert_eq!(signal["sdp"], "v=0\r\n...");
+        assert_eq!(signal["binding"]["ok"], true);
+    }
+
+    /// The JS dispatch in `static/app.html` matches this exact string.
+    #[test]
+    fn peer_dashboard_control_signal_wire_name() {
+        let cmd = UiCommand::PeerDashboardControlSignal {
+            host_id: "intendant:alpha".to_string(),
+            session_id: "dash-session-uuid".to_string(),
+            signal: json!({"kind": "answer", "sdp": "", "binding": {"ok": true}}),
+        };
+        let v = serde_json::to_value(&cmd).expect("serialize");
+        assert_eq!(
+            v["cmd"].as_str(),
+            Some("peer_dashboard_control_signal")
+        );
     }
 
     /// `webrtc_signal` without a session_id can't route to any

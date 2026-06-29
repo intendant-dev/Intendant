@@ -202,6 +202,14 @@ pub enum PeerEvent {
         session_id: WebRtcSessionId,
         signal: WebRtcSignal,
     },
+    /// One leg of a direct browser-to-peer dashboard-control WebRTC signaling
+    /// exchange. Primary acts only as signaling coordinator; dashboard RPC,
+    /// streams, byte streams, and terminal frames flow through the resulting
+    /// browser↔peer DataChannel.
+    PeerDashboardControlSignal {
+        session_id: WebRtcSessionId,
+        signal: WebRtcSignal,
+    },
 }
 
 /// Browser-generated UUID identifying one WebRTC session to one peer's
@@ -256,9 +264,15 @@ pub enum WebRtcSignal {
         sdp: String,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         advertise_tcp_via_url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        client_nonce: Option<String>,
     },
     /// Peer-side SDP answer in response to an offer.
-    Answer { sdp: String },
+    Answer {
+        sdp: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        binding: Option<serde_json::Value>,
+    },
     /// Trickled ICE candidate. Either direction. The wire format is
     /// the JSON object the browser/server already exchanges over the
     /// local /ws path (`{"candidate": "...", "sdpMid": "...", ...}`)
@@ -812,6 +826,7 @@ mod tests {
         let sig = WebRtcSignal::Offer {
             sdp: "v=0\r\n".into(),
             advertise_tcp_via_url: Some("ws://localhost:8766/ws".into()),
+            client_nonce: None,
         };
         let json = serde_json::to_string(&sig).unwrap();
         assert!(
@@ -841,6 +856,7 @@ mod tests {
         let sig = WebRtcSignal::Offer {
             sdp: "v=0\r\n".into(),
             advertise_tcp_via_url: None,
+            client_nonce: None,
         };
         let json = serde_json::to_string(&sig).unwrap();
         assert!(
@@ -860,6 +876,7 @@ mod tests {
             WebRtcSignal::Offer {
                 advertise_tcp_via_url,
                 sdp,
+                ..
             } => {
                 assert_eq!(advertise_tcp_via_url, None);
                 assert_eq!(sdp, "v=0\r\n");

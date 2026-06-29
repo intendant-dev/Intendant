@@ -304,6 +304,47 @@ async function waitForPeerInBrowser(page, label) {
   throw new Error(`timed out waiting for connected peer in browser: ${JSON.stringify(last)}`);
 }
 
+async function dashboardAccessUi(page) {
+  return page.evaluate(`(() => {
+    const normalizedText = el => String(el && el.textContent || '').replace(/\\s+/g, ' ').trim();
+    const read = selector => {
+      const el = document.querySelector(selector);
+      return {
+        text: normalizedText(el),
+        className: String(el && el.className || ''),
+        title: String(el && el.title || ''),
+      };
+    };
+    return {
+      statusLabel: normalizedText(document.querySelector('#sb-dashboard-transport-label')),
+      diagnosticsLegend: normalizedText(document.querySelector('#connect-health-panel legend')),
+      files: read('#files-target-summary'),
+      shell: read('#shell-target-summary'),
+    };
+  })()`);
+}
+
+async function selectPeerTargetInDashboard(page, peerId) {
+  await page.evaluate(`(() => {
+    const peerId = ${JSON.stringify(peerId)};
+    const filesTab = document.querySelector('.tab-btn[data-tab="files"]');
+    if (filesTab) filesTab.click();
+    const filesSelect = document.getElementById('files-download-host');
+    if (!filesSelect) throw new Error('missing files target selector');
+    filesSelect.value = peerId;
+    filesSelect.dispatchEvent(new Event('change', { bubbles: true }));
+
+    const terminalTab = document.querySelector('.tab-btn[data-tab="terminal"]');
+    if (terminalTab) terminalTab.click();
+    const shellTab = document.querySelector('#tab-terminal .subtab-btn[data-term-tab="shell"]');
+    if (shellTab) shellTab.click();
+    const shellSelect = document.getElementById('shell-host-select');
+    if (!shellSelect) throw new Error('missing shell target selector');
+    shellSelect.value = peerId;
+    shellSelect.dispatchEvent(new Event('change', { bubbles: true }));
+  })()`);
+}
+
 async function probePeerDownload(page, peer, fixture) {
   await page.evaluate(`window.__intendantPeerTransferFixture = ${JSON.stringify({
     peerId: peer.id,
@@ -334,8 +375,23 @@ async function probePeerDownload(page, peer, fixture) {
       textLength: result.text.length,
       statusText: result.statusText,
       transfer: result.transfer,
+      transport: result.transfer?.transport || '',
       progressCount: Array.isArray(result.progress) ? result.progress.length : 0,
     };
+  })()`);
+}
+
+async function probePeerDashboardControl(page, peer) {
+  await page.evaluate(`window.__intendantPeerDashboardControlFixture = ${JSON.stringify({
+    peerId: peer.id,
+  })}`);
+  return page.evaluate(`(async () => {
+    const fixture = window.__intendantPeerDashboardControlFixture;
+    const probe = window.intendantDashboardControl?._debugProbePeerDashboardControl;
+    if (typeof probe !== 'function') {
+      throw new Error('peer dashboard-control debug probe is unavailable');
+    }
+    return probe(fixture.peerId, { timeoutMs: 60000, limit: 2 });
   })()`);
 }
 
@@ -498,12 +554,57 @@ async function main() {
     await waitForBrowserReady(page);
     const browserPeer = await waitForPeerInBrowser(page, 'e2e-peer');
     const result = await probePeerDownload(page, browserPeer, fixture);
+    const peerDashboard = await probePeerDashboardControl(page, browserPeer);
 
     assert.strictEqual(result.ok, true, 'peer download probe did not report ok');
     assert.strictEqual(result.textMatches, true, 'downloaded text did not match peer fixture');
     assert.strictEqual(result.size, Buffer.byteLength(fixture.text), 'downloaded size mismatch');
     assert(result.rangeCount > 1, `expected ranged download, got rangeCount=${result.rangeCount}`);
     assert(result.transfer && result.transfer.peerId === browserPeer.id, 'transfer snapshot did not preserve peer id');
+    assert.strictEqual(
+      result.transport,
+      'peer-dashboard-control',
+      `expected shared peer dashboard-control tunnel, got ${result.transport || 'unknown'}`
+    );
+    assert.strictEqual(peerDashboard.connected, true, 'peer dashboard-control tunnel is not connected');
+    assert.strictEqual(peerDashboard.verifiedBindingOk, true, 'peer dashboard-control binding was not verified');
+    assert.strictEqual(
+      peerDashboard.status.apiSessionsAvailable,
+      true,
+      `peer status did not advertise api_sessions: ${JSON.stringify(peerDashboard.status)}`
+    );
+    assert.strictEqual(
+      peerDashboard.status.apiSessionsStreamAvailable,
+      true,
+      `peer status did not advertise api_sessions_stream: ${JSON.stringify(peerDashboard.status)}`
+    );
+    assert.strictEqual(
+      peerDashboard.status.terminalFramesAvailable,
+      true,
+      `peer status did not advertise terminal frames: ${JSON.stringify(peerDashboard.status)}`
+    );
+    assert.strictEqual(
+      peerDashboard.status.grantProfile,
+      'peer-daemon',
+      `peer status did not expose the granted role: ${JSON.stringify(peerDashboard.status)}`
+    );
+    await selectPeerTargetInDashboard(page, browserPeer.id);
+    const accessUi = await dashboardAccessUi(page);
+    assert.strictEqual(accessUi.diagnosticsLegend, 'Connection Diagnostics', `debug panel should own transport details: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.files.text.includes('e2e-peer'), `Files target summary did not identify the selected peer: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.files.text.includes('Peer daemon'), `Files target summary did not label the peer target: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.files.text.includes('Grant: Admin peer'), `Files target summary did not show the granted role: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.files.text.includes('Files'), `Files target summary did not include the Files capability: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.files.text.includes('direct browser access'), `Files target summary did not explain the direct access path: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.shell.text.includes('e2e-peer'), `Shell target summary did not identify the selected peer: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.shell.text.includes('Shell'), `Shell target summary did not include the Shell capability: ${JSON.stringify(accessUi)}`);
+    assert(accessUi.shell.text.includes('Grant: Admin peer'), `Shell target summary did not show the granted role: ${JSON.stringify(accessUi)}`);
+    assert(!/\b(DataChannel|dashboard-control|tunnel|mTLS|ICE)\b/i.test(`${accessUi.statusLabel} ${accessUi.files.text} ${accessUi.shell.text}`), `target summaries leaked protocol wording: ${JSON.stringify(accessUi)}`);
+    assert(peerDashboard.sessionsCount >= 0, `peer api_sessions did not return an array: ${JSON.stringify(peerDashboard)}`);
+    assert(peerDashboard.streamEvents.includes('replace'), `peer api_sessions_stream missed replace event: ${JSON.stringify(peerDashboard.streamEvents)}`);
+    assert(peerDashboard.streamEvents.includes('done'), `peer api_sessions_stream missed done event: ${JSON.stringify(peerDashboard.streamEvents)}`);
+    assert.strictEqual(peerDashboard.terminal?.opened, true, 'peer terminal did not open');
+    assert.strictEqual(peerDashboard.terminal?.sawToken, true, 'peer terminal output did not include token');
 
     console.log(JSON.stringify({
       ok: true,
@@ -525,8 +626,10 @@ async function main() {
         bytes: result.size,
         rangeCount: result.rangeCount,
         progressCount: result.progressCount,
+        transport: result.transport,
         statusText: result.statusText,
       },
+      peerDashboard,
     }, null, 2));
   } catch (err) {
     if (primary) {

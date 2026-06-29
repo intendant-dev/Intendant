@@ -840,6 +840,12 @@ pub enum OutboundEvent {
         session_id: String,
         signal: crate::peer::WebRtcSignal,
     },
+    /// One leg of a direct browser-to-peer dashboard-control WebRTC signaling
+    /// exchange emitted by this daemon back toward a connector.
+    PeerDashboardControlSignal {
+        session_id: String,
+        signal: crate::peer::WebRtcSignal,
+    },
     /// Forward-compat fallback for wire events we don't recognize.
     /// Produced only by the deserializer; never constructed locally.
     /// Cannot be serialized.

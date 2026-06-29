@@ -5168,6 +5168,12 @@ async fn handle_control_command_mcp(
             // DataChannel leg to bind this to, so it is a no-op here.
             None
         }
+        ControlMsg::PeerDashboardControlSignal { .. } => {
+            // Direct peer dashboard-control signaling is handled by the
+            // web gateway's per-peer WS dispatcher. MCP has no browser
+            // DataChannel leg to bind this to, so it is a no-op here.
+            None
+        }
         ControlMsg::RequestDisplayInputAuthority { .. }
         | ControlMsg::ReleaseDisplayInputAuthority { .. } => {
             // Per-display input authority is a WebSocket-connection-

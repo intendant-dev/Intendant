@@ -1806,6 +1806,11 @@ impl App {
                 // web gateway's WS handler and a browser DataChannel.
                 // The TUI has no DataChannel leg; no-op.
             }
+            ControlMsg::PeerDashboardControlSignal { .. } => {
+                // Direct peer dashboard-control signaling is handled by the
+                // web gateway's WS handler and a browser DataChannel. The
+                // TUI has no DataChannel leg; no-op.
+            }
             ControlMsg::RequestDisplayInputAuthority { .. }
             | ControlMsg::ReleaseDisplayInputAuthority { .. } => {
                 // Per-display input authority is a browser-WS concept

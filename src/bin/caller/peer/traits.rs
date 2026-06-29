@@ -83,6 +83,9 @@ pub struct TransportFeatures {
     /// Transport supports relaying direct browser-to-peer file-transfer
     /// WebRTC signaling frames.
     pub file_transfer_signal: bool,
+    /// Transport supports relaying direct browser-to-peer dashboard-control
+    /// WebRTC signaling frames.
+    pub dashboard_control_signal: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -127,6 +130,10 @@ pub enum PeerOp {
         session_id: WebRtcSessionId,
         signal: WebRtcSignal,
     },
+    PeerDashboardControlSignal {
+        session_id: WebRtcSessionId,
+        signal: WebRtcSignal,
+    },
 }
 
 impl PeerOp {
@@ -141,6 +148,7 @@ impl PeerOp {
             Self::ResolveApproval { .. } => "resolve_approval",
             Self::WebRtcSignal { .. } => "webrtc_signal",
             Self::PeerFileTransferSignal { .. } => "peer_file_transfer_signal",
+            Self::PeerDashboardControlSignal { .. } => "peer_dashboard_control_signal",
         }
     }
 }
@@ -216,6 +224,7 @@ pub fn check_feature(features: &TransportFeatures, op: &PeerOp) -> Result<(), Pe
         PeerOp::ResolveApproval { .. } => features.resolve_approval,
         PeerOp::WebRtcSignal { .. } => features.webrtc_signal,
         PeerOp::PeerFileTransferSignal { .. } => features.file_transfer_signal,
+        PeerOp::PeerDashboardControlSignal { .. } => features.dashboard_control_signal,
     };
     if !supported {
         return Err(PeerError::UnsupportedCapability(op.name().to_string()));

@@ -143,6 +143,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_peer_approval",
     "api_peer_webrtc_signal",
     "api_peer_file_transfer_signal",
+    "api_peer_dashboard_control_signal",
     "api_peer_pairing_invite",
     "api_peer_pairing_join",
     "api_peer_pairing_request_access",
@@ -155,6 +156,8 @@ const CONTROL_FEATURES: &[&str] = &[
 ];
 const UDP_BUF_LEN: usize = 2000;
 const COMMAND_CHANNEL: usize = 16;
+const TCP_OUT_QUEUE: usize = 256;
+type TcpFrameSender = mpsc::Sender<Vec<u8>>;
 
 pub struct DashboardControlRegistry {
     config: crate::web_gateway::WebGatewayConfig,
@@ -176,6 +179,53 @@ pub struct DashboardControlRegistry {
     tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
     identity: Mutex<Option<Arc<DaemonIdentity>>>,
     peers: Mutex<HashMap<String, DashboardControlPeer>>,
+}
+
+#[derive(Clone, Debug)]
+pub enum DashboardControlGrant {
+    TrustedLocal,
+    Peer {
+        fingerprint: String,
+        label: String,
+        profile: String,
+        filesystem: crate::peer::access_policy::FilesystemAccessPolicy,
+    },
+}
+
+impl Default for DashboardControlGrant {
+    fn default() -> Self {
+        Self::TrustedLocal
+    }
+}
+
+impl DashboardControlGrant {
+    fn label(&self) -> &str {
+        match self {
+            Self::TrustedLocal => "trusted-local",
+            Self::Peer { label, .. } => label.as_str(),
+        }
+    }
+
+    fn profile(&self) -> Option<&str> {
+        match self {
+            Self::TrustedLocal => None,
+            Self::Peer { profile, .. } => Some(profile.as_str()),
+        }
+    }
+
+    fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
+        match self {
+            Self::TrustedLocal => None,
+            Self::Peer { filesystem, .. } => Some(filesystem),
+        }
+    }
+
+    fn wire_kind(&self) -> &'static str {
+        match self {
+            Self::TrustedLocal => "trusted-local",
+            Self::Peer { .. } => "peer",
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -383,8 +433,62 @@ impl DashboardControlRegistry {
         session_grant: Option<String>,
         client_nonce: Option<String>,
     ) -> Result<DashboardControlAnswer, String> {
-        let identity = self.identity().await?;
+        self.answer_offer_with_grant(
+            offer_sdp,
+            session_grant,
+            client_nonce,
+            DashboardControlGrant::TrustedLocal,
+        )
+        .await
+    }
+
+    pub async fn answer_offer_with_grant(
+        &self,
+        offer_sdp: String,
+        session_grant: Option<String>,
+        client_nonce: Option<String>,
+        grant: DashboardControlGrant,
+    ) -> Result<DashboardControlAnswer, String> {
         let session_id = uuid::Uuid::new_v4().to_string();
+        self.answer_offer_with_session_id_and_grant(
+            session_id,
+            offer_sdp,
+            session_grant,
+            client_nonce,
+            grant,
+        )
+        .await
+    }
+
+    pub async fn answer_offer_with_session_id_and_grant(
+        &self,
+        session_id: String,
+        offer_sdp: String,
+        session_grant: Option<String>,
+        client_nonce: Option<String>,
+        grant: DashboardControlGrant,
+    ) -> Result<DashboardControlAnswer, String> {
+        self.answer_offer_with_session_id_grant_and_tcp(
+            session_id,
+            offer_sdp,
+            session_grant,
+            client_nonce,
+            grant,
+            None,
+        )
+        .await
+    }
+
+    pub async fn answer_offer_with_session_id_grant_and_tcp(
+        &self,
+        session_id: String,
+        offer_sdp: String,
+        session_grant: Option<String>,
+        client_nonce: Option<String>,
+        grant: DashboardControlGrant,
+        tcp_advertised_addr: Option<SocketAddr>,
+    ) -> Result<DashboardControlAnswer, String> {
+        let identity = self.identity().await?;
         let (peer, answer_sdp, binding) = DashboardControlPeer::answer_offer(
             session_id.clone(),
             offer_sdp,
@@ -407,7 +511,9 @@ impl DashboardControlRegistry {
             self.presence.clone(),
             self.ice_config.clone(),
             Arc::clone(&self.tcp_peer_registry),
+            tcp_advertised_addr,
             identity,
+            grant,
         )
         .await
         .map_err(|e| e.to_string())?;
@@ -568,9 +674,14 @@ impl DashboardControlPeer {
         presence: Option<DashboardPresenceBridge>,
         ice_config: crate::display::IceConfig,
         tcp_peer_registry: Arc<crate::display::webrtc::TcpPeerRegistry>,
+        tcp_advertised_addr: Option<SocketAddr>,
         identity: Arc<DaemonIdentity>,
+        grant: DashboardControlGrant,
     ) -> Result<(Self, String, DashboardControlBinding), CallerError> {
+        let local_ufrag = new_control_ice_fragment();
+        let local_pwd = new_control_ice_password();
         let mut setting_engine = SettingEngine::default();
+        setting_engine.set_ice_credentials(local_ufrag.clone(), local_pwd);
         setting_engine
             .set_answering_dtls_role(RTCDtlsRole::Server)
             .map_err(|e| CallerError::WebRtc(format!("set answering DTLS role: {e}")))?;
@@ -610,6 +721,28 @@ impl DashboardControlPeer {
             return Err(CallerError::WebRtc(
                 "no usable local UDP sockets bound for dashboard control".into(),
             ));
+        }
+
+        let mut peer_registration = None;
+        let mut tcp_conn_rx = None;
+        let mut tcp_advertised = None;
+        if let Some(advertised) =
+            tcp_advertised_addr.filter(|a| !a.ip().is_loopback() && !a.ip().is_unspecified())
+        {
+            let (registration, rx) = tcp_peer_registry.register(local_ufrag.clone());
+            peer_registration = Some(registration);
+            tcp_conn_rx = Some(rx);
+            tcp_advertised = Some(advertised);
+            let candidate = tcp_host_candidate_init(advertised);
+            if let Err(e) = rtc.add_local_candidate(candidate) {
+                eprintln!(
+                    "[dashboard/control] failed to add TCP host candidate {advertised}: {e}"
+                );
+            } else {
+                eprintln!(
+                    "[dashboard/control] ICE-TCP enabled on {advertised} for ufrag {local_ufrag}"
+                );
+            }
         }
 
         let offer = RTCSessionDescription::offer(offer_sdp.clone())
@@ -657,12 +790,16 @@ impl DashboardControlPeer {
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: NEXT_DASHBOARD_DISPLAY_PEER_ID.fetch_add(1, Ordering::Relaxed),
+            grant,
         };
         let (command_tx, command_rx) = mpsc::channel(COMMAND_CHANNEL);
         let shutdown = CancellationToken::new();
         tokio::spawn(control_driver(
             rtc,
             sockets,
+            tcp_conn_rx,
+            tcp_advertised,
+            peer_registration,
             runtime,
             broadcast_tx.subscribe(),
             command_rx,
@@ -732,6 +869,7 @@ struct ControlRuntime {
     media_clip_ops: Arc<Mutex<HashMap<String, DashboardMediaClipOperation>>>,
     control_frames_tx: Option<mpsc::UnboundedSender<serde_json::Value>>,
     display_peer_id: crate::display::PeerId,
+    grant: DashboardControlGrant,
 }
 
 #[derive(Debug)]
@@ -752,6 +890,7 @@ enum ControlCommand {
 
 #[derive(Debug)]
 struct InboundPacket {
+    proto: TransportProtocol,
     source: SocketAddr,
     destination: SocketAddr,
     bytes: Vec<u8>,
@@ -901,6 +1040,9 @@ impl OutboundControlQueue {
 async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static>(
     mut rtc: RTCPeerConnection<I>,
     sockets: Vec<Arc<UdpSocket>>,
+    mut tcp_conn_rx: Option<mpsc::Receiver<crate::display::webrtc::AcceptedTcpConnection>>,
+    tcp_advertised: Option<SocketAddr>,
+    _tcp_registration: Option<crate::display::webrtc::PeerRegistration>,
     mut runtime: ControlRuntime,
     mut event_rx: tokio::sync::broadcast::Receiver<String>,
     mut command_rx: mpsc::Receiver<ControlCommand>,
@@ -925,6 +1067,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
                     recv = sock.recv_from(&mut buf) => match recv {
                         Ok((n, source)) => {
                             let pkt = InboundPacket {
+                                proto: TransportProtocol::UDP,
                                 source,
                                 destination: local,
                                 bytes: buf[..n].to_vec(),
@@ -943,8 +1086,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
             }
         }));
     }
-    drop(inbound_tx);
-
+    let mut tcp_senders: HashMap<SocketAddr, TcpFrameSender> = HashMap::new();
     let mut channels: HashMap<String, rtc::data_channel::RTCDataChannelId> = HashMap::new();
     let (task_tx, mut task_rx) = mpsc::channel::<ControlTaskResponse>(64);
     let mut pending_requests: HashMap<String, CancellationToken> = HashMap::new();
@@ -965,6 +1107,7 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
         let timeout_at = match drain_control_outputs(
             &mut rtc,
             &sockets_by_addr,
+            &mut tcp_senders,
             &mut channels,
             &mut runtime,
             &task_tx,
@@ -995,13 +1138,111 @@ async fn control_driver<I: rtc::interceptor::Interceptor + Send + Sync + 'static
                     transport: TransportContext {
                         local_addr: pkt.destination,
                         peer_addr: pkt.source,
-                        transport_protocol: TransportProtocol::UDP,
+                        transport_protocol: pkt.proto,
                         ecn: None,
                     },
                     message: BytesMut::from(pkt.bytes.as_slice()),
                 };
                 if let Err(e) = rtc.handle_read(input) {
                     eprintln!("[dashboard/control] handle_read failed: {e:?}");
+                    shutdown.cancel();
+                    break;
+                }
+            }
+            Some(accepted) = async {
+                match tcp_conn_rx.as_mut() {
+                    Some(rx) => rx.recv().await,
+                    None => std::future::pending().await,
+                }
+            } => {
+                let crate::display::webrtc::AcceptedTcpConnection {
+                    remote_addr,
+                    local_addr: real_local,
+                    first_frame,
+                    stream,
+                } = accepted;
+                let Some(fake_local) = tcp_advertised else {
+                    eprintln!(
+                        "[dashboard/control] TCP connection from {remote_addr} but no advertised local configured, dropping"
+                    );
+                    continue;
+                };
+                eprintln!(
+                    "[dashboard/control] ICE-TCP connection from {remote_addr} -> {real_local} (rtc sees {fake_local})"
+                );
+                let (read_half, write_half) = stream.into_split();
+                let (tcp_out_tx, mut tcp_out_rx) = mpsc::channel::<Vec<u8>>(TCP_OUT_QUEUE);
+                tcp_senders.insert(remote_addr, tcp_out_tx);
+
+                let writer_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut write_half = write_half;
+                    loop {
+                        tokio::select! {
+                            biased;
+                            _ = writer_shutdown.cancelled() => break,
+                            frame = tcp_out_rx.recv() => match frame {
+                                Some(contents) => {
+                                    if let Err(e) =
+                                        crate::display::webrtc::write_rfc4571_frame(&mut write_half, &contents).await
+                                    {
+                                        eprintln!(
+                                            "[dashboard/control] ICE-TCP writer for {remote_addr} failed, tearing down connection: {e}"
+                                        );
+                                        writer_shutdown.cancel();
+                                        break;
+                                    }
+                                }
+                                None => break,
+                            }
+                        }
+                    }
+                    let _ = tokio::io::AsyncWriteExt::shutdown(&mut write_half).await;
+                });
+
+                let reader_tx = inbound_tx.clone();
+                let reader_shutdown = shutdown.clone();
+                tokio::spawn(async move {
+                    let mut read_half = read_half;
+                    loop {
+                        tokio::select! {
+                            _ = reader_shutdown.cancelled() => break,
+                            frame = crate::display::webrtc::read_rfc4571_frame(&mut read_half) => match frame {
+                                Ok(bytes) => {
+                                    let pkt = InboundPacket {
+                                        proto: TransportProtocol::TCP,
+                                        source: remote_addr,
+                                        destination: fake_local,
+                                        bytes,
+                                        received_at: Instant::now(),
+                                    };
+                                    if reader_tx.send(pkt).await.is_err() {
+                                        break;
+                                    }
+                                }
+                                Err(e) => {
+                                    eprintln!(
+                                        "[dashboard/control] ICE-TCP reader for {remote_addr} exiting: {e}"
+                                    );
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                });
+
+                let input = TaggedBytesMut {
+                    now: Instant::now(),
+                    transport: TransportContext {
+                        local_addr: fake_local,
+                        peer_addr: remote_addr,
+                        transport_protocol: TransportProtocol::TCP,
+                        ecn: None,
+                    },
+                    message: BytesMut::from(first_frame.as_slice()),
+                };
+                if let Err(e) = rtc.handle_read(input) {
+                    eprintln!("[dashboard/control] handle_read(first TCP frame) failed: {e:?}");
                     shutdown.cancel();
                     break;
                 }
@@ -1153,6 +1394,7 @@ fn send_display_authority_event<I: rtc::interceptor::Interceptor>(
 async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     rtc: &mut RTCPeerConnection<I>,
     sockets_by_addr: &HashMap<SocketAddr, Arc<UdpSocket>>,
+    tcp_senders: &mut HashMap<SocketAddr, TcpFrameSender>,
     channels: &mut HashMap<String, rtc::data_channel::RTCDataChannelId>,
     runtime: &mut ControlRuntime,
     task_tx: &mpsc::Sender<ControlTaskResponse>,
@@ -1164,27 +1406,43 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
     tui_connections: &mut HashMap<String, DashboardTuiConnection>,
 ) -> Result<Instant, ()> {
     while let Some(t) = rtc.poll_write() {
-        if t.transport.transport_protocol != TransportProtocol::UDP {
-            continue;
+        if t.transport.transport_protocol == TransportProtocol::UDP {
+            if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
+                continue;
+            }
+            if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback() {
+                continue;
+            }
         }
-        if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
-            continue;
-        }
-        if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback() {
-            continue;
-        }
-        let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
-            eprintln!(
-                "[dashboard/control] UDP transmit from unknown source {}, dropping",
-                t.transport.local_addr
-            );
-            continue;
-        };
-        if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
-            eprintln!(
-                "[dashboard/control] udp send {} -> {} failed: {e}",
-                t.transport.local_addr, t.transport.peer_addr
-            );
+        match t.transport.transport_protocol {
+            TransportProtocol::UDP => {
+                let Some(sock) = sockets_by_addr.get(&t.transport.local_addr) else {
+                    eprintln!(
+                        "[dashboard/control] UDP transmit from unknown source {}, dropping",
+                        t.transport.local_addr
+                    );
+                    continue;
+                };
+                if let Err(e) = sock.send_to(&t.message, t.transport.peer_addr).await {
+                    eprintln!(
+                        "[dashboard/control] udp send {} -> {} failed: {e}",
+                        t.transport.local_addr, t.transport.peer_addr
+                    );
+                }
+            }
+            TransportProtocol::TCP => {
+                let Some(sender) = tcp_senders.get(&t.transport.peer_addr) else {
+                    continue;
+                };
+                let contents = t.message.to_vec();
+                match sender.try_send(contents) {
+                    Ok(()) => {}
+                    Err(mpsc::error::TrySendError::Full(_)) => {}
+                    Err(mpsc::error::TrySendError::Closed(_)) => {
+                        tcp_senders.remove(&t.transport.peer_addr);
+                    }
+                }
+            }
         }
     }
 
@@ -1609,6 +1867,197 @@ fn drain_queued_control_frames<I: rtc::interceptor::Interceptor>(
     }
 }
 
+fn dashboard_control_error_response(id: String, message: impl Into<String>) -> serde_json::Value {
+    serde_json::json!({
+        "t": "response",
+        "id": id,
+        "ok": false,
+        "error": message.into(),
+    })
+}
+
+fn runtime_allows_operation(
+    runtime: &ControlRuntime,
+    op: crate::peer::access_policy::PeerOperation,
+) -> bool {
+    match &runtime.grant {
+        DashboardControlGrant::TrustedLocal => true,
+        DashboardControlGrant::Peer { profile, .. } => {
+            crate::peer::access_policy::profile_allows_operation(profile, op)
+        }
+    }
+}
+
+fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_policy::PeerOperation> {
+    use crate::peer::access_policy::PeerOperation;
+    match t {
+        "display_input" => Some(PeerOperation::DisplayInput),
+        "terminal_open" | "terminal_input" | "terminal_resize" | "terminal_close" => {
+            Some(PeerOperation::Terminal)
+        }
+        "tui_subscribe" | "tui_key" | "tui_resize" | "tui_unsubscribe" | "tui_close" => {
+            Some(PeerOperation::RuntimeControl)
+        }
+        "presence_frame" => Some(PeerOperation::Message),
+        "upload_start" | "upload_chunk" | "upload_end" => Some(PeerOperation::FilesystemWrite),
+        _ => None,
+    }
+}
+
+fn dashboard_control_method_operation(
+    method: &str,
+) -> Option<crate::peer::access_policy::PeerOperation> {
+    use crate::peer::access_policy::PeerOperation;
+    match method {
+        "status" | "api_agent_card" => Some(PeerOperation::PresenceRead),
+        "api_cached_bootstrap_events" | "subscribe_events" | "unsubscribe_events" => {
+            Some(PeerOperation::SessionInspect)
+        }
+        "config" => Some(PeerOperation::RuntimeControl),
+        "api_peers"
+        | "api_peer_add"
+        | "api_peer_remove"
+        | "api_peer_eligible"
+        | "api_peer_message"
+        | "api_peer_task"
+        | "api_peer_approval"
+        | "api_peer_webrtc_signal"
+        | "api_peer_file_transfer_signal"
+        | "api_peer_dashboard_control_signal"
+        | "api_peer_pairing_invite"
+        | "api_peer_pairing_join"
+        | "api_peer_pairing_request_access"
+        | "api_peer_pairing_request_access_poll"
+        | "api_peer_pairing_requests"
+        | "api_peer_pairing_request_decision"
+        | "api_peer_pairing_identities"
+        | "api_peer_pairing_identity_revoke"
+        | "api_coordinator_route" => Some(PeerOperation::PeerManage),
+        "api_sessions"
+        | "api_sessions_stream"
+        | "api_session_detail"
+        | "api_session_report"
+        | "api_session_agent_output"
+        | "api_sessions_search"
+        | "api_session_recordings"
+        | "api_session_recording_asset"
+        | "api_session_frame_asset"
+        | "api_worktrees" => Some(PeerOperation::SessionInspect),
+        "api_session_delete"
+        | "api_session_current_history"
+        | "api_session_current_rollback"
+        | "api_session_current_redo"
+        | "api_session_current_prune"
+        | "api_session_current_changes"
+        | "api_session_current_uploads"
+        | "api_session_current_upload_raw"
+        | "api_session_current_upload_delete"
+        | "api_session_current_agent_output"
+        | "api_session_context_snapshot"
+        | "api_session_control_msg"
+        | "api_worktrees_scan"
+        | "api_worktrees_remove" => Some(PeerOperation::SessionManage),
+        "api_transfer_jobs" | "api_transfer_download_read" | "api_fs_stat" | "api_fs_list"
+        | "api_fs_read" => Some(PeerOperation::FilesystemRead),
+        "api_transfer_job_create"
+        | "api_transfer_job_delete"
+        | "api_transfer_upload_commit"
+        | "api_fs_mkdir" => Some(PeerOperation::FilesystemWrite),
+        "api_display_bootstrap" | "api_display_webrtc_signal" | "api_displays" => {
+            Some(PeerOperation::DisplayView)
+        }
+        "api_display_input_authority_snapshot"
+        | "api_display_input_authority_request"
+        | "api_display_input_authority_release"
+        | "api_diagnostics_visual_freshness" => Some(PeerOperation::DisplayInput),
+        "api_control_msg" | "api_dashboard_action_msg" | "api_mcp_tool_call" => {
+            Some(PeerOperation::Message)
+        }
+        "api_settings"
+        | "api_settings_save"
+        | "api_key_status"
+        | "api_api_keys_save"
+        | "api_project_root" => Some(PeerOperation::Settings),
+        "api_voice_session"
+        | "api_presence_video_frame"
+        | "api_media_annotation_attach"
+        | "api_media_annotation_submit"
+        | "api_media_clip_start"
+        | "api_media_clip_frame"
+        | "api_media_clip_end"
+        | "api_media_clip_cancel" => Some(PeerOperation::RuntimeControl),
+        "api_recordings" | "api_recording_asset" => Some(PeerOperation::RuntimeControl),
+        "api_browser_workspace_snapshot"
+        | "api_state_snapshot"
+        | "api_session_log_replay"
+        | "api_external_session_activity_replay"
+        | "api_dashboard_bootstrap"
+        | "api_managed_context_records"
+        | "api_managed_context_anchors"
+        | "api_managed_context_fission" => Some(PeerOperation::SessionInspect),
+        _ => None,
+    }
+}
+
+fn dashboard_control_filesystem_path(params: Option<&serde_json::Value>) -> Option<String> {
+    let params = params?;
+    optional_string_param(params, &["path", "source_path", "sourcePath", "source"])
+}
+
+fn authorize_dashboard_control_filesystem(
+    runtime: &ControlRuntime,
+    op: crate::peer::access_policy::PeerOperation,
+    params: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    use crate::peer::access_policy::{FilesystemAccessKind, PeerOperation};
+    let kind = match op {
+        PeerOperation::FilesystemRead => FilesystemAccessKind::Read,
+        PeerOperation::FilesystemWrite => FilesystemAccessKind::Write,
+        _ => return Ok(()),
+    };
+    let Some(policy) = runtime.grant.filesystem() else {
+        return Ok(());
+    };
+    let raw_path = dashboard_control_filesystem_path(params)
+        .ok_or_else(|| "filesystem request missing path".to_string())?;
+    let path = crate::web_gateway::expand_dashboard_fs_path(&raw_path)?;
+    crate::peer::access_policy::filesystem_access_allowed(policy, kind, &path)
+}
+
+fn authorize_dashboard_control_method(
+    runtime: &ControlRuntime,
+    method: &str,
+    params: Option<&serde_json::Value>,
+) -> Result<(), String> {
+    let Some(op) = dashboard_control_method_operation(method) else {
+        return Ok(());
+    };
+    if !runtime_allows_operation(runtime, op) {
+        let profile = runtime.grant.profile().unwrap_or("trusted-local");
+        return Err(format!(
+            "dashboard-control method {method} is not allowed for profile {profile}"
+        ));
+    }
+    authorize_dashboard_control_filesystem(runtime, op, params)
+}
+
+fn authorize_dashboard_control_frame(
+    runtime: &ControlRuntime,
+    frame_type: &str,
+) -> Result<(), String> {
+    let Some(op) = dashboard_control_frame_operation(frame_type) else {
+        return Ok(());
+    };
+    if runtime_allows_operation(runtime, op) {
+        Ok(())
+    } else {
+        let profile = runtime.grant.profile().unwrap_or("trusted-local");
+        Err(format!(
+            "dashboard-control frame {frame_type} is not allowed for profile {profile}"
+        ))
+    }
+}
+
 fn control_frame_response(
     text: &str,
     runtime: &mut ControlRuntime,
@@ -1627,6 +2076,11 @@ fn control_frame_response(
         .and_then(|v| v.as_str())
         .unwrap_or("")
         .to_string();
+    if !matches!(t, "hello" | "ping" | "request") {
+        if let Err(error) = authorize_dashboard_control_frame(runtime, t) {
+            return Some(dashboard_control_error_response(id, error));
+        }
+    }
     match t {
         "hello" => {
             runtime.response_credit_enabled = parsed
@@ -1682,6 +2136,12 @@ fn control_frame_response(
         ),
         "request" => {
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
+            let params = parsed.get("params").cloned();
+            if let Err(error) =
+                authorize_dashboard_control_method(runtime, method, params.as_ref())
+            {
+                return Some(dashboard_control_error_response(id, error));
+            }
             match method {
                 "status" => Some(status_response_frame(id, runtime)),
                 "api_peers" => match runtime.peer_registry.as_ref() {
@@ -1746,7 +2206,7 @@ fn control_frame_response(
                     spawn_control_stream(
                         id,
                         method.to_string(),
-                        parsed.get("params").cloned(),
+                        params,
                         task_tx.clone(),
                         pending_requests,
                     );
@@ -1821,6 +2281,7 @@ fn control_frame_response(
                 | "api_peer_approval"
                 | "api_peer_webrtc_signal"
                 | "api_peer_file_transfer_signal"
+                | "api_peer_dashboard_control_signal"
                 | "api_peer_pairing_invite"
                 | "api_peer_pairing_join"
                 | "api_peer_pairing_request_access"
@@ -1833,7 +2294,7 @@ fn control_frame_response(
                     spawn_control_request(
                         id,
                         method.to_string(),
-                        parsed.get("params").cloned(),
+                        params,
                         runtime.clone(),
                         task_tx.clone(),
                         pending_requests,
@@ -3249,119 +3710,179 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         "response_credit_enabled".to_string(),
         serde_json::json!(runtime.response_credit_enabled),
     );
+    result.insert(
+        "grant_kind".to_string(),
+        serde_json::json!(runtime.grant.wire_kind()),
+    );
+    result.insert(
+        "grant_label".to_string(),
+        serde_json::json!(runtime.grant.label()),
+    );
+    if let Some(profile) = runtime.grant.profile() {
+        result.insert("grant_profile".to_string(), serde_json::json!(profile));
+    }
 
     let peer_registry_available = runtime.peer_registry.is_some();
+    let presence_read = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::PresenceRead,
+    );
+    let session_inspect = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::SessionInspect,
+    );
+    let session_manage = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::SessionManage,
+    );
+    let fs_read = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::FilesystemRead,
+    );
+    let fs_write = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::FilesystemWrite,
+    );
+    let terminal =
+        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Terminal);
+    let display_view =
+        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::DisplayView);
+    let display_input =
+        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::DisplayInput);
+    let settings =
+        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Settings);
+    let runtime_control = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::RuntimeControl,
+    );
+    let peer_manage =
+        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::PeerManage);
+    let message =
+        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
     let capabilities = [
-        ("api_peers_available", peer_registry_available),
-        ("api_agent_card_available", true),
-        ("api_cached_bootstrap_events_available", true),
-        ("api_browser_workspace_snapshot_available", true),
-        ("api_state_snapshot_available", true),
-        ("api_display_bootstrap_available", true),
+        ("api_peers_available", peer_registry_available && peer_manage),
+        ("api_agent_card_available", presence_read),
+        ("api_cached_bootstrap_events_available", session_inspect),
+        ("api_browser_workspace_snapshot_available", session_inspect),
+        ("api_state_snapshot_available", session_inspect),
+        ("api_display_bootstrap_available", display_view),
         (
             "api_display_input_authority_available",
-            runtime.display_authority.is_some(),
+            runtime.display_authority.is_some() && display_input,
         ),
-        ("api_display_webrtc_signal_available", true),
-        ("api_session_log_replay_available", true),
-        ("api_external_session_activity_replay_available", true),
-        ("api_dashboard_bootstrap_available", true),
+        ("api_display_webrtc_signal_available", display_view),
+        ("api_session_log_replay_available", session_inspect),
+        (
+            "api_external_session_activity_replay_available",
+            session_inspect,
+        ),
+        ("api_dashboard_bootstrap_available", session_inspect),
         ("byte_streams_available", true),
-        ("upload_frames_available", true),
-        ("terminal_frames_available", true),
+        ("upload_frames_available", fs_write),
+        ("terminal_frames_available", terminal),
         ("tui_frames_available", runtime.web_tui_tx.is_some()),
-        ("presence_frames_available", true),
+        ("presence_frames_available", message),
         (
             "presence_active_handoff_available",
-            runtime.presence.is_some(),
+            runtime.presence.is_some() && message,
         ),
-        ("presence_tool_request_available", true),
-        ("api_presence_video_frame_available", true),
-        ("api_sessions_available", true),
-        ("api_sessions_stream_available", true),
-        ("api_session_detail_available", true),
-        ("api_session_report_available", true),
-        ("api_session_delete_available", true),
-        ("api_session_agent_output_available", true),
-        ("api_session_current_agent_output_available", true),
-        ("api_session_current_history_available", true),
-        ("api_session_current_rollback_available", true),
-        ("api_session_current_redo_available", true),
-        ("api_session_current_prune_available", true),
-        ("api_session_current_changes_available", true),
-        ("api_session_context_snapshot_available", true),
-        ("api_session_current_uploads_available", true),
-        ("api_session_current_upload_available", true),
-        ("api_session_current_upload_raw_available", true),
-        ("api_session_current_upload_delete_available", true),
+        ("presence_tool_request_available", message),
+        ("api_presence_video_frame_available", runtime_control),
+        ("api_sessions_available", session_inspect),
+        ("api_sessions_stream_available", session_inspect),
+        ("api_session_detail_available", session_inspect),
+        ("api_session_report_available", session_inspect),
+        ("api_session_delete_available", session_manage),
+        ("api_session_agent_output_available", session_inspect),
+        ("api_session_current_agent_output_available", session_manage),
+        ("api_session_current_history_available", session_manage),
+        ("api_session_current_rollback_available", session_manage),
+        ("api_session_current_redo_available", session_manage),
+        ("api_session_current_prune_available", session_manage),
+        ("api_session_current_changes_available", session_manage),
+        ("api_session_context_snapshot_available", session_manage),
+        ("api_session_current_uploads_available", session_manage),
+        ("api_session_current_upload_available", session_manage),
+        ("api_session_current_upload_raw_available", session_manage),
+        (
+            "api_session_current_upload_delete_available",
+            session_manage,
+        ),
         (
             "api_transfer_jobs_available",
-            runtime.project_root.is_some(),
+            runtime.project_root.is_some() && fs_read,
         ),
         (
             "api_transfer_job_create_available",
-            runtime.project_root.is_some(),
+            runtime.project_root.is_some() && fs_write,
         ),
         (
             "api_transfer_job_delete_available",
-            runtime.project_root.is_some(),
+            runtime.project_root.is_some() && fs_write,
         ),
         (
             "api_transfer_download_read_available",
-            runtime.project_root.is_some(),
+            runtime.project_root.is_some() && fs_read,
         ),
         (
             "api_transfer_upload_chunk_available",
-            runtime.project_root.is_some(),
+            runtime.project_root.is_some() && fs_write,
         ),
         (
             "api_transfer_upload_commit_available",
-            runtime.project_root.is_some(),
+            runtime.project_root.is_some() && fs_write,
         ),
-        ("api_media_editor_available", true),
-        ("api_media_annotation_attach_available", true),
-        ("api_media_annotation_submit_available", true),
-        ("api_media_clip_start_available", true),
-        ("api_media_clip_frame_available", true),
-        ("api_media_clip_end_available", true),
-        ("api_media_clip_cancel_available", true),
-        ("api_fs_stat_available", true),
-        ("api_fs_list_available", true),
-        ("api_fs_mkdir_available", true),
-        ("api_fs_read_available", true),
-        ("api_sessions_search_available", true),
-        ("api_settings_available", true),
+        ("api_media_editor_available", runtime_control),
+        ("api_media_annotation_attach_available", runtime_control),
+        ("api_media_annotation_submit_available", runtime_control),
+        ("api_media_clip_start_available", runtime_control),
+        ("api_media_clip_frame_available", runtime_control),
+        ("api_media_clip_end_available", runtime_control),
+        ("api_media_clip_cancel_available", runtime_control),
+        ("api_fs_stat_available", fs_read),
+        ("api_fs_list_available", fs_read),
+        ("api_fs_mkdir_available", fs_write),
+        ("api_fs_read_available", fs_read),
+        ("api_sessions_search_available", session_inspect),
+        ("api_settings_available", settings),
         (
             "api_settings_save_available",
-            runtime.project_root.is_some(),
+            runtime.project_root.is_some() && settings,
         ),
-        ("api_control_msg_available", true),
-        ("api_session_control_msg_available", true),
-        ("api_dashboard_action_msg_available", true),
-        ("api_diagnostics_visual_freshness_available", true),
-        ("api_key_status_available", true),
-        ("api_api_keys_save_available", true),
-        ("api_voice_session_available", true),
-        ("api_project_root_available", true),
-        ("api_displays_available", true),
-        ("api_recordings_available", true),
-        ("api_recording_asset_available", true),
-        ("api_session_recordings_available", true),
-        ("api_session_recording_asset_available", true),
-        ("api_session_frame_asset_available", true),
-        ("api_worktrees_available", true),
-        ("api_worktrees_scan_available", true),
-        ("api_worktrees_remove_available", true),
-        ("api_managed_context_available", true),
-        ("api_mcp_tool_call_available", runtime.mcp_server.is_some()),
-        ("api_peer_mutations_available", peer_registry_available),
-        ("api_peer_webrtc_signal_available", peer_registry_available),
+        ("api_control_msg_available", message),
+        ("api_session_control_msg_available", session_manage),
+        ("api_dashboard_action_msg_available", message),
+        ("api_diagnostics_visual_freshness_available", display_input),
+        ("api_key_status_available", settings),
+        ("api_api_keys_save_available", settings),
+        ("api_voice_session_available", runtime_control),
+        ("api_project_root_available", settings),
+        ("api_displays_available", display_view),
+        ("api_recordings_available", runtime_control),
+        ("api_recording_asset_available", runtime_control),
+        ("api_session_recordings_available", session_inspect),
+        ("api_session_recording_asset_available", session_inspect),
+        ("api_session_frame_asset_available", session_inspect),
+        ("api_worktrees_available", session_inspect),
+        ("api_worktrees_scan_available", session_manage),
+        ("api_worktrees_remove_available", session_manage),
+        ("api_managed_context_available", session_inspect),
+        ("api_mcp_tool_call_available", runtime.mcp_server.is_some() && message),
+        ("api_peer_mutations_available", peer_registry_available && peer_manage),
+        (
+            "api_peer_webrtc_signal_available",
+            peer_registry_available && peer_manage,
+        ),
         (
             "api_peer_file_transfer_signal_available",
-            peer_registry_available,
+            peer_registry_available && peer_manage,
         ),
-        ("api_peer_pairing_available", true),
-        ("api_coordinator_available", peer_registry_available),
+        (
+            "api_peer_dashboard_control_signal_available",
+            peer_registry_available && peer_manage,
+        ),
+        ("api_peer_pairing_available", peer_manage),
+        ("api_coordinator_available", peer_registry_available && peer_manage),
     ];
     for (name, available) in capabilities {
         result.insert(name.to_string(), serde_json::json!(available));
@@ -3591,6 +4112,9 @@ async fn control_request_response(
         }
         "api_peer_file_transfer_signal" => {
             api_peer_file_transfer_signal_response(id, params.as_ref(), &runtime).await
+        }
+        "api_peer_dashboard_control_signal" => {
+            api_peer_dashboard_control_signal_response(id, params.as_ref(), &runtime).await
         }
         "api_peer_pairing_invite" => api_peer_pairing_invite_response(id, params.as_ref()).await,
         "api_peer_pairing_join" => {
@@ -8112,6 +8636,7 @@ fn dashboard_control_msg_action(ctrl: &ControlMsg) -> &'static str {
         ControlMsg::CancelSteer { .. } => "cancel_steer",
         ControlMsg::WebRtcSignal { .. } => "webrtc_signal",
         ControlMsg::PeerFileTransferSignal { .. } => "peer_file_transfer_signal",
+        ControlMsg::PeerDashboardControlSignal { .. } => "peer_dashboard_control_signal",
         ControlMsg::RequestDisplayInputAuthority { .. } => "request_display_input_authority",
         ControlMsg::ReleaseDisplayInputAuthority { .. } => "release_display_input_authority",
         ControlMsg::SetDiagnosticsVisualMarker { .. } => "set_diagnostics_visual_marker",
@@ -8270,6 +8795,30 @@ async fn api_peer_file_transfer_signal_response(
     )
     .await;
     http_body_response(id, status, body, "peer file-transfer signal")
+}
+
+async fn api_peer_dashboard_control_signal_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let Some(registry) = runtime.peer_registry.as_ref() else {
+        return peer_registry_unavailable_response(id);
+    };
+    let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
+    let peer_id = string_param(&params, &["peer_id", "peerId", "host_id", "hostId", "id"]);
+    if peer_id.is_empty() {
+        return missing_param_response(id, "peer_id");
+    }
+    let body_text = serde_json::to_string(&params).unwrap_or_else(|_| "{}".to_string());
+    let (status, body) = crate::web_gateway::peers_dashboard_control_signal(
+        registry,
+        &peer_id,
+        &body_text,
+        &runtime.bus,
+    )
+    .await;
+    http_body_response(id, status, body, "peer dashboard-control signal")
 }
 
 async fn api_peer_pairing_invite_response(
@@ -8866,6 +9415,19 @@ fn to_rtc_ice_servers(servers: &[crate::display::IceServer]) -> Vec<RTCIceServer
         .collect()
 }
 
+fn new_control_ice_fragment() -> String {
+    uuid::Uuid::new_v4()
+        .simple()
+        .to_string()
+        .chars()
+        .take(12)
+        .collect()
+}
+
+fn new_control_ice_password() -> String {
+    uuid::Uuid::new_v4().simple().to_string()
+}
+
 fn udp_host_candidate_init(addr: SocketAddr) -> Result<RTCIceCandidateInit, CallerError> {
     let candidate = CandidateHostConfig {
         base_config: CandidateConfig {
@@ -8882,6 +9444,20 @@ fn udp_host_candidate_init(addr: SocketAddr) -> Result<RTCIceCandidateInit, Call
     RTCIceCandidate::from(&candidate)
         .to_json()
         .map_err(|e| CallerError::WebRtc(format!("serialize UDP host candidate: {e}")))
+}
+
+fn tcp_host_candidate_init(addr: SocketAddr) -> RTCIceCandidateInit {
+    RTCIceCandidateInit {
+        candidate: format!(
+            "candidate:9001 1 tcp 1677721855 {} {} typ host tcptype passive generation 0",
+            addr.ip(),
+            addr.port()
+        ),
+        sdp_mid: Some(String::new()),
+        sdp_mline_index: Some(0),
+        username_fragment: None,
+        url: None,
+    }
 }
 
 fn sha256_b64u(bytes: &[u8]) -> String {
@@ -8925,6 +9501,7 @@ mod tests {
             media_clip_ops: Arc::new(Mutex::new(HashMap::new())),
             control_frames_tx: None,
             display_peer_id: 1,
+            grant: DashboardControlGrant::TrustedLocal,
         }
     }
 

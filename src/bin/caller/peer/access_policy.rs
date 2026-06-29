@@ -59,10 +59,12 @@ impl FilesystemAccessPolicy {
 pub enum ProfileClass {
     PresenceOnly,
     Stats,
+    SessionReader,
     ReadOnlyDisplay,
     SharedSessionSpectator,
     FileReader,
     FileOperator,
+    TerminalOperator,
     TaskRunner,
     Operator,
     AdminPeer,
@@ -78,7 +80,9 @@ pub enum PeerOperation {
     Task,
     Approval,
     PeerManage,
+    SessionInspect,
     SessionManage,
+    Terminal,
     Settings,
     RuntimeControl,
     FilesystemRead,
@@ -116,10 +120,14 @@ pub fn profile_class(profile: &str) -> ProfileClass {
     match profile.trim().to_ascii_lowercase().as_str() {
         "presence-only" | "presence" => ProfileClass::PresenceOnly,
         "stats" | "stats-only" => ProfileClass::Stats,
+        "session-reader" | "sessions-read" | "session-inspect" | "logs-read" => {
+            ProfileClass::SessionReader
+        }
         "read-only-display" | "display-read-only" => ProfileClass::ReadOnlyDisplay,
         "shared-session-spectator" | "spectator" => ProfileClass::SharedSessionSpectator,
         "file-reader" | "files-read" | "filesystem-read-only" => ProfileClass::FileReader,
         "file-operator" | "files" | "filesystem-operator" => ProfileClass::FileOperator,
+        "terminal-operator" | "terminal" | "shell" => ProfileClass::TerminalOperator,
         "task-runner" => ProfileClass::TaskRunner,
         "operator" => ProfileClass::Operator,
         "admin-peer" | "admin" | DEFAULT_PROFILE => ProfileClass::AdminPeer,
@@ -134,17 +142,28 @@ pub fn profile_allows_operation(profile: &str, op: PeerOperation) -> bool {
     match profile_class(profile) {
         PresenceOnly => matches!(op, PresenceRead),
         Stats => matches!(op, PresenceRead | StatsRead),
+        SessionReader => matches!(op, PresenceRead | StatsRead | SessionInspect),
         ReadOnlyDisplay => matches!(op, PresenceRead | StatsRead | DisplayView),
-        SharedSessionSpectator => matches!(op, PresenceRead | StatsRead | DisplayView),
+        SharedSessionSpectator => {
+            matches!(op, PresenceRead | StatsRead | DisplayView | SessionInspect)
+        }
         FileReader => matches!(op, PresenceRead | StatsRead | FilesystemRead),
         FileOperator => matches!(
             op,
             PresenceRead | StatsRead | FilesystemRead | FilesystemWrite
         ),
+        TerminalOperator => matches!(op, PresenceRead | StatsRead | SessionInspect | Terminal),
         TaskRunner => matches!(op, PresenceRead | StatsRead | Message | Task),
         Operator => matches!(
             op,
-            PresenceRead | StatsRead | DisplayView | DisplayInput | Message | Task | Approval
+            PresenceRead
+                | StatsRead
+                | SessionInspect
+                | DisplayView
+                | DisplayInput
+                | Message
+                | Task
+                | Approval
         ),
         AdminPeer => true,
     }
@@ -160,6 +179,7 @@ pub fn control_msg_operation(ctrl: &ControlMsg) -> PeerOperation {
         ControlMsg::Status { .. } => PeerOperation::PresenceRead,
         ControlMsg::Usage => PeerOperation::StatsRead,
         ControlMsg::WebRtcSignal { .. } => PeerOperation::DisplayView,
+        ControlMsg::PeerDashboardControlSignal { .. } => PeerOperation::SessionInspect,
         ControlMsg::PeerFileTransferSignal { .. } => PeerOperation::FilesystemRead,
         ControlMsg::RequestDisplayInputAuthority { .. }
         | ControlMsg::ReleaseDisplayInputAuthority { .. }
@@ -300,8 +320,11 @@ pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool
     if request_line.contains(" /api/coordinator/") {
         return profile_allows_operation(profile, PeerOperation::Task);
     }
-    if request_line.contains(" /api/sessions") || request_line.contains(" /api/worktrees") {
-        return profile_allows_operation(profile, PeerOperation::SessionManage);
+    if request_line.contains(" /api/sessions") {
+        return profile_allows_operation(profile, PeerOperation::SessionInspect);
+    }
+    if request_line.contains(" /api/worktrees") {
+        return profile_allows_operation(profile, PeerOperation::SessionInspect);
     }
     true
 }
