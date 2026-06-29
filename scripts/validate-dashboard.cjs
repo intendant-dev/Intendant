@@ -1404,6 +1404,70 @@ function validateInlineScriptsInHtmlFile(filePath) {
   };
 }
 
+function dashboardInlineScriptSource(filePath) {
+  const html = fs.readFileSync(filePath, 'utf8');
+  const script = extractInlineJavaScript(html)
+    .find((candidate) => candidate.source.includes('function formatLogTimestampLabel'));
+  if (!script) {
+    throw new Error(`no dashboard helper inline script found in ${filePath}`);
+  }
+  return script.source;
+}
+
+function sourceBetween(source, startNeedle, endNeedle) {
+  const start = source.indexOf(startNeedle);
+  if (start === -1) {
+    throw new Error(`missing source marker: ${startNeedle}`);
+  }
+  const end = source.indexOf(endNeedle, start + startNeedle.length);
+  if (end === -1) {
+    throw new Error(`missing source marker: ${endNeedle}`);
+  }
+  return source.slice(start, end);
+}
+
+function constAssignmentSource(source, name) {
+  const match = source.match(new RegExp(`const\\s+${name}\\s*=\\s*[^;]+;`));
+  if (!match) {
+    throw new Error(`missing const assignment: ${name}`);
+  }
+  return match[0];
+}
+
+function loadDashboardLogHelperSandbox(appHtmlPath) {
+  const source = dashboardInlineScriptSource(appHtmlPath);
+  const helperSource = [
+    constAssignmentSource(source, 'SESSION_TEXT_SIGNATURE_CHAR_LIMIT'),
+    constAssignmentSource(source, 'SESSION_RENDERED_SIGNATURE_CHAR_LIMIT'),
+    sourceBetween(source, 'function compactSessionTextBounded', 'function utf8ByteLength'),
+    sourceBetween(source, 'function sessionWindowTranscriptSignatureContent', 'function findSessionWindowHistoryIndexBySignatures'),
+    sourceBetween(source, 'function sessionWindowHistoryNode', 'function isSessionWindowCommandOutputRecord'),
+    sourceBetween(source, 'function isSessionWindowCommandOutputRecord', 'function commandOutputRecordOutputIds'),
+    sourceBetween(source, 'function padTimestampPart', 'function formatLogTimestampTitle'),
+    `
+this.__helpers = {
+  formatLogTimestampLabel,
+  retargetSessionWindowHistoryItem,
+  sessionWindowTranscriptSignaturesForRecord,
+};
+`,
+  ].join('\n');
+  class Element {}
+  class Node {}
+  const sandbox = {
+    Element,
+    Node,
+    document: {
+      createElement() {
+        throw new Error('dashboard log helper self-test does not render DOM content');
+      },
+    },
+  };
+  vm.createContext(sandbox);
+  vm.runInContext(helperSource, sandbox, { filename: `${appHtmlPath}:dashboard-log-helper-self-test` });
+  return sandbox.__helpers;
+}
+
 function extractInlineJavaScript(html) {
   const scripts = [];
   const scriptTag = /<script\b([^>]*)>([\s\S]*?)<\/script>/gi;
@@ -5788,6 +5852,66 @@ async function runSelfTest() {
   assert.throws(
     () => checkModuleSyntax('import x from "./missing.js"; const broken = ;', 'self-test-module-broken'),
     /module inline script syntax check failed.*(SyntaxError|Unexpected token)/,
+  );
+  const dashboardHelpers = loadDashboardLogHelperSandbox(path.resolve(__dirname, '..', 'static', 'app.html'));
+  const twoDigits = (value) => String(value).padStart(2, '0');
+  const dateStamp = (date) => [
+    date.getFullYear(),
+    twoDigits(date.getMonth() + 1),
+    twoDigits(date.getDate()),
+  ].join('-');
+  const shortDateStamp = (date) => `${twoDigits(date.getMonth() + 1)}-${twoDigits(date.getDate())}`;
+  const today = new Date();
+  const sameYearOtherDay = today.getDate() === 1
+    ? new Date(today.getFullYear(), today.getMonth(), 2, 7, 48, 0)
+    : new Date(today.getFullYear(), today.getMonth(), today.getDate() - 1, 7, 48, 0);
+  const otherYearDay = new Date(today.getFullYear() - 1, today.getMonth(), today.getDate(), 7, 48, 0);
+  assert.strictEqual(
+    dashboardHelpers.formatLogTimestampLabel(`${dateStamp(today)}T07:48:37`),
+    '07:48:37',
+  );
+  assert.strictEqual(
+    dashboardHelpers.formatLogTimestampLabel(`${shortDateStamp(today)} 07:48`),
+    '07:48:00',
+  );
+  assert.strictEqual(
+    dashboardHelpers.formatLogTimestampLabel(`${dateStamp(sameYearOtherDay)}T07:48:37`),
+    `${shortDateStamp(sameYearOtherDay)} 07:48`,
+  );
+  assert.strictEqual(
+    dashboardHelpers.formatLogTimestampLabel(`${dateStamp(otherYearDay)}T07:48:37`),
+    `${dateStamp(otherYearDay)} 07:48`,
+  );
+  const liveRecord = {
+    session_id: 'backend-session',
+    level: 'model',
+    source: 'codex',
+    item_id: 'msg-agent-refresh',
+    content: 'Authoritative completed answer.',
+    ts: '07:49:30',
+  };
+  const replayRecord = {
+    session_id: 'wrapper-session',
+    level: 'model',
+    source: 'codex',
+    item_id: 'msg-agent-refresh',
+    content: 'Partial streamed answer.',
+    ts: `${dateStamp(today)}T07:49:00`,
+  };
+  const liveSignatures = new Set(dashboardHelpers.sessionWindowTranscriptSignaturesForRecord(liveRecord));
+  assert.strictEqual(
+    dashboardHelpers
+      .sessionWindowTranscriptSignaturesForRecord(replayRecord)
+      .some((signature) => liveSignatures.has(signature)),
+    false,
+  );
+  dashboardHelpers.retargetSessionWindowHistoryItem(replayRecord, 'backend-session');
+  assert.strictEqual(replayRecord.session_id, 'backend-session');
+  assert.strictEqual(
+    dashboardHelpers
+      .sessionWindowTranscriptSignaturesForRecord(replayRecord)
+      .some((signature) => liveSignatures.has(signature)),
+    true,
   );
   assert.ok(waitFunctionExpression('document.body').includes('typeof candidate'));
   assert.ok(stationProbeExpression('rendered').includes('collectStationProbe'));

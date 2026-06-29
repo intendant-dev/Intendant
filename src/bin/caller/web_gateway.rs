@@ -8414,11 +8414,19 @@ fn push_codex_transcript_message(
     entries: &mut Vec<serde_json::Value>,
     user_turn_revisions: &mut ReplayUserTurnRevisionState,
     pending_replacement_for_user_turn: &mut Option<u32>,
+    item_id: Option<&str>,
     ts: &str,
     role: &str,
     text: String,
 ) {
-    if push_external_transcript_entry(entries, "codex", ts, role, text) && role == "user" {
+    if push_external_transcript_entry(entries, "codex", ts, role, text) {
+        if let (Some(item_id), Some(entry)) = (item_id, entries.last_mut()) {
+            entry["item_id"] = serde_json::json!(item_id);
+        }
+    } else {
+        return;
+    }
+    if role == "user" {
         let (user_turn_index, user_turn_revision) = user_turn_revisions.record_next_turn();
         if let Some(entry) = entries.last_mut() {
             entry["user_turn_index"] = serde_json::json!(user_turn_index);
@@ -8581,6 +8589,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     &mut entries,
                     &mut user_turn_revisions,
                     &mut pending_replacement_for_user_turn,
+                    response_item_id.as_deref(),
                     &ts,
                     &role,
                     text,
@@ -8588,8 +8597,9 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
             }
             if let Some((role, text)) = codex_payload_text(payload) {
                 if canonical_user_message_events && role == "user" {
-                    if let Some(item_id) = response_item_id {
-                        item_entry_boundaries.insert(item_id, (entries_before, entries.len()));
+                    if let Some(item_id) = response_item_id.as_deref() {
+                        item_entry_boundaries
+                            .insert(item_id.to_string(), (entries_before, entries.len()));
                     }
                     continue;
                 }
@@ -8597,6 +8607,7 @@ fn parse_codex_session_entries(path: &Path) -> Option<Vec<serde_json::Value>> {
                     &mut entries,
                     &mut user_turn_revisions,
                     &mut pending_replacement_for_user_turn,
+                    response_item_id.as_deref(),
                     &ts,
                     &role,
                     text,
@@ -8925,6 +8936,7 @@ fn external_session_activity_replay_from_home_with_attach(
                 .get("superseded_reason")
                 .and_then(|v| v.as_str()),
             "kind": entry.get("kind").and_then(|v| v.as_str()),
+            "item_id": entry.get("item_id").and_then(|v| v.as_str()),
             "output_id": entry.get("output_id").and_then(|v| v.as_str()),
             "rollback_turns": entry.get("rollback_turns").and_then(|v| v.as_u64()),
             "rollback_anchor_item_id": entry
@@ -30188,6 +30200,7 @@ mod tests {
 
     #[test]
     fn external_activity_replay_uses_compact_session_transcript() {
+        let _codex_home = EnvVarGuard::unset("CODEX_HOME");
         let dir = tempfile::tempdir().unwrap();
         let sessions_dir = dir.path().join(".codex").join("sessions");
         std::fs::create_dir_all(&sessions_dir).unwrap();
@@ -30205,6 +30218,7 @@ mod tests {
                     "timestamp": "2026-05-17T16:49:00Z",
                     "type": "response_item",
                     "payload": {
+                        "id": "msg-user-refresh",
                         "type": "message",
                         "role": "user",
                         "content": [{ "type": "input_text", "text": "What happens on refresh?" }]
@@ -30214,6 +30228,7 @@ mod tests {
                     "timestamp": "2026-05-17T16:49:04Z",
                     "type": "response_item",
                     "payload": {
+                        "id": "msg-agent-refresh",
                         "type": "message",
                         "role": "assistant",
                         "content": [{ "type": "output_text", "text": "The task keeps running." }]
@@ -30226,6 +30241,19 @@ mod tests {
             .join("\n"),
         )
         .unwrap();
+
+        let normalized = external_session_entries_from_home(dir.path(), "codex", session_id)
+            .expect("codex session should parse");
+        let normalized_user = normalized
+            .iter()
+            .find(|entry| entry["content"] == "What happens on refresh?")
+            .expect("user entry should parse");
+        assert_eq!(normalized_user["item_id"], "msg-user-refresh");
+        let normalized_agent = normalized
+            .iter()
+            .find(|entry| entry["content"] == "The task keeps running.")
+            .expect("agent entry should parse");
+        assert_eq!(normalized_agent["item_id"], "msg-agent-refresh");
 
         let replay =
             external_session_activity_replay_from_home(dir.path(), "codex", session_id, 80)
@@ -30251,6 +30279,7 @@ mod tests {
                 && entry["source"] == "user"
                 && entry["content"] == "What happens on refresh?"
                 && entry["user_turn_index"] == 1
+                && entry["item_id"] == "msg-user-refresh"
         }));
         assert!(entries.iter().any(|entry| {
             entry["event"] == "log_entry"
@@ -30258,6 +30287,7 @@ mod tests {
                 && entry["level"] == "model"
                 && entry["source"] == "codex"
                 && entry["content"] == "The task keeps running."
+                && entry["item_id"] == "msg-agent-refresh"
         }));
     }
 
