@@ -688,6 +688,156 @@ html {
   color: var(--subtext0);
   font-size: 12px;
 }
+.access-target-surface {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 0 0 14px;
+}
+.access-target-row {
+  --access-target-accent: var(--blue);
+  display: grid;
+  grid-template-columns: minmax(180px, 1.2fr) minmax(160px, 0.9fr) minmax(180px, 1fr) minmax(160px, 0.8fr) auto;
+  gap: 10px 14px;
+  align-items: center;
+  min-width: 0;
+  padding: 10px 12px;
+  border: 1px solid var(--surface1);
+  border-left: 3px solid var(--access-target-accent);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-target-row.ok { --access-target-accent: var(--green); }
+.access-target-row.warn,
+.access-target-row.checking { --access-target-accent: var(--yellow); }
+.access-target-row.err { --access-target-accent: var(--red); }
+.access-target-main {
+  display: grid;
+  grid-template-columns: auto minmax(0, 1fr);
+  gap: 4px 8px;
+  align-items: center;
+  min-width: 0;
+}
+.access-target-dot {
+  grid-row: 1 / span 2;
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: var(--access-target-accent);
+  box-shadow: 0 0 0 3px color-mix(in srgb, var(--access-target-accent) 16%, transparent);
+}
+.access-target-title-row {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+.access-target-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.access-target-badge {
+  flex: 0 0 auto;
+  padding: 1px 6px;
+  border: 1px solid rgba(137, 180, 250, 0.26);
+  border-radius: 999px;
+  color: var(--blue);
+  background: rgba(137, 180, 250, 0.08);
+  font-size: 10px;
+  font-weight: 700;
+  line-height: 1.45;
+}
+.access-target-subtitle {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--subtext0);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 11px;
+  white-space: nowrap;
+}
+.access-target-cell {
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.access-target-label {
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+.access-target-value {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 700;
+  white-space: nowrap;
+}
+.access-target-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  color: var(--subtext0);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.access-target-chips {
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.access-target-actions {
+  display: flex;
+  justify-content: flex-end;
+  flex-wrap: wrap;
+  gap: 6px;
+  min-width: 176px;
+}
+.access-target-actions button {
+  min-height: 28px;
+  padding: 4px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  cursor: pointer;
+  font-family: inherit;
+  font-size: 12px;
+  line-height: 1;
+}
+.access-target-actions button.primary {
+  border-color: var(--blue);
+  background: var(--blue);
+  color: var(--crust);
+  font-weight: 800;
+}
+.access-target-actions button.danger {
+  border-color: rgba(243, 139, 168, 0.7);
+  color: var(--red);
+}
+.access-target-actions button:hover {
+  border-color: var(--blue);
+}
+.access-target-actions button.danger:hover {
+  border-color: var(--red);
+}
+.access-target-actions button:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.access-peer-display-slot {
+  grid-column: 1 / -1;
+}
 .settings-save-row {
   display: flex;
   gap: 8px;
@@ -9102,6 +9252,18 @@ body.display-fullscreen-open {
   .shell-toolbar .target-summary-detail {
     max-width: none;
   }
+  .access-target-row {
+    grid-template-columns: 1fr;
+  }
+  .access-target-actions {
+    justify-content: flex-start;
+    min-width: 0;
+  }
+  .access-target-value,
+  .access-target-detail,
+  .access-target-subtitle {
+    white-space: normal;
+  }
   .files-upload-config {
     grid-template-columns: 1fr;
   }
@@ -10928,9 +11090,7 @@ body.display-fullscreen-open {
       <div class="subtab-panes">
         <div class="subtab-pane active" id="access-pane-targets">
           <div class="access-pane-body">
-            <div id="access-target-overview" class="access-overview-grid"></div>
-            <div id="access-targets-mount"></div>
-            <div id="access-coordinator-mount"></div>
+            <div id="access-target-overview" class="access-target-surface"></div>
           </div>
         </div>
         <div class="subtab-pane" id="access-pane-grants">
@@ -32179,6 +32339,40 @@ function accessOpenShell(hostId) {
   requestAnimationFrame(() => setShellHost(target || SHELL_HOST_ID));
 }
 
+function accessOpenDisplay(hostId) {
+  const peerId = String(hostId || '').trim();
+  const peer = daemons.find(d => d.host_id === peerId);
+  if (!peer) {
+    showControlToast('error', 'Peer target is no longer configured');
+    return;
+  }
+  const tcpViaUrl = resolveBrowserTcpViaUrl(peer);
+  openPeerDisplay(peerId, 0, tcpViaUrl).catch(err => {
+    console.error('openPeerDisplay failed:', err);
+    showControlToast('error', `Display failed: ${err?.message || err}`);
+  });
+}
+
+function accessManageTargetAccess(hostId) {
+  const peerId = String(hostId || '').trim();
+  routeTo('access', peerId ? 'invitations' : 'grants');
+}
+
+async function accessRemoveTarget(hostId, label) {
+  const peerId = String(hostId || '').trim();
+  if (!peerId) return;
+  const ok = await showDashboardConfirm({
+    title: 'Remove access target',
+    message: `Remove ${label || peerId} from this dashboard?`,
+    warning: 'This removes the outbound peer route from this daemon. It does not revoke any inbound grant on the peer.',
+    confirmLabel: 'Remove',
+    danger: true,
+  });
+  if (!ok) return;
+  await removeDaemon(peerId);
+  showControlToast('success', `Removed ${label || peerId}`);
+}
+
 function accessCreateCard(card) {
   const node = document.createElement('div');
   node.className = 'access-card';
@@ -32275,50 +32469,207 @@ function syncDashboardAccessTargetsFromDaemons() {
   renderDashboardTargetSummaries();
 }
 
-function accessTargetCards() {
-  const selfSummary = dashboardTargetSummary('', 'files');
-  const status = dashboardTransport?.status
-    ? dashboardTransport.status()
-    : { enabled: dashboardControlTransportEnabled(), connected: false };
-  const selfTarget = dashboardTargetDescriptor('');
-  const cards = [{
-    title: selfTarget.displayName || selfSummary.name || selfHostLabel || 'This daemon',
-    kind: `${selfTarget.accessDomain}: ${selfTarget.routeType}`,
-    detail: selfSummary.detail || `${selfTarget.accessRole} dashboard access`,
-    actions: [
-      { label: 'Stats', onClick: () => accessOpenStats('') },
-      { label: 'Files', onClick: () => accessOpenFiles('') },
-      { label: 'Shell', primary: true, onClick: () => accessOpenShell('') },
-    ],
-  }];
+function accessLocalTargetModel() {
+  return dashboardAccessTargets.find(t => t.local) || normalizeDashboardAccessTarget({
+    id: selfPeerId || SHELL_HOST_ID,
+    host_id: selfPeerId || SHELL_HOST_ID,
+    label: selfHostLabel || 'This daemon',
+    local: true,
+    source: 'dashboard',
+    access_domain: 'user_client',
+    access_domain_label: 'User/client access',
+    route: 'current_dashboard',
+    route_label: 'Current dashboard',
+    auth: 'trusted_dashboard',
+    auth_label: 'Trusted dashboard session',
+    effective_role: 'root',
+    effective_role_label: 'Root',
+    connected: true,
+    capabilities: [],
+  });
+}
 
+function accessTargetRecords() {
+  const records = [];
+  const seen = new Set();
+  const localTarget = accessLocalTargetModel();
+  if (localTarget) {
+    records.push(localTarget);
+    seen.add(localTarget.host_id || localTarget.id);
+  }
   for (const target of dashboardPeerAccessTargets()) {
-    const peerId = target.host_id || target.id || '';
-    const peer = daemons.find(d => d.host_id === peerId) || {};
-    const summary = dashboardTargetSummary(peerId, 'files');
-    const conn = peerDashboardControlConnectionsByHost.get(peerId);
-    const profile = conn?.lastStatus?.grant_profile || target.profile || '';
-    const role = profile
-      ? dashboardProfileLabel(profile)
-      : (target.effective_role_label || 'Peer profile');
-    const route = target.route_label || summary.kind || 'Peer route';
-    const online = peer.connected === false || target.connected === false ? false : true;
-    cards.push({
-      title: summary.name || target.label || peer.label || peerId,
-      kind: online ? route : `${route} offline`,
-      detail: `${role} - ${summary.detail || target.url || peer.url || peerId}`,
-      actions: [
-        { label: 'Stats', onClick: () => accessOpenStats(peerId) },
-        { label: 'Files', onClick: () => accessOpenFiles(peerId) },
-        { label: 'Shell', primary: true, onClick: () => accessOpenShell(peerId) },
-      ],
-    });
+    const id = target.host_id || target.id || '';
+    if (!id || seen.has(id)) continue;
+    records.push(target);
+    seen.add(id);
+  }
+  return records;
+}
+
+function accessTargetConnection(target, descriptor, summary) {
+  if (descriptor.local) {
+    const status = dashboardTransport?.status
+      ? dashboardTransport.status()
+      : { enabled: dashboardControlTransportEnabled(), connected: false };
+    const transport = dashboardTransportStatusSummary(status);
+    const connected = !status.enabled || Boolean(status.connected && status.verifiedBinding?.ok);
+    return {
+      state: transport.kind === 'err' ? 'err' : (connected ? 'ok' : 'checking'),
+      route: descriptor.routeType || target.route_label || 'Current dashboard',
+      detail: connected ? 'Connected' : (transport.label || 'Connecting'),
+      title: transport.title || summary.title || '',
+    };
   }
 
-  if (status.enabled && !status.connected) {
-    cards[0].detail = `${cards[0].detail} - ${dashboardTransportStatusSummary(status).label || 'connecting'}`;
+  const peerId = descriptor.hostId;
+  const peer = descriptor.peer;
+  const online = Boolean(peer && peer.connected !== false && target.connected !== false);
+  const conn = peerDashboardControlConnectionsByHost.get(peerId);
+  const direct = Boolean(conn?.canUseRpc?.());
+  const signalReady = online && peerDashboardControlSignalAvailable(peerId);
+  const label = direct
+    ? 'Direct browser channel'
+    : (signalReady ? 'Ready on demand' : (online ? 'Connected peer' : 'Offline'));
+  return {
+    state: online ? (direct ? 'ok' : 'checking') : 'err',
+    route: descriptor.routeType || target.route_label || 'Peer route',
+    detail: label,
+    title: summary.title || target.url || peerId,
+  };
+}
+
+function accessTargetSubtitle(target, descriptor) {
+  const peerUrl = target.url || target.browser_tcp_via_url || target.ws_url || descriptor.peer?.url || descriptor.peer?.ws_url || '';
+  if (peerUrl) return peerUrl;
+  return descriptor.targetId || descriptor.hostId || '';
+}
+
+function accessAppendText(parent, className, text, tagName = 'div') {
+  const node = document.createElement(tagName);
+  node.className = className;
+  node.textContent = text || '';
+  parent.appendChild(node);
+  return node;
+}
+
+function accessCreateTargetCell(label, value, detail) {
+  const cell = document.createElement('div');
+  cell.className = 'access-target-cell';
+  accessAppendText(cell, 'access-target-label', label);
+  accessAppendText(cell, 'access-target-value', value);
+  accessAppendText(cell, 'access-target-detail', detail);
+  return cell;
+}
+
+function accessCreateTargetButton(label, onClick, options = {}) {
+  const button = document.createElement('button');
+  button.type = 'button';
+  button.textContent = label;
+  if (options.primary) button.classList.add('primary');
+  if (options.danger) button.classList.add('danger');
+  if (options.title) button.title = options.title;
+  if (options.disabled) button.disabled = true;
+  button.addEventListener('click', onClick);
+  return button;
+}
+
+function accessCreateTargetRow(target) {
+  const hostId = target.local ? '' : String(target.host_id || target.id || '').trim();
+  const descriptor = dashboardTargetDescriptor(hostId);
+  const summary = dashboardTargetSummary(hostId, 'files');
+  const connection = accessTargetConnection(target, descriptor, summary);
+  const state = connection.state || summary.state || 'checking';
+  const row = document.createElement('div');
+  row.className = `access-target-row ${state}`;
+  row.title = connection.title || summary.title || '';
+
+  const main = document.createElement('div');
+  main.className = 'access-target-main';
+  const dot = document.createElement('span');
+  dot.className = 'access-target-dot';
+  dot.setAttribute('aria-hidden', 'true');
+  const titleRow = document.createElement('div');
+  titleRow.className = 'access-target-title-row';
+  accessAppendText(titleRow, 'access-target-title', descriptor.displayName || target.label || 'Target');
+  if (descriptor.local) {
+    accessAppendText(titleRow, 'access-target-badge', 'this daemon', 'span');
   }
-  return cards;
+  const subtitle = accessAppendText(main, 'access-target-subtitle', accessTargetSubtitle(target, descriptor));
+  subtitle.title = subtitle.textContent;
+  main.prepend(dot, titleRow);
+
+  const authLabel = target.auth_label || descriptor.routeDetail || 'Trusted session';
+  const accessCell = accessCreateTargetCell(
+    'Access',
+    `${descriptor.accessDomain || target.access_domain_label || 'Access'} · ${descriptor.accessRole || target.effective_role_label || 'Role'}`,
+    authLabel
+  );
+  const routeCell = accessCreateTargetCell(
+    'Route',
+    connection.route || target.route_label || 'Route',
+    connection.detail || summary.detail || ''
+  );
+
+  const chips = document.createElement('div');
+  chips.className = 'access-target-chips';
+  for (const chip of dashboardTargetFeatureChips(hostId, 'files')) {
+    const item = document.createElement('span');
+    item.className = `target-chip ${chip.state || 'off'}`;
+    item.textContent = chip.label || '';
+    chips.appendChild(item);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'access-target-actions';
+  const disabled = !descriptor.local && state === 'err';
+  actions.append(
+    accessCreateTargetButton('Stats', () => accessOpenStats(hostId), { disabled }),
+    accessCreateTargetButton('Files', () => accessOpenFiles(hostId), { disabled }),
+    accessCreateTargetButton('Shell', () => accessOpenShell(hostId), { primary: true, disabled })
+  );
+  if (!descriptor.local && descriptor.peer && peerCanShareDisplay(descriptor.peer)) {
+    actions.appendChild(accessCreateTargetButton('Display', () => accessOpenDisplay(hostId), { disabled }));
+  }
+  actions.appendChild(accessCreateTargetButton(
+    descriptor.local ? 'Grant peer' : 'Manage',
+    () => accessManageTargetAccess(hostId),
+    { title: descriptor.local ? 'Open peer grant workflows' : 'Open peer access workflows' }
+  ));
+  if (!descriptor.local) {
+    actions.appendChild(accessCreateTargetButton(
+      'Remove',
+      () => accessRemoveTarget(hostId, descriptor.displayName || target.label || hostId),
+      { danger: true }
+    ));
+  }
+
+  row.append(main, accessCell, routeCell, chips, actions);
+  if (!descriptor.local) {
+    const displaySlot = document.createElement('div');
+    displaySlot.id = `peer-display-${hostId}`;
+    displaySlot.className = 'peer-display-container access-peer-display-slot';
+    displaySlot.style.display = 'none';
+    row.appendChild(displaySlot);
+  }
+  return row;
+}
+
+function renderAccessTargetsSurface() {
+  const el = document.getElementById('access-target-overview');
+  if (!el) return;
+  el.innerHTML = '';
+  const targets = accessTargetRecords();
+  if (!targets.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'No access targets';
+    el.appendChild(empty);
+    return;
+  }
+  for (const target of targets) {
+    el.appendChild(accessCreateTargetRow(target));
+  }
+  reapplyPeerDisplayPanes();
 }
 
 function accessGrantCards() {
@@ -32395,7 +32746,7 @@ function accessDiagnosticsCards() {
 
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
-  accessRenderCards('access-target-overview', accessTargetCards());
+  renderAccessTargetsSurface();
   accessRenderCards('access-grants-overview', accessGrantCards());
   accessRenderCards('access-public-shares', accessPublicShareCards());
   accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
@@ -32437,12 +32788,6 @@ function accessMoveToMount(node, mountId) {
 
 function mountAccessAdminSurface() {
   accessMoveIntoSection(
-    document.getElementById('daemons-list'),
-    'access-targets-mount',
-    'access-targets-list-section',
-    'Daemon targets'
-  );
-  accessMoveIntoSection(
     document.querySelector('.daemon-pairing-grid'),
     'access-invitations-mount',
     'access-invitations-section',
@@ -32453,11 +32798,11 @@ function mountAccessAdminSurface() {
     'access-grants-mount'
   );
   accessMoveToMount(
-    document.getElementById('coord-eligible-btn')?.closest('fieldset.settings-group'),
-    'access-coordinator-mount'
+    document.getElementById('connect-health-panel'),
+    'access-diagnostics-mount'
   );
   accessMoveToMount(
-    document.getElementById('connect-health-panel'),
+    document.getElementById('coord-eligible-btn')?.closest('fieldset.settings-group'),
     'access-diagnostics-mount'
   );
   const openAccessBtn = document.getElementById('settings-open-access-btn');
@@ -45263,7 +45608,7 @@ function renderDaemonRow(d, isSelf) {
            ${viewDisplayBtn}
          </div>
          <div class="daemon-msg-status" data-host-id="${escapeHtml(d.host_id)}"></div>
-         <div class="peer-display-container" id="peer-display-${escapeHtml(d.host_id)}" style="display:none"></div>
+         <div class="peer-display-container" id="daemon-peer-display-${escapeHtml(d.host_id)}" style="display:none"></div>
        </div>`;
   return `
     <div class="daemon-entry${isSelf ? ' self' : ''}">
