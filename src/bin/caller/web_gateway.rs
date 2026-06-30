@@ -20716,9 +20716,16 @@ pub fn spawn_web_gateway(
                         return;
                     }
 
+                    let http_access_principal = http_access_principal(
+                        peer_connection_identity.as_ref(),
+                        tls_client_cert_present,
+                        is_tls,
+                    );
+
                     if let Some((op, kind)) = peer_filesystem_query_request(req_method, req_path) {
                         let path = query_param(request_line, "path").unwrap_or_default();
-                        if let Err(message) = authorize_peer_filesystem_access(
+                        if let Err(message) = authorize_http_filesystem_access(
+                            &http_access_principal,
                             peer_connection_identity.as_ref(),
                             op,
                             kind,
@@ -20742,17 +20749,20 @@ pub fn spawn_web_gateway(
                     // `inbound_bearer_token` docs on `spawn_web_gateway`
                     // for the design rationale.
                     if is_federation_path(request_line) {
-                        if let Some(identity) = &peer_connection_identity {
-                            if !crate::peer::access_policy::profile_allows_federation_http(
-                                &identity.profile,
-                                request_line,
-                            ) {
+                        if let Some(op) =
+                            crate::peer::access_policy::federation_http_operation(request_line)
+                        {
+                            let decision = crate::access::iam::evaluate_principal_operation(
+                                &http_access_principal,
+                                op,
+                            );
+                            if !decision.allowed {
                                 use tokio::io::AsyncWriteExt;
                                 let body = serde_json::json!({
-                                    "error": "peer profile does not allow this operation",
-                                    "profile": identity.profile,
-                                    "peer": identity.label,
-                                    "fingerprint": identity.fingerprint,
+                                    "error": "principal does not allow this operation",
+                                    "principal": http_access_principal.as_value(),
+                                    "permission": decision.permission,
+                                    "reason": decision.reason,
                                 })
                                 .to_string();
                                 let response = format!(
@@ -21011,7 +21021,8 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = match serde_json::from_str::<FsMkdirRequest>(&body_text) {
-                            Ok(req) => match authorize_peer_filesystem_access(
+                            Ok(req) => match authorize_http_filesystem_access(
+                                &http_access_principal,
                                 peer_connection_identity.as_ref(),
                                 crate::peer::access_policy::PeerOperation::FilesystemWrite,
                                 crate::peer::access_policy::FilesystemAccessKind::Write,
@@ -26343,13 +26354,44 @@ fn peer_filesystem_query_request(
     }
 }
 
-fn authorize_peer_filesystem_access(
+fn http_access_principal(
+    identity: Option<&PeerConnectionIdentity>,
+    tls_client_cert_present: bool,
+    is_tls: bool,
+) -> crate::access::iam::AccessPrincipal {
+    if let Some(identity) = identity {
+        return crate::access::iam::AccessPrincipal::peer_daemon(
+            identity.fingerprint.clone(),
+            identity.label.clone(),
+            identity.profile.clone(),
+            "peer-http",
+        );
+    }
+    let source = if tls_client_cert_present {
+        "browser-mtls"
+    } else {
+        "trusted-dashboard-http"
+    };
+    let transport = if is_tls { "https" } else { "http" };
+    crate::access::iam::AccessPrincipal::root_dashboard_session(source, transport)
+}
+
+fn authorize_http_filesystem_access(
+    principal: &crate::access::iam::AccessPrincipal,
     identity: Option<&PeerConnectionIdentity>,
     op: crate::peer::access_policy::PeerOperation,
     kind: crate::peer::access_policy::FilesystemAccessKind,
     raw_path: &str,
     bus: &EventBus,
 ) -> Result<(), String> {
+    let decision = crate::access::iam::evaluate_principal_operation(principal, op);
+    if !decision.allowed {
+        if let Some(identity) = identity {
+            audit_peer_filesystem_access(bus, identity, op, raw_path, false, &decision.reason);
+        }
+        return Err(decision.reason);
+    }
+
     let Some(identity) = identity else {
         return Ok(());
     };
@@ -26358,13 +26400,6 @@ fn authorize_peer_filesystem_access(
         audit_peer_filesystem_access(bus, identity, op, raw_path, false, &message);
         Err(message)
     };
-
-    if !crate::peer::access_policy::profile_allows_operation(&identity.profile, op) {
-        return denied(format!(
-            "peer profile {} does not allow {:?}",
-            identity.profile, op
-        ));
-    }
 
     let path = match expand_dashboard_fs_path(raw_path) {
         Ok(path) => path,
@@ -36661,6 +36696,45 @@ mod tests {
             resolve_peer_connection_identity_from_cert_dir(tmp.path(), header_plain, None)
                 .unwrap()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn http_access_principal_maps_root_and_peer_routes() {
+        let root = http_access_principal(None, true, true);
+        assert_eq!(root.kind, "root_session");
+        assert_eq!(root.source, "browser-mtls");
+        assert_eq!(root.transport, "https");
+        assert!(
+            crate::access::iam::evaluate_principal_operation(
+                &root,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+
+        let peer_identity = PeerConnectionIdentity {
+            fingerprint: "abc123".to_string(),
+            label: "peer-a".to_string(),
+            profile: "peer-operator".to_string(),
+            filesystem: crate::peer::access_policy::FilesystemAccessPolicy::default(),
+        };
+        let peer = http_access_principal(Some(&peer_identity), true, true);
+        assert_eq!(peer.kind, "peer_daemon");
+        assert_eq!(peer.peer_profile.as_deref(), Some("peer-operator"));
+        assert!(
+            crate::access::iam::evaluate_principal_operation(
+                &peer,
+                crate::peer::access_policy::PeerOperation::DisplayView,
+            )
+            .allowed
+        );
+        assert!(
+            !crate::access::iam::evaluate_principal_operation(
+                &peer,
+                crate::peer::access_policy::PeerOperation::AccessInspect,
+            )
+            .allowed
         );
     }
 

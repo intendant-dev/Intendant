@@ -313,42 +313,49 @@ pub fn filesystem_access_allowed(
 }
 
 pub fn profile_allows_federation_http(profile: &str, request_line: &str) -> bool {
+    let Some(op) = federation_http_operation(request_line) else {
+        return true;
+    };
+    profile_allows_operation(profile, op)
+}
+
+pub fn federation_http_operation(request_line: &str) -> Option<PeerOperation> {
     if request_line.contains(" /api/access/overview")
         || request_line.contains(" /api/access/iam/state")
         || request_line.contains(" /api/dashboard/targets")
     {
-        return profile_allows_operation(profile, PeerOperation::AccessInspect);
+        return Some(PeerOperation::AccessInspect);
     }
     if request_line.contains(" /api/peers/pairing/requests")
         || request_line.contains(" /api/peers/pairing/identities")
     {
         if request_line.starts_with("GET") {
-            return profile_allows_operation(profile, PeerOperation::AccessInspect);
+            return Some(PeerOperation::AccessInspect);
         }
-        return profile_allows_operation(profile, PeerOperation::AccessManage);
+        return Some(PeerOperation::AccessManage);
     }
     if request_line.contains(" /api/peers/pairing/invite") {
-        return profile_allows_operation(profile, PeerOperation::AccessManage);
+        return Some(PeerOperation::AccessManage);
     }
     if request_line.contains(" /api/peers/pairing/") {
-        return profile_allows_operation(profile, PeerOperation::PeerManage);
+        return Some(PeerOperation::PeerManage);
     }
     if request_line.contains(" /api/peers") {
         if request_line.starts_with("GET") {
-            return profile_allows_operation(profile, PeerOperation::PeerInspect);
+            return Some(PeerOperation::PeerInspect);
         }
-        return profile_allows_operation(profile, PeerOperation::PeerManage);
+        return Some(PeerOperation::PeerManage);
     }
     if request_line.contains(" /api/coordinator/") {
-        return profile_allows_operation(profile, PeerOperation::Task);
+        return Some(PeerOperation::Task);
     }
     if request_line.contains(" /api/sessions") {
-        return profile_allows_operation(profile, PeerOperation::SessionInspect);
+        return Some(PeerOperation::SessionInspect);
     }
     if request_line.contains(" /api/worktrees") {
-        return profile_allows_operation(profile, PeerOperation::SessionInspect);
+        return Some(PeerOperation::SessionInspect);
     }
-    true
+    None
 }
 
 pub fn write_approved_identity(
@@ -594,6 +601,23 @@ mod tests {
             "peer-root",
             "GET /api/access/iam/state HTTP/1.1"
         ));
+        assert_eq!(
+            federation_http_operation("GET /api/access/iam/state HTTP/1.1"),
+            Some(PeerOperation::AccessInspect)
+        );
+        assert_eq!(
+            federation_http_operation("POST /api/peers/pairing/invite HTTP/1.1"),
+            Some(PeerOperation::AccessManage)
+        );
+        assert_eq!(
+            federation_http_operation("GET /api/peers HTTP/1.1"),
+            Some(PeerOperation::PeerInspect)
+        );
+        assert_eq!(
+            federation_http_operation("POST /api/peers HTTP/1.1"),
+            Some(PeerOperation::PeerManage)
+        );
+        assert_eq!(federation_http_operation("GET /config HTTP/1.1"), None);
         assert!(!profile_allows_federation_http(
             "peer-operator",
             "GET /api/access/iam/state HTTP/1.1"
