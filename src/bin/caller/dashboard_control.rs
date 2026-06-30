@@ -129,6 +129,7 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_session_recording_asset",
     "api_session_frame_asset",
     "api_worktrees",
+    "api_worktrees_inspect",
     "api_worktrees_scan",
     "api_worktrees_remove",
     "api_managed_context_records",
@@ -1946,7 +1947,8 @@ fn dashboard_control_method_operation(
         | "api_session_recordings"
         | "api_session_recording_asset"
         | "api_session_frame_asset"
-        | "api_worktrees" => Some(PeerOperation::SessionInspect),
+        | "api_worktrees"
+        | "api_worktrees_inspect" => Some(PeerOperation::SessionInspect),
         "api_session_delete"
         | "api_session_current_history"
         | "api_session_current_rollback"
@@ -2289,6 +2291,7 @@ fn control_frame_response(
                 | "api_external_session_activity_replay"
                 | "api_dashboard_bootstrap"
                 | "api_worktrees"
+                | "api_worktrees_inspect"
                 | "api_worktrees_scan"
                 | "api_worktrees_remove"
                 | "api_managed_context_records"
@@ -3904,6 +3907,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_session_recording_asset_available", session_inspect),
         ("api_session_frame_asset_available", session_inspect),
         ("api_worktrees_available", session_inspect),
+        ("api_worktrees_inspect_available", session_inspect),
         ("api_worktrees_scan_available", session_manage),
         ("api_worktrees_remove_available", session_manage),
         ("api_managed_context_available", session_inspect),
@@ -4149,6 +4153,9 @@ async fn control_request_response(
         }
         "api_dashboard_bootstrap" => api_dashboard_bootstrap_response(id, &runtime).await,
         "api_worktrees" => api_worktrees_response(id, &runtime).await,
+        "api_worktrees_inspect" => {
+            api_worktrees_inspect_response(id, params.as_ref(), &runtime).await
+        }
         "api_worktrees_scan" => api_worktrees_scan_response(id, &runtime).await,
         "api_worktrees_remove" => {
             api_worktrees_remove_response(id, params.as_ref(), &runtime).await
@@ -8036,6 +8043,34 @@ async fn api_worktrees_response(id: String, runtime: &ControlRuntime) -> serde_j
         .and_then(|guard| guard.clone())
         .unwrap_or_else(crate::web_gateway::empty_worktree_inventory_response);
     json_body_response(id, body, "worktrees")
+}
+
+async fn api_worktrees_inspect_response(
+    id: String,
+    params: Option<&serde_json::Value>,
+    _runtime: &ControlRuntime,
+) -> serde_json::Value {
+    let body_text = params_body_text(params);
+    let home = dirs::home_dir().unwrap_or_else(|| PathBuf::from("/tmp"));
+    let result = tokio::task::spawn_blocking(move || {
+        crate::web_gateway::inspect_worktree_inventory_response(&home, &body_text)
+    })
+    .await;
+    match result {
+        Ok((status_line, body)) => {
+            http_body_response(id, status_line_code(status_line), body, "worktree inspect")
+        }
+        Err(e) => http_body_response(
+            id,
+            500,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("worktree inspect task failed: {e}")
+            })
+            .to_string(),
+            "worktree inspect",
+        ),
+    }
 }
 
 async fn api_worktrees_scan_response(id: String, runtime: &ControlRuntime) -> serde_json::Value {

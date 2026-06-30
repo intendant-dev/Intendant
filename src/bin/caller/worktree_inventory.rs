@@ -10,6 +10,7 @@ const MAX_REPOS: usize = 256;
 const MAX_WORKTREES: usize = 1_000;
 const MAX_SIZE_ENTRIES_PER_WORKTREE: usize = 75_000;
 const MAX_SIZE_ENTRIES_PER_SCAN: usize = 300_000;
+const MAX_STATUS_FILES_PER_INSPECT: usize = 300;
 const DISCOVERY_DEPTH: usize = 4;
 const STALE_DAYS: i64 = 14;
 
@@ -117,6 +118,40 @@ pub struct WorktreeRemoveRequest {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInspectRequest {
+    pub repo_root: PathBuf,
+    pub path: PathBuf,
+    pub expected_head: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeInspectResponse {
+    pub ok: bool,
+    pub entry: WorktreeEntry,
+    pub reasons: Vec<WorktreeReviewReason>,
+    pub status_files: Vec<WorktreeStatusFile>,
+    pub status_truncated: bool,
+    pub status_total: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeReviewReason {
+    pub code: String,
+    pub severity: String,
+    pub label: String,
+    pub detail: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorktreeStatusFile {
+    pub path: String,
+    pub original_path: Option<String>,
+    pub index_status: String,
+    pub worktree_status: String,
+    pub category: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorktreeRemoveResponse {
     pub ok: bool,
     pub path: PathBuf,
@@ -150,6 +185,13 @@ struct StatusInfo {
     unstaged: usize,
     untracked: usize,
     conflicted: usize,
+}
+
+#[derive(Debug, Default)]
+struct WorktreeStatusFiles {
+    files: Vec<WorktreeStatusFile>,
+    total: usize,
+    truncated: bool,
 }
 
 #[derive(Debug, Default)]
@@ -196,6 +238,73 @@ pub fn scan_worktrees(
     session_hints: &[WorktreeSessionHint],
 ) -> WorktreeScan {
     scan_worktrees_with_size_budget(home, project_root, session_hints, MAX_SIZE_ENTRIES_PER_SCAN)
+}
+
+pub fn inspect_worktree(
+    request: WorktreeInspectRequest,
+    session_hints: &[WorktreeSessionHint],
+) -> Result<WorktreeInspectResponse, String> {
+    if !request.repo_root.is_absolute() {
+        return Err("repo_root must be an absolute path".to_string());
+    }
+    if !request.path.is_absolute() {
+        return Err("worktree path must be an absolute path".to_string());
+    }
+
+    let repo_root = git_repo_root(&request.repo_root).ok_or_else(|| {
+        format!(
+            "{} is not the root of a Git repository",
+            request.repo_root.display()
+        )
+    })?;
+    if !same_path(&repo_root, &request.repo_root) {
+        return Err(format!(
+            "repo_root resolves to {}; scan again before inspecting",
+            repo_root.display()
+        ));
+    }
+
+    let raw = list_git_worktrees(&repo_root)?
+        .into_iter()
+        .find(|raw| same_path(&raw.path, &request.path))
+        .ok_or_else(|| {
+            format!(
+                "{} is not registered as a worktree for {}",
+                request.path.display(),
+                repo_root.display()
+            )
+        })?;
+
+    let mut default_branches = HashMap::new();
+    default_branches.insert(path_key(&repo_root), default_branch_for_repo(&repo_root));
+    let mut size_budget = SizeBudget::new(MAX_SIZE_ENTRIES_PER_WORKTREE);
+    let entry = enrich_worktree(raw, &default_branches, session_hints, &mut size_budget)?;
+    let status = worktree_status_files(&entry.path, MAX_STATUS_FILES_PER_INSPECT)?;
+    let mut reasons = worktree_review_reasons(&entry);
+    if let Some(expected) = request
+        .expected_head
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+    {
+        if entry.head.as_deref() != Some(expected) {
+            reasons.push(WorktreeReviewReason {
+                code: "head-changed".to_string(),
+                severity: "warning".to_string(),
+                label: "HEAD changed".to_string(),
+                detail: "The worktree HEAD changed since the cached scan; scan again before removing.".to_string(),
+            });
+        }
+    }
+
+    Ok(WorktreeInspectResponse {
+        ok: true,
+        entry,
+        reasons,
+        status_files: status.files,
+        status_truncated: status.truncated,
+        status_total: status.total,
+    })
 }
 
 fn scan_worktrees_with_size_budget(
@@ -760,6 +869,128 @@ fn safety_text(
     "Merge status is unknown; review manually.".to_string()
 }
 
+fn review_reason(
+    code: &str,
+    severity: &str,
+    label: &str,
+    detail: impl Into<String>,
+) -> WorktreeReviewReason {
+    WorktreeReviewReason {
+        code: code.to_string(),
+        severity: severity.to_string(),
+        label: label.to_string(),
+        detail: detail.into(),
+    }
+}
+
+fn worktree_review_reasons(entry: &WorktreeEntry) -> Vec<WorktreeReviewReason> {
+    let mut reasons = Vec::new();
+    if entry.is_main {
+        reasons.push(review_reason(
+            "main",
+            "keep",
+            "Main worktree",
+            "This is the repository's main checkout.",
+        ));
+    }
+    if entry.locked {
+        reasons.push(review_reason(
+            "locked",
+            "warning",
+            "Locked by Git",
+            entry
+                .locked_reason
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Git marks this worktree locked."),
+        ));
+    }
+    if entry.active_sessions > 0 {
+        reasons.push(review_reason(
+            "active-sessions",
+            "warning",
+            "Active sessions",
+            format!("{} active session(s) are linked to this worktree.", entry.active_sessions),
+        ));
+    }
+    if entry.conflicted > 0 {
+        reasons.push(review_reason(
+            "conflicts",
+            "danger",
+            "Conflicted files",
+            format!("{} file(s) have unresolved conflicts.", entry.conflicted),
+        ));
+    }
+    if entry.staged > 0 || entry.unstaged > 0 {
+        reasons.push(review_reason(
+            "tracked-changes",
+            "warning",
+            "Tracked changes",
+            format!(
+                "{} staged and {} unstaged tracked file(s).",
+                entry.staged, entry.unstaged
+            ),
+        ));
+    }
+    if entry.untracked > 0 {
+        reasons.push(review_reason(
+            "untracked",
+            "warning",
+            "Untracked files",
+            format!("{} untracked file(s).", entry.untracked),
+        ));
+    }
+    match entry.merge_status.as_str() {
+        "unmerged" => reasons.push(review_reason(
+            "unmerged",
+            "warning",
+            "Not merged",
+            "HEAD is not reachable from the default branch or upstream.",
+        )),
+        "unknown" => reasons.push(review_reason(
+            "unknown-merge",
+            "warning",
+            "Unknown merge state",
+            "Merge status is unknown; review manually.",
+        )),
+        "prunable" => reasons.push(review_reason(
+            "git-prunable",
+            "ok",
+            "Prunable metadata",
+            entry
+                .prunable_reason
+                .as_deref()
+                .filter(|s| !s.is_empty())
+                .unwrap_or("Git says this worktree metadata is prunable."),
+        )),
+        _ => {}
+    }
+    if entry.size_truncated {
+        reasons.push(review_reason(
+            "size-truncated",
+            "warning",
+            "Large tree",
+            "Disk usage scan was capped for this worktree.",
+        ));
+    }
+    if entry.safe_to_remove {
+        reasons.push(review_reason(
+            "ready",
+            "ok",
+            "Ready to remove",
+            entry.safety.clone(),
+        ));
+    } else if reasons.is_empty() {
+        reasons.push(review_reason(
+            "review",
+            "warning",
+            "Review manually",
+            entry.safety.clone(),
+        ));
+    }
+    reasons
+}
+
 fn list_git_worktrees(repo: &Path) -> Result<Vec<RawWorktree>, String> {
     let output = git_string(repo, &["worktree", "list", "--porcelain"])?;
     let mut out = Vec::new();
@@ -843,6 +1074,74 @@ fn status_info(path: &Path) -> Result<StatusInfo, String> {
         }
     }
     Ok(info)
+}
+
+fn worktree_status_files(path: &Path, limit: usize) -> Result<WorktreeStatusFiles, String> {
+    let output = git_string(
+        path,
+        &[
+            "status",
+            "--porcelain=v1",
+            "--untracked-files=normal",
+            "--renames",
+        ],
+    )?;
+    let mut out = WorktreeStatusFiles::default();
+    for line in output.lines() {
+        if line.len() < 3 {
+            continue;
+        }
+        out.total += 1;
+        if out.files.len() >= limit {
+            out.truncated = true;
+            continue;
+        }
+        let bytes = line.as_bytes();
+        let x = bytes[0] as char;
+        let y = bytes[1] as char;
+        let raw_path = line[3..].to_string();
+        let (path, original_path) = split_porcelain_rename_path(raw_path);
+        out.files.push(WorktreeStatusFile {
+            path,
+            original_path,
+            index_status: x.to_string(),
+            worktree_status: y.to_string(),
+            category: status_file_category(x, y).to_string(),
+        });
+    }
+    Ok(out)
+}
+
+fn split_porcelain_rename_path(path: String) -> (String, Option<String>) {
+    if let Some((old, new)) = path.split_once(" -> ") {
+        return (new.to_string(), Some(old.to_string()));
+    }
+    (path, None)
+}
+
+fn status_file_category(index: char, worktree: char) -> &'static str {
+    if index == '?' && worktree == '?' {
+        return "untracked";
+    }
+    if is_conflicted_status(index, worktree) {
+        return "conflicted";
+    }
+    let staged = index != ' ' && index != '.' && index != '?' && index != '!';
+    let unstaged = worktree != ' ' && worktree != '.' && worktree != '?' && worktree != '!';
+    match (staged, unstaged) {
+        (true, true) => "staged+unstaged",
+        (true, false) => "staged",
+        (false, true) => "unstaged",
+        (false, false) => "clean",
+    }
+}
+
+fn is_conflicted_status(index: char, worktree: char) -> bool {
+    matches!(
+        (index, worktree),
+        ('D', 'D') | ('A', 'U') | ('U', 'D') | ('U', 'A') | ('D', 'U') | ('A', 'A')
+    ) || index == 'U'
+        || worktree == 'U'
 }
 
 fn default_branch_for_repo(repo: &Path) -> Option<String> {
@@ -1217,6 +1516,46 @@ mod tests {
         assert_eq!(found.untracked, 1);
         assert!(!found.safe_to_remove);
         assert!(found.safety.contains("local changes") || found.safety.contains("untracked"));
+    }
+
+    #[test]
+    fn inspect_dirty_worktree_reports_reasons_and_files() {
+        let tmp = init_repo();
+        let repo = repo_path(&tmp);
+        let wt = tmp.path().join("inspect-dirty-worktree");
+        let wt_str = wt.to_string_lossy().to_string();
+        git(
+            &repo,
+            &["worktree", "add", "-b", "inspect-dirty", &wt_str, "main"],
+        );
+        std::fs::write(wt.join("README.md"), "changed\n").unwrap();
+        std::fs::write(wt.join("scratch.txt"), "local\n").unwrap();
+
+        let inspected = inspect_worktree(
+            WorktreeInspectRequest {
+                repo_root: repo.clone(),
+                path: wt.clone(),
+                expected_head: None,
+            },
+            &[],
+        )
+        .expect("dirty worktree inspected");
+
+        assert!(!inspected.entry.safe_to_remove);
+        assert!(inspected
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "tracked-changes"));
+        assert!(inspected
+            .reasons
+            .iter()
+            .any(|reason| reason.code == "untracked"));
+        assert!(inspected.status_files.iter().any(|file| {
+            file.path == "README.md" && file.category == "unstaged"
+        }));
+        assert!(inspected.status_files.iter().any(|file| {
+            file.path == "scratch.txt" && file.category == "untracked"
+        }));
     }
 
     #[test]

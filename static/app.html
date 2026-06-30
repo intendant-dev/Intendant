@@ -5930,6 +5930,10 @@ body.context-focus-active {
   cursor: default;
   padding: 9px 12px;
 }
+.session-card.worktree-card.queued {
+  border-color: var(--overlay1);
+  background: color-mix(in srgb, var(--surface2) 18%, var(--surface0));
+}
 .session-card.worktree-card.removing {
   border-color: var(--blue);
   background: color-mix(in srgb, var(--blue) 8%, var(--surface0));
@@ -6038,6 +6042,115 @@ body.context-focus-active {
   color: var(--overlay1);
   font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
   font-size: 11px;
+}
+.worktree-inspect-dialog {
+  width: min(860px, calc(100vw - 32px));
+  max-width: 860px;
+}
+.worktree-inspect-summary {
+  display: grid;
+  gap: 6px;
+  margin-bottom: 12px;
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.worktree-inspect-path {
+  color: var(--text);
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+  overflow-wrap: anywhere;
+}
+.worktree-inspect-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 8px;
+  margin: 12px 0;
+}
+.worktree-inspect-metric,
+.worktree-inspect-section {
+  border: 1px solid var(--surface0);
+  border-radius: 6px;
+  background: var(--mantle);
+}
+.worktree-inspect-metric {
+  padding: 8px 10px;
+}
+.worktree-inspect-metric .label {
+  display: block;
+  color: var(--subtext0);
+  font-size: 11px;
+  margin-bottom: 3px;
+}
+.worktree-inspect-metric .value {
+  color: var(--text);
+  font-weight: 650;
+}
+.worktree-inspect-section {
+  padding: 10px;
+  margin-top: 10px;
+}
+.worktree-inspect-section h4 {
+  margin: 0 0 8px;
+  color: var(--text);
+  font-size: 13px;
+}
+.worktree-inspect-reasons,
+.worktree-inspect-files,
+.worktree-inspect-commands {
+  display: grid;
+  gap: 6px;
+}
+.worktree-inspect-reason,
+.worktree-inspect-file,
+.worktree-inspect-command {
+  display: grid;
+  gap: 3px;
+  border: 1px solid var(--surface0);
+  border-radius: 4px;
+  background: var(--surface0);
+  padding: 7px 8px;
+}
+.worktree-inspect-reason.ok { border-color: color-mix(in srgb, var(--green) 45%, var(--surface0)); }
+.worktree-inspect-reason.warning { border-color: color-mix(in srgb, var(--yellow) 45%, var(--surface0)); }
+.worktree-inspect-reason.danger,
+.worktree-inspect-reason.keep { border-color: color-mix(in srgb, var(--red) 45%, var(--surface0)); }
+.worktree-inspect-reason-title,
+.worktree-inspect-file-title,
+.worktree-inspect-command-title {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 650;
+}
+.worktree-inspect-reason-detail,
+.worktree-inspect-file-detail,
+.worktree-inspect-command code {
+  color: var(--subtext0);
+  font-size: 11px;
+  overflow-wrap: anywhere;
+}
+.worktree-inspect-file-title,
+.worktree-inspect-command code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+}
+.worktree-inspect-command {
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+}
+.worktree-inspect-command-main {
+  min-width: 0;
+}
+.worktree-inspect-command button {
+  white-space: nowrap;
+}
+.worktree-inspect-status {
+  min-height: 16px;
+}
+@media (max-width: 720px) {
+  .worktree-inspect-grid {
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+  }
+  .worktree-inspect-command {
+    grid-template-columns: 1fr;
+  }
 }
 .session-detail { flex: 1; display: flex; flex-direction: column; min-height: 0; }
 .session-detail-header {
@@ -12000,6 +12113,36 @@ body.display-fullscreen-open {
     <div class="modal-actions">
       <button class="modal-cancel" type="button" onclick="closeSessionDeleteModal()">Cancel</button>
       <button class="modal-confirm danger" type="button" id="session-delete-confirm" onclick="confirmSessionDeleteModal()">Delete</button>
+    </div>
+  </div>
+</div>
+
+<div id="worktree-inspect-modal" class="modal-backdrop" style="display:none">
+  <div class="modal-dialog worktree-inspect-dialog">
+    <button class="modal-close" type="button" onclick="closeWorktreeInspectModal()" aria-label="Close">&times;</button>
+    <h3 id="worktree-inspect-title">Inspect worktree</h3>
+    <div class="worktree-inspect-summary">
+      <div class="worktree-inspect-path" id="worktree-inspect-path"></div>
+      <div id="worktree-inspect-subtitle"></div>
+    </div>
+    <div class="worktree-inspect-grid" id="worktree-inspect-metrics"></div>
+    <div class="worktree-inspect-section">
+      <h4>Review reasons</h4>
+      <div class="worktree-inspect-reasons" id="worktree-inspect-reasons"></div>
+    </div>
+    <div class="worktree-inspect-section">
+      <h4>Dirty files</h4>
+      <div class="worktree-inspect-files" id="worktree-inspect-files"></div>
+    </div>
+    <div class="worktree-inspect-section">
+      <h4>Actions</h4>
+      <div class="worktree-inspect-commands" id="worktree-inspect-commands"></div>
+    </div>
+    <div class="session-config-status worktree-inspect-status" id="worktree-inspect-status"></div>
+    <div class="modal-actions">
+      <button class="modal-confirm secondary" type="button" onclick="worktreeInspectOpenShell()">Open shell</button>
+      <button class="modal-confirm secondary" type="button" onclick="worktreeInspectOpenFiles()">Open files</button>
+      <button class="modal-cancel" type="button" onclick="closeWorktreeInspectModal()">Close</button>
     </div>
   </div>
 </div>
@@ -43935,6 +44078,9 @@ window.intendantDashboardControl = {
   worktrees(options = {}) {
     return dashboardTransport.request('api_worktrees', {}, options);
   },
+  worktreesInspect(params = {}, options = {}) {
+    return dashboardTransport.request('api_worktrees_inspect', params, options);
+  },
   worktreesScan(options = {}) {
     return dashboardTransport.request('api_worktrees_scan', {}, options);
   },
@@ -45112,6 +45258,7 @@ class DashboardControlTransport {
       apiSessionRecordingAssetAvailable: this.lastStatus?.api_session_recording_asset_available ?? null,
       apiSessionFrameAssetAvailable: this.lastStatus?.api_session_frame_asset_available ?? null,
       apiWorktreesAvailable: this.lastStatus?.api_worktrees_available ?? null,
+      apiWorktreesInspectAvailable: this.lastStatus?.api_worktrees_inspect_available ?? null,
       apiWorktreesScanAvailable: this.lastStatus?.api_worktrees_scan_available ?? null,
       apiWorktreesRemoveAvailable: this.lastStatus?.api_worktrees_remove_available ?? null,
       apiManagedContextAvailable: this.lastStatus?.api_managed_context_available ?? null,
@@ -45476,6 +45623,7 @@ function dashboardControlRequestTimeoutMs(method) {
     case 'api_recordings':
     case 'api_session_recordings':
     case 'api_worktrees':
+    case 'api_worktrees_inspect':
     case 'api_worktrees_scan':
     case 'api_worktrees_remove':
     case 'api_fs_mkdir':
@@ -56841,6 +56989,8 @@ let worktreesRequestSerial = 0;
 let worktreesActivityClearTimeout = null;
 let worktreesLoadPromise = null;
 const pendingWorktreeRemovals = new Set();
+const worktreeRemovalQueue = [];
+let activeWorktreeRemovalPath = '';
 const SESSION_CARD_RENDER_LIMIT = 300;
 let _sessionsLoadToken = 0;
 let _sessionsStreamAbort = null;
@@ -59046,6 +59196,273 @@ function worktreeRemoveCommand(wt) {
   return `git -C ${shellQuote(wt.repo_root)} worktree remove ${shellQuote(wt.path)}`;
 }
 
+let worktreeInspectContext = null;
+
+function setWorktreeInspectStatus(message, kind = '') {
+  const el = document.getElementById('worktree-inspect-status');
+  if (!el) return;
+  el.className = 'session-config-status worktree-inspect-status' + (kind ? ` ${kind}` : '');
+  el.textContent = message || '';
+}
+
+function closeWorktreeInspectModal() {
+  const modal = document.getElementById('worktree-inspect-modal');
+  if (modal) modal.style.display = 'none';
+}
+
+function worktreeInspectPayload(wt) {
+  return {
+    repo_root: wt?.repo_root || '',
+    path: wt?.path || '',
+    expected_head: wt?.head || null,
+  };
+}
+
+async function openWorktreeInspect(wt) {
+  const modal = document.getElementById('worktree-inspect-modal');
+  if (!modal) return;
+  worktreeInspectContext = { wt: { ...wt }, inspect: null };
+  modal.style.display = 'flex';
+  renderWorktreeInspectLoading(wt);
+  try {
+    const payload = worktreeInspectPayload(wt);
+    const resp = await dashboardTransport.jsonFetch('api_worktrees_inspect', payload, () => (
+      authedFetch('/api/worktrees/inspect', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      })
+    ), 'api_worktrees_inspect', { fallbackAfterRpcFailure: false });
+    const text = await resp.text();
+    let inspect = {};
+    try { inspect = text ? JSON.parse(text) : {}; } catch (_) {}
+    if (!resp.ok || inspect.ok === false) {
+      throw new Error(inspect.error || `worktree inspect returned ${resp.status}`);
+    }
+    worktreeInspectContext = { wt: inspect.entry || wt, inspect };
+    renderWorktreeInspect(inspect);
+  } catch (err) {
+    renderWorktreeInspectError(wt, err?.message || 'Worktree inspect failed');
+  }
+}
+
+function renderWorktreeInspectLoading(wt) {
+  document.getElementById('worktree-inspect-title').textContent = 'Inspect worktree';
+  document.getElementById('worktree-inspect-path').textContent = wt?.path || '';
+  document.getElementById('worktree-inspect-subtitle').textContent = 'Loading current Git state...';
+  document.getElementById('worktree-inspect-metrics').innerHTML = '';
+  document.getElementById('worktree-inspect-reasons').innerHTML = '<div class="empty-state">Loading reasons...</div>';
+  document.getElementById('worktree-inspect-files').innerHTML = '<div class="empty-state">Loading dirty files...</div>';
+  document.getElementById('worktree-inspect-commands').innerHTML = '';
+  setWorktreeInspectStatus('', '');
+}
+
+function renderWorktreeInspectError(wt, message) {
+  document.getElementById('worktree-inspect-title').textContent = 'Inspect worktree';
+  document.getElementById('worktree-inspect-path').textContent = wt?.path || '';
+  document.getElementById('worktree-inspect-subtitle').textContent = 'Inspect failed.';
+  document.getElementById('worktree-inspect-reasons').innerHTML = '<div class="empty-state">No current details available</div>';
+  document.getElementById('worktree-inspect-files').innerHTML = '<div class="empty-state">No file details available</div>';
+  document.getElementById('worktree-inspect-commands').innerHTML = '';
+  setWorktreeInspectStatus(message, 'error');
+}
+
+function appendWorktreeInspectMetric(parent, label, value) {
+  const card = document.createElement('div');
+  card.className = 'worktree-inspect-metric';
+  const l = document.createElement('span');
+  l.className = 'label';
+  l.textContent = label;
+  const v = document.createElement('span');
+  v.className = 'value';
+  v.textContent = value || '--';
+  card.appendChild(l);
+  card.appendChild(v);
+  parent.appendChild(card);
+}
+
+function renderWorktreeInspect(inspect) {
+  const wt = inspect?.entry || {};
+  const title = document.getElementById('worktree-inspect-title');
+  const path = document.getElementById('worktree-inspect-path');
+  const subtitle = document.getElementById('worktree-inspect-subtitle');
+  if (title) title.textContent = wt.branch || wt.head_short || 'Inspect worktree';
+  if (path) path.textContent = wt.path || '';
+  if (subtitle) {
+    subtitle.textContent = [
+      wt.repo_name || wt.repo_root || '',
+      wt.safe_to_remove ? 'removal candidate' : (wt.recommended_action || 'review'),
+      wt.safety || '',
+    ].filter(Boolean).join(' · ');
+  }
+
+  const metrics = document.getElementById('worktree-inspect-metrics');
+  if (metrics) {
+    metrics.innerHTML = '';
+    appendWorktreeInspectMetric(metrics, 'Status', wt.safe_to_remove ? 'candidate' : (wt.recommended_action || 'review'));
+    appendWorktreeInspectMetric(metrics, 'Dirty', `${wt.staged || 0} staged / ${wt.unstaged || 0} unstaged / ${wt.untracked || 0} untracked`);
+    appendWorktreeInspectMetric(metrics, 'Merge', wt.merge_status || '--');
+    appendWorktreeInspectMetric(metrics, 'Sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`);
+    appendWorktreeInspectMetric(metrics, 'Size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''));
+    appendWorktreeInspectMetric(metrics, 'Branch', wt.branch || (wt.detached ? 'detached' : '--'));
+    appendWorktreeInspectMetric(metrics, 'HEAD', wt.head_short || '--');
+    appendWorktreeInspectMetric(metrics, 'Changed', fmtWorktreeMinute(wt.last_changed_at));
+  }
+
+  renderWorktreeInspectReasons(inspect?.reasons || []);
+  renderWorktreeInspectFiles(inspect?.status_files || [], inspect?.status_total || 0, !!inspect?.status_truncated);
+  renderWorktreeInspectCommands(wt);
+  setWorktreeInspectStatus('Current Git state loaded.', 'ok');
+}
+
+function renderWorktreeInspectReasons(reasons) {
+  const el = document.getElementById('worktree-inspect-reasons');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!reasons.length) {
+    el.innerHTML = '<div class="empty-state">No review blockers found</div>';
+    return;
+  }
+  for (const reason of reasons) {
+    const row = document.createElement('div');
+    const severity = String(reason.severity || 'warning').replace(/[^a-z0-9_-]/gi, '-');
+    row.className = `worktree-inspect-reason ${severity}`;
+    const title = document.createElement('div');
+    title.className = 'worktree-inspect-reason-title';
+    title.textContent = reason.label || reason.code || 'Review';
+    const detail = document.createElement('div');
+    detail.className = 'worktree-inspect-reason-detail';
+    detail.textContent = reason.detail || '';
+    row.appendChild(title);
+    row.appendChild(detail);
+    el.appendChild(row);
+  }
+}
+
+function worktreeInspectFileLabel(file) {
+  const category = String(file?.category || '').replace(/\+/g, ' + ');
+  const status = `${file?.index_status || ' '}${file?.worktree_status || ' '}`.trim();
+  return [category || 'changed', status ? `(${status})` : ''].filter(Boolean).join(' ');
+}
+
+function renderWorktreeInspectFiles(files, total, truncated) {
+  const el = document.getElementById('worktree-inspect-files');
+  if (!el) return;
+  el.innerHTML = '';
+  if (!files.length) {
+    el.innerHTML = '<div class="empty-state">No dirty files reported</div>';
+    return;
+  }
+  const order = ['conflicted', 'staged+unstaged', 'staged', 'unstaged', 'untracked', 'clean'];
+  const rows = files.slice().sort((a, b) => {
+    const ai = order.indexOf(a.category);
+    const bi = order.indexOf(b.category);
+    return (ai < 0 ? order.length : ai) - (bi < 0 ? order.length : bi) ||
+      String(a.path || '').localeCompare(String(b.path || ''));
+  });
+  for (const file of rows) {
+    const row = document.createElement('div');
+    row.className = 'worktree-inspect-file';
+    const title = document.createElement('div');
+    title.className = 'worktree-inspect-file-title';
+    title.textContent = file.path || '';
+    const detail = document.createElement('div');
+    detail.className = 'worktree-inspect-file-detail';
+    detail.textContent = file.original_path
+      ? `${worktreeInspectFileLabel(file)} · renamed from ${file.original_path}`
+      : worktreeInspectFileLabel(file);
+    row.appendChild(title);
+    row.appendChild(detail);
+    el.appendChild(row);
+  }
+  if (truncated) {
+    const more = document.createElement('div');
+    more.className = 'empty-state';
+    more.textContent = `Showing ${files.length.toLocaleString()} of ${Number(total || files.length).toLocaleString()} changed files. Open Shell for the full status.`;
+    el.appendChild(more);
+  }
+}
+
+function worktreeInspectCommands(wt) {
+  const path = wt?.path || '';
+  const repo = wt?.repo_root || path;
+  const commands = [
+    { title: 'Show status', command: `git -C ${shellQuote(path)} status --short --branch` },
+    { title: 'Show unstaged diff stat', command: `git -C ${shellQuote(path)} diff --stat` },
+    { title: 'Show staged diff stat', command: `git -C ${shellQuote(path)} diff --cached --stat` },
+    { title: 'Preview untracked cleanup', command: `git -C ${shellQuote(path)} clean -nd` },
+    { title: 'Stash tracked and untracked changes', command: `git -C ${shellQuote(path)} stash push -u -m ${shellQuote('intendant worktree cleanup')}` },
+    { title: 'Remove after cleanup', command: `git -C ${shellQuote(repo)} worktree remove ${shellQuote(path)}` },
+  ];
+  return commands.filter(cmd => !cmd.command.includes("''"));
+}
+
+function renderWorktreeInspectCommands(wt) {
+  const el = document.getElementById('worktree-inspect-commands');
+  if (!el) return;
+  el.innerHTML = '';
+  for (const item of worktreeInspectCommands(wt)) {
+    const row = document.createElement('div');
+    row.className = 'worktree-inspect-command';
+    const main = document.createElement('div');
+    main.className = 'worktree-inspect-command-main';
+    const title = document.createElement('div');
+    title.className = 'worktree-inspect-command-title';
+    title.textContent = item.title;
+    const code = document.createElement('code');
+    code.textContent = item.command;
+    main.appendChild(title);
+    main.appendChild(code);
+    const copy = document.createElement('button');
+    copy.type = 'button';
+    copy.className = 'sc-resume-btn';
+    copy.textContent = 'Copy';
+    copy.addEventListener('click', () => {
+      copyTextToClipboard(item.command).then(
+        () => setWorktreeInspectStatus('Command copied.', 'ok'),
+        err => setWorktreeInspectStatus(err?.message || 'Copy failed', 'error')
+      );
+    });
+    row.appendChild(main);
+    row.appendChild(copy);
+    el.appendChild(row);
+  }
+}
+
+function worktreeInspectCurrentPath() {
+  return worktreeInspectContext?.inspect?.entry?.path || worktreeInspectContext?.wt?.path || '';
+}
+
+function worktreeInspectOpenShell() {
+  const path = worktreeInspectCurrentPath();
+  if (!path) return;
+  closeWorktreeInspectModal();
+  routeTo('terminal', 'shell');
+  setTimeout(() => {
+    setShellHost(SHELL_HOST_ID);
+    if (!shellInitialized) initShell();
+    openShellSessionIfPossible();
+    sendShellBytes(`cd ${shellQuote(path)}`);
+    showControlToast('success', 'Shell opened with worktree path queued.');
+  }, 0);
+}
+
+function worktreeInspectOpenFiles() {
+  const path = worktreeInspectCurrentPath();
+  if (!path) return;
+  closeWorktreeInspectModal();
+  routeTo('files');
+  setTimeout(() => {
+    setFilesDownloadPath(path);
+    setFilesDownloadStatus('', 'Worktree path loaded. Use Browse to choose a file inside it.');
+    document.getElementById('files-download-path')?.focus();
+  }, 0);
+}
+
+window.closeWorktreeInspectModal = closeWorktreeInspectModal;
+window.worktreeInspectOpenShell = worktreeInspectOpenShell;
+window.worktreeInspectOpenFiles = worktreeInspectOpenFiles;
+
 function formatWorktreeDivergence(target, ahead, behind) {
   const label = target ? `${target} ` : '';
   return `${label}+${Number(ahead || 0).toLocaleString()} / -${Number(behind || 0).toLocaleString()}`;
@@ -59076,11 +59493,24 @@ function recomputeWorktreeSummary(scan) {
   scan.summary = summary;
 }
 
-function setWorktreeRemoveButtonPending(button, pending) {
+function worktreeRemovalState(pathKey) {
+  const key = String(pathKey || '');
+  if (!key) return '';
+  if (activeWorktreeRemovalPath === key) return 'removing';
+  return pendingWorktreeRemovals.has(key) ? 'queued' : '';
+}
+
+function setWorktreeRemoveButtonPending(button, state) {
   if (!button) return;
-  button.disabled = !!pending;
-  button.classList.toggle('pending', !!pending);
-  button.textContent = pending ? 'Removing...' : 'Remove worktree...';
+  const mode = state === true ? 'removing' : (state || '');
+  const pending = mode === 'queued' || mode === 'removing';
+  button.disabled = pending;
+  button.classList.toggle('pending', pending);
+  button.textContent = mode === 'queued'
+    ? 'Queued...'
+    : mode === 'removing'
+    ? 'Removing...'
+    : 'Remove worktree...';
 }
 
 async function removeWorktree(wt, button) {
@@ -59099,56 +59529,97 @@ async function removeWorktree(wt, button) {
   if (!ok) return;
 
   const pathKey = String(wt.path || '');
-  if (pendingWorktreeRemovals.has(pathKey)) {
-    setWorktreesStatus(`Already removing ${wt.path}...`);
+  if (!pathKey) {
+    setWorktreesStatus('Worktree removal failed: missing path.', 'error');
+    setWorktreesActivityNotice('error', 'Worktree removal failed: missing path.');
     return;
   }
+  if (pendingWorktreeRemovals.has(pathKey)) {
+    const state = worktreeRemovalState(pathKey);
+    setWorktreesStatus(`${state === 'removing' ? 'Already removing' : 'Already queued'} ${wt.path}...`);
+    return;
+  }
+
   pendingWorktreeRemovals.add(pathKey);
-  setWorktreeRemoveButtonPending(button, true);
-  button?.closest('.worktree-card')?.classList.add('removing');
-  setWorktreesStatus(`Removing ${wt.path}...`);
-  setWorktreesActivityNotice('pending', `Removing ${wt.path}...`);
+  worktreeRemovalQueue.push({
+    pathKey,
+    wt: { ...wt },
+  });
+  setWorktreeRemoveButtonPending(button, activeWorktreeRemovalPath ? 'queued' : 'removing');
+  button?.closest('.worktree-card')?.classList.add(activeWorktreeRemovalPath ? 'queued' : 'removing');
+  const waiting = worktreeRemovalQueue.length;
+  if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
+  if (activeWorktreeRemovalPath) {
+    setWorktreesStatus(`Queued ${wt.path} for removal. ${waiting} waiting.`);
+    setWorktreesActivityNotice('pending', `Queued ${wt.path} for removal. ${waiting} waiting.`);
+  }
+  drainWorktreeRemovalQueue();
+}
 
-  try {
-    const payload = {
-      repo_root: wt.repo_root,
-      path: wt.path,
-      expected_head: wt.head || null,
-    };
-    const r = await dashboardTransport.jsonFetch('api_worktrees_remove', payload, () => (
-      authedFetch('/api/worktrees/remove', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(payload),
-      })
-    ), 'api_worktrees_remove', { fallbackAfterRpcFailure: false });
-    const text = await r.text();
-    let result = {};
-    try { result = text ? JSON.parse(text) : {}; } catch (_) {}
-    if (!r.ok || result.ok === false) {
-      throw new Error(result.error || `worktree removal returned ${r.status}`);
-    }
+async function drainWorktreeRemovalQueue() {
+  if (activeWorktreeRemovalPath) return;
+  while (worktreeRemovalQueue.length > 0) {
+    const job = worktreeRemovalQueue.shift();
+    const wt = job?.wt || {};
+    const pathKey = job?.pathKey || String(wt.path || '');
+    if (!pathKey || !pendingWorktreeRemovals.has(pathKey)) continue;
 
-    const freed = Number(result.size_bytes || wt.size_bytes || 0);
-    pendingWorktreeRemovals.delete(pathKey);
-    if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
-      _cachedWorktreeScan.worktrees = _cachedWorktreeScan.worktrees
-        .filter(entry => entry.path !== wt.path);
-      recomputeWorktreeSummary(_cachedWorktreeScan);
-      renderWorktrees(_cachedWorktreeScan);
-    }
-    const message = `Removed ${wt.path}. Freed about ${_fmtBytes(freed)}. Click Scan to refresh from disk.`;
-    setWorktreesStatus(message);
-    setWorktreesActivityNotice('ok', message, 3500);
-    showControlToast('success', 'Worktree removed.');
-  } catch (err) {
-    pendingWorktreeRemovals.delete(pathKey);
+    activeWorktreeRemovalPath = pathKey;
     if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
-    const message = err.message || 'Worktree removal failed';
-    setWorktreesStatus(message, 'error');
-    setWorktreesActivityNotice('error', message);
-  } finally {
-    setWorktreeRemoveButtonPending(button, false);
+    setWorktreesStatus(`Removing ${wt.path}...`);
+    setWorktreesActivityNotice('pending', `Removing ${wt.path}...${worktreeRemovalQueue.length ? ` ${worktreeRemovalQueue.length} queued.` : ''}`);
+
+    let finalStatus = '';
+    let finalStatusKind = '';
+    let finalNoticeKind = 'ok';
+    let finalNoticeAutoHideMs = 0;
+    try {
+      const payload = {
+        repo_root: wt.repo_root,
+        path: wt.path,
+        expected_head: wt.head || null,
+      };
+      const r = await dashboardTransport.jsonFetch('api_worktrees_remove', payload, () => (
+        authedFetch('/api/worktrees/remove', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(payload),
+        })
+      ), 'api_worktrees_remove', { fallbackAfterRpcFailure: false });
+      const text = await r.text();
+      let result = {};
+      try { result = text ? JSON.parse(text) : {}; } catch (_) {}
+      if (!r.ok || result.ok === false) {
+        throw new Error(result.error || `worktree removal returned ${r.status}`);
+      }
+
+      const freed = Number(result.size_bytes || wt.size_bytes || 0);
+      if (_cachedWorktreeScan && Array.isArray(_cachedWorktreeScan.worktrees)) {
+        _cachedWorktreeScan.worktrees = _cachedWorktreeScan.worktrees
+          .filter(entry => entry.path !== wt.path);
+        recomputeWorktreeSummary(_cachedWorktreeScan);
+      }
+      const remaining = worktreeRemovalQueue.length;
+      finalStatus = `Removed ${wt.path}. Freed about ${_fmtBytes(freed)}.${remaining ? ` ${remaining} removal${remaining === 1 ? '' : 's'} still queued.` : ' Click Scan to refresh from disk.'}`;
+      finalNoticeKind = remaining ? 'pending' : 'ok';
+      finalNoticeAutoHideMs = remaining ? 0 : 3500;
+      showControlToast('success', 'Worktree removed.');
+    } catch (err) {
+      const remaining = worktreeRemovalQueue.length;
+      const message = err.message || 'Worktree removal failed';
+      finalStatus = remaining ? `${message}. Continuing with ${remaining} queued.` : message;
+      finalStatusKind = 'error';
+      finalNoticeKind = 'error';
+      showControlToast('error', message);
+    } finally {
+      pendingWorktreeRemovals.delete(pathKey);
+      activeWorktreeRemovalPath = '';
+      if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
+      if (finalStatus) {
+        setWorktreesStatus(finalStatus, finalStatusKind);
+        setWorktreesActivityNotice(finalNoticeKind, finalStatus, finalNoticeAutoHideMs);
+      }
+    }
   }
 }
 
@@ -59205,11 +59676,14 @@ function renderWorktreesList(scan, el) {
 
   for (const wt of rows) {
     const pathKey = String(wt.path || '');
-    const removing = pendingWorktreeRemovals.has(pathKey);
+    const removalState = worktreeRemovalState(pathKey);
+    const removing = removalState === 'removing';
+    const queued = removalState === 'queued';
     const card = document.createElement('div');
     card.className = 'session-card worktree-card';
     card.dataset.worktreePath = pathKey;
     if (removing) card.classList.add('removing');
+    else if (queued) card.classList.add('queued');
     if (wt.safe_to_remove) card.classList.add('safe');
     else if (wt.dirty || wt.merge_status === 'unmerged' || (wt.active_sessions || 0) > 0 || wt.conflicted > 0) card.classList.add('danger');
     else card.classList.add('warning');
@@ -59239,8 +59713,8 @@ function renderWorktreesList(scan, el) {
     top.appendChild(titleBlock);
 
     const statusEl = document.createElement('span');
-    statusEl.className = 'sc-status ' + (removing ? 'in_progress' : (wt.safe_to_remove ? 'completed' : (wt.dirty || wt.merge_status === 'unmerged' ? 'interrupted' : 'idle')));
-    statusEl.textContent = removing ? 'removing' : (wt.safe_to_remove ? 'candidate' : wt.recommended_action || 'review');
+    statusEl.className = 'sc-status ' + (removalState ? 'in_progress' : (wt.safe_to_remove ? 'completed' : (wt.dirty || wt.merge_status === 'unmerged' ? 'interrupted' : 'idle')));
+    statusEl.textContent = removalState || (wt.safe_to_remove ? 'candidate' : wt.recommended_action || 'review');
     top.appendChild(statusEl);
     card.appendChild(top);
 
@@ -59308,14 +59782,24 @@ function renderWorktreesList(scan, el) {
     });
     actions.appendChild(copyPath);
 
+    const inspectBtn = document.createElement('button');
+    inspectBtn.className = 'sc-resume-btn';
+    inspectBtn.textContent = 'Inspect';
+    inspectBtn.title = 'Inspect review reasons, dirty files, and cleanup commands';
+    inspectBtn.addEventListener('click', (ev) => {
+      ev.stopPropagation();
+      openWorktreeInspect(wt);
+    });
+    actions.appendChild(inspectBtn);
+
     if (wt.safe_to_remove) {
       const command = worktreeRemoveCommand(wt);
       const removeBtn = document.createElement('button');
       removeBtn.className = 'sc-delete-btn';
-      removeBtn.textContent = removing ? 'Removing...' : 'Remove worktree...';
+      removeBtn.textContent = queued ? 'Queued...' : (removing ? 'Removing...' : 'Remove worktree...');
       removeBtn.title = 'Re-check safety and remove this worktree';
-      removeBtn.disabled = removing;
-      removeBtn.classList.toggle('pending', removing);
+      removeBtn.disabled = !!removalState;
+      removeBtn.classList.toggle('pending', !!removalState);
       removeBtn.addEventListener('click', (ev) => {
         ev.stopPropagation();
         removeWorktree(wt, removeBtn);
@@ -59325,7 +59809,7 @@ function renderWorktreesList(scan, el) {
       const copyCmd = document.createElement('button');
       copyCmd.className = 'sc-resume-btn';
       copyCmd.textContent = 'Copy remove command';
-      copyCmd.disabled = removing;
+      copyCmd.disabled = !!removalState;
       copyCmd.addEventListener('click', (ev) => {
         ev.stopPropagation();
         copyTextToClipboard(command).then(
@@ -61008,6 +61492,11 @@ document.addEventListener('keydown', (e) => {
     closeSessionDeleteModal();
     return;
   }
+  const worktreeInspectModal = document.getElementById('worktree-inspect-modal');
+  if (worktreeInspectModal && worktreeInspectModal.style.display !== 'none') {
+    closeWorktreeInspectModal();
+    return;
+  }
   const dashboardConfirmModal = document.getElementById('dashboard-confirm-modal');
   if (dashboardConfirmModal && dashboardConfirmModal.style.display !== 'none') {
     closeDashboardConfirmModal(false);
@@ -61038,6 +61527,9 @@ document.getElementById('session-config-modal')?.addEventListener('click', (e) =
 });
 document.getElementById('session-delete-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'session-delete-modal') closeSessionDeleteModal();
+});
+document.getElementById('worktree-inspect-modal')?.addEventListener('click', (e) => {
+  if (e.target && e.target.id === 'worktree-inspect-modal') closeWorktreeInspectModal();
 });
 document.getElementById('dashboard-confirm-modal')?.addEventListener('click', (e) => {
   if (e.target && e.target.id === 'dashboard-confirm-modal') closeDashboardConfirmModal(false);
