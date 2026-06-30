@@ -5,6 +5,7 @@ members = [".", "crates/presence-core", "crates/presence-web", "crates/station-w
 name = "intendant"
 version = "0.1.0"
 edition = "2021"
+license = "MIT"
 
 [[bin]]
 name = "intendant-runtime"
