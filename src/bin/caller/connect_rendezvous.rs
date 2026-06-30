@@ -552,6 +552,7 @@ fn connect_dashboard_root_grant(
             "connect-dashboard-control",
             label,
             Some(serde_json::Value::Object(account)),
+            None,
             vec![serde_json::Value::Object(authn)],
         ),
     }

@@ -121,6 +121,16 @@ pub struct UserClientGrantUpsertRequest {
     #[serde(default)]
     pub account_name: Option<String>,
     #[serde(default)]
+    pub account_provider: Option<String>,
+    #[serde(default)]
+    pub handle: Option<String>,
+    #[serde(default)]
+    pub verified_provider: Option<String>,
+    #[serde(default)]
+    pub organization_id: Option<String>,
+    #[serde(default)]
+    pub organization_name: Option<String>,
+    #[serde(default)]
     pub role_id: Option<String>,
     #[serde(default)]
     pub status: Option<String>,
@@ -185,6 +195,8 @@ pub struct AccessPrincipal {
     #[serde(default)]
     pub account: Option<Value>,
     #[serde(default)]
+    pub organization: Option<Value>,
+    #[serde(default)]
     pub authn: Vec<Value>,
 }
 
@@ -209,6 +221,7 @@ impl AccessPrincipal {
             transport: transport.into(),
             peer_profile: None,
             account: None,
+            organization: None,
             authn: Vec::new(),
         }
     }
@@ -218,11 +231,13 @@ impl AccessPrincipal {
         transport: impl Into<String>,
         label: impl Into<String>,
         account: Option<Value>,
+        organization: Option<Value>,
         authn: Vec<Value>,
     ) -> Self {
         let mut principal = Self::root_dashboard_session(source, transport);
         principal.label = label.into();
         principal.account = account;
+        principal.organization = organization;
         principal.authn = authn;
         principal
     }
@@ -250,6 +265,7 @@ impl AccessPrincipal {
             transport: transport.into(),
             peer_profile: Some(profile),
             account: None,
+            organization: None,
             authn: Vec::new(),
         }
     }
@@ -287,6 +303,7 @@ impl AccessPrincipal {
             transport: transport.into(),
             peer_profile: None,
             account: principal.account.clone(),
+            organization: principal.organization.clone(),
             authn: principal.authn.clone(),
         }
     }
@@ -458,6 +475,7 @@ struct UserClientBinding {
     principal_kind: String,
     label: String,
     account: Option<Value>,
+    organization: Option<Value>,
     authn: Vec<Value>,
 }
 
@@ -516,6 +534,7 @@ pub fn upsert_user_client_grant(
         existing.status = status.clone();
         existing.source = "local_iam_state".to_string();
         existing.account = binding.account.clone();
+        existing.organization = binding.organization.clone();
         existing.authn = binding.authn.clone();
         existing.notes = Some(reason.clone());
         if existing.created_at_unix_ms.is_none() {
@@ -531,7 +550,7 @@ pub fn upsert_user_client_grant(
             status: status.clone(),
             source: "local_iam_state".to_string(),
             account: binding.account.clone(),
-            organization: None,
+            organization: binding.organization.clone(),
             authn: binding.authn.clone(),
             notes: Some(reason.clone()),
             created_at_unix_ms: Some(now),
@@ -773,8 +792,11 @@ fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessR
         "connect_account" | "connect-account" | "passkey_account" | "passkey-account" => {
             Ok("connect_account".to_string())
         }
+        "human_user" | "human-user" | "human" | "human_mtls" | "human-mtls" => {
+            Ok("human_user".to_string())
+        }
         _ => Err(AccessError(
-            "kind must be browser_certificate or connect_account".to_string(),
+            "kind must be browser_certificate, connect_account, or human_user".to_string(),
         )),
     }
 }
@@ -816,6 +838,7 @@ fn build_user_client_binding(
                 principal_kind: "browser_certificate".to_string(),
                 label,
                 account: None,
+                organization: organization_metadata(request),
                 authn: vec![json!({
                     "kind": "browser_mtls_cert",
                     "label": "Browser mTLS certificate",
@@ -832,6 +855,7 @@ fn build_user_client_binding(
             let account_name = request
                 .account_name
                 .as_deref()
+                .or(request.handle.as_deref())
                 .and_then(trimmed_nonempty)
                 .map(ToOwned::to_owned);
             if user_id.is_none() && account_name.is_none() {
@@ -850,7 +874,7 @@ fn build_user_client_binding(
             let mut account = serde_json::Map::new();
             account.insert(
                 "provider".to_string(),
-                Value::String("intendant.dev".to_string()),
+                Value::String(account_provider(request)),
             );
             if let Some(user_id) = user_id.as_ref() {
                 account.insert("user_id".to_string(), Value::String(user_id.clone()));
@@ -859,6 +883,17 @@ fn build_user_client_binding(
                 account.insert(
                     "account_name".to_string(),
                     Value::String(account_name.clone()),
+                );
+                account.insert("handle".to_string(), Value::String(account_name.clone()));
+            }
+            if let Some(provider) = request
+                .verified_provider
+                .as_deref()
+                .and_then(trimmed_nonempty)
+            {
+                account.insert(
+                    "verified_provider".to_string(),
+                    Value::String(provider.to_string()),
                 );
             }
             let mut authn = serde_json::Map::new();
@@ -884,11 +919,163 @@ fn build_user_client_binding(
                 principal_kind: "connect_account".to_string(),
                 label,
                 account: Some(Value::Object(account)),
+                organization: organization_metadata(request),
                 authn: vec![Value::Object(authn)],
             })
         }
+        "human_user" => build_human_user_binding(request),
         _ => Err(AccessError(format!("unsupported user/client kind {kind}"))),
     }
+}
+
+fn build_human_user_binding(
+    request: &UserClientGrantUpsertRequest,
+) -> AccessResult<UserClientBinding> {
+    let fingerprint = request
+        .fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(normalize_fingerprint)
+        .filter(|fingerprint| !fingerprint.is_empty());
+    let user_id = request
+        .user_id
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(ToOwned::to_owned);
+    let handle = request
+        .handle
+        .as_deref()
+        .or(request.account_name.as_deref())
+        .and_then(trimmed_nonempty)
+        .map(ToOwned::to_owned);
+    if fingerprint.is_none() && user_id.is_none() && handle.is_none() {
+        return Err(AccessError(
+            "human_user requires a fingerprint, user_id, or handle".to_string(),
+        ));
+    }
+    let id_source = user_id
+        .as_deref()
+        .or(handle.as_deref())
+        .or(fingerprint.as_deref())
+        .unwrap_or("human");
+    let label = request
+        .label
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(ToOwned::to_owned)
+        .or_else(|| handle.as_ref().map(|name| format!("@{name}")))
+        .unwrap_or_else(|| format!("Human user {}", short_id(id_source)));
+
+    let mut authn = Vec::new();
+    if let Some(fingerprint) = fingerprint.as_ref() {
+        authn.push(json!({
+            "kind": "browser_mtls_cert",
+            "label": "Browser mTLS certificate",
+            "fingerprint": fingerprint,
+        }));
+    }
+    if user_id.is_some() || handle.is_some() {
+        let mut connect = serde_json::Map::new();
+        connect.insert(
+            "kind".to_string(),
+            Value::String("connect_account".to_string()),
+        );
+        connect.insert(
+            "label".to_string(),
+            Value::String("Intendant Connect account".to_string()),
+        );
+        if let Some(user_id) = user_id.as_ref() {
+            connect.insert("user_id".to_string(), Value::String(user_id.clone()));
+        }
+        if let Some(handle) = handle.as_ref() {
+            connect.insert("account_name".to_string(), Value::String(handle.clone()));
+            connect.insert("handle".to_string(), Value::String(handle.clone()));
+        }
+        authn.push(Value::Object(connect));
+    }
+
+    Ok(UserClientBinding {
+        principal_id: format!("principal:human-user:{}", slug_component(id_source)),
+        principal_kind: "human_user".to_string(),
+        label,
+        account: account_metadata(request, user_id.as_deref(), handle.as_deref()),
+        organization: organization_metadata(request),
+        authn,
+    })
+}
+
+fn account_provider(request: &UserClientGrantUpsertRequest) -> String {
+    request
+        .account_provider
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .unwrap_or("intendant.dev")
+        .to_string()
+}
+
+fn account_metadata(
+    request: &UserClientGrantUpsertRequest,
+    user_id: Option<&str>,
+    handle: Option<&str>,
+) -> Option<Value> {
+    if user_id.is_none()
+        && handle.is_none()
+        && request
+            .verified_provider
+            .as_deref()
+            .and_then(trimmed_nonempty)
+            .is_none()
+    {
+        return None;
+    }
+    let mut account = serde_json::Map::new();
+    account.insert(
+        "provider".to_string(),
+        Value::String(account_provider(request)),
+    );
+    if let Some(user_id) = user_id {
+        account.insert("user_id".to_string(), Value::String(user_id.to_string()));
+    }
+    if let Some(handle) = handle {
+        account.insert(
+            "account_name".to_string(),
+            Value::String(handle.to_string()),
+        );
+        account.insert("handle".to_string(), Value::String(handle.to_string()));
+    }
+    if let Some(provider) = request
+        .verified_provider
+        .as_deref()
+        .and_then(trimmed_nonempty)
+    {
+        account.insert(
+            "verified_provider".to_string(),
+            Value::String(provider.to_string()),
+        );
+    }
+    Some(Value::Object(account))
+}
+
+fn organization_metadata(request: &UserClientGrantUpsertRequest) -> Option<Value> {
+    let org_id = request
+        .organization_id
+        .as_deref()
+        .and_then(trimmed_nonempty);
+    let org_name = request
+        .organization_name
+        .as_deref()
+        .and_then(trimmed_nonempty);
+    if org_id.is_none() && org_name.is_none() {
+        return None;
+    }
+    let mut org = serde_json::Map::new();
+    if let Some(org_id) = org_id {
+        org.insert("id".to_string(), Value::String(org_id.to_string()));
+    }
+    if let Some(org_name) = org_name {
+        org.insert("name".to_string(), Value::String(org_name.to_string()));
+    }
+    Some(Value::Object(org))
 }
 
 fn policy_for_role(role_id: &str) -> String {
@@ -1904,6 +2091,62 @@ mod tests {
                 &state,
                 &principal,
                 crate::peer::access_policy::PeerOperation::AccessInspect,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn upsert_human_user_grant_binds_browser_cert_and_metadata() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "human_user".to_string(),
+                label: Some("Alice".to_string()),
+                fingerprint: Some("F0:0D".to_string()),
+                handle: Some("alice".to_string()),
+                account_provider: Some("github".to_string()),
+                verified_provider: Some("github".to_string()),
+                organization_id: Some("org-1".to_string()),
+                organization_name: Some("Acme".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert_eq!(result.principal.kind, "human_user");
+        assert_eq!(result.principal.label, "Alice");
+        assert_eq!(
+            result
+                .principal
+                .account
+                .as_ref()
+                .and_then(|account| account.get("provider"))
+                .and_then(Value::as_str),
+            Some("github")
+        );
+        assert_eq!(
+            result
+                .principal
+                .organization
+                .as_ref()
+                .and_then(|org| org.get("name"))
+                .and_then(Value::as_str),
+            Some("Acme")
+        );
+
+        let principal = principal_for_browser_mtls_cert(&state, "f00d", "https").unwrap();
+        assert_eq!(principal.kind, "human_user");
+        assert_eq!(principal.role_id, "role:observer");
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::SessionInspect,
             )
             .allowed
         );

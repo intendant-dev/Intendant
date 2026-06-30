@@ -287,9 +287,9 @@ Unified administration for how dashboards and daemons reach each other:
 - **Overview** shows the current access scope, the local daemon identity, and
   the boundary between authority models and transports.
 - **People & Devices** lists user/client principals separately from peer daemon
-  identities. The current browser or Connect account is user/client access; the
-  pane can bind that identity to a local role grant, from minimal inspect-only
-  access through root.
+  identities. The current browser certificate, Connect account, or combined
+  human mTLS user is user/client access; the pane can bind that identity to a
+  local role grant, from minimal inspect-only access through root.
 - **Daemons** lists daemon targets, not raw transports. A target can be this
   daemon over user/client access, a hosted-transport daemon, a direct browser-mTLS
   daemon, or a peer-routed daemon. Each row shows the access domain, route, and
@@ -325,8 +325,9 @@ and peer federation:
   a peer-daemon principal with a peer-profile grant to this daemon; revoked
   identities remain visible as revoked grants for audit clarity. Local IAM
   grants loaded from `iam.json` are enforced when active and bound to browser
-  mTLS certificate fingerprints or hosted Connect account metadata; draft and
-  revoked records remain visible for review.
+  mTLS certificate fingerprints, hosted Connect account metadata, or a
+  `human_user` record that can carry both bindings plus account/provider and
+  organization metadata. Draft and revoked records remain visible for review.
 - A **policy** defines the shape of authority behind a grant. `root` and
   `peer-profile` are enforced today, but they live in different domains:
   `root` is user/client authority and `peer-profile` is daemon-to-daemon
@@ -350,9 +351,9 @@ The important security-domain split is:
 - **User/client daemon access** means a human-operated dashboard can control a
   daemon. Hosted Connect passkey access and browser mTLS client certificates are
   both in this domain. Unbound owner sessions remain root-compatible; active
-  local IAM bindings can scope a browser certificate or Connect account through
-  this same domain. Future coworker/team access belongs here, not in peer
-  federation.
+  local IAM bindings can scope a browser certificate, Connect account, or
+  combined human mTLS user through this same domain. Future coworker/team access
+  belongs here, not in peer federation.
 - **Peer access** means one daemon can call capabilities on another daemon. That
   uses daemon-to-daemon mTLS identities and peer profiles such as `peer-operator`
   or `peer-root`. Peer access does not imply that the human's browser can open
@@ -376,12 +377,14 @@ dashboard-control `api_access_iam_state`. Its schema contains `principals`,
 inspection, merges managed principals/grants into the unified overview, and
 enforces active scoped user/client grants when a request can be bound to a
 stable local principal. Today those stable bindings are browser mTLS client
-certificate fingerprints and hosted Connect account metadata. Existing owner
-browser mTLS and hosted Connect requests remain root-compatible when no active
-local binding exists. Once a browser certificate or Connect account has any
-matching local IAM record, that record wins over the root fallback: active
-grants are evaluated by role, while draft or revoked records deny instead of
-silently becoming root again. The `iam.enforcement` object reports
+certificate fingerprints, hosted Connect account metadata, and `human_user`
+records that can combine both while carrying optional account provider,
+verified-provider, handle, and organization metadata. Existing owner browser
+mTLS and hosted Connect requests remain root-compatible when no active local
+binding exists. Once a browser certificate or Connect account has any matching
+local IAM record, that record wins over the root fallback: active grants are
+evaluated by role, while draft or revoked records deny instead of silently
+becoming root again. The `iam.enforcement` object reports
 `root_session_grants: true`, `peer_profile_grants: true`,
 `user_client_grants: true`, and
 `principal_binding: root_peer_and_local_user_client`. Root sessions can create
@@ -390,6 +393,13 @@ or update local user/client grants through the People & Devices pane,
 `api_access_iam_upsert_user_client_grant`. Existing grants can be activated,
 drafted, revoked, or role-changed with `POST /api/access/iam/grants/update` or
 dashboard-control `api_access_iam_update_grant`.
+
+The same IAM evaluator now protects the direct dashboard HTTP routes that expose
+Access, target discovery, settings, filesystem reads/writes, sessions,
+worktrees, displays, diagnostics, and managed-context data. Static bootstrap
+assets, `/config`, `/.well-known/agent-card.json`, local Connect signaling, and
+the WebSocket bootstrap stay outside this generic HTTP gate because they either
+do not mutate daemon state or have their own transport/authentication binding.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access
@@ -856,6 +866,13 @@ daemon list, daemon labels, open dashboard, revoke ownership, and audit events.
 The visible account identity is the globally unique account name/handle; the
 internal WebAuthn display-name field is derived from that handle and is not a
 separate user-facing profile field in the MVP UI.
+
+Hosted Connect does not yet have Google/GitHub verification, organizations, or
+team IAM. The local daemon IAM schema already has portable account/provider,
+verified-provider, handle, and organization fields so a future hosted identity
+layer can issue grants without changing the daemon-side access vocabulary, but
+today those fields are operator-entered local metadata unless the current
+transport already supplies them.
 
 Inside the hosted dashboard, Settings -> Debug includes a **Connect Health**
 panel. It summarizes the active dashboard-control transport, daemon binding,

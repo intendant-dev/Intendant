@@ -609,15 +609,25 @@ The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
 sessions, peer daemon profiles, and active scoped user/client grants pass
 through the IAM operation evaluator. The daemon can currently bind scoped
-user/client grants to browser mTLS certificate fingerprints and hosted Connect
-account metadata. Matching active records are enforced by role. Unbound owner
-browser mTLS and Connect dashboard sessions keep the existing root-compatible
-fallback, but a known local IAM record in `draft` or `revoked` status denies
-instead of falling back to root. Root users can create these records through the
-Access UI, `POST /api/access/iam/user-client-grants`, or dashboard-control
+user/client grants to browser mTLS certificate fingerprints, hosted Connect
+account metadata, or a combined `human_user` principal that carries both
+bindings plus optional account/provider and organization metadata. Matching
+active records are enforced by role. Unbound owner browser mTLS and Connect
+dashboard sessions keep the existing root-compatible fallback, but a known local
+IAM record in `draft` or `revoked` status denies instead of falling back to
+root. Root users can create these records through the Access UI,
+`POST /api/access/iam/user-client-grants`, or dashboard-control
 `api_access_iam_upsert_user_client_grant`; existing records can be activated,
 drafted, revoked, or role-changed through `POST /api/access/iam/grants/update`
 or dashboard-control `api_access_iam_update_grant`.
+
+The user-client grant upsert request accepts `kind = "browser_certificate"`,
+`"connect_account"`, or `"human_user"`. `human_user` is the local IAM shape for a
+real person who may authenticate through browser mTLS now and through a hosted
+account later. The optional `account_provider`, `verified_provider`, `handle`,
+`organization_id`, and `organization_name` fields are local metadata today; the
+hosted Connect service does not yet verify OAuth providers or organization
+membership.
 
 The enforced built-in user/client roles are `role:scoped-human`,
 `role:observer`, `role:session-reader`, `role:terminal`, `role:files-read`,

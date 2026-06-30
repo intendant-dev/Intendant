@@ -34171,12 +34171,17 @@ function accessCurrentUserClientCandidate() {
     accessModelLabel(item?.kind) === 'browser_mtls_cert' && accessModelLabel(item?.fingerprint)
   );
   if (browserAuthn) {
+    const human = accessModelLabel(principal?.kind) === 'human_user';
     return {
-      kind: 'browser_certificate',
+      kind: human ? 'human_user' : 'browser_certificate',
       label: accessModelLabel(principal?.label, 'Current browser certificate'),
       fingerprint: accessModelLabel(browserAuthn.fingerprint),
-      user_id: '',
-      account_name: '',
+      user_id: accessModelLabel(principal?.account?.user_id),
+      account_name: accessModelLabel(principal?.account?.account_name || principal?.account?.handle),
+      account_provider: accessModelLabel(principal?.account?.provider),
+      verified_provider: accessModelLabel(principal?.account?.verified_provider),
+      organization_id: accessModelLabel(principal?.organization?.id),
+      organization_name: accessModelLabel(principal?.organization?.name),
     };
   }
   const connectAuthn = authnList.find(item =>
@@ -34192,6 +34197,10 @@ function accessCurrentUserClientCandidate() {
       fingerprint: '',
       user_id: userId,
       account_name: accountName,
+      account_provider: accessModelLabel(principal?.account?.provider),
+      verified_provider: accessModelLabel(principal?.account?.verified_provider),
+      organization_id: accessModelLabel(principal?.organization?.id),
+      organization_name: accessModelLabel(principal?.organization?.name),
     };
   }
   return null;
@@ -34204,10 +34213,14 @@ function accessSetField(parent, id, value) {
 
 function accessSyncUserClientGrantFields(form) {
   const kind = form?.querySelector('#access-user-client-kind')?.value || 'browser_certificate';
-  const browserFields = form?.querySelectorAll('[data-access-kind-field="browser_certificate"]') || [];
-  const connectFields = form?.querySelectorAll('[data-access-kind-field="connect_account"]') || [];
-  browserFields.forEach(node => { node.style.display = kind === 'browser_certificate' ? '' : 'none'; });
-  connectFields.forEach(node => { node.style.display = kind === 'connect_account' ? '' : 'none'; });
+  const fields = form?.querySelectorAll('[data-access-kind-field]') || [];
+  fields.forEach(node => {
+    const visibleKinds = String(node.dataset.accessKindField || '')
+      .split('|')
+      .map(value => value.trim())
+      .filter(Boolean);
+    node.style.display = visibleKinds.includes(kind) ? '' : 'none';
+  });
 }
 
 function accessAssignableIamRoles(overview = accessOverviewModel()) {
@@ -34266,6 +34279,7 @@ function renderAccessUserClientGrantForm() {
     options: [
       ['browser_certificate', 'Browser certificate'],
       ['connect_account', 'Connect account'],
+      ['human_user', 'Human mTLS user'],
     ],
   }, {
     id: 'access-user-client-label',
@@ -34277,19 +34291,43 @@ function renderAccessUserClientGrantForm() {
     label: 'Fingerprint',
     type: 'text',
     autocomplete: 'off',
-    kind: 'browser_certificate',
+    kind: 'browser_certificate|human_user',
   }, {
     id: 'access-user-client-user-id',
     label: 'User id',
     type: 'text',
     autocomplete: 'off',
-    kind: 'connect_account',
+    kind: 'connect_account|human_user',
   }, {
     id: 'access-user-client-account-name',
-    label: 'Account name',
+    label: 'Handle',
     type: 'text',
     autocomplete: 'off',
-    kind: 'connect_account',
+    kind: 'connect_account|human_user',
+  }, {
+    id: 'access-user-client-account-provider',
+    label: 'Account provider',
+    type: 'text',
+    autocomplete: 'off',
+    kind: 'connect_account|human_user',
+  }, {
+    id: 'access-user-client-verified-provider',
+    label: 'Verified by',
+    type: 'text',
+    autocomplete: 'off',
+    kind: 'connect_account|human_user',
+  }, {
+    id: 'access-user-client-organization-id',
+    label: 'Org id',
+    type: 'text',
+    autocomplete: 'off',
+    kind: 'human_user',
+  }, {
+    id: 'access-user-client-organization-name',
+    label: 'Org name',
+    type: 'text',
+    autocomplete: 'off',
+    kind: 'human_user',
   }, {
     id: 'access-user-client-role',
     label: 'Role',
@@ -34337,7 +34375,9 @@ function renderAccessUserClientGrantForm() {
   message.className = 'access-iam-form-message';
   message.id = 'access-user-client-grant-message';
   message.textContent = candidate
-    ? (candidate.kind === 'connect_account' ? 'Connect account detected' : 'Browser certificate detected')
+    ? (candidate.kind === 'connect_account'
+      ? 'Connect account detected'
+      : (candidate.kind === 'human_user' ? 'Human mTLS user detected' : 'Browser certificate detected'))
     : 'Manual identity entry';
   const button = document.createElement('button');
   button.type = 'submit';
@@ -34353,6 +34393,10 @@ function renderAccessUserClientGrantForm() {
     accessSetField(form, 'access-user-client-fingerprint', candidate.fingerprint);
     accessSetField(form, 'access-user-client-user-id', candidate.user_id);
     accessSetField(form, 'access-user-client-account-name', candidate.account_name);
+    accessSetField(form, 'access-user-client-account-provider', candidate.account_provider);
+    accessSetField(form, 'access-user-client-verified-provider', candidate.verified_provider);
+    accessSetField(form, 'access-user-client-organization-id', candidate.organization_id);
+    accessSetField(form, 'access-user-client-organization-name', candidate.organization_name);
   }
   accessSetField(form, 'access-user-client-role', 'role:scoped-human');
   accessSetField(form, 'access-user-client-status', 'active');
@@ -34365,22 +34409,36 @@ async function accessSubmitUserClientGrant(event) {
   const form = event?.currentTarget || document.querySelector('#access-user-client-grant-form form');
   if (!form || accessUserClientGrantSubmitting) return;
   const kind = form.querySelector('#access-user-client-kind')?.value || 'browser_certificate';
+  const kindHasFingerprint = kind === 'browser_certificate' || kind === 'human_user';
+  const kindHasAccount = kind === 'connect_account' || kind === 'human_user';
   const payload = {
     kind,
     label: form.querySelector('#access-user-client-label')?.value?.trim() || null,
-    fingerprint: kind === 'browser_certificate'
+    fingerprint: kindHasFingerprint
       ? (form.querySelector('#access-user-client-fingerprint')?.value?.trim() || null)
       : null,
-    user_id: kind === 'connect_account'
+    user_id: kindHasAccount
       ? (form.querySelector('#access-user-client-user-id')?.value?.trim() || null)
       : null,
-    account_name: kind === 'connect_account'
+    account_name: kindHasAccount
       ? (form.querySelector('#access-user-client-account-name')?.value?.trim() || null)
+      : null,
+    account_provider: kindHasAccount
+      ? (form.querySelector('#access-user-client-account-provider')?.value?.trim() || null)
+      : null,
+    verified_provider: kindHasAccount
+      ? (form.querySelector('#access-user-client-verified-provider')?.value?.trim() || null)
+      : null,
+    organization_id: kind === 'human_user'
+      ? (form.querySelector('#access-user-client-organization-id')?.value?.trim() || null)
+      : null,
+    organization_name: kind === 'human_user'
+      ? (form.querySelector('#access-user-client-organization-name')?.value?.trim() || null)
       : null,
     role_id: form.querySelector('#access-user-client-role')?.value || 'role:scoped-human',
     status: form.querySelector('#access-user-client-status')?.value || 'active',
   };
-  if (kind === 'browser_certificate' && !payload.fingerprint) {
+  if ((kind === 'browser_certificate' || kind === 'human_user') && !payload.fingerprint) {
     showControlToast?.('error', 'Fingerprint is required');
     return;
   }

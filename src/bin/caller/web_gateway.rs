@@ -20872,6 +20872,18 @@ pub fn spawn_web_gateway(
                         }
                     }
 
+                    if let Some(op) = dashboard_http_operation(req_method, req_path) {
+                        let decision = http_access_context.decision(op);
+                        if !decision.allowed {
+                            use tokio::io::AsyncWriteExt;
+                            let response =
+                                http_access_forbidden_response(&http_access_context, decision);
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
+                        }
+                    }
+
                     if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
                         let body = connect_bootstrap_html();
@@ -26521,6 +26533,90 @@ fn peer_filesystem_query_request(
     }
 }
 
+fn dashboard_http_operation(
+    req_method: &str,
+    req_path: &str,
+) -> Option<crate::peer::access_policy::PeerOperation> {
+    use crate::peer::access_policy::PeerOperation;
+
+    if !req_path.starts_with("/api/") {
+        return None;
+    }
+
+    match (req_method, req_path) {
+        ("GET", "/api/access/overview")
+        | ("GET", "/api/access/iam/state")
+        | ("GET", "/api/dashboard/targets") => return Some(PeerOperation::AccessInspect),
+        ("POST", "/api/access/iam/user-client-grants")
+        | ("POST", "/api/access/iam/grants/update") => return Some(PeerOperation::AccessManage),
+        ("GET", "/api/project-root") => return Some(PeerOperation::Settings),
+        ("GET", "/api/settings") | ("GET", "/api/api-key-status") => {
+            return Some(PeerOperation::Settings);
+        }
+        ("POST", "/api/settings") | ("POST", "/api/api-keys") => {
+            return Some(PeerOperation::Settings);
+        }
+        ("GET", "/api/fs/stat") | ("GET", "/api/fs/list") | ("GET", "/api/fs/read") => {
+            return Some(PeerOperation::FilesystemRead);
+        }
+        ("POST", "/api/fs/mkdir") => return Some(PeerOperation::FilesystemWrite),
+        ("POST", "/api/diagnostics/visual-freshness") => {
+            return Some(PeerOperation::DisplayInput);
+        }
+        ("GET", "/api/displays") => return Some(PeerOperation::DisplayView),
+        _ => {}
+    }
+
+    if req_path.starts_with("/api/managed-context/") {
+        return Some(PeerOperation::SessionInspect);
+    }
+    if req_path.starts_with("/api/session/current/") {
+        return Some(PeerOperation::SessionManage);
+    }
+    if req_path.starts_with("/api/session/") {
+        return match req_method {
+            "GET" => Some(PeerOperation::SessionInspect),
+            "POST" | "DELETE" => Some(PeerOperation::SessionManage),
+            _ => None,
+        };
+    }
+    if req_path.starts_with("/api/worktrees/inspect") {
+        return Some(PeerOperation::SessionInspect);
+    }
+    if req_path.starts_with("/api/worktrees/scan") || req_path.starts_with("/api/worktrees/remove")
+    {
+        return Some(PeerOperation::SessionManage);
+    }
+    if req_path.starts_with("/api/worktrees") {
+        return Some(PeerOperation::SessionInspect);
+    }
+    if req_path.starts_with("/api/sessions") {
+        return Some(PeerOperation::SessionInspect);
+    }
+    if req_path.starts_with("/api/peers") {
+        let request_line = format!("{req_method} {req_path} HTTP/1.1");
+        return crate::peer::access_policy::federation_http_operation(&request_line);
+    }
+
+    None
+}
+
+fn http_access_forbidden_response(
+    access: &HttpAccessContext,
+    decision: crate::access::iam::AccessDecision,
+) -> String {
+    json_response(
+        "403 Forbidden",
+        serde_json::json!({
+            "error": "principal does not allow this operation",
+            "principal": access.principal.as_value(),
+            "permission": decision.permission,
+            "reason": decision.reason,
+        })
+        .to_string(),
+    )
+}
+
 struct HttpAccessContext {
     principal: crate::access::iam::AccessPrincipal,
     iam_state: Option<crate::access::iam::LocalIamState>,
@@ -26671,6 +26767,7 @@ fn browser_mtls_root_principal(
         "browser-mtls",
         transport,
         label,
+        None,
         None,
         vec![serde_json::json!({
             "kind": "browser_mtls_cert",
@@ -37145,6 +37242,65 @@ mod tests {
                 .decision(crate::peer::access_policy::PeerOperation::AccessManage)
                 .allowed
         );
+    }
+
+    #[test]
+    fn dashboard_http_operation_maps_access_and_dashboard_routes() {
+        use crate::peer::access_policy::PeerOperation;
+
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/access/overview"),
+            Some(PeerOperation::AccessInspect)
+        );
+        assert_eq!(
+            dashboard_http_operation("POST", "/api/access/iam/grants/update"),
+            Some(PeerOperation::AccessManage)
+        );
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/dashboard/targets"),
+            Some(PeerOperation::AccessInspect)
+        );
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/session/current/uploads"),
+            Some(PeerOperation::SessionManage)
+        );
+        assert_eq!(
+            dashboard_http_operation("GET", "/api/fs/read"),
+            Some(PeerOperation::FilesystemRead)
+        );
+        assert_eq!(dashboard_http_operation("POST", "/api/coordinator/route"), None);
+        assert_eq!(dashboard_http_operation("GET", "/config"), None);
+    }
+
+    #[test]
+    fn scoped_browser_cert_denies_http_access_management() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            tmp.path(),
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Alice browser",
+                "fingerprint": "A1:CE",
+                "role_id": "role:scoped-human"
+            }),
+            &actor,
+        )
+        .unwrap();
+
+        let access = http_access_context(tmp.path(), None, Some("a1ce"), true, true).unwrap();
+        let inspect = access.decision(crate::peer::access_policy::PeerOperation::AccessInspect);
+        let manage = access.decision(crate::peer::access_policy::PeerOperation::AccessManage);
+
+        assert!(inspect.allowed);
+        assert!(!manage.allowed);
+        let response = http_access_forbidden_response(&access, manage);
+        assert!(response.contains("403 Forbidden"));
+        assert!(response.contains("access.manage"));
+        assert!(response.contains("Alice browser"));
     }
 
     #[test]

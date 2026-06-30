@@ -10398,6 +10398,7 @@ mod tests {
                 "webrtc-datachannel",
                 "Browser certificate ab123",
                 None,
+                None,
                 vec![serde_json::json!({
                     "kind": "browser_mtls_cert",
                     "fingerprint": "ab123"
