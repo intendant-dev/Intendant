@@ -277,7 +277,7 @@ the active compacted session is not mistaken for the target of the mutation.
 
 Browse staged uploads and download files from the local daemon or a configured
 peer target. The target summary uses the same access abstraction as Terminal:
-local/mTLS, hosted Connect, and peer dashboard-control routes are shown as
+local/mTLS, hosted transports, and peer dashboard-control routes are shown as
 targets with their available capabilities rather than as transport internals.
 
 ### Access
@@ -285,12 +285,15 @@ targets with their available capabilities rather than as transport internals.
 Unified administration for how dashboards and daemons reach each other:
 
 - **Targets** lists daemon targets, not raw transports. A target can be this
-  daemon over user/client access, a hosted Connect daemon, a direct browser-mTLS
+  daemon over user/client access, a hosted-transport daemon, a direct browser-mTLS
   daemon, or a peer-routed daemon. Each row shows the access domain, route, and
   available capabilities, then links to Stats, Files, and Shell.
 - **Grants** separates user/client access from peer access. The current browser
   is user/client access and is root dashboard access in the single-user product.
-  Inbound peer identities are daemon-to-daemon grants with peer profiles.
+  Inbound peer identities are daemon-to-daemon grants with peer profiles. The
+  tab renders the overview-backed principal, supported-principal-kind, grant,
+  policy, and transport rows so the summary cards and detailed model use the
+  same source of truth.
 - **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
   Request Peer Access, Manual Add, and inbound peer access requests.
 - **Public Shares** is the placeholder surface for future explicit public or
@@ -299,7 +302,26 @@ Unified administration for how dashboards and daemons reach each other:
   local/mTLS, local WebRTC control, event delivery, byte streams, uploads, and
   self-tests.
 
-The important split is:
+Access uses one vocabulary across the hosted dashboard, direct/self-hosted mTLS,
+and peer federation:
+
+- A **target** is a daemon the dashboard can operate.
+- A **principal** is the actor being trusted: the current browser session, a
+  future passkey/account principal, a future browser-certificate human
+  principal, an organization group, or a peer daemon.
+- A **grant** connects one principal to one target with a role and status. The
+  current browser has a root user/client grant to the local daemon. A peer route
+  has a daemon peer-profile grant. An approved inbound peer identity appears as
+  a peer-daemon principal with a peer-profile grant to this daemon; revoked
+  identities remain visible as revoked grants for audit clarity.
+- A **policy** defines the shape of authority behind a grant. `root` and
+  `peer-profile` are enforced today. Scoped human IAM, directory-scoped file
+  access, and public shares are design targets, not hidden enforcement.
+- A **transport** is only how the route is carried: browser mTLS, hosted
+  Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
+  product UI should not make Connect a separate access system.
+
+The important security-domain split is:
 
 - **User/client daemon access** means a human-operated dashboard can control a
   daemon. Hosted Connect passkey access and browser mTLS client certificates are
@@ -312,14 +334,22 @@ The important split is:
   the remote daemon directly, and browser access does not imply that two daemons
   can federate.
 
-The target list is backend-backed. `GET /api/dashboard/targets` and the
-dashboard-control `api_dashboard_targets` method return the canonical target
-model: target id/host id, display label, access domain (`user_client` or
-`peer`), route (`current_dashboard` or `peer_route`), effective role
-(`root` or `peer_profile`), connection state, and capability hints. The browser
-still refines the local route label to **Hosted Connect**, **Browser mTLS**, or
-**Local/debug** because only the browser knows how the current page was reached,
-but it should not invent the target/security-domain vocabulary.
+The model is backend-backed. `GET /api/access/overview` and the
+dashboard-control `api_access_overview` method return schema version 1 with
+`scope`, `targets`, `principals`, `grants`, `policies`, `transports`,
+`supported_principal_kinds`, and explicit unresolved architecture notes. This
+overview is descriptive for now: it exposes one product model over the current
+enforcement paths rather than replacing mTLS, Connect account checks, or peer
+profiles.
+
+`GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
+target model used by older UI paths: target id/host id, display label, access
+domain (`user_client` or `peer`), route (`current_dashboard` or `peer_route`),
+effective role (`root` or `peer_profile`), connection state, and capability
+hints. The browser may refine the local route label to **Hosted transport**,
+**Browser mTLS**, or **Local/debug** because only the browser knows how the
+current page was reached, but it should not invent principal/grant/policy
+vocabulary.
 
 ### Debug
 

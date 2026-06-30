@@ -694,6 +694,111 @@ html {
   gap: 8px;
   margin: 0 0 14px;
 }
+.access-model-details {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.access-model-section {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-model-section-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--surface1);
+}
+.access-model-section-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+.access-model-section-count {
+  flex: 0 0 auto;
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 800;
+  letter-spacing: 0;
+  text-transform: uppercase;
+}
+.access-model-table {
+  display: grid;
+}
+.access-model-row {
+  display: grid;
+  grid-template-columns: minmax(170px, 1.1fr) minmax(130px, 0.85fr) minmax(190px, 1.2fr) minmax(90px, auto);
+  gap: 8px 12px;
+  align-items: center;
+  min-width: 0;
+  padding: 9px 11px;
+}
+.access-model-row + .access-model-row {
+  border-top: 1px solid rgba(205, 214, 244, 0.1);
+}
+.access-model-main,
+.access-model-meta,
+.access-model-detail {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.access-model-main {
+  color: var(--text);
+  font-size: 12px;
+  font-weight: 800;
+}
+.access-model-meta {
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.access-model-detail {
+  color: var(--overlay0);
+  font-family: 'JetBrains Mono', 'Fira Code', monospace;
+  font-size: 10px;
+}
+.access-model-status {
+  justify-self: end;
+  padding: 2px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  color: var(--overlay0);
+  background: var(--surface0);
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1.45;
+  text-transform: uppercase;
+}
+.access-model-status.active,
+.access-model-status.connected,
+.access-model-status.enforced,
+.access-model-status.current {
+  border-color: rgba(166, 227, 161, 0.28);
+  color: var(--green);
+  background: rgba(166, 227, 161, 0.08);
+}
+.access-model-status.offline,
+.access-model-status.planned {
+  border-color: rgba(249, 226, 175, 0.28);
+  color: var(--yellow);
+  background: rgba(249, 226, 175, 0.08);
+}
+.access-model-status.revoked,
+.access-model-status.disabled,
+.access-model-status.failed {
+  border-color: rgba(243, 139, 168, 0.28);
+  color: var(--red);
+  background: rgba(243, 139, 168, 0.08);
+}
 .access-target-row {
   --access-target-accent: var(--blue);
   display: grid;
@@ -9255,13 +9360,22 @@ body.display-fullscreen-open {
   .access-target-row {
     grid-template-columns: 1fr;
   }
+  .access-model-row {
+    grid-template-columns: 1fr;
+  }
+  .access-model-status {
+    justify-self: flex-start;
+  }
   .access-target-actions {
     justify-content: flex-start;
     min-width: 0;
   }
   .access-target-value,
   .access-target-detail,
-  .access-target-subtitle {
+  .access-target-subtitle,
+  .access-model-main,
+  .access-model-meta,
+  .access-model-detail {
     white-space: normal;
   }
   .files-upload-config {
@@ -11090,12 +11204,14 @@ body.display-fullscreen-open {
       <div class="subtab-panes">
         <div class="subtab-pane active" id="access-pane-targets">
           <div class="access-pane-body">
+            <div id="access-model-overview" class="access-overview-grid"></div>
             <div id="access-target-overview" class="access-target-surface"></div>
           </div>
         </div>
         <div class="subtab-pane" id="access-pane-grants">
           <div class="access-pane-body">
             <div id="access-grants-overview" class="access-overview-grid"></div>
+            <div id="access-model-details" class="access-model-details"></div>
             <div id="access-grants-mount"></div>
           </div>
         </div>
@@ -12129,6 +12245,7 @@ const DASHBOARD_CONNECT_SIGNALING_BASE = String(
 ).trim().replace(/\/+$/, '');
 let daemons = [];
 let dashboardAccessTargets = [];
+let dashboardAccessOverview = null;
 let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
@@ -31978,9 +32095,60 @@ function applyDashboardAccessTargets(payload) {
   renderDashboardTargetSummaries();
 }
 
+function normalizeAccessOverview(payload) {
+  if (!payload || typeof payload !== 'object') return null;
+  const normalizeArray = key => Array.isArray(payload[key]) ? payload[key].filter(Boolean) : [];
+  return {
+    ...payload,
+    schema_version: Number(payload.schema_version || payload.schemaVersion || 1),
+    scope: payload.scope && typeof payload.scope === 'object' ? payload.scope : {},
+    targets: normalizeArray('targets'),
+    principals: normalizeArray('principals'),
+    grants: normalizeArray('grants'),
+    policies: normalizeArray('policies'),
+    transports: normalizeArray('transports'),
+    supported_principal_kinds: normalizeArray('supported_principal_kinds'),
+    architecture: payload.architecture && typeof payload.architecture === 'object'
+      ? payload.architecture
+      : {},
+  };
+}
+
+function applyAccessOverview(payload) {
+  const overview = normalizeAccessOverview(payload);
+  if (!overview) return null;
+  dashboardAccessOverview = overview;
+  if (overview.targets.length) applyDashboardAccessTargets(overview);
+  else renderAccessAdminSummaries();
+  return overview;
+}
+
+function invalidateAccessOverview() {
+  dashboardAccessOverview = null;
+}
+
+async function refreshAccessOverviewFromApi(options = {}) {
+  try {
+    const resp = await dashboardJsonFetch('api_access_overview', {}, () => authedFetch('/api/access/overview', {
+      cache: 'no-store',
+      signal: options.signal,
+    }), 'api_access_overview', { signal: options.signal });
+    if (!resp.ok) throw new Error(`/api/access/overview returned ${resp.status}`);
+    const payload = await resp.json();
+    return applyAccessOverview(payload);
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!options.silent) {
+      console.warn('[access-overview] refresh failed; using derived access model', err);
+    }
+    return null;
+  }
+}
+
 function upsertDashboardAccessTarget(target) {
   const normalized = normalizeDashboardAccessTarget(target);
   if (!normalized) return;
+  invalidateAccessOverview();
   const idx = dashboardAccessTargets.findIndex(t =>
     t.host_id === normalized.host_id || t.id === normalized.id
   );
@@ -31991,6 +32159,7 @@ function upsertDashboardAccessTarget(target) {
 function removeDashboardAccessTarget(hostId) {
   const id = String(hostId || '').trim();
   if (!id) return;
+  invalidateAccessOverview();
   dashboardAccessTargets = dashboardAccessTargets.filter(t =>
     t.local || (t.host_id !== id && t.id !== id)
   );
@@ -32067,9 +32236,9 @@ function dashboardTargetAccessRoute(hostId) {
     if (dashboardConnectModeEnabled()) {
       return {
         domain: 'User access',
-        route: 'Hosted Connect',
+        route: 'Hosted transport',
         role: 'Root',
-        detail: 'passkey/account grant to this daemon',
+        detail: 'passkey/account grant over the hosted tunnel',
       };
     }
     if (location.protocol === 'https:') {
@@ -32442,6 +32611,7 @@ function dashboardPeerAccessTargets() {
 }
 
 function syncDashboardAccessTargetsFromDaemons() {
+  invalidateAccessOverview();
   const localTargets = dashboardAccessTargets.filter(t => t.local);
   const peerTargets = daemons
     .map(peer => normalizeDashboardAccessTarget({
@@ -32504,6 +32674,130 @@ function accessTargetRecords() {
     seen.add(id);
   }
   return records;
+}
+
+function accessPlural(count, singular, plural = `${singular}s`) {
+  return `${count} ${count === 1 ? singular : plural}`;
+}
+
+function accessOverviewModel() {
+  if (dashboardAccessOverview) return dashboardAccessOverview;
+  const targets = accessTargetRecords();
+  const peerTargets = targets.filter(t => !t.local);
+  const principals = [{
+    id: 'principal:current-browser-session',
+    kind: 'browser_session',
+    label: 'Current browser',
+  }, ...peerTargets.map(target => ({
+    id: `principal:peer-daemon:${target.host_id || target.id || ''}`,
+    kind: 'peer_daemon',
+    label: target.label || target.host_id || target.id || 'Peer daemon',
+  }))];
+  const grants = [{
+    id: 'grant:current-browser:root',
+    kind: 'user_client_root',
+    role: 'root',
+    status: 'active',
+  }, ...peerTargets.map(target => ({
+    id: `grant:peer-route:${target.host_id || target.id || ''}`,
+    kind: 'daemon_peer_profile',
+    role: 'peer_profile',
+    status: target.connected === false ? 'offline' : 'active',
+  }))];
+  const transports = [{
+    id: 'transport:current-dashboard',
+    kind: 'current_dashboard',
+    status: 'connected',
+  }, ...peerTargets.map(target => ({
+    id: `transport:peer-route:${target.host_id || target.id || ''}`,
+    kind: 'peer_route',
+    status: target.connected === false ? 'offline' : 'connected',
+  }))];
+  return {
+    scope: {
+      kind: 'local_daemon',
+      label: selfHostLabel || 'This daemon',
+      account: null,
+      organization: null,
+      hosted_account_configured: false,
+    },
+    targets,
+    principals,
+    grants,
+    transports,
+    policies: [{
+      id: 'policy:root',
+      status: 'enforced',
+    }, {
+      id: 'policy:peer-profile',
+      status: 'enforced',
+    }, {
+      id: 'policy:scoped-human',
+      status: 'planned',
+    }],
+    architecture: {
+      unresolved: [
+        'external identity provider and Sybil-resistance policy',
+        'organization ownership, billing, and recovery semantics',
+        'final IAM policy language and editing UX',
+      ],
+    },
+  };
+}
+
+function accessOverviewCards() {
+  const overview = accessOverviewModel();
+  const scope = overview.scope || {};
+  const principals = Array.isArray(overview.principals) ? overview.principals : [];
+  const grants = Array.isArray(overview.grants) ? overview.grants : [];
+  const policies = Array.isArray(overview.policies) ? overview.policies : [];
+  const transports = Array.isArray(overview.transports) ? overview.transports : [];
+  const unresolved = Array.isArray(overview.architecture?.unresolved)
+    ? overview.architecture.unresolved.length
+    : 0;
+  const humanPrincipals = principals.filter(p =>
+    /browser|human|passkey|certificate/.test(String(p.kind || ''))
+  ).length;
+  const peerPrincipals = principals.filter(p => String(p.kind || '') === 'peer_daemon').length;
+  const activeGrants = grants.filter(g => !/planned|offline|revoked|disabled/.test(String(g.status || 'active'))).length;
+  const enforcedPolicies = policies.filter(p => String(p.status || '') === 'enforced').length;
+  const plannedPolicies = policies.filter(p => String(p.status || '') === 'planned').length;
+  const activeTransports = transports.filter(t => !/offline|failed|disabled/.test(String(t.status || 'connected'))).length;
+  const scopeLabel = String(scope.label || selfHostLabel || 'This daemon');
+  const accountState = scope.account || scope.organization || scope.hosted_account_configured
+    ? 'account/org linked'
+    : 'account/org not linked';
+  return [{
+    title: 'Access scope',
+    kind: 'Daemon',
+    detail: `${scopeLabel}: ${accountState}. This page is the admin surface for user/client access and daemon peers.`,
+  }, {
+    title: 'Principals',
+    kind: accessPlural(principals.length, 'principal'),
+    detail: `${accessPlural(humanPrincipals, 'user/client principal', 'user/client principals')} and ${accessPlural(peerPrincipals, 'peer daemon')} are visible in this model.`,
+  }, {
+    title: 'Grants',
+    kind: `${activeGrants}/${grants.length || activeGrants} active`,
+    detail: 'Root owner access and peer-profile access now use the same grant vocabulary.',
+    actions: [{ label: 'Review', onClick: () => routeTo('access', 'grants') }],
+  }, {
+    title: 'Policies',
+    kind: `${enforcedPolicies} enforced`,
+    detail: plannedPolicies === 1
+      ? '1 planned policy area remains a design target, including scoped human IAM.'
+      : `${plannedPolicies} planned policy areas remain design targets, including scoped human IAM.`,
+  }, {
+    title: 'Transports',
+    kind: `${activeTransports}/${transports.length || activeTransports} active`,
+    detail: 'mTLS, hosted tunnels, and peer routes are implementation transports under the same access model.',
+    actions: [{ label: 'Health', onClick: () => routeTo('access', 'diagnostics') }],
+  }, {
+    title: 'Open design',
+    kind: unresolved ? `${unresolved} items` : 'Clear',
+    detail: unresolved
+      ? 'Identity-provider policy, organizations, and the final IAM language are still explicit architecture decisions.'
+      : 'No unresolved access architecture notes are reported by this daemon.',
+  }];
 }
 
 function accessTargetConnection(target, descriptor, summary) {
@@ -32673,37 +32967,217 @@ function renderAccessTargetsSurface() {
 }
 
 function accessGrantCards() {
+  const overview = accessOverviewModel();
+  const grants = Array.isArray(overview.grants) ? overview.grants : [];
+  const hasBackendOverview = Boolean(dashboardAccessOverview);
+  const activeGrantCount = list => list.filter(grant =>
+    !/planned|offline|revoked|disabled/.test(String(grant.status || 'active'))
+  ).length;
+  const userClientGrants = grants.filter(grant => String(grant.kind || '') === 'user_client_root');
+  const inboundPeerGrants = grants.filter(grant => String(grant.kind || '') === 'inbound_daemon_peer_profile');
+  const outboundPeerGrants = grants.filter(grant => String(grant.kind || '') === 'daemon_peer_profile');
   const transportLabel = dashboardConnectModeEnabled()
-    ? 'Connect owner session'
+    ? 'Hosted transport owner session'
     : (location.protocol === 'https:' ? 'Trusted browser certificate' : 'Local dashboard session');
   const cards = [{
     title: 'Current browser access',
-    kind: 'Root',
+    kind: userClientGrants.length ? 'Root' : 'Unknown',
     detail: `${transportLabel} gives this browser root dashboard access to this daemon. This is user/client access, not peer federation.`,
     actions: [{ label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') }],
   }];
 
-  const inboundCards = Array.from(document.querySelectorAll('#daemon-peer-identities-list .daemon-identity-card'));
-  const approved = inboundCards.filter(card => card.classList.contains('approved')).length;
+  const inboundCards = hasBackendOverview
+    ? []
+    : Array.from(document.querySelectorAll('#daemon-peer-identities-list .daemon-identity-card'));
+  const approved = hasBackendOverview
+    ? activeGrantCount(inboundPeerGrants)
+    : inboundCards.filter(card => card.classList.contains('approved')).length;
+  const revoked = hasBackendOverview
+    ? inboundPeerGrants.filter(grant => String(grant.status || '') === 'revoked').length
+    : inboundCards.filter(card => card.classList.contains('revoked')).length;
   cards.push({
     title: 'Inbound peer access',
-    kind: approved > 0 ? `${approved} approved` : 'None',
+    kind: approved > 0 ? `${approved} active` : 'None',
     detail: approved > 0
-      ? `${approved} daemon-to-daemon mTLS grant${approved === 1 ? '' : 's'} can access this daemon with peer profiles.`
-      : 'No peer identities currently have approved inbound access.',
+      ? `${approved} daemon-to-daemon mTLS grant${approved === 1 ? '' : 's'} can access this daemon with peer profiles.${revoked ? ` ${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : ''}`
+      : (revoked ? `${revoked} revoked inbound grant${revoked === 1 ? '' : 's'} retained for audit; none are active.` : 'No peer identities currently have approved inbound access.'),
     actions: [{ label: 'Manage', primary: true, onClick: () => routeTo('access', 'grants') }],
   });
 
+  const outboundActive = activeGrantCount(outboundPeerGrants);
+  const outboundTotal = hasBackendOverview ? outboundPeerGrants.length : daemons.length;
   cards.push({
     title: 'Outbound peer routes',
-    kind: daemons.length ? `${daemons.length} target${daemons.length === 1 ? '' : 's'}` : 'None',
-    detail: daemons.length
+    kind: outboundTotal ? `${outboundActive}/${outboundTotal} active` : 'None',
+    detail: outboundTotal
       ? 'This daemon can reach configured peer targets through daemon-to-daemon grants; this is separate from browser root access.'
       : 'No peer targets are configured yet.',
     actions: [{ label: 'Add', onClick: () => routeTo('access', 'invitations') }],
   });
 
   return cards;
+}
+
+function accessModelStatusText(value) {
+  return String(value || 'active').trim().toLowerCase().replace(/_/g, '-') || 'active';
+}
+
+function accessModelLabel(value, fallback = '') {
+  return String(value || fallback || '').trim();
+}
+
+function accessOverviewTargetLabelMap(overview) {
+  const map = new Map();
+  for (const target of Array.isArray(overview.targets) ? overview.targets : []) {
+    const id = accessModelLabel(target.id || target.host_id);
+    if (id) map.set(id, accessModelLabel(target.label, id));
+    const hostId = accessModelLabel(target.host_id);
+    if (hostId && !map.has(hostId)) map.set(hostId, accessModelLabel(target.label, hostId));
+  }
+  return map;
+}
+
+function accessOverviewPrincipalLabelMap(overview) {
+  const map = new Map();
+  for (const principal of Array.isArray(overview.principals) ? overview.principals : []) {
+    const id = accessModelLabel(principal.id);
+    if (id) map.set(id, accessModelLabel(principal.label, id));
+  }
+  return map;
+}
+
+function accessModelCreateStatus(status) {
+  const value = accessModelStatusText(status);
+  const node = document.createElement('span');
+  node.className = `access-model-status ${value}`;
+  node.textContent = value;
+  return node;
+}
+
+function accessModelCreateRow({ main, meta, detail, status, title }) {
+  const row = document.createElement('div');
+  row.className = 'access-model-row';
+  if (title) row.title = title;
+  const mainEl = document.createElement('div');
+  mainEl.className = 'access-model-main';
+  mainEl.textContent = main || '';
+  const metaEl = document.createElement('div');
+  metaEl.className = 'access-model-meta';
+  metaEl.textContent = meta || '';
+  const detailEl = document.createElement('div');
+  detailEl.className = 'access-model-detail';
+  detailEl.textContent = detail || '';
+  row.append(mainEl, metaEl, detailEl, accessModelCreateStatus(status));
+  return row;
+}
+
+function accessModelCreateSection(title, rows) {
+  const section = document.createElement('div');
+  section.className = 'access-model-section';
+  const head = document.createElement('div');
+  head.className = 'access-model-section-head';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'access-model-section-title';
+  titleEl.textContent = title || 'Access';
+  const count = document.createElement('div');
+  count.className = 'access-model-section-count';
+  count.textContent = accessPlural(rows.length, 'item');
+  head.append(titleEl, count);
+  const table = document.createElement('div');
+  table.className = 'access-model-table';
+  if (!rows.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'None';
+    table.appendChild(empty);
+  } else {
+    for (const row of rows) table.appendChild(accessModelCreateRow(row));
+  }
+  section.append(head, table);
+  return section;
+}
+
+function accessPrincipalRow(principal) {
+  const authn = Array.isArray(principal.authn) ? principal.authn : [];
+  const authLabel = authn
+    .map(item => accessModelLabel(item.label || item.kind))
+    .filter(Boolean)
+    .join(', ');
+  return {
+    main: accessModelLabel(principal.label, principal.id || 'Principal'),
+    meta: accessModelLabel(principal.kind_label || principal.kind, 'Principal'),
+    detail: authLabel || accessModelLabel(principal.source, principal.id),
+    status: principal.status || (principal.local ? 'current' : 'active'),
+    title: accessModelLabel(principal.id),
+  };
+}
+
+function accessPrincipalKindRow(kind) {
+  return {
+    main: accessModelLabel(kind.label, kind.kind || 'Principal type'),
+    meta: accessModelLabel(kind.kind, 'Principal type'),
+    detail: accessModelLabel(kind.summary),
+    status: kind.status || 'planned',
+    title: accessModelLabel(kind.kind),
+  };
+}
+
+function accessGrantRow(grant, principalLabels, targetLabels) {
+  const principal = principalLabels.get(accessModelLabel(grant.principal_id))
+    || accessModelLabel(grant.principal_id, 'Principal');
+  const target = targetLabels.get(accessModelLabel(grant.target_id))
+    || accessModelLabel(grant.target_id, 'Target');
+  const role = accessModelLabel(grant.role_label || grant.profile || grant.role, 'Role');
+  return {
+    main: principal,
+    meta: `${role} -> ${target}`,
+    detail: accessModelLabel(grant.kind_label || grant.source || grant.policy_id, grant.id),
+    status: grant.status || 'active',
+    title: accessModelLabel(grant.id),
+  };
+}
+
+function accessPolicyRow(policy) {
+  return {
+    main: accessModelLabel(policy.label, policy.id || 'Policy'),
+    meta: accessModelLabel(policy.id, 'Policy'),
+    detail: accessModelLabel(policy.summary),
+    status: policy.status || 'planned',
+    title: accessModelLabel(policy.id),
+  };
+}
+
+function accessTransportRow(transport, targetLabels) {
+  const target = targetLabels.get(accessModelLabel(transport.target_id))
+    || accessModelLabel(transport.target_id, 'Target');
+  return {
+    main: accessModelLabel(transport.label, transport.id || 'Transport'),
+    meta: accessModelLabel(transport.kind_label || transport.kind, 'Transport'),
+    detail: `${target} - ${accessModelLabel(transport.implementation, transport.id)}`,
+    status: transport.status || 'connected',
+    title: accessModelLabel(transport.id),
+  };
+}
+
+function renderAccessModelDetails() {
+  const el = document.getElementById('access-model-details');
+  if (!el) return;
+  el.innerHTML = '';
+  const overview = accessOverviewModel();
+  const targetLabels = accessOverviewTargetLabelMap(overview);
+  const principalLabels = accessOverviewPrincipalLabelMap(overview);
+  const principals = Array.isArray(overview.principals) ? overview.principals : [];
+  const principalKinds = Array.isArray(overview.supported_principal_kinds) ? overview.supported_principal_kinds : [];
+  const grants = Array.isArray(overview.grants) ? overview.grants : [];
+  const policies = Array.isArray(overview.policies) ? overview.policies : [];
+  const transports = Array.isArray(overview.transports) ? overview.transports : [];
+  el.append(
+    accessModelCreateSection('Principals', principals.map(accessPrincipalRow)),
+    accessModelCreateSection('Principal types', principalKinds.map(accessPrincipalKindRow)),
+    accessModelCreateSection('Grants', grants.map(grant => accessGrantRow(grant, principalLabels, targetLabels))),
+    accessModelCreateSection('Policies', policies.map(accessPolicyRow)),
+    accessModelCreateSection('Transports', transports.map(transport => accessTransportRow(transport, targetLabels)))
+  );
 }
 
 function accessPublicShareCards() {
@@ -32746,8 +33220,10 @@ function accessDiagnosticsCards() {
 
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
+  accessRenderCards('access-model-overview', accessOverviewCards());
   renderAccessTargetsSurface();
   accessRenderCards('access-grants-overview', accessGrantCards());
+  renderAccessModelDetails();
   accessRenderCards('access-public-shares', accessPublicShareCards());
   accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
 }
@@ -38873,6 +39349,7 @@ function switchTab(tabId) {
     mountAccessAdminSurface();
     renderDaemonsList();
     renderAccessAdminSummaries();
+    refreshAccessOverviewFromApi({ silent: true }).catch(() => {});
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
 }
@@ -41542,10 +42019,11 @@ async function hydrateDashboardFromControl() {
   if (!dashboardTransport?.canUseRpc?.()) {
     throw new Error('dashboard Connect transport is not connected');
   }
-  const [status, config, card, targets] = await Promise.all([
+  const [status, config, card, accessOverview, targets] = await Promise.all([
     dashboardTransport.request('status', {}, { timeoutMs: 15000 }).catch(() => null),
     dashboardTransport.request('config', {}, { timeoutMs: 15000 }).catch(() => ({})),
     dashboardTransport.request('api_agent_card', {}, { timeoutMs: 15000 }).catch(() => null),
+    dashboardTransport.request('api_access_overview', {}, { timeoutMs: 15000 }).catch(() => null),
     dashboardTransport.request('api_dashboard_targets', {}, { timeoutMs: 15000 }).catch(() => null),
   ]);
   if (status && typeof status === 'object' && dashboardControlTransport) {
@@ -41553,7 +42031,8 @@ async function hydrateDashboardFromControl() {
   }
   applyGatewayConfig(config || {});
   applyAgentCardIdentity(card);
-  if (targets) applyDashboardAccessTargets(targets);
+  if (accessOverview) applyAccessOverview(accessOverview);
+  else if (targets) applyDashboardAccessTargets(targets);
   const bootstrap = await dashboardTransport.request('api_dashboard_bootstrap', {}, {
     timeoutMs: 60000,
   }).catch(err => {
@@ -43045,6 +43524,9 @@ class DashboardControlTransport {
     this.request('api_dashboard_targets').then(targets => {
       if (targets) applyDashboardAccessTargets(targets);
     }).catch(err => console.warn('[dashboard-control] dashboard targets RPC failed', err));
+    this.request('api_access_overview').then(overview => {
+      if (overview) applyAccessOverview(overview);
+    }).catch(err => console.warn('[dashboard-control] access overview RPC failed', err));
     this.request('subscribe_events').then(result => {
       if (result?.subscribed) {
         dashboardControlEventsActive = true;
@@ -45280,6 +45762,10 @@ async function refreshPeersFromApi() {
     // per-peer events come through the primary /ws push pipeline.
     daemons = newDaemons;
     renderDaemonsList();
+    const overview = await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+    if (overview) {
+      return;
+    }
     if (data.targets) {
       applyDashboardAccessTargets(data);
     } else {

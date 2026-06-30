@@ -20,6 +20,14 @@ use peer-scoped mTLS identities plus peer profiles. Future coworker/team access
 belongs in user-scoped IAM unless the federation trust model is deliberately
 expanded.
 
+The dashboard now describes both domains with the same access vocabulary:
+principal, target, grant, policy, and transport. In that model a peer daemon is
+a principal with a peer-profile grant to a target daemon, carried over
+daemon-to-daemon mTLS plus optional browser-to-peer DataChannels for interactive
+views. That shared vocabulary does not make peer mTLS a human login mechanism;
+it only lets the Access UI compare peer grants with user/client grants without
+conflating them.
+
 ## Federation vs. External Agents
 
 These are two orthogonal relationships, and they compose:
