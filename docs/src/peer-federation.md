@@ -414,10 +414,11 @@ certificate pin, a peer-scoped client certificate, capability metadata, and loca
 policy that can later be changed or revoked.
 
 The dashboard's **Access** tab exposes peer relationship management:
-**Invitations** contains onboarding flows, **Grants** shows inbound identities,
-and **Targets** shows configured outbound peers. Targets are a dashboard
-navigation abstraction backed by `/api/dashboard/targets`; the security decision
-is still the peer profile on the daemon-to-daemon mTLS identity.
+**Invitations** contains onboarding flows, **Peer Trust** shows inbound
+identities and outbound peer routes, and **Daemons** shows peer-routed targets
+alongside local/user-client targets. Targets are a dashboard navigation
+abstraction backed by `/api/dashboard/targets`; the security decision is still
+the peer profile on the daemon-to-daemon mTLS identity.
 
 #### Invite flow
 

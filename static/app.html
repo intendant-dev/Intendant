@@ -694,6 +694,127 @@ html {
   gap: 8px;
   margin: 0 0 14px;
 }
+.access-admin-grid,
+.access-detail-grid {
+  display: grid;
+  gap: 12px;
+  margin: 0 0 16px;
+}
+.access-admin-grid.two {
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.access-detail-card {
+  min-width: 0;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-detail-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  padding: 9px 11px;
+  border-bottom: 1px solid var(--surface1);
+}
+.access-detail-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+.access-detail-body {
+  display: grid;
+  gap: 8px;
+  padding: 10px 11px;
+}
+.access-detail-line {
+  display: grid;
+  grid-template-columns: minmax(120px, 0.45fr) minmax(0, 1fr);
+  gap: 10px;
+  min-width: 0;
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.access-detail-line strong {
+  min-width: 0;
+  color: var(--overlay1);
+  font-weight: 800;
+}
+.access-detail-line span {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.access-matrix {
+  min-width: 0;
+  overflow-x: auto;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-matrix-table {
+  width: 100%;
+  min-width: 760px;
+  border-collapse: collapse;
+}
+.access-matrix-table th,
+.access-matrix-table td {
+  padding: 9px 10px;
+  border-bottom: 1px solid rgba(205, 214, 244, 0.1);
+  color: var(--subtext0);
+  font-size: 11px;
+  text-align: left;
+  vertical-align: top;
+}
+.access-matrix-table th {
+  color: var(--text);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.access-matrix-table tr:last-child td {
+  border-bottom: 0;
+}
+.access-matrix-policy {
+  color: var(--text);
+  font-weight: 800;
+}
+.access-matrix-cell {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 56px;
+  min-height: 20px;
+  padding: 2px 7px;
+  border: 1px solid var(--surface1);
+  border-radius: 999px;
+  color: var(--overlay0);
+  background: var(--surface0);
+  font-size: 10px;
+  font-weight: 800;
+  white-space: nowrap;
+}
+.access-matrix-cell.yes {
+  border-color: rgba(166, 227, 161, 0.28);
+  color: var(--green);
+  background: rgba(166, 227, 161, 0.08);
+}
+.access-matrix-cell.no {
+  border-color: rgba(243, 139, 168, 0.28);
+  color: var(--red);
+  background: rgba(243, 139, 168, 0.08);
+}
+.access-matrix-cell.conditional,
+.access-matrix-cell.planned {
+  border-color: rgba(249, 226, 175, 0.28);
+  color: var(--yellow);
+  background: rgba(249, 226, 175, 0.08);
+}
 .access-model-details {
   display: grid;
   gap: 12px;
@@ -6667,6 +6788,13 @@ body.context-focus-active {
   color: var(--text);
   border-color: var(--surface1);
 }
+#access-subtabs {
+  overflow-x: auto;
+  -webkit-overflow-scrolling: touch;
+}
+#access-subtabs .subtab-btn {
+  flex: 0 0 auto;
+}
 .subtab-panes {
   flex: 1;
   position: relative;
@@ -9360,6 +9488,10 @@ body.display-fullscreen-open {
   .access-target-row {
     grid-template-columns: 1fr;
   }
+  .access-admin-grid.two,
+  .access-detail-line {
+    grid-template-columns: 1fr;
+  }
   .access-model-row {
     grid-template-columns: 1fr;
   }
@@ -9373,6 +9505,8 @@ body.display-fullscreen-open {
   .access-target-value,
   .access-target-detail,
   .access-target-subtitle,
+  .access-detail-title,
+  .access-detail-line span,
   .access-model-main,
   .access-model-meta,
   .access-model-detail {
@@ -11194,23 +11328,53 @@ body.display-fullscreen-open {
     <!-- Access Tab -->
     <div id="tab-access" class="tab-pane">
       <div class="subtabs" id="access-subtabs">
-        <button class="subtab-btn active" data-access-tab="targets">Targets</button>
-        <button class="subtab-btn" data-access-tab="grants">Grants</button>
+        <button class="subtab-btn active" data-access-tab="overview">Overview</button>
+        <button class="subtab-btn" data-access-tab="people">People & Devices</button>
+        <button class="subtab-btn" data-access-tab="daemons">Daemons</button>
+        <button class="subtab-btn" data-access-tab="peers">Peer Trust</button>
+        <button class="subtab-btn" data-access-tab="policies">Policies</button>
+        <button class="subtab-btn" data-access-tab="audit">Audit</button>
         <button class="subtab-btn" data-access-tab="invitations">Invitations</button>
         <button class="subtab-btn" data-access-tab="public">Public Shares</button>
         <button class="subtab-btn" data-access-tab="diagnostics">Diagnostics</button>
       </div>
 
       <div class="subtab-panes">
-        <div class="subtab-pane active" id="access-pane-targets">
+        <div class="subtab-pane active" id="access-pane-overview">
           <div class="access-pane-body">
             <div id="access-model-overview" class="access-overview-grid"></div>
-            <div id="access-target-overview" class="access-target-surface"></div>
+            <div id="access-overview-details" class="access-detail-grid"></div>
           </div>
         </div>
-        <div class="subtab-pane" id="access-pane-grants">
+        <div class="subtab-pane" id="access-pane-people">
           <div class="access-pane-body">
-            <div id="access-grants-overview" class="access-overview-grid"></div>
+            <div id="access-people-overview" class="access-overview-grid"></div>
+            <div id="access-people-details" class="access-detail-grid"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-daemons">
+          <div class="access-pane-body">
+            <div id="access-daemon-overview" class="access-overview-grid"></div>
+            <div id="access-target-overview" class="access-target-surface"></div>
+            <div id="access-target-details" class="access-detail-grid"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-peers">
+          <div class="access-pane-body">
+            <div id="access-peer-overview" class="access-overview-grid"></div>
+            <div id="access-peer-details" class="access-detail-grid"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-policies">
+          <div class="access-pane-body">
+            <div id="access-policy-overview" class="access-overview-grid"></div>
+            <div id="access-permission-matrix" class="access-detail-grid"></div>
+          </div>
+        </div>
+        <div class="subtab-pane" id="access-pane-audit">
+          <div class="access-pane-body">
+            <div id="access-audit-overview" class="access-overview-grid"></div>
+            <div id="access-grant-details" class="access-detail-grid"></div>
             <div id="access-model-details" class="access-model-details"></div>
             <div id="access-grants-mount"></div>
           </div>
@@ -32525,7 +32689,7 @@ function accessOpenDisplay(hostId) {
 
 function accessManageTargetAccess(hostId) {
   const peerId = String(hostId || '').trim();
-  routeTo('access', peerId ? 'invitations' : 'grants');
+  routeTo('access', peerId ? 'invitations' : 'audit');
 }
 
 async function accessRemoveTarget(hostId, label) {
@@ -32593,6 +32757,59 @@ function accessRenderCards(containerId, cards) {
     return;
   }
   for (const card of cards) el.appendChild(accessCreateCard(card));
+}
+
+function accessOverviewArray(overview, key) {
+  return Array.isArray(overview?.[key]) ? overview[key] : [];
+}
+
+function accessDetailValue(value, fallback = 'None') {
+  const text = String(value ?? '').trim();
+  return text || fallback;
+}
+
+function accessCreateDetailCard({ title, status, lines = [] }) {
+  const card = document.createElement('div');
+  card.className = 'access-detail-card';
+  const head = document.createElement('div');
+  head.className = 'access-detail-head';
+  const titleEl = document.createElement('div');
+  titleEl.className = 'access-detail-title';
+  titleEl.textContent = title || 'Access detail';
+  head.appendChild(titleEl);
+  if (status) head.appendChild(accessModelCreateStatus(status));
+  const body = document.createElement('div');
+  body.className = 'access-detail-body';
+  for (const [label, value, titleValue] of lines) {
+    const line = document.createElement('div');
+    line.className = 'access-detail-line';
+    const key = document.createElement('strong');
+    key.textContent = label || '';
+    const val = document.createElement('span');
+    val.textContent = accessDetailValue(value);
+    val.title = accessDetailValue(titleValue ?? value);
+    line.append(key, val);
+    body.appendChild(line);
+  }
+  card.append(head, body);
+  return card;
+}
+
+function accessRenderDetailCards(containerId, cards) {
+  const el = document.getElementById(containerId);
+  if (!el) return;
+  el.innerHTML = '';
+  if (!cards.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'Nothing configured';
+    el.appendChild(empty);
+    return;
+  }
+  const grid = document.createElement('div');
+  grid.className = 'access-admin-grid two';
+  for (const card of cards) grid.appendChild(accessCreateDetailCard(card));
+  el.appendChild(grid);
 }
 
 function dashboardPeerAccessTargets() {
@@ -32685,39 +32902,84 @@ function accessOverviewModel() {
   if (dashboardAccessOverview) return dashboardAccessOverview;
   const targets = accessTargetRecords();
   const peerTargets = targets.filter(t => !t.local);
+  const targetId = target => String(target?.host_id || target?.id || '').trim();
+  const localTarget = targets.find(t => t.local) || {};
+  const localTargetId = targetId(localTarget) || selfPeerId || SHELL_HOST_ID || 'local';
   const principals = [{
     id: 'principal:current-browser-session',
     kind: 'browser_session',
+    kind_label: 'Current browser session',
     label: 'Current browser',
+    source: 'trusted_dashboard_session',
+    local: true,
+    account: null,
+    organization: null,
+    authn: [{
+      kind: 'trusted_dashboard_session',
+      label: 'Trusted dashboard session',
+    }],
   }, ...peerTargets.map(target => ({
-    id: `principal:peer-daemon:${target.host_id || target.id || ''}`,
+    id: `principal:peer-daemon:${targetId(target)}`,
     kind: 'peer_daemon',
+    kind_label: 'Peer daemon',
     label: target.label || target.host_id || target.id || 'Peer daemon',
+    source: 'peer_registry',
+    target_id: targetId(target),
+    local: false,
+    account: null,
+    organization: null,
+    authn: [{
+      kind: 'daemon_mutual_tls',
+      label: 'Daemon mTLS identity',
+    }],
   }))];
   const grants = [{
-    id: 'grant:current-browser:root',
+    id: `grant:current-browser:${localTargetId}:root`,
+    principal_id: 'principal:current-browser-session',
+    target_id: localTargetId,
     kind: 'user_client_root',
+    kind_label: 'User/client root',
+    policy_id: 'policy:root',
     role: 'root',
+    role_label: 'Root',
+    transport_id: 'transport:current-dashboard',
+    source: 'trusted_dashboard_session',
     status: 'active',
   }, ...peerTargets.map(target => ({
-    id: `grant:peer-route:${target.host_id || target.id || ''}`,
+    id: `grant:peer-route:${targetId(target)}:profile`,
+    principal_id: `principal:peer-daemon:${targetId(target)}`,
+    target_id: targetId(target),
     kind: 'daemon_peer_profile',
+    kind_label: 'Daemon peer profile',
+    policy_id: 'policy:peer-profile',
     role: 'peer_profile',
+    role_label: 'Peer profile',
+    transport_id: `transport:peer-route:${targetId(target)}`,
+    source: 'peer_registry',
     status: target.connected === false ? 'offline' : 'active',
   }))];
   const transports = [{
     id: 'transport:current-dashboard',
     kind: 'current_dashboard',
+    kind_label: 'Current dashboard transport',
+    label: 'Current dashboard',
     status: 'connected',
+    implementation: 'local_mtls_or_hosted_tunnel',
+    target_id: localTargetId,
   }, ...peerTargets.map(target => ({
-    id: `transport:peer-route:${target.host_id || target.id || ''}`,
+    id: `transport:peer-route:${targetId(target)}`,
     kind: 'peer_route',
+    kind_label: 'Peer route',
+    label: target.label || target.host_id || target.id || 'Peer daemon',
     status: target.connected === false ? 'offline' : 'connected',
+    implementation: 'daemon_mutual_tls_plus_optional_browser_datachannel',
+    target_id: targetId(target),
   }))];
   return {
     scope: {
       kind: 'local_daemon',
       label: selfHostLabel || 'This daemon',
+      target_id: localTargetId,
       account: null,
       organization: null,
       hosted_account_configured: false,
@@ -32728,13 +32990,29 @@ function accessOverviewModel() {
     transports,
     policies: [{
       id: 'policy:root',
+      label: 'Root',
       status: 'enforced',
+      summary: 'Full dashboard authority for the owner/browser session on one daemon.',
     }, {
       id: 'policy:peer-profile',
+      label: 'Peer profile',
       status: 'enforced',
+      summary: 'Daemon-to-daemon authority bounded by the approved peer profile.',
     }, {
       id: 'policy:scoped-human',
+      label: 'Scoped human access',
       status: 'planned',
+      summary: 'Future IAM-style grants for coworkers, teams, and browser certificates.',
+    }, {
+      id: 'policy:directory-files',
+      label: 'Directory scoped files',
+      status: 'planned',
+      summary: 'Future file grants limited to selected roots and operations.',
+    }, {
+      id: 'policy:public-share',
+      label: 'Public share',
+      status: 'planned',
+      summary: 'Future explicit grants for publishing selected stats or artifacts.',
     }],
     permissions: [{
       id: 'access.inspect',
@@ -32807,7 +33085,7 @@ function accessOverviewCards() {
     title: 'Grants',
     kind: `${activeGrants}/${grants.length || activeGrants} active`,
     detail: 'Root owner access and peer-profile access now use the same grant vocabulary.',
-    actions: [{ label: 'Review', onClick: () => routeTo('access', 'grants') }],
+    actions: [{ label: 'Review', onClick: () => routeTo('access', 'audit') }],
   }, {
     title: 'Policies',
     kind: `${enforcedPolicies} enforced`,
@@ -33033,7 +33311,7 @@ function accessGrantCards() {
     detail: approved > 0
       ? `${approved} daemon-to-daemon mTLS grant${approved === 1 ? '' : 's'} can access this daemon with peer profiles.${revoked ? ` ${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : ''}`
       : (revoked ? `${revoked} revoked inbound grant${revoked === 1 ? '' : 's'} retained for audit; none are active.` : 'No peer identities currently have approved inbound access.'),
-    actions: [{ label: 'Manage', primary: true, onClick: () => routeTo('access', 'grants') }],
+    actions: [{ label: 'Review', primary: true, onClick: () => routeTo('access', 'peers') }],
   });
 
   const outboundActive = activeGrantCount(outboundPeerGrants);
@@ -33202,6 +33480,309 @@ function accessTransportRow(transport, targetLabels) {
   };
 }
 
+function accessGrantsBy(overview, key) {
+  const map = new Map();
+  for (const grant of accessOverviewArray(overview, 'grants')) {
+    const id = accessModelLabel(grant[key]);
+    if (!id) continue;
+    if (!map.has(id)) map.set(id, []);
+    map.get(id).push(grant);
+  }
+  return map;
+}
+
+function accessGrantWhy(grant) {
+  const kind = accessModelLabel(grant.kind);
+  const source = accessModelLabel(grant.source);
+  if (kind === 'user_client_root') {
+    return 'This browser is trusted as the owner/root client for this daemon. Connect and browser mTLS are transports for that authority.';
+  }
+  if (kind === 'daemon_peer_profile') {
+    return 'This outbound daemon peer route was configured on this daemon. It gives this daemon peer-profile authority on the target daemon.';
+  }
+  if (kind === 'inbound_daemon_peer_profile') {
+    return 'This inbound daemon mTLS identity was approved for this daemon. The peer profile bounds what the remote daemon may do here.';
+  }
+  return source ? `Authority comes from ${source}.` : 'Authority is described by this grant.';
+}
+
+function accessPrincipalDetailCards() {
+  const overview = accessOverviewModel();
+  const grantsByPrincipal = accessGrantsBy(overview, 'principal_id');
+  return accessOverviewArray(overview, 'principals').map(principal => {
+    const id = accessModelLabel(principal.id);
+    const grants = grantsByPrincipal.get(id) || [];
+    const authn = accessOverviewArray(principal, 'authn')
+      .map(item => accessModelLabel(item.label || item.kind))
+      .filter(Boolean)
+      .join(', ');
+    return {
+      title: accessModelLabel(principal.label, id || 'Principal'),
+      status: principal.status || (principal.local ? 'current' : 'active'),
+      lines: [
+        ['Type', accessModelLabel(principal.kind_label || principal.kind, 'Principal')],
+        ['Authentication', authn || accessModelLabel(principal.source, 'Descriptive model')],
+        ['Grants', accessPlural(grants.length, 'grant')],
+        ['Account', principal.account ? JSON.stringify(principal.account) : 'Not linked'],
+        ['Organization', principal.organization ? JSON.stringify(principal.organization) : 'Not linked'],
+        ['Identifier', id],
+      ],
+    };
+  });
+}
+
+function accessTargetDetailCards() {
+  const overview = accessOverviewModel();
+  const grantsByTarget = accessGrantsBy(overview, 'target_id');
+  const transportByTarget = new Map();
+  for (const transport of accessOverviewArray(overview, 'transports')) {
+    const targetId = accessModelLabel(transport.target_id);
+    if (targetId && !transportByTarget.has(targetId)) transportByTarget.set(targetId, transport);
+  }
+  return accessOverviewArray(overview, 'targets').map(target => {
+    const id = accessModelLabel(target.id || target.host_id);
+    const descriptor = dashboardTargetDescriptor(target.local ? '' : accessModelLabel(target.host_id || target.id));
+    const grants = grantsByTarget.get(id) || grantsByTarget.get(accessModelLabel(target.host_id)) || [];
+    const transport = transportByTarget.get(id) || transportByTarget.get(accessModelLabel(target.host_id)) || {};
+    return {
+      title: accessModelLabel(target.label, id || 'Daemon'),
+      status: target.connected === false ? 'offline' : 'connected',
+      lines: [
+        ['Target', target.local ? 'This daemon' : 'Peer daemon'],
+        ['Access domain', target.access_domain_label || descriptor.accessDomain],
+        ['Effective role', target.effective_role_label || descriptor.accessRole],
+        ['Authentication', target.auth_label || descriptor.routeDetail],
+        ['Route', target.route_label || descriptor.routeType],
+        ['Transport', accessModelLabel(transport.kind_label || transport.kind, 'Current dashboard')],
+        ['Grants', accessPlural(grants.length, 'grant')],
+        ['Identifier', id],
+      ],
+    };
+  });
+}
+
+function accessPeerTrustCards() {
+  const overview = accessOverviewModel();
+  const grants = accessOverviewArray(overview, 'grants');
+  const inbound = grants.filter(grant => accessModelLabel(grant.kind) === 'inbound_daemon_peer_profile');
+  const outbound = grants.filter(grant => accessModelLabel(grant.kind) === 'daemon_peer_profile');
+  const revoked = inbound.filter(grant => accessModelLabel(grant.status) === 'revoked').length;
+  return [{
+    title: 'Inbound peer trust',
+    kind: `${inbound.filter(grant => accessModelLabel(grant.status, 'active') !== 'revoked').length} active`,
+    detail: revoked ? `${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : 'Approved peer identities that may call into this daemon.',
+    actions: [{ label: 'Requests', onClick: () => routeTo('access', 'invitations') }],
+  }, {
+    title: 'Outbound peer routes',
+    kind: `${outbound.filter(grant => accessModelLabel(grant.status, 'active') !== 'offline').length}/${outbound.length} active`,
+    detail: 'Configured peer targets this daemon may call through daemon-to-daemon trust.',
+    actions: [{ label: 'Daemons', onClick: () => routeTo('access', 'daemons') }],
+  }];
+}
+
+function accessPeerTrustDetailCards() {
+  const overview = accessOverviewModel();
+  const principalLabels = accessOverviewPrincipalLabelMap(overview);
+  const targetLabels = accessOverviewTargetLabelMap(overview);
+  return accessOverviewArray(overview, 'grants')
+    .filter(grant => /peer_profile/.test(accessModelLabel(grant.kind)))
+    .map(grant => ({
+      title: accessModelLabel(grant.role_label || grant.profile || grant.role, 'Peer profile'),
+      status: grant.status || 'active',
+      lines: [
+        ['Principal', principalLabels.get(accessModelLabel(grant.principal_id)) || accessModelLabel(grant.principal_id)],
+        ['Target', targetLabels.get(accessModelLabel(grant.target_id)) || accessModelLabel(grant.target_id)],
+        ['Direction', accessModelLabel(grant.kind) === 'inbound_daemon_peer_profile' ? 'Inbound to this daemon' : 'Outbound from this daemon'],
+        ['Source', accessModelLabel(grant.source, 'Peer registry')],
+        ['Why access exists', accessGrantWhy(grant)],
+        ['Grant id', accessModelLabel(grant.id)],
+      ],
+    }));
+}
+
+function accessAuditGrantCards() {
+  const overview = accessOverviewModel();
+  const principalLabels = accessOverviewPrincipalLabelMap(overview);
+  const targetLabels = accessOverviewTargetLabelMap(overview);
+  return accessOverviewArray(overview, 'grants').map(grant => ({
+    title: accessModelLabel(grant.role_label || grant.profile || grant.role, 'Grant'),
+    status: grant.status || 'active',
+    lines: [
+      ['Principal', principalLabels.get(accessModelLabel(grant.principal_id)) || accessModelLabel(grant.principal_id)],
+      ['Target', targetLabels.get(accessModelLabel(grant.target_id)) || accessModelLabel(grant.target_id)],
+      ['Kind', accessModelLabel(grant.kind_label || grant.kind)],
+      ['Policy', accessModelLabel(grant.policy_id)],
+      ['Transport', accessModelLabel(grant.transport_id)],
+      ['Why access exists', accessGrantWhy(grant)],
+      ['Grant id', accessModelLabel(grant.id)],
+    ],
+  }));
+}
+
+function accessPeopleCards() {
+  const overview = accessOverviewModel();
+  const principals = accessOverviewArray(overview, 'principals');
+  const human = principals.filter(p => /browser|human|passkey|certificate/.test(accessModelLabel(p.kind))).length;
+  const peer = principals.filter(p => accessModelLabel(p.kind) === 'peer_daemon').length;
+  const plannedKinds = accessOverviewArray(overview, 'supported_principal_kinds')
+    .filter(kind => /planned/.test(accessModelLabel(kind.status))).length;
+  return [{
+    title: 'People and devices',
+    kind: accessPlural(human, 'user/client principal', 'user/client principals'),
+    detail: 'Human-operated dashboard access is separate from daemon peer trust.',
+  }, {
+    title: 'Peer daemon principals',
+    kind: accessPlural(peer, 'peer daemon'),
+    detail: 'Peer daemons use daemon-to-daemon identities and peer profiles.',
+  }, {
+    title: 'Planned principal types',
+    kind: accessPlural(plannedKinds, 'type'),
+    detail: 'Organization groups and future scoped human IAM are visible as design targets only.',
+  }];
+}
+
+function accessDaemonCards() {
+  const targets = accessOverviewArray(accessOverviewModel(), 'targets');
+  const peers = targets.filter(target => !target.local);
+  const online = peers.filter(target => target.connected !== false).length;
+  return [{
+    title: 'Daemon targets',
+    kind: accessPlural(targets.length, 'target'),
+    detail: 'Each target is a daemon the dashboard can operate or inspect.',
+  }, {
+    title: 'Peer daemons',
+    kind: peers.length ? `${online}/${peers.length} online` : 'None',
+    detail: 'Peer daemon access uses peer routes and daemon mTLS, not user/client root access.',
+    actions: [{ label: 'Add', onClick: () => routeTo('access', 'invitations') }],
+  }];
+}
+
+function accessAuditCards() {
+  const grants = accessOverviewArray(accessOverviewModel(), 'grants');
+  const active = grants.filter(grant => !/planned|offline|revoked|disabled/.test(accessModelLabel(grant.status, 'active'))).length;
+  const revoked = grants.filter(grant => accessModelLabel(grant.status) === 'revoked').length;
+  return [{
+    title: 'Grant audit',
+    kind: `${active}/${grants.length || active} active`,
+    detail: revoked ? `${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : 'Every grant below explains the principal, target, policy, transport, and reason.',
+  }];
+}
+
+function accessPolicyCards() {
+  const overview = accessOverviewModel();
+  const policies = accessOverviewArray(overview, 'policies');
+  const permissions = accessOverviewArray(overview, 'permissions');
+  const enforcedPolicies = policies.filter(policy => accessModelLabel(policy.status) === 'enforced').length;
+  const enforcedPermissions = permissions.filter(permission => accessModelLabel(permission.status) === 'enforced').length;
+  return [{
+    title: 'Policies',
+    kind: `${enforcedPolicies}/${policies.length || enforcedPolicies} enforced`,
+    detail: 'Policies describe roles; scoped human IAM and public shares remain planned.',
+  }, {
+    title: 'Permissions',
+    kind: `${enforcedPermissions}/${permissions.length || enforcedPermissions} enforced`,
+    detail: 'Permissions are concrete operation gates used by dashboard-control and peer auth.',
+  }];
+}
+
+function renderAccessOverviewDetails() {
+  const overview = accessOverviewModel();
+  const scope = overview.scope || {};
+  const unresolved = accessOverviewArray(overview.architecture || {}, 'unresolved');
+  accessRenderDetailCards('access-overview-details', [{
+    title: accessModelLabel(scope.label, 'This daemon'),
+    status: 'current',
+    lines: [
+      ['Scope', accessModelLabel(scope.kind, 'local_daemon')],
+      ['Target', accessModelLabel(scope.target_id, selfPeerId || 'local')],
+      ['Account', scope.account ? JSON.stringify(scope.account) : 'Not linked'],
+      ['Organization', scope.organization ? JSON.stringify(scope.organization) : 'Not linked'],
+      ['Hosted account', scope.hosted_account_configured ? 'Configured' : 'Not configured'],
+    ],
+  }, {
+    title: 'Access boundary',
+    status: unresolved.length ? 'planned' : 'enforced',
+    lines: [
+      ['Current model', 'Read-only access administration'],
+      ['Connect', 'Transport, not an authority model'],
+      ['Browser mTLS', 'Transport/auth credential for user-client authority'],
+      ['Peer mTLS', 'Daemon-to-daemon authority only'],
+      ['Open decisions', unresolved.join('; ') || 'None reported'],
+    ],
+  }]);
+}
+
+function accessPermissionMatrixCell(policy, permission) {
+  const policyId = accessModelLabel(policy.id);
+  const permissionId = accessModelLabel(permission.id);
+  if (accessModelLabel(policy.status) === 'planned') return { text: 'Planned', state: 'planned' };
+  if (policyId === 'policy:root') return { text: 'Yes', state: 'yes' };
+  if (policyId === 'policy:peer-profile') {
+    if (permissionId === 'access.manage') return { text: 'No', state: 'no' };
+    if (permissionId === 'access.inspect') return { text: 'Peer root', state: 'conditional' };
+    if (permissionId === 'peer.inspect' || permissionId === 'peer.manage') return { text: 'Profile', state: 'conditional' };
+  }
+  return { text: 'No', state: 'no' };
+}
+
+function renderAccessPermissionMatrix() {
+  const mount = document.getElementById('access-permission-matrix');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const overview = accessOverviewModel();
+  const policies = accessOverviewArray(overview, 'policies');
+  const permissions = accessOverviewArray(overview, 'permissions');
+  if (!policies.length || !permissions.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'No policy or permission model available';
+    mount.appendChild(empty);
+    return;
+  }
+  const wrap = document.createElement('div');
+  wrap.className = 'access-matrix';
+  const table = document.createElement('table');
+  table.className = 'access-matrix-table';
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  const first = document.createElement('th');
+  first.textContent = 'Policy';
+  headRow.appendChild(first);
+  for (const permission of permissions) {
+    const th = document.createElement('th');
+    th.textContent = accessModelLabel(permission.label, permission.id);
+    th.title = accessModelLabel(permission.summary);
+    headRow.appendChild(th);
+  }
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+  const tbody = document.createElement('tbody');
+  for (const policy of policies) {
+    const row = document.createElement('tr');
+    const policyCell = document.createElement('td');
+    const policyName = document.createElement('div');
+    policyName.className = 'access-matrix-policy';
+    policyName.textContent = accessModelLabel(policy.label, policy.id);
+    const policyDetail = document.createElement('div');
+    policyDetail.textContent = accessModelLabel(policy.summary);
+    policyCell.append(policyName, policyDetail);
+    row.appendChild(policyCell);
+    for (const permission of permissions) {
+      const td = document.createElement('td');
+      const cell = accessPermissionMatrixCell(policy, permission);
+      const pill = document.createElement('span');
+      pill.className = `access-matrix-cell ${cell.state}`;
+      pill.textContent = cell.text;
+      td.appendChild(pill);
+      row.appendChild(td);
+    }
+    tbody.appendChild(row);
+  }
+  table.appendChild(tbody);
+  wrap.appendChild(table);
+  mount.appendChild(wrap);
+}
+
 function renderAccessModelDetails() {
   const el = document.getElementById('access-model-details');
   if (!el) return;
@@ -33266,8 +33847,18 @@ function accessDiagnosticsCards() {
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
   accessRenderCards('access-model-overview', accessOverviewCards());
+  renderAccessOverviewDetails();
+  accessRenderCards('access-people-overview', accessPeopleCards());
+  accessRenderDetailCards('access-people-details', accessPrincipalDetailCards());
+  accessRenderCards('access-daemon-overview', accessDaemonCards());
   renderAccessTargetsSurface();
-  accessRenderCards('access-grants-overview', accessGrantCards());
+  accessRenderDetailCards('access-target-details', accessTargetDetailCards());
+  accessRenderCards('access-peer-overview', accessPeerTrustCards());
+  accessRenderDetailCards('access-peer-details', accessPeerTrustDetailCards());
+  accessRenderCards('access-policy-overview', accessPolicyCards());
+  renderAccessPermissionMatrix();
+  accessRenderCards('access-audit-overview', accessAuditCards());
+  accessRenderDetailCards('access-grant-details', accessAuditGrantCards());
   renderAccessModelDetails();
   accessRenderCards('access-public-shares', accessPublicShareCards());
   accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
@@ -33329,7 +33920,7 @@ function mountAccessAdminSurface() {
   const openAccessBtn = document.getElementById('settings-open-access-btn');
   if (openAccessBtn && openAccessBtn.dataset.wired !== 'true') {
     openAccessBtn.dataset.wired = 'true';
-    openAccessBtn.addEventListener('click', () => routeTo('access', 'targets'));
+    openAccessBtn.addEventListener('click', () => routeTo('access', 'overview'));
   }
 }
 
@@ -39190,7 +39781,7 @@ document.querySelectorAll('#tab-settings .subtab-btn[data-settings-tab]').forEac
   btn.addEventListener('click', () => routeTo('settings', btn.dataset.settingsTab));
 });
 
-// Access sub-tab switching (Targets | Grants | Invitations | Public Shares | Diagnostics).
+// Access sub-tab switching (Overview | People & Devices | Daemons | Peer Trust | Policies | Audit).
 document.querySelectorAll('#access-subtabs .subtab-btn[data-access-tab]').forEach(btn => {
   btn.addEventListener('click', () => routeTo('access', btn.dataset.accessTab));
 });
@@ -39212,7 +39803,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 //   #stats
 //   #terminal           → defaults to TUI sub-tab
 //   #terminal/shell     → opens the Shell sub-tab directly
-//   #access/targets     → opens unified access administration
+//   #access/overview    → opens unified access administration
 //   #settings/agent     → opens the Settings tab on the Agent sub-tab
 //
 // This gives us three things for free:
@@ -39220,7 +39811,7 @@ document.querySelectorAll('#activity-subtabs .subtab-btn[data-activity-tab]').fo
 //   2. Refresh preserves the current tab (no localStorage hack needed
 //      for main/sub-tab persistence)
 //   3. Deep links like `http://host:8765#stats` or
-//      `http://host:8765#access/targets` open the dashboard at a
+//      `http://host:8765#access/overview` open the dashboard at a
 //      specific view - useful for bookmarking multi-host daemons.
 //
 // We still use localStorage for preferences that aren't navigation
@@ -39230,8 +39821,15 @@ const VALID_TABS = ['activity', 'stats', 'terminal', 'displays', 'station', 'ses
 const VALID_ACTIVITY_SUBTABS = ['log', 'context', 'managed', 'changes', 'control'];
 const VALID_TERM_SUBTABS = ['tui', 'shell'];
 const VALID_SETTINGS_SUBTABS = ['account', 'agent', 'network', 'debug'];
-const VALID_ACCESS_SUBTABS = ['targets', 'grants', 'invitations', 'public', 'diagnostics'];
+const ACCESS_SUBTAB_ALIASES = { targets: 'daemons', grants: 'audit' };
+const ACCESS_CANONICAL_SUBTABS = ['overview', 'people', 'daemons', 'peers', 'policies', 'audit', 'invitations', 'public', 'diagnostics'];
+const VALID_ACCESS_SUBTABS = ACCESS_CANONICAL_SUBTABS.concat(Object.keys(ACCESS_SUBTAB_ALIASES));
 const VALID_SESSIONS_SUBTABS = ['recent', 'deep', 'worktrees', 'new'];
+
+function normalizeAccessSubtab(name) {
+  const raw = String(name || 'overview').trim();
+  return ACCESS_SUBTAB_ALIASES[raw] || (ACCESS_CANONICAL_SUBTABS.includes(raw) ? raw : 'overview');
+}
 
 function parseRoute() {
   const raw = window.location.hash.slice(1); // strip leading '#'
@@ -39239,7 +39837,7 @@ function parseRoute() {
   const [tab, subtab] = raw.split('/');
   if (!VALID_TABS.includes(tab)) return { tab: 'activity', subtab: null };
   if (tab === 'settings' && subtab === 'network') {
-    return { tab: 'access', subtab: 'targets' };
+    return { tab: 'access', subtab: 'overview' };
   }
   if (tab === 'activity' && subtab && !VALID_ACTIVITY_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
@@ -39256,7 +39854,7 @@ function parseRoute() {
   if (tab === 'sessions' && subtab && !VALID_SESSIONS_SUBTABS.includes(subtab)) {
     return { tab, subtab: null };
   }
-  return { tab, subtab: subtab || null };
+  return { tab, subtab: tab === 'access' && subtab ? normalizeAccessSubtab(subtab) : (subtab || null) };
 }
 
 function tabDomMatches(tab) {
@@ -39276,6 +39874,7 @@ function tabDomMatches(tab) {
 // `subtab` is optional; when omitted, the target tab's default sub-tab
 // is used (or preserved if it's already the active one).
 function routeTo(tab, subtab) {
+  if (tab === 'access' && subtab) subtab = normalizeAccessSubtab(subtab);
   const target = subtab ? `${tab}/${subtab}` : tab;
   const nextHash = `#${target}`;
   if (window.location.hash !== nextHash) {
@@ -39291,7 +39890,7 @@ function routeTo(tab, subtab) {
   } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
   } else if (tab === 'access') {
-    switchAccessSubtab(subtab || activeAccessSubtab || 'targets');
+    switchAccessSubtab(subtab || activeAccessSubtab || 'overview');
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
   } else if (tab === 'sessions') {
@@ -39324,7 +39923,7 @@ function applyCurrentRoute() {
   } else if (tab === 'terminal' && subtab) {
     switchTerminalSubtab(subtab);
   } else if (tab === 'access') {
-    switchAccessSubtab(subtab || activeAccessSubtab || 'targets');
+    switchAccessSubtab(subtab || activeAccessSubtab || 'overview');
   } else if (tab === 'settings' && subtab) {
     switchSettingsSubtab(subtab);
   } else if (tab === 'sessions') {
@@ -41033,14 +41632,14 @@ if (activeSettingsSubtab === 'network') {
   localStorage.setItem(SETTINGS_SUBTAB_KEY, activeSettingsSubtab);
 }
 let activeAccessSubtab =
-  localStorage.getItem(ACCESS_SUBTAB_KEY) || 'targets';
+  normalizeAccessSubtab(localStorage.getItem(ACCESS_SUBTAB_KEY) || 'overview');
 if (!VALID_ACCESS_SUBTABS.includes(activeAccessSubtab)) {
-  activeAccessSubtab = 'targets';
+  activeAccessSubtab = 'overview';
   localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
 }
 
 function switchAccessSubtab(name) {
-  const next = VALID_ACCESS_SUBTABS.includes(name) ? name : 'targets';
+  const next = normalizeAccessSubtab(name);
   if (activeAccessSubtab !== next) {
     activeAccessSubtab = next;
     localStorage.setItem(ACCESS_SUBTAB_KEY, activeAccessSubtab);
@@ -41058,7 +41657,7 @@ function switchAccessSubtab(name) {
 
 function switchSettingsSubtab(name) {
   if (name === 'network') {
-    routeTo('access', 'targets');
+    routeTo('access', 'overview');
     return;
   }
   if (activeSettingsSubtab === name) return;
@@ -60501,7 +61100,7 @@ document.getElementById('stats-host-select').addEventListener('change', (e) => {
 // bar - click jumps to Access targets so the user can investigate
 // which host is disconnected/skewed.
 document.getElementById('sb-hosts-group').addEventListener('click', () => {
-  routeTo('access', 'targets');
+  routeTo('access', 'overview');
 });
 
 // Auto-scroll detection

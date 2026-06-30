@@ -284,16 +284,23 @@ targets with their available capabilities rather than as transport internals.
 
 Unified administration for how dashboards and daemons reach each other:
 
-- **Targets** lists daemon targets, not raw transports. A target can be this
+- **Overview** shows the current access scope, the local daemon identity, and
+  the boundary between authority models and transports.
+- **People & Devices** lists user/client principals separately from peer daemon
+  identities. The current browser is user/client access and is root dashboard
+  access in the single-user product.
+- **Daemons** lists daemon targets, not raw transports. A target can be this
   daemon over user/client access, a hosted-transport daemon, a direct browser-mTLS
   daemon, or a peer-routed daemon. Each row shows the access domain, route, and
   available capabilities, then links to Stats, Files, and Shell.
-- **Grants** separates user/client access from peer access. The current browser
-  is user/client access and is root dashboard access in the single-user product.
-  Inbound peer identities are daemon-to-daemon grants with peer profiles. The
-  tab renders the overview-backed principal, supported-principal-kind, grant,
-  policy, permission, and transport rows so the summary cards and detailed model
-  use the same source of truth.
+- **Peer Trust** focuses on daemon-to-daemon relationships: approved inbound
+  identities and configured outbound peer routes, both bounded by peer profiles.
+- **Policies** shows the role/policy model and the permission matrix used by
+  dashboard-control and peer auth. This is read-only until editable IAM is
+  deliberately designed.
+- **Audit** renders the overview-backed grant detail: principal, target, policy,
+  transport, status, and why the access exists. It also keeps the legacy trusted
+  relationship panel during the transition.
 - **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
   Request Peer Access, Manual Add, and inbound peer access requests.
 - **Public Shares** is the placeholder surface for future explicit public or
