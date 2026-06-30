@@ -288,7 +288,8 @@ Unified administration for how dashboards and daemons reach each other:
   the boundary between authority models and transports.
 - **People & Devices** lists user/client principals separately from peer daemon
   identities. The current browser or Connect account is user/client access; the
-  pane can bind that identity to a local scoped or root grant.
+  pane can bind that identity to a local role grant, from minimal inspect-only
+  access through root.
 - **Daemons** lists daemon targets, not raw transports. A target can be this
   daemon over user/client access, a hosted-transport daemon, a direct browser-mTLS
   daemon, or a peer-routed daemon. Each row shows the access domain, route, and
@@ -296,12 +297,13 @@ Unified administration for how dashboards and daemons reach each other:
 - **Peer Trust** focuses on daemon-to-daemon relationships: approved inbound
   identities and configured outbound peer routes, both bounded by peer profiles.
 - **Policies** shows the role/policy model, local IAM role templates, and the
-  permission matrix used by dashboard-control and peer auth. Minimal local
-  browser/Connect grants are editable; organization groups, directory scopes,
+  permission matrix used by dashboard-control and peer auth. Local
+  browser/Connect roles are editable; organization groups, directory scopes,
   public shares, and external identity policy remain design targets.
 - **Audit** renders the overview-backed grant detail: principal, target, policy,
-  transport, enforcement status, and why the access exists. It also keeps the
-  legacy trusted relationship panel during the transition.
+  transport, enforcement status, and why the access exists. Persisted local
+  user/client grants can be activated, drafted, or revoked from this pane. It
+  also keeps the legacy trusted relationship panel during the transition.
 - **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
   Request Peer Access, Manual Add, and inbound peer access requests.
 - **Public Shares** is the placeholder surface for future explicit public or
@@ -326,10 +328,13 @@ and peer federation:
   mTLS certificate fingerprints or hosted Connect account metadata; draft and
   revoked records remain visible for review.
 - A **policy** defines the shape of authority behind a grant. `root` and
-  `peer-profile` are enforced today. Minimal `scoped-human` access is enforced
-  for local browser/Connect bindings. Directory-scoped file access, public
-  shares, organization groups, and external identity policy are design targets,
-  not hidden enforcement.
+  `peer-profile` are enforced today, but they live in different domains:
+  `root` is user/client authority and `peer-profile` is daemon-to-daemon
+  authority. Local user/client bindings can also use enforced scoped roles:
+  `scoped-human` (access model inspection only), `observer`, `session-reader`,
+  `terminal`, `files-read`, `files-write`, and `operator`. Directory-scoped file
+  access, public shares, organization groups, and external identity policy are
+  design targets, not hidden enforcement.
 - A **permission** is the operation gate the daemon enforces. Access
   administration now separates `access.inspect` from `access.manage`, and peer
   topology separates `peer.inspect` from `peer.manage`. Owner/root dashboard
@@ -373,19 +378,24 @@ enforces active scoped user/client grants when a request can be bound to a
 stable local principal. Today those stable bindings are browser mTLS client
 certificate fingerprints and hosted Connect account metadata. Existing owner
 browser mTLS and hosted Connect requests remain root-compatible when no active
-local binding exists, but an active matching local principal/grant wins over the
-root fallback. The `iam.enforcement` object reports `root_session_grants: true`,
-`peer_profile_grants: true`, `user_client_grants: true`, and
+local binding exists. Once a browser certificate or Connect account has any
+matching local IAM record, that record wins over the root fallback: active
+grants are evaluated by role, while draft or revoked records deny instead of
+silently becoming root again. The `iam.enforcement` object reports
+`root_session_grants: true`, `peer_profile_grants: true`,
+`user_client_grants: true`, and
 `principal_binding: root_peer_and_local_user_client`. Root sessions can create
 or update local user/client grants through the People & Devices pane,
 `POST /api/access/iam/user-client-grants`, or dashboard-control
-`api_access_iam_upsert_user_client_grant`.
+`api_access_iam_upsert_user_client_grant`. Existing grants can be activated,
+drafted, revoked, or role-changed with `POST /api/access/iam/grants/update` or
+dashboard-control `api_access_iam_update_grant`.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access
 domain (`user_client` or `peer`), route (`current_dashboard` or `peer_route`),
 effective role (`root` or `peer_profile`), connection state, and capability
-hints. The browser may refine the local route label to **Hosted transport**,
+hints. The browser may refine the local route label to **Intendant Connect**,
 **Browser mTLS**, or **Local/debug** because only the browser knows how the
 current page was reached, but it should not invent principal/grant/policy
 vocabulary.

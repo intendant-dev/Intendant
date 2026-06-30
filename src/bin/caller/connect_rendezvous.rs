@@ -486,7 +486,18 @@ fn connect_dashboard_grant_from_state(
             principal,
             iam_state: state,
         },
-        None => connect_dashboard_root_grant(Some(user_id), account_name),
+        None => match crate::access::iam::principal_for_connect_account_any_status(
+            &state,
+            user_id,
+            account_name,
+            "connect-dashboard-control",
+        ) {
+            Some(principal) => crate::dashboard_control::DashboardControlGrant::UserClient {
+                principal,
+                iam_state: state,
+            },
+            None => connect_dashboard_root_grant(Some(user_id), account_name),
+        },
     }
 }
 
@@ -750,6 +761,60 @@ mod tests {
                 .and_then(|authn| authn.get("kind"))
                 .and_then(serde_json::Value::as_str),
             Some("connect_account")
+        );
+    }
+
+    #[test]
+    fn revoked_connect_account_binding_does_not_fall_back_to_root() {
+        let mut state = crate::access::iam::LocalIamState::default();
+        state.principals.push(crate::access::iam::IamPrincipal {
+            id: "principal:connect:alice".to_string(),
+            kind: "connect_account".to_string(),
+            label: "alice".to_string(),
+            status: "revoked".to_string(),
+            source: "local_iam_state".to_string(),
+            account: Some(serde_json::json!({
+                "provider": "intendant.dev",
+                "account_name": "alice"
+            })),
+            organization: None,
+            authn: vec![serde_json::json!({
+                "kind": "connect_account",
+                "user_id": "user-123",
+                "account_name": "alice"
+            })],
+            notes: None,
+            created_at_unix_ms: Some(100),
+        });
+        state.grants.push(crate::access::iam::IamGrant {
+            id: "grant:connect:alice:inspect".to_string(),
+            principal_id: "principal:connect:alice".to_string(),
+            target_id: "local".to_string(),
+            role_id: "role:scoped-human".to_string(),
+            policy_id: "policy:scoped-human".to_string(),
+            status: "revoked".to_string(),
+            source: "local_iam_state".to_string(),
+            reason: "revoked Connect account grant".to_string(),
+            created_at_unix_ms: Some(101),
+            revoked_at_unix_ms: Some(102),
+        });
+
+        let grant = connect_dashboard_grant_from_state(state, "user-123", Some("alice"));
+        let crate::dashboard_control::DashboardControlGrant::UserClient {
+            principal,
+            iam_state,
+        } = grant
+        else {
+            panic!("expected inactive user-client grant, not root fallback");
+        };
+        assert_eq!(principal.kind, "connect_account");
+        assert!(
+            !crate::access::iam::evaluate_principal_operation_with_state(
+                &iam_state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessInspect,
+            )
+            .allowed
         );
     }
 }

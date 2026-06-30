@@ -655,9 +655,20 @@ html {
   color: var(--crust);
   font-weight: 700;
 }
+.access-card-actions button.danger {
+  border-color: var(--red);
+  color: var(--red);
+}
+.access-card-actions button:disabled {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
 .access-card-actions button:hover,
 .access-moved-note button:hover {
   border-color: var(--blue);
+}
+.access-card-actions button.danger:hover {
+  border-color: var(--red);
 }
 .access-section {
   border: 1px solid var(--surface1);
@@ -824,6 +835,9 @@ html {
   display: grid;
   gap: 8px;
   padding: 10px 11px;
+}
+.access-detail-actions {
+  padding: 0 11px 11px;
 }
 .access-detail-line {
   display: grid;
@@ -12650,6 +12664,7 @@ let daemons = [];
 let dashboardAccessTargets = [];
 let dashboardAccessOverview = null;
 let accessUserClientGrantSubmitting = false;
+const accessGrantLifecycleSubmitting = new Set();
 let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
@@ -32495,6 +32510,7 @@ function applyDashboardAccessTargets(payload) {
   const rawTargets = Array.isArray(payload?.targets) ? payload.targets : [];
   dashboardAccessTargets = rawTargets
     .map(normalizeDashboardAccessTarget)
+    .map(decorateDashboardAccessTarget)
     .filter(Boolean);
   renderDashboardTargetSummaries();
 }
@@ -32638,30 +32654,95 @@ function dashboardTargetLabel(hostId) {
   return peer?.label || String(hostId || '').trim();
 }
 
+function dashboardAccessRoleLabel(roleId) {
+  const key = String(roleId || '').trim();
+  return {
+    'role:root': 'Root',
+    'role:scoped-human': 'Scoped human',
+    'role:observer': 'Observer',
+    'role:session-reader': 'Session reader',
+    'role:terminal': 'Terminal',
+    'role:files-read': 'Files read',
+    'role:files-write': 'Files write',
+    'role:operator': 'Operator',
+  }[key] || (key ? key.replace(/^role:/, '').replace(/-/g, ' ') : 'Root');
+}
+
+function dashboardCurrentAccessRouteInfo() {
+  const status = dashboardControlTransport?.lastStatus || {};
+  const principal = status.access_principal && typeof status.access_principal === 'object'
+    ? status.access_principal
+    : {};
+  const source = String(principal.source || '').trim();
+  const transport = String(principal.transport || '').trim();
+  const kind = String(principal.kind || '').trim();
+  const roleLabel = dashboardAccessRoleLabel(principal.role_id || 'role:root');
+  const connectAccount = principal.account?.account_name
+    ? `@${principal.account.account_name}`
+    : (principal.account?.user_id ? 'Connect account' : 'Connect account');
+  const isConnect = dashboardConnectModeEnabled() ||
+    source === 'connect-account' ||
+    transport.includes('connect') ||
+    kind === 'connect_account';
+  if (isConnect) {
+    return {
+      domain: 'User/client access',
+      route: 'Intendant Connect',
+      auth: 'connect_account',
+      authLabel: connectAccount,
+      role: roleLabel,
+      detail: `${connectAccount} over the hosted dashboard tunnel`,
+    };
+  }
+  const isBrowserCert = kind === 'browser_certificate' ||
+    source === 'browser-mtls' ||
+    transport === 'https' ||
+    location.protocol === 'https:';
+  if (isBrowserCert) {
+    return {
+      domain: 'User/client access',
+      route: 'Browser mTLS',
+      auth: 'browser_mtls_cert',
+      authLabel: kind === 'browser_certificate' ? 'Browser certificate grant' : 'Trusted browser certificate',
+      role: roleLabel,
+      detail: 'trusted browser client certificate',
+    };
+  }
+  return {
+    domain: 'User/client access',
+    route: 'Local/debug',
+    auth: 'trusted_dashboard',
+    authLabel: 'Trusted local dashboard',
+    role: roleLabel,
+    detail: 'local browser session',
+  };
+}
+
+function decorateDashboardAccessTarget(target) {
+  if (!target || !target.local) return target;
+  const route = dashboardCurrentAccessRouteInfo();
+  return {
+    ...target,
+    access_domain: 'user_client',
+    access_domain_label: route.domain,
+    route: route.route.toLowerCase().replace(/[^a-z0-9]+/g, '_').replace(/^_|_$/g, '') || 'current_dashboard',
+    route_label: route.route,
+    auth: route.auth,
+    auth_label: route.authLabel,
+    effective_role: String((dashboardControlTransport?.lastStatus?.access_principal?.role_id) || 'role:root'),
+    effective_role_label: route.role,
+  };
+}
+
 function dashboardTargetAccessRoute(hostId) {
   const model = dashboardAccessTargetForHost(hostId);
   if (dashboardTargetIsLocal(hostId)) {
-    if (dashboardConnectModeEnabled()) {
-      return {
-        domain: 'User access',
-        route: 'Hosted transport',
-        role: 'Root',
-        detail: 'passkey/account grant over the hosted tunnel',
-      };
-    }
-    if (location.protocol === 'https:') {
-      return {
-        domain: 'User access',
-        route: 'Browser mTLS',
-        role: 'Root',
-        detail: 'trusted browser client certificate',
-      };
-    }
+    const route = dashboardCurrentAccessRouteInfo();
     return {
-      domain: 'User access',
-      route: 'Local/debug',
-      role: 'Root',
-      detail: 'local browser session',
+      domain: route.domain,
+      route: route.route,
+      role: route.role,
+      detail: route.detail,
     };
   }
   if (model) {
@@ -33011,7 +33092,7 @@ function accessDetailValue(value, fallback = 'None') {
   return text || fallback;
 }
 
-function accessCreateDetailCard({ title, status, lines = [] }) {
+function accessCreateDetailCard({ title, status, lines = [], actions = [] }) {
   const card = document.createElement('div');
   card.className = 'access-detail-card';
   const head = document.createElement('div');
@@ -33035,6 +33116,22 @@ function accessCreateDetailCard({ title, status, lines = [] }) {
     body.appendChild(line);
   }
   card.append(head, body);
+  const usableActions = Array.isArray(actions) ? actions.filter(Boolean) : [];
+  if (usableActions.length) {
+    const actionRow = document.createElement('div');
+    actionRow.className = 'access-card-actions access-detail-actions';
+    for (const action of usableActions) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      if (action.primary) button.classList.add('primary');
+      if (action.danger) button.classList.add('danger');
+      button.disabled = Boolean(action.disabled);
+      button.textContent = action.label || 'Open';
+      button.addEventListener('click', action.onClick);
+      actionRow.appendChild(button);
+    }
+    card.appendChild(actionRow);
+  }
   return card;
 }
 
@@ -33101,7 +33198,7 @@ function syncDashboardAccessTargetsFromDaemons() {
 }
 
 function accessLocalTargetModel() {
-  return dashboardAccessTargets.find(t => t.local) || normalizeDashboardAccessTarget({
+  return decorateDashboardAccessTarget(dashboardAccessTargets.find(t => t.local) || normalizeDashboardAccessTarget({
     id: selfPeerId || SHELL_HOST_ID,
     host_id: selfPeerId || SHELL_HOST_ID,
     label: selfHostLabel || 'This daemon',
@@ -33117,7 +33214,7 @@ function accessLocalTargetModel() {
     effective_role_label: 'Root',
     connected: true,
     capabilities: [],
-  });
+  }));
 }
 
 function accessTargetRecords() {
@@ -33158,6 +33255,147 @@ function accessIamLoadLabel(iam) {
 function accessIamEnforcementReason(iam) {
   const enforcement = iam.enforcement && typeof iam.enforcement === 'object' ? iam.enforcement : {};
   return accessModelLabel(enforcement.reason, 'Active scoped user/client grants are enforced when requests bind to browser mTLS or Connect account identities.');
+}
+
+function accessFallbackIamRoles() {
+  const rootPermissions = ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'];
+  return [{
+    id: 'role:root',
+    label: 'Root',
+    status: 'enforced',
+    summary: 'Current owner/root dashboard authority.',
+    permissions: rootPermissions,
+    source: 'builtin',
+  }, {
+    id: 'role:peer-profile',
+    label: 'Peer profile',
+    status: 'enforced',
+    summary: 'Daemon-to-daemon grants enforced by the approved peer identity profile.',
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
+    source: 'builtin',
+  }, {
+    id: 'role:scoped-human',
+    label: 'Scoped human',
+    status: 'enforced',
+    summary: 'Minimal user/client IAM role for stable browser mTLS and Connect account request bindings.',
+    permissions: ['access.inspect'],
+    source: 'builtin',
+  }, {
+    id: 'role:observer',
+    label: 'Observer',
+    status: 'enforced',
+    summary: 'Read-only dashboard visibility without files, terminal, task control, or settings.',
+    permissions: ['presence.read', 'stats.read', 'display.view', 'access.inspect', 'peer.inspect', 'session.inspect'],
+    source: 'builtin',
+  }, {
+    id: 'role:session-reader',
+    label: 'Session reader',
+    status: 'enforced',
+    summary: 'Read sessions, logs, reports, and status without controlling the daemon.',
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'session.inspect'],
+    source: 'builtin',
+  }, {
+    id: 'role:terminal',
+    label: 'Terminal',
+    status: 'enforced',
+    summary: 'Open and use shell sessions without broader dashboard mutation rights.',
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'session.inspect', 'terminal.use'],
+    source: 'builtin',
+  }, {
+    id: 'role:files-read',
+    label: 'Files read',
+    status: 'enforced',
+    summary: 'Browse metadata and download files without writing to disk.',
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'filesystem.read'],
+    source: 'builtin',
+  }, {
+    id: 'role:files-write',
+    label: 'Files write',
+    status: 'enforced',
+    summary: 'Read files and upload/create file content through the dashboard.',
+    permissions: ['presence.read', 'stats.read', 'access.inspect', 'filesystem.read', 'filesystem.write'],
+    source: 'builtin',
+  }, {
+    id: 'role:operator',
+    label: 'Operator',
+    status: 'enforced',
+    summary: 'Operate sessions, display, shell, files, and approvals without access/settings administration.',
+    permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'session.inspect', 'session.manage', 'terminal.use', 'filesystem.read', 'filesystem.write'],
+    source: 'builtin',
+  }, {
+    id: 'role:directory-files',
+    label: 'Directory scoped files',
+    status: 'planned',
+    summary: 'Future file role bounded by selected roots and operations.',
+    permissions: ['filesystem.read'],
+    source: 'builtin',
+  }];
+}
+
+function accessFallbackPolicyIdForRole(roleId) {
+  return {
+    'role:root': 'policy:root',
+    'role:peer-profile': 'policy:peer-profile',
+    'role:scoped-human': 'policy:scoped-human',
+    'role:observer': 'policy:observer',
+    'role:session-reader': 'policy:session-reader',
+    'role:terminal': 'policy:terminal',
+    'role:files-read': 'policy:files-read',
+    'role:files-write': 'policy:files-write',
+    'role:operator': 'policy:operator',
+    'role:directory-files': 'policy:directory-files',
+  }[roleId] || `policy:${String(roleId || 'role').replace(/[^a-zA-Z0-9]+/g, '-').replace(/^-|-$/g, '').toLowerCase()}`;
+}
+
+function accessFallbackPolicies() {
+  return accessFallbackIamRoles().map(role => ({
+    id: accessFallbackPolicyIdForRole(role.id),
+    label: role.label,
+    status: role.status,
+    summary: role.summary,
+    role_id: role.id,
+    permissions: role.permissions,
+    source: role.source,
+    assignment: role.id === 'role:peer-profile' ? 'daemon_peer_only' : (role.status === 'planned' ? 'planned' : 'user_client'),
+  })).concat([{
+    id: 'policy:public-share',
+    label: 'Public share',
+    status: 'planned',
+    summary: 'Future explicit grants for publishing selected stats or artifacts.',
+    permissions: [],
+    source: 'builtin',
+    assignment: 'planned',
+  }]);
+}
+
+function accessFallbackPermissions() {
+  const summaries = {
+    'presence.read': ['Presence read', 'presence', 'Read live presence and basic daemon availability.'],
+    'stats.read': ['Stats read', 'stats', 'Read daemon health, usage, and status summaries.'],
+    'display.view': ['Display view', 'display', 'View display streams without injecting input.'],
+    'display.input': ['Display input', 'display', 'Inject keyboard, pointer, or display-control input.'],
+    'message.send': ['Message send', 'message', 'Send user messages or dashboard actions into a session.'],
+    'task.run': ['Task run', 'task', 'Start or delegate agent tasks.'],
+    'approval.resolve': ['Approval resolve', 'approval', 'Approve or deny pending supervised actions.'],
+    'access.inspect': ['Access inspect', 'access', 'Read targets, principals, grants, policies, transports, and access architecture notes.'],
+    'access.manage': ['Access manage', 'access', 'Approve, revoke, or change access grants.'],
+    'peer.inspect': ['Peer inspect', 'peer', 'Read configured peer routes and peer eligibility.'],
+    'peer.manage': ['Peer manage', 'peer', 'Create, remove, pair, and use daemon peer routes.'],
+    'session.inspect': ['Session inspect', 'session', 'Read session lists, logs, reports, recordings, and replay metadata.'],
+    'session.manage': ['Session manage', 'session', 'Delete, rewind, prune, upload to, or otherwise mutate sessions.'],
+    'terminal.use': ['Terminal use', 'terminal', 'Open and operate dashboard shell sessions.'],
+    'settings.manage': ['Settings manage', 'settings', 'Read or write daemon settings and API keys.'],
+    'runtime.control': ['Runtime control', 'runtime', 'Use runtime-control surfaces such as TUI, media, and recording controls.'],
+    'filesystem.read': ['Filesystem read', 'filesystem', 'Stat, list, and read files through dashboard APIs.'],
+    'filesystem.write': ['Filesystem write', 'filesystem', 'Create directories or write uploaded file content.'],
+  };
+  return Object.entries(summaries).map(([id, [label, domain, summary]]) => ({
+    id,
+    label,
+    domain,
+    status: 'enforced',
+    summary,
+  }));
 }
 
 function accessOverviewModel() {
@@ -33250,57 +33488,8 @@ function accessOverviewModel() {
     principals,
     grants,
     transports,
-    policies: [{
-      id: 'policy:root',
-      label: 'Root',
-      status: 'enforced',
-      summary: 'Full dashboard authority for the owner/browser session on one daemon.',
-    }, {
-      id: 'policy:peer-profile',
-      label: 'Peer profile',
-      status: 'enforced',
-      summary: 'Daemon-to-daemon authority bounded by the approved peer profile.',
-    }, {
-      id: 'policy:scoped-human',
-      label: 'Scoped human access',
-      status: 'enforced',
-      summary: 'Minimal local IAM grants for stable browser mTLS certificates and hosted Connect account metadata.',
-    }, {
-      id: 'policy:directory-files',
-      label: 'Directory scoped files',
-      status: 'planned',
-      summary: 'Future file grants limited to selected roots and operations.',
-    }, {
-      id: 'policy:public-share',
-      label: 'Public share',
-      status: 'planned',
-      summary: 'Future explicit grants for publishing selected stats or artifacts.',
-    }],
-    permissions: [{
-      id: 'access.inspect',
-      label: 'Access inspect',
-      domain: 'access',
-      status: 'enforced',
-      summary: 'Read targets, principals, grants, policies, transports, and access architecture notes.',
-    }, {
-      id: 'access.manage',
-      label: 'Access manage',
-      domain: 'access',
-      status: 'enforced',
-      summary: 'Approve, revoke, or change access grants. Currently reserved for trusted owner/root sessions.',
-    }, {
-      id: 'peer.inspect',
-      label: 'Peer inspect',
-      domain: 'peer',
-      status: 'enforced',
-      summary: 'Read configured peer routes and peer eligibility without changing them.',
-    }, {
-      id: 'peer.manage',
-      label: 'Peer manage',
-      domain: 'peer',
-      status: 'enforced',
-      summary: 'Create, remove, pair, and use daemon peer routes.',
-    }],
+    policies: accessFallbackPolicies(),
+    permissions: accessFallbackPermissions(),
     architecture: {
       unresolved: [
         'external identity provider and Sybil-resistance policy',
@@ -33314,28 +33503,7 @@ function accessOverviewModel() {
       state_path: '',
       managed_principals: 0,
       managed_grants: 0,
-      roles: [{
-        id: 'role:root',
-        label: 'Root',
-        status: 'enforced',
-        summary: 'Current owner/root dashboard authority.',
-        permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
-        source: 'builtin',
-      }, {
-        id: 'role:peer-profile',
-        label: 'Peer profile',
-        status: 'enforced',
-        summary: 'Daemon-to-daemon grants enforced by the approved peer identity profile.',
-        permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
-        source: 'builtin',
-      }, {
-        id: 'role:scoped-human',
-        label: 'Scoped human',
-        status: 'enforced',
-        summary: 'Minimal user/client IAM role for stable browser mTLS and Connect account request bindings.',
-        permissions: ['access.inspect'],
-        source: 'builtin',
-      }],
+      roles: accessFallbackIamRoles(),
       audit_events: [],
       capabilities: {
         state_file_supported: true,
@@ -33945,21 +34113,55 @@ function accessAuditGrantCards() {
   const overview = accessOverviewModel();
   const principalLabels = accessOverviewPrincipalLabelMap(overview);
   const targetLabels = accessOverviewTargetLabelMap(overview);
-  return accessOverviewArray(overview, 'grants').map(grant => ({
-    title: accessModelLabel(grant.role_label || grant.profile || grant.role, 'Grant'),
-    status: grant.status || 'active',
-    lines: [
-      ['Principal', principalLabels.get(accessModelLabel(grant.principal_id)) || accessModelLabel(grant.principal_id)],
-      ['Target', targetLabels.get(accessModelLabel(grant.target_id)) || accessModelLabel(grant.target_id)],
-      ['Kind', accessModelLabel(grant.kind_label || grant.kind)],
-      ['Policy', accessModelLabel(grant.policy_id)],
-      ['Transport', accessModelLabel(grant.transport_id)],
-      ['Enforced', grant.enforced === false ? 'No' : 'Yes'],
-      ['Reason', accessModelLabel(grant.reason)],
-      ['Why access exists', accessGrantWhy(grant)],
-      ['Grant id', accessModelLabel(grant.id)],
-    ],
-  }));
+  return accessOverviewArray(overview, 'grants').map(grant => {
+    const grantId = accessModelLabel(grant.id);
+    const status = accessModelLabel(grant.status, 'active');
+    const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
+    const lifecycleBusy = accessGrantLifecycleSubmitting.has(grantId);
+    const canManage = dashboardControlTransport?.lastStatus?.api_access_iam_update_grant_available !== false;
+    const actions = [];
+    if (localIamGrant && grantId) {
+      if (status !== 'active') {
+        actions.push({
+          label: lifecycleBusy ? 'Saving' : 'Activate',
+          primary: true,
+          disabled: lifecycleBusy || !canManage,
+          onClick: () => accessUpdateGrantLifecycle(grantId, { status: 'active' }),
+        });
+      }
+      if (status !== 'draft') {
+        actions.push({
+          label: lifecycleBusy ? 'Saving' : 'Draft',
+          disabled: lifecycleBusy || !canManage,
+          onClick: () => accessUpdateGrantLifecycle(grantId, { status: 'draft' }),
+        });
+      }
+      if (status !== 'revoked') {
+        actions.push({
+          label: lifecycleBusy ? 'Saving' : 'Revoke',
+          danger: true,
+          disabled: lifecycleBusy || !canManage,
+          onClick: () => accessConfirmRevokeGrant(grantId),
+        });
+      }
+    }
+    return {
+      title: accessModelLabel(grant.role_label || grant.profile || grant.role, 'Grant'),
+      status: grant.status || 'active',
+      lines: [
+        ['Principal', principalLabels.get(accessModelLabel(grant.principal_id)) || accessModelLabel(grant.principal_id)],
+        ['Target', targetLabels.get(accessModelLabel(grant.target_id)) || accessModelLabel(grant.target_id)],
+        ['Kind', accessModelLabel(grant.kind_label || grant.kind)],
+        ['Policy', accessModelLabel(grant.policy_id)],
+        ['Transport', accessModelLabel(grant.transport_id)],
+        ['Enforced', grant.enforced === false ? 'No' : 'Yes'],
+        ['Reason', accessModelLabel(grant.reason)],
+        ['Why access exists', accessGrantWhy(grant)],
+        ['Grant id', grantId],
+      ],
+      actions,
+    };
+  });
 }
 
 function accessCurrentUserClientCandidate() {
@@ -34006,6 +34208,28 @@ function accessSyncUserClientGrantFields(form) {
   const connectFields = form?.querySelectorAll('[data-access-kind-field="connect_account"]') || [];
   browserFields.forEach(node => { node.style.display = kind === 'browser_certificate' ? '' : 'none'; });
   connectFields.forEach(node => { node.style.display = kind === 'connect_account' ? '' : 'none'; });
+}
+
+function accessAssignableIamRoles(overview = accessOverviewModel()) {
+  const iam = accessIamModel(overview);
+  const roles = Array.isArray(iam.roles) ? iam.roles : [];
+  const filtered = roles.filter(role => {
+    const id = accessModelLabel(role?.id);
+    const status = accessModelLabel(role?.status, 'enforced');
+    if (!id || status === 'planned') return false;
+    if (id === 'role:peer-profile') return false;
+    return true;
+  });
+  if (filtered.length) return filtered;
+  return [{
+    id: 'role:scoped-human',
+    label: 'Scoped human',
+    status: 'enforced',
+  }, {
+    id: 'role:root',
+    label: 'Root',
+    status: 'enforced',
+  }];
 }
 
 function renderAccessUserClientGrantForm() {
@@ -34070,10 +34294,10 @@ function renderAccessUserClientGrantForm() {
     id: 'access-user-client-role',
     label: 'Role',
     type: 'select',
-    options: [
-      ['role:scoped-human', 'Scoped human'],
-      ['role:root', 'Root'],
-    ],
+    options: accessAssignableIamRoles(overview).map(role => [
+      accessModelLabel(role.id),
+      accessModelLabel(role.label, role.id),
+    ]),
   }, {
     id: 'access-user-client-status',
     label: 'Status',
@@ -34193,6 +34417,51 @@ async function accessSubmitUserClientGrant(event) {
     showControlToast?.('error', err?.message || 'Access grant save failed');
   } finally {
     accessUserClientGrantSubmitting = false;
+    renderAccessAdminSummaries();
+  }
+}
+
+async function accessConfirmRevokeGrant(grantId) {
+  const id = accessModelLabel(grantId);
+  if (!id) return;
+  const ok = await showDashboardConfirm({
+    title: 'Revoke access grant',
+    message: 'This immediately stops this user/client grant from authorizing new dashboard requests.',
+    warning: id,
+    confirmLabel: 'Revoke',
+    cancelLabel: 'Cancel',
+    danger: true,
+  });
+  if (!ok) return;
+  await accessUpdateGrantLifecycle(id, { status: 'revoked' });
+}
+
+async function accessUpdateGrantLifecycle(grantId, changes = {}) {
+  const id = accessModelLabel(grantId);
+  if (!id || accessGrantLifecycleSubmitting.has(id)) return;
+  const payload = {
+    grant_id: id,
+    ...changes,
+  };
+  accessGrantLifecycleSubmitting.add(id);
+  renderAccessAdminSummaries();
+  try {
+    const resp = await dashboardJsonFetch('api_access_iam_update_grant', payload, () => authedFetch('/api/access/iam/grants/update', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_iam_update_grant', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    if (data?.iam) {
+      dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };
+    }
+    await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+    showControlToast?.('success', 'Access grant updated');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Access grant update failed');
+  } finally {
+    accessGrantLifecycleSubmitting.delete(id);
     renderAccessAdminSummaries();
   }
 }
@@ -34323,11 +34592,12 @@ function accessPermissionMatrixCell(policy, permission) {
     if (permissionId === 'access.manage') return { text: 'No', state: 'no' };
     if (permissionId === 'access.inspect') return { text: 'Peer root', state: 'conditional' };
     if (permissionId === 'peer.inspect' || permissionId === 'peer.manage') return { text: 'Profile', state: 'conditional' };
-  }
-  if (policyId === 'policy:scoped-human') {
-    if (permissionId === 'access.inspect') return { text: 'Yes', state: 'yes' };
+    const peerPermissions = Array.isArray(policy.permissions) ? policy.permissions.map(accessModelLabel) : [];
+    if (peerPermissions.includes(permissionId)) return { text: 'Profile', state: 'conditional' };
     return { text: 'No', state: 'no' };
   }
+  const policyPermissions = Array.isArray(policy.permissions) ? policy.permissions.map(accessModelLabel) : [];
+  if (policyPermissions.includes(permissionId)) return { text: 'Yes', state: 'yes' };
   return { text: 'No', state: 'no' };
 }
 
@@ -45675,6 +45945,7 @@ class DashboardControlTransport {
       accessInspectAvailable: this.lastStatus?.access_inspect_available ?? null,
       accessManageAvailable: this.lastStatus?.access_manage_available ?? null,
       apiAccessIamUpsertUserClientGrantAvailable: this.lastStatus?.api_access_iam_upsert_user_client_grant_available ?? null,
+      apiAccessIamUpdateGrantAvailable: this.lastStatus?.api_access_iam_update_grant_available ?? null,
       peerInspectAvailable: this.lastStatus?.peer_inspect_available ?? null,
       peerManageAvailable: this.lastStatus?.peer_manage_available ?? null,
       apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,

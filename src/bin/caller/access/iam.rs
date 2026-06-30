@@ -138,6 +138,23 @@ pub struct UserClientGrantUpsertResult {
     pub created_grant: bool,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct IamGrantUpdateRequest {
+    pub grant_id: String,
+    #[serde(default)]
+    pub role_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct IamGrantUpdateResult {
+    pub principal: IamPrincipal,
+    pub grant: IamGrant,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum IamStateStatus {
     Missing,
@@ -462,9 +479,7 @@ pub fn upsert_user_client_grant(
         .and_then(trimmed_nonempty)
         .unwrap_or("role:scoped-human")
         .to_string();
-    if !state.roles.iter().any(|role| role.id == role_id) {
-        return Err(AccessError(format!("unknown IAM role {role_id}")));
-    }
+    validate_user_client_role(state, &role_id)?;
     let status = normalize_user_client_status(request.status.as_deref())?;
     let target_id = request
         .target_id
@@ -527,8 +542,11 @@ pub fn upsert_user_client_grant(
 
     let policy_id = policy_for_role(&role_id);
     let created_grant;
-    let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id) {
+    let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| {
+        grant.id == grant_id || (grant.principal_id == principal_id && grant.target_id == target_id)
+    }) {
         created_grant = false;
+        existing.id = grant_id;
         existing.principal_id = principal_id.clone();
         existing.target_id = target_id.clone();
         existing.role_id = role_id.clone();
@@ -580,6 +598,147 @@ pub fn upsert_user_client_grant(
         created_principal,
         created_grant,
     })
+}
+
+pub fn update_user_client_grant(
+    state: &mut LocalIamState,
+    request: IamGrantUpdateRequest,
+    actor: &AccessPrincipal,
+) -> AccessResult<IamGrantUpdateResult> {
+    for role in builtin_role_templates() {
+        if !state.roles.iter().any(|existing| existing.id == role.id) {
+            state.roles.push(role);
+        }
+    }
+
+    let grant_id = request.grant_id.as_str().trim().to_string();
+    if grant_id.is_empty() {
+        return Err(AccessError("grant_id is required".to_string()));
+    }
+    let grant_index = state
+        .grants
+        .iter()
+        .position(|grant| grant.id == grant_id)
+        .ok_or_else(|| AccessError(format!("IAM grant {grant_id} was not found")))?;
+    if state.grants[grant_index].source != "local_iam_state" {
+        return Err(AccessError(
+            "only local IAM user/client grants can be updated".to_string(),
+        ));
+    }
+    let principal_id = state.grants[grant_index].principal_id.clone();
+    let principal_index = state
+        .principals
+        .iter()
+        .position(|principal| principal.id == principal_id)
+        .ok_or_else(|| AccessError(format!("IAM principal {principal_id} was not found")))?;
+    if !matches!(
+        state.principals[principal_index].kind.as_str(),
+        "browser_certificate" | "connect_account" | "human_user" | ""
+    ) {
+        return Err(AccessError(
+            "only user/client principals can be updated through this API".to_string(),
+        ));
+    }
+
+    let now = now_unix_ms();
+    let role_id = request
+        .role_id
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(ToOwned::to_owned);
+    if let Some(role_id) = role_id.as_deref() {
+        validate_user_client_role(state, role_id)?;
+    }
+    let status = match request.status.as_deref() {
+        Some(_) => Some(normalize_user_client_status(request.status.as_deref())?),
+        None => None,
+    };
+    let reason = request
+        .reason
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(ToOwned::to_owned);
+
+    {
+        let grant = &mut state.grants[grant_index];
+        if let Some(role_id) = role_id {
+            grant.role_id = role_id.clone();
+            grant.policy_id = policy_for_role(&role_id);
+        } else if grant.policy_id.trim().is_empty() {
+            grant.policy_id = policy_for_role(if grant.role_id.trim().is_empty() {
+                "role:scoped-human"
+            } else {
+                grant.role_id.as_str()
+            });
+        }
+        if let Some(status) = status.as_ref() {
+            grant.status = status.clone();
+            grant.revoked_at_unix_ms = if status == "revoked" { Some(now) } else { None };
+        }
+        if let Some(reason) = reason.as_ref() {
+            grant.reason = reason.clone();
+        }
+    }
+
+    let principal_has_active_grant = state
+        .grants
+        .iter()
+        .any(|grant| grant.principal_id == principal_id && is_enforced_status(&grant.status));
+    {
+        let principal = &mut state.principals[principal_index];
+        principal.status = if principal_has_active_grant {
+            "active".to_string()
+        } else {
+            status.clone().unwrap_or_else(|| "draft".to_string())
+        };
+        if let Some(reason) = reason.as_ref() {
+            principal.notes = Some(reason.clone());
+        }
+    }
+
+    let grant = state.grants[grant_index].clone();
+    let principal = state.principals[principal_index].clone();
+    state.audit_events.push(IamAuditEvent {
+        id: format!("audit:{}:{}", now, state.audit_events.len() + 1),
+        at_unix_ms: Some(now),
+        actor_principal_id: actor.id.clone(),
+        action: "update_user_client_grant".to_string(),
+        target_id: grant.id.clone(),
+        summary: format!(
+            "Updated {} grant {} for {}",
+            if grant.status.is_empty() {
+                "draft"
+            } else {
+                grant.status.as_str()
+            },
+            if grant.role_id.is_empty() {
+                "role:scoped-human"
+            } else {
+                grant.role_id.as_str()
+            },
+            principal.label
+        ),
+    });
+
+    Ok(IamGrantUpdateResult { principal, grant })
+}
+
+fn validate_user_client_role(state: &LocalIamState, role_id: &str) -> AccessResult<()> {
+    let Some(role) = state.roles.iter().find(|role| role.id == role_id) else {
+        return Err(AccessError(format!("unknown IAM role {role_id}")));
+    };
+    if role.id == "role:peer-profile" {
+        return Err(AccessError(
+            "peer-profile is a daemon-to-daemon role and cannot be assigned to a user/client"
+                .to_string(),
+        ));
+    }
+    if role.status == "planned" {
+        return Err(AccessError(format!(
+            "IAM role {role_id} is planned but not enforced"
+        )));
+    }
+    Ok(())
 }
 
 fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessResult<String> {
@@ -735,8 +894,15 @@ fn build_user_client_binding(
 fn policy_for_role(role_id: &str) -> String {
     match role_id {
         "role:root" => "policy:root".to_string(),
-        "role:directory-files" => "policy:directory-files".to_string(),
+        "role:peer-profile" => "policy:peer-profile".to_string(),
         "role:scoped-human" => "policy:scoped-human".to_string(),
+        "role:observer" => "policy:observer".to_string(),
+        "role:session-reader" => "policy:session-reader".to_string(),
+        "role:terminal" => "policy:terminal".to_string(),
+        "role:files-read" => "policy:files-read".to_string(),
+        "role:files-write" => "policy:files-write".to_string(),
+        "role:operator" => "policy:operator".to_string(),
+        "role:directory-files" => "policy:directory-files".to_string(),
         other => format!("policy:{}", slug_component(other)),
     }
 }
@@ -820,6 +986,111 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser mTLS or Connect account identities."
         }
     })
+}
+
+pub fn policy_overview_values(state: &LocalIamState) -> Vec<Value> {
+    let mut values: Vec<Value> = state
+        .roles
+        .iter()
+        .map(|role| {
+            json!({
+                "id": policy_for_role(&role.id),
+                "label": role.label.clone(),
+                "status": role.status.clone(),
+                "summary": role.summary.clone(),
+                "role_id": role.id.clone(),
+                "permissions": role.permissions.clone(),
+                "source": role.source.clone(),
+                "assignment": if role.id == "role:peer-profile" {
+                    "daemon_peer_only"
+                } else if role.status == "planned" {
+                    "planned"
+                } else {
+                    "user_client"
+                }
+            })
+        })
+        .collect();
+    values.push(json!({
+        "id": "policy:public-share",
+        "label": "Public share",
+        "status": "planned",
+        "summary": "Future explicit grants for publishing selected stats or artifacts.",
+        "permissions": [],
+        "source": "builtin",
+        "assignment": "planned"
+    }));
+    values
+}
+
+pub fn permission_catalog_values() -> Vec<Value> {
+    root_permission_ids()
+        .into_iter()
+        .map(|id| {
+            let label = permission_label(&id);
+            let domain = id.split('.').next().unwrap_or("access").to_string();
+            let summary = permission_summary(&id);
+            json!({
+                "id": id,
+                "label": label,
+                "domain": domain,
+                "status": "enforced",
+                "summary": summary,
+            })
+        })
+        .collect()
+}
+
+fn permission_label(id: &str) -> &'static str {
+    match id {
+        "presence.read" => "Presence read",
+        "stats.read" => "Stats read",
+        "display.view" => "Display view",
+        "display.input" => "Display input",
+        "message.send" => "Message send",
+        "task.run" => "Task run",
+        "approval.resolve" => "Approval resolve",
+        "access.inspect" => "Access inspect",
+        "access.manage" => "Access manage",
+        "peer.inspect" => "Peer inspect",
+        "peer.manage" => "Peer manage",
+        "session.inspect" => "Session inspect",
+        "session.manage" => "Session manage",
+        "terminal.use" => "Terminal use",
+        "settings.manage" => "Settings manage",
+        "runtime.control" => "Runtime control",
+        "filesystem.read" => "Filesystem read",
+        "filesystem.write" => "Filesystem write",
+        _ => "Permission",
+    }
+}
+
+fn permission_summary(id: &str) -> &'static str {
+    match id {
+        "presence.read" => "Read live presence and basic daemon availability.",
+        "stats.read" => "Read daemon health, usage, and status summaries.",
+        "display.view" => "View display streams without injecting input.",
+        "display.input" => "Inject keyboard, pointer, or display-control input.",
+        "message.send" => "Send user messages or dashboard actions into a session.",
+        "task.run" => "Start or delegate agent tasks.",
+        "approval.resolve" => "Approve or deny pending supervised actions.",
+        "access.inspect" => {
+            "Read targets, principals, grants, policies, transports, and access architecture notes."
+        }
+        "access.manage" => {
+            "Approve, revoke, or change access grants. Reserved for root sessions unless explicitly delegated later."
+        }
+        "peer.inspect" => "Read configured peer routes and peer eligibility.",
+        "peer.manage" => "Create, remove, pair, and use daemon peer routes.",
+        "session.inspect" => "Read session lists, logs, reports, recordings, and replay metadata.",
+        "session.manage" => "Delete, rewind, prune, upload to, or otherwise mutate sessions.",
+        "terminal.use" => "Open and operate dashboard shell sessions.",
+        "settings.manage" => "Read or write daemon settings and API keys.",
+        "runtime.control" => "Use runtime-control surfaces such as TUI, media, and recording controls.",
+        "filesystem.read" => "Stat, list, and read files through dashboard APIs.",
+        "filesystem.write" => "Create directories or write uploaded file content.",
+        _ => "Operation permission.",
+    }
 }
 
 pub fn evaluate_principal_operation(
@@ -1080,6 +1351,104 @@ fn builtin_role_templates() -> Vec<IamRole> {
             source: "builtin".to_string(),
         },
         IamRole {
+            id: "role:observer".to_string(),
+            label: "Observer".to_string(),
+            status: "enforced".to_string(),
+            summary:
+                "Read-only dashboard visibility without files, terminal, task control, or settings."
+                    .to_string(),
+            permissions: vec![
+                "presence.read".to_string(),
+                "stats.read".to_string(),
+                "display.view".to_string(),
+                "access.inspect".to_string(),
+                "peer.inspect".to_string(),
+                "session.inspect".to_string(),
+            ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
+            id: "role:session-reader".to_string(),
+            label: "Session reader".to_string(),
+            status: "enforced".to_string(),
+            summary: "Read sessions, logs, reports, and status without controlling the daemon."
+                .to_string(),
+            permissions: vec![
+                "presence.read".to_string(),
+                "stats.read".to_string(),
+                "access.inspect".to_string(),
+                "session.inspect".to_string(),
+            ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
+            id: "role:terminal".to_string(),
+            label: "Terminal".to_string(),
+            status: "enforced".to_string(),
+            summary: "Open and use shell sessions without broader dashboard mutation rights."
+                .to_string(),
+            permissions: vec![
+                "presence.read".to_string(),
+                "stats.read".to_string(),
+                "access.inspect".to_string(),
+                "session.inspect".to_string(),
+                "terminal.use".to_string(),
+            ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
+            id: "role:files-read".to_string(),
+            label: "Files read".to_string(),
+            status: "enforced".to_string(),
+            summary: "Browse metadata and download files without writing to disk.".to_string(),
+            permissions: vec![
+                "presence.read".to_string(),
+                "stats.read".to_string(),
+                "access.inspect".to_string(),
+                "filesystem.read".to_string(),
+            ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
+            id: "role:files-write".to_string(),
+            label: "Files write".to_string(),
+            status: "enforced".to_string(),
+            summary: "Read files and upload/create file content through the dashboard.".to_string(),
+            permissions: vec![
+                "presence.read".to_string(),
+                "stats.read".to_string(),
+                "access.inspect".to_string(),
+                "filesystem.read".to_string(),
+                "filesystem.write".to_string(),
+            ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
+            id: "role:operator".to_string(),
+            label: "Operator".to_string(),
+            status: "enforced".to_string(),
+            summary:
+                "Operate sessions, display, shell, files, and approvals without access/settings administration."
+                    .to_string(),
+            permissions: vec![
+                "presence.read".to_string(),
+                "stats.read".to_string(),
+                "display.view".to_string(),
+                "display.input".to_string(),
+                "message.send".to_string(),
+                "task.run".to_string(),
+                "approval.resolve".to_string(),
+                "access.inspect".to_string(),
+                "peer.inspect".to_string(),
+                "session.inspect".to_string(),
+                "session.manage".to_string(),
+                "terminal.use".to_string(),
+                "filesystem.read".to_string(),
+                "filesystem.write".to_string(),
+            ],
+            source: "builtin".to_string(),
+        },
+        IamRole {
             id: "role:directory-files".to_string(),
             label: "Directory scoped files".to_string(),
             status: "planned".to_string(),
@@ -1164,6 +1533,21 @@ pub fn principal_for_browser_mtls_cert(
     )
 }
 
+pub fn principal_for_browser_mtls_cert_any_status(
+    state: &LocalIamState,
+    fingerprint: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let fingerprint = normalize_fingerprint(fingerprint);
+    principal_for_authn_any_status(
+        state,
+        "browser_mtls_cert",
+        "fingerprint",
+        &fingerprint,
+        transport,
+    )
+}
+
 pub fn principal_for_connect_account(
     state: &LocalIamState,
     user_id: &str,
@@ -1181,6 +1565,33 @@ pub fn principal_for_connect_account(
     .or_else(|| {
         account_name.and_then(|name| {
             principal_for_authn(state, "connect_account", "account_name", name, transport)
+        })
+    })
+}
+
+pub fn principal_for_connect_account_any_status(
+    state: &LocalIamState,
+    user_id: &str,
+    account_name: Option<&str>,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let transport = transport.into();
+    principal_for_authn_any_status(
+        state,
+        "connect_account",
+        "user_id",
+        user_id,
+        transport.clone(),
+    )
+    .or_else(|| {
+        account_name.and_then(|name| {
+            principal_for_authn_any_status(
+                state,
+                "connect_account",
+                "account_name",
+                name,
+                transport,
+            )
         })
     })
 }
@@ -1207,6 +1618,38 @@ fn principal_for_authn(
         .grants
         .iter()
         .find(|grant| grant.principal_id == principal.id && is_enforced_status(&grant.status))?;
+    Some(AccessPrincipal::local_user_client(
+        principal, grant, transport,
+    ))
+}
+
+fn principal_for_authn_any_status(
+    state: &LocalIamState,
+    authn_kind: &str,
+    key: &str,
+    value: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let value = value.trim();
+    if value.is_empty() {
+        return None;
+    }
+    let principal = state.principals.iter().find(|principal| {
+        principal.authn.iter().any(|authn| {
+            authn.get("kind").and_then(Value::as_str) == Some(authn_kind)
+                && authn.get(key).and_then(Value::as_str) == Some(value)
+        })
+    })?;
+    let grant = state
+        .grants
+        .iter()
+        .find(|grant| grant.principal_id == principal.id && is_enforced_status(&grant.status))
+        .or_else(|| {
+            state
+                .grants
+                .iter()
+                .find(|grant| grant.principal_id == principal.id)
+        })?;
     Some(AccessPrincipal::local_user_client(
         principal, grant, transport,
     ))
@@ -1464,6 +1907,126 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    #[test]
+    fn scoped_human_roles_are_enforced_by_permission_id() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                label: Some("Terminal browser".to_string()),
+                fingerprint: Some("CA:FE".to_string()),
+                role_id: Some("role:terminal".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert_eq!(result.grant.role_id, "role:terminal");
+        let principal = principal_for_browser_mtls_cert(&state, "cafe", "https").unwrap();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::FilesystemWrite,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn upsert_same_user_client_target_replaces_role_grant() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("FE:ED".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("FE:ED".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert!(!result.created_grant);
+        assert_eq!(state.grants.len(), 1);
+        assert_eq!(state.grants[0].role_id, "role:operator");
+        assert_eq!(state.grants[0].policy_id, "policy:operator");
+    }
+
+    #[test]
+    fn update_user_client_grant_revokes_binding() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("DE:AD".to_string()),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let updated = update_user_client_grant(
+            &mut state,
+            IamGrantUpdateRequest {
+                grant_id: result.grant.id,
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert_eq!(updated.grant.status, "revoked");
+        assert!(updated.grant.revoked_at_unix_ms.is_some());
+        assert!(principal_for_browser_mtls_cert(&state, "dead", "https").is_none());
+    }
+
+    #[test]
+    fn user_client_grants_reject_peer_profile_role() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let err = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("12:34".to_string()),
+                role_id: Some("role:peer-profile".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+
+        assert!(err.to_string().contains("daemon-to-daemon role"));
     }
 
     #[test]

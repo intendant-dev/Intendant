@@ -610,11 +610,21 @@ and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
 sessions, peer daemon profiles, and active scoped user/client grants pass
 through the IAM operation evaluator. The daemon can currently bind scoped
 user/client grants to browser mTLS certificate fingerprints and hosted Connect
-account metadata. Matching active records are enforced; unbound owner browser
-mTLS and Connect dashboard sessions keep the existing root-compatible fallback.
-Root users can create or update these records through the Access UI,
-`POST /api/access/iam/user-client-grants`, or dashboard-control
-`api_access_iam_upsert_user_client_grant`.
+account metadata. Matching active records are enforced by role. Unbound owner
+browser mTLS and Connect dashboard sessions keep the existing root-compatible
+fallback, but a known local IAM record in `draft` or `revoked` status denies
+instead of falling back to root. Root users can create these records through the
+Access UI, `POST /api/access/iam/user-client-grants`, or dashboard-control
+`api_access_iam_upsert_user_client_grant`; existing records can be activated,
+drafted, revoked, or role-changed through `POST /api/access/iam/grants/update`
+or dashboard-control `api_access_iam_update_grant`.
+
+The enforced built-in user/client roles are `role:scoped-human`,
+`role:observer`, `role:session-reader`, `role:terminal`, `role:files-read`,
+`role:files-write`, `role:operator`, and `role:root`. `role:peer-profile` is
+visible in the same Access overview so daemon peer grants and human grants can
+be compared, but it is daemon-to-daemon only and cannot be assigned to a
+browser certificate or Connect account.
 
 ### `mcp_servers`
 
