@@ -32852,31 +32852,49 @@ function renderAccessTargetsSurface() {
 }
 
 function accessGrantCards() {
+  const overview = accessOverviewModel();
+  const grants = Array.isArray(overview.grants) ? overview.grants : [];
+  const hasBackendOverview = Boolean(dashboardAccessOverview);
+  const activeGrantCount = list => list.filter(grant =>
+    !/planned|offline|revoked|disabled/.test(String(grant.status || 'active'))
+  ).length;
+  const userClientGrants = grants.filter(grant => String(grant.kind || '') === 'user_client_root');
+  const inboundPeerGrants = grants.filter(grant => String(grant.kind || '') === 'inbound_daemon_peer_profile');
+  const outboundPeerGrants = grants.filter(grant => String(grant.kind || '') === 'daemon_peer_profile');
   const transportLabel = dashboardConnectModeEnabled()
-    ? 'Connect owner session'
+    ? 'Hosted transport owner session'
     : (location.protocol === 'https:' ? 'Trusted browser certificate' : 'Local dashboard session');
   const cards = [{
     title: 'Current browser access',
-    kind: 'Root',
+    kind: userClientGrants.length ? 'Root' : 'Unknown',
     detail: `${transportLabel} gives this browser root dashboard access to this daemon. This is user/client access, not peer federation.`,
     actions: [{ label: 'Diagnostics', onClick: () => routeTo('access', 'diagnostics') }],
   }];
 
-  const inboundCards = Array.from(document.querySelectorAll('#daemon-peer-identities-list .daemon-identity-card'));
-  const approved = inboundCards.filter(card => card.classList.contains('approved')).length;
+  const inboundCards = hasBackendOverview
+    ? []
+    : Array.from(document.querySelectorAll('#daemon-peer-identities-list .daemon-identity-card'));
+  const approved = hasBackendOverview
+    ? activeGrantCount(inboundPeerGrants)
+    : inboundCards.filter(card => card.classList.contains('approved')).length;
+  const revoked = hasBackendOverview
+    ? inboundPeerGrants.filter(grant => String(grant.status || '') === 'revoked').length
+    : inboundCards.filter(card => card.classList.contains('revoked')).length;
   cards.push({
     title: 'Inbound peer access',
-    kind: approved > 0 ? `${approved} approved` : 'None',
+    kind: approved > 0 ? `${approved} active` : 'None',
     detail: approved > 0
-      ? `${approved} daemon-to-daemon mTLS grant${approved === 1 ? '' : 's'} can access this daemon with peer profiles.`
-      : 'No peer identities currently have approved inbound access.',
+      ? `${approved} daemon-to-daemon mTLS grant${approved === 1 ? '' : 's'} can access this daemon with peer profiles.${revoked ? ` ${revoked} revoked grant${revoked === 1 ? '' : 's'} retained for audit.` : ''}`
+      : (revoked ? `${revoked} revoked inbound grant${revoked === 1 ? '' : 's'} retained for audit; none are active.` : 'No peer identities currently have approved inbound access.'),
     actions: [{ label: 'Manage', primary: true, onClick: () => routeTo('access', 'grants') }],
   });
 
+  const outboundActive = activeGrantCount(outboundPeerGrants);
+  const outboundTotal = hasBackendOverview ? outboundPeerGrants.length : daemons.length;
   cards.push({
     title: 'Outbound peer routes',
-    kind: daemons.length ? `${daemons.length} target${daemons.length === 1 ? '' : 's'}` : 'None',
-    detail: daemons.length
+    kind: outboundTotal ? `${outboundActive}/${outboundTotal} active` : 'None',
+    detail: outboundTotal
       ? 'This daemon can reach configured peer targets through daemon-to-daemon grants; this is separate from browser root access.'
       : 'No peer targets are configured yet.',
     actions: [{ label: 'Add', onClick: () => routeTo('access', 'invitations') }],

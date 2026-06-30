@@ -23436,6 +23436,27 @@ pub(crate) fn access_overview_response_value(
     agent_card: &serde_json::Value,
     registry: Option<&crate::peer::PeerRegistry>,
 ) -> serde_json::Value {
+    let inbound_peer_identities = access_overview_inbound_peer_identities();
+    access_overview_response_value_with_identities(agent_card, registry, &inbound_peer_identities)
+}
+
+fn access_overview_inbound_peer_identities(
+) -> Vec<crate::peer::access_policy::PeerIdentityRecord> {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    match crate::peer::access_policy::list_identities(&cert_dir) {
+        Ok(records) => records,
+        Err(e) => {
+            eprintln!("intendant: failed to list inbound peer identities for access overview: {e}");
+            Vec::new()
+        }
+    }
+}
+
+fn access_overview_response_value_with_identities(
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+    inbound_peer_identities: &[crate::peer::access_policy::PeerIdentityRecord],
+) -> serde_json::Value {
     let targets_value = dashboard_targets_response_value(agent_card, registry);
     let targets = targets_value
         .get("targets")
@@ -23557,6 +23578,64 @@ pub(crate) fn access_overview_response_value(
             "status": if connected { "connected" } else { "offline" },
             "implementation": "daemon_mutual_tls_plus_optional_browser_datachannel",
             "target_id": target_id
+        }));
+    }
+
+    for identity in inbound_peer_identities {
+        let fingerprint = identity.fingerprint.trim();
+        if fingerprint.is_empty() {
+            continue;
+        }
+        let status = match identity.status {
+            crate::peer::access_policy::PeerIdentityStatus::Approved => "active",
+            crate::peer::access_policy::PeerIdentityStatus::Revoked => "revoked",
+        };
+        let principal_id = format!("principal:inbound-peer-daemon:{fingerprint}");
+        let grant_id = format!("grant:inbound-peer:{fingerprint}:{}", identity.profile);
+        let transport_id = format!("transport:inbound-peer-mtls:{fingerprint}");
+        principals.push(serde_json::json!({
+            "id": principal_id.clone(),
+            "kind": "peer_daemon",
+            "kind_label": "Peer daemon",
+            "label": identity.label.clone(),
+            "source": "peer_access_identity",
+            "target_id": local_target_id.clone(),
+            "local": false,
+            "fingerprint": fingerprint,
+            "card_url": identity.card_url.clone(),
+            "request_id": identity.request_id.clone(),
+            "account": serde_json::Value::Null,
+            "organization": serde_json::Value::Null,
+            "authn": [{
+                "kind": "daemon_mutual_tls",
+                "label": "Daemon mTLS identity"
+            }]
+        }));
+        grants.push(serde_json::json!({
+            "id": grant_id,
+            "principal_id": principal_id,
+            "target_id": local_target_id.clone(),
+            "kind": "inbound_daemon_peer_profile",
+            "kind_label": "Inbound daemon peer profile",
+            "policy_id": "policy:peer-profile",
+            "role": "peer_profile",
+            "role_label": "Peer profile",
+            "profile": identity.profile.clone(),
+            "transport_id": transport_id.clone(),
+            "source": "peer_access_identity",
+            "status": status,
+            "created_at_unix": identity.created_at_unix,
+            "revoked_at_unix": identity.revoked_at_unix
+        }));
+        transports.push(serde_json::json!({
+            "id": transport_id,
+            "kind": "inbound_peer_mtls",
+            "kind_label": "Inbound peer mTLS",
+            "label": identity.label.clone(),
+            "status": status,
+            "implementation": "daemon_mutual_tls_inbound",
+            "target_id": local_target_id.clone(),
+            "fingerprint": fingerprint
         }));
     }
 
@@ -35736,6 +35815,59 @@ mod tests {
         );
 
         handle.abort();
+    }
+
+    #[test]
+    fn test_access_overview_includes_inbound_peer_identity_grants() {
+        let cert_dir = tempfile::TempDir::new().unwrap();
+        let fp = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        crate::peer::access_policy::write_approved_identity(
+            cert_dir.path(),
+            fp,
+            "peer-c",
+            "peer-operator",
+            Some("https://peer-c/.well-known/agent-card.json"),
+            Some("req-c"),
+        )
+        .unwrap();
+        let identities = crate::peer::access_policy::list_identities(cert_dir.path()).unwrap();
+        let agent_card = serde_json::json!({
+            "id": "local-daemon",
+            "label": "Local daemon",
+            "capabilities": [],
+        });
+        let payload =
+            access_overview_response_value_with_identities(&agent_card, None, &identities);
+        let expected_principal_id = format!("principal:inbound-peer-daemon:{fp}");
+
+        let principals = payload["principals"].as_array().expect("principals");
+        assert!(
+            principals
+                .iter()
+                .any(|principal| principal["id"].as_str() == Some(expected_principal_id.as_str())
+                    && principal["source"].as_str() == Some("peer_access_identity")
+                    && principal["label"].as_str() == Some("peer-c")),
+            "inbound peer identity principal should be present"
+        );
+        let grants = payload["grants"].as_array().expect("grants");
+        assert!(
+            grants
+                .iter()
+                .any(|grant| grant["kind"].as_str() == Some("inbound_daemon_peer_profile")
+                    && grant["target_id"].as_str() == Some("local-daemon")
+                    && grant["profile"].as_str() == Some("peer-operator")
+                    && grant["status"].as_str() == Some("active")),
+            "approved inbound peer identity should become an active local peer-profile grant"
+        );
+        let transports = payload["transports"].as_array().expect("transports");
+        assert!(
+            transports
+                .iter()
+                .any(|transport| transport["kind"].as_str() == Some("inbound_peer_mtls")
+                    && transport["fingerprint"].as_str() == Some(fp)
+                    && transport["status"].as_str() == Some("active")),
+            "inbound peer mTLS transport should be visible"
+        );
     }
 
     /// End-to-end exercise of the static-asset arms through a real

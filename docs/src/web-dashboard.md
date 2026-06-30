@@ -308,7 +308,9 @@ and peer federation:
   principal, an organization group, or a peer daemon.
 - A **grant** connects one principal to one target with a role and status. The
   current browser has a root user/client grant to the local daemon. A peer route
-  has a daemon peer-profile grant.
+  has a daemon peer-profile grant. An approved inbound peer identity appears as
+  a peer-daemon principal with a peer-profile grant to this daemon; revoked
+  identities remain visible as revoked grants for audit clarity.
 - A **policy** defines the shape of authority behind a grant. `root` and
   `peer-profile` are enforced today. Scoped human IAM, directory-scoped file
   access, and public shares are design targets, not hidden enforcement.
