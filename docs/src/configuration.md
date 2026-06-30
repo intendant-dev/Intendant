@@ -606,11 +606,11 @@ Schema version 1 contains:
 | `audit_events` | Local IAM audit metadata |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
-and exposes the raw state through `GET /api/access/iam/state`. Current local IAM
-records are inspection/model data only: scoped user/client grants are marked
-`enforced: false` until browser mTLS or Connect requests can be bound to stable
-human/device principals. Peer profiles and owner/root access keep their existing
-enforcement paths.
+and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
+sessions and peer daemon profiles pass through the IAM operation evaluator, but
+current local IAM records are still inspection/model data only: scoped
+user/client grants are marked `enforced: false` until browser mTLS or Connect
+requests can be bound to stable human/device principals.
 
 ### `mcp_servers`
 

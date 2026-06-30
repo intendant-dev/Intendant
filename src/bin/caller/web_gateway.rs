@@ -10348,20 +10348,21 @@ pub(crate) fn inspect_worktree_inventory_response(
     home: &Path,
     body_text: &str,
 ) -> (&'static str, String) {
-    let request =
-        match serde_json::from_str::<crate::worktree_inventory::WorktreeInspectRequest>(body_text) {
-            Ok(request) => request,
-            Err(e) => {
-                return (
-                    "400 Bad Request",
-                    serde_json::json!({
-                        "ok": false,
-                        "error": format!("invalid worktree inspect request: {e}")
-                    })
-                    .to_string(),
-                );
-            }
-        };
+    let request = match serde_json::from_str::<crate::worktree_inventory::WorktreeInspectRequest>(
+        body_text,
+    ) {
+        Ok(request) => request,
+        Err(e) => {
+            return (
+                "400 Bad Request",
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid worktree inspect request: {e}")
+                })
+                .to_string(),
+            );
+        }
+    };
     let hints = worktree_session_hints_from_home(home);
     match crate::worktree_inventory::inspect_worktree(request, &hints) {
         Ok(response) => (
@@ -23516,8 +23517,8 @@ pub(crate) fn access_overview_response_value(
     )
 }
 
-fn access_overview_inbound_peer_identities(
-) -> Vec<crate::peer::access_policy::PeerIdentityRecord> {
+fn access_overview_inbound_peer_identities() -> Vec<crate::peer::access_policy::PeerIdentityRecord>
+{
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     match crate::peer::access_policy::list_identities(&cert_dir) {
         Ok(records) => records,
@@ -35991,8 +35992,12 @@ mod tests {
             false
         );
         assert_eq!(
+            payload["iam"]["capabilities"]["enforce_root_and_peer_grants"],
+            true
+        );
+        assert_eq!(
             payload["iam"]["enforcement"]["principal_binding"],
-            "root_session_only"
+            "root_session_and_peer_daemon"
         );
 
         handle.abort();
@@ -36023,30 +36028,27 @@ mod tests {
 
         let principals = payload["principals"].as_array().expect("principals");
         assert!(
-            principals
-                .iter()
-                .any(|principal| principal["id"].as_str() == Some(expected_principal_id.as_str())
-                    && principal["source"].as_str() == Some("peer_access_identity")
-                    && principal["label"].as_str() == Some("peer-c")),
+            principals.iter().any(|principal| principal["id"].as_str()
+                == Some(expected_principal_id.as_str())
+                && principal["source"].as_str() == Some("peer_access_identity")
+                && principal["label"].as_str() == Some("peer-c")),
             "inbound peer identity principal should be present"
         );
         let grants = payload["grants"].as_array().expect("grants");
         assert!(
-            grants
-                .iter()
-                .any(|grant| grant["kind"].as_str() == Some("inbound_daemon_peer_profile")
-                    && grant["target_id"].as_str() == Some("local-daemon")
-                    && grant["profile"].as_str() == Some("peer-operator")
-                    && grant["status"].as_str() == Some("active")),
+            grants.iter().any(|grant| grant["kind"].as_str()
+                == Some("inbound_daemon_peer_profile")
+                && grant["target_id"].as_str() == Some("local-daemon")
+                && grant["profile"].as_str() == Some("peer-operator")
+                && grant["status"].as_str() == Some("active")),
             "approved inbound peer identity should become an active local peer-profile grant"
         );
         let transports = payload["transports"].as_array().expect("transports");
         assert!(
-            transports
-                .iter()
-                .any(|transport| transport["kind"].as_str() == Some("inbound_peer_mtls")
-                    && transport["fingerprint"].as_str() == Some(fp)
-                    && transport["status"].as_str() == Some("active")),
+            transports.iter().any(|transport| transport["kind"].as_str()
+                == Some("inbound_peer_mtls")
+                && transport["fingerprint"].as_str() == Some(fp)
+                && transport["status"].as_str() == Some("active")),
             "inbound peer mTLS transport should be visible"
         );
     }

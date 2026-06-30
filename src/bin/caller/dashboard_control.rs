@@ -223,6 +223,26 @@ impl DashboardControlGrant {
         }
     }
 
+    fn access_principal(&self) -> crate::access::iam::AccessPrincipal {
+        match self {
+            Self::TrustedLocal => crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "dashboard-control",
+                "webrtc-datachannel",
+            ),
+            Self::Peer {
+                fingerprint,
+                label,
+                profile,
+                ..
+            } => crate::access::iam::AccessPrincipal::peer_daemon(
+                fingerprint.clone(),
+                label.clone(),
+                profile.clone(),
+                "peer-dashboard-control",
+            ),
+        }
+    }
+
     fn wire_kind(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "trusted-local",
@@ -738,9 +758,7 @@ impl DashboardControlPeer {
             tcp_advertised = Some(advertised);
             let candidate = tcp_host_candidate_init(advertised);
             if let Err(e) = rtc.add_local_candidate(candidate) {
-                eprintln!(
-                    "[dashboard/control] failed to add TCP host candidate {advertised}: {e}"
-                );
+                eprintln!("[dashboard/control] failed to add TCP host candidate {advertised}: {e}");
             } else {
                 eprintln!(
                     "[dashboard/control] ICE-TCP enabled on {advertised} for ufrag {local_ufrag}"
@@ -1413,7 +1431,8 @@ async fn drain_control_outputs<I: rtc::interceptor::Interceptor>(
             if t.transport.local_addr.is_ipv4() != t.transport.peer_addr.is_ipv4() {
                 continue;
             }
-            if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback() {
+            if t.transport.local_addr.ip().is_loopback() != t.transport.peer_addr.ip().is_loopback()
+            {
                 continue;
             }
         }
@@ -1883,12 +1902,15 @@ fn runtime_allows_operation(
     runtime: &ControlRuntime,
     op: crate::peer::access_policy::PeerOperation,
 ) -> bool {
-    match &runtime.grant {
-        DashboardControlGrant::TrustedLocal => true,
-        DashboardControlGrant::Peer { profile, .. } => {
-            crate::peer::access_policy::profile_allows_operation(profile, op)
-        }
-    }
+    runtime_operation_decision(runtime, op).allowed
+}
+
+fn runtime_operation_decision(
+    runtime: &ControlRuntime,
+    op: crate::peer::access_policy::PeerOperation,
+) -> crate::access::iam::AccessDecision {
+    let principal = runtime.grant.access_principal();
+    crate::access::iam::evaluate_principal_operation(&principal, op)
 }
 
 fn dashboard_control_frame_operation(t: &str) -> Option<crate::peer::access_policy::PeerOperation> {
@@ -1965,7 +1987,10 @@ fn dashboard_control_method_operation(
         | "api_session_control_msg"
         | "api_worktrees_scan"
         | "api_worktrees_remove" => Some(PeerOperation::SessionManage),
-        "api_transfer_jobs" | "api_transfer_download_read" | "api_fs_stat" | "api_fs_list"
+        "api_transfer_jobs"
+        | "api_transfer_download_read"
+        | "api_fs_stat"
+        | "api_fs_list"
         | "api_fs_read" => Some(PeerOperation::FilesystemRead),
         "api_transfer_job_create"
         | "api_transfer_job_delete"
@@ -1981,10 +2006,7 @@ fn dashboard_control_method_operation(
         "api_control_msg" | "api_dashboard_action_msg" | "api_mcp_tool_call" => {
             Some(PeerOperation::Message)
         }
-        "api_settings"
-        | "api_settings_save"
-        | "api_key_status"
-        | "api_api_keys_save"
+        "api_settings" | "api_settings_save" | "api_key_status" | "api_api_keys_save"
         | "api_project_root" => Some(PeerOperation::Settings),
         "api_voice_session"
         | "api_presence_video_frame"
@@ -2040,12 +2062,9 @@ fn authorize_dashboard_control_method(
     let Some(op) = dashboard_control_method_operation(method) else {
         return Ok(());
     };
-    if !runtime_allows_operation(runtime, op) {
-        let profile = runtime.grant.profile().unwrap_or("trusted-local");
-        return Err(format!(
-            "dashboard-control method {method} is not allowed for profile {profile}"
-        ));
-    }
+    runtime_operation_decision(runtime, op)
+        .ensure_allowed()
+        .map_err(|reason| format!("dashboard-control method {method} is not allowed: {reason}"))?;
     authorize_dashboard_control_filesystem(runtime, op, params)
 }
 
@@ -2056,14 +2075,9 @@ fn authorize_dashboard_control_frame(
     let Some(op) = dashboard_control_frame_operation(frame_type) else {
         return Ok(());
     };
-    if runtime_allows_operation(runtime, op) {
-        Ok(())
-    } else {
-        let profile = runtime.grant.profile().unwrap_or("trusted-local");
-        Err(format!(
-            "dashboard-control frame {frame_type} is not allowed for profile {profile}"
-        ))
-    }
+    runtime_operation_decision(runtime, op)
+        .ensure_allowed()
+        .map_err(|reason| format!("dashboard-control frame {frame_type} is not allowed: {reason}"))
 }
 
 fn control_frame_response(
@@ -2145,8 +2159,7 @@ fn control_frame_response(
         "request" => {
             let method = parsed.get("method").and_then(|v| v.as_str()).unwrap_or("");
             let params = parsed.get("params").cloned();
-            if let Err(error) =
-                authorize_dashboard_control_method(runtime, method, params.as_ref())
+            if let Err(error) = authorize_dashboard_control_method(runtime, method, params.as_ref())
             {
                 return Some(dashboard_control_error_response(id, error));
             }
@@ -3754,6 +3767,20 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     if let Some(profile) = runtime.grant.profile() {
         result.insert("grant_profile".to_string(), serde_json::json!(profile));
     }
+    let access_principal = runtime.grant.access_principal();
+    result.insert("access_principal".to_string(), access_principal.as_value());
+    result.insert(
+        "iam_enforcement".to_string(),
+        serde_json::json!({
+            "operation_evaluator": true,
+            "principal_kind": access_principal.kind,
+            "principal_binding": match runtime.grant {
+                DashboardControlGrant::TrustedLocal => "root_session",
+                DashboardControlGrant::Peer { .. } => "peer_daemon",
+            },
+            "user_client_grants": false
+        }),
+    );
 
     let peer_registry_available = runtime.peer_registry.is_some();
     let presence_read = runtime_allows_operation(
@@ -3778,10 +3805,14 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
     );
     let terminal =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Terminal);
-    let display_view =
-        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::DisplayView);
-    let display_input =
-        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::DisplayInput);
+    let display_view = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::DisplayView,
+    );
+    let display_input = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::DisplayInput,
+    );
     let settings =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Settings);
     let runtime_control = runtime_allows_operation(
@@ -3800,8 +3831,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         runtime,
         crate::peer::access_policy::PeerOperation::PeerInspect,
     );
-    let peer_manage =
-        runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::PeerManage);
+    let peer_manage = runtime_allows_operation(
+        runtime,
+        crate::peer::access_policy::PeerOperation::PeerManage,
+    );
     let message =
         runtime_allows_operation(runtime, crate::peer::access_policy::PeerOperation::Message);
     let capabilities = [
@@ -3809,7 +3842,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("access_manage_available", access_manage),
         ("peer_inspect_available", peer_inspect),
         ("peer_manage_available", peer_manage),
-        ("api_peers_available", peer_registry_available && peer_inspect),
+        (
+            "api_peers_available",
+            peer_registry_available && peer_inspect,
+        ),
         ("api_access_overview_available", access_inspect),
         ("api_access_iam_state_available", access_inspect),
         ("api_dashboard_targets_available", access_inspect),
@@ -3920,8 +3956,14 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_worktrees_scan_available", session_manage),
         ("api_worktrees_remove_available", session_manage),
         ("api_managed_context_available", session_inspect),
-        ("api_mcp_tool_call_available", runtime.mcp_server.is_some() && message),
-        ("api_peer_mutations_available", peer_registry_available && peer_manage),
+        (
+            "api_mcp_tool_call_available",
+            runtime.mcp_server.is_some() && message,
+        ),
+        (
+            "api_peer_mutations_available",
+            peer_registry_available && peer_manage,
+        ),
         (
             "api_peer_webrtc_signal_available",
             peer_registry_available && peer_manage,
@@ -3937,14 +3979,8 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_peer_pairing_available", peer_manage || access_manage),
         ("api_peer_pairing_invite_available", access_manage),
         ("api_peer_pairing_join_available", peer_manage),
-        (
-            "api_peer_pairing_request_access_available",
-            peer_manage,
-        ),
-        (
-            "api_peer_pairing_request_decision_available",
-            access_manage,
-        ),
+        ("api_peer_pairing_request_access_available", peer_manage),
+        ("api_peer_pairing_request_decision_available", access_manage),
         (
             "api_peer_pairing_requests_available",
             access_inspect || access_manage,
@@ -3953,11 +3989,11 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             "api_peer_pairing_identities_available",
             access_inspect || access_manage,
         ),
+        ("api_peer_pairing_identity_revoke_available", access_manage),
         (
-            "api_peer_pairing_identity_revoke_available",
-            access_manage,
+            "api_coordinator_available",
+            peer_registry_available && peer_manage,
         ),
-        ("api_coordinator_available", peer_registry_available && peer_manage),
     ];
     for (name, available) in capabilities {
         result.insert(name.to_string(), serde_json::json!(available));
@@ -9771,10 +9807,20 @@ mod tests {
         assert_eq!(status["result"]["api_access_overview_available"], true);
         assert_eq!(status["result"]["api_access_iam_state_available"], true);
         assert_eq!(status["result"]["api_dashboard_targets_available"], true);
+        assert_eq!(status["result"]["access_principal"]["kind"], "peer_daemon");
         assert_eq!(
-            status["result"]["api_peer_pairing_invite_available"],
-            false
+            status["result"]["access_principal"]["peer_profile"],
+            "peer-root"
         );
+        assert_eq!(
+            status["result"]["iam_enforcement"]["operation_evaluator"],
+            true
+        );
+        assert_eq!(
+            status["result"]["iam_enforcement"]["principal_binding"],
+            "peer_daemon"
+        );
+        assert_eq!(status["result"]["api_peer_pairing_invite_available"], false);
         assert_eq!(status["result"]["api_peer_pairing_join_available"], true);
         assert_eq!(
             status["result"]["api_peer_pairing_request_decision_available"],
@@ -9821,7 +9867,7 @@ mod tests {
         assert!(revoke["error"]
             .as_str()
             .unwrap_or("")
-            .contains("not allowed for profile peer-root"));
+            .contains("peer profile peer-root does not allow access.manage"));
 
         let invite = test_control_frame_response(
             r#"{"t":"request","id":"i1","method":"api_peer_pairing_invite","params":{}}"#,
@@ -9835,7 +9881,7 @@ mod tests {
         assert!(invite["error"]
             .as_str()
             .unwrap_or("")
-            .contains("not allowed for profile peer-root"));
+            .contains("peer profile peer-root does not allow access.manage"));
 
         let mut peer_operator = runtime();
         peer_operator.grant = DashboardControlGrant::Peer {
@@ -9856,7 +9902,7 @@ mod tests {
         assert!(denied["error"]
             .as_str()
             .unwrap_or("")
-            .contains("not allowed for profile peer-operator"));
+            .contains("peer profile peer-operator does not allow access.inspect"));
     }
 
     #[tokio::test]
@@ -9952,6 +9998,16 @@ mod tests {
         assert_eq!(status["result"]["transport"], "webrtc-datachannel");
         assert_eq!(status["result"]["events_subscribed"], false);
         assert_eq!(status["result"]["response_credit_enabled"], false);
+        assert_eq!(status["result"]["access_principal"]["kind"], "root_session");
+        assert_eq!(status["result"]["access_principal"]["role_id"], "role:root");
+        assert_eq!(
+            status["result"]["iam_enforcement"]["operation_evaluator"],
+            true
+        );
+        assert_eq!(
+            status["result"]["iam_enforcement"]["principal_binding"],
+            "root_session"
+        );
         assert_eq!(status["result"]["api_peers_available"], false);
         assert_eq!(status["result"]["api_agent_card_available"], true);
         assert_eq!(
@@ -10079,10 +10135,7 @@ mod tests {
         assert_eq!(status["result"]["api_peer_mutations_available"], false);
         assert_eq!(status["result"]["api_peer_webrtc_signal_available"], false);
         assert_eq!(status["result"]["api_peer_pairing_available"], true);
-        assert_eq!(
-            status["result"]["api_peer_pairing_invite_available"],
-            true
-        );
+        assert_eq!(status["result"]["api_peer_pairing_invite_available"], true);
         assert_eq!(status["result"]["api_peer_pairing_join_available"], true);
         assert_eq!(
             status["result"]["api_peer_pairing_request_access_available"],

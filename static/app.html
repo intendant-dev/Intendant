@@ -33223,7 +33223,14 @@ function accessOverviewModel() {
         label: 'Root',
         status: 'enforced',
         summary: 'Current owner/root dashboard authority.',
-        permissions: ['access.inspect', 'access.manage', 'peer.inspect', 'peer.manage'],
+        permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'access.manage', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
+        source: 'builtin',
+      }, {
+        id: 'role:peer-profile',
+        label: 'Peer profile',
+        status: 'enforced',
+        summary: 'Daemon-to-daemon grants enforced by the approved peer identity profile.',
+        permissions: ['presence.read', 'stats.read', 'display.view', 'display.input', 'message.send', 'task.run', 'approval.resolve', 'access.inspect', 'peer.inspect', 'peer.manage', 'session.inspect', 'session.manage', 'terminal.use', 'settings.manage', 'runtime.control', 'filesystem.read', 'filesystem.write'],
         source: 'builtin',
       }, {
         id: 'role:scoped-human',
@@ -33238,12 +33245,17 @@ function accessOverviewModel() {
         state_file_supported: true,
         read_local_state: true,
         write_api_available: false,
+        operation_evaluator: true,
+        enforce_root_and_peer_grants: true,
         enforce_user_client_grants: false,
       },
       enforcement: {
+        root_session_grants: true,
+        peer_profile_grants: true,
         user_client_grants: false,
-        principal_binding: 'root_session_only',
-        reason: 'The daemon currently distinguishes trusted owner/root dashboard sessions and daemon peer identities, but not stable scoped human/device principals.',
+        principal_binding: 'root_session_and_peer_daemon',
+        enforced_principal_kinds: ['root_session', 'peer_daemon'],
+        reason: 'The daemon currently enforces trusted owner/root dashboard sessions and daemon peer profiles, but not stable scoped human/device principals.',
       },
     },
   };
@@ -33291,8 +33303,8 @@ function accessOverviewCards() {
   }, {
     title: 'IAM foundation',
     kind: accessIamLoadLabel(iam),
-    detail: iamCapabilities.enforce_user_client_grants
-      ? 'Scoped user/client grants are enforceable on this daemon.'
+    detail: iamCapabilities.enforce_root_and_peer_grants
+      ? `Root sessions and peer profiles use the IAM evaluator. Scoped user/client grants are not enforced yet. ${accessIamEnforcementReason(iam)}`
       : `Local IAM state is visible, but scoped user/client grants are not enforced yet. ${accessIamEnforcementReason(iam)}`,
     actions: [{ label: 'Policies', onClick: () => routeTo('access', 'policies') }],
   }, {
@@ -33955,15 +33967,17 @@ function renderAccessOverviewDetails() {
     ],
   }, {
     title: 'Local IAM state',
-    status: iam.load_status === 'error' ? 'failed' : (iamCapabilities.enforce_user_client_grants ? 'enforced' : 'planned'),
+    status: iam.load_status === 'error' ? 'failed' : (iamCapabilities.enforce_root_and_peer_grants ? 'active' : 'planned'),
     lines: [
       ['State', accessIamLoadLabel(iam)],
       ['Store', accessModelLabel(iam.state_path, 'Default access store')],
       ['Managed principals', accessModelLabel(iam.managed_principals, '0')],
       ['Managed grants', accessModelLabel(iam.managed_grants, '0')],
       ['Write API', iamCapabilities.write_api_available ? 'Available' : 'Not exposed'],
+      ['Operation evaluator', iamCapabilities.operation_evaluator ? 'Enabled' : 'Not enabled'],
+      ['Root/peer enforcement', iamCapabilities.enforce_root_and_peer_grants ? 'Enabled' : 'Not enabled'],
       ['User grant enforcement', iamEnforcement.user_client_grants ? 'Enabled' : 'Not enabled'],
-      ['Binding', accessModelLabel(iamEnforcement.principal_binding, 'root_session_only')],
+      ['Binding', accessModelLabel(iamEnforcement.principal_binding, 'root_session_and_peer_daemon')],
       ['Reason', accessIamEnforcementReason(iam)],
     ],
   }]);

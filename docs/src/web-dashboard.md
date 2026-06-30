@@ -354,9 +354,11 @@ The model is backend-backed. `GET /api/access/overview` and the
 dashboard-control `api_access_overview` method return schema version 1 with
 `scope`, `targets`, `principals`, `grants`, `policies`, `permissions`,
 `transports`, `supported_principal_kinds`, `iam`, and explicit unresolved
-architecture notes. This overview is descriptive for now: it exposes one
-product model over the current enforcement paths rather than replacing mTLS,
-Connect account checks, or peer profiles.
+architecture notes. Root dashboard sessions and peer daemon sessions now pass
+through the shared IAM operation evaluator, while preserving the existing root
+and peer-profile semantics. The overview still exposes one product model over
+the current transport/auth paths rather than replacing mTLS, Connect account
+checks, or peer profiles.
 
 The local IAM foundation lives beside the native access cert store as
 `iam.json` and is also available at `GET /api/access/iam/state` or
@@ -364,9 +366,10 @@ dashboard-control `api_access_iam_state`. Its schema contains `principals`,
 `roles`, `grants`, and `audit_events`. The daemon currently exposes this state
 for inspection and merges managed principals/grants into the unified overview,
 but it does not enforce scoped user/client grants yet. The `iam.enforcement`
-object reports `user_client_grants: false` and `principal_binding:
-root_session_only` until browser mTLS or Connect requests can be bound to stable
-human/device principals.
+object reports `root_session_grants: true`, `peer_profile_grants: true`,
+`user_client_grants: false`, and `principal_binding:
+root_session_and_peer_daemon` until browser mTLS or Connect requests can be
+bound to stable human/device principals.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access
