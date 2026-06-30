@@ -580,6 +580,12 @@ or Connect user access by themselves. Peer profiles use names such as
 `peer-operator` and `peer-root`; older `operator`, `admin-peer`, and
 `peer-daemon` values are still accepted as aliases.
 
+In the Access UI and `/api/access/overview`, a `[[peer]]` entry appears as a
+peer-daemon principal with a peer-profile grant to a daemon target. Browser mTLS
+and hosted/passkey dashboard access are user/client grants instead. The same
+page shows both kinds of access, but the config entry only persists the peer
+route and its daemon-to-daemon credentials.
+
 ### `mcp_servers`
 
 External MCP servers to connect to as a client (see

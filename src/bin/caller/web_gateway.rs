@@ -22468,6 +22468,14 @@ pub fn spawn_web_gateway(
                             };
                         let response = json_response(status_reason(status), body);
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if request_line.contains(" /api/access/overview") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = access_overview_response_body(
+                            &agent_card_value_for_targets,
+                            peer_registry.as_ref(),
+                        );
+                        let response = json_response("200 OK", body);
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/dashboard/targets") {
                         use tokio::io::AsyncWriteExt;
                         let body = dashboard_targets_response_body(
@@ -23416,6 +23424,218 @@ pub(crate) fn dashboard_targets_response_body(
     registry: Option<&crate::peer::PeerRegistry>,
 ) -> String {
     dashboard_targets_response_value(agent_card, registry).to_string()
+}
+
+/// Build the shared access overview model.
+///
+/// This is intentionally descriptive rather than a new enforcement engine. It
+/// gives every dashboard route the same vocabulary - principals, targets,
+/// grants, policies, and transports - while the existing mTLS, Connect, and
+/// peer-profile paths continue to enforce their current rules.
+pub(crate) fn access_overview_response_value(
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+) -> serde_json::Value {
+    let targets_value = dashboard_targets_response_value(agent_card, registry);
+    let targets = targets_value
+        .get("targets")
+        .and_then(|v| v.as_array())
+        .cloned()
+        .unwrap_or_default();
+    let local_target = targets.iter().find(|target| {
+        target
+            .get("local")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    });
+    let local_target_id = local_target
+        .and_then(|target| target.get("id").and_then(|v| v.as_str()))
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("local")
+        .to_string();
+    let local_target_label = local_target
+        .and_then(|target| target.get("label").and_then(|v| v.as_str()))
+        .filter(|v| !v.trim().is_empty())
+        .unwrap_or("This daemon")
+        .to_string();
+
+    let mut principals = vec![serde_json::json!({
+        "id": "principal:current-browser-session",
+        "kind": "browser_session",
+        "kind_label": "Current browser session",
+        "label": "Current browser",
+        "source": "trusted_dashboard_session",
+        "local": true,
+        "account": serde_json::Value::Null,
+        "organization": serde_json::Value::Null,
+        "authn": [{
+            "kind": "trusted_dashboard_session",
+            "label": "Trusted dashboard session"
+        }]
+    })];
+    let mut grants = vec![serde_json::json!({
+        "id": format!("grant:current-browser:{}:root", local_target_id),
+        "principal_id": "principal:current-browser-session",
+        "target_id": local_target_id.clone(),
+        "kind": "user_client_root",
+        "kind_label": "User/client root",
+        "policy_id": "policy:root",
+        "role": "root",
+        "role_label": "Root",
+        "transport_id": "transport:current-dashboard",
+        "source": "trusted_dashboard_session",
+        "status": "active"
+    })];
+    let mut transports = vec![serde_json::json!({
+        "id": "transport:current-dashboard",
+        "kind": "current_dashboard",
+        "kind_label": "Current dashboard transport",
+        "label": "Current dashboard",
+        "status": "connected",
+        "implementation": "local_mtls_or_hosted_tunnel",
+        "target_id": local_target_id.clone()
+    })];
+
+    for target in targets.iter().filter(|target| {
+        !target
+            .get("local")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }) {
+        let target_id = target
+            .get("id")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .or_else(|| target.get("host_id").and_then(|v| v.as_str()))
+            .unwrap_or("peer")
+            .to_string();
+        let target_label = target
+            .get("label")
+            .and_then(|v| v.as_str())
+            .filter(|v| !v.trim().is_empty())
+            .map(ToOwned::to_owned)
+            .unwrap_or_else(|| target_id.clone());
+        let connected = target
+            .get("connected")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let principal_id = format!("principal:peer-daemon:{target_id}");
+        let transport_id = format!("transport:peer-route:{target_id}");
+        principals.push(serde_json::json!({
+            "id": principal_id.clone(),
+            "kind": "peer_daemon",
+            "kind_label": "Peer daemon",
+            "label": target_label.clone(),
+            "source": "peer_registry",
+            "target_id": target_id.clone(),
+            "local": false,
+            "account": serde_json::Value::Null,
+            "organization": serde_json::Value::Null,
+            "authn": [{
+                "kind": "daemon_mutual_tls",
+                "label": "Daemon mTLS identity"
+            }]
+        }));
+        grants.push(serde_json::json!({
+            "id": format!("grant:peer-route:{target_id}:profile"),
+            "principal_id": principal_id,
+            "target_id": target_id.clone(),
+            "kind": "daemon_peer_profile",
+            "kind_label": "Daemon peer profile",
+            "policy_id": "policy:peer-profile",
+            "role": "peer_profile",
+            "role_label": "Peer profile",
+            "transport_id": transport_id.clone(),
+            "source": "peer_registry",
+            "status": if connected { "active" } else { "offline" }
+        }));
+        transports.push(serde_json::json!({
+            "id": transport_id,
+            "kind": "peer_route",
+            "kind_label": "Peer route",
+            "label": target_label,
+            "status": if connected { "connected" } else { "offline" },
+            "implementation": "daemon_mutual_tls_plus_optional_browser_datachannel",
+            "target_id": target_id
+        }));
+    }
+
+    serde_json::json!({
+        "schema_version": 1,
+        "scope": {
+            "kind": "local_daemon",
+            "label": local_target_label,
+            "target_id": local_target_id,
+            "account": serde_json::Value::Null,
+            "organization": serde_json::Value::Null,
+            "hosted_account_configured": false
+        },
+        "targets": targets,
+        "principals": principals,
+        "grants": grants,
+        "policies": [{
+            "id": "policy:root",
+            "label": "Root",
+            "status": "enforced",
+            "summary": "Full dashboard authority for the owner/browser session on one daemon."
+        }, {
+            "id": "policy:peer-profile",
+            "label": "Peer profile",
+            "status": "enforced",
+            "summary": "Daemon-to-daemon authority bounded by the approved peer profile."
+        }, {
+            "id": "policy:scoped-human",
+            "label": "Scoped human access",
+            "status": "planned",
+            "summary": "Future IAM-style grants for coworkers, teams, and browser certificates."
+        }, {
+            "id": "policy:directory-files",
+            "label": "Directory scoped files",
+            "status": "planned",
+            "summary": "Future file grants limited to selected roots and operations."
+        }, {
+            "id": "policy:public-share",
+            "label": "Public share",
+            "status": "planned",
+            "summary": "Future explicit grants for publishing selected stats or artifacts."
+        }],
+        "transports": transports,
+        "supported_principal_kinds": [{
+            "kind": "browser_session",
+            "label": "Browser session",
+            "status": "current"
+        }, {
+            "kind": "passkey_account",
+            "label": "Passkey account",
+            "status": "current_hosted_transport"
+        }, {
+            "kind": "browser_certificate",
+            "label": "Browser certificate",
+            "status": "current_self_hosted_transport"
+        }, {
+            "kind": "peer_daemon",
+            "label": "Peer daemon",
+            "status": "current"
+        }, {
+            "kind": "organization_group",
+            "label": "Organization group",
+            "status": "planned"
+        }],
+        "architecture": {
+            "unresolved": [
+                "external identity provider and Sybil-resistance policy",
+                "organization ownership, billing, and recovery semantics",
+                "final IAM policy language and editing UX"
+            ]
+        }
+    })
+}
+
+pub(crate) fn access_overview_response_body(
+    agent_card: &serde_json::Value,
+    registry: Option<&crate::peer::PeerRegistry>,
+) -> String {
+    access_overview_response_value(agent_card, registry).to_string()
 }
 
 /// Handle a `POST /api/peers` body: parse, call `PeerRegistry::add_peer`,
@@ -35459,6 +35679,61 @@ mod tests {
         assert_eq!(local["route"], "current_dashboard");
         assert_eq!(local["effective_role"], "root");
         assert_eq!(local["connected"], true);
+
+        handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_api_access_overview_lists_current_browser_root_grant() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        let resp = http_request(
+            port,
+            "GET /api/access/overview HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        )
+        .await;
+        let (head, body) = resp
+            .split_once("\r\n\r\n")
+            .expect("HTTP response has header/body split");
+        assert!(
+            head.starts_with("HTTP/1.1 200 OK\r\n"),
+            "access overview should return 200: {head}"
+        );
+        assert!(
+            head.contains("Content-Type: application/json"),
+            "access overview should return JSON: {head}"
+        );
+
+        let payload: serde_json::Value =
+            serde_json::from_str(body).expect("access overview body is JSON");
+        assert_eq!(payload["schema_version"], 1);
+        assert_eq!(payload["scope"]["kind"], "local_daemon");
+        assert_eq!(payload["targets"].as_array().expect("targets").len(), 1);
+
+        let principals = payload["principals"].as_array().expect("principals");
+        assert!(
+            principals
+                .iter()
+                .any(|p| p["id"] == "principal:current-browser-session"
+                    && p["kind"] == "browser_session"),
+            "current browser principal should be present"
+        );
+        let grants = payload["grants"].as_array().expect("grants");
+        assert!(
+            grants
+                .iter()
+                .any(|grant| grant["kind"] == "user_client_root"
+                    && grant["role"] == "root"
+                    && grant["policy_id"] == "policy:root"),
+            "current browser root grant should be present"
+        );
+        let policies = payload["policies"].as_array().expect("policies");
+        assert!(
+            policies
+                .iter()
+                .any(|policy| policy["id"] == "policy:peer-profile"
+                    && policy["status"] == "enforced"),
+            "peer profile policy should be visible in the overview"
+        );
 
         handle.abort();
     }
