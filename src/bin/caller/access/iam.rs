@@ -1,10 +1,9 @@
 //! Local Access/IAM state.
 //!
-//! This is deliberately a data model, not an enforcement engine. Today the
-//! daemon can distinguish trusted owner/root dashboard sessions and daemon peer
-//! identities. It cannot yet bind every browser/passkey request to a stable
-//! scoped human/device principal, so local IAM grants loaded here are exposed as
-//! managed/draft model data until that binding exists.
+//! This is deliberately a local daemon-owned access model. The daemon can
+//! distinguish trusted owner/root dashboard sessions, daemon peer identities, and
+//! active user/client records bound to stable browser mTLS or Connect account
+//! metadata.
 
 use std::path::{Path, PathBuf};
 
@@ -109,6 +108,36 @@ pub struct IamAuditEvent {
     pub summary: String,
 }
 
+#[derive(Clone, Debug, Default, PartialEq, Serialize, Deserialize)]
+pub struct UserClientGrantUpsertRequest {
+    #[serde(default)]
+    pub kind: String,
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub fingerprint: Option<String>,
+    #[serde(default)]
+    pub user_id: Option<String>,
+    #[serde(default)]
+    pub account_name: Option<String>,
+    #[serde(default)]
+    pub role_id: Option<String>,
+    #[serde(default)]
+    pub status: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub target_id: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct UserClientGrantUpsertResult {
+    pub principal: IamPrincipal,
+    pub grant: IamGrant,
+    pub created_principal: bool,
+    pub created_grant: bool,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub enum IamStateStatus {
     Missing,
@@ -165,6 +194,20 @@ impl AccessPrincipal {
             account: None,
             authn: Vec::new(),
         }
+    }
+
+    pub fn root_user_client(
+        source: impl Into<String>,
+        transport: impl Into<String>,
+        label: impl Into<String>,
+        account: Option<Value>,
+        authn: Vec<Value>,
+    ) -> Self {
+        let mut principal = Self::root_dashboard_session(source, transport);
+        principal.label = label.into();
+        principal.account = account;
+        principal.authn = authn;
+        principal
     }
 
     pub fn peer_daemon(
@@ -393,6 +436,363 @@ pub fn save_state(cert_dir: &Path, state: &LocalIamState) -> AccessResult<()> {
     Ok(())
 }
 
+struct UserClientBinding {
+    principal_id: String,
+    principal_kind: String,
+    label: String,
+    account: Option<Value>,
+    authn: Vec<Value>,
+}
+
+pub fn upsert_user_client_grant(
+    state: &mut LocalIamState,
+    request: UserClientGrantUpsertRequest,
+    actor: &AccessPrincipal,
+) -> AccessResult<UserClientGrantUpsertResult> {
+    for role in builtin_role_templates() {
+        if !state.roles.iter().any(|existing| existing.id == role.id) {
+            state.roles.push(role);
+        }
+    }
+
+    let kind = normalize_user_client_kind(&request)?;
+    let role_id = request
+        .role_id
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .unwrap_or("role:scoped-human")
+        .to_string();
+    if !state.roles.iter().any(|role| role.id == role_id) {
+        return Err(AccessError(format!("unknown IAM role {role_id}")));
+    }
+    let status = normalize_user_client_status(request.status.as_deref())?;
+    let target_id = request
+        .target_id
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .unwrap_or("local")
+        .to_string();
+    let reason = request
+        .reason
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .unwrap_or("local IAM user/client grant")
+        .to_string();
+    let now = now_unix_ms();
+
+    let binding = build_user_client_binding(&kind, &request)?;
+    let principal_id = binding.principal_id;
+    let grant_id = format!(
+        "grant:user-client:{}:{}:{}",
+        slug_component(&principal_id),
+        slug_component(&target_id),
+        slug_component(&role_id)
+    );
+
+    let created_principal;
+    let principal = if let Some(existing) = state
+        .principals
+        .iter_mut()
+        .find(|principal| principal.id == principal_id)
+    {
+        created_principal = false;
+        existing.kind = binding.principal_kind.clone();
+        existing.label = binding.label.clone();
+        existing.status = status.clone();
+        existing.source = "local_iam_state".to_string();
+        existing.account = binding.account.clone();
+        existing.authn = binding.authn.clone();
+        existing.notes = Some(reason.clone());
+        if existing.created_at_unix_ms.is_none() {
+            existing.created_at_unix_ms = Some(now);
+        }
+        existing.clone()
+    } else {
+        created_principal = true;
+        let principal = IamPrincipal {
+            id: principal_id.clone(),
+            kind: binding.principal_kind.clone(),
+            label: binding.label.clone(),
+            status: status.clone(),
+            source: "local_iam_state".to_string(),
+            account: binding.account.clone(),
+            organization: None,
+            authn: binding.authn.clone(),
+            notes: Some(reason.clone()),
+            created_at_unix_ms: Some(now),
+        };
+        state.principals.push(principal.clone());
+        principal
+    };
+
+    let policy_id = policy_for_role(&role_id);
+    let created_grant;
+    let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id) {
+        created_grant = false;
+        existing.principal_id = principal_id.clone();
+        existing.target_id = target_id.clone();
+        existing.role_id = role_id.clone();
+        existing.policy_id = policy_id.clone();
+        existing.status = status.clone();
+        existing.source = "local_iam_state".to_string();
+        existing.reason = reason.clone();
+        if existing.created_at_unix_ms.is_none() {
+            existing.created_at_unix_ms = Some(now);
+        }
+        existing.revoked_at_unix_ms = if status == "revoked" { Some(now) } else { None };
+        existing.clone()
+    } else {
+        created_grant = true;
+        let grant = IamGrant {
+            id: grant_id,
+            principal_id: principal_id.clone(),
+            target_id: target_id.clone(),
+            role_id: role_id.clone(),
+            policy_id,
+            status: status.clone(),
+            source: "local_iam_state".to_string(),
+            reason: reason.clone(),
+            created_at_unix_ms: Some(now),
+            revoked_at_unix_ms: if status == "revoked" { Some(now) } else { None },
+        };
+        state.grants.push(grant.clone());
+        grant
+    };
+
+    state.audit_events.push(IamAuditEvent {
+        id: format!("audit:{}:{}", now, state.audit_events.len() + 1),
+        at_unix_ms: Some(now),
+        actor_principal_id: actor.id.clone(),
+        action: "upsert_user_client_grant".to_string(),
+        target_id: grant.id.clone(),
+        summary: format!(
+            "{} {} grant {} for {}",
+            if created_grant { "Created" } else { "Updated" },
+            status,
+            role_id,
+            principal.label
+        ),
+    });
+
+    Ok(UserClientGrantUpsertResult {
+        principal,
+        grant,
+        created_principal,
+        created_grant,
+    })
+}
+
+fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessResult<String> {
+    let explicit = trimmed_nonempty(request.kind.as_str());
+    let inferred = if request
+        .fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .is_some()
+    {
+        Some("browser_certificate")
+    } else if request
+        .user_id
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .is_some()
+        || request
+            .account_name
+            .as_deref()
+            .and_then(trimmed_nonempty)
+            .is_some()
+    {
+        Some("connect_account")
+    } else {
+        None
+    };
+    let kind = explicit.or(inferred).unwrap_or("").to_ascii_lowercase();
+    match kind.as_str() {
+        "browser_certificate" | "browser_mtls_cert" | "browser-mtls-cert" => {
+            Ok("browser_certificate".to_string())
+        }
+        "connect_account" | "connect-account" | "passkey_account" | "passkey-account" => {
+            Ok("connect_account".to_string())
+        }
+        _ => Err(AccessError(
+            "kind must be browser_certificate or connect_account".to_string(),
+        )),
+    }
+}
+
+fn normalize_user_client_status(status: Option<&str>) -> AccessResult<String> {
+    let status = status
+        .and_then(trimmed_nonempty)
+        .unwrap_or("active")
+        .to_ascii_lowercase();
+    match status.as_str() {
+        "active" | "draft" | "revoked" => Ok(status),
+        _ => Err(AccessError(
+            "status must be active, draft, or revoked".to_string(),
+        )),
+    }
+}
+
+fn build_user_client_binding(
+    kind: &str,
+    request: &UserClientGrantUpsertRequest,
+) -> AccessResult<UserClientBinding> {
+    match kind {
+        "browser_certificate" => {
+            let fingerprint = request
+                .fingerprint
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(normalize_fingerprint)
+                .filter(|fingerprint| !fingerprint.is_empty())
+                .ok_or_else(|| AccessError("fingerprint is required".to_string()))?;
+            let label = request
+                .label
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Browser certificate {}", short_id(&fingerprint)));
+            Ok(UserClientBinding {
+                principal_id: format!("principal:browser-cert:{fingerprint}"),
+                principal_kind: "browser_certificate".to_string(),
+                label,
+                account: None,
+                authn: vec![json!({
+                    "kind": "browser_mtls_cert",
+                    "label": "Browser mTLS certificate",
+                    "fingerprint": fingerprint,
+                })],
+            })
+        }
+        "connect_account" => {
+            let user_id = request
+                .user_id
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(ToOwned::to_owned);
+            let account_name = request
+                .account_name
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(ToOwned::to_owned);
+            if user_id.is_none() && account_name.is_none() {
+                return Err(AccessError(
+                    "user_id or account_name is required for connect_account".to_string(),
+                ));
+            }
+            let id_source = user_id.as_deref().or(account_name.as_deref()).unwrap_or("");
+            let label = request
+                .label
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(ToOwned::to_owned)
+                .or_else(|| account_name.as_ref().map(|name| format!("@{name}")))
+                .unwrap_or_else(|| format!("Connect account {}", short_id(id_source)));
+            let mut account = serde_json::Map::new();
+            account.insert(
+                "provider".to_string(),
+                Value::String("intendant.dev".to_string()),
+            );
+            if let Some(user_id) = user_id.as_ref() {
+                account.insert("user_id".to_string(), Value::String(user_id.clone()));
+            }
+            if let Some(account_name) = account_name.as_ref() {
+                account.insert(
+                    "account_name".to_string(),
+                    Value::String(account_name.clone()),
+                );
+            }
+            let mut authn = serde_json::Map::new();
+            authn.insert(
+                "kind".to_string(),
+                Value::String("connect_account".to_string()),
+            );
+            authn.insert(
+                "label".to_string(),
+                Value::String("Intendant Connect account".to_string()),
+            );
+            if let Some(user_id) = user_id.as_ref() {
+                authn.insert("user_id".to_string(), Value::String(user_id.clone()));
+            }
+            if let Some(account_name) = account_name.as_ref() {
+                authn.insert(
+                    "account_name".to_string(),
+                    Value::String(account_name.clone()),
+                );
+            }
+            Ok(UserClientBinding {
+                principal_id: format!("principal:connect-account:{}", slug_component(id_source)),
+                principal_kind: "connect_account".to_string(),
+                label,
+                account: Some(Value::Object(account)),
+                authn: vec![Value::Object(authn)],
+            })
+        }
+        _ => Err(AccessError(format!("unsupported user/client kind {kind}"))),
+    }
+}
+
+fn policy_for_role(role_id: &str) -> String {
+    match role_id {
+        "role:root" => "policy:root".to_string(),
+        "role:directory-files" => "policy:directory-files".to_string(),
+        "role:scoped-human" => "policy:scoped-human".to_string(),
+        other => format!("policy:{}", slug_component(other)),
+    }
+}
+
+fn trimmed_nonempty(value: &str) -> Option<&str> {
+    let value = value.trim();
+    if value.is_empty() {
+        None
+    } else {
+        Some(value)
+    }
+}
+
+fn normalize_fingerprint(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_hexdigit())
+        .map(|ch| ch.to_ascii_lowercase())
+        .collect()
+}
+
+pub fn normalize_browser_mtls_fingerprint(value: &str) -> String {
+    normalize_fingerprint(value)
+}
+
+fn slug_component(value: &str) -> String {
+    let slug: String = value
+        .trim()
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() {
+                ch.to_ascii_lowercase()
+            } else {
+                '-'
+            }
+        })
+        .collect();
+    let slug = slug.trim_matches('-');
+    if slug.is_empty() {
+        "unknown".to_string()
+    } else {
+        slug.to_string()
+    }
+}
+
+fn short_id(value: &str) -> String {
+    value.chars().take(12).collect()
+}
+
+fn now_unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
 pub fn overview_metadata(load: &LoadedIamState) -> Value {
     json!({
         "schema_version": load.state.schema_version,
@@ -406,7 +806,7 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
         "capabilities": {
             "state_file_supported": true,
             "read_local_state": true,
-            "write_api_available": false,
+            "write_api_available": true,
             "operation_evaluator": true,
             "enforce_root_and_peer_grants": true,
             "enforce_user_client_grants": true
@@ -719,6 +1119,7 @@ fn root_permission_ids() -> Vec<String> {
 fn principal_kind_label(kind: &str) -> &'static str {
     match kind {
         "browser_certificate" => "Browser certificate",
+        "connect_account" => "Connect account",
         "passkey_account" => "Passkey account",
         "human_user" | "" => "Human user",
         "organization_group" => "Organization group",
@@ -753,11 +1154,12 @@ pub fn principal_for_browser_mtls_cert(
     fingerprint: &str,
     transport: impl Into<String>,
 ) -> Option<AccessPrincipal> {
+    let fingerprint = normalize_fingerprint(fingerprint);
     principal_for_authn(
         state,
         "browser_mtls_cert",
         "fingerprint",
-        fingerprint,
+        &fingerprint,
         transport,
     )
 }
@@ -923,7 +1325,7 @@ mod tests {
     fn active_browser_cert_state() -> LocalIamState {
         let mut state = LocalIamState::default();
         state.principals.push(IamPrincipal {
-            id: "principal:browser-cert:fp123".to_string(),
+            id: "principal:browser-cert:ab123".to_string(),
             kind: "browser_certificate".to_string(),
             label: "Alice laptop browser".to_string(),
             status: "active".to_string(),
@@ -932,14 +1334,14 @@ mod tests {
             organization: None,
             authn: vec![json!({
                 "kind": "browser_mtls_cert",
-                "fingerprint": "fp123"
+                "fingerprint": "ab123"
             })],
             notes: None,
             created_at_unix_ms: Some(100),
         });
         state.grants.push(IamGrant {
-            id: "grant:browser-cert:fp123:inspect".to_string(),
-            principal_id: "principal:browser-cert:fp123".to_string(),
+            id: "grant:browser-cert:ab123:inspect".to_string(),
+            principal_id: "principal:browser-cert:ab123".to_string(),
             target_id: "local".to_string(),
             role_id: "role:scoped-human".to_string(),
             policy_id: "policy:local-user-client".to_string(),
@@ -955,12 +1357,12 @@ mod tests {
     #[test]
     fn active_browser_cert_binding_uses_local_role_permissions() {
         let state = active_browser_cert_state();
-        let principal = principal_for_browser_mtls_cert(&state, "fp123", "https").unwrap();
+        let principal = principal_for_browser_mtls_cert(&state, "ab123", "https").unwrap();
 
         assert_eq!(principal.kind, "browser_certificate");
         assert_eq!(
             principal.grant_id.as_deref(),
-            Some("grant:browser-cert:fp123:inspect")
+            Some("grant:browser-cert:ab123:inspect")
         );
         assert!(
             evaluate_principal_operation_with_state(
@@ -985,7 +1387,83 @@ mod tests {
         let mut state = active_browser_cert_state();
         state.principals[0].status = "draft".to_string();
 
-        assert!(principal_for_browser_mtls_cert(&state, "fp123", "https").is_none());
+        assert!(principal_for_browser_mtls_cert(&state, "ab123", "https").is_none());
+    }
+
+    #[test]
+    fn upsert_browser_cert_grant_creates_active_binding() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                label: Some("Alice browser".to_string()),
+                fingerprint: Some("AB:12:3".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert!(result.created_principal);
+        assert!(result.created_grant);
+        assert_eq!(result.principal.kind, "browser_certificate");
+        assert_eq!(result.grant.status, "active");
+        assert_eq!(state.audit_events.len(), 1);
+
+        let principal = principal_for_browser_mtls_cert(&state, "ab123", "https").unwrap();
+        assert_eq!(principal.label, "Alice browser");
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessInspect,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn upsert_connect_account_grant_creates_active_binding() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "connect_account".to_string(),
+                user_id: Some("user-123".to_string()),
+                account_name: Some("alice".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert_eq!(result.principal.kind, "connect_account");
+        assert_eq!(result.principal.label, "@alice");
+        assert_eq!(result.grant.role_id, "role:scoped-human");
+
+        let principal =
+            principal_for_connect_account(&state, "user-123", Some("alice"), "dashboard-control")
+                .unwrap();
+        assert_eq!(principal.id, result.principal.id);
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessInspect,
+            )
+            .allowed
+        );
     }
 
     #[test]

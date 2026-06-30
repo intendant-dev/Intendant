@@ -154,6 +154,8 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_peer_pairing_identities",
     "api_peer_pairing_identity_revoke",
     "api_access_overview",
+    "api_access_iam_state",
+    "api_access_iam_upsert_user_client_grant",
     "api_dashboard_targets",
     "api_coordinator_route",
 ];
@@ -187,6 +189,9 @@ pub struct DashboardControlRegistry {
 #[derive(Clone, Debug)]
 pub enum DashboardControlGrant {
     TrustedLocal,
+    UserClientRoot {
+        principal: crate::access::iam::AccessPrincipal,
+    },
     UserClient {
         principal: crate::access::iam::AccessPrincipal,
         iam_state: crate::access::iam::LocalIamState,
@@ -209,6 +214,7 @@ impl DashboardControlGrant {
     fn label(&self) -> &str {
         match self {
             Self::TrustedLocal => "trusted-local",
+            Self::UserClientRoot { principal } => principal.label.as_str(),
             Self::UserClient { principal, .. } => principal.label.as_str(),
             Self::Peer { label, .. } => label.as_str(),
         }
@@ -216,14 +222,14 @@ impl DashboardControlGrant {
 
     fn profile(&self) -> Option<&str> {
         match self {
-            Self::TrustedLocal | Self::UserClient { .. } => None,
+            Self::TrustedLocal | Self::UserClientRoot { .. } | Self::UserClient { .. } => None,
             Self::Peer { profile, .. } => Some(profile.as_str()),
         }
     }
 
     fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
         match self {
-            Self::TrustedLocal | Self::UserClient { .. } => None,
+            Self::TrustedLocal | Self::UserClientRoot { .. } | Self::UserClient { .. } => None,
             Self::Peer { filesystem, .. } => Some(filesystem),
         }
     }
@@ -234,6 +240,7 @@ impl DashboardControlGrant {
                 "dashboard-control",
                 "webrtc-datachannel",
             ),
+            Self::UserClientRoot { principal } => principal.clone(),
             Self::UserClient { principal, .. } => principal.clone(),
             Self::Peer {
                 fingerprint,
@@ -267,6 +274,7 @@ impl DashboardControlGrant {
     fn wire_kind(&self) -> &'static str {
         match self {
             Self::TrustedLocal => "trusted-local",
+            Self::UserClientRoot { .. } => "user-client-root",
             Self::UserClient { .. } => "user-client",
             Self::Peer { .. } => "peer",
         }
@@ -1963,6 +1971,7 @@ fn dashboard_control_method_operation(
         "api_access_overview" | "api_access_iam_state" | "api_dashboard_targets" => {
             Some(PeerOperation::AccessInspect)
         }
+        "api_access_iam_upsert_user_client_grant" => Some(PeerOperation::AccessManage),
         "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
             Some(PeerOperation::AccessInspect)
         }
@@ -2230,6 +2239,26 @@ fn control_frame_response(
                     "ok": true,
                     "result": crate::web_gateway::access_iam_state_response_value(),
                 })),
+                "api_access_iam_upsert_user_client_grant" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    match crate::web_gateway::access_iam_upsert_user_client_grant_response_value(
+                        params,
+                        &runtime.grant.access_principal(),
+                    ) {
+                        Ok(result) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": result,
+                        })),
+                        Err(error) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": false,
+                            "error": error,
+                        })),
+                    }
+                }
                 "subscribe_events" => {
                     runtime.events_subscribed = true;
                     Some(serde_json::json!({
@@ -3797,6 +3826,7 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
             "principal_kind": access_principal.kind,
             "principal_binding": match runtime.grant {
                 DashboardControlGrant::TrustedLocal => "root_session",
+                DashboardControlGrant::UserClientRoot { .. } => "user_client_root",
                 DashboardControlGrant::UserClient { .. } => "user_client",
                 DashboardControlGrant::Peer { .. } => "peer_daemon",
             },
@@ -3870,6 +3900,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ),
         ("api_access_overview_available", access_inspect),
         ("api_access_iam_state_available", access_inspect),
+        (
+            "api_access_iam_upsert_user_client_grant_available",
+            access_manage,
+        ),
         ("api_dashboard_targets_available", access_inspect),
         ("api_agent_card_available", presence_read),
         ("api_cached_bootstrap_events_available", session_inspect),
@@ -9672,7 +9706,7 @@ mod tests {
     fn scoped_user_client_grant() -> DashboardControlGrant {
         let mut iam_state = crate::access::iam::LocalIamState::default();
         iam_state.principals.push(crate::access::iam::IamPrincipal {
-            id: "principal:browser-cert:fp123".to_string(),
+            id: "principal:browser-cert:ab123".to_string(),
             kind: "browser_certificate".to_string(),
             label: "Alice browser".to_string(),
             status: "active".to_string(),
@@ -9681,14 +9715,14 @@ mod tests {
             organization: None,
             authn: vec![serde_json::json!({
                 "kind": "browser_mtls_cert",
-                "fingerprint": "fp123"
+                "fingerprint": "ab123"
             })],
             notes: None,
             created_at_unix_ms: Some(100),
         });
         iam_state.grants.push(crate::access::iam::IamGrant {
-            id: "grant:browser-cert:fp123:inspect".to_string(),
-            principal_id: "principal:browser-cert:fp123".to_string(),
+            id: "grant:browser-cert:ab123:inspect".to_string(),
+            principal_id: "principal:browser-cert:ab123".to_string(),
             target_id: "local".to_string(),
             role_id: "role:scoped-human".to_string(),
             policy_id: "policy:local-user-client".to_string(),
@@ -9699,7 +9733,7 @@ mod tests {
             revoked_at_unix_ms: None,
         });
         let principal =
-            crate::access::iam::principal_for_browser_mtls_cert(&iam_state, "fp123", "https")
+            crate::access::iam::principal_for_browser_mtls_cert(&iam_state, "ab123", "https")
                 .unwrap();
         DashboardControlGrant::UserClient {
             principal,
@@ -10097,6 +10131,10 @@ mod tests {
         assert_eq!(status["result"]["presence_tool_request_available"], true);
         assert_eq!(status["result"]["access_inspect_available"], true);
         assert_eq!(status["result"]["access_manage_available"], true);
+        assert_eq!(
+            status["result"]["api_access_iam_upsert_user_client_grant_available"],
+            true
+        );
         assert_eq!(status["result"]["peer_inspect_available"], true);
         assert_eq!(status["result"]["peer_manage_available"], true);
         assert_eq!(status["result"]["api_presence_video_frame_available"], true);
@@ -10317,6 +10355,40 @@ mod tests {
         );
         assert_eq!(status["result"]["access_inspect_available"], true);
         assert_eq!(status["result"]["access_manage_available"], false);
+    }
+
+    #[test]
+    fn user_client_root_grant_reports_identity_without_scoping_permissions() {
+        let mut rt = runtime();
+        rt.grant = DashboardControlGrant::UserClientRoot {
+            principal: crate::access::iam::AccessPrincipal::root_user_client(
+                "browser-mtls",
+                "webrtc-datachannel",
+                "Browser certificate ab123",
+                None,
+                vec![serde_json::json!({
+                    "kind": "browser_mtls_cert",
+                    "fingerprint": "ab123"
+                })],
+            ),
+        };
+
+        let status = status_response_frame("s1".to_string(), &rt);
+        assert_eq!(status["result"]["grant_kind"], "user-client-root");
+        assert_eq!(status["result"]["access_principal"]["kind"], "root_session");
+        assert_eq!(
+            status["result"]["access_principal"]["authn"][0]["kind"],
+            "browser_mtls_cert"
+        );
+        assert_eq!(
+            status["result"]["iam_enforcement"]["principal_binding"],
+            "user_client_root"
+        );
+        assert_eq!(
+            status["result"]["iam_enforcement"]["user_client_grants"],
+            false
+        );
+        assert_eq!(status["result"]["access_manage_available"], true);
     }
 
     #[tokio::test]

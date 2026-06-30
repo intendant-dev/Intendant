@@ -22543,6 +22543,40 @@ pub fn spawn_web_gateway(
                             };
                         let response = json_response(status_reason(status), body);
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_path == "/api/access/iam/user-client-grants" {
+                        use tokio::io::AsyncWriteExt;
+                        if req_method != "POST" {
+                            let response = json_response(
+                                "405 Method Not Allowed",
+                                serde_json::json!({"error": "method not allowed"}).to_string(),
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        } else {
+                            let decision = http_access_context
+                                .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+                            if !decision.allowed {
+                                let response = json_response(
+                                    "403 Forbidden",
+                                    serde_json::json!({
+                                        "error": "principal does not allow this operation",
+                                        "principal": http_access_context.principal.as_value(),
+                                        "permission": decision.permission,
+                                        "reason": decision.reason,
+                                    })
+                                    .to_string(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else {
+                                let body_text = read_request_body(&mut stream, &header_text).await;
+                                let (status, body) =
+                                    access_iam_upsert_user_client_grant_response_body(
+                                        &body_text,
+                                        &http_access_context.principal,
+                                    );
+                                let response = json_response(status_reason(status), body);
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                        }
                     } else if request_line.contains(" /api/access/iam/state") {
                         use tokio::io::AsyncWriteExt;
                         let body = access_iam_state_response_body();
@@ -23814,8 +23848,8 @@ fn access_overview_response_value_with_identities_and_iam(
         }, {
             "id": "policy:scoped-human",
             "label": "Scoped human access",
-            "status": "planned",
-            "summary": "Future IAM-style grants for coworkers, teams, and browser certificates."
+            "status": "enforced",
+            "summary": "Minimal local IAM grants for stable browser mTLS certificates and hosted Connect account metadata."
         }, {
             "id": "policy:directory-files",
             "label": "Directory scoped files",
@@ -23862,13 +23896,17 @@ fn access_overview_response_value_with_identities_and_iam(
             "label": "Passkey account",
             "status": "current_hosted_transport"
         }, {
+            "kind": "connect_account",
+            "label": "Connect account",
+            "status": "current_local_iam"
+        }, {
             "kind": "browser_certificate",
             "label": "Browser certificate",
             "status": "current_self_hosted_transport"
         }, {
             "kind": "human_user",
             "label": "Human user",
-            "status": "planned_local_iam"
+            "status": "current_local_iam"
         }, {
             "kind": "peer_daemon",
             "label": "Peer daemon",
@@ -23908,6 +23946,58 @@ pub(crate) fn access_iam_state_response_value() -> serde_json::Value {
 
 pub(crate) fn access_iam_state_response_body() -> String {
     access_iam_state_response_value().to_string()
+}
+
+pub(crate) fn access_iam_upsert_user_client_grant_response_value(
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> Result<serde_json::Value, String> {
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    access_iam_upsert_user_client_grant_response_value_with_cert_dir(&cert_dir, params, actor)
+}
+
+fn access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+    cert_dir: &std::path::Path,
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> Result<serde_json::Value, String> {
+    let request: crate::access::iam::UserClientGrantUpsertRequest =
+        serde_json::from_value(params).map_err(|e| format!("invalid request body: {e}"))?;
+    let mut state = crate::access::iam::load_state(cert_dir)
+        .map_err(|e| format!("load local IAM state: {e}"))?;
+    let result = crate::access::iam::upsert_user_client_grant(&mut state, request, actor)
+        .map_err(|e| e.to_string())?;
+    crate::access::iam::save_state(cert_dir, &state)
+        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let loaded = crate::access::iam::load_state_for_overview(cert_dir);
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "principal": result.principal,
+        "grant": result.grant,
+        "created_principal": result.created_principal,
+        "created_grant": result.created_grant,
+        "iam": crate::access::iam::overview_metadata(&loaded),
+        "state": loaded.state
+    }))
+}
+
+fn access_iam_upsert_user_client_grant_response_body(
+    body_text: &str,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> (u16, String) {
+    let params = match serde_json::from_str::<serde_json::Value>(body_text) {
+        Ok(params) => params,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    match access_iam_upsert_user_client_grant_response_value(params, actor) {
+        Ok(value) => (200, value.to_string()),
+        Err(error) => (400, serde_json::json!({"error": error}).to_string()),
+    }
 }
 
 /// Handle a `POST /api/peers` body: parse, call `PeerRegistry::add_peer`,
@@ -26422,6 +26512,10 @@ fn http_access_context(
                 });
             }
         }
+        return Ok(HttpAccessContext {
+            principal: browser_mtls_root_principal(fingerprint, transport),
+            iam_state: None,
+        });
     }
     let source = if tls_client_cert_present {
         "browser-mtls"
@@ -26474,8 +26568,39 @@ fn dashboard_control_grant_for_client(
                 );
             }
         }
+        return Ok(
+            crate::dashboard_control::DashboardControlGrant::UserClientRoot {
+                principal: browser_mtls_root_principal(fingerprint, "webrtc-datachannel"),
+            },
+        );
     }
     Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal)
+}
+
+fn browser_mtls_root_principal(
+    fingerprint: &str,
+    transport: &str,
+) -> crate::access::iam::AccessPrincipal {
+    let fingerprint = crate::access::iam::normalize_browser_mtls_fingerprint(fingerprint);
+    let label = if fingerprint.is_empty() {
+        "Current browser certificate".to_string()
+    } else {
+        format!(
+            "Browser certificate {}",
+            fingerprint.chars().take(12).collect::<String>()
+        )
+    };
+    crate::access::iam::AccessPrincipal::root_user_client(
+        "browser-mtls",
+        transport,
+        label,
+        None,
+        vec![serde_json::json!({
+            "kind": "browser_mtls_cert",
+            "label": "Browser mTLS certificate",
+            "fingerprint": fingerprint,
+        })],
+    )
 }
 
 fn peer_identity_access_principal(
@@ -36837,6 +36962,14 @@ mod tests {
         assert_eq!(root.principal.kind, "root_session");
         assert_eq!(root.principal.source, "browser-mtls");
         assert_eq!(root.principal.transport, "https");
+        assert_eq!(
+            root.principal
+                .authn
+                .first()
+                .and_then(|authn| authn.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("browser_mtls_cert")
+        );
         assert!(
             root.decision(crate::peer::access_policy::PeerOperation::AccessManage)
                 .allowed
@@ -36882,7 +37015,7 @@ mod tests {
         let tmp = tempfile::TempDir::new().unwrap();
         let mut state = crate::access::iam::LocalIamState::default();
         state.principals.push(crate::access::iam::IamPrincipal {
-            id: "principal:browser-cert:fp123".to_string(),
+            id: "principal:browser-cert:ab123".to_string(),
             kind: "browser_certificate".to_string(),
             label: "Alice browser".to_string(),
             status: "active".to_string(),
@@ -36891,14 +37024,14 @@ mod tests {
             organization: None,
             authn: vec![serde_json::json!({
                 "kind": "browser_mtls_cert",
-                "fingerprint": "fp123"
+                "fingerprint": "ab123"
             })],
             notes: None,
             created_at_unix_ms: Some(100),
         });
         state.grants.push(crate::access::iam::IamGrant {
-            id: "grant:browser-cert:fp123:inspect".to_string(),
-            principal_id: "principal:browser-cert:fp123".to_string(),
+            id: "grant:browser-cert:ab123:inspect".to_string(),
+            principal_id: "principal:browser-cert:ab123".to_string(),
             target_id: "local".to_string(),
             role_id: "role:scoped-human".to_string(),
             policy_id: "policy:local-user-client".to_string(),
@@ -36910,8 +37043,45 @@ mod tests {
         });
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 
-        let access = http_access_context(tmp.path(), None, Some("fp123"), true, true).unwrap();
+        let access = http_access_context(tmp.path(), None, Some("ab123"), true, true).unwrap();
         assert_eq!(access.principal.kind, "browser_certificate");
+        assert!(
+            access
+                .decision(crate::peer::access_policy::PeerOperation::AccessInspect)
+                .allowed
+        );
+        assert!(
+            !access
+                .decision(crate::peer::access_policy::PeerOperation::AccessManage)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn access_iam_upsert_user_client_grant_persists_browser_binding() {
+        let tmp = tempfile::TempDir::new().unwrap();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        let result = access_iam_upsert_user_client_grant_response_value_with_cert_dir(
+            tmp.path(),
+            serde_json::json!({
+                "kind": "browser_certificate",
+                "label": "Alice browser",
+                "fingerprint": "AB:45:6"
+            }),
+            &actor,
+        )
+        .unwrap();
+
+        assert_eq!(result["created_principal"], true);
+        assert_eq!(result["created_grant"], true);
+        assert_eq!(result["iam"]["capabilities"]["write_api_available"], true);
+
+        let access = http_access_context(tmp.path(), None, Some("ab456"), true, true).unwrap();
+        assert_eq!(access.principal.kind, "browser_certificate");
+        assert_eq!(access.principal.label, "Alice browser");
         assert!(
             access
                 .decision(crate::peer::access_policy::PeerOperation::AccessInspect)

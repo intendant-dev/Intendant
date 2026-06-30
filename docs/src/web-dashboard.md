@@ -287,8 +287,8 @@ Unified administration for how dashboards and daemons reach each other:
 - **Overview** shows the current access scope, the local daemon identity, and
   the boundary between authority models and transports.
 - **People & Devices** lists user/client principals separately from peer daemon
-  identities. The current browser is user/client access and is root dashboard
-  access in the single-user product.
+  identities. The current browser or Connect account is user/client access; the
+  pane can bind that identity to a local scoped or root grant.
 - **Daemons** lists daemon targets, not raw transports. A target can be this
   daemon over user/client access, a hosted-transport daemon, a direct browser-mTLS
   daemon, or a peer-routed daemon. Each row shows the access domain, route, and
@@ -296,8 +296,9 @@ Unified administration for how dashboards and daemons reach each other:
 - **Peer Trust** focuses on daemon-to-daemon relationships: approved inbound
   identities and configured outbound peer routes, both bounded by peer profiles.
 - **Policies** shows the role/policy model, local IAM role templates, and the
-  permission matrix used by dashboard-control and peer auth. This is read-only
-  until editable IAM is deliberately designed.
+  permission matrix used by dashboard-control and peer auth. Minimal local
+  browser/Connect grants are editable; organization groups, directory scopes,
+  public shares, and external identity policy remain design targets.
 - **Audit** renders the overview-backed grant detail: principal, target, policy,
   transport, enforcement status, and why the access exists. It also keeps the
   legacy trusted relationship panel during the transition.
@@ -314,25 +315,27 @@ and peer federation:
 
 - A **target** is a daemon the dashboard can operate.
 - A **principal** is the actor being trusted: the current browser session, a
-  future passkey/account principal, a future browser-certificate human
-  principal, an organization group, or a peer daemon.
+  browser certificate, a hosted Connect account, a future organization group, or
+  a peer daemon.
 - A **grant** connects one principal to one target with a role and status. The
   current browser has a root user/client grant to the local daemon. A peer route
   has a daemon peer-profile grant. An approved inbound peer identity appears as
   a peer-daemon principal with a peer-profile grant to this daemon; revoked
   identities remain visible as revoked grants for audit clarity. Local IAM
-  draft grants loaded from `iam.json` are visible as `enforced: false` until
-  stable user/client principal binding exists.
+  grants loaded from `iam.json` are enforced when active and bound to browser
+  mTLS certificate fingerprints or hosted Connect account metadata; draft and
+  revoked records remain visible for review.
 - A **policy** defines the shape of authority behind a grant. `root` and
-  `peer-profile` are enforced today. Scoped human IAM, directory-scoped file
-  access, and public shares are design targets, not hidden enforcement.
+  `peer-profile` are enforced today. Minimal `scoped-human` access is enforced
+  for local browser/Connect bindings. Directory-scoped file access, public
+  shares, organization groups, and external identity policy are design targets,
+  not hidden enforcement.
 - A **permission** is the operation gate the daemon enforces. Access
   administration now separates `access.inspect` from `access.manage`, and peer
   topology separates `peer.inspect` from `peer.manage`. Owner/root dashboard
   sessions have all four. Existing peer profiles are mapped conservatively:
   `peer-root` can inspect access and inspect/manage peer topology, but
-  `access.manage` remains reserved for trusted user/client owner sessions until
-  human IAM is deliberately designed.
+  `access.manage` remains reserved for trusted root user/client sessions.
 - A **transport** is only how the route is carried: browser mTLS, hosted
   Connect/WebRTC tunnel, local/debug HTTP, or daemon-to-daemon peer mTLS. The
   product UI should not make Connect a separate access system.
@@ -341,8 +344,9 @@ The important security-domain split is:
 
 - **User/client daemon access** means a human-operated dashboard can control a
   daemon. Hosted Connect passkey access and browser mTLS client certificates are
-  both in this domain. Today that is intentionally root dashboard access for the
-  owner. Future coworker/team access should be user-scoped IAM here, not peer
+  both in this domain. Unbound owner sessions remain root-compatible; active
+  local IAM bindings can scope a browser certificate or Connect account through
+  this same domain. Future coworker/team access belongs here, not in peer
   federation.
 - **Peer access** means one daemon can call capabilities on another daemon. That
   uses daemon-to-daemon mTLS identities and peer profiles such as `peer-operator`
@@ -372,7 +376,10 @@ browser mTLS and hosted Connect requests remain root-compatible when no active
 local binding exists, but an active matching local principal/grant wins over the
 root fallback. The `iam.enforcement` object reports `root_session_grants: true`,
 `peer_profile_grants: true`, `user_client_grants: true`, and
-`principal_binding: root_peer_and_local_user_client`.
+`principal_binding: root_peer_and_local_user_client`. Root sessions can create
+or update local user/client grants through the People & Devices pane,
+`POST /api/access/iam/user-client-grants`, or dashboard-control
+`api_access_iam_upsert_user_client_grant`.
 
 `GET /api/dashboard/targets` and `api_dashboard_targets` remain the compatibility
 target model used by older UI paths: target id/host id, display label, access

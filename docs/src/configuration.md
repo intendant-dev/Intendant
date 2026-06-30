@@ -607,10 +607,14 @@ Schema version 1 contains:
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
-sessions and peer daemon profiles pass through the IAM operation evaluator, but
-current local IAM records are still inspection/model data only: scoped
-user/client grants are marked `enforced: false` until browser mTLS or Connect
-requests can be bound to stable human/device principals.
+sessions, peer daemon profiles, and active scoped user/client grants pass
+through the IAM operation evaluator. The daemon can currently bind scoped
+user/client grants to browser mTLS certificate fingerprints and hosted Connect
+account metadata. Matching active records are enforced; unbound owner browser
+mTLS and Connect dashboard sessions keep the existing root-compatible fallback.
+Root users can create or update these records through the Access UI,
+`POST /api/access/iam/user-client-grants`, or dashboard-control
+`api_access_iam_upsert_user_client_grant`.
 
 ### `mcp_servers`
 

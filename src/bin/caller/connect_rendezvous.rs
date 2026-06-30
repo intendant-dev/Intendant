@@ -460,7 +460,7 @@ fn connect_dashboard_grant(
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     let path = crate::access::iam::iam_state_path(&cert_dir);
     if !path.exists() {
-        return Ok(crate::dashboard_control::DashboardControlGrant::TrustedLocal);
+        return Ok(connect_dashboard_root_grant(user_id, account_name));
     }
     let state = crate::access::iam::load_state(&cert_dir)
         .map_err(|e| format!("local IAM state is invalid: {e}"))?;
@@ -486,7 +486,63 @@ fn connect_dashboard_grant_from_state(
             principal,
             iam_state: state,
         },
-        None => crate::dashboard_control::DashboardControlGrant::TrustedLocal,
+        None => connect_dashboard_root_grant(Some(user_id), account_name),
+    }
+}
+
+fn connect_dashboard_root_grant(
+    user_id: Option<&str>,
+    account_name: Option<&str>,
+) -> crate::dashboard_control::DashboardControlGrant {
+    let user_id = user_id.map(str::trim).filter(|value| !value.is_empty());
+    let account_name = account_name
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let mut account = serde_json::Map::new();
+    account.insert(
+        "provider".to_string(),
+        serde_json::Value::String("intendant.dev".to_string()),
+    );
+    if let Some(user_id) = user_id {
+        account.insert(
+            "user_id".to_string(),
+            serde_json::Value::String(user_id.to_string()),
+        );
+    }
+    if let Some(account_name) = account_name {
+        account.insert(
+            "account_name".to_string(),
+            serde_json::Value::String(account_name.to_string()),
+        );
+    }
+    let label = account_name
+        .map(|name| format!("@{name}"))
+        .or_else(|| {
+            user_id.map(|id| {
+                format!(
+                    "Connect account {}",
+                    id.chars().take(12).collect::<String>()
+                )
+            })
+        })
+        .unwrap_or_else(|| "Connect account".to_string());
+    let mut authn = account.clone();
+    authn.insert(
+        "kind".to_string(),
+        serde_json::Value::String("connect_account".to_string()),
+    );
+    authn.insert(
+        "label".to_string(),
+        serde_json::Value::String("Intendant Connect account".to_string()),
+    );
+    crate::dashboard_control::DashboardControlGrant::UserClientRoot {
+        principal: crate::access::iam::AccessPrincipal::root_user_client(
+            "connect-account",
+            "connect-dashboard-control",
+            label,
+            Some(serde_json::Value::Object(account)),
+            vec![serde_json::Value::Object(authn)],
+        ),
     }
 }
 
@@ -668,6 +724,32 @@ mod tests {
                 crate::peer::access_policy::PeerOperation::AccessManage,
             )
             .allowed
+        );
+    }
+
+    #[test]
+    fn unmatched_connect_account_metadata_remains_root_but_identified() {
+        let state = crate::access::iam::LocalIamState::default();
+        let grant = connect_dashboard_grant_from_state(state, "user-123", Some("alice"));
+        let crate::dashboard_control::DashboardControlGrant::UserClientRoot { principal } = grant
+        else {
+            panic!("expected identified root user-client grant");
+        };
+        assert_eq!(principal.kind, "root_session");
+        assert_eq!(principal.label, "@alice");
+        assert_eq!(
+            principal.account.as_ref().and_then(|account| account
+                .get("account_name")
+                .and_then(serde_json::Value::as_str)),
+            Some("alice")
+        );
+        assert_eq!(
+            principal
+                .authn
+                .first()
+                .and_then(|authn| authn.get("kind"))
+                .and_then(serde_json::Value::as_str),
+            Some("connect_account")
         );
     }
 }

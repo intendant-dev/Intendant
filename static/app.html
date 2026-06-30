@@ -671,6 +671,100 @@ html {
   font-size: 13px;
   font-weight: 700;
 }
+.access-iam-form {
+  margin: 0 0 14px;
+  padding: 12px;
+  border: 1px solid var(--surface1);
+  border-radius: 6px;
+  background: var(--base);
+}
+.access-iam-form-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+.access-iam-form-title {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 800;
+}
+.access-iam-form-status {
+  flex: 0 0 auto;
+  color: var(--overlay0);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.access-iam-form-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(180px, 1fr));
+  gap: 8px;
+}
+.access-iam-form-grid label {
+  display: grid;
+  gap: 4px;
+  min-width: 0;
+  color: var(--overlay1);
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+.access-iam-form-grid input,
+.access-iam-form-grid select {
+  min-width: 0;
+  width: 100%;
+  padding: 7px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font: inherit;
+  font-size: 12px;
+}
+.access-iam-form-grid input:focus,
+.access-iam-form-grid select:focus {
+  outline: 1px solid var(--blue);
+  outline-offset: 1px;
+}
+.access-iam-form-actions {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-top: 10px;
+}
+.access-iam-form-message {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--subtext0);
+  font-size: 11px;
+}
+.access-iam-form-actions button {
+  flex: 0 0 auto;
+  padding: 6px 10px;
+  border: 1px solid var(--blue);
+  border-radius: 4px;
+  background: var(--blue);
+  color: var(--crust);
+  cursor: pointer;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 800;
+}
+.access-iam-form-actions button:disabled {
+  border-color: var(--surface1);
+  background: var(--surface0);
+  color: var(--overlay0);
+  cursor: not-allowed;
+}
 .access-empty {
   color: var(--subtext0);
   font-size: 12px;
@@ -11462,6 +11556,7 @@ body.display-fullscreen-open {
         </div>
         <div class="subtab-pane" id="access-pane-people">
           <div class="access-pane-body">
+            <div id="access-user-client-grant-form"></div>
             <div id="access-people-overview" class="access-overview-grid"></div>
             <div id="access-people-details" class="access-detail-grid"></div>
           </div>
@@ -12554,6 +12649,7 @@ const DASHBOARD_CONNECT_SIGNALING_BASE = String(
 let daemons = [];
 let dashboardAccessTargets = [];
 let dashboardAccessOverview = null;
+let accessUserClientGrantSubmitting = false;
 let dashboardControlTransport = null;
 let dashboardTransport = null;
 let dashboardServerMessageDispatcher = null;
@@ -33061,7 +33157,7 @@ function accessIamLoadLabel(iam) {
 
 function accessIamEnforcementReason(iam) {
   const enforcement = iam.enforcement && typeof iam.enforcement === 'object' ? iam.enforcement : {};
-  return accessModelLabel(enforcement.reason, 'Scoped user/client grants are model data until stable human/device principal binding is available.');
+  return accessModelLabel(enforcement.reason, 'Active scoped user/client grants are enforced when requests bind to browser mTLS or Connect account identities.');
 }
 
 function accessOverviewModel() {
@@ -33167,8 +33263,8 @@ function accessOverviewModel() {
     }, {
       id: 'policy:scoped-human',
       label: 'Scoped human access',
-      status: 'planned',
-      summary: 'Future IAM-style grants for coworkers, teams, and browser certificates.',
+      status: 'enforced',
+      summary: 'Minimal local IAM grants for stable browser mTLS certificates and hosted Connect account metadata.',
     }, {
       id: 'policy:directory-files',
       label: 'Directory scoped files',
@@ -33244,7 +33340,7 @@ function accessOverviewModel() {
       capabilities: {
         state_file_supported: true,
         read_local_state: true,
-        write_api_available: false,
+        write_api_available: true,
         operation_evaluator: true,
         enforce_root_and_peer_grants: true,
         enforce_user_client_grants: true,
@@ -33275,7 +33371,7 @@ function accessOverviewCards() {
     ? overview.architecture.unresolved.length
     : 0;
   const humanPrincipals = principals.filter(p =>
-    /browser|human|passkey|certificate/.test(String(p.kind || ''))
+    /browser|human|passkey|certificate|connect/.test(String(p.kind || ''))
   ).length;
   const peerPrincipals = principals.filter(p => String(p.kind || '') === 'peer_daemon').length;
   const activeGrants = grants.filter(g => !/planned|draft|offline|revoked|disabled|failed/.test(String(g.status || 'active'))).length;
@@ -33311,8 +33407,8 @@ function accessOverviewCards() {
     title: 'Policies',
     kind: `${enforcedPolicies} enforced`,
     detail: plannedPolicies === 1
-      ? '1 planned policy area remains a design target, including scoped human IAM.'
-      : `${plannedPolicies} planned policy areas remain design targets, including scoped human IAM.`,
+      ? '1 planned policy area remains a design target.'
+      : `${plannedPolicies} planned policy areas remain design targets.`,
   }, {
     title: 'Permissions',
     kind: `${enforcedPermissions}/${permissions.length || enforcedPermissions} enforced`,
@@ -33746,7 +33842,7 @@ function accessGrantWhy(grant) {
     return 'This inbound daemon mTLS identity was approved for this daemon. The peer profile bounds what the remote daemon may do here.';
   }
   if (kind === 'user_client_local_iam') {
-    return 'This grant is stored in local IAM state, but it is not enforced until requests can be bound to stable human/device principals.';
+    return 'This local IAM grant is enforced when a request binds to its browser certificate or Connect account metadata.';
   }
   return source ? `Authority comes from ${source}.` : 'Authority is described by this grant.';
 }
@@ -33866,10 +33962,245 @@ function accessAuditGrantCards() {
   }));
 }
 
+function accessCurrentUserClientCandidate() {
+  const principal = dashboardControlTransport?.lastStatus?.access_principal;
+  const authnList = Array.isArray(principal?.authn) ? principal.authn : [];
+  const browserAuthn = authnList.find(item =>
+    accessModelLabel(item?.kind) === 'browser_mtls_cert' && accessModelLabel(item?.fingerprint)
+  );
+  if (browserAuthn) {
+    return {
+      kind: 'browser_certificate',
+      label: accessModelLabel(principal?.label, 'Current browser certificate'),
+      fingerprint: accessModelLabel(browserAuthn.fingerprint),
+      user_id: '',
+      account_name: '',
+    };
+  }
+  const connectAuthn = authnList.find(item =>
+    accessModelLabel(item?.kind) === 'connect_account' &&
+    (accessModelLabel(item?.user_id) || accessModelLabel(item?.account_name))
+  );
+  if (connectAuthn) {
+    const accountName = accessModelLabel(connectAuthn.account_name || principal?.account?.account_name);
+    const userId = accessModelLabel(connectAuthn.user_id || principal?.account?.user_id);
+    return {
+      kind: 'connect_account',
+      label: accessModelLabel(principal?.label, accountName ? `@${accountName}` : 'Current Connect account'),
+      fingerprint: '',
+      user_id: userId,
+      account_name: accountName,
+    };
+  }
+  return null;
+}
+
+function accessSetField(parent, id, value) {
+  const el = parent.querySelector(`#${id}`);
+  if (el) el.value = value == null ? '' : String(value);
+}
+
+function accessSyncUserClientGrantFields(form) {
+  const kind = form?.querySelector('#access-user-client-kind')?.value || 'browser_certificate';
+  const browserFields = form?.querySelectorAll('[data-access-kind-field="browser_certificate"]') || [];
+  const connectFields = form?.querySelectorAll('[data-access-kind-field="connect_account"]') || [];
+  browserFields.forEach(node => { node.style.display = kind === 'browser_certificate' ? '' : 'none'; });
+  connectFields.forEach(node => { node.style.display = kind === 'connect_account' ? '' : 'none'; });
+}
+
+function renderAccessUserClientGrantForm() {
+  const mount = document.getElementById('access-user-client-grant-form');
+  if (!mount) return;
+  const overview = accessOverviewModel();
+  const iam = accessIamModel(overview);
+  const writeApiAvailable = iam?.capabilities?.write_api_available !== false;
+  const rpcAvailable = dashboardControlTransport?.lastStatus?.api_access_iam_upsert_user_client_grant_available;
+  const canSubmit = writeApiAvailable && rpcAvailable !== false;
+  const candidate = accessCurrentUserClientCandidate();
+  mount.innerHTML = '';
+
+  const form = document.createElement('form');
+  form.className = 'access-iam-form';
+  form.addEventListener('submit', accessSubmitUserClientGrant);
+
+  const head = document.createElement('div');
+  head.className = 'access-iam-form-head';
+  const title = document.createElement('div');
+  title.className = 'access-iam-form-title';
+  title.textContent = 'Current user/client grant';
+  const status = document.createElement('div');
+  status.className = 'access-iam-form-status';
+  status.textContent = canSubmit ? 'Manage' : 'Inspect';
+  head.append(title, status);
+
+  const grid = document.createElement('div');
+  grid.className = 'access-iam-form-grid';
+  const fields = [{
+    id: 'access-user-client-kind',
+    label: 'Type',
+    type: 'select',
+    options: [
+      ['browser_certificate', 'Browser certificate'],
+      ['connect_account', 'Connect account'],
+    ],
+  }, {
+    id: 'access-user-client-label',
+    label: 'Label',
+    type: 'text',
+    autocomplete: 'off',
+  }, {
+    id: 'access-user-client-fingerprint',
+    label: 'Fingerprint',
+    type: 'text',
+    autocomplete: 'off',
+    kind: 'browser_certificate',
+  }, {
+    id: 'access-user-client-user-id',
+    label: 'User id',
+    type: 'text',
+    autocomplete: 'off',
+    kind: 'connect_account',
+  }, {
+    id: 'access-user-client-account-name',
+    label: 'Account name',
+    type: 'text',
+    autocomplete: 'off',
+    kind: 'connect_account',
+  }, {
+    id: 'access-user-client-role',
+    label: 'Role',
+    type: 'select',
+    options: [
+      ['role:scoped-human', 'Scoped human'],
+      ['role:root', 'Root'],
+    ],
+  }, {
+    id: 'access-user-client-status',
+    label: 'Status',
+    type: 'select',
+    options: [
+      ['active', 'Active'],
+      ['draft', 'Draft'],
+    ],
+  }];
+  for (const field of fields) {
+    const label = document.createElement('label');
+    label.textContent = field.label;
+    if (field.kind) label.dataset.accessKindField = field.kind;
+    let input;
+    if (field.type === 'select') {
+      input = document.createElement('select');
+      for (const [value, text] of field.options || []) {
+        const option = document.createElement('option');
+        option.value = value;
+        option.textContent = text;
+        input.appendChild(option);
+      }
+    } else {
+      input = document.createElement('input');
+      input.type = field.type || 'text';
+      input.autocomplete = field.autocomplete || 'off';
+      input.spellcheck = false;
+    }
+    input.id = field.id;
+    label.appendChild(input);
+    grid.appendChild(label);
+  }
+
+  const actions = document.createElement('div');
+  actions.className = 'access-iam-form-actions';
+  const message = document.createElement('div');
+  message.className = 'access-iam-form-message';
+  message.id = 'access-user-client-grant-message';
+  message.textContent = candidate
+    ? (candidate.kind === 'connect_account' ? 'Connect account detected' : 'Browser certificate detected')
+    : 'Manual identity entry';
+  const button = document.createElement('button');
+  button.type = 'submit';
+  button.disabled = !canSubmit || accessUserClientGrantSubmitting;
+  button.textContent = accessUserClientGrantSubmitting ? 'Saving' : 'Save grant';
+  actions.append(message, button);
+
+  form.append(head, grid, actions);
+  mount.appendChild(form);
+  if (candidate) {
+    accessSetField(form, 'access-user-client-kind', candidate.kind);
+    accessSetField(form, 'access-user-client-label', candidate.label);
+    accessSetField(form, 'access-user-client-fingerprint', candidate.fingerprint);
+    accessSetField(form, 'access-user-client-user-id', candidate.user_id);
+    accessSetField(form, 'access-user-client-account-name', candidate.account_name);
+  }
+  accessSetField(form, 'access-user-client-role', 'role:scoped-human');
+  accessSetField(form, 'access-user-client-status', 'active');
+  form.querySelector('#access-user-client-kind')?.addEventListener('change', () => accessSyncUserClientGrantFields(form));
+  accessSyncUserClientGrantFields(form);
+}
+
+async function accessSubmitUserClientGrant(event) {
+  event?.preventDefault?.();
+  const form = event?.currentTarget || document.querySelector('#access-user-client-grant-form form');
+  if (!form || accessUserClientGrantSubmitting) return;
+  const kind = form.querySelector('#access-user-client-kind')?.value || 'browser_certificate';
+  const payload = {
+    kind,
+    label: form.querySelector('#access-user-client-label')?.value?.trim() || null,
+    fingerprint: kind === 'browser_certificate'
+      ? (form.querySelector('#access-user-client-fingerprint')?.value?.trim() || null)
+      : null,
+    user_id: kind === 'connect_account'
+      ? (form.querySelector('#access-user-client-user-id')?.value?.trim() || null)
+      : null,
+    account_name: kind === 'connect_account'
+      ? (form.querySelector('#access-user-client-account-name')?.value?.trim() || null)
+      : null,
+    role_id: form.querySelector('#access-user-client-role')?.value || 'role:scoped-human',
+    status: form.querySelector('#access-user-client-status')?.value || 'active',
+  };
+  if (kind === 'browser_certificate' && !payload.fingerprint) {
+    showControlToast?.('error', 'Fingerprint is required');
+    return;
+  }
+  if (kind === 'connect_account' && !payload.user_id && !payload.account_name) {
+    showControlToast?.('error', 'User id or account name is required');
+    return;
+  }
+  if (payload.role_id === 'role:root') {
+    const ok = await showDashboardConfirm({
+      title: 'Grant root access',
+      message: 'Root can control this daemon.',
+      confirmLabel: 'Grant root',
+      cancelLabel: 'Cancel',
+      danger: true,
+    });
+    if (!ok) return;
+  }
+  accessUserClientGrantSubmitting = true;
+  renderAccessUserClientGrantForm();
+  try {
+    const resp = await dashboardJsonFetch('api_access_iam_upsert_user_client_grant', payload, () => authedFetch('/api/access/iam/user-client-grants', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_iam_upsert_user_client_grant', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    if (data?.iam) {
+      dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };
+    }
+    await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+    showControlToast?.('success', 'Access grant saved');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Access grant save failed');
+  } finally {
+    accessUserClientGrantSubmitting = false;
+    renderAccessAdminSummaries();
+  }
+}
+
 function accessPeopleCards() {
   const overview = accessOverviewModel();
   const principals = accessOverviewArray(overview, 'principals');
-  const human = principals.filter(p => /browser|human|passkey|certificate/.test(accessModelLabel(p.kind))).length;
+  const human = principals.filter(p => /browser|human|passkey|certificate|connect/.test(accessModelLabel(p.kind))).length;
   const peer = principals.filter(p => accessModelLabel(p.kind) === 'peer_daemon').length;
   const plannedKinds = accessOverviewArray(overview, 'supported_principal_kinds')
     .filter(kind => /planned/.test(accessModelLabel(kind.status))).length;
@@ -33884,7 +34215,7 @@ function accessPeopleCards() {
   }, {
     title: 'Planned principal types',
     kind: accessPlural(plannedKinds, 'type'),
-    detail: 'Organization groups and future scoped human IAM are visible as design targets only.',
+    detail: 'Organization groups remain visible as a design target.',
   }];
 }
 
@@ -33926,7 +34257,7 @@ function accessPolicyCards() {
   return [{
     title: 'Policies',
     kind: `${enforcedPolicies}/${policies.length || enforcedPolicies} enforced`,
-    detail: 'Policies describe roles; scoped human IAM and public shares remain planned.',
+    detail: 'Policies describe roles; organization groups, directory scopes, and public shares remain planned.',
   }, {
     title: 'Permissions',
     kind: `${enforcedPermissions}/${permissions.length || enforcedPermissions} enforced`,
@@ -33959,7 +34290,7 @@ function renderAccessOverviewDetails() {
     title: 'Access boundary',
     status: unresolved.length ? 'planned' : 'enforced',
     lines: [
-      ['Current model', 'Read-only access administration'],
+      ['Current model', 'Local user/client grants and daemon peer grants'],
       ['Connect', 'Transport, not an authority model'],
       ['Browser mTLS', 'Transport/auth credential for user-client authority'],
       ['Peer mTLS', 'Daemon-to-daemon authority only'],
@@ -33992,6 +34323,10 @@ function accessPermissionMatrixCell(policy, permission) {
     if (permissionId === 'access.manage') return { text: 'No', state: 'no' };
     if (permissionId === 'access.inspect') return { text: 'Peer root', state: 'conditional' };
     if (permissionId === 'peer.inspect' || permissionId === 'peer.manage') return { text: 'Profile', state: 'conditional' };
+  }
+  if (policyId === 'policy:scoped-human') {
+    if (permissionId === 'access.inspect') return { text: 'Yes', state: 'yes' };
+    return { text: 'No', state: 'no' };
   }
   return { text: 'No', state: 'no' };
 }
@@ -34124,6 +34459,7 @@ function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
   accessRenderCards('access-model-overview', accessOverviewCards());
   renderAccessOverviewDetails();
+  renderAccessUserClientGrantForm();
   accessRenderCards('access-people-overview', accessPeopleCards());
   accessRenderDetailCards('access-people-details', accessPrincipalDetailCards());
   accessRenderCards('access-daemon-overview', accessDaemonCards());
@@ -45338,6 +45674,7 @@ class DashboardControlTransport {
       presenceToolRequestAvailable: this.lastStatus?.presence_tool_request_available ?? null,
       accessInspectAvailable: this.lastStatus?.access_inspect_available ?? null,
       accessManageAvailable: this.lastStatus?.access_manage_available ?? null,
+      apiAccessIamUpsertUserClientGrantAvailable: this.lastStatus?.api_access_iam_upsert_user_client_grant_available ?? null,
       peerInspectAvailable: this.lastStatus?.peer_inspect_available ?? null,
       peerManageAvailable: this.lastStatus?.peer_manage_available ?? null,
       apiPresenceVideoFrameAvailable: this.lastStatus?.api_presence_video_frame_available ?? null,
