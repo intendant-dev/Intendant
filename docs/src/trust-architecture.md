@@ -182,9 +182,15 @@ The pieces that implement the model, mapped to the codebase:
   ceilings and audit apply unchanged. The certificate ceremony happens once
   per *user*, not once per browser or per daemon.
 - **Grant fanout**: the anchor-served Access page applies one grant across
-  many daemons by opening direct, key-authenticated, daemon-verified sessions
-  to each fleet member and calling its IAM API. No central grant store
-  exists.
+  many daemons — an "Apply to" step in the grant flow calls each selected
+  fleet daemon's IAM API directly (browser mTLS, cross-origin), with
+  per-daemon results; every target authorizes independently and no central
+  grant store exists. Cross-origin access to the six fleet Access APIs is
+  gated by a per-daemon origin allowlist (itself, the macOS app scheme, its
+  outbound peer routes, its approved inbound identities) that both drives
+  the CORS echo and refuses state-changing requests from any other page —
+  closing the hole where a cert-installed browser could be steered by an
+  arbitrary website. These routes are never wildcard-readable.
 - **Signed/encrypted fleet sync**: the hosted metadata store holds
   client-encrypted blobs and owner-signed records; clients verify on read.
   The store cannot inject a daemon into your fleet view.

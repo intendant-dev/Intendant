@@ -430,6 +430,20 @@ or update local user/client grants through the People & Devices pane,
 drafted, revoked, or role-changed with `POST /api/access/iam/grants/update` or
 dashboard-control `api_access_iam_update_grant`.
 
+The grant flow's **Apply to** step fans one grant out across the fleet: the
+page calls each selected daemon's
+`POST /api/access/iam/user-client-grants` directly and reports per-daemon
+results; every target authorizes independently. Cross-origin use of the
+fleet Access APIs (`/api/access/overview`, `/api/access/iam/state`,
+`/api/access/iam/user-client-grants`, `/api/access/iam/grants/update`,
+`/api/access/enrollment-requests[/decide]`) is origin-gated per daemon: only
+the daemon's own origin, the macOS app scheme, its outbound peer routes, and
+its approved inbound peer identities may drive them, and responses are never
+wildcard-readable. Requests from any other page are refused outright, so a
+browser-installed mTLS certificate cannot be steered cross-site. Reach the
+Access page by an origin the fleet advertises (the target rows already link
+that way) for cross-daemon administration to work.
+
 Device enrollment closes the loop for browsers that hold an identity key but
 no grant yet: when a *verified* client key is refused, the daemon queues a
 pending enrollment (in-memory, capped, TTL'd — the queue grants nothing by

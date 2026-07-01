@@ -20797,15 +20797,53 @@ pub fn spawn_web_gateway(
                     // CORS preflight: respond to OPTIONS with permissive headers.
                     // Needed when the page is served from a custom scheme (intendant://)
                     // in the macOS app bundle — API fetches become cross-origin.
+                    //
+                    // Exception: the fleet Access APIs never get the wildcard.
+                    // Their preflight only succeeds for allowlisted fleet
+                    // origins (and the write-side gate below enforces the same
+                    // list on the actual requests, so a non-preflighted
+                    // cross-site POST is refused too).
                     if request_line.starts_with("OPTIONS") {
                         use tokio::io::AsyncWriteExt;
-                        let response = "HTTP/1.1 204 No Content\r\n\
-                            Access-Control-Allow-Origin: *\r\n\
-                            Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
-                            Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
-                            Access-Control-Max-Age: 86400\r\n\
-                            Connection: close\r\n\
-                            \r\n";
+                        let (_, opt_path, _) = parse_request_target(request_line);
+                        let response = if is_fleet_cors_access_path(opt_path) {
+                            let cert_dir = crate::access::backend::select_backend().cert_dir();
+                            let allowed = extract_origin_header(&header_text).filter(|origin| {
+                                fleet_access_origin_allowed(
+                                    origin,
+                                    is_tls,
+                                    &header_text,
+                                    peer_registry.as_ref(),
+                                    &cert_dir,
+                                )
+                            });
+                            match allowed {
+                                Some(origin) => format!(
+                                    "HTTP/1.1 204 No Content\r\n\
+                                     Access-Control-Allow-Origin: {origin}\r\n\
+                                     Access-Control-Allow-Methods: GET, POST, OPTIONS\r\n\
+                                     Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+                                     Access-Control-Max-Age: 86400\r\n\
+                                     Vary: Origin\r\n\
+                                     Connection: close\r\n\
+                                     \r\n"
+                                ),
+                                None => "HTTP/1.1 204 No Content\r\n\
+                                    Vary: Origin\r\n\
+                                    Connection: close\r\n\
+                                    \r\n"
+                                    .to_string(),
+                            }
+                        } else {
+                            "HTTP/1.1 204 No Content\r\n\
+                                Access-Control-Allow-Origin: *\r\n\
+                                Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                                Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+                                Access-Control-Max-Age: 86400\r\n\
+                                Connection: close\r\n\
+                                \r\n"
+                                .to_string()
+                        };
                         let _ = stream.write_all(response.as_bytes()).await;
                         finalize_http_stream(&mut stream).await;
                         return;
@@ -20946,6 +20984,45 @@ pub fn spawn_web_gateway(
                             return;
                         }
                     }
+
+                    // Fleet Access APIs: origin gate + CORS echo. A browser
+                    // sends an Origin header on every cross-origin request
+                    // (and on same-origin POSTs); requests from pages outside
+                    // the fleet allowlist are refused outright — the
+                    // browser-attached mTLS certificate must not let an
+                    // arbitrary website drive IAM writes. Allowed origins get
+                    // the CORS echo appended to the arm's response below.
+                    let fleet_cors_origin: Option<String> = if is_fleet_cors_access_path(req_path)
+                    {
+                        let origin = extract_origin_header(&header_text);
+                        match origin {
+                            Some(origin) => {
+                                if fleet_access_origin_allowed(
+                                    &origin,
+                                    is_tls,
+                                    &header_text,
+                                    peer_registry.as_ref(),
+                                    &cert_dir,
+                                ) {
+                                    Some(origin)
+                                } else {
+                                    use tokio::io::AsyncWriteExt;
+                                    let body = serde_json::json!({
+                                        "error": "cross-origin caller is not in this daemon's fleet allowlist",
+                                        "origin": origin,
+                                    })
+                                    .to_string();
+                                    let response = json_response("403 Forbidden", body);
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    finalize_http_stream(&mut stream).await;
+                                    return;
+                                }
+                            }
+                            None => None,
+                        }
+                    } else {
+                        None
+                    };
 
                     if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
@@ -22702,7 +22779,10 @@ pub fn spawn_web_gateway(
                                         &http_access_context.principal,
                                     )
                                 };
-                                let response = json_response(status_reason(status), body);
+                                let response = with_fleet_cors(
+                                    json_response(status_reason(status), body),
+                                    fleet_cors_origin.as_deref(),
+                                );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
@@ -22735,19 +22815,28 @@ pub fn spawn_web_gateway(
                                     &body_text,
                                     &http_access_context.principal,
                                 );
-                                let response = json_response(status_reason(status), body);
+                                let response = with_fleet_cors(
+                                    json_response(status_reason(status), body),
+                                    fleet_cors_origin.as_deref(),
+                                );
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
                     } else if request_line.contains(" /api/access/enrollment-requests") {
                         use tokio::io::AsyncWriteExt;
                         let body = access_enrollment_requests_response_body();
-                        let response = json_response("200 OK", body);
+                        let response = with_fleet_cors(
+                            json_response("200 OK", body),
+                            fleet_cors_origin.as_deref(),
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/access/iam/state") {
                         use tokio::io::AsyncWriteExt;
                         let body = access_iam_state_response_body();
-                        let response = json_response("200 OK", body);
+                        let response = with_fleet_cors(
+                            json_response("200 OK", body),
+                            fleet_cors_origin.as_deref(),
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/access/overview") {
                         use tokio::io::AsyncWriteExt;
@@ -22756,7 +22845,10 @@ pub fn spawn_web_gateway(
                             peer_registry.as_ref(),
                             &http_access_context.principal,
                         );
-                        let response = json_response("200 OK", body);
+                        let response = with_fleet_cors(
+                            json_response("200 OK", body),
+                            fleet_cors_origin.as_deref(),
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/dashboard/targets") {
                         use tokio::io::AsyncWriteExt;
@@ -24258,6 +24350,150 @@ fn access_iam_upsert_user_client_grant_response_value_with_cert_dir(
         "iam": crate::access::iam::overview_metadata(&loaded),
         "state": loaded.state
     }))
+}
+
+/// The Access API paths that participate in fleet cross-origin access: the
+/// anchor-served Access page manages sibling daemons by calling these
+/// directly, so they get an origin allowlist instead of the wildcard CORS
+/// used by harmless bootstrap endpoints. The same allowlist doubles as a
+/// write-side origin gate: browser-attached mTLS certificates would
+/// otherwise let any website fire state-changing requests cross-site.
+pub(crate) fn is_fleet_cors_access_path(req_path: &str) -> bool {
+    matches!(
+        req_path,
+        "/api/access/overview"
+            | "/api/access/iam/state"
+            | "/api/access/enrollment-requests"
+            | "/api/access/enrollment-requests/decide"
+            | "/api/access/iam/user-client-grants"
+            | "/api/access/iam/grants/update"
+    )
+}
+
+fn normalized_origin(value: &str) -> Option<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() || trimmed.eq_ignore_ascii_case("null") {
+        return None;
+    }
+    let url = url::Url::parse(trimmed).ok()?;
+    let scheme = match url.scheme() {
+        "ws" => "http",
+        "wss" => "https",
+        other => other,
+    };
+    let host = url.host_str()?.to_ascii_lowercase();
+    match url.port() {
+        Some(port) => Some(format!("{scheme}://{host}:{port}")),
+        None => Some(format!("{scheme}://{host}")),
+    }
+}
+
+fn extract_origin_header(header_text: &str) -> Option<String> {
+    header_text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("origin:"))
+        .map(|line| line[line.find(':').unwrap_or(6) + 1..].trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn extract_host_header(header_text: &str) -> Option<String> {
+    header_text
+        .lines()
+        .find(|line| line.to_ascii_lowercase().starts_with("host:"))
+        .map(|line| line[line.find(':').unwrap_or(4) + 1..].trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+/// Decide whether a cross-origin caller may use the fleet Access APIs.
+/// Allowed origins are: this daemon itself (same-origin requests also send
+/// an Origin header on POST), the macOS app bundle's custom scheme, this
+/// daemon's outbound peer routes, and its approved inbound peer identities.
+/// Everything else — including `Origin: null` — is refused. Authentication
+/// is still mTLS/IAM; this gate only decides which *pages* may drive it.
+fn fleet_access_origin_allowed(
+    origin: &str,
+    is_tls: bool,
+    header_text: &str,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+    cert_dir: &std::path::Path,
+) -> bool {
+    let origin = origin.trim();
+    if origin.eq_ignore_ascii_case("null") || origin.is_empty() {
+        return false;
+    }
+    // The macOS app bundle serves app.html from its own custom scheme; web
+    // content can never carry a custom-scheme origin.
+    if origin.to_ascii_lowercase().starts_with("intendant://") {
+        return true;
+    }
+    let Some(normalized) = normalized_origin(origin) else {
+        return false;
+    };
+    if let Some(host) = extract_host_header(header_text) {
+        let scheme = if is_tls { "https" } else { "http" };
+        if normalized_origin(&format!("{scheme}://{host}")).as_deref() == Some(&normalized) {
+            return true;
+        }
+    }
+    if let Some(registry) = peer_registry {
+        for handle in registry.list() {
+            let snapshot = handle.snapshot();
+            for candidate in [snapshot.ws_url.as_deref(), snapshot.browser_tcp_via_url.as_deref()]
+                .into_iter()
+                .flatten()
+            {
+                if normalized_origin(candidate).as_deref() == Some(&normalized) {
+                    return true;
+                }
+            }
+        }
+    }
+    if let Ok(identities) = crate::peer::access_policy::list_identities(cert_dir) {
+        for identity in identities {
+            if !matches!(
+                identity.status,
+                crate::peer::access_policy::PeerIdentityStatus::Approved
+            ) {
+                continue;
+            }
+            if let Some(card_url) = identity.card_url.as_deref() {
+                if normalized_origin(card_url).as_deref() == Some(&normalized) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
+}
+
+/// Rewrite a JSON response's CORS posture for the fleet Access APIs. The
+/// generic `json_response` helpers bake in `Access-Control-Allow-Origin: *`
+/// (for harmless bootstrap endpoints and the macOS app's custom scheme);
+/// these six routes must never be wildcard-readable — a cert-installed
+/// browser would happily authenticate reads for any website. Strip the
+/// wildcard, then echo the specific origin only when it passed the fleet
+/// allowlist. Duplicate ACAO headers are invalid to browsers, so this
+/// replaces rather than appends.
+fn with_fleet_cors(response: String, allowed_origin: Option<&str>) -> String {
+    let Some(split) = response.find("\r\n\r\n") else {
+        return response;
+    };
+    let (head, rest) = response.split_at(split);
+    let mut lines: Vec<&str> = head
+        .split("\r\n")
+        .filter(|line| {
+            !line
+                .to_ascii_lowercase()
+                .starts_with("access-control-allow-origin:")
+        })
+        .collect();
+    let echo;
+    if let Some(origin) = allowed_origin {
+        echo = format!("Access-Control-Allow-Origin: {origin}");
+        lines.push(&echo);
+    }
+    lines.push("Vary: Origin");
+    format!("{}{rest}", lines.join("\r\n"))
 }
 
 pub(crate) fn access_enrollment_requests_response_value() -> serde_json::Value {
@@ -36761,6 +36997,93 @@ mod tests {
         assert_eq!(local["connected"], true);
 
         handle.abort();
+    }
+
+    #[test]
+    fn fleet_origin_gate_normalizes_and_allowlists() {
+        assert_eq!(
+            normalized_origin("WSS://Daemon.Local:8765").as_deref(),
+            Some("https://daemon.local:8765")
+        );
+        assert_eq!(
+            normalized_origin("http://127.0.0.1:8899").as_deref(),
+            Some("http://127.0.0.1:8899")
+        );
+        assert_eq!(normalized_origin("null"), None);
+        assert_eq!(normalized_origin(""), None);
+
+        let cert_dir = tempfile::tempdir().unwrap();
+        let headers = "GET /api/access/overview HTTP/1.1\r\nHost: daemon.local:8765\r\n";
+        // Same-origin caller (Origin matches the Host header) is allowed.
+        assert!(fleet_access_origin_allowed(
+            "https://daemon.local:8765",
+            true,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+        // Scheme mismatch, unknown origins, and `null` are refused.
+        assert!(!fleet_access_origin_allowed(
+            "http://daemon.local:8765",
+            true,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+        assert!(!fleet_access_origin_allowed(
+            "https://evil.example",
+            true,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+        assert!(!fleet_access_origin_allowed(
+            "null",
+            true,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+        // The macOS app bundle's custom scheme stays usable.
+        assert!(fleet_access_origin_allowed(
+            "intendant://bundle",
+            true,
+            headers,
+            None,
+            cert_dir.path(),
+        ));
+    }
+
+    #[test]
+    fn fleet_cors_paths_cover_exactly_the_access_apis() {
+        for path in [
+            "/api/access/overview",
+            "/api/access/iam/state",
+            "/api/access/enrollment-requests",
+            "/api/access/enrollment-requests/decide",
+            "/api/access/iam/user-client-grants",
+            "/api/access/iam/grants/update",
+        ] {
+            assert!(is_fleet_cors_access_path(path), "{path}");
+        }
+        assert!(!is_fleet_cors_access_path("/api/peers"));
+        assert!(!is_fleet_cors_access_path("/config"));
+
+        // The generic helper's wildcard must be REPLACED, never duplicated.
+        let with = with_fleet_cors(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}".to_string(),
+            Some("https://daemon.local:8765"),
+        );
+        assert_eq!(with.matches("Access-Control-Allow-Origin").count(), 1);
+        assert!(with.contains("Access-Control-Allow-Origin: https://daemon.local:8765"));
+        assert!(with.contains("Vary: Origin"));
+        assert!(with.ends_with("\r\n\r\n{}"));
+        let without = with_fleet_cors(
+            "HTTP/1.1 200 OK\r\nAccess-Control-Allow-Origin: *\r\n\r\n{}".to_string(),
+            None,
+        );
+        assert!(!without.contains("Access-Control-Allow-Origin"));
+        assert!(without.contains("Vary: Origin"));
     }
 
     #[tokio::test]

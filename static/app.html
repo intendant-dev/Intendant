@@ -35135,6 +35135,68 @@ const ACCESS_ROLE_PICKER_ORDER = [
   'role:files-write', 'role:terminal', 'role:operator', 'role:root',
 ];
 
+/* Grant fanout: the daemons this page can apply a grant to, each with the
+   channel it would use. 'self' uses the normal session; 'remote' is a
+   direct cross-origin call to a fleet daemon (mTLS in the browser, origin
+   allowlisted daemon-side); 'connect-only' targets have no direct route
+   from this page. Every write is still authorized by the target daemon. */
+function accessGrantFanoutTargets() {
+  const targets = [];
+  for (const target of accessTargetRecords()) {
+    const hostId = String(target.host_id || target.id || '').trim();
+    const descriptor = dashboardTargetDescriptor(target.local ? '' : hostId);
+    const label = accessTargetDisplayName(target, descriptor);
+    if (target.local || descriptor.local) {
+      targets.push({ key: 'local', label, mode: 'self' });
+      continue;
+    }
+    const rawUrl = target.browser_tcp_via_url || target.url || target.ws_url
+      || descriptor.peer?.browser_tcp_via_url || descriptor.peer?.url || descriptor.peer?.ws_url || '';
+    let origin = '';
+    try {
+      if (rawUrl) {
+        const url = new URL(rawUrl);
+        const scheme = url.protocol === 'wss:' ? 'https:' : (url.protocol === 'ws:' ? 'http:' : url.protocol);
+        origin = `${scheme}//${url.host}`;
+      }
+    } catch { origin = ''; }
+    const hostedOnly = !origin || /\/app\?connect=1/.test(rawUrl);
+    targets.push({
+      key: hostId || label,
+      label,
+      mode: hostedOnly ? 'connect-only' : 'remote',
+      origin: hostedOnly ? '' : origin,
+      connected: target.connected !== false,
+    });
+  }
+  return targets;
+}
+
+/* Results of the last fanout, kept across re-renders until dismissed. */
+let accessGrantFanoutResults = null;
+
+async function accessApplyGrantToTarget(target, payload) {
+  if (target.mode === 'self') {
+    const resp = await dashboardJsonFetch('api_access_iam_upsert_user_client_grant', payload, () => authedFetch('/api/access/iam/user-client-grants', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_iam_upsert_user_client_grant', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    return data;
+  }
+  const resp = await fetch(`${target.origin}/api/access/iam/user-client-grants`, {
+    method: 'POST',
+    mode: 'cors',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+  return data;
+}
+
 function renderAccessUserClientGrantForm() {
   const mount = document.getElementById('access-user-client-grant-form');
   if (!mount) return;
@@ -35147,7 +35209,9 @@ function renderAccessUserClientGrantForm() {
   if (existing && !accessUserClientGrantSubmitting && existing.dataset.submitting !== 'true') {
     if (existing.contains(document.activeElement)) return;
     const dirty = Array.from(existing.querySelectorAll('input[type="text"]'))
-      .some(input => (input.dataset.autofill || '') !== input.value);
+      .some(input => (input.dataset.autofill || '') !== input.value)
+      || Array.from(existing.querySelectorAll('input[name="access-grant-fanout"]'))
+        .some(input => input.checked !== input.defaultChecked);
     if (dirty) return;
   }
   const overview = accessOverviewModel();
@@ -35339,6 +35403,39 @@ function renderAccessUserClientGrantForm() {
   }
   form.appendChild(picker);
 
+  form.appendChild(stepLabel('4 · Apply to'));
+  const fanoutRow = document.createElement('div');
+  fanoutRow.className = 'acc-choice-row';
+  for (const target of accessGrantFanoutTargets()) {
+    const card = document.createElement('label');
+    card.className = 'acc-choice-card';
+    const input = document.createElement('input');
+    input.type = 'checkbox';
+    input.name = 'access-grant-fanout';
+    input.value = target.key;
+    if (target.mode === 'self') input.defaultChecked = true;
+    if (target.mode === 'connect-only' || (target.mode === 'remote' && target.connected === false)) {
+      input.disabled = true;
+    }
+    input.addEventListener('change', () => card.classList.toggle('selected', input.checked));
+    const t = document.createElement('div');
+    t.className = 't';
+    t.textContent = target.label + (target.mode === 'self' ? ' (this daemon)' : '');
+    const d = document.createElement('div');
+    d.className = 'd';
+    d.textContent = target.mode === 'self'
+      ? 'Applied through this session.'
+      : (target.mode === 'remote'
+        ? (target.connected === false
+          ? `Offline — ${target.origin}`
+          : `Direct call to ${target.origin}; that daemon authorizes it independently.`)
+        : 'No direct route from this page — open it via Connect once and approve the key there.');
+    card.classList.toggle('selected', input.checked);
+    card.append(input, t, d);
+    fanoutRow.appendChild(card);
+  }
+  form.appendChild(fanoutRow);
+
   const actions = document.createElement('div');
   actions.className = 'acc-grant-flow-actions';
   const statusToggle = document.createElement('div');
@@ -35376,6 +35473,36 @@ function renderAccessUserClientGrantForm() {
   ceilingNote.style.color = 'var(--yellow)';
   ceilingNote.style.marginTop = '8px';
   form.appendChild(ceilingNote);
+
+  if (accessGrantFanoutResults?.length) {
+    const results = document.createElement('div');
+    results.className = 'acc-grant-rows';
+    results.style.marginTop = '12px';
+    for (const result of accessGrantFanoutResults) {
+      const row = document.createElement('div');
+      row.className = 'acc-grant-row';
+      const label = document.createElement('span');
+      label.className = 't';
+      label.textContent = result.label;
+      row.appendChild(label);
+      row.appendChild(accessModelCreateStatus(result.ok ? 'active' : 'failed'));
+      const message = document.createElement('span');
+      message.className = 'why';
+      message.textContent = result.message;
+      row.appendChild(message);
+      results.appendChild(row);
+    }
+    const dismiss = document.createElement('button');
+    dismiss.type = 'button';
+    dismiss.className = 'acc-btn';
+    dismiss.textContent = 'Dismiss results';
+    dismiss.addEventListener('click', () => {
+      accessGrantFanoutResults = null;
+      results.remove();
+    });
+    results.appendChild(dismiss);
+    form.appendChild(results);
+  }
 
   mount.appendChild(form);
 
@@ -35476,27 +35603,43 @@ async function accessSubmitUserClientGrant(event) {
     });
     if (!ok) return;
   }
+  // Fanout: apply the same grant to every selected daemon. Each target
+  // authorizes independently — a refusal on one is reported, not fatal to
+  // the others.
+  const chosenKeys = Array.from(form.querySelectorAll('input[name="access-grant-fanout"]:checked'))
+    .map(input => input.value);
+  const fanoutTargets = accessGrantFanoutTargets()
+    .filter(target => chosenKeys.includes(target.key) && target.mode !== 'connect-only');
+  if (!fanoutTargets.length) {
+    showControlToast?.('error', 'Pick at least one daemon to apply the grant to');
+    return;
+  }
   accessUserClientGrantSubmitting = true;
   renderAccessUserClientGrantForm();
-  try {
-    const resp = await dashboardJsonFetch('api_access_iam_upsert_user_client_grant', payload, () => authedFetch('/api/access/iam/user-client-grants', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(payload),
-    }), 'api_access_iam_upsert_user_client_grant', { fallbackAfterRpcFailure: false });
-    const data = await resp.json().catch(() => ({}));
-    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
-    if (data?.iam) {
-      dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };
+  const results = [];
+  for (const target of fanoutTargets) {
+    try {
+      const data = await accessApplyGrantToTarget(target, payload);
+      if (target.mode === 'self' && data?.iam) {
+        dashboardAccessOverview = { ...(dashboardAccessOverview || {}), iam: data.iam };
+      }
+      results.push({ label: target.label, ok: true, message: 'Grant saved' });
+    } catch (err) {
+      results.push({ label: target.label, ok: false, message: err?.message || 'save failed' });
     }
-    await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
-    showControlToast?.('success', 'Access grant saved');
-  } catch (err) {
-    showControlToast?.('error', err?.message || 'Access grant save failed');
-  } finally {
-    accessUserClientGrantSubmitting = false;
-    renderAccessAdminSummaries();
   }
+  accessGrantFanoutResults = results;
+  const failures = results.filter(result => !result.ok).length;
+  if (failures === 0) {
+    showControlToast?.('success', results.length === 1
+      ? 'Access grant saved'
+      : `Access grant saved on ${results.length} daemons`);
+  } else {
+    showControlToast?.('error', `Grant saved on ${results.length - failures}/${results.length} daemons — see results`);
+  }
+  await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+  accessUserClientGrantSubmitting = false;
+  renderAccessAdminSummaries();
 }
 
 async function accessConfirmRevokeGrant(grantId) {
