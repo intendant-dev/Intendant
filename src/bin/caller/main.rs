@@ -11670,6 +11670,7 @@ struct DaemonConfig {
     shared_codex_config: control_plane::SharedCodexConfig,
     shared_gemini_config: control_plane::SharedGeminiConfig,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    session_registry: Option<display::SharedSessionRegistry>,
     web_port: Option<u16>,
     flags_direct: bool,
     /// Optional shared session state for headless mode (cleared between tasks).
@@ -11694,6 +11695,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
         shared_codex_config: config.shared_codex_config,
         shared_gemini_config: config.shared_gemini_config,
         frame_registry: config.frame_registry,
+        session_registry: config.session_registry,
         web_port: config.web_port,
         flags_direct: config.flags_direct,
         shared_session: config.shared_session,
@@ -24286,6 +24288,7 @@ async fn run_agent_loop(
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
     mut xvfb_guard: &mut Option<vision::XvfbGuard>,
+    session_registry: Option<&display::SharedSessionRegistry>,
     // When true, askHuman is unavailable and approvals without a json_approval
     // slot are auto-denied (headless non-JSON mode).
     headless: bool,
@@ -25346,6 +25349,7 @@ async fn run_agent_loop(
                     log_dir,
                     &mut cu_action_counter,
                     &session_log,
+                    session_registry,
                 )
                 .await;
             }
@@ -25358,6 +25362,7 @@ async fn run_agent_loop(
                 log_dir,
                 &mut cu_action_counter,
                 &session_log,
+                session_registry,
             )
             .await;
         } else {
@@ -25809,6 +25814,7 @@ async fn run_round_loop(
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
+    session_registry: Option<&display::SharedSessionRegistry>,
     headless: bool,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
@@ -25833,6 +25839,7 @@ async fn run_round_loop(
             approval_registry,
             context_injection,
             &mut xvfb_guard,
+            session_registry,
             headless,
         )
         .await?;
@@ -26133,6 +26140,7 @@ All relative paths and commands execute from this directory.",
         &sub_agent_registry,
         &event::ContextInjectionQueue::default(),
         &mut None, // sub-agents get their own display if needed
+        None,      // sub-agent processes have no in-process display sessions
         true,      // headless (sub-agents have no interactive UI)
     )
     .await;
@@ -28511,7 +28519,8 @@ async fn run_with_presence(
                 None, // no JSON approval
                 &approval_registry,
                 &context_injection, // shared with presence
-                false,              // not headless
+                Some(&session_registry),
+                false, // not headless
             )
             .await;
 
@@ -28850,6 +28859,7 @@ async fn run_direct_mode(
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
+    session_registry: Option<display::SharedSessionRegistry>,
     headless: bool,
     attachments: UserAttachments,
 ) -> Result<LoopStats, CallerError> {
@@ -28954,6 +28964,7 @@ async fn run_direct_mode(
         json_approval.as_ref(),
         &approval_registry,
         &context_injection,
+        session_registry.as_ref(),
         headless,
     )
     .await
@@ -32103,6 +32114,7 @@ async fn try_cu_first(
             bus,
             &proj.config.computer_use,
             None, // auto-resolve display target
+            Some(session_registry),
         )
         .await,
     )
@@ -32672,7 +32684,10 @@ async fn run_cu_task(
     bus: &event::EventBus,
     cu_config: &project::ComputerUseConfig,
     target_override: Option<computer_use::DisplayTarget>,
+    session_registry: Option<&display::SharedSessionRegistry>,
 ) -> Result<CuTaskResult, CallerError> {
+    // Owned form for execute_actions, which wants `&Option<_>`.
+    let session_registry = session_registry.cloned();
     let mut stats = LoopStats::default();
     let mut cu_counter = 0u64;
     let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
@@ -32910,7 +32925,7 @@ async fn run_cu_task(
                     backend,
                     log_dir,
                     &mut cu_counter,
-                    &None,
+                    &session_registry,
                     None,
                 )
                 .await;
@@ -32966,7 +32981,10 @@ async fn execute_cu_calls(
     log_dir: &std::path::Path,
     counter: &mut u64,
     session_log: &SharedSessionLog,
+    session_registry: Option<&display::SharedSessionRegistry>,
 ) {
+    // Owned form for execute_actions, which wants `&Option<_>`.
+    let session_registry = session_registry.cloned();
     let display_target = if cu_display.is_some() {
         resolve_cu_display_target()
     } else {
@@ -33017,7 +33035,7 @@ async fn execute_cu_calls(
             backend,
             log_dir,
             counter,
-            &None,
+            &session_registry,
             None,
         )
         .await;
@@ -33771,6 +33789,7 @@ async fn main() -> Result<(), CallerError> {
             shared_codex_config,
             shared_gemini_config,
             frame_registry,
+            session_registry: Some(session_registry.clone()),
             web_port: web_port_for_agent,
             flags_direct: flags.direct,
             shared_session: Some(shared_session),
@@ -33999,6 +34018,7 @@ async fn main() -> Result<(), CallerError> {
         let session_log_for_launcher = session_log.clone();
         let log_dir_for_launcher = log_dir.clone();
         let mcp_state_for_launcher = mcp_state.clone();
+        let session_registry_for_launcher = session_registry.clone();
         #[allow(clippy::async_yields_async)]
         let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
             let project_root = project_root.clone();
@@ -34006,6 +34026,7 @@ async fn main() -> Result<(), CallerError> {
             let session_log = session_log_for_launcher.clone();
             let _parent_log_dir = log_dir_for_launcher.clone();
             let mcp_state = mcp_state_for_launcher.clone();
+            let session_registry = session_registry_for_launcher.clone();
             Box::pin(async move {
                 // Each MCP task gets a fresh session directory so conversations
                 // don't bleed between tasks (reasoning items, tool calls, etc.).
@@ -34133,6 +34154,7 @@ async fn main() -> Result<(), CallerError> {
                             None, // no JSON approval in MCP mode
                             approval_registry,
                             event::ContextInjectionQueue::default(),
+                            Some(session_registry),
                             false, // not headless — MCP has interactive approval
                             UserAttachments::default(),
                         )
@@ -34589,6 +34611,7 @@ async fn main() -> Result<(), CallerError> {
         let log_dir_clone = log_dir.clone();
         let approval_registry_clone = app.approval_registry.clone();
         let context_injection_clone = app.context_injection.clone();
+        let session_registry_clone = session_registry.clone();
         let mcp_mgr = if !project.config.mcp_servers.is_empty() {
             Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
         } else {
@@ -34660,6 +34683,7 @@ async fn main() -> Result<(), CallerError> {
                         shared_codex_config: shared_codex_config.clone(),
                         shared_gemini_config: shared_gemini_config.clone(),
                         frame_registry: frame_registry.clone(),
+                        session_registry: Some(session_registry.clone()),
                         web_port: web_port_for_agent,
                         flags_direct: flags.direct,
                         shared_session: web_shared_session_for_supervisor.clone(),
@@ -34728,6 +34752,7 @@ async fn main() -> Result<(), CallerError> {
             let shared_external_agent_for_presence = shared_external_agent.clone();
             let shared_codex_config_for_presence = shared_codex_config.clone();
             let shared_gemini_config_for_presence = shared_gemini_config.clone();
+            let session_registry_for_presence = session_registry.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
                     task,
@@ -34747,7 +34772,7 @@ async fn main() -> Result<(), CallerError> {
                     approval_registry_clone,
                     frame_registry.clone(),
                     context_injection_clone,
-                    session_registry.clone(),
+                    session_registry_for_presence,
                     agent_backend_for_presence,
                     shared_external_agent_for_presence,
                     shared_codex_config_for_presence,
@@ -34857,6 +34882,7 @@ async fn main() -> Result<(), CallerError> {
                             None, // no JSON approval in TUI mode
                             approval_registry_clone,
                             context_injection_clone,
+                            Some(session_registry_clone),
                             false, // not headless — TUI handles approval
                             UserAttachments::default(),
                         )
@@ -34949,6 +34975,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_codex_config: shared_codex_config.clone(),
                 shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry_for_events.clone(),
+                session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: None,
@@ -35349,6 +35376,7 @@ async fn main() -> Result<(), CallerError> {
                     json_approval_slot,
                     event::ApprovalRegistry::default(),
                     event::ContextInjectionQueue::default(),
+                    Some(session_registry.clone()),
                     true, // headless mode
                     UserAttachments::default(),
                 )
@@ -35411,6 +35439,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_codex_config: shared_codex_config.clone(),
                 shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry.clone(),
+                session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: headless_shared_session.clone(),

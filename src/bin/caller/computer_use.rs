@@ -15,7 +15,8 @@ use tokio::process::Command;
 pub enum DisplayBackend {
     /// X11: xdotool + ImageMagick import. Works with Xvfb and real X11 DEs.
     X11,
-    /// Wayland: ydotool + grim. Requires /dev/uinput access. (not yet implemented)
+    /// Wayland: routed through the live portal `DisplaySession` (PipeWire
+    /// capture + portal input injection). Requires an active session.
     #[allow(dead_code)]
     Wayland,
     /// macOS: cliclick + screencapture. Requires accessibility permissions.
@@ -328,19 +329,54 @@ pub async fn execute_actions(
         }
         DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
     }
+    // Even on the subprocess-input backends, prefer the in-memory frames of a
+    // live capture session for screenshots — no fork, no disk round-trip.
+    let session = lookup_display_session(session_registry, &target).await;
     let display = target.display_env_string();
     let mut results = Vec::with_capacity(actions.len());
     let mut last_screenshot: Option<ScreenshotData> = None;
+    let mut last_input_at: Option<std::time::Instant> = None;
 
     for action in actions {
-        let result = execute_single(
-            action,
-            &display,
-            effective_backend,
-            screenshot_dir,
-            action_counter,
-        )
-        .await;
+        let result = match action {
+            CuAction::Screenshot => {
+                match capture_screenshot_preferring_session(
+                    session.as_deref(),
+                    last_input_at,
+                    &display,
+                    effective_backend,
+                    screenshot_dir,
+                    action_counter,
+                )
+                .await
+                {
+                    Ok(s) => CuActionResult {
+                        success: true,
+                        screenshot: Some(s),
+                        error: None,
+                    },
+                    Err(e) => CuActionResult {
+                        success: false,
+                        screenshot: None,
+                        error: Some(e),
+                    },
+                }
+            }
+            _ => {
+                let result = execute_single(
+                    action,
+                    &display,
+                    effective_backend,
+                    screenshot_dir,
+                    action_counter,
+                )
+                .await;
+                if !matches!(action, CuAction::Wait { .. }) {
+                    last_input_at = Some(std::time::Instant::now());
+                }
+                result
+            }
+        };
         if let Some(ref s) = result.screenshot {
             last_screenshot = Some(s.clone());
         }
@@ -352,8 +388,15 @@ pub async fn execute_actions(
         .last()
         .is_some_and(|a| !matches!(a, CuAction::Screenshot));
     if needs_auto_screenshot {
-        let auto =
-            take_screenshot(&display, effective_backend, screenshot_dir, action_counter).await;
+        let auto = capture_screenshot_preferring_session(
+            session.as_deref(),
+            last_input_at,
+            &display,
+            effective_backend,
+            screenshot_dir,
+            action_counter,
+        )
+        .await;
         match auto {
             Ok(s) => {
                 last_screenshot = Some(s.clone());
@@ -912,10 +955,28 @@ async fn take_screenshot(
         .map_err(|e| format!("read screenshot: {}", e))?;
 
     let (raw_w, raw_h) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
-    let (logical_w, logical_h) = logical_display_size();
+    let bytes = normalize_png_to_logical(raw_bytes);
+    let (width, height) = png_dimensions(&bytes).unwrap_or((raw_w, raw_h));
 
-    let bytes = if raw_w > logical_w && logical_w > 0 && logical_h > 0 {
-        // Resize to logical display size so model coords = logical coords
+    use base64::Engine;
+    let base64_png = base64::engine::general_purpose::STANDARD.encode(&bytes);
+
+    Ok(ScreenshotData {
+        path,
+        base64_png,
+        width,
+        height,
+    })
+}
+
+/// Downscale a PNG to the logical display size when the capture is larger
+/// (Retina/HiDPI captures at physical resolution), so model coordinates land
+/// in the same logical space the input tools consume. Returns the input
+/// unchanged when it already fits or cannot be decoded.
+fn normalize_png_to_logical(raw_bytes: Vec<u8>) -> Vec<u8> {
+    let (raw_w, _) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
+    let (logical_w, logical_h) = logical_display_size();
+    if raw_w > logical_w && logical_w > 0 && logical_h > 0 {
         match image::load_from_memory(&raw_bytes) {
             Ok(img) => {
                 let resized =
@@ -931,19 +992,7 @@ async fn take_screenshot(
         }
     } else {
         raw_bytes
-    };
-
-    let (width, height) = png_dimensions(&bytes).unwrap_or((raw_w, raw_h));
-
-    use base64::Engine;
-    let base64_png = base64::engine::general_purpose::STANDARD.encode(&bytes);
-
-    Ok(ScreenshotData {
-        path,
-        base64_png,
-        width,
-        height,
-    })
+    }
 }
 
 /// Extract width and height from a PNG file header.
@@ -1060,11 +1109,14 @@ async fn execute_via_session(
     let (width, height) = denorm_ref.unwrap_or_else(|| session.resolution());
     let mut results = Vec::with_capacity(actions.len());
     let mut needs_auto_screenshot = false;
+    let mut last_input_at: Option<std::time::Instant> = None;
 
     for action in actions {
         match action {
             CuAction::Screenshot => {
-                let result = take_session_screenshot(session, screenshot_dir, action_counter).await;
+                let result =
+                    take_session_screenshot(session, screenshot_dir, action_counter, last_input_at)
+                        .await;
                 results.push(result);
                 needs_auto_screenshot = false;
             }
@@ -1277,11 +1329,15 @@ async fn execute_via_session(
                 });
             }
         }
+        if !matches!(action, CuAction::Screenshot | CuAction::Wait { .. }) {
+            last_input_at = Some(std::time::Instant::now());
+        }
     }
 
     // Auto-screenshot after the last non-screenshot action (matches X11 path).
     if needs_auto_screenshot {
-        let auto = take_session_screenshot(session, screenshot_dir, action_counter).await;
+        let auto =
+            take_session_screenshot(session, screenshot_dir, action_counter, last_input_at).await;
         if auto.success {
             let screenshot = auto.screenshot.clone();
             results.push(auto);
@@ -1299,43 +1355,96 @@ async fn execute_via_session(
     results
 }
 
+/// How long to wait for a frame captured after the last input action before
+/// serving the freshest available one. Capture backends are damage-driven:
+/// a post-action frame lands within a vsync or two when the action changed
+/// pixels, and never when it didn't — in which case the pre-action frame is
+/// already content-accurate.
+const FRESH_FRAME_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+
+/// Capture screenshot data from a `DisplaySession`'s in-memory frame.
+///
+/// When `min_fresh` is set (the completion time of the last input action),
+/// waits up to [`FRESH_FRAME_TIMEOUT`] for a frame at least that new so the
+/// model never sees pre-action pixels after an action that changed the screen.
+///
+/// `normalize_to_logical` must be true on the X11/macOS executor path, where
+/// model coordinates are interpreted in logical-display space (matching the
+/// subprocess screenshot path), and false on the Wayland/session-injection
+/// path, where coordinates are normalized against the session resolution.
+async fn session_screenshot_data(
+    session: &crate::display::DisplaySession,
+    screenshot_dir: &std::path::Path,
+    counter: &mut u64,
+    min_fresh: Option<std::time::Instant>,
+    normalize_to_logical: bool,
+) -> Result<ScreenshotData, String> {
+    *counter += 1;
+    let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
+    let mut png_bytes = match min_fresh {
+        Some(ts) => session.screenshot_fresh(ts, FRESH_FRAME_TIMEOUT).await,
+        None => session.screenshot().await,
+    }
+    .map_err(|e| format!("Screenshot failed: {}", e))?;
+    if normalize_to_logical {
+        png_bytes = normalize_png_to_logical(png_bytes);
+    }
+    std::fs::write(&path, &png_bytes).map_err(|e| format!("Failed to write screenshot: {}", e))?;
+    let (width, height) = png_dimensions(&png_bytes).unwrap_or((0, 0));
+    use base64::Engine;
+    let base64_png = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
+    Ok(ScreenshotData {
+        path,
+        base64_png,
+        width,
+        height,
+    })
+}
+
 /// Capture a PNG screenshot from a `DisplaySession`.
 async fn take_session_screenshot(
     session: &crate::display::DisplaySession,
     screenshot_dir: &std::path::Path,
     counter: &mut u64,
+    min_fresh: Option<std::time::Instant>,
 ) -> CuActionResult {
-    *counter += 1;
-    let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
-    match session.screenshot().await {
-        Ok(png_bytes) => match std::fs::write(&path, &png_bytes) {
-            Ok(_) => {
-                let (width, height) = png_dimensions(&png_bytes).unwrap_or((0, 0));
-                use base64::Engine;
-                let base64_png = base64::engine::general_purpose::STANDARD.encode(&png_bytes);
-                CuActionResult {
-                    success: true,
-                    screenshot: Some(ScreenshotData {
-                        path,
-                        base64_png,
-                        width,
-                        height,
-                    }),
-                    error: None,
-                }
-            }
-            Err(e) => CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some(format!("Failed to write screenshot: {}", e)),
-            },
+    match session_screenshot_data(session, screenshot_dir, counter, min_fresh, false).await {
+        Ok(s) => CuActionResult {
+            success: true,
+            screenshot: Some(s),
+            error: None,
         },
         Err(e) => CuActionResult {
             success: false,
             screenshot: None,
-            error: Some(format!("Screenshot failed: {}", e)),
+            error: Some(e),
         },
     }
+}
+
+/// Capture a screenshot for the target, preferring the in-memory frame of a
+/// live capture session over spawning the platform screenshot tool
+/// (`screencapture` / `import`), which costs a subprocess fork plus a disk
+/// round-trip per shot. Falls back to the subprocess path when no session
+/// exists for the target or the session has no frames yet.
+async fn capture_screenshot_preferring_session(
+    session: Option<&crate::display::DisplaySession>,
+    min_fresh: Option<std::time::Instant>,
+    display: &str,
+    backend: DisplayBackend,
+    screenshot_dir: &Path,
+    counter: &mut u64,
+) -> Result<ScreenshotData, String> {
+    if let Some(session) = session {
+        match session_screenshot_data(session, screenshot_dir, counter, min_fresh, true).await {
+            Ok(s) => return Ok(s),
+            Err(_) => {
+                // Session exists but has no usable frame (e.g. capture just
+                // started) — fall through to the subprocess path.
+            }
+        }
+    }
+    take_screenshot(display, backend, screenshot_dir, counter).await
 }
 
 /// Map a `MouseButton` to the browser button index used by `InputEvent`.
