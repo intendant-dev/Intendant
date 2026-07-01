@@ -10,6 +10,7 @@
 - [Control Plane & Daemon](./control-plane-and-daemon.md)
 - [Display Pipeline](./display-pipeline.md)
 - [Peer Federation](./peer-federation.md)
+- [Trust Architecture](./trust-architecture.md)
 - [Computer Use & Live Audio](./computer-use-and-audio.md)
 - [Presence Layer](./presence.md)
 - [TUI & Autonomy](./tui.md)

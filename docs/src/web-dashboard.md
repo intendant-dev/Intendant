@@ -1021,6 +1021,14 @@ tunnel to close, and checks the audit events.
 
 ### Design Target: Public Bootstrap with a Direct WebRTC Dashboard Tunnel
 
+> **Superseded in part.** The tunnel/bootstrap mechanics below shipped, but
+> the trust conclusions were revised after production experience: a hosted
+> origin must never serve privileged code or hold account authority. The
+> adopted model — anchor daemons serve privileged code, the hosted service is
+> demoted to zero-authority introductions/relay/backup/directory, and
+> low-provenance sessions are role-capped — is specified in
+> [Trust Architecture](./trust-architecture.md).
+
 The current dashboard access model is certificate-first: a remote browser
 reaches the daemon over HTTPS/WSS, usually with mTLS. That keeps the
 implementation simple and gives the browser a secure context, but it also means
