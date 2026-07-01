@@ -58,6 +58,56 @@ pub(super) fn encode_mcp_query_value(value: &str) -> String {
     encoded
 }
 
+/// Build the loopback MCP URL Intendant injects into a supervised backend.
+///
+/// Carries the per-process auth token, the Intendant session id (so tool
+/// calls are scoped to the calling backend), the `core` tool profile (the
+/// small bootstrap set — the broad surface is discovered lazily through
+/// `intendant ctl`), and, for Codex, the managed-context mode.
+pub(super) fn intendant_bootstrap_mcp_url(
+    port: u16,
+    session_id: Option<&str>,
+    managed_context: Option<&str>,
+    mcp_token: Option<&str>,
+) -> String {
+    let mut params: Vec<(&str, String)> = Vec::new();
+    if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(("session_id", encode_mcp_query_value(session_id)));
+    }
+    if let Some(mode) = managed_context.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(("managed_context", mode.to_string()));
+    }
+    params.push(("tool_profile", "core".to_string()));
+    if let Some(token) = mcp_token.map(str::trim).filter(|s| !s.is_empty()) {
+        params.push(("mcp_token", encode_mcp_query_value(token)));
+    }
+    let query = params
+        .into_iter()
+        .map(|(key, value)| format!("{key}={value}"))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("http://localhost:{port}/mcp?{query}")
+}
+
+/// Inject the `intendant ctl` bootstrap environment into a supervised child:
+/// `INTENDANT` (absolute controller binary path), `INTENDANT_MCP_URL`
+/// (loopback endpoint with auth token + session scope baked in), and
+/// `INTENDANT_SESSION_ID`. With these set, `"$INTENDANT" ctl ...` works from
+/// any backend's shell without further configuration.
+pub(super) fn add_intendant_bootstrap_env(
+    command: &mut tokio::process::Command,
+    mcp_url: &str,
+    session_id: Option<&str>,
+) {
+    command.env("INTENDANT_MCP_URL", mcp_url);
+    if let Some(session_id) = session_id.map(str::trim).filter(|s| !s.is_empty()) {
+        command.env("INTENDANT_SESSION_ID", session_id);
+    }
+    if let Ok(current_exe) = std::env::current_exe() {
+        command.env("INTENDANT", current_exe);
+    }
+}
+
 /// Drop ANSI SGR/CSI escape sequences from a tracing-formatted stderr
 /// line so activity-log rows don't render `[31m` noise.
 pub(crate) fn strip_ansi_escapes(input: &str) -> String {

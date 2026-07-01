@@ -1424,7 +1424,7 @@ async fn create_external_agent(
                 codex_managed_context: false,
                 web_port,
                 mcp_auth_token: mcp_auth_token.clone(),
-                mcp_session_id: None,
+                mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 codex_home: None,
             };

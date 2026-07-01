@@ -1727,37 +1727,12 @@ impl CodexAgent {
     }
 
     fn intendant_mcp_url(&self, port: u16) -> String {
-        let base_url = Self::intendant_mcp_base_url(port);
-        let mode = if self.managed_context {
-            "managed"
-        } else {
-            "vanilla"
-        };
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(session_id) = self
-            .mcp_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            params.push(("session_id", encode_mcp_query_value(session_id)));
-        }
-        params.push(("managed_context", mode.to_string()));
-        params.push(("tool_profile", "core".to_string()));
-        if let Some(token) = self
-            .mcp_auth_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            params.push(("mcp_token", encode_mcp_query_value(token)));
-        }
-        let query = params
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("{base_url}?{query}")
+        super::intendant_bootstrap_mcp_url(
+            port,
+            self.mcp_session_id.as_deref(),
+            Some(self.intendant_managed_context_mode()),
+            self.mcp_auth_token.as_deref(),
+        )
     }
 
     fn intendant_mcp_base_url(port: u16) -> String {
@@ -1773,22 +1748,15 @@ impl CodexAgent {
     }
 
     fn add_intendant_ctl_env(&self, command: &mut tokio::process::Command, port: u16) {
-        command.env("INTENDANT_MCP_URL", self.intendant_mcp_url(port));
+        super::add_intendant_bootstrap_env(
+            command,
+            &self.intendant_mcp_url(port),
+            self.mcp_session_id.as_deref(),
+        );
         command.env(
             "INTENDANT_MANAGED_CONTEXT",
             self.intendant_managed_context_mode(),
         );
-        if let Some(session_id) = self
-            .mcp_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            command.env("INTENDANT_SESSION_ID", session_id);
-        }
-        if let Ok(current_exe) = std::env::current_exe() {
-            command.env("INTENDANT", current_exe);
-        }
     }
 
     fn apply_codex_home_env(command: &mut tokio::process::Command, codex_home: Option<&Path>) {

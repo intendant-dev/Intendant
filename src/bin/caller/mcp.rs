@@ -1405,20 +1405,21 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
+                    // Minimal display/CU surface for every supervised backend
+                    // (managed or vanilla): screenshots and input actions are
+                    // the highest-frequency capabilities and return images,
+                    // which only travel well as MCP content blocks. The broad
+                    // control surface stays behind `intendant ctl`.
+                    | "list_displays"
+                    | "grant_user_display"
+                    | "revoke_user_display"
+                    | "take_screenshot"
+                    | "execute_cu_actions"
             ) || (managed_context
                 // Keep managed rewind + fission tools reachable from Codex's
                 // small MCP profile; descriptions and status decide when
                 // normal turns should use them.
-                && (managed_context_tool(name)
-                    || fission_tool(name)
-                    || matches!(
-                        name,
-                        "list_displays"
-                            | "grant_user_display"
-                            | "revoke_user_display"
-                            | "take_screenshot"
-                            | "execute_cu_actions"
-                    )))
+                && (managed_context_tool(name) || fission_tool(name)))
         }
         "screen" | "display" => {
             matches!(
@@ -12437,10 +12438,17 @@ mod tests {
             assert!(vanilla_names.contains(&"request_shared_view_input"));
             assert!(vanilla_names.contains(&"capture_shared_view_frame"));
             assert!(vanilla_names.contains(&"hide_shared_view"));
-            assert!(!vanilla_names.contains(&"grant_user_display"));
-            assert!(!vanilla_names.contains(&"revoke_user_display"));
-            assert!(!vanilla_names.contains(&"execute_cu_actions"));
+            // The minimal display/CU surface is part of the bootstrap set for
+            // vanilla sessions too — every supervised backend gets screenshots
+            // and input actions over MCP; only managed rewind/fission tools
+            // stay behind managed context.
+            assert!(vanilla_names.contains(&"list_displays"));
+            assert!(vanilla_names.contains(&"grant_user_display"));
+            assert!(vanilla_names.contains(&"revoke_user_display"));
+            assert!(vanilla_names.contains(&"take_screenshot"));
+            assert!(vanilla_names.contains(&"execute_cu_actions"));
             assert!(!vanilla_names.contains(&"spawn_live_audio"));
+            assert!(!vanilla_names.contains(&"list_frames"));
             assert!(!vanilla_names.contains(&"list_rewind_anchors"));
             assert!(!vanilla_names.contains(&"rewind_context"));
             assert!(!vanilla_names.contains(&"fission_spawn"));
