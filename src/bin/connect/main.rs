@@ -2717,31 +2717,31 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
   <style>
     :root {{
       color-scheme: dark;
-      --bg: #0d1016;
-      --top: #121722;
-      --surface: #161b24;
-      --surface-2: #1c2330;
-      --surface-3: #222b38;
-      --line: #2b3443;
-      --line-strong: #3d4858;
-      --text: #f5f7fb;
-      --muted: #9da8b7;
-      --muted-2: #727f8f;
-      --accent: #69b7ff;
-      --accent-hover: #88c8ff;
-      --accent-ink: #061320;
-      --ok: #7edc8f;
-      --warn: #ffd166;
-      --err: #ff7d9a;
-      --focus: #f2c94c;
-      --shadow: 0 18px 50px rgba(0, 0, 0, .28);
+      --bg: #11111b;
+      --top: #181825;
+      --surface: #1e1e2e;
+      --surface-2: #313244;
+      --surface-3: #45475a;
+      --line: rgba(205, 214, 244, 0.09);
+      --line-strong: rgba(205, 214, 244, 0.16);
+      --text: #cdd6f4;
+      --muted: #a6adc8;
+      --muted-2: #6c7086;
+      --accent: #89b4fa;
+      --accent-hover: #74c7ec;
+      --accent-ink: #11111b;
+      --ok: #a6e3a1;
+      --warn: #f9e2af;
+      --err: #f38ba8;
+      --focus: #f9e2af;
+      --shadow: 0 18px 50px rgba(0, 0, 0, .35);
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg);
       color: var(--text);
     }}
     * {{ box-sizing: border-box; }}
     html {{ min-height: 100%; }}
-    body {{ margin: 0; min-height: 100vh; background: var(--bg); }}
+    body {{ margin: 0; min-height: 100vh; background-color: var(--bg); background-image: radial-gradient(ellipse at 50% -12%, #1e1e2e 0%, #11111b 72%); background-attachment: fixed; background-repeat: no-repeat; background-size: cover; }}
     button, input {{ font: inherit; }}
     button {{ height: 38px; padding: 0 14px; color: var(--accent-ink); background: var(--accent); border: 1px solid transparent; border-radius: 7px; font-weight: 700; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease, transform .12s ease; white-space: nowrap; }}
     button:hover:not(:disabled) {{ background: var(--accent-hover); transform: translateY(-1px); }}
@@ -2750,21 +2750,21 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     button.secondary:hover:not(:disabled) {{ background: var(--surface-3); }}
     button.ghost {{ color: var(--muted); background: transparent; border-color: var(--line); }}
     button.ghost:hover:not(:disabled) {{ color: var(--text); background: var(--surface-2); }}
-    button.danger {{ color: var(--err); background: rgba(255, 125, 154, .08); border-color: rgba(255, 125, 154, .58); }}
-    button.danger:hover:not(:disabled) {{ background: rgba(255, 125, 154, .15); }}
+    button.danger {{ color: var(--err); background: rgba(243, 139, 168, .08); border-color: rgba(243, 139, 168, .5); }}
+    button.danger:hover:not(:disabled) {{ background: rgba(243, 139, 168, .16); }}
     button:disabled {{ opacity: .58; cursor: default; transform: none; }}
-    input {{ width: 100%; min-width: 0; height: 42px; padding: 9px 12px; color: var(--text); background: #10151d; border: 1px solid var(--line-strong); border-radius: 7px; }}
+    input {{ width: 100%; min-width: 0; height: 42px; padding: 9px 12px; color: var(--text); background: #11111b; border: 1px solid var(--line-strong); border-radius: 7px; }}
     input::placeholder {{ color: var(--muted-2); }}
     header {{ border-bottom: 1px solid var(--line); background: var(--top); }}
     .topbar {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
     .brand {{ display: flex; align-items: center; gap: 12px; min-width: 0; }}
-    .brand-mark {{ width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--accent); background: #101722; font-size: 13px; font-weight: 800; letter-spacing: 0; }}
+    .brand-mark {{ width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 8px; color: #b4befe; background: #1e1e2e; font-size: 13px; font-weight: 800; letter-spacing: 0; }}
     .brand h1 {{ font-size: 20px; line-height: 1.15; margin: 0; letter-spacing: 0; }}
     .origin-chip {{ min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }}
     .origin-chip code {{ max-width: min(48vw, 420px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
     main.shell {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 22px 0 44px; display: grid; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); gap: 16px; align-items: start; }}
     body.signed-out main.shell {{ width: min(440px, calc(100vw - 32px)); grid-template-columns: 1fr; padding-top: 54px; }}
-    section {{ min-width: 0; border: 1px solid var(--line); background: var(--surface); border-radius: 8px; box-shadow: var(--shadow); }}
+    section {{ min-width: 0; border: 1px solid var(--line-strong); background: rgba(24, 24, 37, 0.72); border-radius: 10px; box-shadow: var(--shadow); }}
     .panel-header {{ min-height: 62px; padding: 16px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 14px; }}
     .panel-title {{ min-width: 0; }}
     h2 {{ font-size: 15px; line-height: 1.25; margin: 0; letter-spacing: 0; }}
@@ -2776,10 +2776,15 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     label {{ display: block; color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 7px; }}
     .actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
     .account-summary {{ padding-top: 14px; border-top: 1px solid var(--line); }}
-    .handle {{ color: var(--text); font-size: 17px; font-weight: 750; overflow-wrap: anywhere; }}
+    .handle {{ color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }}
     .metric-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }}
+    .user-id-block {{ margin-top: 12px; display: grid; gap: 6px; }}
+    .user-id-label {{ color: var(--muted-2); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }}
+    .user-id-row {{ display: flex; gap: 8px; align-items: center; }}
+    .user-id-row code {{ flex: 1 1 auto; min-width: 0; color: var(--text); font-size: 12px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: rgba(17, 17, 27, .55); }}
+    .user-id-row button {{ height: 30px; padding: 0 10px; font-size: 12px; font-weight: 700; flex: 0 0 auto; }}
     .claim-strip {{ display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 9px; align-items: end; padding-bottom: 16px; border-bottom: 1px solid var(--line); }}
-    .notice {{ padding: 12px 13px; border: 1px solid rgba(255, 209, 102, .35); border-radius: 7px; color: var(--muted); background: rgba(255, 209, 102, .07); font-size: 13px; line-height: 1.4; }}
+    .notice {{ padding: 12px 13px; border: 1px solid rgba(249, 226, 175, .3); border-radius: 8px; color: var(--muted); background: rgba(249, 226, 175, .06); font-size: 13px; line-height: 1.4; }}
     .status {{ min-height: 20px; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }}
     .status.status-ok {{ color: var(--ok); }}
     .status.status-err {{ color: var(--err); }}
@@ -2788,7 +2793,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
     th, td {{ text-align: left; padding: 13px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
     th {{ color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }}
-    tbody tr:hover {{ background: rgba(255, 255, 255, .025); }}
+    tbody tr:hover {{ background: rgba(205, 214, 244, .03); }}
     tbody tr:last-child td {{ border-bottom: 0; }}
     code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
     .daemon-name {{ display: grid; gap: 3px; min-width: 220px; }}
@@ -2797,8 +2802,14 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     .target-route {{ display: grid; gap: 4px; min-width: 180px; }}
     .action-cell .actions {{ justify-content: flex-end; flex-wrap: nowrap; }}
     .pill {{ display: inline-flex; align-items: center; width: fit-content; min-height: 24px; padding: 0 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); font-size: 12px; font-weight: 750; }}
-    .pill.ok {{ color: var(--ok); border-color: rgba(126, 220, 143, .4); background: rgba(126, 220, 143, .09); }}
-    .pill.warn {{ color: var(--warn); border-color: rgba(255, 209, 102, .35); background: rgba(255, 209, 102, .08); }}
+    .pill.ok {{ color: var(--ok); border-color: rgba(166, 227, 161, .4); background: rgba(166, 227, 161, .09); }}
+    .pill.warn {{ color: var(--warn); border-color: rgba(249, 226, 175, .35); background: rgba(249, 226, 175, .08); }}
+    .route-chip {{ display: inline-flex; align-items: center; gap: 6px; width: fit-content; min-height: 24px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--muted); font-size: 12px; font-weight: 750; }}
+    .route-chip .dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--muted-2); flex: 0 0 auto; }}
+    .route-chip.ok {{ color: var(--ok); border-color: rgba(166, 227, 161, .4); background: rgba(166, 227, 161, .09); }}
+    .route-chip.ok .dot {{ background: var(--ok); }}
+    .route-chip.warn {{ color: var(--warn); border-color: rgba(249, 226, 175, .35); background: rgba(249, 226, 175, .08); }}
+    .route-chip.warn .dot {{ background: var(--warn); }}
     .empty-state {{ padding: 22px 10px; color: var(--muted); }}
     .hidden {{ display: none !important; }}
     .wide {{ grid-column: 1 / -1; }}
@@ -2865,6 +2876,13 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
             <span id="session-passkeys" class="pill"></span>
             <span class="pill ok">active</span>
           </div>
+          <div class="user-id-block">
+            <div class="user-id-label">User id &mdash; use this id when granting access on a daemon</div>
+            <div class="user-id-row">
+              <code id="session-user-id"></code>
+              <button id="copy-user-id" class="ghost" type="button">Copy</button>
+            </div>
+          </div>
         </div>
         <div id="auth-status" class="status"></div>
       </div>
@@ -2879,13 +2897,13 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
         <button id="refresh" class="secondary">Refresh</button>
       </div>
       <div class="panel-body stack">
-        <div class="notice">This account is for rendezvous and navigation. Each daemon must still authorize this account through its local IAM before hosted dashboard access opens.</div>
+        <div class="notice">This account is rendezvous and navigation only &mdash; it grants nothing by itself. Each daemon decides access through its own local IAM.</div>
         <div class="claim-strip">
           <div>
-            <label for="claim-code">Rendezvous claim phrase</label>
+            <label for="claim-code">Claim phrase (shown in the daemon's startup log)</label>
             <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="12-word claim phrase">
           </div>
-          <button id="claim">Claim route</button>
+          <button id="claim">Claim daemon</button>
         </div>
         <div id="claim-status" class="status"></div>
         <div class="table-wrap">
@@ -3073,7 +3091,7 @@ async function claimDaemon() {{
       await new Promise(resolve => setTimeout(resolve, 750));
       const status = await api(`/api/claims/${{encodeURIComponent(start.claim_id)}}`);
       if (status.result?.status === 'approved') {{
-        setStatus('claim-status', `Rendezvous route claimed for ${{status.result.daemon_id}}. Add a local IAM grant on that daemon before using hosted dashboard access.`, 'ok');
+        setStatus('claim-status', `Rendezvous route claimed for ${{status.result.daemon_id}}. Next: open that daemon directly (its https://host:8765 address) as root, go to Access → People & Devices, and grant this account a role — until then the daemon will refuse hosted dashboard control.`, 'ok');
         $('claim-code').value = '';
         await refreshAll();
         return;
@@ -3126,10 +3144,12 @@ function renderAuth() {{
     $('account').value = state.user.account_name || '';
     $('session-handle').textContent = '@' + state.user.account_name;
     $('session-passkeys').textContent = `${{state.user.passkey_count}} passkey${{state.user.passkey_count === 1 ? '' : 's'}}`;
+    $('session-user-id').textContent = state.user.id || '';
     $('who').textContent = '@' + state.user.account_name;
   }} else {{
     $('session-handle').textContent = '';
     $('session-passkeys').textContent = '';
+    $('session-user-id').textContent = '';
     $('who').textContent = '';
   }}
 }}
@@ -3144,14 +3164,16 @@ function renderDaemons() {{
   for (const daemon of state.daemons) {{
     const tr = document.createElement('tr');
     const key = String(daemon.daemon_public_key || '');
-    const label = String(daemon.label || daemon.daemon_id || '');
+    const daemonId = String(daemon.daemon_id || '');
+    const hasLabel = Boolean(String(daemon.label || '').trim());
+    const label = hasLabel ? String(daemon.label) : shortId(daemonId);
     const lastSeen = formatRelative(daemon.last_seen_unix_ms);
     tr.innerHTML = `
-      <td data-cell-label="Daemon"><div class="daemon-name"><strong>${{escapeHtml(label)}}</strong><code>${{escapeHtml(daemon.daemon_id)}}</code></div></td>
+      <td data-cell-label="Daemon"><div class="daemon-name"><strong title="${{escapeAttr(hasLabel ? label : daemonId)}}">${{escapeHtml(label)}}</strong><code title="${{escapeAttr(daemonId)}}">${{escapeHtml(shortId(daemonId))}}</code></div></td>
       <td data-cell-label="Activity"><div class="daemon-activity"><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span><span class="sub">${{escapeHtml(lastSeen)}}</span></div></td>
       <td data-cell-label="Public key"><code title="${{escapeAttr(key)}}">${{escapeHtml(compactKey(key))}}</code></td>
       <td class="action-cell" data-cell-label="Actions"><div class="actions">
-        <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open tunnel</button>
+        <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open dashboard</button>
         <button class="secondary" data-rename="${{escapeAttr(daemon.daemon_id)}}">Rename</button>
         <button class="danger" data-revoke="${{escapeAttr(daemon.daemon_id)}}">Revoke</button>
       </div></td>`;
@@ -3196,7 +3218,9 @@ function renderFleetTargets() {{
   for (const target of state.fleetTargets) {{
     const tr = document.createElement('tr');
     const id = String(target.host_id || target.id || '');
-    const label = String(target.label || id || 'Target');
+    const rawLabel = String(target.label || '').trim();
+    const labelIsFallback = !rawLabel || rawLabel === id;
+    const label = labelIsFallback ? (shortId(id) || 'Target') : rawLabel;
     const source = String(target.source || 'browser_fleet');
     const route = String(target.route_label || target.route || target.url || 'Remembered route');
     const auth = String(target.auth_label || target.auth || target.effective_role_label || 'Account record');
@@ -3205,11 +3229,11 @@ function renderFleetTargets() {{
     const url = String(target.url || '');
     const canForget = target.claimed_daemon !== true;
     tr.innerHTML = `
-      <td data-cell-label="Target"><div class="daemon-name"><strong>${{escapeHtml(label)}}</strong><code>${{escapeHtml(id)}}</code></div></td>
-      <td data-cell-label="Route"><div class="target-route"><span class="pill ${{statusClass}}">${{escapeHtml(statusText)}}</span><span class="sub">${{escapeHtml(route)}}</span></div></td>
+      <td data-cell-label="Target"><div class="daemon-name"><strong title="${{escapeAttr(labelIsFallback ? id : label)}}">${{escapeHtml(label)}}</strong><code title="${{escapeAttr(id)}}">${{escapeHtml(shortId(id))}}</code></div></td>
+      <td data-cell-label="Route"><div class="target-route"><span class="route-chip ${{statusClass}}"><span class="dot" aria-hidden="true"></span>${{escapeHtml(statusText)}}</span><span class="sub">${{escapeHtml(route)}}</span></div></td>
       <td data-cell-label="Authority"><div class="target-route"><span class="pill">${{escapeHtml(source.replaceAll('_', ' '))}}</span><span class="sub">${{escapeHtml(auth)}}</span></div></td>
       <td class="action-cell" data-cell-label="Actions"><div class="actions">
-        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open tunnel</button>
+        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open dashboard</button>
         <button class="secondary" data-fleet-forget="${{escapeAttr(id)}}" ${{canForget ? '' : 'disabled'}}>Forget</button>
       </div></td>`;
     rows.appendChild(tr);
@@ -3253,6 +3277,12 @@ function compactKey(value) {{
   return key.slice(0, 12) + '...' + key.slice(-8);
 }}
 
+function shortId(value) {{
+  const id = String(value || '');
+  if (id.length > 24 && !id.includes('.')) return id.slice(0, 8) + '…' + id.slice(-4);
+  return id;
+}}
+
 function formatDate(unixMs) {{
   const value = Number(unixMs || 0);
   if (!value) return 'unknown';
@@ -3282,6 +3312,18 @@ $('login').addEventListener('click', () => login().catch(err => setStatus('auth-
 $('claim').addEventListener('click', () => claimDaemon().catch(err => setStatus('claim-status', err.message, 'err')));
 $('refresh').addEventListener('click', () => refreshAll().catch(err => setStatus('claim-status', err.message, 'err')));
 $('logout').addEventListener('click', async () => {{ await api('/api/logout', {{ method: 'POST', body: '{{}}' }}); state.user = null; state.csrfToken = ''; renderAuth(); }});
+$('copy-user-id').addEventListener('click', async () => {{
+  const id = state.user && state.user.id ? String(state.user.id) : '';
+  if (!id) return;
+  try {{
+    await navigator.clipboard.writeText(id);
+    const btn = $('copy-user-id');
+    btn.textContent = 'Copied';
+    setTimeout(() => {{ btn.textContent = 'Copy'; }}, 1200);
+  }} catch (err) {{
+    setStatus('auth-status', 'Copy failed: ' + ((err && err.message) || err), 'err');
+  }}
+}});
 $('account').addEventListener('keydown', event => {{ if (event.key === 'Enter') login().catch(err => setStatus('auth-status', err.message, 'err')); }});
 $('claim-code').addEventListener('keydown', event => {{ if (event.key === 'Enter') claimDaemon().catch(err => setStatus('claim-status', err.message, 'err')); }});
 

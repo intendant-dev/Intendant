@@ -287,33 +287,43 @@ Unified administration for how dashboards and daemons reach each other:
 - Access is available as both the in-dashboard **Access** tab and a first-class
   `/access` page on daemon origins. The page opens the same Access surface
   without task/session chrome so it can act as a local fleet-admin home.
-- **Overview** shows the current access scope, the local daemon identity, and
-  the boundary between authority models and transports.
-- **People & Devices** lists user/client principals separately from peer daemon
-  identities. The current browser certificate, Connect account, or combined
-  human mTLS user is user/client access; the pane can bind that identity to a
-  local role grant, from minimal inspect-only access through root.
-- **Daemons** lists daemon targets, not raw transports. A target can be this
-  daemon over user/client access, a hosted-transport daemon, a direct browser-mTLS
-  daemon, or a peer-routed daemon. Each row shows the access domain, route, and
-  available capabilities, then links to Stats, Files, and Shell.
-- **Peer Trust** focuses on daemon-to-daemon relationships: approved inbound
-  identities and configured outbound peer routes, both bounded by peer profiles.
-- **Policies** shows the role/policy model, local IAM role templates, and the
-  permission matrix used by dashboard-control and peer auth. Local
-  browser/Connect roles are editable; organization groups, directory scopes,
-  public shares, and external identity policy remain design targets.
-- **Audit** renders the overview-backed grant detail: principal, target, policy,
-  transport, enforcement status, and why the access exists. Persisted local
-  user/client grants can be activated, drafted, or revoked from this pane. It
-  also keeps the legacy trusted relationship panel during the transition.
-- **Invitations** contains peer onboarding flows: Grant Peer Invite, Join Invite,
-  Request Peer Access, Manual Add, and inbound peer access requests.
-- **Public Shares** is the placeholder surface for future explicit public or
-  hosted-service grants; by default nothing is shared publicly.
+- The surface is organized around the product mental model — *who* is acting,
+  *how* the request travels, and *the target daemon decides* — in six panes:
+- **Overview** answers "who am I here and what can I reach": actionable
+  attention banners first (failed routes, a hosted Connect account the daemon
+  refuses, draft grants, unreadable IAM state), then an identity hero (your
+  principal, the route you arrived on, your role and what it allows), a daemon
+  card with fleet/people/peer counts, a fleet-at-a-glance strip, and a
+  three-step explainer of the access model.
+- **Daemons** lists targets, not raw transports: each row shows a clean display
+  name (never a bare IP or key when a better name exists), a route chip, your
+  role badge there, capability chips, and Stats/Files/Shell/Display actions.
+  The pane also hosts the per-peer messaging/task/approval quick controls and
+  capability routing, both in collapsed poweruser folds.
+- **People & Devices** owns the user/client domain. It shows your identity on
+  this daemon, a guided grant flow (who → identity details → role → active or
+  draft) with a role-card picker and advanced identity metadata folded away,
+  and every user/client principal with its grants. Grants can be activated,
+  drafted, or revoked inline; draft and revoked records stay visible for
+  review.
+- **Peers** owns the daemon-to-daemon domain: inbound/outbound summaries, the
+  Link-daemons wizard (Request Peer Access, Join Invite, Grant Peer Invite,
+  Manual Add), inbound peer access requests, approved/revoked inbound peer
+  identities, and every peer-profile grant in both directions.
 - **Diagnostics** owns dashboard route health, including hosted Connect,
   local/mTLS, local WebRTC control, event delivery, byte streams, uploads, and
-  self-tests.
+  self-tests. The status-bar access dot links here, and its prefix names the
+  actual route (`mTLS`, `Connect`, `WebRTC`, or `local`) so "Ready" is never
+  ambiguous.
+- **Advanced** is the poweruser den: the role catalog and the exact
+  policy×permission matrix, every grant with policy/transport/reason detail,
+  the raw model inspector (principals, grants, policies, permissions, IAM
+  roles, audit events, transports), the local IAM state card with raw JSON
+  links, unresolved architecture notes, and the public-sharing posture
+  (nothing is shared unless explicitly granted).
+- Old deep links keep working: `#access/policies`, `#access/audit`, and
+  `#access/public` resolve to Advanced, `#access/invitations` to Peers, and
+  `#access/targets` to Daemons.
 
 Access uses one vocabulary across the hosted dashboard, direct/self-hosted mTLS,
 and peer federation:
