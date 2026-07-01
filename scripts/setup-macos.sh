@@ -122,12 +122,7 @@ check_computer_use() {
         all_ok=false
     fi
 
-    if has_cmd cliclick; then
-        ok "cliclick"
-    else
-        miss "cliclick" "brew install cliclick"
-        all_ok=false
-    fi
+    # CU input injection is in-process (CGEvent) — no cliclick needed.
 
     $all_ok
 }
@@ -492,7 +487,6 @@ run_install() {
 
     # Phase 2: Homebrew packages
     info "installing Homebrew packages..."
-    brew_install cliclick
     brew_install ffmpeg
     brew_install switchaudio-osx
     brew_install sox

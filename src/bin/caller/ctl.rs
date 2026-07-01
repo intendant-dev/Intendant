@@ -591,6 +591,14 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 .collect::<Vec<_>>();
             run_display(client, config, &next).await?;
         }
+        "elements" | "read-screen" => {
+            let args = parse_command_args(&raw[1..], &["--target", "--format"], &[])?;
+            let mut map = Map::new();
+            insert_string(&mut map, "display_target", args.one("--target"));
+            insert_string(&mut map, "format", args.one("--format"));
+            let response = call_tool(client, config, "read_screen", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
+        }
         other => return Err(format!("unknown cu command '{other}'")),
     }
     Ok(())
@@ -1697,8 +1705,11 @@ fn help_cu() {
         "Usage:\n\
   intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
   intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
+  intendant ctl cu elements [--target TARGET] [--format text|json]\n\
 \n\
 Run `intendant ctl cu actions --help` for the action JSON shapes.\n\
+`cu elements` reads the frontmost app's UI element tree (roles, labels, values, frames) — \n\
+cheap textual grounding: click the center of a reported frame. macOS user-session only for now.\n\
 Targets: user_session (needs display grant), 99/display_99 (virtual). Omit to auto-detect."
     );
 }

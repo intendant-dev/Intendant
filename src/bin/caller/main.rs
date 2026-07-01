@@ -4,6 +4,8 @@ mod app_state_pricing;
 mod approval;
 mod audio_routing;
 mod autonomy;
+#[cfg(target_os = "macos")]
+mod ax;
 mod browser_workspace;
 mod computer_use;
 mod connect_rendezvous;

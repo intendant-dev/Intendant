@@ -56,7 +56,7 @@ Intendant, not Codex automatic compaction, owns long-task context density. This 
 
 Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
-- For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
+- For GUI inspection in Intendant-managed sessions, use Intendant MCP tools directly: `read_screen` first for the frontmost app's UI element tree (roles, labels, values, frames — a few hundred tokens; click the center of a reported frame), `take_screenshot` when pixels are needed for visual verification or the element tree is sparse, and `execute_cu_actions` for input. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, ad-hoc accessibility queries, or app binary inspection for GUI interaction.
 - Do not use broad argv-pattern process cleanup such as `pkill -f intendant` or `pkill -f <script-name>`. Managed controller argv can contain the task prompt, and prompts often include command examples, so `pkill -f` can match and kill the controller supervising you. Prefer helper-owned cleanup, tracked child PIDs, process groups created by the command you launched, temporary workspace/profile directories, or exact PIDs you verified with `ps`.
 - Browser/GUI validation retry discipline: run one primary validation attempt. If it fails or times out, run at most one compact diagnostic retry. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the failure reason and relevant logs/diagnostics. Do not cycle through multiple automation stacks unless the user explicitly asks for deeper manual investigation or the validation tool itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid re-running build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
@@ -11349,6 +11349,7 @@ error: build failed
         assert!(developer_instructions.contains("Existing developer policy."));
         assert!(developer_instructions.contains("managed_context=managed"));
         assert!(developer_instructions.contains("Keep the live transcript informationally dense"));
+        assert!(developer_instructions.contains("read_screen"));
         assert!(developer_instructions.contains("take_screenshot"));
         assert!(developer_instructions.contains("execute_cu_actions"));
         assert!(developer_instructions.contains("pkill -f intendant"));

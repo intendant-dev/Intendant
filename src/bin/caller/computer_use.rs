@@ -268,6 +268,161 @@ pub struct ScreenshotData {
     pub height: u32,
 }
 
+// ── Element-tree observation ────────────────────────────────────────────────
+
+/// One node of a UI element tree read from the platform accessibility API.
+/// Coordinates are logical points in the same space CU click actions consume.
+#[derive(Debug, Clone, Serialize)]
+pub struct UiElement {
+    /// Normalized role, lowercase with the platform prefix stripped
+    /// (`AXButton` → `button`).
+    pub role: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub value: Option<String>,
+    /// (x, y, width, height) in logical points.
+    pub frame: (i32, i32, u32, u32),
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub focused: bool,
+    /// True unless the element reports itself disabled.
+    pub enabled: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub children: Vec<UiElement>,
+}
+
+/// A compact snapshot of the frontmost application's focused-window element
+/// tree plus a one-line summary of the other visible windows.
+#[derive(Debug, Clone, Serialize)]
+pub struct ScreenElements {
+    pub app: String,
+    pub pid: i32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub window_title: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub root: Option<UiElement>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub other_windows: Vec<String>,
+    /// Present when a depth/node cap cut the walk short — never truncate
+    /// silently.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub truncated: Option<String>,
+}
+
+/// Depth cap for element-tree walks.
+pub const ELEMENT_TREE_MAX_DEPTH: usize = 12;
+/// Node-count cap for element-tree walks (keeps the observation a few KB).
+pub const ELEMENT_TREE_MAX_NODES: usize = 400;
+
+/// Read the element tree of the frontmost application on the user's display.
+///
+/// This is the cheap textual observation path: a filtered accessibility tree
+/// with roles, labels, values, and logical-point frames — typically a few
+/// hundred tokens versus ~1.5k for a screenshot — and it grounds clicks
+/// deterministically (click the center of a reported frame). Pixels remain
+/// the fallback for visual verification and for apps with poor accessibility
+/// support.
+pub async fn read_screen_elements(target: DisplayTarget) -> Result<ScreenElements, String> {
+    #[cfg(target_os = "macos")]
+    {
+        if !target.is_user_session() {
+            return Err(
+                "element trees are only available for the user session display on macOS \
+                 (virtual displays are Xvfb/Linux); use display_target=\"user_session\""
+                    .to_string(),
+            );
+        }
+        // The AX walk is a series of blocking IPC calls into the target app;
+        // AXUIElement is not Send, so the whole read runs inside one
+        // spawn_blocking closure.
+        tokio::task::spawn_blocking(|| {
+            crate::ax::read_frontmost(ELEMENT_TREE_MAX_DEPTH, ELEMENT_TREE_MAX_NODES)
+        })
+        .await
+        .map_err(|e| format!("element read task failed: {e}"))?
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = target;
+        Err(
+            "element-tree observation is not implemented on this platform yet — \
+             use take_screenshot instead"
+                .to_string(),
+        )
+    }
+}
+
+/// Render a [`ScreenElements`] snapshot as indented text — one element per
+/// line, cheap for a model to scan. Structure-only containers (unlabeled
+/// groups) are collapsed so nesting reflects meaning rather than toolkit
+/// internals; zero-size childless leaves are dropped.
+pub fn format_screen_elements(snapshot: &ScreenElements) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "frontmost: {} (pid {})",
+        snapshot.app, snapshot.pid
+    ));
+    if let Some(title) = &snapshot.window_title {
+        out.push_str(&format!(" — window \"{title}\""));
+    }
+    out.push('\n');
+    match &snapshot.root {
+        Some(root) => format_element(root, 1, &mut out),
+        None => out.push_str("  (no accessible window content)\n"),
+    }
+    if !snapshot.other_windows.is_empty() {
+        out.push_str("other visible windows:\n");
+        for window in &snapshot.other_windows {
+            out.push_str(&format!("  {window}\n"));
+        }
+    }
+    if let Some(note) = &snapshot.truncated {
+        out.push_str(&format!("truncated: {note}\n"));
+    }
+    out
+}
+
+fn format_element(element: &UiElement, depth: usize, out: &mut String) {
+    let structural_only = matches!(element.role.as_str(), "group" | "generic" | "unknown")
+        && element.label.is_none()
+        && element.value.is_none()
+        && element.enabled
+        && !element.focused;
+    if structural_only {
+        for child in &element.children {
+            format_element(child, depth, out);
+        }
+        return;
+    }
+    let (x, y, w, h) = element.frame;
+    if (w == 0 || h == 0) && element.children.is_empty() {
+        return;
+    }
+    out.push_str(&"  ".repeat(depth));
+    out.push_str(&element.role);
+    if let Some(label) = &element.label {
+        out.push_str(&format!(" \"{label}\""));
+    }
+    if let Some(value) = &element.value {
+        out.push_str(&format!(" value=\"{value}\""));
+    }
+    out.push_str(&format!(" ({x},{y} {w}x{h})"));
+    let mut flags: Vec<&str> = Vec::new();
+    if element.focused {
+        flags.push("focused");
+    }
+    if !element.enabled {
+        flags.push("disabled");
+    }
+    if !flags.is_empty() {
+        out.push_str(&format!(" [{}]", flags.join(",")));
+    }
+    out.push('\n');
+    for child in &element.children {
+        format_element(child, depth + 1, out);
+    }
+}
+
 // ── Coordinate transforms ────────────────────────────────────────────────────
 
 /// Convert Gemini's normalized 0-999 coordinates to absolute pixels.
@@ -1986,6 +2141,95 @@ mod tests {
         assert_eq!(normalized_to_pixels(0, 0, 1440, 900), (0, 0));
         assert_eq!(normalized_to_pixels(999, 999, 1440, 900), (1440, 900));
         assert_eq!(normalized_to_pixels(500, 500, 1440, 900), (721, 450));
+    }
+
+    fn leaf(role: &str, label: Option<&str>, frame: (i32, i32, u32, u32)) -> UiElement {
+        UiElement {
+            role: role.to_string(),
+            label: label.map(str::to_string),
+            value: None,
+            frame,
+            focused: false,
+            enabled: true,
+            children: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn format_screen_elements_collapses_structural_groups_and_drops_zero_size() {
+        let mut button = leaf("button", Some("Save"), (10, 30, 96, 28));
+        button.enabled = false;
+        let mut field = leaf("textfield", Some("Address"), (120, 30, 400, 28));
+        field.focused = true;
+        field.value = Some("https://example.com".to_string());
+        let group = UiElement {
+            role: "group".to_string(),
+            label: None,
+            value: None,
+            frame: (0, 25, 1512, 942),
+            focused: false,
+            enabled: true,
+            children: vec![button, field, leaf("image", None, (0, 0, 0, 0))],
+        };
+        let window = UiElement {
+            role: "window".to_string(),
+            label: Some("GitHub".to_string()),
+            value: None,
+            frame: (0, 25, 1512, 942),
+            focused: false,
+            enabled: true,
+            children: vec![group],
+        };
+        let snapshot = ScreenElements {
+            app: "Safari".to_string(),
+            pid: 42,
+            window_title: Some("GitHub".to_string()),
+            root: Some(window),
+            other_windows: vec!["Finder — \"Downloads\" (100,100 800x600)".to_string()],
+            truncated: Some("element cap (400) reached".to_string()),
+        };
+
+        let text = format_screen_elements(&snapshot);
+        assert!(
+            text.starts_with("frontmost: Safari (pid 42) — window \"GitHub\"\n"),
+            "header: {text}"
+        );
+        // The unlabeled group is collapsed: its children print at its depth.
+        assert!(
+            text.contains("\n    button \"Save\" (10,30 96x28) [disabled]\n"),
+            "button line: {text}"
+        );
+        assert!(
+            text.contains(
+                "\n    textfield \"Address\" value=\"https://example.com\" (120,30 400x28) [focused]\n"
+            ),
+            "field line: {text}"
+        );
+        assert!(!text.contains("group"), "group not collapsed: {text}");
+        // Zero-size childless leaves are dropped.
+        assert!(!text.contains("image"), "zero-size leaf kept: {text}");
+        assert!(text.contains("other visible windows:\n  Finder"));
+        assert!(text.contains("truncated: element cap"));
+    }
+
+    #[test]
+    fn screen_elements_json_omits_empty_fields() {
+        let snapshot = ScreenElements {
+            app: "Safari".to_string(),
+            pid: 42,
+            window_title: None,
+            root: Some(leaf("window", None, (0, 0, 100, 100))),
+            other_windows: Vec::new(),
+            truncated: None,
+        };
+        let json = serde_json::to_value(&snapshot).unwrap();
+        assert!(json.get("window_title").is_none());
+        assert!(json.get("truncated").is_none());
+        assert!(json.get("other_windows").is_none());
+        let root = json.get("root").unwrap();
+        assert!(root.get("children").is_none());
+        assert!(root.get("focused").is_none());
+        assert_eq!(root.get("enabled"), Some(&serde_json::Value::Bool(true)));
     }
 
     #[test]

@@ -25,7 +25,7 @@ const CLAUDE_CODE_BOOTSTRAP_ADDENDUM: &str = r#"
 
 ### Intendant Supervision
 This session runs under Intendant, which adds desktop and display capabilities beyond your own tools:
-- The connected `intendant` MCP server carries the bootstrap set: `take_screenshot` and `execute_cu_actions` for desktop computer use (screenshots return as images), `list_displays`/`grant_user_display` for display access, and the shared-view tools (`show_shared_view`, `focus_shared_view`, `capture_shared_view_frame`, `request_shared_view_input`, `hide_shared_view`) for putting work on a display the user watches live.
+- The connected `intendant` MCP server carries the bootstrap set: `read_screen` for the frontmost app's UI element tree (cheap textual grounding — click the center of a reported frame), `take_screenshot` and `execute_cu_actions` for desktop computer use (screenshots return as images), `list_displays`/`grant_user_display` for display access, and the shared-view tools (`show_shared_view`, `focus_shared_view`, `capture_shared_view_frame`, `request_shared_view_input`, `hide_shared_view`) for putting work on a display the user watches live.
 - The broad control surface (browser workspaces, frames, approvals, tasks, audio) is discovered lazily through the CLI: run `"$INTENDANT" ctl --help`, then focused help like `"$INTENDANT" ctl cu actions --help`. `ctl tools list` / `ctl tools schema TOOL` / `ctl tools call TOOL` cover anything not wrapped.
 - When the user should visually stay in the loop (demoing a result, watching you operate a GUI or browser, an auth handoff), open the shared view with `show_shared_view` before acting and `hide_shared_view` when the moment is over.
 - Do not drive the desktop with `cliclick`/`osascript`/`xdotool` or ad-hoc scripts — go through the Intendant tools so actions run under the user's approval settings.
@@ -910,6 +910,7 @@ mod tests {
         // keep the load-bearing pointers present.
         for needle in [
             "\"$INTENDANT\" ctl --help",
+            "read_screen",
             "take_screenshot",
             "execute_cu_actions",
             "show_shared_view",

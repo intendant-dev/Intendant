@@ -115,7 +115,12 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
 - WASM boundary: `serde_wasm_bindgen` with `serialize_maps_as_objects(true)`
 - Pure-safe Rust by default. The Unix (macOS / Linux) code paths contain no
   `unsafe` beyond a handful of well-documented libc existence/identity probes
-  in `platform.rs`. The Windows backends are the deliberate exception: capture,
+  in `platform.rs` and the macOS Accessibility bindings in `ax.rs` (raw
+  `accessibility-sys` FFI wrapped once there — no safe wrapper crate exists
+  without dragging in a duplicate `core-graphics`/legacy `objc` stack; every
+  block is type-checked, `// SAFETY:`-commented, and RAII-managed via
+  `core-foundation` `TCFType` wrappers — do not add AX `unsafe` outside that
+  module). The Windows backends are the other deliberate exception: capture,
   input injection, and H.264 encoding necessarily go through Win32/COM/Media
   Foundation FFI (`display/windows.rs`, `display/encode/h264_windows.rs`,
   `platform.rs`), which has no safe alternative. Confine that `unsafe` to those
@@ -125,7 +130,8 @@ SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, rese
   management, and annotate every `unsafe` block with a `// SAFETY:` comment
   stating the invariant that makes it sound (handle/pointer validity, COM
   refcount/ownership, buffer bounds, thread/apartment affinity). Do not
-  introduce `unsafe` on the cross-platform or Unix paths.
+  introduce `unsafe` on the cross-platform or Unix paths beyond these
+  documented exceptions.
 - When adding a new system / `-sys` crate dependency, update **both**
   `scripts/setup-linux.sh` (`APT_PACKAGES`) and `scripts/setup-macos.sh`
   (`check_core` or an appropriate check function) in the same commit. Silent

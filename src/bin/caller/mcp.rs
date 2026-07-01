@@ -1414,6 +1414,7 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "grant_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
+                    | "read_screen"
                     | "execute_cu_actions"
             ) || (managed_context
                 // Keep managed rewind + fission tools reachable from Codex's
@@ -1435,6 +1436,7 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "grant_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
+                    | "read_screen"
                     | "execute_cu_actions"
                     | "list_frames"
                     | "read_frame"
@@ -1608,6 +1610,14 @@ fn append_manual_http_tool_definitions(
             "take_screenshot",
             "Take a screenshot of a display. Returns an MCP image content block.",
             TakeScreenshotParams
+        ),
+    );
+    push(
+        "read_screen",
+        manual_http_tool_definition!(
+            "read_screen",
+            "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. Currently macOS user-session only.",
+            ReadScreenParams
         ),
     );
     push(
@@ -7033,6 +7043,17 @@ pub struct TakeScreenshotParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadScreenParams {
+    /// Display target: "user_session" (the only target supported on macOS).
+    /// Defaults to the user session display.
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// "text" (default) for the compact indented tree, or "json".
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateBrowserWorkspaceParams {
     /// URL to open in the browser workspace. Omit for about:blank.
     #[serde(default)]
@@ -7817,6 +7838,10 @@ impl IntendantServer {
                 self.take_screenshot_with_output(params, managed_context_override == Some(true))
                     .await
                     .map_err(|e| e.to_string())
+            }
+            "read_screen" => {
+                let params = parse_params::<ReadScreenParams>(args)?;
+                self.read_screen(params).await.map_err(|e| e.to_string())
             }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
@@ -10488,6 +10513,33 @@ impl IntendantServer {
     }
 
     #[tool(
+        description = "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. Currently macOS user-session only."
+    )]
+    async fn read_screen(
+        &self,
+        Parameters(params): Parameters<ReadScreenParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Element trees only exist for the real session; default there rather
+        // than to a virtual display like the pixel tools do.
+        let target = match params.display_target.as_deref() {
+            None => crate::computer_use::DisplayTarget::UserSession,
+            some => resolve_display_target(some),
+        };
+        match crate::computer_use::read_screen_elements(target).await {
+            Ok(snapshot) => {
+                let body = if params.format.as_deref() == Some("json") {
+                    serde_json::to_string_pretty(&snapshot)
+                        .unwrap_or_else(|e| format!("serialize error: {e}"))
+                } else {
+                    crate::computer_use::format_screen_elements(&snapshot)
+                };
+                Ok(text_tool_result(body))
+            }
+            Err(e) => Ok(text_tool_error(format!("read_screen error: {e}"))),
+        }
+    }
+
+    #[tool(
         description = "Execute computer-use actions on a display (click, type, scroll, etc). Returns action status plus an MCP image content block for the post-action screenshot. Set coordinate_space to \"normalized_1000\" if coordinates are on a 0-1000 grid."
     )]
     async fn execute_cu_actions(
@@ -12446,6 +12498,7 @@ mod tests {
             assert!(vanilla_names.contains(&"grant_user_display"));
             assert!(vanilla_names.contains(&"revoke_user_display"));
             assert!(vanilla_names.contains(&"take_screenshot"));
+            assert!(vanilla_names.contains(&"read_screen"));
             assert!(vanilla_names.contains(&"execute_cu_actions"));
             assert!(!vanilla_names.contains(&"spawn_live_audio"));
             assert!(!vanilla_names.contains(&"list_frames"));
@@ -12475,6 +12528,7 @@ mod tests {
             assert!(managed_names.contains(&"grant_user_display"));
             assert!(managed_names.contains(&"revoke_user_display"));
             assert!(managed_names.contains(&"take_screenshot"));
+            assert!(managed_names.contains(&"read_screen"));
             assert!(managed_names.contains(&"execute_cu_actions"));
             assert!(!managed_names.contains(&"spawn_live_audio"));
 
