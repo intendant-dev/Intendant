@@ -19,8 +19,14 @@ pub enum DisplayBackend {
     /// capture + portal input injection). Requires an active session.
     #[allow(dead_code)]
     Wayland,
-    /// macOS: cliclick + screencapture. Requires accessibility permissions.
+    /// macOS: in-process CGEvent injection + session-frame screenshots
+    /// (`screencapture` fallback). Requires the Accessibility permission.
     MacOS,
+    /// Windows: routed through the live `DisplaySession` (DXGI capture +
+    /// `SendInput` injection). Requires an active session — the desktop
+    /// display auto-registers at daemon startup.
+    #[allow(dead_code)]
+    Windows,
 }
 
 impl DisplayBackend {
@@ -30,6 +36,7 @@ impl DisplayBackend {
             "x11" => DisplayBackend::X11,
             "wayland" => DisplayBackend::Wayland,
             "macos" => DisplayBackend::MacOS,
+            "windows" => DisplayBackend::Windows,
             _ => Self::detect(),
         }
     }
@@ -38,6 +45,9 @@ impl DisplayBackend {
     pub fn detect() -> Self {
         if cfg!(target_os = "macos") {
             return DisplayBackend::MacOS;
+        }
+        if cfg!(target_os = "windows") {
+            return DisplayBackend::Windows;
         }
         if std::env::var("WAYLAND_DISPLAY").is_ok() {
             return DisplayBackend::Wayland;
@@ -196,16 +206,6 @@ impl MouseButton {
             MouseButton::Middle => "2",
         }
     }
-
-    /// cliclick action prefix for this button.
-    fn cliclick_prefix(self) -> &'static str {
-        match self {
-            MouseButton::Left => "c",
-            MouseButton::Right => "rc",
-            // cliclick has no middle-click; use triple-click as closest approximation
-            MouseButton::Middle => "tc",
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, schemars::JsonSchema)]
@@ -310,7 +310,9 @@ pub async fn execute_actions(
     };
 
     match effective_backend {
-        DisplayBackend::Wayland => {
+        // Session-only backends: capture and input both live in the display
+        // pipeline (Wayland portal / Windows DXGI + SendInput).
+        DisplayBackend::Wayland | DisplayBackend::Windows => {
             if let Some(session) = lookup_display_session(session_registry, &target).await {
                 return execute_via_session(
                     &session,
@@ -324,7 +326,7 @@ pub async fn execute_actions(
             return vec![CuActionResult {
                 success: false,
                 screenshot: None,
-                error: Some(no_wayland_session_message(&target)),
+                error: Some(no_session_message(effective_backend, &target)),
             }];
         }
         DisplayBackend::X11 | DisplayBackend::MacOS => {} // handled below
@@ -429,7 +431,7 @@ pub async fn execute_actions(
 
 /// Get the logical display size for the main display. Cached after first call.
 /// Used to map CU model coordinates (which are in a normalized 1024-wide space)
-/// to actual logical points for cliclick/xdotool.
+/// to actual logical points for input injection.
 ///
 /// This is a platform-agnostic *fallback* used when no active capture session
 /// is available for the target display. Prefer [`target_pixel_size`] for any
@@ -505,7 +507,7 @@ pub async fn target_pixel_size(
 }
 
 /// Screenshots are resized to logical display size before sending to the model,
-/// so model coordinates are already in logical (cliclick/xdotool) space.
+/// so model coordinates are already in logical (input-injection) space.
 /// This function is a no-op but kept as the single place to adjust if needed.
 fn scale_coords(x: i32, y: i32) -> (i32, i32) {
     (x, y)
@@ -521,17 +523,10 @@ async fn execute_single(
 ) -> CuActionResult {
     match action {
         CuAction::Click { x, y, button } => match backend {
+            #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => {
                 let (sx, sy) = scale_coords(*x, *y);
-                // Move first so hover-to-reveal UIs register the pointer,
-                // then click. Without this, UIs like Element's call controls
-                // don't respond because cliclick's c: doesn't hover first.
-                run_cliclick(&[
-                    &format!("m:{},{}", sx, sy),
-                    "w:50",
-                    &format!("{}:{},{}", button.cliclick_prefix(), sx, sy),
-                ])
-                .await
+                macos_input::click(sx, sy, *button, 1).await
             }
             _ => {
                 run_xdotool(
@@ -548,10 +543,11 @@ async fn execute_single(
                 .await
             }
         },
-        CuAction::DoubleClick { x, y, .. } => match backend {
+        CuAction::DoubleClick { x, y, button } => match backend {
+            #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => {
                 let (sx, sy) = scale_coords(*x, *y);
-                run_cliclick(&[&format!("dc:{},{}", sx, sy)]).await
+                macos_input::click(sx, sy, *button, 2).await
             }
             _ => {
                 run_xdotool(
@@ -573,23 +569,13 @@ async fn execute_single(
             }
         },
         CuAction::Type { text } => match backend {
-            DisplayBackend::MacOS => {
-                // CU models often append \n to Type text expecting Enter.
-                // cliclick's t: command types literally, so strip \n and
-                // append kp:return as a separate keystroke.
-                let has_newline = text.ends_with('\n');
-                let clean = text.trim_end_matches('\n');
-                let mut args = vec![format!("t:{}", clean)];
-                if has_newline {
-                    args.push("kp:return".to_string());
-                }
-                let refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-                run_cliclick(&refs).await
-            }
+            #[cfg(target_os = "macos")]
+            DisplayBackend::MacOS => macos_input::type_text(text).await,
             _ => run_xdotool(display, &["type", "--clearmodifiers", text]).await,
         },
         CuAction::Key { key } => match backend {
-            DisplayBackend::MacOS => execute_macos_key(key).await,
+            #[cfg(target_os = "macos")]
+            DisplayBackend::MacOS => macos_input::key(key).await,
             _ => run_xdotool(display, &["key", "--clearmodifiers", key]).await,
         },
         CuAction::Scroll {
@@ -598,9 +584,10 @@ async fn execute_single(
             direction,
             amount,
         } => match backend {
+            #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => {
                 let (sx, sy) = scale_coords(*x, *y);
-                execute_macos_scroll(sx, sy, *direction, *amount).await
+                macos_input::scroll(sx, sy, *direction, *amount).await
             }
             _ => {
                 let mut result = run_xdotool(
@@ -621,9 +608,10 @@ async fn execute_single(
             }
         },
         CuAction::MoveMouse { x, y } => match backend {
+            #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => {
                 let (sx, sy) = scale_coords(*x, *y);
-                run_cliclick(&[&format!("m:{},{}", sx, sy)]).await
+                macos_input::move_mouse(sx, sy).await
             }
             _ => {
                 run_xdotool(
@@ -639,14 +627,11 @@ async fn execute_single(
             end_x,
             end_y,
         } => match backend {
+            #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => {
                 let (sx1, sy1) = scale_coords(*start_x, *start_y);
                 let (sx2, sy2) = scale_coords(*end_x, *end_y);
-                run_cliclick(&[
-                    &format!("dd:{},{}", sx1, sy1),
-                    &format!("du:{},{}", sx2, sy2),
-                ])
-                .await
+                macos_input::drag(sx1, sy1, sx2, sy2).await
             }
             _ => {
                 run_xdotool(
@@ -725,179 +710,450 @@ async fn run_xdotool(display: &str, args: &[&str]) -> CuActionResult {
     }
 }
 
-// ── macOS backend (cliclick + osascript) ─────────────────────────────────────
+// ── macOS backend (in-process CGEvent injection) ─────────────────────────────
 
-/// Run a cliclick command with the given action arguments.
-async fn run_cliclick(args: &[&str]) -> CuActionResult {
-    let output = Command::new("cliclick").args(args).output().await;
-
-    match output {
-        Ok(o) if o.status.success() => CuActionResult {
-            success: true,
-            screenshot: None,
-            error: None,
-        },
-        Ok(o) => CuActionResult {
-            success: false,
-            screenshot: None,
-            error: Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        },
-        Err(e) => CuActionResult {
-            success: false,
-            screenshot: None,
-            error: Some(format!(
-                "cliclick exec error (is cliclick installed?): {}",
-                e
-            )),
-        },
-    }
-}
-
-/// Translate an xdotool-style key name to cliclick key press syntax.
+/// In-process mouse/keyboard injection via CoreGraphics `CGEvent`s.
 ///
-/// Handles single keys and modifier combos (e.g. "ctrl+c" → "kd:ctrl kp:c ku:ctrl").
-fn translate_key_for_cliclick(key: &str) -> Vec<String> {
-    // Check for modifier combo (e.g. "ctrl+c", "super+shift+a")
-    if key.contains('+') {
-        let parts: Vec<&str> = key.split('+').collect();
-        if parts.len() >= 2 {
-            let modifiers: Vec<&str> = parts[..parts.len() - 1].to_vec();
-            let base_key = parts[parts.len() - 1];
-            let mut args = Vec::new();
-            // Press modifiers down
-            for m in &modifiers {
-                args.push(format!("kd:{}", translate_single_key(m)));
-            }
-            // Press the base key — use kp: for special keys, t: for single characters
-            let translated = translate_single_key(base_key);
-            if translated == base_key && base_key.len() == 1 {
-                // Single character (e.g. 'w', 'a') — cliclick kp: doesn't accept these
-                args.push(format!("t:{}", base_key));
-            } else {
-                args.push(format!("kp:{}", translated));
-            }
-            // Release modifiers in reverse
-            for m in modifiers.iter().rev() {
-                args.push(format!("ku:{}", translate_single_key(m)));
-            }
-            return args;
-        }
-    }
-    let translated = translate_single_key(key);
-    if translated == key && key.len() == 1 {
-        vec![format!("t:{}", key)]
-    } else {
-        vec![format!("kp:{}", translated)]
-    }
-}
-
-/// Map a single key name from xdotool convention to cliclick convention.
-fn translate_single_key(key: &str) -> &str {
-    match key.to_lowercase().as_str() {
-        "return" | "enter" | "kp_enter" => "return",
-        "tab" => "tab",
-        "escape" | "esc" => "esc",
-        "space" => "space",
-        "backspace" => "delete",
-        "delete" => "fwd-delete",
-        "up" => "arrow-up",
-        "down" => "arrow-down",
-        "left" => "arrow-left",
-        "right" => "arrow-right",
-        "home" => "home",
-        "end" => "end",
-        "prior" | "page_up" | "pageup" => "page-up",
-        "next" | "page_down" | "pagedown" => "page-down",
-        "ctrl" | "control" | "control_l" | "control_r" => "ctrl",
-        "alt" | "alt_l" | "alt_r" => "alt",
-        "shift" | "shift_l" | "shift_r" => "shift",
-        "super" | "super_l" | "super_r" | "meta" | "cmd" | "command" => "cmd",
-        "f1" => "f1",
-        "f2" => "f2",
-        "f3" => "f3",
-        "f4" => "f4",
-        "f5" => "f5",
-        "f6" => "f6",
-        "f7" => "f7",
-        "f8" => "f8",
-        "f9" => "f9",
-        "f10" => "f10",
-        "f11" => "f11",
-        "f12" => "f12",
-        // cliclick accepts single characters directly
-        _ => {
-            // Can't return a computed value from a match arm that borrows,
-            // so for unrecognized keys, return the input as-is via leak-free path.
-            // The caller already owns the key string.
-            key
-        }
-    }
-}
-
-/// Execute a key press on macOS via cliclick.
-async fn execute_macos_key(key: &str) -> CuActionResult {
-    let args = translate_key_for_cliclick(key);
-    let arg_refs: Vec<&str> = args.iter().map(|s| s.as_str()).collect();
-    run_cliclick(&arg_refs).await
-}
-
-/// Execute a scroll action on macOS.
-///
-/// Moves the mouse to (x, y) via cliclick, then uses osascript to post
-/// scroll wheel events via CGEvent.
-async fn execute_macos_scroll(
-    x: i32,
-    y: i32,
-    direction: ScrollDirection,
-    amount: i32,
-) -> CuActionResult {
-    // Move mouse to target position first
-    let move_result = run_cliclick(&[&format!("m:{},{}", x, y)]).await;
-    if !move_result.success {
-        return move_result;
-    }
-
-    let amt = amount.max(1);
-    // CGEvent scroll: positive = up/left, negative = down/right
-    let (dy, dx) = match direction {
-        ScrollDirection::Up => (amt, 0),
-        ScrollDirection::Down => (-amt, 0),
-        ScrollDirection::Left => (0, amt),
-        ScrollDirection::Right => (0, -amt),
+/// Replaces the earlier `cliclick`/`osascript` subprocess path: no external
+/// binary, no fork per action, a real middle button (cliclick approximated it
+/// as a triple-click), and the same Accessibility (TCC) permission
+/// requirement. Coordinates are logical points, matching the normalized
+/// screenshots. Key chords use ANSI-US virtual keycodes (the same layout
+/// assumption cliclick made); `type_text` posts unicode strings directly and
+/// is layout-independent.
+#[cfg(target_os = "macos")]
+mod macos_input {
+    use super::{CuActionResult, MouseButton, ScrollDirection};
+    use core_graphics::event::{
+        CGEvent, CGEventFlags, CGEventTapLocation, CGEventType, CGKeyCode, CGMouseButton,
+        EventField, KeyCode, ScrollEventUnit,
     };
+    use core_graphics::event_source::{CGEventSource, CGEventSourceStateID};
+    use core_graphics::geometry::CGPoint;
+    use std::time::Duration;
 
-    // Use osascript + ObjC bridge to post a CGEvent scroll wheel event
-    let script = format!(
-        concat!(
-            "use framework \"ApplicationServices\"\n",
-            "set e to current application's CGEventCreateScrollWheelEvent(",
-            "missing value, 0, 2, {}, {})\n",
-            "current application's CGEventPost(0, e)"
-        ),
-        dy, dx
-    );
+    /// Pause between a pointer move and the click that follows, so
+    /// hover-to-reveal UIs register the pointer before the press (the same
+    /// reason the cliclick path did `m:` `w:50` `c:`).
+    const HOVER_DELAY: Duration = Duration::from_millis(50);
+    /// Pause between button-down and button-up of one click.
+    const PRESS_DELAY: Duration = Duration::from_millis(20);
+    /// Pause between the two clicks of a double-click.
+    const DOUBLE_CLICK_DELAY: Duration = Duration::from_millis(50);
+    /// Unicode-typing chunk size: `CGEventKeyboardSetUnicodeString` accepts
+    /// long strings, but some apps drop oversized injections.
+    const TYPE_CHUNK_UTF16: usize = 20;
 
-    let output = Command::new("osascript")
-        .args(["-l", "AppleScript", "-e", &script])
-        .output()
-        .await;
+    fn source() -> Result<CGEventSource, String> {
+        CGEventSource::new(CGEventSourceStateID::HIDSystemState).map_err(|_| {
+            "CGEventSource creation failed — grant Intendant the Accessibility permission \
+             (System Settings → Privacy & Security → Accessibility) and retry"
+                .to_string()
+        })
+    }
 
-    match output {
-        Ok(o) if o.status.success() => CuActionResult {
+    fn ok() -> CuActionResult {
+        CuActionResult {
             success: true,
             screenshot: None,
             error: None,
-        },
-        Ok(o) => CuActionResult {
+        }
+    }
+
+    fn fail(error: String) -> CuActionResult {
+        CuActionResult {
             success: false,
             screenshot: None,
-            error: Some(String::from_utf8_lossy(&o.stderr).to_string()),
-        },
-        Err(e) => CuActionResult {
-            success: false,
-            screenshot: None,
-            error: Some(format!("osascript exec error: {}", e)),
-        },
+            error: Some(error),
+        }
+    }
+
+    fn result(outcome: Result<(), String>) -> CuActionResult {
+        match outcome {
+            Ok(()) => ok(),
+            Err(e) => fail(e),
+        }
+    }
+
+    fn post_mouse(
+        event_type: CGEventType,
+        x: i32,
+        y: i32,
+        button: CGMouseButton,
+        click_state: Option<i64>,
+    ) -> Result<(), String> {
+        let event = CGEvent::new_mouse_event(
+            source()?,
+            event_type,
+            CGPoint::new(x as f64, y as f64),
+            button,
+        )
+        .map_err(|_| "CGEvent mouse event creation failed".to_string())?;
+        if let Some(state) = click_state {
+            event.set_integer_value_field(EventField::MOUSE_EVENT_CLICK_STATE, state);
+        }
+        event.post(CGEventTapLocation::HID);
+        Ok(())
+    }
+
+    fn button_events(button: MouseButton) -> (CGEventType, CGEventType, CGMouseButton) {
+        match button {
+            MouseButton::Left => (
+                CGEventType::LeftMouseDown,
+                CGEventType::LeftMouseUp,
+                CGMouseButton::Left,
+            ),
+            MouseButton::Right => (
+                CGEventType::RightMouseDown,
+                CGEventType::RightMouseUp,
+                CGMouseButton::Right,
+            ),
+            MouseButton::Middle => (
+                CGEventType::OtherMouseDown,
+                CGEventType::OtherMouseUp,
+                CGMouseButton::Center,
+            ),
+        }
+    }
+
+    /// Move the pointer, wait for hover UIs, then click `clicks` times
+    /// (1 = click, 2 = double-click with the proper `MOUSE_EVENT_CLICK_STATE`).
+    pub async fn click(x: i32, y: i32, button: MouseButton, clicks: i64) -> CuActionResult {
+        if let Err(e) = post_mouse(CGEventType::MouseMoved, x, y, CGMouseButton::Left, None) {
+            return fail(e);
+        }
+        tokio::time::sleep(HOVER_DELAY).await;
+        let (down, up, cg_button) = button_events(button);
+        for click_state in 1..=clicks {
+            if click_state > 1 {
+                tokio::time::sleep(DOUBLE_CLICK_DELAY).await;
+            }
+            if let Err(e) = post_mouse(down, x, y, cg_button, Some(click_state)) {
+                return fail(e);
+            }
+            tokio::time::sleep(PRESS_DELAY).await;
+            if let Err(e) = post_mouse(up, x, y, cg_button, Some(click_state)) {
+                return fail(e);
+            }
+        }
+        ok()
+    }
+
+    pub async fn move_mouse(x: i32, y: i32) -> CuActionResult {
+        result(post_mouse(
+            CGEventType::MouseMoved,
+            x,
+            y,
+            CGMouseButton::Left,
+            None,
+        ))
+    }
+
+    /// Press at the start point, drag through interpolated positions, and
+    /// release at the end point (mirrors the session path's 5×20 ms ramp).
+    pub async fn drag(start_x: i32, start_y: i32, end_x: i32, end_y: i32) -> CuActionResult {
+        if let Err(e) = post_mouse(
+            CGEventType::MouseMoved,
+            start_x,
+            start_y,
+            CGMouseButton::Left,
+            None,
+        ) {
+            return fail(e);
+        }
+        tokio::time::sleep(HOVER_DELAY).await;
+        if let Err(e) = post_mouse(
+            CGEventType::LeftMouseDown,
+            start_x,
+            start_y,
+            CGMouseButton::Left,
+            Some(1),
+        ) {
+            return fail(e);
+        }
+        tokio::time::sleep(HOVER_DELAY).await;
+        const STEPS: i32 = 5;
+        for step in 1..=STEPS {
+            let ix = start_x + (end_x - start_x) * step / STEPS;
+            let iy = start_y + (end_y - start_y) * step / STEPS;
+            if let Err(e) = post_mouse(
+                CGEventType::LeftMouseDragged,
+                ix,
+                iy,
+                CGMouseButton::Left,
+                None,
+            ) {
+                return fail(e);
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        result(post_mouse(
+            CGEventType::LeftMouseUp,
+            end_x,
+            end_y,
+            CGMouseButton::Left,
+            Some(1),
+        ))
+    }
+
+    /// Scroll at (x, y). Line units; positive wheel values scroll up/left
+    /// (the CGEvent convention, matching the previous osascript path).
+    pub async fn scroll(x: i32, y: i32, direction: ScrollDirection, amount: i32) -> CuActionResult {
+        if let Err(e) = post_mouse(CGEventType::MouseMoved, x, y, CGMouseButton::Left, None) {
+            return fail(e);
+        }
+        tokio::time::sleep(HOVER_DELAY).await;
+        let amt = amount.max(1);
+        let (dy, dx) = match direction {
+            ScrollDirection::Up => (amt, 0),
+            ScrollDirection::Down => (-amt, 0),
+            ScrollDirection::Left => (0, amt),
+            ScrollDirection::Right => (0, -amt),
+        };
+        let outcome = source().and_then(|source| {
+            let event = CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, dy, dx, 0)
+                .map_err(|_| "CGEvent scroll event creation failed".to_string())?;
+            event.post(CGEventTapLocation::HID);
+            Ok(())
+        });
+        result(outcome)
+    }
+
+    /// Type unicode text. A trailing newline becomes a Return press, matching
+    /// CU models' habit of appending `\n` to mean Enter (and the previous
+    /// cliclick behavior).
+    pub async fn type_text(text: &str) -> CuActionResult {
+        let presses_return = text.ends_with('\n');
+        let clean = text.trim_end_matches('\n');
+        let utf16: Vec<u16> = clean.encode_utf16().collect();
+        for chunk in utf16.chunks(TYPE_CHUNK_UTF16) {
+            let outcome = source().and_then(|source| {
+                let down = CGEvent::new_keyboard_event(source, 0, true)
+                    .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+                down.set_string_from_utf16_unchecked(chunk);
+                down.post(CGEventTapLocation::HID);
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                return fail(e);
+            }
+            let outcome = source().and_then(|source| {
+                let up = CGEvent::new_keyboard_event(source, 0, false)
+                    .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+                up.post(CGEventTapLocation::HID);
+                Ok(())
+            });
+            if let Err(e) = outcome {
+                return fail(e);
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        if presses_return {
+            return key("Return").await;
+        }
+        ok()
+    }
+
+    /// Press an xdotool-style key or chord (e.g. `Return`, `ctrl+shift+t`,
+    /// `cmd+space`). Modifiers ride as event flags on the base key's
+    /// down/up events.
+    pub async fn key(key: &str) -> CuActionResult {
+        let (keycode, flags) = match parse_key(key) {
+            Ok(parsed) => parsed,
+            Err(e) => return fail(e),
+        };
+        let outcome = source().and_then(|source| {
+            let down = CGEvent::new_keyboard_event(source.clone(), keycode, true)
+                .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+            down.set_flags(flags);
+            down.post(CGEventTapLocation::HID);
+            let up = CGEvent::new_keyboard_event(source, keycode, false)
+                .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+            up.set_flags(flags);
+            up.post(CGEventTapLocation::HID);
+            Ok(())
+        });
+        result(outcome)
+    }
+
+    /// Parse an xdotool-style key name or `mod+...+key` chord into a virtual
+    /// keycode plus modifier flags.
+    fn parse_key(key: &str) -> Result<(CGKeyCode, CGEventFlags), String> {
+        let mut flags = CGEventFlags::CGEventFlagNull;
+        let parts: Vec<&str> = key.split('+').collect();
+        let (modifiers, base) = parts.split_at(parts.len() - 1);
+        for modifier in modifiers {
+            flags |= modifier_flag(modifier).ok_or_else(|| {
+                format!("unknown modifier '{modifier}' in key '{key}' (ctrl/shift/alt/cmd)")
+            })?;
+        }
+        let keycode = keycode_for(base[0])
+            .ok_or_else(|| format!("unmapped key '{}' in key '{key}'", base[0]))?;
+        Ok((keycode, flags))
+    }
+
+    fn modifier_flag(name: &str) -> Option<CGEventFlags> {
+        match name.to_ascii_lowercase().as_str() {
+            "ctrl" | "control" | "control_l" | "control_r" => {
+                Some(CGEventFlags::CGEventFlagControl)
+            }
+            "shift" | "shift_l" | "shift_r" => Some(CGEventFlags::CGEventFlagShift),
+            "alt" | "alt_l" | "alt_r" | "option" => Some(CGEventFlags::CGEventFlagAlternate),
+            "super" | "super_l" | "super_r" | "meta" | "cmd" | "command" => {
+                Some(CGEventFlags::CGEventFlagCommand)
+            }
+            _ => None,
+        }
+    }
+
+    /// Map an xdotool-style key name to an ANSI-US virtual keycode.
+    fn keycode_for(name: &str) -> Option<CGKeyCode> {
+        let lowered = name.to_ascii_lowercase();
+        let code = match lowered.as_str() {
+            "return" | "enter" => KeyCode::RETURN,
+            "kp_enter" => KeyCode::ANSI_KEYPAD_ENTER,
+            "tab" => KeyCode::TAB,
+            "space" => KeyCode::SPACE,
+            "escape" | "esc" => KeyCode::ESCAPE,
+            "backspace" => KeyCode::DELETE,
+            "delete" => KeyCode::FORWARD_DELETE,
+            "up" => KeyCode::UP_ARROW,
+            "down" => KeyCode::DOWN_ARROW,
+            "left" => KeyCode::LEFT_ARROW,
+            "right" => KeyCode::RIGHT_ARROW,
+            "home" => KeyCode::HOME,
+            "end" => KeyCode::END,
+            "prior" | "page_up" | "pageup" => KeyCode::PAGE_UP,
+            "next" | "page_down" | "pagedown" => KeyCode::PAGE_DOWN,
+            "ctrl" | "control" | "control_l" | "control_r" => KeyCode::CONTROL,
+            "shift" | "shift_l" | "shift_r" => KeyCode::SHIFT,
+            "alt" | "alt_l" | "alt_r" | "option" => KeyCode::OPTION,
+            "super" | "super_l" | "super_r" | "meta" | "cmd" | "command" => KeyCode::COMMAND,
+            "f1" => KeyCode::F1,
+            "f2" => KeyCode::F2,
+            "f3" => KeyCode::F3,
+            "f4" => KeyCode::F4,
+            "f5" => KeyCode::F5,
+            "f6" => KeyCode::F6,
+            "f7" => KeyCode::F7,
+            "f8" => KeyCode::F8,
+            "f9" => KeyCode::F9,
+            "f10" => KeyCode::F10,
+            "f11" => KeyCode::F11,
+            "f12" => KeyCode::F12,
+            _ => {
+                let mut chars = lowered.chars();
+                let (Some(ch), None) = (chars.next(), chars.next()) else {
+                    return None;
+                };
+                char_keycode(ch)?
+            }
+        };
+        Some(code)
+    }
+
+    /// ANSI-US keycode for a single printable character.
+    fn char_keycode(ch: char) -> Option<CGKeyCode> {
+        let code = match ch {
+            'a' => KeyCode::ANSI_A,
+            'b' => KeyCode::ANSI_B,
+            'c' => KeyCode::ANSI_C,
+            'd' => KeyCode::ANSI_D,
+            'e' => KeyCode::ANSI_E,
+            'f' => KeyCode::ANSI_F,
+            'g' => KeyCode::ANSI_G,
+            'h' => KeyCode::ANSI_H,
+            'i' => KeyCode::ANSI_I,
+            'j' => KeyCode::ANSI_J,
+            'k' => KeyCode::ANSI_K,
+            'l' => KeyCode::ANSI_L,
+            'm' => KeyCode::ANSI_M,
+            'n' => KeyCode::ANSI_N,
+            'o' => KeyCode::ANSI_O,
+            'p' => KeyCode::ANSI_P,
+            'q' => KeyCode::ANSI_Q,
+            'r' => KeyCode::ANSI_R,
+            's' => KeyCode::ANSI_S,
+            't' => KeyCode::ANSI_T,
+            'u' => KeyCode::ANSI_U,
+            'v' => KeyCode::ANSI_V,
+            'w' => KeyCode::ANSI_W,
+            'x' => KeyCode::ANSI_X,
+            'y' => KeyCode::ANSI_Y,
+            'z' => KeyCode::ANSI_Z,
+            '0' => KeyCode::ANSI_0,
+            '1' => KeyCode::ANSI_1,
+            '2' => KeyCode::ANSI_2,
+            '3' => KeyCode::ANSI_3,
+            '4' => KeyCode::ANSI_4,
+            '5' => KeyCode::ANSI_5,
+            '6' => KeyCode::ANSI_6,
+            '7' => KeyCode::ANSI_7,
+            '8' => KeyCode::ANSI_8,
+            '9' => KeyCode::ANSI_9,
+            '-' => KeyCode::ANSI_MINUS,
+            '=' => KeyCode::ANSI_EQUAL,
+            '[' => KeyCode::ANSI_LEFT_BRACKET,
+            ']' => KeyCode::ANSI_RIGHT_BRACKET,
+            '\\' => KeyCode::ANSI_BACKSLASH,
+            ';' => KeyCode::ANSI_SEMICOLON,
+            '\'' => KeyCode::ANSI_QUOTE,
+            ',' => KeyCode::ANSI_COMMA,
+            '.' => KeyCode::ANSI_PERIOD,
+            '/' => KeyCode::ANSI_SLASH,
+            '`' => KeyCode::ANSI_GRAVE,
+            _ => return None,
+        };
+        Some(code)
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn parse_key_single_special_keys() {
+            assert_eq!(parse_key("Return").unwrap().0, KeyCode::RETURN);
+            assert_eq!(parse_key("Tab").unwrap().0, KeyCode::TAB);
+            assert_eq!(parse_key("Escape").unwrap().0, KeyCode::ESCAPE);
+            assert_eq!(parse_key("BackSpace").unwrap().0, KeyCode::DELETE);
+            assert_eq!(parse_key("Delete").unwrap().0, KeyCode::FORWARD_DELETE);
+            assert_eq!(parse_key("Up").unwrap().0, KeyCode::UP_ARROW);
+            assert_eq!(parse_key("page_down").unwrap().0, KeyCode::PAGE_DOWN);
+            assert!(parse_key("Return").unwrap().1.is_empty());
+        }
+
+        #[test]
+        fn parse_key_chords_set_flags() {
+            let (code, flags) = parse_key("ctrl+c").unwrap();
+            assert_eq!(code, KeyCode::ANSI_C);
+            assert_eq!(flags, CGEventFlags::CGEventFlagControl);
+
+            let (code, flags) = parse_key("super+shift+a").unwrap();
+            assert_eq!(code, KeyCode::ANSI_A);
+            assert!(flags.contains(CGEventFlags::CGEventFlagCommand));
+            assert!(flags.contains(CGEventFlags::CGEventFlagShift));
+
+            let (code, flags) = parse_key("cmd+space").unwrap();
+            assert_eq!(code, KeyCode::SPACE);
+            assert_eq!(flags, CGEventFlags::CGEventFlagCommand);
+        }
+
+        #[test]
+        fn parse_key_modifier_alone_presses_it() {
+            // `key("cmd")` should press and release the modifier itself.
+            let (code, flags) = parse_key("cmd").unwrap();
+            assert_eq!(code, KeyCode::COMMAND);
+            assert!(flags.is_empty());
+        }
+
+        #[test]
+        fn parse_key_characters_and_unknowns() {
+            assert_eq!(parse_key("a").unwrap().0, KeyCode::ANSI_A);
+            assert_eq!(parse_key("/").unwrap().0, KeyCode::ANSI_SLASH);
+            assert!(parse_key("no_such_key").is_err());
+            assert!(parse_key("badmod+x").is_err());
+        }
     }
 }
 
@@ -948,8 +1204,8 @@ async fn take_screenshot(
         ));
     }
 
-    // Read file, resize to logical display size (so model coordinates = cliclick
-    // coordinates), and encode as base64.
+    // Read file, resize to logical display size (so model coordinates =
+    // input-injection coordinates), and encode as base64.
     let raw_bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("read screenshot: {}", e))?;
@@ -1006,13 +1262,25 @@ fn png_dimensions(data: &[u8]) -> Option<(u32, u32)> {
     Some((width, height))
 }
 
-// ── Wayland: DisplaySession routing ─────────────────────────────────────────
+// ── Session-only backends: DisplaySession routing ───────────────────────────
 
-/// Build an actionable error for the "no Wayland session" failure path.
-/// The previous message ("No display session for Wayland target") left callers
-/// with no hint about what's wrong or how to recover, which caused external
-/// agents to retry the same call indefinitely.
-fn no_wayland_session_message(target: &DisplayTarget) -> String {
+/// Build an actionable error for the "no capture session" failure path on the
+/// session-only backends (Wayland, Windows). A bare "no session" message left
+/// callers with no hint about what's wrong or how to recover, which caused
+/// external agents to retry the same call indefinitely.
+fn no_session_message(backend: DisplayBackend, target: &DisplayTarget) -> String {
+    if backend == DisplayBackend::Windows {
+        return match target {
+            DisplayTarget::UserSession => "No active display capture session on Windows. The \
+                 desktop display normally auto-registers at daemon startup; re-request it with \
+                 grant_user_display (or `intendant ctl display grant-user`) and retry."
+                .to_string(),
+            DisplayTarget::Virtual { id } => format!(
+                "No virtual display {id} exists on Windows — virtual displays are Xvfb/Linux \
+                 only. Target the desktop with display_target=\"user_session\" instead."
+            ),
+        };
+    }
     let granted = std::env::var("INTENDANT_USER_DISPLAY_GRANTED").is_ok();
     let diagnostic = linux_gui_env_diagnostic_suffix();
     match target {
@@ -1728,21 +1996,14 @@ mod tests {
     }
 
     #[test]
-    fn mouse_button_cliclick() {
-        assert_eq!(MouseButton::Left.cliclick_prefix(), "c");
-        assert_eq!(MouseButton::Right.cliclick_prefix(), "rc");
-        assert_eq!(MouseButton::Middle.cliclick_prefix(), "tc");
-    }
-
-    #[test]
     fn scroll_direction_xdotool() {
         assert_eq!(ScrollDirection::Up.xdotool_button(), "4");
         assert_eq!(ScrollDirection::Down.xdotool_button(), "5");
     }
 
     #[test]
-    fn no_wayland_session_message_virtual_target_suggests_xvfb() {
-        let msg = no_wayland_session_message(&DisplayTarget::Virtual { id: 99 });
+    fn no_session_message_wayland_virtual_target_suggests_xvfb() {
+        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::Virtual { id: 99 });
         assert!(
             msg.contains(":99"),
             "message should mention display number: {}",
@@ -1752,10 +2013,10 @@ mod tests {
     }
 
     #[test]
-    fn no_wayland_session_message_user_session_mentions_portal() {
+    fn no_session_message_wayland_user_session_mentions_portal() {
         // Clear env first so the test is deterministic.
         std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
-        let msg = no_wayland_session_message(&DisplayTarget::UserSession);
+        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession);
         assert!(
             msg.contains("grant_user_display"),
             "ungranted message: {}",
@@ -1768,13 +2029,29 @@ mod tests {
         );
 
         std::env::set_var("INTENDANT_USER_DISPLAY_GRANTED", "1");
-        let msg = no_wayland_session_message(&DisplayTarget::UserSession);
+        let msg = no_session_message(DisplayBackend::Wayland, &DisplayTarget::UserSession);
         assert!(
             msg.contains("portal"),
             "granted message should mention portal: {}",
             msg
         );
         std::env::remove_var("INTENDANT_USER_DISPLAY_GRANTED");
+    }
+
+    #[test]
+    fn no_session_message_windows_names_recovery_paths() {
+        let msg = no_session_message(DisplayBackend::Windows, &DisplayTarget::UserSession);
+        assert!(
+            msg.contains("grant_user_display"),
+            "windows user-session message: {}",
+            msg
+        );
+        let msg = no_session_message(DisplayBackend::Windows, &DisplayTarget::Virtual { id: 99 });
+        assert!(
+            msg.contains("user_session"),
+            "windows virtual-target message should redirect to the desktop: {}",
+            msg
+        );
     }
 
     #[test]
@@ -1808,53 +2085,6 @@ mod tests {
             }
             _ => panic!("wrong variant"),
         }
-    }
-
-    #[test]
-    fn translate_simple_keys() {
-        assert_eq!(translate_single_key("Return"), "return");
-        assert_eq!(translate_single_key("Tab"), "tab");
-        assert_eq!(translate_single_key("Escape"), "esc");
-        assert_eq!(translate_single_key("BackSpace"), "delete");
-        assert_eq!(translate_single_key("Up"), "arrow-up");
-        assert_eq!(translate_single_key("Down"), "arrow-down");
-        assert_eq!(translate_single_key("super"), "cmd");
-        assert_eq!(translate_single_key("control"), "ctrl");
-    }
-
-    #[test]
-    fn translate_modifier_combo() {
-        // Single chars use t: (type) since cliclick kp: only accepts special key names
-        let args = translate_key_for_cliclick("ctrl+c");
-        assert_eq!(args, vec!["kd:ctrl", "t:c", "ku:ctrl"]);
-
-        let args = translate_key_for_cliclick("super+shift+a");
-        assert_eq!(
-            args,
-            vec!["kd:cmd", "kd:shift", "t:a", "ku:shift", "ku:cmd"]
-        );
-
-        // Special keys still use kp:
-        let args = translate_key_for_cliclick("cmd+space");
-        assert_eq!(args, vec!["kd:cmd", "kp:space", "ku:cmd"]);
-    }
-
-    #[test]
-    fn translate_single_key_passthrough() {
-        // Unrecognized keys pass through as-is
-        assert_eq!(translate_single_key("a"), "a");
-        assert_eq!(translate_single_key("z"), "z");
-    }
-
-    #[test]
-    fn translate_single_key_cmd_variants() {
-        // OpenAI CU sends "CMD", Gemini sends "super"/"meta"
-        assert_eq!(translate_single_key("CMD"), "cmd");
-        assert_eq!(translate_single_key("cmd"), "cmd");
-        assert_eq!(translate_single_key("command"), "cmd");
-        assert_eq!(translate_single_key("super"), "cmd");
-        assert_eq!(translate_single_key("meta"), "cmd");
-        assert_eq!(translate_single_key("Meta"), "cmd");
     }
 
     #[test]

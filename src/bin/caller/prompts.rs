@@ -102,12 +102,13 @@ fn substitute_platform(prompt: &str) -> String {
         (
             "macOS",
             "You run as an unprivileged user. \
-             Screenshots use `screencapture`, input automation uses `cliclick`, \
-             and `osascript` is available for AppleScript. \
              There is no X11 — do NOT use xdotool, xrandr, or import. \
-             IMPORTANT: On Retina displays, `screencapture` produces images at 2x resolution \
-             but `cliclick` uses logical (1x) coordinates. Divide screenshot pixel coordinates \
-             by 2 before passing to `cliclick`.",
+             Do NOT drive the GUI with `cliclick` or `osascript` — use your native \
+             click/type/screenshot actions (or Intendant's take_screenshot / \
+             execute_cu_actions tools), which inject events in-process and take \
+             logical (1x) coordinates matching their own screenshots. \
+             If you capture raw images with `screencapture` yourself, remember \
+             Retina output is 2x the logical coordinate space.",
         )
     } else if cfg!(target_os = "windows") {
         (
