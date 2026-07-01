@@ -22,6 +22,7 @@ pub mod cert_server;
 #[cfg_attr(target_os = "windows", allow(dead_code))]
 pub mod certs;
 pub mod client_key;
+pub mod enrollment;
 pub mod iam;
 pub mod state;
 #[cfg(not(target_os = "windows"))]

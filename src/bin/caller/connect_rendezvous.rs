@@ -346,6 +346,35 @@ async fn handle_event(
             ) {
                 Ok(grant) => grant,
                 Err(e) => {
+                    // A verified key without a grant is an enrollment
+                    // candidate: queue it so the owner can approve from an
+                    // already-trusted Access session instead of copying the
+                    // fingerprint out of this error by hand.
+                    if let Some(key) = verified_client_key.as_ref() {
+                        let origin = {
+                            let mut origin = base_url.clone();
+                            origin.set_path("");
+                            origin.set_query(None);
+                            origin.set_fragment(None);
+                            origin.to_string().trim_end_matches('/').to_string()
+                        };
+                        let account_hint = match (
+                            event.account_name.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+                            event.user_id.as_deref().map(str::trim).filter(|v| !v.is_empty()),
+                        ) {
+                            (Some(name), _) => format!("@{name}"),
+                            (None, Some(id)) => id.chars().take(12).collect(),
+                            (None, None) => String::new(),
+                        };
+                        crate::access::enrollment::record_refused_client_key(
+                            &key.fingerprint,
+                            &key.public_key_b64u,
+                            &origin,
+                            "connect-dashboard-control",
+                            &account_hint,
+                            crate::access::client_key::now_unix_ms(),
+                        );
+                    }
                     let _ = post_error(client, base_url, config, daemon_id, &event.id, &e).await;
                     return;
                 }

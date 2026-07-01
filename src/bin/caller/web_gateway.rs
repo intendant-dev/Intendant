@@ -22706,6 +22706,44 @@ pub fn spawn_web_gateway(
                                 let _ = stream.write_all(response.as_bytes()).await;
                             }
                         }
+                    } else if req_path == "/api/access/enrollment-requests/decide" {
+                        use tokio::io::AsyncWriteExt;
+                        if req_method != "POST" {
+                            let response = json_response(
+                                "405 Method Not Allowed",
+                                serde_json::json!({"error": "method not allowed"}).to_string(),
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        } else {
+                            let decision = http_access_context
+                                .decision(crate::peer::access_policy::PeerOperation::AccessManage);
+                            if !decision.allowed {
+                                let response = json_response(
+                                    "403 Forbidden",
+                                    serde_json::json!({
+                                        "error": "principal does not allow this operation",
+                                        "principal": http_access_context.principal.as_value(),
+                                        "permission": decision.permission,
+                                        "reason": decision.reason,
+                                    })
+                                    .to_string(),
+                                );
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            } else {
+                                let body_text = read_request_body(&mut stream, &header_text).await;
+                                let (status, body) = access_enrollment_decide_response_body(
+                                    &body_text,
+                                    &http_access_context.principal,
+                                );
+                                let response = json_response(status_reason(status), body);
+                                let _ = stream.write_all(response.as_bytes()).await;
+                            }
+                        }
+                    } else if request_line.contains(" /api/access/enrollment-requests") {
+                        use tokio::io::AsyncWriteExt;
+                        let body = access_enrollment_requests_response_body();
+                        let response = json_response("200 OK", body);
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if request_line.contains(" /api/access/iam/state") {
                         use tokio::io::AsyncWriteExt;
                         let body = access_iam_state_response_body();
@@ -24220,6 +24258,103 @@ fn access_iam_upsert_user_client_grant_response_value_with_cert_dir(
         "iam": crate::access::iam::overview_metadata(&loaded),
         "state": loaded.state
     }))
+}
+
+pub(crate) fn access_enrollment_requests_response_value() -> serde_json::Value {
+    serde_json::json!({
+        "schema_version": 1,
+        "requests": crate::access::enrollment::pending_enrollments(
+            crate::access::client_key::now_unix_ms(),
+        ),
+    })
+}
+
+fn access_enrollment_requests_response_body() -> String {
+    access_enrollment_requests_response_value().to_string()
+}
+
+/// Approve or deny a pending browser-key enrollment. Approval reuses the
+/// ordinary user-client grant upsert with the queued key's public key and
+/// route origin attached, so ceilings and audit behave exactly as if the
+/// owner had typed the grant by hand.
+pub(crate) fn access_enrollment_decide_response_value(
+    params: serde_json::Value,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> Result<serde_json::Value, String> {
+    let fingerprint = params
+        .get("fingerprint")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .ok_or_else(|| "fingerprint is required".to_string())?;
+    let approve = params
+        .get("approve")
+        .and_then(|v| v.as_bool())
+        .ok_or_else(|| "approve must be true or false".to_string())?;
+    let Some(pending) = crate::access::enrollment::take_enrollment(fingerprint) else {
+        return Err(format!(
+            "no pending enrollment for fingerprint {fingerprint}"
+        ));
+    };
+    if !approve {
+        return Ok(serde_json::json!({
+            "schema_version": 1,
+            "decided": true,
+            "approved": false,
+            "fingerprint": pending.fingerprint,
+        }));
+    }
+    let label = params
+        .get("label")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|v| !v.is_empty())
+        .map(str::to_string)
+        .or_else(|| {
+            if pending.account_hint.is_empty() {
+                None
+            } else {
+                Some(format!("{} (enrolled device)", pending.account_hint))
+            }
+        });
+    let upsert = serde_json::json!({
+        "kind": "client_key",
+        "label": label,
+        "client_key_fingerprint": pending.fingerprint,
+        "client_key": pending.public_key_b64u,
+        "client_key_origin": pending.origin,
+        "role_id": params.get("role_id").and_then(|v| v.as_str()),
+        "status": "active",
+        "reason": format!(
+            "Approved device enrollment via {}",
+            if pending.transport.is_empty() { "dashboard" } else { pending.transport.as_str() }
+        ),
+    });
+    let mut value = access_iam_upsert_user_client_grant_response_value(upsert, actor)?;
+    if let Some(object) = value.as_object_mut() {
+        object.insert("decided".to_string(), serde_json::json!(true));
+        object.insert("approved".to_string(), serde_json::json!(true));
+    }
+    Ok(value)
+}
+
+fn access_enrollment_decide_response_body(
+    body_text: &str,
+    actor: &crate::access::iam::AccessPrincipal,
+) -> (u16, String) {
+    let params = match serde_json::from_str::<serde_json::Value>(body_text) {
+        Ok(params) => params,
+        Err(e) => {
+            return (
+                400,
+                serde_json::json!({"error": format!("invalid request body: {e}")}).to_string(),
+            );
+        }
+    };
+    match access_enrollment_decide_response_value(params, actor) {
+        Ok(value) => (200, value.to_string()),
+        Err(error) => (400, serde_json::json!({"error": error}).to_string()),
+    }
 }
 
 fn access_iam_upsert_user_client_grant_response_body(
@@ -26768,6 +26903,10 @@ fn dashboard_http_operation(
     }
 
     match (req_method, req_path) {
+        ("POST", "/api/access/enrollment-requests/decide") => {
+            return Some(PeerOperation::AccessManage)
+        }
+        ("GET", "/api/access/enrollment-requests") => return Some(PeerOperation::AccessInspect),
         ("GET", "/api/access/overview")
         | ("GET", "/api/access/iam/state")
         | ("GET", "/api/dashboard/targets") => return Some(PeerOperation::AccessInspect),

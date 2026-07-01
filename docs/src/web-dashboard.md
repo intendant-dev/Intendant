@@ -430,6 +430,18 @@ or update local user/client grants through the People & Devices pane,
 drafted, revoked, or role-changed with `POST /api/access/iam/grants/update` or
 dashboard-control `api_access_iam_update_grant`.
 
+Device enrollment closes the loop for browsers that hold an identity key but
+no grant yet: when a *verified* client key is refused, the daemon queues a
+pending enrollment (in-memory, capped, TTL'd — the queue grants nothing by
+itself). `GET /api/access/enrollment-requests` /
+`api_access_enrollment_requests` list the queue (`access.inspect`), and
+`POST /api/access/enrollment-requests/decide` / `api_access_enrollment_decide`
+(`access.manage`) approve with a role or deny. Approval reuses the normal
+user-client grant upsert with the queued key's public key and route origin
+attached, so role ceilings and audit apply as usual. People & Devices shows
+the queue as **Pending devices**, and the Overview raises an attention banner
+while any request waits.
+
 The same IAM evaluator now protects the direct dashboard HTTP routes that expose
 Access, target discovery, settings, filesystem reads/writes, sessions,
 worktrees, displays, diagnostics, and managed-context data. Static bootstrap

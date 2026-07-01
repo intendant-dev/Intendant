@@ -12053,6 +12053,7 @@ body.display-fullscreen-open {
               <div class="acc-section-sub">Humans and their browsers, certificates, and Connect accounts — everyone who may operate <em>this</em> daemon. Daemon-to-daemon trust lives under Peers.</div>
             </div>
             <div id="access-people-current" class="acc-hero-grid"></div>
+            <div id="access-enrollment-requests"></div>
             <div id="access-user-client-grant-form"></div>
             <div class="acc-section-head">
               <div class="acc-section-title">Who has access</div>
@@ -33493,6 +33494,52 @@ async function refreshAccessOverviewFromApi(options = {}) {
   }
 }
 
+/* Pending browser-key enrollment requests (devices knocking on this daemon).
+   Pull-based like the overview; renderers read the cached list. */
+let accessPendingEnrollments = [];
+
+async function refreshAccessEnrollments(options = {}) {
+  try {
+    const resp = await dashboardJsonFetch('api_access_enrollment_requests', {}, () => authedFetch('/api/access/enrollment-requests', {
+      cache: 'no-store',
+      signal: options.signal,
+    }), 'api_access_enrollment_requests', { signal: options.signal });
+    if (!resp.ok) throw new Error(`/api/access/enrollment-requests returned ${resp.status}`);
+    const payload = await resp.json();
+    const requests = Array.isArray(payload?.requests) ? payload.requests : [];
+    const changed = JSON.stringify(requests) !== JSON.stringify(accessPendingEnrollments);
+    accessPendingEnrollments = requests;
+    if (changed) renderAccessAdminSummaries();
+    return requests;
+  } catch (err) {
+    if (err?.name === 'AbortError') throw err;
+    if (!options.silent) {
+      console.warn('[access-enrollments] refresh failed', err);
+    }
+    return null;
+  }
+}
+
+async function accessDecideEnrollment(fingerprint, approve, roleId) {
+  const payload = { fingerprint, approve };
+  if (approve && roleId) payload.role_id = roleId;
+  try {
+    const resp = await dashboardJsonFetch('api_access_enrollment_decide', payload, () => authedFetch('/api/access/enrollment-requests/decide', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(payload),
+    }), 'api_access_enrollment_decide', { fallbackAfterRpcFailure: false });
+    const data = await resp.json().catch(() => ({}));
+    if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+    showControlToast?.('success', approve ? 'Device approved — it can connect now' : 'Device request denied');
+  } catch (err) {
+    showControlToast?.('error', err?.message || 'Enrollment decision failed');
+  }
+  await refreshAccessEnrollments({ silent: true }).catch(() => null);
+  await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+  renderAccessAdminSummaries();
+}
+
 function upsertDashboardAccessTarget(target) {
   const normalized = normalizeDashboardAccessTarget(target);
   if (!normalized) return;
@@ -35959,6 +36006,15 @@ function renderAccessAttention() {
       action: { label: 'Inspect', onClick: () => routeTo('access', 'advanced') },
     });
   }
+  if (accessPendingEnrollments.length) {
+    items.push({
+      kind: 'info',
+      icon: 'i',
+      message: `${accessPlural(accessPendingEnrollments.length, 'device is', 'devices are')} waiting for an enrollment decision.`,
+      detail: 'A verified browser key reached this daemon without a grant.',
+      action: { label: 'Review', onClick: () => routeTo('access', 'people') },
+    });
+  }
   const draftGrants = accessOverviewArray(overview, 'grants')
     .filter(grant => accessModelLabel(grant.kind) === 'user_client_local_iam'
       && accessModelLabel(grant.status) === 'draft').length;
@@ -36255,6 +36311,91 @@ function renderAccessPeopleCurrent() {
   }));
 }
 
+/* People & Devices: devices knocking on this daemon, awaiting a decision.
+   Empty (and invisible) when nothing is pending. */
+function renderAccessEnrollmentRequests() {
+  const mount = document.getElementById('access-enrollment-requests');
+  if (!mount) return;
+  mount.innerHTML = '';
+  if (!accessPendingEnrollments.length) return;
+  const canManage = dashboardControlTransport?.lastStatus?.api_access_enrollment_decide_available !== false;
+
+  const head = document.createElement('div');
+  head.className = 'acc-section-head';
+  const title = document.createElement('div');
+  title.className = 'acc-section-title';
+  title.textContent = 'Pending devices';
+  const sub = document.createElement('div');
+  sub.className = 'acc-section-sub';
+  sub.textContent = 'Browsers whose verified identity key reached this daemon without a grant. Approving writes a normal IAM grant; hosted-route keys stay under the role ceiling.';
+  head.append(title, sub);
+  mount.appendChild(head);
+
+  const list = document.createElement('div');
+  list.className = 'acc-principal-list';
+  for (const request of accessPendingEnrollments) {
+    const fingerprint = accessModelLabel(request.fingerprint);
+    const card = document.createElement('div');
+    card.className = 'acc-principal-card';
+    const headRow = document.createElement('div');
+    headRow.className = 'acc-principal-head';
+    const glyphEl = document.createElement('div');
+    glyphEl.className = 'acc-principal-glyph kind-cert';
+    glyphEl.textContent = 'KEY';
+    const nameWrap = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'acc-principal-name';
+    name.textContent = request.account_hint
+      ? `${request.account_hint} — new device`
+      : 'New device';
+    const kind = document.createElement('div');
+    kind.className = 'acc-principal-kind';
+    const attempts = Number(request.attempts || 1);
+    kind.textContent = `${attempts === 1 ? '1 attempt' : `${attempts} attempts`} · last ${new Date(Number(request.last_seen_unix_ms || 0)).toLocaleString()}`;
+    nameWrap.append(name, kind);
+    headRow.append(glyphEl, nameWrap);
+    if (request.origin) {
+      headRow.appendChild(accessRouteChip('connect', 'via hosted route', `The offer arrived through ${request.origin}; the key will be recorded with that origin, so the role ceiling applies until it is re-enrolled from an anchor origin.`));
+    }
+    card.appendChild(headRow);
+
+    const authn = document.createElement('div');
+    authn.className = 'acc-principal-authn';
+    authn.textContent = `Key fingerprint ${fingerprint}`;
+    authn.title = fingerprint;
+    card.appendChild(authn);
+
+    const actions = document.createElement('div');
+    actions.className = 'acc-grant-flow-actions';
+    const roleSelect = document.createElement('select');
+    roleSelect.className = 'acc-btn';
+    roleSelect.title = 'Role the approved device receives on this daemon';
+    for (const role of accessAssignableIamRoles()) {
+      const option = document.createElement('option');
+      option.value = accessModelLabel(role.id);
+      option.textContent = accessModelLabel(role.label, role.id);
+      if (accessModelLabel(role.id) === 'role:observer') option.selected = true;
+      roleSelect.appendChild(option);
+    }
+    const approve = document.createElement('button');
+    approve.type = 'button';
+    approve.className = 'acc-btn primary';
+    approve.textContent = 'Approve';
+    approve.disabled = !canManage;
+    approve.addEventListener('click', () => accessDecideEnrollment(fingerprint, true, roleSelect.value));
+    const deny = document.createElement('button');
+    deny.type = 'button';
+    deny.className = 'acc-btn danger';
+    deny.textContent = 'Deny';
+    deny.disabled = !canManage;
+    deny.addEventListener('click', () => accessDecideEnrollment(fingerprint, false));
+    actions.append(roleSelect, approve, deny);
+    card.appendChild(actions);
+    list.appendChild(card);
+  }
+  mount.appendChild(list);
+}
+
 /* People & Devices: principal cards with their grants and lifecycle. */
 function renderAccessPeopleGrants() {
   const mount = document.getElementById('access-people-grants');
@@ -36468,6 +36609,7 @@ function renderAccessAdminSummaries() {
   renderAccessExplainer();
   renderAccessTargetsSurface();
   renderAccessPeopleCurrent();
+  renderAccessEnrollmentRequests();
   renderAccessUserClientGrantForm();
   renderAccessPeopleGrants();
   renderAccessPeerSummary();
@@ -42599,6 +42741,7 @@ function switchTab(tabId) {
     renderDaemonsList();
     renderAccessAdminSummaries();
     refreshAccessOverviewFromApi({ silent: true }).catch(() => {});
+    refreshAccessEnrollments({ silent: true }).catch(() => {});
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
 }
@@ -44257,6 +44400,9 @@ function switchAccessSubtab(name) {
   });
   renderAccessAdminSummaries();
   if (activeAccessSubtab === 'daemons') renderDaemonsList();
+  if (activeAccessSubtab === 'overview' || activeAccessSubtab === 'people') {
+    refreshAccessEnrollments({ silent: true }).catch(() => {});
+  }
   if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
 }
 

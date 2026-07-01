@@ -174,9 +174,12 @@ The pieces that implement the model, mapped to the codebase:
   no `runtime.control`). Ceilings are enforced as a permission intersection
   at decision time and surfaced in the Access UI, and are configurable in
   `iam.json` for owners who explicitly accept hosted-root risk.
-- **Device enrollment**: a new browser displays its key fingerprint as a
-  short code; an existing trusted session approves it from Access → People &
-  Devices; the daemon writes the grant. The certificate ceremony happens once
+- **Device enrollment**: when a browser's *verified* key is refused, the
+  daemon queues a pending enrollment (in-memory, capped, TTL'd — the queue
+  grants nothing by itself); the owner approves it with a role, or denies it,
+  from Access → People & Devices in an already-trusted session. Approval goes
+  through the ordinary grant upsert with the key's route origin recorded, so
+  ceilings and audit apply unchanged. The certificate ceremony happens once
   per *user*, not once per browser or per daemon.
 - **Grant fanout**: the anchor-served Access page applies one grant across
   many daemons by opening direct, key-authenticated, daemon-verified sessions
