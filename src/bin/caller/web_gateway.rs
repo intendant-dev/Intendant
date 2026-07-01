@@ -36587,13 +36587,15 @@ mod tests {
         assert_eq!(payload["scope"]["kind"], "local_daemon");
         assert_eq!(payload["targets"].as_array().expect("targets").len(), 1);
 
+        // Trusted local requests resolve through the shared IAM evaluator to
+        // an actual root-session principal; the overview must report that
+        // real subject rather than a synthetic "current browser" placeholder.
         let principals = payload["principals"].as_array().expect("principals");
         assert!(
             principals
                 .iter()
-                .any(|p| p["id"] == "principal:current-browser-session"
-                    && p["kind"] == "browser_session"),
-            "current browser principal should be present"
+                .any(|p| p["id"] == "principal:root:dashboard" && p["kind"] == "root_session"),
+            "current root session principal should be present: {principals:?}"
         );
         let grants = payload["grants"].as_array().expect("grants");
         assert!(
