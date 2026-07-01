@@ -35,6 +35,9 @@ const ACTIVE_DASHBOARD_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CSRF_HEADER: &str = "x-intendant-csrf";
 const FLEET_TARGET_LIMIT: usize = 100;
 const FLEET_TEXT_MAX: usize = 160;
+// Raw P-256 point (65B) and fixed-form signature (64B) are 87/86 chars in
+// base64url; leave headroom without letting the field grow unbounded.
+const FLEET_SIG_MAX: usize = 200;
 const FLEET_LABEL_MAX: usize = 120;
 const FLEET_URL_MAX: usize = 2048;
 const FLEET_CAPABILITY_LIMIT: usize = 64;
@@ -329,9 +332,23 @@ struct FleetTargetRecord {
     connect_daemon_id: Option<String>,
     #[serde(default)]
     capabilities: Vec<String>,
+    // Owner-signature passthrough (trust architecture phase 5): the browser
+    // signs its own records with its identity key and verifies them on
+    // read, so this store cannot silently inject or alter fleet entries.
+    // The service never interprets these fields.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    record_key: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    record_sig: String,
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    record_signed_at_unix_ms: u64,
     first_seen_unix_ms: u64,
     last_seen_unix_ms: u64,
     updated_unix_ms: u64,
+}
+
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -610,6 +627,9 @@ fn fleet_target_view(target: &FleetTargetRecord) -> serde_json::Value {
         "origin": target.origin,
         "connect_daemon_id": target.connect_daemon_id,
         "capabilities": target.capabilities,
+        "record_key": target.record_key,
+        "record_sig": target.record_sig,
+        "record_signed_at_unix_ms": target.record_signed_at_unix_ms,
         "first_seen_unix_ms": target.first_seen_unix_ms,
         "last_seen_unix_ms": target.last_seen_unix_ms,
         "updated_unix_ms": target.updated_unix_ms,
@@ -1258,7 +1278,7 @@ struct FleetTargetsSyncRequest {
     targets: Vec<FleetTargetInput>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Default, Deserialize)]
 struct FleetTargetInput {
     #[serde(default)]
     id: String,
@@ -1302,6 +1322,12 @@ struct FleetTargetInput {
     connect_daemon_id: String,
     #[serde(default)]
     capabilities: Vec<serde_json::Value>,
+    #[serde(default, alias = "recordKey")]
+    record_key: String,
+    #[serde(default, alias = "recordSig")]
+    record_sig: String,
+    #[serde(default, alias = "recordSignedAtUnixMs")]
+    record_signed_at_unix_ms: u64,
     #[serde(default, alias = "firstSeenUnixMs")]
     first_seen_unix_ms: u64,
     #[serde(default, alias = "lastSeenUnixMs")]
@@ -1346,7 +1372,10 @@ async fn api_fleet_targets_sync(
         by_host.insert(
             target.host_id.clone(),
             FleetTargetRecord {
-                first_seen_unix_ms,
+                record_key: String::new(),
+                    record_sig: String::new(),
+                    record_signed_at_unix_ms: 0,
+                    first_seen_unix_ms,
                 ..target
             },
         );
@@ -1544,6 +1573,13 @@ fn normalize_fleet_target_input(
             Some(connect_daemon_id)
         },
         capabilities: clean_fleet_capabilities(input.capabilities),
+        record_key: clean_fleet_text(&input.record_key, FLEET_SIG_MAX),
+        record_sig: clean_fleet_text(&input.record_sig, FLEET_SIG_MAX),
+        record_signed_at_unix_ms: if input.record_signed_at_unix_ms > now {
+            now
+        } else {
+            input.record_signed_at_unix_ms
+        },
         first_seen_unix_ms,
         last_seen_unix_ms,
         updated_unix_ms: now,
@@ -3369,6 +3405,49 @@ mod tests {
     use super::*;
     use bip39::Language;
 
+    #[test]
+    fn fleet_sync_round_trips_record_signatures() {
+        let user_id = Uuid::new_v4();
+        let record = normalize_fleet_target_input(
+            user_id,
+            FleetTargetInput {
+                id: "daemon-1".to_string(),
+                host_id: "daemon-1".to_string(),
+                label: "Anchor box".to_string(),
+                record_key: "PubKeyB64u".to_string(),
+                record_sig: "SigB64u".to_string(),
+                record_signed_at_unix_ms: 1_700_000_000_000,
+                ..Default::default()
+            },
+            1_800_000_000_000,
+        )
+        .expect("record normalizes");
+        // The service carries owner signatures verbatim — it never
+        // interprets them, and the view exposes them for client-side
+        // verification.
+        assert_eq!(record.record_key, "PubKeyB64u");
+        assert_eq!(record.record_sig, "SigB64u");
+        assert_eq!(record.record_signed_at_unix_ms, 1_700_000_000_000);
+        let view = fleet_target_view(&record);
+        assert_eq!(view["record_key"], "PubKeyB64u");
+        assert_eq!(view["record_sig"], "SigB64u");
+        assert_eq!(view["record_signed_at_unix_ms"], 1_700_000_000_000u64);
+
+        // Future timestamps clamp to the sync time instead of trusting the
+        // client clock.
+        let clamped = normalize_fleet_target_input(
+            user_id,
+            FleetTargetInput {
+                id: "daemon-2".to_string(),
+                record_signed_at_unix_ms: u64::MAX,
+                ..Default::default()
+            },
+            1_800_000_000_000,
+        )
+        .expect("record normalizes");
+        assert_eq!(clamped.record_signed_at_unix_ms, 1_800_000_000_000);
+    }
+
     fn daemon_record(
         daemon_id: &str,
         owner_user_id: Option<Uuid>,
@@ -3542,6 +3621,9 @@ mod tests {
                 browser_tcp_via_url: "/app?connect=1&daemon_id=daemon".to_string(),
                 origin: "https://intendant.dev".to_string(),
                 connect_daemon_id: " daemon ".to_string(),
+                record_key: String::new(),
+                record_sig: String::new(),
+                record_signed_at_unix_ms: 0,
                 capabilities: vec![
                     json!("display"),
                     json!("display"),
@@ -3611,6 +3693,9 @@ mod tests {
                     origin: "https://intendant.dev".to_string(),
                     connect_daemon_id: Some("daemon-1".to_string()),
                     capabilities: Vec::new(),
+                    record_key: String::new(),
+                    record_sig: String::new(),
+                    record_signed_at_unix_ms: 0,
                     first_seen_unix_ms: 1,
                     last_seen_unix_ms: 1,
                     updated_unix_ms: 1,
@@ -3637,6 +3722,9 @@ mod tests {
                     origin: "https://connect.intendant.dev".to_string(),
                     connect_daemon_id: Some("daemon-1".to_string()),
                     capabilities: Vec::new(),
+                    record_key: String::new(),
+                    record_sig: String::new(),
+                    record_signed_at_unix_ms: 0,
                     first_seen_unix_ms: 1,
                     last_seen_unix_ms: 1,
                     updated_unix_ms: 1,
@@ -3663,6 +3751,9 @@ mod tests {
                     origin: "https://intendant.dev".to_string(),
                     connect_daemon_id: None,
                     capabilities: Vec::new(),
+                    record_key: String::new(),
+                    record_sig: String::new(),
+                    record_signed_at_unix_ms: 0,
                     first_seen_unix_ms: 1,
                     last_seen_unix_ms: 1,
                     updated_unix_ms: 1,

@@ -191,9 +191,14 @@ The pieces that implement the model, mapped to the codebase:
   the CORS echo and refuses state-changing requests from any other page —
   closing the hole where a cert-installed browser could be steered by an
   arbitrary website. These routes are never wildcard-readable.
-- **Signed/encrypted fleet sync**: the hosted metadata store holds
-  client-encrypted blobs and owner-signed records; clients verify on read.
-  The store cannot inject a daemon into your fleet view.
+- **Signed fleet sync**: fleet records that round-trip the hosted metadata
+  store are signed by the pushing browser's identity key (over host id,
+  label, and route URLs) and verified on read; the Access UI badges each
+  synced record as verified-by-this-browser, signed-by-another-device,
+  unverified, or hosted-claim. The store carries the signatures verbatim
+  and cannot silently inject or relabel a daemon in your fleet view.
+  Cross-device encryption of private fields (via passkey-PRF-derived keys)
+  remains the follow-on step.
 - **Org root keys**: membership and role assertions signed by the org key;
   daemons verify signatures rather than trusting a directory. The global
   directory maps handle → org root key and is cross-checkable; a

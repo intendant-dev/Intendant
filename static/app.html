@@ -13418,6 +13418,94 @@ async function clientIdentityReset() {
   db.close();
 }
 
+/* ── Signed fleet records (trust architecture phase 5) ──
+   Fleet entries that round-trip through the hosted metadata store are
+   signed with this browser's identity key and verified on read, so the
+   store can remember the fleet but cannot invent or alter it unnoticed.
+   Provenance is display metadata only — authority always stays with the
+   target daemon. */
+
+function accessFleetRecordPayload(record, signedAt) {
+  return new TextEncoder().encode([
+    'intendant-fleet-record-v1',
+    String(record.host_id || record.id || ''),
+    String(record.label || ''),
+    String(record.url || ''),
+    String(record.ws_url || ''),
+    String(record.browser_tcp_via_url || ''),
+    String(record.connect_daemon_id || ''),
+    String(signedAt),
+  ].join('\n'));
+}
+
+async function accessFleetSignRecord(record) {
+  const identity = await clientIdentityGet();
+  if (!identity) return record;
+  const signedAt = Date.now();
+  try {
+    const signature = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      identity.privateKey,
+      accessFleetRecordPayload(record, signedAt)
+    );
+    return {
+      ...record,
+      record_key: identity.publicRawB64u,
+      record_sig: dashboardBytesToBase64Url(new Uint8Array(signature)),
+      record_signed_at_unix_ms: signedAt,
+    };
+  } catch (err) {
+    console.warn('[fleet-sync] record signing failed:', err?.message || err);
+    return record;
+  }
+}
+
+/* host_id → 'verified' | 'signed' | 'unverified' | 'hosted-claim'. */
+const accessFleetProvenance = new Map();
+
+async function accessFleetVerifyRecord(record) {
+  if (String(record.source || '') === 'connect_daemon') return 'hosted-claim';
+  const key = String(record.record_key || '');
+  const sig = String(record.record_sig || '');
+  const signedAt = Number(record.record_signed_at_unix_ms || 0);
+  if (!key || !sig || !signedAt) return 'unverified';
+  try {
+    const publicKey = await crypto.subtle.importKey(
+      'raw',
+      dashboardBase64UrlToBytes(key),
+      { name: 'ECDSA', namedCurve: 'P-256' },
+      false,
+      ['verify']
+    );
+    const valid = await crypto.subtle.verify(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      publicKey,
+      dashboardBase64UrlToBytes(sig),
+      accessFleetRecordPayload(record, signedAt)
+    );
+    if (!valid) return 'unverified';
+    const mine = clientIdentityCache?.publicRawB64u === key;
+    return mine ? 'verified' : 'signed';
+  } catch {
+    return 'unverified';
+  }
+}
+
+async function accessFleetRefreshProvenance() {
+  if (!clientIdentitySupported()) return;
+  let changed = false;
+  for (const record of accessFleetRead().targets || []) {
+    const id = String(record.host_id || record.id || '').trim();
+    if (!id) continue;
+    const provenance = await accessFleetVerifyRecord(record);
+    if (accessFleetProvenance.get(id) !== provenance) {
+      accessFleetProvenance.set(id, provenance);
+      changed = true;
+    }
+  }
+  if (changed) renderAccessAdminSummaries();
+}
+
 /* Sign an offer. Absence is legacy-compatible (the daemon falls back to
    account/trusted-transport identity); a present-but-invalid signature is
    rejected by the daemon, so a signaling relay can neither forge nor splice
@@ -33251,7 +33339,10 @@ async function accessFleetHydrateFromHosted() {
   try {
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets'));
     const body = await resp.json().catch(() => ({}));
-    if (resp.ok && body.ok !== false) accessFleetMergeHostedTargets(body.targets || []);
+    if (resp.ok && body.ok !== false) {
+      accessFleetMergeHostedTargets(body.targets || []);
+      accessFleetRefreshProvenance().catch(() => {});
+    }
   } catch (err) {
     console.warn('[access] hosted fleet hydrate failed', err);
   }
@@ -33280,7 +33371,11 @@ async function accessFleetPushToHosted() {
   try {
     const headers = await accessFleetHostedHeaders();
     if (!headers) return;
-    const targets = accessFleetRead().targets || [];
+    // Sign just-in-time so the pushed record always covers its current
+    // content; browsers without WebCrypto push unsigned (shown as such).
+    const targets = await Promise.all(
+      (accessFleetRead().targets || []).map(target => accessFleetSignRecord(target))
+    );
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets/sync'), {
       method: 'POST',
       headers,
@@ -33289,6 +33384,7 @@ async function accessFleetPushToHosted() {
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
     accessFleetMergeHostedTargets(body.targets || []);
+    accessFleetRefreshProvenance().catch(() => {});
   } finally {
     accessFleetHostedSyncInFlight = false;
     if (accessFleetHostedSyncDirty) accessFleetScheduleHostedSync();
@@ -34609,6 +34705,8 @@ function accessCreateTargetRow(target) {
   } else if (rememberedOnly) {
     accessAppendText(titleRow, 'access-target-badge', 'browser record', 'span');
   }
+  const provenanceChip = accessTargetProvenanceChip(target);
+  if (provenanceChip) titleRow.appendChild(provenanceChip);
   const subtitle = accessAppendText(main, 'access-target-subtitle', accessTargetSubtitle(target, descriptor));
   subtitle.title = subtitle.textContent;
   main.prepend(dot, titleRow);
@@ -35926,6 +36024,25 @@ function accessRouteInfoForTarget(target, descriptor, rememberedOnly) {
   return { kind: 'peer', label: 'Peer mTLS' };
 }
 
+/* Sync-provenance chip for fleet records that round-trip the hosted store.
+   null for live/local targets, which need no such badge. */
+function accessTargetProvenanceChip(target) {
+  const source = String(target?.source || '');
+  if (!/browser_fleet|hosted_access|connect_daemon/.test(source)) return null;
+  const id = String(target?.host_id || target?.id || '').trim();
+  const provenance = accessFleetProvenance.get(id)
+    || (source === 'connect_daemon' ? 'hosted-claim' : null);
+  if (!provenance) return null;
+  const spec = {
+    'verified': { cls: 'webrtc', label: 'synced ✓ this browser', title: 'This fleet record was signed by this browser\u2019s identity key and verified after syncing through the hosted store.' },
+    'signed': { cls: 'remembered', label: 'synced · other device', title: 'Signed by a different device\u2019s key; the signature verifies but this browser cannot vouch for the signer.' },
+    'unverified': { cls: 'remembered', label: 'synced · unverified', title: 'This record carries no valid owner signature — treat labels and URLs as hints from the metadata store, not facts.' },
+    'hosted-claim': { cls: 'connect', label: 'hosted claim', title: 'Attested by the hosted Connect service\u2019s claim records. Navigation metadata only; the daemon still decides all access.' },
+  }[provenance];
+  if (!spec) return null;
+  return accessRouteChip(spec.cls, spec.label, spec.title);
+}
+
 /* Best human name for a target: label unless it is a bare address,
    then the URL hostname, then a shortened id. Raw IPs and key-shaped
    ids only appear as the subtitle, never as the headline. */
@@ -36332,6 +36449,8 @@ function renderAccessFleetStrip() {
       const roleId = /peer/i.test(roleLabel) ? 'role:peer-profile' : (/root/i.test(roleLabel) ? 'role:root' : '');
       meta.appendChild(accessRoleBadge(roleId, roleLabel));
     }
+    const provenanceChip = accessTargetProvenanceChip(target);
+    if (provenanceChip) meta.appendChild(provenanceChip);
     card.append(top, meta);
     card.addEventListener('click', () => routeTo('access', 'daemons'));
     mount.appendChild(card);

@@ -375,7 +375,12 @@ navigation metadata: target ids, labels, route labels, URLs, capability hints,
 and last-seen timestamps. It does not store browser mTLS private keys, daemon
 IAM grants, peer secrets, dashboard session grants, or passkey private material.
 Claimed Connect daemons are merged into the same target list as live
-`connect_daemon` records and override stale remembered labels. Direct mTLS
+`connect_daemon` records and override stale remembered labels. Records the
+browser pushes are signed with its identity key and re-verified after every
+round trip; target rows and the fleet strip badge each synced record as
+verified (this browser), signed (another device), unverified, or a hosted
+claim — so the metadata store can remember the fleet but cannot invent or
+alter it unnoticed. Direct mTLS
 dashboards on daemon origins remain local-first; cross-origin sync to
 `intendant.dev` is a separate explicit-consent design problem, not something the
 current cookie model does silently.
