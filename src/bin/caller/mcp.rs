@@ -11115,7 +11115,11 @@ fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32,
     let dn_x = |x: &mut i32| *x = (*x as f64 * screen_w as f64 / 1000.0) as i32;
     let dn_y = |y: &mut i32| *y = (*y as f64 * screen_h as f64 / 1000.0) as i32;
     match action {
-        CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => {
+        CuAction::Click { x, y, .. }
+        | CuAction::DoubleClick { x, y, .. }
+        | CuAction::TripleClick { x, y, .. }
+        | CuAction::MouseDown { x, y, .. }
+        | CuAction::MouseUp { x, y, .. } => {
             dn_x(x);
             dn_y(y);
         }
@@ -11138,7 +11142,24 @@ fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32,
             dn_x(end_x);
             dn_y(end_y);
         }
-        _ => {} // Type, Key, Screenshot, Wait — no coordinates
+        CuAction::Zoom {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            dn_x(x);
+            dn_y(y);
+            *width = (*width as f64 * screen_w as f64 / 1000.0) as u32;
+            *height = (*height as f64 * screen_h as f64 / 1000.0) as u32;
+        }
+        // Type, Paste, Key, HoldKey, Screenshot, Wait — no coordinates.
+        CuAction::Type { .. }
+        | CuAction::Paste { .. }
+        | CuAction::Key { .. }
+        | CuAction::HoldKey { .. }
+        | CuAction::Screenshot
+        | CuAction::Wait { .. } => {}
     }
 }
 
@@ -11170,6 +11191,22 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
         } => {
             format!("(drag {},{}->{},{})", start_x, start_y, end_x, end_y)
         }
+        CuAction::TripleClick { x, y, button } => {
+            format!("(tripleclick {},{} {:?})", x, y, button)
+        }
+        CuAction::MouseDown { x, y, button } => format!("(mousedown {},{} {:?})", x, y, button),
+        CuAction::MouseUp { x, y, button } => format!("(mouseup {},{} {:?})", x, y, button),
+        CuAction::Paste { text } => {
+            let preview = if text.len() > 30 { &text[..30] } else { text };
+            format!("(paste \"{}\")", preview)
+        }
+        CuAction::HoldKey { key, ms } => format!("(holdkey {} {}ms)", key, ms),
+        CuAction::Zoom {
+            x,
+            y,
+            width,
+            height,
+        } => format!("(zoom {},{} {}x{})", x, y, width, height),
         CuAction::Screenshot => "(screenshot)".to_string(),
         CuAction::Wait { ms } => format!("(wait {}ms)", ms),
     }
@@ -11195,7 +11232,10 @@ fn annotate_screenshot_with_clicks(
     let clicks: Vec<(i32, i32)> = actions
         .iter()
         .filter_map(|a| match a {
-            CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => Some((*x, *y)),
+            CuAction::Click { x, y, .. }
+            | CuAction::DoubleClick { x, y, .. }
+            | CuAction::TripleClick { x, y, .. }
+            | CuAction::MouseDown { x, y, .. } => Some((*x, *y)),
             _ => None,
         })
         .collect();

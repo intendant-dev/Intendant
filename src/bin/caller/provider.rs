@@ -1758,6 +1758,30 @@ fn parse_anthropic_cu_action(input: &serde_json::Value) -> Option<super::compute
                 button: MouseButton::Left,
             })
         }
+        "triple_click" => {
+            let (x, y) = coord()?;
+            Some(CuAction::TripleClick {
+                x,
+                y,
+                button: MouseButton::Left,
+            })
+        }
+        "left_mouse_down" => {
+            let (x, y) = coord()?;
+            Some(CuAction::MouseDown {
+                x,
+                y,
+                button: MouseButton::Left,
+            })
+        }
+        "left_mouse_up" => {
+            let (x, y) = coord()?;
+            Some(CuAction::MouseUp {
+                x,
+                y,
+                button: MouseButton::Left,
+            })
+        }
         "type" => {
             let text = input.get("text")?.as_str()?.to_string();
             Some(CuAction::Type { text })
@@ -1765,6 +1789,26 @@ fn parse_anthropic_cu_action(input: &serde_json::Value) -> Option<super::compute
         "key" => {
             let key = input.get("text")?.as_str()?.to_string();
             Some(CuAction::Key { key })
+        }
+        "hold_key" => {
+            let key = input.get("text")?.as_str()?.to_string();
+            // Anthropic sends duration in seconds (fractional allowed).
+            let ms = anthropic_duration_ms(input, 1000);
+            Some(CuAction::HoldKey { key, ms })
+        }
+        "zoom" => {
+            // region is [x0, y0, x1, y1] in screenshot coordinates.
+            let region = input.get("region")?.as_array()?;
+            let x0 = region.first()?.as_i64()? as i32;
+            let y0 = region.get(1)?.as_i64()? as i32;
+            let x1 = region.get(2)?.as_i64()? as i32;
+            let y1 = region.get(3)?.as_i64()? as i32;
+            Some(CuAction::Zoom {
+                x: x0.min(x1),
+                y: y0.min(y1),
+                width: (x1 - x0).unsigned_abs(),
+                height: (y1 - y0).unsigned_abs(),
+            })
         }
         "mouse_move" => {
             let (x, y) = coord()?;
@@ -1804,13 +1848,23 @@ fn parse_anthropic_cu_action(input: &serde_json::Value) -> Option<super::compute
             })
         }
         "wait" => {
-            let ms = input
-                .get("duration")
-                .and_then(|v| v.as_u64())
-                .unwrap_or(1000);
+            // Anthropic sends duration in seconds (the previous read treated
+            // it as milliseconds, turning a 2-second wait into 2 ms).
+            let ms = anthropic_duration_ms(input, 1000);
             Some(CuAction::Wait { ms })
         }
         _ => None,
+    }
+}
+
+/// Convert an Anthropic CU `duration` field (seconds, fractional allowed)
+/// into clamped milliseconds.
+fn anthropic_duration_ms(input: &serde_json::Value, default_ms: u64) -> u64 {
+    match input.get("duration").and_then(|v| v.as_f64()) {
+        Some(seconds) if seconds.is_finite() && seconds > 0.0 => {
+            ((seconds * 1000.0).round() as u64).min(30_000)
+        }
+        _ => default_ms,
     }
 }
 

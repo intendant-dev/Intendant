@@ -33023,6 +33023,25 @@ async fn execute_cu_calls(
                     end_x,
                     end_y,
                 } => format!("drag({},{}->{},{})", start_x, start_y, end_x, end_y),
+                computer_use::CuAction::TripleClick { x, y, .. } => {
+                    format!("triple_click({},{})", x, y)
+                }
+                computer_use::CuAction::MouseDown { x, y, .. } => {
+                    format!("mouse_down({},{})", x, y)
+                }
+                computer_use::CuAction::MouseUp { x, y, .. } => format!("mouse_up({},{})", x, y),
+                computer_use::CuAction::Paste { text } => {
+                    format!("paste(\"{}\")", &text[..text.len().min(50)])
+                }
+                computer_use::CuAction::HoldKey { key, ms } => {
+                    format!("hold_key({},{}ms)", key, ms)
+                }
+                computer_use::CuAction::Zoom {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => format!("zoom({},{} {}x{})", x, y, width, height),
                 computer_use::CuAction::Screenshot => "screenshot".to_string(),
                 computer_use::CuAction::Wait { ms } => format!("wait({}ms)", ms),
             })

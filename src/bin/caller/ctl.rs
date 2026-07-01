@@ -1687,14 +1687,20 @@ const CU_ACTION_SHAPES: &str = r#"Actions are a JSON array of tagged objects (co
 --coordinate-space normalized_1000 maps 0-1000 onto the display):
   {"type":"click","x":N,"y":N}                    optional "button": left|right|middle
   {"type":"double_click","x":N,"y":N}             optional "button"
+  {"type":"triple_click","x":N,"y":N}             optional "button"
+  {"type":"mouse_down","x":N,"y":N}               press without releasing; optional "button"
+  {"type":"mouse_up","x":N,"y":N}                 release; optional "button"
   {"type":"type","text":"..."}                    trailing \n presses Enter
+  {"type":"paste","text":"..."}                   clipboard+paste; fast for long text
   {"type":"key","key":"Return"}                   key or chord, e.g. "ctrl+shift+t"
+  {"type":"hold_key","key":"shift","ms":N}        hold a key/chord for N ms
   {"type":"scroll","x":N,"y":N,"direction":"up|down|left|right"}  optional "amount" (default 3)
   {"type":"move_mouse","x":N,"y":N}
   {"type":"drag","start_x":N,"start_y":N,"end_x":N,"end_y":N}
   {"type":"screenshot"}
+  {"type":"zoom","x":N,"y":N,"width":N,"height":N}  region capture at native (Retina) detail
   {"type":"wait","ms":N}
-A screenshot of the final state is captured automatically after the last action."#;
+A screenshot of the final state is captured automatically after the last action (unless it was already a screenshot/zoom)."#;
 
 /// A working example covering common actions, shown in help and parsed by a
 /// unit test to guarantee the documented shapes match `CuAction`.
@@ -1830,12 +1836,18 @@ mod tests {
         let all = serde_json::json!([
             {"type":"click","x":1,"y":2,"button":"middle"},
             {"type":"double_click","x":1,"y":2},
+            {"type":"triple_click","x":1,"y":2},
+            {"type":"mouse_down","x":1,"y":2,"button":"left"},
+            {"type":"mouse_up","x":1,"y":2},
             {"type":"type","text":"hello\n"},
+            {"type":"paste","text":"long text"},
             {"type":"key","key":"ctrl+shift+t"},
+            {"type":"hold_key","key":"shift","ms":500},
             {"type":"scroll","x":3,"y":4,"direction":"down","amount":2},
             {"type":"move_mouse","x":5,"y":6},
             {"type":"drag","start_x":1,"start_y":2,"end_x":3,"end_y":4},
             {"type":"screenshot"},
+            {"type":"zoom","x":10,"y":20,"width":300,"height":200},
             {"type":"wait","ms":100},
         ]);
         validate_cu_actions(&all).expect("all shapes validate");
@@ -1848,12 +1860,18 @@ mod tests {
         for name in [
             "click",
             "double_click",
+            "triple_click",
+            "mouse_down",
+            "mouse_up",
             "type",
+            "paste",
             "key",
+            "hold_key",
             "scroll",
             "move_mouse",
             "drag",
             "screenshot",
+            "zoom",
             "wait",
         ] {
             listed(name);

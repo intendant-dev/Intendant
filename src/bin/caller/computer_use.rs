@@ -155,11 +155,42 @@ pub enum CuAction {
         #[serde(default)]
         button: MouseButton,
     },
+    TripleClick {
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        button: MouseButton,
+    },
+    /// Press and hold a button at (x, y) without releasing — pair with
+    /// `mouse_up` for manual drags and drag-and-drop with hover pauses.
+    MouseDown {
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        button: MouseButton,
+    },
+    MouseUp {
+        x: i32,
+        y: i32,
+        #[serde(default)]
+        button: MouseButton,
+    },
     Type {
+        text: String,
+    },
+    /// Set the clipboard to `text` and paste it — much faster and more
+    /// reliable than `type` for long text. On the user's macOS session the
+    /// previous clipboard text is restored afterwards.
+    Paste {
         text: String,
     },
     Key {
         key: String,
+    },
+    /// Hold a key or chord down for `ms` milliseconds, then release.
+    HoldKey {
+        key: String,
+        ms: u64,
     },
     Scroll {
         x: i32,
@@ -179,6 +210,15 @@ pub enum CuAction {
         end_y: i32,
     },
     Screenshot,
+    /// Capture just the given region (logical coordinates) at the highest
+    /// resolution the platform can supply — on Retina displays this returns
+    /// the native 2x pixels instead of the downscaled full-frame view.
+    Zoom {
+        x: i32,
+        y: i32,
+        width: u32,
+        height: u32,
+    },
     Wait {
         ms: u64,
     },
@@ -519,6 +559,35 @@ pub async fn execute_actions(
                     },
                 }
             }
+            CuAction::Zoom {
+                x,
+                y,
+                width,
+                height,
+            } => {
+                match capture_zoom_screenshot(
+                    session.as_deref(),
+                    last_input_at,
+                    &display,
+                    effective_backend,
+                    screenshot_dir,
+                    action_counter,
+                    (*x, *y, *width, *height),
+                )
+                .await
+                {
+                    Ok(s) => CuActionResult {
+                        success: true,
+                        screenshot: Some(s),
+                        error: None,
+                    },
+                    Err(e) => CuActionResult {
+                        success: false,
+                        screenshot: None,
+                        error: Some(e),
+                    },
+                }
+            }
             _ => {
                 let result = execute_single(
                     action,
@@ -540,10 +609,10 @@ pub async fn execute_actions(
         results.push(result);
     }
 
-    // If the last action was not a Screenshot, auto-capture one.
+    // If the last action was not already a capture, auto-capture one.
     let needs_auto_screenshot = actions
         .last()
-        .is_some_and(|a| !matches!(a, CuAction::Screenshot));
+        .is_some_and(|a| !matches!(a, CuAction::Screenshot | CuAction::Zoom { .. }));
     if needs_auto_screenshot {
         let auto = capture_screenshot_preferring_session(
             session.as_deref(),
@@ -809,8 +878,130 @@ async fn execute_single(
                 .await
             }
         },
+        CuAction::TripleClick { x, y, button } => match backend {
+            #[cfg(target_os = "macos")]
+            DisplayBackend::MacOS => {
+                let (sx, sy) = scale_coords(*x, *y);
+                macos_input::click(sx, sy, *button, 3).await
+            }
+            _ => {
+                run_xdotool(
+                    display,
+                    &[
+                        "mousemove",
+                        "--sync",
+                        &x.to_string(),
+                        &y.to_string(),
+                        "click",
+                        "--repeat",
+                        "3",
+                        "--delay",
+                        "50",
+                        button.xdotool_button(),
+                    ],
+                )
+                .await
+            }
+        },
+        CuAction::MouseDown { x, y, button } => match backend {
+            #[cfg(target_os = "macos")]
+            DisplayBackend::MacOS => {
+                let (sx, sy) = scale_coords(*x, *y);
+                macos_input::mouse_down(sx, sy, *button).await
+            }
+            _ => {
+                run_xdotool(
+                    display,
+                    &[
+                        "mousemove",
+                        "--sync",
+                        &x.to_string(),
+                        &y.to_string(),
+                        "mousedown",
+                        button.xdotool_button(),
+                    ],
+                )
+                .await
+            }
+        },
+        CuAction::MouseUp { x, y, button } => match backend {
+            #[cfg(target_os = "macos")]
+            DisplayBackend::MacOS => {
+                let (sx, sy) = scale_coords(*x, *y);
+                macos_input::mouse_up(sx, sy, *button).await
+            }
+            _ => {
+                run_xdotool(
+                    display,
+                    &[
+                        "mousemove",
+                        "--sync",
+                        &x.to_string(),
+                        &y.to_string(),
+                        "mouseup",
+                        button.xdotool_button(),
+                    ],
+                )
+                .await
+            }
+        },
+        CuAction::HoldKey { key, ms } => match backend {
+            #[cfg(target_os = "macos")]
+            DisplayBackend::MacOS => macos_input::hold_key(key, *ms).await,
+            _ => {
+                // xdotool sleep takes seconds (fractional allowed).
+                let secs = format!("{:.3}", (*ms as f64) / 1000.0);
+                run_xdotool(
+                    display,
+                    &[
+                        "keydown",
+                        "--clearmodifiers",
+                        key,
+                        "sleep",
+                        &secs,
+                        "keyup",
+                        key,
+                    ],
+                )
+                .await
+            }
+        },
+        CuAction::Paste { text } => match backend {
+            #[cfg(target_os = "macos")]
+            DisplayBackend::MacOS => macos_input::paste(text).await,
+            _ => x11_paste(display, text).await,
+        },
         CuAction::Screenshot => {
             match take_screenshot(display, backend, screenshot_dir, counter).await {
+                Ok(s) => CuActionResult {
+                    success: true,
+                    screenshot: Some(s),
+                    error: None,
+                },
+                Err(e) => CuActionResult {
+                    success: false,
+                    screenshot: None,
+                    error: Some(e),
+                },
+            }
+        }
+        CuAction::Zoom {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            match capture_zoom_screenshot(
+                None,
+                None,
+                display,
+                backend,
+                screenshot_dir,
+                counter,
+                (*x, *y, *width, *height),
+            )
+            .await
+            {
                 Ok(s) => CuActionResult {
                     success: true,
                     screenshot: Some(s),
@@ -832,6 +1023,55 @@ async fn execute_single(
             }
         }
     }
+}
+
+/// Paste on X11: set the clipboard via `xclip` (text over stdin, so content
+/// never hits argv), then press ctrl+v. The previous clipboard is not
+/// restored — X11 CU displays are agent-owned Xvfb sessions.
+async fn x11_paste(display: &str, text: &str) -> CuActionResult {
+    use tokio::io::AsyncWriteExt;
+
+    let spawn = Command::new("xclip")
+        .args(["-selection", "clipboard", "-display", display])
+        .stdin(std::process::Stdio::piped())
+        .spawn();
+    let mut child = match spawn {
+        Ok(child) => child,
+        Err(e) => {
+            return CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some(format!("xclip spawn failed (is xclip installed?): {e}")),
+            }
+        }
+    };
+    if let Some(mut stdin) = child.stdin.take() {
+        if let Err(e) = stdin.write_all(text.as_bytes()).await {
+            return CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some(format!("xclip write failed: {e}")),
+            };
+        }
+    }
+    match child.wait().await {
+        Ok(status) if status.success() => {}
+        Ok(status) => {
+            return CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some(format!("xclip exited with {status}")),
+            }
+        }
+        Err(e) => {
+            return CuActionResult {
+                success: false,
+                screenshot: None,
+                error: Some(format!("xclip wait failed: {e}")),
+            }
+        }
+    }
+    run_xdotool(display, &["key", "--clearmodifiers", "ctrl+v"]).await
 }
 
 // ── X11 backend (xdotool) ───────────────────────────────────────────────────
@@ -1002,6 +1242,97 @@ mod macos_input {
             CGMouseButton::Left,
             None,
         ))
+    }
+
+    /// Press a button at (x, y) without releasing.
+    pub async fn mouse_down(x: i32, y: i32, button: MouseButton) -> CuActionResult {
+        if let Err(e) = post_mouse(CGEventType::MouseMoved, x, y, CGMouseButton::Left, None) {
+            return fail(e);
+        }
+        tokio::time::sleep(HOVER_DELAY).await;
+        let (down, _, cg_button) = button_events(button);
+        result(post_mouse(down, x, y, cg_button, Some(1)))
+    }
+
+    /// Release a button at (x, y).
+    pub async fn mouse_up(x: i32, y: i32, button: MouseButton) -> CuActionResult {
+        let (_, up, cg_button) = button_events(button);
+        result(post_mouse(up, x, y, cg_button, Some(1)))
+    }
+
+    /// Hold a key or chord down for `ms` milliseconds, then release.
+    pub async fn hold_key(key: &str, ms: u64) -> CuActionResult {
+        let (keycode, flags) = match parse_key(key) {
+            Ok(parsed) => parsed,
+            Err(e) => return fail(e),
+        };
+        let outcome = source().and_then(|source| {
+            let down = CGEvent::new_keyboard_event(source, keycode, true)
+                .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+            down.set_flags(flags);
+            down.post(CGEventTapLocation::HID);
+            Ok(())
+        });
+        if let Err(e) = outcome {
+            return fail(e);
+        }
+        tokio::time::sleep(Duration::from_millis(ms)).await;
+        let outcome = source().and_then(|source| {
+            let up = CGEvent::new_keyboard_event(source, keycode, false)
+                .map_err(|_| "CGEvent keyboard event creation failed".to_string())?;
+            up.set_flags(flags);
+            up.post(CGEventTapLocation::HID);
+            Ok(())
+        });
+        result(outcome)
+    }
+
+    /// Set the clipboard to `text`, press ⌘V, and restore the previous
+    /// clipboard text. Far faster than `type_text` for long strings; note
+    /// that a non-text clipboard (e.g. an image) is not restored.
+    pub async fn paste(text: &str) -> CuActionResult {
+        use tokio::io::AsyncWriteExt;
+        use tokio::process::Command;
+
+        let previous = Command::new("pbpaste")
+            .output()
+            .await
+            .ok()
+            .filter(|o| o.status.success())
+            .map(|o| o.stdout);
+
+        let set_clipboard = |content: Vec<u8>| async move {
+            let mut child = Command::new("pbcopy")
+                .stdin(std::process::Stdio::piped())
+                .spawn()
+                .map_err(|e| format!("pbcopy spawn failed: {e}"))?;
+            if let Some(mut stdin) = child.stdin.take() {
+                stdin
+                    .write_all(&content)
+                    .await
+                    .map_err(|e| format!("pbcopy write failed: {e}"))?;
+            }
+            let status = child
+                .wait()
+                .await
+                .map_err(|e| format!("pbcopy wait failed: {e}"))?;
+            if !status.success() {
+                return Err("pbcopy exited with an error".to_string());
+            }
+            Ok(())
+        };
+
+        if let Err(e) = set_clipboard(text.as_bytes().to_vec()).await {
+            return fail(e);
+        }
+        let paste_result = key("cmd+v").await;
+        // Give the frontmost app time to consume the clipboard before
+        // restoring what the user had there.
+        tokio::time::sleep(Duration::from_millis(300)).await;
+        if let Some(previous) = previous {
+            let _ = set_clipboard(previous).await;
+        }
+        paste_result
     }
 
     /// Press at the start point, drag through interpolated positions, and
@@ -1543,6 +1874,60 @@ async fn execute_via_session(
                 results.push(result);
                 needs_auto_screenshot = false;
             }
+            CuAction::Zoom {
+                x,
+                y,
+                width: zw,
+                height: zh,
+            } => {
+                // Crop the session frame. Passing the denorm reference as the
+                // "logical" size makes the crop resize-drift-proof: if the
+                // live stream resolution differs from the resolution the
+                // model's coordinates are based on, the region scales along.
+                let capture = match last_input_at {
+                    Some(ts) => session.screenshot_fresh(ts, FRESH_FRAME_TIMEOUT).await,
+                    None => session.screenshot().await,
+                };
+                let result = match capture
+                    .map_err(|e| format!("Screenshot failed: {e}"))
+                    .and_then(|bytes| crop_png_region(&bytes, (*x, *y, *zw, *zh), (width, height)))
+                {
+                    Ok(cropped) => {
+                        *action_counter += 1;
+                        let path = screenshot_dir.join(format!("cu_zoom_{}.png", action_counter));
+                        match std::fs::write(&path, &cropped) {
+                            Ok(()) => {
+                                let (w, h) = png_dimensions(&cropped).unwrap_or((0, 0));
+                                use base64::Engine;
+                                let base64_png =
+                                    base64::engine::general_purpose::STANDARD.encode(&cropped);
+                                CuActionResult {
+                                    success: true,
+                                    screenshot: Some(ScreenshotData {
+                                        path,
+                                        base64_png,
+                                        width: w,
+                                        height: h,
+                                    }),
+                                    error: None,
+                                }
+                            }
+                            Err(e) => CuActionResult {
+                                success: false,
+                                screenshot: None,
+                                error: Some(format!("Failed to write zoom screenshot: {e}")),
+                            },
+                        }
+                    }
+                    Err(e) => CuActionResult {
+                        success: false,
+                        screenshot: None,
+                        error: Some(e),
+                    },
+                };
+                results.push(result);
+                needs_auto_screenshot = false;
+            }
             CuAction::Click { x, y, button } => {
                 let nx = *x as f64 / width as f64;
                 let ny = *y as f64 / height as f64;
@@ -1610,6 +1995,72 @@ async fn execute_via_session(
                 });
                 needs_auto_screenshot = true;
             }
+            CuAction::TripleClick { x, y, button } => {
+                let nx = *x as f64 / width as f64;
+                let ny = *y as f64 / height as f64;
+                let b = mouse_button_index(*button);
+                let mut errors = Vec::new();
+                for _ in 0..3 {
+                    if let Err(e) = session
+                        .inject_input(crate::display::InputEvent::MouseDown { x: nx, y: ny, b })
+                        .await
+                    {
+                        errors.push(format!("mouse down: {e}"));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
+                    if let Err(e) = session
+                        .inject_input(crate::display::InputEvent::MouseUp { x: nx, y: ny, b })
+                        .await
+                    {
+                        errors.push(format!("mouse up: {e}"));
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                let success = errors.is_empty();
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error: if success {
+                        None
+                    } else {
+                        Some(format!(
+                            "TripleClick injection failed: {}",
+                            errors.join("; ")
+                        ))
+                    },
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::MouseDown { x, y, button } => {
+                let nx = *x as f64 / width as f64;
+                let ny = *y as f64 / height as f64;
+                let b = mouse_button_index(*button);
+                let result = session
+                    .inject_input(crate::display::InputEvent::MouseDown { x: nx, y: ny, b })
+                    .await;
+                let success = result.is_ok();
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error: result.err().map(|e| format!("mouse down: {e}")),
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::MouseUp { x, y, button } => {
+                let nx = *x as f64 / width as f64;
+                let ny = *y as f64 / height as f64;
+                let b = mouse_button_index(*button);
+                let result = session
+                    .inject_input(crate::display::InputEvent::MouseUp { x: nx, y: ny, b })
+                    .await;
+                let success = result.is_ok();
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error: result.err().map(|e| format!("mouse up: {e}")),
+                });
+                needs_auto_screenshot = true;
+            }
             CuAction::Type { text } => {
                 let result = session.inject_text(text).await;
                 let success = result.is_ok();
@@ -1619,6 +2070,17 @@ async fn execute_via_session(
                     error: result.err().map(|e| e.to_string()),
                 });
                 needs_auto_screenshot = true;
+            }
+            CuAction::Paste { .. } => {
+                results.push(CuActionResult {
+                    success: false,
+                    screenshot: None,
+                    error: Some(
+                        "paste is not supported on the Wayland/Windows session backend yet — \
+                         use type instead"
+                            .to_string(),
+                    ),
+                });
             }
             CuAction::Key { key } => {
                 let events = key_action_events(key);
@@ -1632,6 +2094,41 @@ async fn execute_via_session(
                             break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                }
+                results.push(CuActionResult {
+                    success,
+                    screenshot: None,
+                    error,
+                });
+                needs_auto_screenshot = true;
+            }
+            CuAction::HoldKey { key, ms } => {
+                let events = key_action_events(key);
+                let mut success = events.is_ok();
+                let mut error = events.as_ref().err().cloned();
+                if let Ok(events) = events {
+                    let (downs, ups): (Vec<_>, Vec<_>) = events
+                        .into_iter()
+                        .partition(|e| matches!(e, crate::display::InputEvent::KeyDown { .. }));
+                    'inject: {
+                        for event in downs {
+                            if let Err(e) = session.inject_input(event).await {
+                                success = false;
+                                error = Some(e.to_string());
+                                break 'inject;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
+                        tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+                        for event in ups {
+                            if let Err(e) = session.inject_input(event).await {
+                                success = false;
+                                error = Some(e.to_string());
+                                break 'inject;
+                            }
+                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        }
                     }
                 }
                 results.push(CuActionResult {
@@ -1752,7 +2249,10 @@ async fn execute_via_session(
                 });
             }
         }
-        if !matches!(action, CuAction::Screenshot | CuAction::Wait { .. }) {
+        if !matches!(
+            action,
+            CuAction::Screenshot | CuAction::Zoom { .. } | CuAction::Wait { .. }
+        ) {
             last_input_at = Some(std::time::Instant::now());
         }
     }
@@ -1843,6 +2343,127 @@ async fn take_session_screenshot(
             error: Some(e),
         },
     }
+}
+
+/// Crop a PNG to `region` given in logical coordinates, keeping whatever
+/// extra resolution the capture has: the region is scaled by the capture's
+/// physical/logical ratio, so a Retina capture yields native 2x detail.
+fn crop_png_region(
+    png_bytes: &[u8],
+    region: (i32, i32, u32, u32),
+    logical_size: (u32, u32),
+) -> Result<Vec<u8>, String> {
+    let (x, y, w, h) = region;
+    if w == 0 || h == 0 {
+        return Err("zoom region must have a non-zero width and height".to_string());
+    }
+    let img = image::load_from_memory(png_bytes).map_err(|e| format!("decode capture: {e}"))?;
+    let (img_w, img_h) = (img.width(), img.height());
+    let (logical_w, _) = logical_size;
+    let scale = if logical_w > 0 && img_w > logical_w {
+        img_w as f64 / logical_w as f64
+    } else {
+        1.0
+    };
+    let sx = ((x.max(0) as f64) * scale).round() as u32;
+    let sy = ((y.max(0) as f64) * scale).round() as u32;
+    let sw = ((w as f64) * scale).round() as u32;
+    let sh = ((h as f64) * scale).round() as u32;
+    if sx >= img_w || sy >= img_h {
+        return Err(format!(
+            "zoom region ({x},{y} {w}x{h}) lies outside the {img_w}x{img_h} capture"
+        ));
+    }
+    let sw = sw.min(img_w - sx).max(1);
+    let sh = sh.min(img_h - sy).max(1);
+    let cropped = img.crop_imm(sx, sy, sw, sh);
+    let mut buf = std::io::Cursor::new(Vec::new());
+    cropped
+        .write_to(&mut buf, image::ImageFormat::Png)
+        .map_err(|e| format!("encode crop: {e}"))?;
+    Ok(buf.into_inner())
+}
+
+/// Capture just `region` (logical coordinates) at the highest resolution the
+/// backend can supply. On macOS this deliberately uses a raw `screencapture`
+/// (physical pixels — 2x on Retina) rather than the logical-size session
+/// frame, because zoom's whole point is detail; on X11 the session frame and
+/// `import` have identical resolution, so the in-memory frame is preferred.
+async fn capture_zoom_screenshot(
+    session: Option<&crate::display::DisplaySession>,
+    min_fresh: Option<std::time::Instant>,
+    display: &str,
+    backend: DisplayBackend,
+    screenshot_dir: &Path,
+    counter: &mut u64,
+    region: (i32, i32, u32, u32),
+) -> Result<ScreenshotData, String> {
+    let raw = match backend {
+        DisplayBackend::MacOS => None,
+        _ => match session {
+            Some(session) => {
+                let bytes = match min_fresh {
+                    Some(ts) => session.screenshot_fresh(ts, FRESH_FRAME_TIMEOUT).await,
+                    None => session.screenshot().await,
+                }
+                .map_err(|e| format!("Screenshot failed: {e}"))?;
+                Some(bytes)
+            }
+            None => None,
+        },
+    };
+    let raw = match raw {
+        Some(bytes) => bytes,
+        None => {
+            // Raw subprocess capture, deliberately without the
+            // logical-size downscale.
+            *counter += 1;
+            let path = screenshot_dir.join(format!("cu_zoom_raw_{}.png", counter));
+            let output = match backend {
+                DisplayBackend::MacOS => Command::new("screencapture")
+                    .args(["-x", &path.to_string_lossy()])
+                    .output()
+                    .await
+                    .map_err(|e| format!("screencapture exec error: {e}"))?,
+                _ => Command::new("import")
+                    .args([
+                        "-window",
+                        "root",
+                        "-display",
+                        display,
+                        &path.to_string_lossy(),
+                    ])
+                    .output()
+                    .await
+                    .map_err(|e| format!("import exec error: {e}"))?,
+            };
+            if !output.status.success() {
+                return Err(format!(
+                    "zoom capture failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            let bytes = tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("read zoom capture: {e}"))?;
+            let _ = tokio::fs::remove_file(&path).await;
+            bytes
+        }
+    };
+
+    let cropped = crop_png_region(&raw, region, logical_display_size())?;
+    *counter += 1;
+    let path = screenshot_dir.join(format!("cu_zoom_{}.png", counter));
+    std::fs::write(&path, &cropped).map_err(|e| format!("write zoom screenshot: {e}"))?;
+    let (width, height) = png_dimensions(&cropped).unwrap_or((0, 0));
+    use base64::Engine;
+    let base64_png = base64::engine::general_purpose::STANDARD.encode(&cropped);
+    Ok(ScreenshotData {
+        path,
+        base64_png,
+        width,
+        height,
+    })
 }
 
 /// Capture a screenshot for the target, preferring the in-memory frame of a
