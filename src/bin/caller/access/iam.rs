@@ -116,6 +116,19 @@ pub struct UserClientGrantUpsertRequest {
     pub label: Option<String>,
     #[serde(default)]
     pub fingerprint: Option<String>,
+    /// Browser identity-key fingerprint (base64url of sha256 over the raw
+    /// P-256 point). Distinct from `fingerprint`, which is the hex mTLS
+    /// certificate fingerprint.
+    #[serde(default)]
+    pub client_key_fingerprint: Option<String>,
+    /// Optional full public key (base64url raw point) kept for audit/display.
+    #[serde(default)]
+    pub client_key: Option<String>,
+    /// Origin the key was enrolled from, recorded by the trusted session
+    /// that creates the grant. Role ceilings use this to distinguish
+    /// anchor-origin keys from hosted-origin keys.
+    #[serde(default)]
+    pub client_key_origin: Option<String>,
     #[serde(default)]
     pub user_id: Option<String>,
     #[serde(default)]
@@ -239,6 +252,26 @@ impl AccessPrincipal {
         principal.account = account;
         principal.organization = organization;
         principal.authn = authn;
+        principal
+    }
+
+    /// A trusted-local root session whose offer carried a verified browser
+    /// identity key that has no local grant yet. The session keeps its
+    /// root-compatible authority (the transport is trusted), but the key is
+    /// surfaced in `authn` so the UI can offer to enroll it.
+    pub fn root_dashboard_session_with_client_key(
+        source: impl Into<String>,
+        transport: impl Into<String>,
+        client_key_fingerprint: &str,
+        client_key_public_b64u: &str,
+    ) -> Self {
+        let mut principal = Self::root_dashboard_session(source, transport);
+        principal.authn.push(serde_json::json!({
+            "kind": "client_key",
+            "label": "Browser identity key",
+            "fingerprint": client_key_fingerprint,
+            "public_key": client_key_public_b64u,
+        }));
         principal
     }
 
@@ -763,6 +796,13 @@ fn validate_user_client_role(state: &LocalIamState, role_id: &str) -> AccessResu
 fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessResult<String> {
     let explicit = trimmed_nonempty(request.kind.as_str());
     let inferred = if request
+        .client_key_fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .is_some()
+    {
+        Some("client_key")
+    } else if request
         .fingerprint
         .as_deref()
         .and_then(trimmed_nonempty)
@@ -789,6 +829,9 @@ fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessR
         "browser_certificate" | "browser_mtls_cert" | "browser-mtls-cert" => {
             Ok("browser_certificate".to_string())
         }
+        "client_key" | "client-key" | "browser_key" | "browser-key" => {
+            Ok("client_key".to_string())
+        }
         "connect_account" | "connect-account" | "passkey_account" | "passkey-account" => {
             Ok("connect_account".to_string())
         }
@@ -796,7 +839,8 @@ fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessR
             Ok("human_user".to_string())
         }
         _ => Err(AccessError(
-            "kind must be browser_certificate, connect_account, or human_user".to_string(),
+            "kind must be client_key, browser_certificate, connect_account, or human_user"
+                .to_string(),
         )),
     }
 }
@@ -923,9 +967,69 @@ fn build_user_client_binding(
                 authn: vec![Value::Object(authn)],
             })
         }
+        "client_key" => {
+            let fingerprint = request
+                .client_key_fingerprint
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(normalize_client_key_fingerprint)
+                .filter(|fingerprint| !fingerprint.is_empty())
+                .ok_or_else(|| AccessError("client_key_fingerprint is required".to_string()))?;
+            let label = request
+                .label
+                .as_deref()
+                .and_then(trimmed_nonempty)
+                .map(ToOwned::to_owned)
+                .unwrap_or_else(|| format!("Browser key {}", short_id(&fingerprint)));
+            Ok(UserClientBinding {
+                principal_id: format!("principal:client-key:{fingerprint}"),
+                principal_kind: "client_key".to_string(),
+                label,
+                account: None,
+                organization: organization_metadata(request),
+                authn: vec![client_key_authn_entry(
+                    &fingerprint,
+                    request.client_key.as_deref(),
+                    request.client_key_origin.as_deref(),
+                )],
+            })
+        }
         "human_user" => build_human_user_binding(request),
         _ => Err(AccessError(format!("unsupported user/client kind {kind}"))),
     }
+}
+
+/// Client-key fingerprints are base64url (case-sensitive); unlike hex mTLS
+/// fingerprints they must not be case-folded or stripped.
+pub fn normalize_client_key_fingerprint(value: &str) -> String {
+    value.trim().to_string()
+}
+
+fn client_key_authn_entry(
+    fingerprint: &str,
+    public_key: Option<&str>,
+    origin: Option<&str>,
+) -> Value {
+    let mut authn = serde_json::Map::new();
+    authn.insert("kind".to_string(), Value::String("client_key".to_string()));
+    authn.insert(
+        "label".to_string(),
+        Value::String("Browser identity key".to_string()),
+    );
+    authn.insert(
+        "fingerprint".to_string(),
+        Value::String(fingerprint.to_string()),
+    );
+    if let Some(public_key) = public_key.and_then(trimmed_nonempty) {
+        authn.insert(
+            "public_key".to_string(),
+            Value::String(public_key.to_string()),
+        );
+    }
+    if let Some(origin) = origin.and_then(trimmed_nonempty) {
+        authn.insert("origin".to_string(), Value::String(origin.to_string()));
+    }
+    Value::Object(authn)
 }
 
 fn build_human_user_binding(
@@ -936,6 +1040,12 @@ fn build_human_user_binding(
         .as_deref()
         .and_then(trimmed_nonempty)
         .map(normalize_fingerprint)
+        .filter(|fingerprint| !fingerprint.is_empty());
+    let client_key_fingerprint = request
+        .client_key_fingerprint
+        .as_deref()
+        .and_then(trimmed_nonempty)
+        .map(normalize_client_key_fingerprint)
         .filter(|fingerprint| !fingerprint.is_empty());
     let user_id = request
         .user_id
@@ -948,15 +1058,20 @@ fn build_human_user_binding(
         .or(request.account_name.as_deref())
         .and_then(trimmed_nonempty)
         .map(ToOwned::to_owned);
-    if fingerprint.is_none() && user_id.is_none() && handle.is_none() {
+    if fingerprint.is_none()
+        && client_key_fingerprint.is_none()
+        && user_id.is_none()
+        && handle.is_none()
+    {
         return Err(AccessError(
-            "human_user requires a fingerprint, user_id, or handle".to_string(),
+            "human_user requires a fingerprint, client key, user_id, or handle".to_string(),
         ));
     }
     let id_source = user_id
         .as_deref()
         .or(handle.as_deref())
         .or(fingerprint.as_deref())
+        .or(client_key_fingerprint.as_deref())
         .unwrap_or("human");
     let label = request
         .label
@@ -973,6 +1088,13 @@ fn build_human_user_binding(
             "label": "Browser mTLS certificate",
             "fingerprint": fingerprint,
         }));
+    }
+    if let Some(client_key_fingerprint) = client_key_fingerprint.as_ref() {
+        authn.push(client_key_authn_entry(
+            client_key_fingerprint,
+            request.client_key.as_deref(),
+            request.client_key_origin.as_deref(),
+        ));
     }
     if user_id.is_some() || handle.is_some() {
         let mut connect = serde_json::Map::new();
@@ -1169,7 +1291,7 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "peer_profile_grants": true,
             "user_client_grants": true,
             "principal_binding": "root_peer_and_local_user_client",
-            "enforced_principal_kinds": ["root_session", "peer_daemon", "human_user", "browser_certificate", "connect_account"],
+            "enforced_principal_kinds": ["root_session", "peer_daemon", "human_user", "browser_certificate", "client_key", "connect_account"],
             "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser mTLS or Connect account identities."
         }
     })
@@ -1675,6 +1797,7 @@ fn root_permission_ids() -> Vec<String> {
 fn principal_kind_label(kind: &str) -> &'static str {
     match kind {
         "browser_certificate" => "Browser certificate",
+        "client_key" => "Browser key",
         "connect_account" => "Connect account",
         "passkey_account" => "Passkey account",
         "human_user" | "" => "Human user",
@@ -1733,6 +1856,24 @@ pub fn principal_for_browser_mtls_cert_any_status(
         &fingerprint,
         transport,
     )
+}
+
+pub fn principal_for_client_key(
+    state: &LocalIamState,
+    fingerprint: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let fingerprint = normalize_client_key_fingerprint(fingerprint);
+    principal_for_authn(state, "client_key", "fingerprint", &fingerprint, transport)
+}
+
+pub fn principal_for_client_key_any_status(
+    state: &LocalIamState,
+    fingerprint: &str,
+    transport: impl Into<String>,
+) -> Option<AccessPrincipal> {
+    let fingerprint = normalize_client_key_fingerprint(fingerprint);
+    principal_for_authn_any_status(state, "client_key", "fingerprint", &fingerprint, transport)
 }
 
 pub fn principal_for_connect_account(
@@ -2060,6 +2201,57 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    #[test]
+    fn upsert_client_key_grant_creates_active_binding() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                // Kind is inferred from the client-key fingerprint.
+                client_key_fingerprint: Some("Fp_Base64-Url".to_string()),
+                client_key: Some("BPubKeyRaw".to_string()),
+                client_key_origin: Some("https://anchor.local:8765".to_string()),
+                role_id: Some("role:terminal".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        assert!(result.created_principal);
+        assert_eq!(result.principal.kind, "client_key");
+        // base64url fingerprints keep their case, unlike hex cert prints.
+        let authn = &result.principal.authn[0];
+        assert_eq!(authn["kind"], "client_key");
+        assert_eq!(authn["fingerprint"], "Fp_Base64-Url");
+        assert_eq!(authn["origin"], "https://anchor.local:8765");
+        assert_eq!(authn["public_key"], "BPubKeyRaw");
+
+        let principal =
+            principal_for_client_key(&state, "Fp_Base64-Url", "connect-dashboard-control")
+                .unwrap();
+        assert_eq!(principal.id, result.principal.id);
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Settings,
+            )
+            .allowed
+        );
+        // Case differences must not match.
+        assert!(principal_for_client_key(&state, "fp_base64-url", "x").is_none());
     }
 
     #[test]

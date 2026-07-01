@@ -2168,6 +2168,15 @@ struct RendezvousEvent {
     user_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     account_name: Option<String>,
+    // Browser identity-key fields are relayed verbatim; the daemon verifies
+    // the signature end-to-end, so this service never gains authority by
+    // carrying them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key_sig: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_key_ts: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claim_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2526,6 +2535,12 @@ struct BrowserOfferRequest {
     sdp: String,
     #[serde(default)]
     client_nonce: Option<String>,
+    #[serde(default)]
+    client_key: Option<String>,
+    #[serde(default)]
+    client_key_sig: Option<String>,
+    #[serde(default)]
+    client_key_ts: Option<i64>,
 }
 
 async fn browser_offer(
@@ -2579,6 +2594,19 @@ async fn browser_offer(
                 .map(str::to_string),
             user_id: Some(user.id.to_string()),
             account_name: Some(user.account_name.clone()),
+            client_key: body
+                .client_key
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            client_key_sig: body
+                .client_key_sig
+                .as_deref()
+                .map(str::trim)
+                .filter(|v| !v.is_empty())
+                .map(str::to_string),
+            client_key_ts: body.client_key_ts,
             ..RendezvousEvent::default()
         },
     )

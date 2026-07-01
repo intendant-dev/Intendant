@@ -34777,6 +34777,28 @@ function accessAuditGrantCards() {
 function accessCurrentUserClientCandidate() {
   const principal = dashboardControlTransport?.lastStatus?.access_principal;
   const authnList = Array.isArray(principal?.authn) ? principal.authn : [];
+  // This origin's identity key is the strongest, always-available binding:
+  // prefer it whenever the keystore holds one (the cache is warmed at
+  // startup, so this synchronous read is normally populated).
+  const keyAuthn = authnList.find(item =>
+    accessModelLabel(item?.kind) === 'client_key' && accessModelLabel(item?.fingerprint)
+  );
+  const localKey = clientIdentityCache;
+  if (keyAuthn || localKey) {
+    return {
+      kind: 'client_key',
+      label: accessModelLabel(principal?.label, 'This browser'),
+      fingerprint: '',
+      client_key_fingerprint: accessModelLabel(keyAuthn?.fingerprint, localKey?.fingerprint || ''),
+      client_key: accessModelLabel(keyAuthn?.public_key, localKey?.publicRawB64u || ''),
+      user_id: accessModelLabel(principal?.account?.user_id),
+      account_name: accessModelLabel(principal?.account?.account_name || principal?.account?.handle),
+      account_provider: accessModelLabel(principal?.account?.provider),
+      verified_provider: accessModelLabel(principal?.account?.verified_provider),
+      organization_id: accessModelLabel(principal?.organization?.id),
+      organization_name: accessModelLabel(principal?.organization?.name),
+    };
+  }
   const browserAuthn = authnList.find(item =>
     accessModelLabel(item?.kind) === 'browser_mtls_cert' && accessModelLabel(item?.fingerprint)
   );
@@ -34872,6 +34894,10 @@ function accessAssignableIamRoles(overview = accessOverviewModel()) {
 }
 
 const ACCESS_GRANT_KIND_CHOICES = [{
+  value: 'client_key',
+  title: 'A browser identity key',
+  desc: 'The key a browser holds in its own storage — signed into every session, no certificate install needed.',
+}, {
   value: 'browser_certificate',
   title: 'A browser certificate',
   desc: 'Pin one browser’s mTLS client certificate to a role on this daemon.',
@@ -34882,7 +34908,7 @@ const ACCESS_GRANT_KIND_CHOICES = [{
 }, {
   value: 'human_user',
   title: 'A person',
-  desc: 'One human record that can carry both a certificate and a Connect account.',
+  desc: 'One human record that can carry a key, a certificate, and a Connect account.',
 }];
 
 const ACCESS_ROLE_PICKER_ORDER = [
@@ -34963,11 +34989,13 @@ function renderAccessUserClientGrantForm() {
   if (candidate) {
     const detected = document.createElement('div');
     detected.className = 'acc-detected';
-    detected.textContent = candidate.kind === 'connect_account'
-      ? `Detected: your Connect account ${candidate.account_name ? `@${candidate.account_name}` : candidate.user_id} — fields are pre-filled`
-      : (candidate.kind === 'human_user'
-        ? 'Detected: your mTLS user — fields are pre-filled'
-        : 'Detected: this browser’s certificate — fields are pre-filled');
+    detected.textContent = candidate.kind === 'client_key'
+      ? `Detected: this browser’s identity key ${String(candidate.client_key_fingerprint || '').slice(0, 12)}… — fields are pre-filled`
+      : (candidate.kind === 'connect_account'
+        ? `Detected: your Connect account ${candidate.account_name ? `@${candidate.account_name}` : candidate.user_id} — fields are pre-filled`
+        : (candidate.kind === 'human_user'
+          ? 'Detected: your mTLS user — fields are pre-filled'
+          : 'Detected: this browser’s certificate — fields are pre-filled'));
     form.appendChild(detected);
   }
 
@@ -34978,6 +35006,11 @@ function renderAccessUserClientGrantForm() {
     id: 'access-user-client-label',
     label: 'Label',
     placeholder: 'e.g. Alice’s laptop browser',
+  }, {
+    id: 'access-user-client-client-key-fingerprint',
+    label: 'Browser key fingerprint',
+    kind: 'client_key|human_user',
+    placeholder: 'shown on the connecting browser’s Access page',
   }, {
     id: 'access-user-client-fingerprint',
     label: 'Certificate fingerprint',
@@ -35123,9 +35156,10 @@ function renderAccessUserClientGrantForm() {
     const input = form.querySelector(`input[name="${name}"][value="${value}"]`);
     if (input) input.checked = true;
   };
-  setRadio('access-user-client-kind', candidate?.kind || 'browser_certificate');
+  setRadio('access-user-client-kind', candidate?.kind || 'client_key');
   if (candidate) {
     accessSetField(form, 'access-user-client-label', candidate.label);
+    accessSetField(form, 'access-user-client-client-key-fingerprint', candidate.client_key_fingerprint);
     accessSetField(form, 'access-user-client-fingerprint', candidate.fingerprint);
     accessSetField(form, 'access-user-client-user-id', candidate.user_id);
     accessSetField(form, 'access-user-client-account-name', candidate.account_name);
@@ -35144,10 +35178,23 @@ async function accessSubmitUserClientGrant(event) {
   if (!form || accessUserClientGrantSubmitting) return;
   const kind = accessSelectedUserClientKind(form);
   const kindHasFingerprint = kind === 'browser_certificate' || kind === 'human_user';
+  const kindHasClientKey = kind === 'client_key' || kind === 'human_user';
   const kindHasAccount = kind === 'connect_account' || kind === 'human_user';
+  const clientKeyFingerprint = kindHasClientKey
+    ? (form.querySelector('#access-user-client-client-key-fingerprint')?.value?.trim() || null)
+    : null;
+  // Only attach the public key and enrollment origin when the fingerprint
+  // being granted is this browser's own key — for a pasted foreign
+  // fingerprint neither is known to this session.
+  const grantingOwnKey = Boolean(
+    clientKeyFingerprint && clientIdentityCache?.fingerprint === clientKeyFingerprint
+  );
   const payload = {
     kind,
     label: form.querySelector('#access-user-client-label')?.value?.trim() || null,
+    client_key_fingerprint: clientKeyFingerprint,
+    client_key: grantingOwnKey ? clientIdentityCache.publicRawB64u : null,
+    client_key_origin: grantingOwnKey ? location.origin : null,
     fingerprint: kindHasFingerprint
       ? (form.querySelector('#access-user-client-fingerprint')?.value?.trim() || null)
       : null,
@@ -35172,12 +35219,24 @@ async function accessSubmitUserClientGrant(event) {
     role_id: form.querySelector('input[name="access-user-client-role"]:checked')?.value || 'role:scoped-human',
     status: form.querySelector('input[name="access-user-client-status"]:checked')?.value || 'active',
   };
-  if ((kind === 'browser_certificate' || kind === 'human_user') && !payload.fingerprint) {
+  if (kind === 'browser_certificate' && !payload.fingerprint) {
     showControlToast?.('error', 'Fingerprint is required');
+    return;
+  }
+  if (kind === 'client_key' && !payload.client_key_fingerprint) {
+    showControlToast?.('error', 'Browser key fingerprint is required');
     return;
   }
   if (kind === 'connect_account' && !payload.user_id && !payload.account_name) {
     showControlToast?.('error', 'User id or account name is required');
+    return;
+  }
+  if (kind === 'human_user'
+    && !payload.fingerprint
+    && !payload.client_key_fingerprint
+    && !payload.user_id
+    && !payload.account_name) {
+    showControlToast?.('error', 'A person needs at least one binding: key, certificate, or account');
     return;
   }
   if (payload.role_id === 'role:root') {
@@ -35508,12 +35567,14 @@ function accessCurrentPrincipalInfo() {
     const authn = Array.isArray(principal.authn) ? principal.authn : [];
     const cert = authn.find(item => accessModelLabel(item?.kind) === 'browser_mtls_cert');
     const connect = authn.find(item => accessModelLabel(item?.kind) === 'connect_account');
+    const key = authn.find(item => accessModelLabel(item?.kind) === 'client_key');
     return {
       known: true,
       kind: accessModelLabel(principal.kind, 'browser_session'),
       label: accessModelLabel(principal.label, connectMode ? 'Connect account' : 'This browser'),
       roleId: accessModelLabel(principal.role_id, 'role:root'),
       fingerprint: accessModelLabel(cert?.fingerprint),
+      clientKeyFingerprint: accessModelLabel(key?.fingerprint, clientIdentityCache?.fingerprint || ''),
       accountName: accessModelLabel(connect?.account_name || principal.account?.account_name || principal.account?.handle),
       accountUserId: accessModelLabel(connect?.user_id || principal.account?.user_id),
       route,
@@ -35525,6 +35586,7 @@ function accessCurrentPrincipalInfo() {
     label: connectMode ? 'Connect account' : 'This browser',
     roleId: connectMode ? '' : 'role:root',
     fingerprint: '',
+    clientKeyFingerprint: accessModelLabel(clientIdentityCache?.fingerprint),
     accountName: '',
     accountUserId: '',
     route,
@@ -35534,6 +35596,7 @@ function accessCurrentPrincipalInfo() {
 function accessPrincipalGlyph(kind) {
   const value = accessModelLabel(kind);
   if (/connect|passkey/.test(value)) return { text: '@', cls: 'kind-connect' };
+  if (/client_key/.test(value)) return { text: 'KEY', cls: 'kind-cert' };
   if (/certificate|mtls/.test(value)) return { text: 'CRT', cls: 'kind-cert' };
   if (/human/.test(value)) return { text: 'HU', cls: 'kind-human' };
   if (/peer/.test(value)) return { text: 'PD', cls: 'kind-peer' };
@@ -35763,6 +35826,12 @@ function renderAccessIdentityHero() {
   } else {
     youLines.push(accessHeroLine('Can do', 'Not authorized yet — this daemon has no grant for this account.'));
   }
+  if (me.clientKeyFingerprint) {
+    youLines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
+      mono: true,
+      title: 'This origin’s identity key. Grant it on other daemons to sign in there with no certificate install.',
+    }));
+  }
   if (me.fingerprint) youLines.push(accessHeroLine('Certificate', me.fingerprint, { mono: true }));
   if (me.accountName || me.accountUserId) {
     youLines.push(accessHeroLine('Account', me.accountName ? `@${me.accountName}` : me.accountUserId, {
@@ -35913,14 +35982,51 @@ function renderAccessPeopleCurrent() {
   const chips = [accessRouteChip(me.route.kind, me.route.label)];
   if (me.roleId) chips.push(accessRoleBadge(me.roleId, roleLabel));
   const lines = [];
+  if (me.clientKeyFingerprint) {
+    lines.push(accessHeroLine('Browser key', me.clientKeyFingerprint, {
+      mono: true,
+      title: 'Held in this browser’s origin storage; signed into every session offer. Paste this fingerprint into another daemon’s grant form to get access there.',
+    }));
+  }
   if (me.fingerprint) {
     lines.push(accessHeroLine('Certificate', me.fingerprint, { mono: true }));
   }
   if (me.accountName || me.accountUserId) {
     lines.push(accessHeroLine('Account', me.accountName ? `@${me.accountName}` : me.accountUserId, { title: me.accountUserId }));
   }
-  if (!me.fingerprint && !me.accountName && !me.accountUserId) {
+  if (!me.clientKeyFingerprint && !me.fingerprint && !me.accountName && !me.accountUserId) {
     lines.push(accessHeroLine('Binding', 'Trusted session only — no persistent identity. Save a grant below to pin this browser or an account to a role.'));
+  }
+  const actions = [];
+  if (me.clientKeyFingerprint && clientIdentityCache) {
+    actions.push({
+      label: 'Copy key fingerprint',
+      onClick: () => {
+        navigator.clipboard?.writeText(me.clientKeyFingerprint)
+          .then(() => showControlToast?.('success', 'Fingerprint copied'))
+          .catch(() => showControlToast?.('error', 'Copy failed'));
+      },
+    });
+    actions.push({
+      label: 'Reset key',
+      onClick: async () => {
+        const ok = await showDashboardConfirm({
+          title: 'Reset browser identity key',
+          message: 'Grants bound to the current key stop matching this browser. A fresh key is created on the next connection.',
+          confirmLabel: 'Reset key',
+          cancelLabel: 'Cancel',
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await clientIdentityReset();
+          showControlToast?.('success', 'Browser key reset — reload to mint a new one');
+        } catch (err) {
+          showControlToast?.('error', `Reset failed: ${err?.message || err}`);
+        }
+        renderAccessAdminSummaries();
+      },
+    });
   }
   mount.appendChild(accessHeroCard({
     glyph: glyph.text,
@@ -35929,6 +36035,7 @@ function renderAccessPeopleCurrent() {
     title: me.label,
     chips,
     lines,
+    actions,
   }));
 }
 
@@ -47163,19 +47270,27 @@ class DashboardControlTransport {
       if (!DASHBOARD_CONNECT_DAEMON_ID) {
         throw new Error('Connect dashboard missing daemon_id');
       }
+      const identity = await clientIdentityOfferFields(
+        DASHBOARD_CONNECT_DAEMON_ID,
+        this.clientNonce,
+        sdp
+      );
       const answer = await this.postConnectSignal('/api/browser/offer', {
         daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
         sdp,
         client_nonce: this.clientNonce,
+        ...identity,
       });
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
       return answer;
     }
     try {
+      const identity = await clientIdentityOfferFields('', this.clientNonce, sdp);
       const answer = await this.postLocalSignal('/connect/dashboard/offer', {
         sdp,
         client_nonce: this.clientNonce,
+        ...identity,
       });
       this.signalingMode = 'local-http';
       dashboardUpdateTransportStatus();
@@ -48369,6 +48484,155 @@ function dashboardBytesToBase64Url(bytes) {
   let binary = '';
   for (const byte of bytes) binary += String.fromCharCode(byte);
   return btoa(binary).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/g, '');
+}
+
+/* ── Browser client identity key ──
+   The durable identity of this browser *on this origin*: a WebCrypto P-256
+   keypair whose non-extractable private key lives in IndexedDB. Because
+   browser storage is origin-scoped, a key created under an anchor daemon's
+   origin can never be wielded by code served from any other origin — that
+   property is what lets daemons treat key-bound sessions as anchor-grade
+   (see docs/src/trust-architecture.md). Offers carry the public key plus a
+   signature over (daemon id, client nonce, sdp digest, timestamp); daemons
+   resolve the key fingerprint against their local IAM. */
+
+const CLIENT_IDENTITY_DB = 'intendant-client-identity';
+const CLIENT_IDENTITY_STORE = 'keys';
+const CLIENT_IDENTITY_RECORD = 'v1';
+let clientIdentityCache = null;
+let clientIdentityLoad = null;
+
+function clientIdentitySupported() {
+  return Boolean(window.isSecureContext && crypto?.subtle && window.indexedDB);
+}
+
+function clientIdentityOpenDb() {
+  return new Promise((resolve, reject) => {
+    const req = indexedDB.open(CLIENT_IDENTITY_DB, 1);
+    req.onupgradeneeded = () => {
+      if (!req.result.objectStoreNames.contains(CLIENT_IDENTITY_STORE)) {
+        req.result.createObjectStore(CLIENT_IDENTITY_STORE);
+      }
+    };
+    req.onsuccess = () => resolve(req.result);
+    req.onerror = () => reject(req.error || new Error('indexedDB open failed'));
+  });
+}
+
+function clientIdentityDbGet(db) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CLIENT_IDENTITY_STORE, 'readonly');
+    const req = tx.objectStore(CLIENT_IDENTITY_STORE).get(CLIENT_IDENTITY_RECORD);
+    req.onsuccess = () => resolve(req.result || null);
+    req.onerror = () => reject(req.error || new Error('indexedDB read failed'));
+  });
+}
+
+function clientIdentityDbPut(db, record) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CLIENT_IDENTITY_STORE, 'readwrite');
+    tx.objectStore(CLIENT_IDENTITY_STORE).put(record, CLIENT_IDENTITY_RECORD);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('indexedDB write failed'));
+  });
+}
+
+function clientIdentityDbDelete(db) {
+  return new Promise((resolve, reject) => {
+    const tx = db.transaction(CLIENT_IDENTITY_STORE, 'readwrite');
+    tx.objectStore(CLIENT_IDENTITY_STORE).delete(CLIENT_IDENTITY_RECORD);
+    tx.oncomplete = () => resolve();
+    tx.onerror = () => reject(tx.error || new Error('indexedDB delete failed'));
+  });
+}
+
+async function clientIdentityFingerprint(publicRaw) {
+  const digest = await crypto.subtle.digest('SHA-256', publicRaw);
+  return dashboardBytesToBase64Url(new Uint8Array(digest));
+}
+
+/* Load (or create on first use) this origin's identity key. Returns
+   { privateKey, publicRawB64u, fingerprint, createdAtMs } or null when the
+   platform cannot hold one (non-secure context, storage disabled). */
+async function clientIdentityGet() {
+  if (clientIdentityCache) return clientIdentityCache;
+  if (!clientIdentitySupported()) return null;
+  if (!clientIdentityLoad) {
+    clientIdentityLoad = (async () => {
+      try {
+        const db = await clientIdentityOpenDb();
+        let record = await clientIdentityDbGet(db);
+        if (!record?.privateKey || !record?.publicRaw) {
+          const pair = await crypto.subtle.generateKey(
+            { name: 'ECDSA', namedCurve: 'P-256' },
+            false,
+            ['sign']
+          );
+          const publicRaw = await crypto.subtle.exportKey('raw', pair.publicKey);
+          record = {
+            privateKey: pair.privateKey,
+            publicRaw,
+            createdAtMs: Date.now(),
+          };
+          await clientIdentityDbPut(db, record);
+        }
+        db.close();
+        const publicBytes = new Uint8Array(record.publicRaw);
+        clientIdentityCache = {
+          privateKey: record.privateKey,
+          publicRawB64u: dashboardBytesToBase64Url(publicBytes),
+          fingerprint: await clientIdentityFingerprint(record.publicRaw),
+          createdAtMs: record.createdAtMs || 0,
+        };
+        return clientIdentityCache;
+      } catch (err) {
+        console.warn('[client-identity] unavailable:', err?.message || err);
+        return null;
+      } finally {
+        clientIdentityLoad = null;
+      }
+    })();
+  }
+  return clientIdentityLoad;
+}
+
+async function clientIdentityReset() {
+  clientIdentityCache = null;
+  if (!clientIdentitySupported()) return;
+  const db = await clientIdentityOpenDb();
+  await clientIdentityDbDelete(db);
+  db.close();
+}
+
+/* Sign an offer. Absence is legacy-compatible (the daemon falls back to
+   account/trusted-transport identity); a present-but-invalid signature is
+   rejected by the daemon, so a signaling relay can neither forge nor splice
+   a key binding. */
+async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
+  try {
+    const identity = await clientIdentityGet();
+    if (!identity) return {};
+    const ts = Date.now();
+    const sdpDigest = dashboardBytesToBase64Url(
+      new Uint8Array(await crypto.subtle.digest('SHA-256', new TextEncoder().encode(sdp)))
+    );
+    const payload = new TextEncoder().encode(
+      `intendant-client-key-offer-v1\n${daemonId || ''}\n${clientNonce || ''}\n${sdpDigest}\n${ts}`
+    );
+    const signature = await crypto.subtle.sign(
+      { name: 'ECDSA', hash: 'SHA-256' },
+      identity.privateKey,
+      payload
+    );
+    return {
+      client_key: identity.publicRawB64u,
+      client_key_sig: dashboardBytesToBase64Url(new Uint8Array(signature)),
+      client_key_ts: ts,
+    };
+  } catch (err) {
+    console.warn('[client-identity] offer signing failed:', err?.message || err);
+    return {};
+  }
 }
 
 function dashboardRandomBase64Url(byteLength = 32) {
@@ -63728,6 +63992,14 @@ document.getElementById('sb-hosts-group').addEventListener('click', () => {
 document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
 document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => routeTo('access', 'diagnostics'));
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
+
+// Warm the browser identity key early: transports sign offers with it, and
+// the Access renderers read the cache synchronously once it resolves.
+if (clientIdentitySupported()) {
+  clientIdentityGet().then(identity => {
+    if (identity) renderAccessAdminSummaries();
+  }).catch(() => {});
+}
 syncAccessPageNavLink();
 
 // Auto-scroll detection

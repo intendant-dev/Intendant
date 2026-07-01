@@ -13098,8 +13098,71 @@ async fn connect_dashboard_offer_response(
         .map(str::trim)
         .filter(|nonce| !nonce.is_empty())
         .map(str::to_string);
+    // Reaching this path already required a trusted transport (mTLS or local
+    // loopback), so sessions stay root-compatible. A signed browser identity
+    // key refines that: a key with a local IAM grant binds the session to
+    // that scoped principal, and an ungranted key keeps root authority but
+    // surfaces its fingerprint so the Access UI can offer enrollment. An
+    // invalid signature fails closed.
+    let client_key_fields: crate::access::client_key::ClientKeyOfferFields =
+        serde_json::from_value(body.clone()).unwrap_or_default();
+    let verified_client_key = match client_key_fields.verify(
+        "",
+        client_nonce.as_deref().unwrap_or(""),
+        sdp,
+        crate::access::client_key::now_unix_ms(),
+    ) {
+        Ok(verified) => verified,
+        Err(e) => {
+            return json_error(
+                "400 Bad Request",
+                format!("client key verification failed: {e}"),
+            )
+        }
+    };
+    let grant = match verified_client_key {
+        Some(key) => {
+            let cert_dir = crate::access::backend::select_backend().cert_dir();
+            let loaded = load_local_iam_state_for_request(&cert_dir)
+                .ok()
+                .flatten();
+            let bound = loaded.as_ref().and_then(|state| {
+                crate::access::iam::principal_for_client_key(
+                    state,
+                    &key.fingerprint,
+                    "local-dashboard-control",
+                )
+                .or_else(|| {
+                    crate::access::iam::principal_for_client_key_any_status(
+                        state,
+                        &key.fingerprint,
+                        "local-dashboard-control",
+                    )
+                })
+                .map(|principal| (principal, state.clone()))
+            });
+            match bound {
+                Some((principal, iam_state)) => {
+                    crate::dashboard_control::DashboardControlGrant::UserClient {
+                        principal,
+                        iam_state,
+                    }
+                }
+                None => crate::dashboard_control::DashboardControlGrant::UserClientRoot {
+                    principal:
+                        crate::access::iam::AccessPrincipal::root_dashboard_session_with_client_key(
+                            "dashboard-control",
+                            "local-dashboard-control",
+                            &key.fingerprint,
+                            &key.public_key_b64u,
+                        ),
+                },
+            }
+        }
+        None => crate::dashboard_control::DashboardControlGrant::TrustedLocal,
+    };
     match dashboard_control
-        .answer_offer(sdp.to_string(), None, client_nonce)
+        .answer_offer_with_grant(sdp.to_string(), None, client_nonce, grant)
         .await
     {
         Ok(answer) => json_ok(serde_json::json!({
