@@ -31,6 +31,32 @@ pub struct LocalIamState {
     pub grants: Vec<IamGrant>,
     #[serde(default)]
     pub audit_events: Vec<IamAuditEvent>,
+    /// Effective-permission ceilings for low-provenance authn bindings,
+    /// keyed by binding kind (`connect_account`, `client_key`). A session
+    /// authenticated by a capped binding never exceeds the ceiling role's
+    /// permissions, no matter what its grant says. `connect_account`
+    /// sessions are always subject to their ceiling; `client_key` sessions
+    /// only when the key's recorded enrollment origin is in
+    /// `hosted_origins`. Owners who accept hosted-root risk can raise or
+    /// clear a ceiling by editing this map (an explicit empty map disables
+    /// ceilings entirely).
+    #[serde(default = "default_role_ceilings")]
+    pub role_ceilings: std::collections::BTreeMap<String, String>,
+    /// Origins treated as hosted (low-provenance) app sources when recorded
+    /// on a client key's enrollment binding.
+    #[serde(default = "default_hosted_origins")]
+    pub hosted_origins: Vec<String>,
+}
+
+fn default_role_ceilings() -> std::collections::BTreeMap<String, String> {
+    let mut ceilings = std::collections::BTreeMap::new();
+    ceilings.insert("connect_account".to_string(), "role:operator".to_string());
+    ceilings.insert("client_key".to_string(), "role:operator".to_string());
+    ceilings
+}
+
+fn default_hosted_origins() -> Vec<String> {
+    vec!["https://connect.intendant.dev".to_string()]
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -211,6 +237,16 @@ pub struct AccessPrincipal {
     pub organization: Option<Value>,
     #[serde(default)]
     pub authn: Vec<Value>,
+    /// The authn binding kind that actually authenticated this session
+    /// (e.g. `client_key`, `connect_account`, `browser_mtls_cert`). Role
+    /// ceilings key off this, not the principal kind, because one principal
+    /// (a `human_user`) can carry several bindings of different provenance.
+    #[serde(default)]
+    pub authn_kind: Option<String>,
+    /// The origin recorded on the matched binding at grant time, when the
+    /// binding carries one (client keys do).
+    #[serde(default)]
+    pub authn_origin: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -236,6 +272,8 @@ impl AccessPrincipal {
             account: None,
             organization: None,
             authn: Vec::new(),
+            authn_kind: None,
+            authn_origin: None,
         }
     }
 
@@ -300,6 +338,8 @@ impl AccessPrincipal {
             account: None,
             organization: None,
             authn: Vec::new(),
+            authn_kind: None,
+            authn_origin: None,
         }
     }
 
@@ -338,6 +378,8 @@ impl AccessPrincipal {
             account: principal.account.clone(),
             organization: principal.organization.clone(),
             authn: principal.authn.clone(),
+            authn_kind: None,
+            authn_origin: None,
         }
     }
 
@@ -409,6 +451,8 @@ impl Default for LocalIamState {
             roles: builtin_role_templates(),
             grants: Vec::new(),
             audit_events: Vec::new(),
+            role_ceilings: default_role_ceilings(),
+            hosted_origins: default_hosted_origins(),
         }
     }
 }
@@ -1292,8 +1336,10 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "user_client_grants": true,
             "principal_binding": "root_peer_and_local_user_client",
             "enforced_principal_kinds": ["root_session", "peer_daemon", "human_user", "browser_certificate", "client_key", "connect_account"],
-            "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser mTLS or Connect account identities."
-        }
+            "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser identity keys, browser mTLS certificates, or Connect account identities."
+        },
+        "role_ceilings": load.state.role_ceilings.clone(),
+        "hosted_origins": load.state.hosted_origins.clone()
     })
 }
 
@@ -1517,23 +1563,79 @@ pub fn evaluate_principal_operation_with_state(
         );
     };
     let permission = operation_permission_id(op);
-    if role
+    if !role
         .permissions
         .iter()
         .any(|candidate| candidate == permission)
     {
-        AccessDecision::allowed(
-            principal,
-            op,
-            format!("local IAM role {role_id} allows {permission}"),
-        )
-    } else {
-        AccessDecision::denied(
+        return AccessDecision::denied(
             principal,
             op,
             format!("local IAM role {role_id} does not allow {permission}"),
-        )
+        );
     }
+
+    // Role ceilings: the effective permission set of a low-provenance
+    // session is the intersection of its granted role and the ceiling role
+    // for the binding that authenticated it. The grant stays intact; only
+    // this session's authority is bounded.
+    if let Some(ceiling_role_id) = role_ceiling_for_session(state, principal) {
+        let Some(ceiling_role) = state.roles.iter().find(|role| role.id == ceiling_role_id)
+        else {
+            return AccessDecision::denied(
+                principal,
+                op,
+                format!(
+                    "role ceiling {ceiling_role_id} is configured but not defined; failing closed"
+                ),
+            );
+        };
+        if !ceiling_role
+            .permissions
+            .iter()
+            .any(|candidate| candidate == permission)
+        {
+            let binding = principal.authn_kind.as_deref().unwrap_or("session");
+            return AccessDecision::denied(
+                principal,
+                op,
+                format!(
+                    "role ceiling {ceiling_role_id} for {binding} bindings does not allow {permission}"
+                ),
+            );
+        }
+    }
+
+    AccessDecision::allowed(
+        principal,
+        op,
+        format!("local IAM role {role_id} allows {permission}"),
+    )
+}
+
+/// The ceiling role applying to this session, if any. `connect_account`
+/// bindings are always subject to their configured ceiling; `client_key`
+/// bindings only when the key's recorded enrollment origin is one of the
+/// configured hosted origins (keys born on daemon-served origins are
+/// anchor-grade and uncapped).
+pub fn role_ceiling_for_session(
+    state: &LocalIamState,
+    principal: &AccessPrincipal,
+) -> Option<String> {
+    let binding = principal.authn_kind.as_deref()?;
+    let ceiling = state.role_ceilings.get(binding)?;
+    if binding == "client_key" {
+        let origin = principal.authn_origin.as_deref().unwrap_or("");
+        let hosted = !origin.is_empty()
+            && state
+                .hosted_origins
+                .iter()
+                .any(|candidate| candidate.trim_end_matches('/') == origin.trim_end_matches('/'));
+        if !hosted {
+            return None;
+        }
+    }
+    Some(ceiling.clone())
 }
 
 pub fn operation_permission_id(op: crate::peer::access_policy::PeerOperation) -> &'static str {
@@ -1924,6 +2026,18 @@ pub fn principal_for_connect_account_any_status(
     })
 }
 
+fn matched_authn_origin(principal: &IamPrincipal, authn_kind: &str, key: &str, value: &str) -> Option<String> {
+    principal
+        .authn
+        .iter()
+        .find(|authn| {
+            authn.get("kind").and_then(Value::as_str) == Some(authn_kind)
+                && authn.get(key).and_then(Value::as_str) == Some(value)
+        })
+        .and_then(|authn| authn.get("origin").and_then(Value::as_str))
+        .map(str::to_string)
+}
+
 fn principal_for_authn(
     state: &LocalIamState,
     authn_kind: &str,
@@ -1946,9 +2060,10 @@ fn principal_for_authn(
         .grants
         .iter()
         .find(|grant| grant.principal_id == principal.id && is_enforced_status(&grant.status))?;
-    Some(AccessPrincipal::local_user_client(
-        principal, grant, transport,
-    ))
+    let mut access = AccessPrincipal::local_user_client(principal, grant, transport);
+    access.authn_kind = Some(authn_kind.to_string());
+    access.authn_origin = matched_authn_origin(principal, authn_kind, key, value);
+    Some(access)
 }
 
 fn principal_for_authn_any_status(
@@ -1978,9 +2093,10 @@ fn principal_for_authn_any_status(
                 .iter()
                 .find(|grant| grant.principal_id == principal.id)
         })?;
-    Some(AccessPrincipal::local_user_client(
-        principal, grant, transport,
-    ))
+    let mut access = AccessPrincipal::local_user_client(principal, grant, transport);
+    access.authn_kind = Some(authn_kind.to_string());
+    access.authn_origin = matched_authn_origin(principal, authn_kind, key, value);
+    Some(access)
 }
 
 #[allow(dead_code)]
@@ -2197,6 +2313,115 @@ mod tests {
             !evaluate_principal_operation_with_state(
                 &state,
                 &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn role_ceiling_caps_connect_account_sessions() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "connect_account".to_string(),
+                user_id: Some("user-123".to_string()),
+                account_name: Some("alice".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        let principal =
+            principal_for_connect_account(&state, "user-123", Some("alice"), "connect").unwrap();
+        assert_eq!(principal.authn_kind.as_deref(), Some("connect_account"));
+        // The grant says root, but the default connect_account ceiling is
+        // operator: operating permissions pass, admin permissions do not.
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        let denied = evaluate_principal_operation_with_state(
+            &state,
+            &principal,
+            crate::peer::access_policy::PeerOperation::AccessManage,
+        );
+        assert!(!denied.allowed);
+        assert!(denied.reason.contains("role ceiling"));
+
+        // Clearing the ceiling restores the full granted role.
+        state.role_ceilings.clear();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+    }
+
+    #[test]
+    fn role_ceiling_caps_only_hosted_origin_client_keys() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("anchor-key".to_string()),
+                client_key_origin: Some("https://anchor.local:8765".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("hosted-key".to_string()),
+                client_key_origin: Some("https://connect.intendant.dev".to_string()),
+                role_id: Some("role:root".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        // Anchor-origin keys are anchor-grade: no ceiling.
+        let anchor = principal_for_client_key(&state, "anchor-key", "connect").unwrap();
+        assert_eq!(anchor.authn_origin.as_deref(), Some("https://anchor.local:8765"));
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &anchor,
+                crate::peer::access_policy::PeerOperation::AccessManage,
+            )
+            .allowed
+        );
+
+        // Keys enrolled from a hosted origin are capped.
+        let hosted = principal_for_client_key(&state, "hosted-key", "connect").unwrap();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &hosted,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+        assert!(
+            !evaluate_principal_operation_with_state(
+                &state,
+                &hosted,
                 crate::peer::access_policy::PeerOperation::AccessManage,
             )
             .allowed

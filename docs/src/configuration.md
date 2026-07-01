@@ -610,32 +610,58 @@ Schema version 1 contains:
 | `roles` | Built-in or local role templates |
 | `grants` | Local IAM grant records targeting daemon IDs |
 | `audit_events` | Local IAM audit metadata |
+| `role_ceilings` | Per-binding-kind effective-role caps for low-provenance sessions (see below) |
+| `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard
 sessions, peer daemon profiles, and active scoped user/client grants pass
 through the IAM operation evaluator. The daemon can currently bind scoped
-user/client grants to browser mTLS certificate fingerprints, hosted Connect
-account metadata, or a combined `human_user` principal that carries both
-bindings plus optional account/provider and organization metadata. Matching
-active records are enforced by role. Unbound owner browser mTLS dashboard
-sessions keep the existing root-compatible fallback so direct/self-hosted access
-remains first-class. Connect dashboard sessions do not have an implicit root
-fallback: the routed Connect account must match local IAM, and a record in
-`draft` or `revoked` status denies instead of falling back to root. Root users
-can create these records through the Access UI,
-`POST /api/access/iam/user-client-grants`, or dashboard-control
+user/client grants to browser identity keys (`client_key`, the WebCrypto key
+each browser signs into its dashboard-control offers; see
+[Trust Architecture](./trust-architecture.md)), browser mTLS certificate
+fingerprints, hosted Connect account metadata, or a combined `human_user`
+principal that carries any of those bindings plus optional account/provider
+and organization metadata. Matching active records are enforced by role.
+Unbound owner browser mTLS dashboard sessions keep the existing
+root-compatible fallback so direct/self-hosted access remains first-class.
+Connect dashboard sessions do not have an implicit root fallback: the routed
+identity — a verified client key first, else the Connect account — must match
+local IAM, and a record in `draft` or `revoked` status denies instead of
+falling back to root. Root users can create these records through the Access
+UI, `POST /api/access/iam/user-client-grants`, or dashboard-control
 `api_access_iam_upsert_user_client_grant`; existing records can be activated,
 drafted, revoked, or role-changed through `POST /api/access/iam/grants/update`
 or dashboard-control `api_access_iam_update_grant`.
 
-The user-client grant upsert request accepts `kind = "browser_certificate"`,
-`"connect_account"`, or `"human_user"`. `human_user` is the local IAM shape for a
-real person who may authenticate through browser mTLS now and through a hosted
-account later. The optional `account_provider`, `verified_provider`, `handle`,
-`organization_id`, and `organization_name` fields are local metadata today; the
-hosted Connect service does not yet verify OAuth providers or organization
-membership.
+The user-client grant upsert request accepts `kind = "client_key"`,
+`"browser_certificate"`, `"connect_account"`, or `"human_user"`. `human_user`
+is the local IAM shape for a real person who may authenticate through a
+browser key or mTLS now and through a hosted account later. `client_key`
+grants take `client_key_fingerprint` (base64url, case-sensitive), an optional
+`client_key` public key for audit, and an optional `client_key_origin`
+recorded by the trusted session that creates the grant. The optional
+`account_provider`, `verified_provider`, `handle`, `organization_id`, and
+`organization_name` fields are local metadata today; the hosted Connect
+service does not yet verify OAuth providers or organization membership.
+
+**Role ceilings.** `role_ceilings` maps an authenticating binding kind to a
+ceiling role, and defaults to
+
+```json
+{ "connect_account": "role:operator", "client_key": "role:operator" }
+```
+
+A session authenticated by a capped binding never exceeds the ceiling role's
+permissions in that session, no matter what its grant says — the grant record
+itself is untouched. `connect_account` sessions are always subject to their
+ceiling; `client_key` sessions only when the key's recorded enrollment origin
+is listed in `hosted_origins` (default `["https://connect.intendant.dev"]`) —
+keys enrolled from a daemon-served origin are anchor-grade and uncapped. This
+is the honest degraded-trust tier from the trust architecture: hosted-route
+sessions can operate but cannot administer. Owners who accept hosted-root
+risk can raise a ceiling or disable them all with an explicit empty map
+(`"role_ceilings": {}`).
 
 The enforced built-in user/client roles are `role:scoped-human`,
 `role:observer`, `role:session-reader`, `role:terminal`, `role:files-read`,

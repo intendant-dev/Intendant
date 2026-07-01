@@ -1245,6 +1245,11 @@ function writeConnectAccountIamGrant(homeDir, userId = RENDEZVOUS_TEST_USER_ID, 
       revoked_at_unix_ms: null,
     }],
     audit_events: [],
+    // These validators exercise full root authority over the tunnel, so the
+    // default role ceilings (connect_account/client_key -> operator) are
+    // explicitly cleared. Ceiling enforcement itself is unit-tested in
+    // access::iam.
+    role_ceilings: {},
   };
   fs.writeFileSync(path.join(certDir, 'iam.json'), `${JSON.stringify(state, null, 2)}\n`, { mode: 0o600 });
 }
