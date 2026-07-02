@@ -834,6 +834,7 @@ mod tests {
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
 
         let grant =
@@ -915,6 +916,7 @@ mod tests {
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
 
         let key = crate::access::client_key::VerifiedClientKey {
@@ -1002,6 +1004,7 @@ mod tests {
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: Some(102),
             expires_at_unix_ms: None,
+            issued_via: None,
         });
 
         let grant =

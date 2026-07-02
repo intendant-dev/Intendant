@@ -9887,6 +9887,7 @@ mod tests {
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
         let principal =
             crate::access::iam::principal_for_browser_mtls_cert(&iam_state, "ab123", "https")

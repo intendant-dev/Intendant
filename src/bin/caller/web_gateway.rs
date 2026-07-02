@@ -25200,6 +25200,20 @@ pub(crate) fn access_org_revoke_member_response_value(
     if let Some(subject) = params.get("subject").and_then(|v| v.as_str()) {
         subjects.push(subject.to_string());
     }
+    let mut issuer_keys: Vec<String> = params
+        .get("issuer_keys")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(key) = params.get("issuer_key").and_then(|v| v.as_str()) {
+        issuer_keys.push(key.to_string());
+    }
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
         format!(
@@ -25207,7 +25221,9 @@ pub(crate) fn access_org_revoke_member_response_value(
         )
     })?;
     let now = crate::access::client_key::now_unix_ms() as u64;
-    let orl = crate::access::org::orl_revoke(&identity, &cert_dir, &handle, &grant_ids, &subjects, now)?;
+    let orl = crate::access::org::orl_revoke(
+        &identity, &cert_dir, &handle, &grant_ids, &subjects, &issuer_keys, now,
+    )?;
     let applied = crate::access::iam::load_state(&cert_dir)
         .ok()
         .and_then(|mut state| {
@@ -38762,6 +38778,7 @@ mod tests {
             created_at_unix_ms: None,
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
         let loaded = crate::access::iam::LoadedIamState {
             path: std::path::PathBuf::from("iam.json"),
@@ -39433,6 +39450,7 @@ mod tests {
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 

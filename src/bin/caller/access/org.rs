@@ -135,7 +135,130 @@ pub struct OrgGrantDocument {
     pub grant_id: String,
     pub issued_at_unix_ms: u64,
     pub expires_at_unix_ms: u64,
+    /// Issuer delegation chain (step 6b): empty when the root signed the
+    /// document; exactly one root-signed issuer certificate when a
+    /// delegated key did. Not part of the document payload — the chain
+    /// is carried beside the signature it explains.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub chain: Vec<OrgIssuerCert>,
     pub sig: String,
+}
+
+/// A root-signed delegation certificate: day-to-day signing moves off
+/// the root. One level only — an issuer cannot mint issuers.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct OrgIssuerCert {
+    pub v: u32,
+    pub kind: String,
+    pub org: OrgGrantOrg,
+    pub issuer_key: String,
+    #[serde(default)]
+    pub label: String,
+    /// Optional scope: `role:*` caps human documents (permission subset,
+    /// checked at materialization where the role catalog lives); `peer:*`
+    /// caps peer documents (profile containment). A scoped cert refuses
+    /// documents of the other kind; no scope allows both.
+    #[serde(default)]
+    pub max_role: String,
+    pub issued_at_unix_ms: u64,
+    pub expires_at_unix_ms: u64,
+    pub sig: String,
+}
+
+pub const ORG_ISSUER_PROTOCOL: &str = "intendant-org-issuer-v1";
+/// Hard cap on delegation lifetime.
+pub const MAX_ORG_ISSUER_TTL_MS: u64 = 365 * 24 * 60 * 60 * 1000;
+
+pub fn org_issuer_signing_payload(cert: &OrgIssuerCert) -> Vec<u8> {
+    format!(
+        "{ORG_ISSUER_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+        cert.org.handle,
+        cert.org.root_key,
+        cert.issuer_key,
+        cert.label,
+        cert.max_role,
+        cert.issued_at_unix_ms,
+        cert.expires_at_unix_ms,
+    )
+    .into_bytes()
+}
+
+/// Sign a delegation certificate with the org root key.
+pub fn delegate_org_issuer(
+    identity: &DaemonIdentity,
+    handle: &str,
+    issuer_key: &str,
+    label: &str,
+    max_role: &str,
+    ttl_ms: Option<u64>,
+    now_unix_ms: u64,
+) -> Result<OrgIssuerCert, String> {
+    let issuer_key = issuer_key.trim().to_string();
+    let decoded = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(&issuer_key)
+        .map_err(|_| "issuer key is not valid base64url".to_string())?;
+    if decoded.len() != 32 {
+        return Err("issuer key must be a 32-byte Ed25519 public key".to_string());
+    }
+    if issuer_key == identity.public_key_b64u() {
+        return Err("the org root key cannot be its own issuer; delegate a different key".to_string());
+    }
+    let ttl = ttl_ms.unwrap_or(MAX_ORG_ISSUER_TTL_MS);
+    if ttl == 0 || ttl > MAX_ORG_ISSUER_TTL_MS {
+        return Err(format!(
+            "ttl_ms must be between 1 and {MAX_ORG_ISSUER_TTL_MS} (365 days)"
+        ));
+    }
+    let max_role = max_role.trim();
+    if !max_role.is_empty() && !max_role.starts_with("role:") && !max_role.starts_with("peer:") {
+        return Err("issuer scope must be a role:* or peer:* id (or empty for both lanes)".to_string());
+    }
+    let mut cert = OrgIssuerCert {
+        v: 1,
+        kind: "org-issuer".to_string(),
+        org: OrgGrantOrg {
+            handle: handle.trim().to_string(),
+            root_key: identity.public_key_b64u(),
+        },
+        issuer_key,
+        label: label.trim().to_string(),
+        max_role: max_role.to_string(),
+        issued_at_unix_ms: now_unix_ms,
+        expires_at_unix_ms: now_unix_ms.saturating_add(ttl),
+        sig: String::new(),
+    };
+    cert.sig = identity.sign_b64u(&org_issuer_signing_payload(&cert));
+    Ok(cert)
+}
+
+/// Verify a certificate's own integrity and window against the org key
+/// it names. Whether THAT key is trusted here is the caller's problem.
+pub fn verify_org_issuer_cert(cert: &OrgIssuerCert, now_unix_ms: u64) -> Result<(), String> {
+    if cert.v != 1 || cert.kind != "org-issuer" {
+        return Err("unsupported org issuer certificate version or kind".to_string());
+    }
+    if cert.expires_at_unix_ms <= now_unix_ms {
+        return Err("org issuer certificate has expired".to_string());
+    }
+    if cert.issued_at_unix_ms > now_unix_ms.saturating_add(ISSUED_AT_SKEW_MS) {
+        return Err("org issuer certificate issued_at is in the future".to_string());
+    }
+    if cert
+        .expires_at_unix_ms
+        .saturating_sub(cert.issued_at_unix_ms)
+        > MAX_ORG_ISSUER_TTL_MS
+    {
+        return Err("org issuer certificate lifetime exceeds the 365 day cap".to_string());
+    }
+    let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cert.org.root_key.trim())
+        .map_err(|_| "org root key is not valid base64url".to_string())?;
+    let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(cert.sig.trim())
+        .map_err(|_| "org issuer certificate signature is not valid base64url".to_string())?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
+        .verify(&org_issuer_signing_payload(cert), &sig)
+        .map_err(|_| "org issuer certificate signature verification failed".to_string())
 }
 
 /// The exact byte string the org root signs. Newline-joined fields, the
@@ -260,6 +383,7 @@ pub fn issue_org_grant(
         grant_id: uuid::Uuid::new_v4().to_string(),
         issued_at_unix_ms: now_unix_ms,
         expires_at_unix_ms: now_unix_ms.saturating_add(ttl),
+        chain: Vec::new(),
         sig: String::new(),
     };
     doc.sig = identity.sign_b64u(&org_grant_signing_payload(&doc));
@@ -307,9 +431,49 @@ pub fn verify_org_grant(doc: &OrgGrantDocument, now_unix_ms: u64) -> Result<(), 
     {
         return Err("org grant lifetime exceeds the 90 day cap".to_string());
     }
+    // Outside-in: the trusted root validates the (at most one) issuer
+    // certificate, and whichever key ends the chain validates the document.
+    let signing_key_b64u = match doc.chain.len() {
+        0 => doc.org.root_key.trim().to_string(),
+        1 => {
+            let cert = &doc.chain[0];
+            if cert.org.handle.trim() != doc.org.handle.trim()
+                || cert.org.root_key != doc.org.root_key
+            {
+                return Err("issuer certificate and document belong to different orgs".to_string());
+            }
+            verify_org_issuer_cert(cert, now_unix_ms)?;
+            match cert.max_role.trim() {
+                "" => {}
+                scope if scope.starts_with("peer:") => {
+                    if !doc.subject.is_peer() {
+                        return Err("this issuer may only sign peer-subject documents".to_string());
+                    }
+                    let granted = peer_profile_from_role(&doc.role_id).unwrap_or("");
+                    let cap = scope.strip_prefix("peer:").unwrap_or(scope);
+                    if !crate::peer::access_policy::profile_fits_under(granted, cap) {
+                        return Err(format!(
+                            "document profile {} exceeds the issuer's scope {scope}",
+                            doc.role_id
+                        ));
+                    }
+                }
+                _scope => {
+                    // role:* scope caps human documents; the permission
+                    // subset needs the role catalog, so materialization
+                    // enforces it — here we only refuse kind mismatches.
+                    if doc.subject.is_peer() {
+                        return Err("this issuer may only sign human-subject documents".to_string());
+                    }
+                }
+            }
+            cert.issuer_key.trim().to_string()
+        }
+        _ => return Err("issuer chains are one level: root, then issuer".to_string()),
+    };
     let key = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(doc.org.root_key.trim())
-        .map_err(|_| "org root key is not valid base64url".to_string())?;
+        .decode(&signing_key_b64u)
+        .map_err(|_| "org signing key is not valid base64url".to_string())?;
     let sig = base64::engine::general_purpose::URL_SAFE_NO_PAD
         .decode(doc.sig.trim())
         .map_err(|_| "org grant signature is not valid base64url".to_string())?;
@@ -388,6 +552,17 @@ fn trusted_org_for_doc<'a>(
         return Err(AccessError(format!(
             "the subject key is revoked by org {handle}'s revocation list"
         )));
+    }
+    if let Some(cert) = doc.chain.first() {
+        if trusted
+            .orl_revoked_issuer_keys
+            .iter()
+            .any(|key| key == cert.issuer_key.trim())
+        {
+            return Err(AccessError(format!(
+                "the issuer key that signed this document is revoked by org {handle}'s revocation list"
+            )));
+        }
     }
 
     let targets_self = doc
@@ -516,6 +691,7 @@ pub fn materialize_org_grant(
         created_at_unix_ms: Some(now_unix_ms),
         revoked_at_unix_ms: None,
         expires_at_unix_ms: Some(doc.expires_at_unix_ms),
+        issued_via: doc.chain.first().map(|cert| cert.issuer_key.trim().to_string()),
     };
     let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id)
     {
@@ -662,7 +838,7 @@ pub fn materialize_org_peer_grant(
         expires_at_unix: Some(expires_at_unix),
         source: Some(format!("org:{handle}")),
         org_grant_id: Some(doc.grant_id.trim().to_string()),
-        issued_via: None,
+        issued_via: doc.chain.first().map(|cert| cert.issuer_key.trim().to_string()),
     };
     pol::write_identity_record(cert_dir, &record).map_err(|e| AccessError(e.to_string()))?;
 
@@ -821,6 +997,10 @@ pub struct OrgRevocationList {
     pub seq: u64,
     pub revoked_grant_ids: Vec<String>,
     pub revoked_subjects: Vec<String>,
+    /// Delegated issuer keys revoked wholesale: every document they
+    /// signed is refused and every grant they materialized is swept.
+    #[serde(default)]
+    pub revoked_issuer_keys: Vec<String>,
     pub issued_at_unix_ms: u64,
     pub sig: String,
 }
@@ -830,12 +1010,13 @@ pub struct OrgRevocationList {
 /// base64url fingerprints, so neither can contain a comma.
 pub fn orl_signing_payload(orl: &OrgRevocationList) -> Vec<u8> {
     format!(
-        "{ORG_ORL_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}",
+        "{ORG_ORL_PROTOCOL}\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
         orl.org.handle,
         orl.org.root_key,
         orl.seq,
         orl.revoked_grant_ids.join(","),
         orl.revoked_subjects.join(","),
+        orl.revoked_issuer_keys.join(","),
         orl.issued_at_unix_ms,
     )
     .into_bytes()
@@ -897,6 +1078,7 @@ pub fn load_or_init_orl(
         seq: 0,
         revoked_grant_ids: Vec::new(),
         revoked_subjects: Vec::new(),
+        revoked_issuer_keys: Vec::new(),
         issued_at_unix_ms: now_unix_ms,
         sig: String::new(),
     };
@@ -911,6 +1093,7 @@ pub fn orl_revoke(
     handle: &str,
     grant_ids: &[String],
     subjects: &[String],
+    issuer_keys: &[String],
     now_unix_ms: u64,
 ) -> Result<OrgRevocationList, String> {
     let mut orl = load_or_init_orl(identity, cert_dir, handle, now_unix_ms)?;
@@ -940,8 +1123,18 @@ pub fn orl_revoke(
             added = true;
         }
     }
+    for key in issuer_keys {
+        let key = key.trim();
+        if key.contains(',') {
+            return Err(format!("invalid issuer key {key:?}"));
+        }
+        if !key.is_empty() && !orl.revoked_issuer_keys.iter().any(|existing| existing == key) {
+            orl.revoked_issuer_keys.push(key.to_string());
+            added = true;
+        }
+    }
     if !added {
-        return Err("nothing new to revoke: pass a document grant_id or a subject key fingerprint".to_string());
+        return Err("nothing new to revoke: pass a document grant_id, a subject key fingerprint, or an issuer key".to_string());
     }
     orl.seq += 1;
     orl.issued_at_unix_ms = now_unix_ms;
@@ -1020,6 +1213,12 @@ pub fn apply_orl(
         .map(|subject| normalize_client_key_fingerprint(subject))
         .filter(|subject| !subject.is_empty())
         .collect();
+    let revoked_issuer_keys: Vec<String> = orl
+        .revoked_issuer_keys
+        .iter()
+        .map(|key| key.trim().to_string())
+        .filter(|key| !key.is_empty())
+        .collect();
 
     // Subjects resolve to principals via their client-key authn entries.
     let revoked_principals: Vec<String> = state
@@ -1049,7 +1248,12 @@ pub fn apply_orl(
         grant.source == source
             && is_enforced_status(&grant.status)
             && (local_grant_ids.iter().any(|id| id == &grant.id)
-                || revoked_principals.iter().any(|id| id == &grant.principal_id))
+                || revoked_principals.iter().any(|id| id == &grant.principal_id)
+                || grant
+                    .issued_via
+                    .as_deref()
+                    .map(|key| revoked_issuer_keys.iter().any(|k| k == key))
+                    .unwrap_or(false))
     }) {
         grant.status = "revoked".to_string();
         grant.revoked_at_unix_ms = Some(now_unix_ms);
@@ -1068,6 +1272,11 @@ pub fn apply_orl(
                     .org_grant_id
                     .as_deref()
                     .map(|id| revoked_grant_ids.iter().any(|g| g == id))
+                    .unwrap_or(false)
+                || record
+                    .issued_via
+                    .as_deref()
+                    .map(|key| revoked_issuer_keys.iter().any(|k| k == key))
                     .unwrap_or(false);
             if from_org
                 && listed
@@ -1089,6 +1298,7 @@ pub fn apply_orl(
     entry.last_orl_seq = orl.seq;
     entry.orl_revoked_grant_ids = revoked_grant_ids;
     entry.orl_revoked_subjects = revoked_subjects;
+    entry.orl_revoked_issuer_keys = revoked_issuer_keys;
 
     state.audit_events.push(IamAuditEvent {
         id: format!("audit:{now_unix_ms}:{}", state.audit_events.len() + 1),
@@ -1149,6 +1359,15 @@ pub fn renew_org_grant(
     {
         return Err("the subject key is revoked; the document cannot be renewed".to_string());
     }
+    if let Some(cert) = doc.chain.first() {
+        if orl
+            .revoked_issuer_keys
+            .iter()
+            .any(|key| key == cert.issuer_key.trim())
+        {
+            return Err("the issuer key that signed this document is revoked; it cannot be renewed".to_string());
+        }
+    }
     let span = doc
         .expires_at_unix_ms
         .saturating_sub(doc.issued_at_unix_ms)
@@ -1156,8 +1375,35 @@ pub fn renew_org_grant(
     let mut renewed = doc.clone();
     renewed.issued_at_unix_ms = now_unix_ms;
     renewed.expires_at_unix_ms = now_unix_ms.saturating_add(span);
+    renewed.chain = Vec::new();
     renewed.sig = identity.sign_b64u(&org_grant_signing_payload(&renewed));
     Ok(renewed)
+}
+
+/// Deputy-side issuance: sign with a delegated issuer key and attach its
+/// certificate as the one-link chain. The certificate's scope and window
+/// are enforced by every verifier; a courtesy check here fails early.
+pub fn issue_org_grant_via(
+    issuer: &DaemonIdentity,
+    cert: &OrgIssuerCert,
+    state: &LocalIamState,
+    request: IssueOrgGrantRequest<'_>,
+    now_unix_ms: u64,
+) -> AccessResult<OrgGrantDocument> {
+    if cert.issuer_key.trim() != issuer.public_key_b64u() {
+        return Err(AccessError(
+            "the installed issuer certificate names a different key".to_string(),
+        ));
+    }
+    verify_org_issuer_cert(cert, now_unix_ms).map_err(AccessError)?;
+    // Sign a root-style document first (issue_org_grant validates the
+    // request shape), then re-sign with the issuer key and the chain.
+    let mut doc = issue_org_grant(issuer, state, request, now_unix_ms)?;
+    doc.org = cert.org.clone();
+    doc.chain = vec![cert.clone()];
+    doc.sig = issuer.sign_b64u(&org_grant_signing_payload(&doc));
+    verify_org_grant(&doc, now_unix_ms).map_err(AccessError)?;
+    Ok(doc)
 }
 
 /// Root-session action: trust an org key on this daemon.
@@ -1214,6 +1460,7 @@ pub fn trust_org(
         last_orl_seq: 0,
         orl_revoked_grant_ids: Vec::new(),
         orl_revoked_subjects: Vec::new(),
+        orl_revoked_issuer_keys: Vec::new(),
     };
     if let Some(existing) = state
         .trusted_orgs
@@ -1227,6 +1474,7 @@ pub fn trust_org(
             entry.last_orl_seq = existing.last_orl_seq;
             entry.orl_revoked_grant_ids = existing.orl_revoked_grant_ids.clone();
             entry.orl_revoked_subjects = existing.orl_revoked_subjects.clone();
+            entry.orl_revoked_issuer_keys = existing.orl_revoked_issuer_keys.clone();
         }
         *existing = entry.clone();
     } else {
@@ -1593,6 +1841,7 @@ mod tests {
             "acme",
             &[doc.grant_id.clone()],
             &[],
+            &[],
             test_now(),
         )
         .unwrap();
@@ -1638,6 +1887,7 @@ mod tests {
             "acme",
             &[],
             &["member-key".to_string()],
+            &[],
             test_now(),
         )
         .unwrap();
@@ -1702,6 +1952,7 @@ mod tests {
             "acme",
             &[doc.grant_id.clone()],
             &[],
+            &[],
             test_now(),
         )
         .unwrap();
@@ -1714,6 +1965,7 @@ mod tests {
             "acme",
             &[],
             &["member-key".to_string()],
+            &[],
             test_now(),
         )
         .unwrap();
@@ -1804,7 +2056,14 @@ mod tests {
         assert_eq!(state.audit_events.len(), audit_len);
 
         // ORL subject revocation sweeps the record and blocks re-presentation.
-        let orl = orl_revoke(&identity, dir.path(), "acme", &[], &[peer_fp.to_string()], test_now())
+        let orl = orl_revoke(
+            &identity,
+            dir.path(),
+            "acme",
+            &[],
+            &[peer_fp.to_string()],
+            &[],
+            test_now())
             .unwrap();
         let applied = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
         assert_eq!(applied.revoked_peer_identities, 1);
@@ -1815,6 +2074,98 @@ mod tests {
         let err =
             materialize_org_peer_grant(&mut state, dir.path(), &doc, &ids, test_now()).unwrap_err();
         assert!(err.to_string().contains("revocation list"), "{err}");
+    }
+
+    #[test]
+    fn issuer_delegation_signs_verifies_scopes_and_revokes() {
+        let (dir, root) = org_identity_with_dir();
+        let mut state = LocalIamState::default();
+        trust_org(&mut state, "acme", &root.public_key_b64u(), None, None, test_now()).unwrap();
+
+        let issuer_dir = tempfile::tempdir().unwrap();
+        let issuer = DaemonIdentity::load_or_create(issuer_dir.path().join("issuer.pk8")).unwrap();
+        let cert = delegate_org_issuer(
+            &root,
+            "acme",
+            &issuer.public_key_b64u(),
+            "CI signer",
+            "",
+            None,
+            test_now(),
+        )
+        .unwrap();
+        verify_org_issuer_cert(&cert, test_now()).unwrap();
+        // Tamper: scope change breaks the root signature.
+        let mut tampered = cert.clone();
+        tampered.max_role = "role:root".to_string();
+        assert!(verify_org_issuer_cert(&tampered, test_now()).unwrap_err().contains("signature"));
+        // The root cannot delegate to itself.
+        assert!(delegate_org_issuer(&root, "acme", &root.public_key_b64u(), "", "", None, test_now()).is_err());
+
+        // Issuer-signed document verifies via the chain and materializes
+        // with the issuer recorded.
+        let doc = issue_org_grant_via(
+            &issuer,
+            &cert,
+            &state,
+            IssueOrgGrantRequest {
+                handle: "acme",
+                client_key_fingerprint: "member-key",
+                peer_fingerprint: "",
+                subject_label: "Alice",
+                role_id: "role:session-reader",
+                targets: vec!["*".to_string()],
+                ttl_ms: None,
+            },
+            test_now(),
+        )
+        .unwrap();
+        assert_eq!(doc.chain.len(), 1);
+        verify_org_grant(&doc, test_now()).unwrap();
+        let outcome =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap();
+        assert_eq!(outcome.grant.issued_via.as_deref(), Some(issuer.public_key_b64u().as_str()));
+        // A stranger key with the same cert is refused (sig mismatch).
+        let stranger = org_identity();
+        let mut forged = doc.clone();
+        forged.sig = stranger.sign_b64u(&org_grant_signing_payload(&forged));
+        assert!(verify_org_grant(&forged, test_now()).unwrap_err().contains("signature"));
+
+        // Peer-scoped issuers cannot sign human documents.
+        let peer_scoped = delegate_org_issuer(
+            &root, "acme", &issuer.public_key_b64u(), "peer signer", "peer:session-reader", None, test_now(),
+        )
+        .unwrap();
+        let mut wrong_kind = doc.clone();
+        wrong_kind.chain = vec![peer_scoped];
+        wrong_kind.sig = issuer.sign_b64u(&org_grant_signing_payload(&wrong_kind));
+        assert!(verify_org_grant(&wrong_kind, test_now())
+            .unwrap_err()
+            .contains("peer-subject documents"));
+
+        // Revoking the issuer sweeps its grants and blocks new documents
+        // and renewals wholesale.
+        let orl = orl_revoke(
+            &identity_ref(&root, dir.path()),
+            dir.path(),
+            "acme",
+            &[],
+            &[],
+            &[issuer.public_key_b64u()],
+            test_now(),
+        )
+        .unwrap();
+        let applied = apply_orl(&mut state, dir.path(), &orl, test_now()).unwrap();
+        assert_eq!(applied.revoked_grants, 1);
+        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
+            .unwrap_err();
+        assert!(err.to_string().contains("issuer key"), "{err}");
+        let err = renew_org_grant(&root, &orl, &doc, test_now() + 1000).unwrap_err();
+        assert!(err.contains("issuer key"), "{err}");
+    }
+
+    fn identity_ref<'a>(identity: &'a DaemonIdentity, _dir: &Path) -> &'a DaemonIdentity {
+        identity
     }
 
     #[test]
