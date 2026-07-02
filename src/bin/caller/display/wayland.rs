@@ -478,6 +478,10 @@ async fn set_paste_payload(
     _session: &Session<'static, RemoteDesktop<'static>>,
     _text: &str,
 ) -> Result<(), CallerError> {
+    _clipboard
+        .set_selection(_session, &["text/plain;charset=utf-8", "text/plain"])
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard SetSelection: {e}")))?;
     Err(CallerError::Display(
         "Wayland paste payload serving is not implemented yet — use a type action instead"
             .to_string(),
