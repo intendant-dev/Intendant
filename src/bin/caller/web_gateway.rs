@@ -3510,13 +3510,18 @@ pub(crate) fn current_agent_output_post_response(body: &str, log_dir: &Path) -> 
     }
 }
 
+// Deliberately no Access-Control-Allow-Origin here: API responses are
+// same-origin by default. Cross-origin readability is opt-in — the fleet
+// Access APIs echo allowlisted origins (`with_fleet_cors`) and the public
+// bootstrap surfaces use `with_public_cors`. A blanket wildcard would let
+// any website read cert-authenticated responses through a visitor's
+// browser (see docs/src/trust-architecture.md).
 fn json_response_body(body: String) -> String {
     format!(
         "HTTP/1.1 200 OK\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -13037,13 +13042,13 @@ pub(crate) fn current_upload_delete_response_body(
     }
 }
 
+// Same-origin by default; see `json_response_body` for the CORS rationale.
 fn json_response(status: &str, body: String) -> String {
     format!(
         "HTTP/1.1 {}\r\n\
          Content-Type: application/json\r\n\
          Content-Length: {}\r\n\
          Cache-Control: no-cache\r\n\
-         Access-Control-Allow-Origin: *\r\n\
          Connection: close\r\n\
          \r\n\
          {}",
@@ -20806,7 +20811,33 @@ pub fn spawn_web_gateway(
                     if request_line.starts_with("OPTIONS") {
                         use tokio::io::AsyncWriteExt;
                         let (_, opt_path, _) = parse_request_target(request_line);
-                        let response = if is_fleet_cors_access_path(opt_path) {
+                        let response = if opt_path.starts_with("/api/")
+                            && !is_fleet_cors_access_path(opt_path)
+                            && !is_public_peer_access_request_path(request_line)
+                        {
+                            // Non-fleet APIs are same-origin (or app-scheme)
+                            // only; a cross-origin preflight gets no ACAO and
+                            // the browser stops there.
+                            let allowed = extract_origin_header(&header_text)
+                                .filter(|origin| is_own_or_app_origin(origin, is_tls, &header_text));
+                            match allowed {
+                                Some(origin) => format!(
+                                    "HTTP/1.1 204 No Content\r\n\
+                                     Access-Control-Allow-Origin: {origin}\r\n\
+                                     Access-Control-Allow-Methods: GET, POST, DELETE, OPTIONS\r\n\
+                                     Access-Control-Allow-Headers: Content-Type, Authorization\r\n\
+                                     Access-Control-Max-Age: 86400\r\n\
+                                     Vary: Origin\r\n\
+                                     Connection: close\r\n\
+                                     \r\n"
+                                ),
+                                None => "HTTP/1.1 204 No Content\r\n\
+                                    Vary: Origin\r\n\
+                                    Connection: close\r\n\
+                                    \r\n"
+                                    .to_string(),
+                            }
+                        } else if is_fleet_cors_access_path(opt_path) {
                             let cert_dir = crate::access::backend::select_backend().cert_dir();
                             let allowed = extract_origin_header(&header_text).filter(|origin| {
                                 fleet_access_origin_allowed(
@@ -20985,44 +21016,50 @@ pub fn spawn_web_gateway(
                         }
                     }
 
-                    // Fleet Access APIs: origin gate + CORS echo. A browser
-                    // sends an Origin header on every cross-origin request
-                    // (and on same-origin POSTs); requests from pages outside
-                    // the fleet allowlist are refused outright — the
-                    // browser-attached mTLS certificate must not let an
-                    // arbitrary website drive IAM writes. Allowed origins get
-                    // the CORS echo appended to the arm's response below.
-                    let fleet_cors_origin: Option<String> = if is_fleet_cors_access_path(req_path)
-                    {
-                        let origin = extract_origin_header(&header_text);
-                        match origin {
-                            Some(origin) => {
-                                if fleet_access_origin_allowed(
-                                    &origin,
-                                    is_tls,
-                                    &header_text,
-                                    peer_registry.as_ref(),
-                                    &cert_dir,
-                                ) {
-                                    Some(origin)
-                                } else {
-                                    use tokio::io::AsyncWriteExt;
-                                    let body = serde_json::json!({
-                                        "error": "cross-origin caller is not in this daemon's fleet allowlist",
-                                        "origin": origin,
-                                    })
-                                    .to_string();
-                                    let response = json_response("403 Forbidden", body);
-                                    let _ = stream.write_all(response.as_bytes()).await;
-                                    finalize_http_stream(&mut stream).await;
-                                    return;
-                                }
-                            }
-                            None => None,
+                    // API origin gate + CORS echo. A browser sends an Origin
+                    // header on every cross-origin request (and on
+                    // same-origin POSTs); the browser-attached mTLS
+                    // certificate must not let an arbitrary website drive or
+                    // read these APIs cross-site. Policy:
+                    //   - no Origin header (same-origin GETs, curl, native
+                    //     code, the macOS app's URLSession proxy): untouched;
+                    //   - own origin or the intendant:// app scheme: allowed;
+                    //   - fleet-allowlisted origins: allowed on the six fleet
+                    //     Access APIs, which also echo the origin so the
+                    //     anchor page can read the responses;
+                    //   - anything else on any /api/ path: 403, except the
+                    //     public doorbell, which is designed to be knocked on.
+                    let request_origin = extract_origin_header(&header_text);
+                    let mut fleet_cors_origin: Option<String> = None;
+                    if let Some(origin) = request_origin.as_deref().filter(|_| {
+                        req_path.starts_with("/api/")
+                            && !is_public_peer_access_request_path(request_line)
+                    }) {
+                        let own = is_own_or_app_origin(origin, is_tls, &header_text);
+                        let fleet_allowed = !own
+                            && is_fleet_cors_access_path(req_path)
+                            && fleet_access_origin_allowed(
+                                origin,
+                                is_tls,
+                                &header_text,
+                                peer_registry.as_ref(),
+                                &cert_dir,
+                            );
+                        if fleet_allowed {
+                            fleet_cors_origin = Some(origin.to_string());
+                        } else if !own {
+                            use tokio::io::AsyncWriteExt;
+                            let body = serde_json::json!({
+                                "error": "cross-origin caller is not allowed on this API",
+                                "origin": origin,
+                            })
+                            .to_string();
+                            let response = json_response("403 Forbidden", body);
+                            let _ = stream.write_all(response.as_bytes()).await;
+                            finalize_http_stream(&mut stream).await;
+                            return;
                         }
-                    } else {
-                        None
-                    };
+                    }
 
                     if req_method == "GET" && req_path == "/connect/bootstrap" {
                         use tokio::io::AsyncWriteExt;
@@ -21037,24 +21074,29 @@ pub fn spawn_web_gateway(
                             "signaling": "connect-bootstrap-local",
                             "mtls_required_for_dashboard": tls_client_cert_required,
                         });
-                        let _ = stream.write_all(json_ok(body).as_bytes()).await;
+                        let _ = stream
+                            .write_all(with_public_cors(json_ok(body)).as_bytes())
+                            .await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/offer" {
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response =
-                            connect_dashboard_offer_response(&dashboard_control, &body_text).await;
+                        let response = with_public_cors(
+                            connect_dashboard_offer_response(&dashboard_control, &body_text).await,
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response =
-                            connect_dashboard_ice_response(&dashboard_control, &body_text).await;
+                        let response = with_public_cors(
+                            connect_dashboard_ice_response(&dashboard_control, &body_text).await,
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/close" {
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
-                        let response =
-                            connect_dashboard_close_response(&dashboard_control, &body_text).await;
+                        let response = with_public_cors(
+                            connect_dashboard_close_response(&dashboard_control, &body_text).await,
+                        );
                         let _ = stream.write_all(response.as_bytes()).await;
                     // Route WASM binaries (need async write_all for large payloads)
                     } else if let Some(asset) = static_asset_arm(
@@ -22738,7 +22780,7 @@ pub fn spawn_web_gateway(
                                     .to_string(),
                             )
                             };
-                        let response = json_response(status_reason(status), body);
+                        let response = with_public_cors(json_response(status_reason(status), body));
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/api/access/iam/user-client-grants"
                         || req_path == "/api/access/iam/grants/update"
@@ -24410,19 +24452,15 @@ fn extract_host_header(header_text: &str) -> Option<String> {
 /// daemon's outbound peer routes, and its approved inbound peer identities.
 /// Everything else — including `Origin: null` — is refused. Authentication
 /// is still mTLS/IAM; this gate only decides which *pages* may drive it.
-fn fleet_access_origin_allowed(
-    origin: &str,
-    is_tls: bool,
-    header_text: &str,
-    peer_registry: Option<&crate::peer::PeerRegistry>,
-    cert_dir: &std::path::Path,
-) -> bool {
+/// True for the request's own origin (Origin matches the Host header under
+/// the connection's scheme) and for the macOS app bundle's custom scheme —
+/// web content can never carry a custom-scheme origin, and the app's native
+/// proxy is not subject to CORS anyway.
+fn is_own_or_app_origin(origin: &str, is_tls: bool, header_text: &str) -> bool {
     let origin = origin.trim();
     if origin.eq_ignore_ascii_case("null") || origin.is_empty() {
         return false;
     }
-    // The macOS app bundle serves app.html from its own custom scheme; web
-    // content can never carry a custom-scheme origin.
     if origin.to_ascii_lowercase().starts_with("intendant://") {
         return true;
     }
@@ -24435,6 +24473,23 @@ fn fleet_access_origin_allowed(
             return true;
         }
     }
+    false
+}
+
+fn fleet_access_origin_allowed(
+    origin: &str,
+    is_tls: bool,
+    header_text: &str,
+    peer_registry: Option<&crate::peer::PeerRegistry>,
+    cert_dir: &std::path::Path,
+) -> bool {
+    let origin = origin.trim();
+    if is_own_or_app_origin(origin, is_tls, header_text) {
+        return true;
+    }
+    let Some(normalized) = normalized_origin(origin) else {
+        return false;
+    };
     if let Some(registry) = peer_registry {
         for handle in registry.list() {
             let snapshot = handle.snapshot();
@@ -24466,14 +24521,24 @@ fn fleet_access_origin_allowed(
     false
 }
 
-/// Rewrite a JSON response's CORS posture for the fleet Access APIs. The
-/// generic `json_response` helpers bake in `Access-Control-Allow-Origin: *`
-/// (for harmless bootstrap endpoints and the macOS app's custom scheme);
-/// these six routes must never be wildcard-readable — a cert-installed
-/// browser would happily authenticate reads for any website. Strip the
-/// wildcard, then echo the specific origin only when it passed the fleet
-/// allowlist. Duplicate ACAO headers are invalid to browsers, so this
-/// replaces rather than appends.
+/// The bootstrap surfaces that are *designed* for foreign-origin browsers:
+/// local Connect signaling (a page from a rendezvous origin negotiates a
+/// tunnel whose real authentication is the daemon-signed binding plus IAM)
+/// and the public peer-access doorbell. Their responses stay
+/// wildcard-readable; everything else is same-origin or fleet-echoed.
+fn with_public_cors(response: String) -> String {
+    let Some(split) = response.find("\r\n\r\n") else {
+        return response;
+    };
+    let (head, rest) = response.split_at(split);
+    format!("{head}\r\nAccess-Control-Allow-Origin: *{rest}")
+}
+
+/// Rewrite a JSON response's CORS posture for the fleet Access APIs: echo
+/// the specific origin only when it passed the fleet allowlist (stripping
+/// any pre-existing ACAO — duplicates are invalid to browsers). These six
+/// routes must never be wildcard-readable — a cert-installed browser would
+/// happily authenticate reads for any website.
 fn with_fleet_cors(response: String, allowed_origin: Option<&str>) -> String {
     let Some(split) = response.find("\r\n\r\n") else {
         return response;
@@ -37084,6 +37149,69 @@ mod tests {
         );
         assert!(!without.contains("Access-Control-Allow-Origin"));
         assert!(without.contains("Vary: Origin"));
+    }
+
+    #[test]
+    fn json_responses_are_same_origin_by_default() {
+        let response = json_response("200 OK", "{}".to_string());
+        assert!(!response.contains("Access-Control-Allow-Origin"));
+        let public = with_public_cors(response);
+        assert!(public.contains("Access-Control-Allow-Origin: *"));
+        assert!(is_own_or_app_origin(
+            "https://daemon.local:8765",
+            true,
+            "GET / HTTP/1.1\r\nHost: daemon.local:8765\r\n",
+        ));
+        assert!(is_own_or_app_origin("intendant://backend", true, ""));
+        assert!(!is_own_or_app_origin("null", true, ""));
+        assert!(!is_own_or_app_origin(
+            "https://evil.example",
+            true,
+            "GET / HTTP/1.1\r\nHost: daemon.local:8765\r\n",
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_api_origin_gate_refuses_foreign_pages() {
+        let (port, handle) = spawn_test_gateway_with_registry(None).await;
+        // Foreign origin on a fleet path: refused (not in the allowlist).
+        let resp = http_request(
+            port,
+            "GET /api/access/overview HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "foreign origin should be refused on fleet APIs: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        // Foreign origin on a non-fleet API: also refused.
+        let resp = http_request(
+            port,
+            "GET /api/dashboard/targets HTTP/1.1\r\nHost: localhost\r\nOrigin: https://evil.example\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 403 Forbidden\r\n"),
+            "foreign origin should be refused on non-fleet APIs: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        // The daemon's own origin sails through and is echoed on fleet paths.
+        let resp = http_request(
+            port,
+            "GET /api/access/overview HTTP/1.1\r\nHost: localhost\r\nOrigin: http://localhost\r\n\r\n",
+        )
+        .await;
+        assert!(
+            resp.starts_with("HTTP/1.1 200 OK\r\n"),
+            "own origin should be allowed: {}",
+            resp.lines().next().unwrap_or("")
+        );
+        assert!(
+            !resp.contains("Access-Control-Allow-Origin: *"),
+            "fleet APIs must never be wildcard-readable"
+        );
+        handle.abort();
     }
 
     #[tokio::test]

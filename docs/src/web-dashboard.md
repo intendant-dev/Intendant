@@ -449,6 +449,16 @@ browser-installed mTLS certificate cannot be steered cross-site. Reach the
 Access page by an origin the fleet advertises (the target rows already link
 that way) for cross-daemon administration to work.
 
+The same posture now applies daemon-wide: API responses carry no
+`Access-Control-Allow-Origin` by default (same-origin only), every `/api/*`
+request bearing a foreign Origin is refused, and only the deliberate
+public-bootstrap surfaces stay wildcard-readable — `/config`, the agent
+card, local Connect signaling (`/connect/status`, `/connect/dashboard/*`,
+whose real authentication is the daemon-signed binding plus IAM), and the
+public peer-access doorbell. The macOS app is unaffected: its custom-scheme
+pages are proxied natively, and the `intendant://` scheme is treated as the
+daemon's own origin.
+
 Device enrollment closes the loop for browsers that hold an identity key but
 no grant yet: when a *verified* client key is refused, the daemon queues a
 pending enrollment (in-memory, capped, TTL'd — the queue grants nothing by

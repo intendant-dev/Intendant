@@ -190,7 +190,10 @@ The pieces that implement the model, mapped to the codebase:
   outbound peer routes, its approved inbound identities) that both drives
   the CORS echo and refuses state-changing requests from any other page —
   closing the hole where a cert-installed browser could be steered by an
-  arbitrary website. These routes are never wildcard-readable.
+  arbitrary website. This posture is daemon-wide: no API response is
+  wildcard-readable, foreign-origin `/api/*` requests are refused, and only
+  the deliberate public-bootstrap surfaces (`/config`, the agent card,
+  local Connect signaling, the peer doorbell) remain open to any page.
 - **Signed fleet sync**: fleet records that round-trip the hosted metadata
   store are signed by the pushing browser's identity key (over host id,
   label, and route URLs) and verified on read; the Access UI badges each
