@@ -57,6 +57,14 @@
   --glass-hairline-bright: rgba(205, 214, 244, 0.16);
   --glass-highlight: inset 0 1px 0 rgba(205, 214, 244, 0.05);
   --glass-blur: blur(14px) saturate(1.2);
+  /* Validated viz ramps (dataviz method; ordinal blue ramp passes monotone-L,
+     step-gap, and light-end checks on the Mocha surface). */
+  --viz-ramp-1: #455477;
+  --viz-ramp-2: #566c98;
+  --viz-ramp-3: #6784b8;
+  --viz-ramp-4: #789cd9;
+  --viz-ramp-5: #89b4fa;
+  --viz-empty: #313244;
 }
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -1078,29 +1086,29 @@ body.access-page #tab-access {
    are meaningful, not decorative: routes are cool hues, authority is
    warm — the more a role can do, the warmer its badge. */
 
-.acc-section-head {
+.acc-section-head, .ui-section-head {
   display: flex;
   flex-wrap: wrap;
   align-items: baseline;
   gap: 4px 12px;
   margin: 18px 2px 10px;
 }
-.acc-section-head:first-child { margin-top: 2px; }
-.acc-section-title {
+.acc-section-head:first-child, .ui-section-head:first-child { margin-top: 2px; }
+.acc-section-title, .ui-section-title {
   font-size: 14px;
   font-weight: 800;
   letter-spacing: 0.02em;
   color: var(--text);
 }
-.acc-section-sub {
+.acc-section-sub, .ui-section-sub {
   flex: 1 1 260px;
   font-size: 11.5px;
   color: var(--subtext0);
   line-height: 1.45;
 }
-.acc-section-actions { margin-left: auto; display: flex; gap: 8px; }
+.acc-section-actions, .ui-section-actions { margin-left: auto; display: flex; gap: 8px; }
 
-.acc-btn {
+.acc-btn, .ui-btn {
   min-height: 28px;
   padding: 4px 12px;
   border: 1px solid var(--surface1);
@@ -1112,20 +1120,20 @@ body.access-page #tab-access {
   font-size: 12px;
   line-height: 1;
 }
-.acc-btn:hover { border-color: var(--blue); }
-.acc-btn.primary {
+.acc-btn:hover, .ui-btn:hover { border-color: var(--blue); }
+.acc-btn.primary, .ui-btn.primary {
   border-color: var(--blue);
   background: var(--blue);
   color: var(--crust);
   font-weight: 800;
 }
-.acc-btn.primary:hover { background: var(--sapphire); border-color: var(--sapphire); }
-.acc-btn.danger { border-color: rgba(243, 139, 168, 0.7); color: var(--red); background: transparent; }
-.acc-btn.danger:hover { border-color: var(--red); background: rgba(243, 139, 168, 0.08); }
-.acc-btn:disabled { opacity: 0.45; cursor: not-allowed; }
+.acc-btn.primary:hover, .ui-btn.primary:hover { background: var(--sapphire); border-color: var(--sapphire); }
+.acc-btn.danger, .ui-btn.danger { border-color: rgba(243, 139, 168, 0.7); color: var(--red); background: transparent; }
+.acc-btn.danger:hover, .ui-btn.danger:hover { border-color: var(--red); background: rgba(243, 139, 168, 0.08); }
+.acc-btn:disabled, .ui-btn:disabled { opacity: 0.45; cursor: not-allowed; }
 
 /* Route chips — transport is how you got there, never authority. */
-.acc-chip {
+.acc-chip, .ui-chip {
   display: inline-flex;
   align-items: center;
   gap: 5px;
@@ -1139,7 +1147,7 @@ body.access-page #tab-access {
   color: var(--subtext1);
   white-space: nowrap;
 }
-.acc-chip::before {
+.acc-chip::before, .ui-chip::before {
   content: '';
   width: 6px;
   height: 6px;
@@ -1161,7 +1169,7 @@ body.access-page #tab-access {
 .acc-chip.route-remembered { border-style: dashed; color: var(--overlay1); }
 
 /* Role badges — warmer = more authority. */
-.acc-badge {
+.acc-badge, .ui-badge {
   display: inline-flex;
   align-items: center;
   padding: 2px 8px;
@@ -1356,27 +1364,27 @@ body.access-page #tab-access {
 .acc-fleet-add:hover { border-color: var(--blue); color: var(--blue); }
 
 /* "How access works" explainer. */
-.acc-explainer {
+.acc-explainer, .ui-explainer {
   display: grid;
   grid-template-columns: 1fr auto 1fr auto 1fr;
   gap: 10px;
   align-items: stretch;
   margin: 4px 0 14px;
 }
-.acc-explainer-step {
+.acc-explainer-step, .ui-explainer-step {
   border: 1px solid var(--glass-hairline);
   border-radius: 9px;
   background: rgba(24, 24, 37, 0.4);
   padding: 12px 14px;
 }
-.acc-explainer-arrow {
+.acc-explainer-arrow, .ui-explainer-arrow {
   align-self: center;
   color: var(--overlay0);
   font-size: 16px;
   font-weight: 900;
   padding: 0 2px;
 }
-.acc-explainer-kicker {
+.acc-explainer-kicker, .ui-explainer-kicker {
   font-size: 10px;
   font-weight: 800;
   text-transform: uppercase;
@@ -1384,21 +1392,21 @@ body.access-page #tab-access {
   color: var(--overlay1);
   margin-bottom: 4px;
 }
-.acc-explainer-title { font-size: 12.5px; font-weight: 800; color: var(--text); margin-bottom: 4px; }
-.acc-explainer-text { font-size: 11px; color: var(--subtext0); line-height: 1.55; }
+.acc-explainer-title, .ui-explainer-title { font-size: 12.5px; font-weight: 800; color: var(--text); margin-bottom: 4px; }
+.acc-explainer-text, .ui-explainer-text { font-size: 11px; color: var(--subtext0); line-height: 1.55; }
 @media (max-width: 900px) {
-  .acc-explainer { grid-template-columns: 1fr; }
-  .acc-explainer-arrow { transform: rotate(90deg); justify-self: center; padding: 0; }
+  .acc-explainer, .ui-explainer { grid-template-columns: 1fr; }
+  .acc-explainer-arrow, .ui-explainer-arrow { transform: rotate(90deg); justify-self: center; padding: 0; }
 }
 
 /* Collapsible poweruser folds. */
-.acc-fold {
+.acc-fold, .ui-fold {
   margin: 14px 0 0;
   border: 1px solid var(--glass-hairline);
   border-radius: 9px;
   background: rgba(24, 24, 37, 0.35);
 }
-.acc-fold > summary {
+.acc-fold > summary, .ui-fold > summary {
   list-style: none;
   cursor: pointer;
   padding: 10px 14px;
@@ -1410,18 +1418,18 @@ body.access-page #tab-access {
   gap: 8px;
   user-select: none;
 }
-.acc-fold > summary::-webkit-details-marker { display: none; }
-.acc-fold > summary::before {
+.acc-fold > summary::-webkit-details-marker, .ui-fold > summary::-webkit-details-marker { display: none; }
+.acc-fold > summary::before, .ui-fold > summary::before {
   content: '\25B8';
   color: var(--overlay0);
   font-size: 11px;
   transition: transform 0.15s ease;
 }
-.acc-fold[open] > summary::before { transform: rotate(90deg); }
-.acc-fold > summary:hover { color: var(--text); }
-.acc-fold-body { padding: 2px 14px 14px; }
-.acc-fold-hint { margin: 0 0 10px; font-size: 11.5px; color: var(--subtext0); line-height: 1.5; }
-.acc-fold-hint code { color: var(--blue); }
+.acc-fold[open] > summary::before, .ui-fold[open] > summary::before { transform: rotate(90deg); }
+.acc-fold > summary:hover, .ui-fold > summary:hover { color: var(--text); }
+.acc-fold-body, .ui-fold-body { padding: 2px 14px 14px; }
+.acc-fold-hint, .ui-fold-hint { margin: 0 0 10px; font-size: 11.5px; color: var(--subtext0); line-height: 1.5; }
+.acc-fold-hint code, .ui-fold-hint code { color: var(--blue); }
 
 /* Guided grant flow. */
 .acc-grant-flow {
@@ -1478,9 +1486,9 @@ body.access-page #tab-access {
   font-size: 10.5px;
   font-weight: 700;
 }
-.acc-field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
-.acc-field-grid label { display: grid; gap: 4px; font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; color: var(--overlay1); }
-.acc-field-grid input, .acc-field-grid select {
+.acc-field-grid, .ui-field-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 10px; }
+.acc-field-grid label, .ui-field-grid label { display: grid; gap: 4px; font-size: 10.5px; font-weight: 800; text-transform: uppercase; letter-spacing: 0.05em; color: var(--overlay1); }
+.acc-field-grid input, .acc-field-grid select, .ui-field-grid input, .ui-field-grid select {
   min-height: 30px;
   padding: 5px 9px;
   border: 1px solid var(--surface1);
@@ -1490,7 +1498,7 @@ body.access-page #tab-access {
   font-family: inherit;
   font-size: 12px;
 }
-.acc-field-grid input:focus, .acc-field-grid select:focus { outline: none; border-color: var(--blue); }
+.acc-field-grid input:focus, .acc-field-grid select:focus, .ui-field-grid input:focus, .ui-field-grid select:focus { outline: none; border-color: var(--blue); }
 .acc-role-picker { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 8px; }
 .acc-role-card {
   position: relative;
@@ -1588,6 +1596,119 @@ body.access-page #tab-access {
   .acc-hero-grid { grid-template-columns: 1fr; }
   .acc-hero-line strong { flex-basis: 84px; }
   .acc-section-actions { margin-left: 0; }
+}
+
+/* ── Dashboard-wide primitives (.ui-*) ──
+   The whole dashboard speaks the Access design language: the .ui-* names
+   above are grouped-selector aliases of the .acc-* rules (one source of
+   truth), and the primitives below add what only the wider dashboard
+   needs. Status tones are reserved meaning (ok/warn/err/info) — a chip
+   always carries its label text, never color alone (the yellow/green
+   pair is indistinguishable under protanopia). Viz colors come from the
+   --viz-* tokens in :root; they are validated ramps — don't improvise. */
+
+.ui-chip.ok::before { background: var(--green); }
+.ui-chip.ok { border-color: rgba(166, 227, 161, 0.35); color: var(--green); }
+.ui-chip.warn::before { background: var(--yellow); }
+.ui-chip.warn { border-color: rgba(249, 226, 175, 0.35); color: var(--yellow); }
+.ui-chip.err::before { background: var(--red); }
+.ui-chip.err { border-color: rgba(243, 139, 168, 0.4); color: var(--red); }
+.ui-chip.info::before { background: var(--blue); }
+.ui-chip.info { border-color: rgba(137, 180, 250, 0.35); color: var(--blue); }
+.ui-chip.muted::before { background: var(--overlay0); }
+.ui-chip.muted { color: var(--subtext0); }
+
+.ui-card {
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 10px;
+  background: var(--glass-bg);
+  box-shadow: var(--glass-highlight);
+  padding: 14px 16px;
+}
+.ui-card + .ui-card { margin-top: 12px; }
+
+.ui-empty {
+  display: grid;
+  justify-items: center;
+  gap: 6px;
+  padding: 40px 20px;
+  text-align: center;
+}
+.ui-empty-glyph { font-size: 22px; line-height: 1; color: var(--overlay0); }
+.ui-empty-glyph svg { display: block; width: 26px; height: 26px; stroke: var(--overlay0); fill: none; stroke-width: 1.6; }
+.ui-empty-title { font-size: 13px; font-weight: 800; color: var(--subtext1); }
+.ui-empty-hint { max-width: 460px; font-size: 11.5px; line-height: 1.55; color: var(--subtext0); }
+.ui-empty-hint code { color: var(--blue); }
+.ui-empty-actions { display: flex; gap: 8px; margin-top: 6px; }
+
+/* Stat tiles: label / value / optional sub or delta. Values use the font's
+   proportional figures (tabular-nums is for aligned table columns only). */
+.ui-stat-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 4px 0 14px;
+}
+.ui-stat {
+  display: grid;
+  align-content: start;
+  gap: 3px;
+  border: 1px solid var(--glass-hairline);
+  border-radius: 9px;
+  background: rgba(24, 24, 37, 0.4);
+  padding: 10px 12px;
+  min-width: 0;
+}
+.ui-stat-label {
+  font-size: 10px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--overlay1);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.ui-stat-value { font-size: 18px; font-weight: 800; color: var(--text); line-height: 1.15; }
+.ui-stat-sub { font-size: 10.5px; color: var(--subtext0); line-height: 1.4; }
+.ui-stat-delta { font-size: 10.5px; font-weight: 700; }
+.ui-stat-delta.good { color: var(--green); }
+.ui-stat-delta.bad { color: var(--red); }
+
+/* Meters: the fill carries severity; the track is a dim step of the SAME
+   hue so state reads across the whole bar. */
+.ui-meter {
+  height: 6px;
+  border-radius: 999px;
+  background: rgba(137, 180, 250, 0.16);
+  overflow: hidden;
+}
+.ui-meter > i {
+  display: block;
+  height: 100%;
+  border-radius: 999px;
+  background: var(--blue);
+  transition: width 0.25s ease;
+}
+.ui-meter.warn { background: rgba(249, 226, 175, 0.16); }
+.ui-meter.warn > i { background: var(--yellow); }
+.ui-meter.danger { background: rgba(243, 139, 168, 0.16); }
+.ui-meter.danger > i { background: var(--red); }
+
+/* Skeleton shimmer for content that is still loading. */
+.ui-skel {
+  border-radius: 7px;
+  background: linear-gradient(100deg, rgba(49, 50, 68, 0.55) 40%, rgba(88, 91, 112, 0.35) 50%, rgba(49, 50, 68, 0.55) 60%);
+  background-size: 200% 100%;
+  animation: ui-skel-sheen 1.4s ease-in-out infinite;
+  min-height: 14px;
+}
+@keyframes ui-skel-sheen {
+  from { background-position: 120% 0; }
+  to { background-position: -80% 0; }
+}
+@media (prefers-reduced-motion: reduce) {
+  .ui-skel { animation: none; }
 }
 .settings-save-row {
   display: flex;
@@ -12974,6 +13095,52 @@ const LEVEL_TOOLTIPS = {
 let app = null;
 let activeTab = 'activity';
 let autoScroll = true;
+
+// ── Hidden-pane render deferral ──
+// High-frequency events (transport ticks, update_usage, session refreshes)
+// used to rebuild large DOM regions in panes the user wasn't looking at.
+// Renderers route through renderOrDefer(tab, key, fn): visible panes render
+// immediately; hidden panes remember only the LATEST render thunk per key
+// and run it once when the pane is next shown (switchTab / tab visibility).
+const paneDeferredRenders = new Map();
+function paneIsVisible(tab) {
+  return activeTab === tab && !document.hidden;
+}
+function renderOrDefer(tab, key, fn) {
+  if (paneIsVisible(tab)) {
+    paneDeferredRenders.get(tab)?.delete(key);
+    fn();
+    return;
+  }
+  let pending = paneDeferredRenders.get(tab);
+  if (!pending) {
+    pending = new Map();
+    paneDeferredRenders.set(tab, pending);
+  }
+  pending.set(key, fn);
+}
+function flushPaneRenders(tab) {
+  const pending = paneDeferredRenders.get(tab);
+  if (!pending || !pending.size) return;
+  paneDeferredRenders.delete(tab);
+  for (const fn of pending.values()) {
+    try { fn(); } catch (err) { console.warn('[dashboard] deferred render failed', err); }
+  }
+}
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) flushPaneRenders(activeTab);
+});
+// Diagnostic handle for QA harnesses (the app script is module-scoped, so
+// probes can't reach these bindings by name).
+window.__intendantPaneDiag = {
+  activeTab: () => activeTab,
+  deferredCounts: () => {
+    const out = {};
+    for (const [tab, pending] of paneDeferredRenders) out[tab] = pending.size;
+    return out;
+  },
+};
+
 let logEntryCount = 0;
 let commandOutputGroupSeq = 0;
 const activeCommandOutputGroups = new Map();
@@ -33038,6 +33205,12 @@ window.toggleTicker = function() {
 };
 
 function renderUsageTab(c) {
+  // update_usage fires on every token tick; rebuilding the Stats region
+  // while the pane is hidden is wasted work. Defer to the next pane entry.
+  if (!paneIsVisible('stats')) {
+    renderOrDefer('stats', 'usage', () => renderUsageTab(c));
+    return;
+  }
   const cardsEl = document.getElementById('usage-cards');
   const emptyEl = document.getElementById('usage-empty');
   const costEl = document.getElementById('cost-section');
@@ -37194,6 +37367,12 @@ function renderAccessIamStateCard() {
 
 function renderAccessAdminSummaries() {
   if (!document.getElementById('tab-access')) return;
+  // Transport ticks call this 17-renderer fanout constantly; skip the DOM
+  // work while the Access pane is hidden and run once on the next entry.
+  if (!paneIsVisible('access')) {
+    renderOrDefer('access', 'admin-summaries', renderAccessAdminSummaries);
+    return;
+  }
   renderAccessAttention();
   renderAccessIdentityHero();
   renderAccessFleetStrip();
@@ -43314,9 +43493,14 @@ function switchTab(tabId) {
     loadSessions();
   }
   if (tabId === 'stats') {
+    // The explicit refresh below supersedes any render deferred while
+    // the pane was hidden (same for files/access) — drop it so the
+    // trailing flushPaneRenders doesn't paint twice.
+    paneDeferredRenders.delete('stats');
     renderStatsForActiveHost({ forceSessions: true });
   }
   if (tabId === 'files') {
+    paneDeferredRenders.delete('files');
     refreshFilesDownloadAvailability();
     renderFilesTransfers();
     refreshFilesTransferJobs();
@@ -43330,12 +43514,14 @@ function switchTab(tabId) {
     loadApiKeyStatus();
   }
   if (tabId === 'access') {
+    paneDeferredRenders.delete('access');
     renderDaemonsList();
     renderAccessAdminSummaries();
     refreshAccessOverviewFromApi({ silent: true }).catch(() => {});
     refreshAccessEnrollments({ silent: true }).catch(() => {});
     if (activeAccessSubtab === 'diagnostics') renderConnectHealthPanel();
   }
+  flushPaneRenders(tabId);
 }
 
 // ── Settings sub-tabs ──
@@ -45425,6 +45611,12 @@ function renderConnectHealthPanel(statusArg = null, summaryArg = null) {
   const summaryEl = document.getElementById('connect-health-summary');
   const gridEl = document.getElementById('connect-health-grid');
   if (!summaryEl || !gridEl) return null;
+  // Redraws on every transport tick; while the Access pane is hidden defer
+  // one argless redraw (status is re-derived fresh at flush time).
+  if (!paneIsVisible('access')) {
+    renderOrDefer('access', 'connect-health', () => renderConnectHealthPanel());
+    return null;
+  }
   const state = connectHealthState(statusArg, summaryArg);
   summaryEl.innerHTML = '';
   for (const badge of state.badges) {
@@ -55095,6 +55287,10 @@ function currentStatsHostKey() {
 }
 
 function renderStatsSessionSections(sessions) {
+  if (!paneIsVisible('stats')) {
+    renderOrDefer('stats', 'session-sections', () => renderStatsSessionSections(sessions));
+    return;
+  }
   setStatsSessionLoading(currentStatsHostKey(), false);
   renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
@@ -57867,6 +58063,12 @@ async function refreshFilesTransferJobs() {
 }
 
 function renderFilesTransfers() {
+  // Progress ticks re-render the whole list; while the Files pane is
+  // hidden, remember one redraw for the next entry instead.
+  if (!paneIsVisible('files')) {
+    renderOrDefer('files', 'transfers', renderFilesTransfers);
+    return;
+  }
   const list = document.getElementById('files-transfer-list');
   if (!list) return;
   list.innerHTML = '';
@@ -58616,6 +58818,10 @@ function filesStagedDescriptorName(descriptor) {
 }
 
 function renderFilesStagedUploads() {
+  if (!paneIsVisible('files')) {
+    renderOrDefer('files', 'staged', renderFilesStagedUploads);
+    return;
+  }
   const list = document.getElementById('files-staged-list');
   if (!list) return;
   list.innerHTML = '';
@@ -60352,8 +60558,33 @@ function applyLoadedSessions(sessions, aggEl) {
     renderManagedContextSessionSelect();
     renderManagedContextPane();
   }
-  renderSessionsAggregate(sessions, aggEl);
+  scheduleSessionsListRender();
+}
+
+// Rendering the sessions list is decoupled from data arrival: streamed
+// batches and background refreshes merge into _cachedSessions eagerly, but
+// the (expensive, full-list) DOM rebuild runs at most every 250ms, and only
+// while the Sessions pane is actually visible — otherwise one render is
+// deferred to the next pane entry.
+let _sessionsRenderTimer = null;
+let _sessionsRenderLastTs = 0;
+const SESSIONS_RENDER_MIN_INTERVAL_MS = 250;
+function renderSessionsListNow() {
+  _sessionsRenderLastTs = Date.now();
+  renderSessionsAggregate(_cachedSessions || [], document.getElementById('sessions-aggregate'));
   renderSessionsViews();
+}
+function scheduleSessionsListRender() {
+  if (!paneIsVisible('sessions')) {
+    renderOrDefer('sessions', 'list', renderSessionsListNow);
+    return;
+  }
+  if (_sessionsRenderTimer) return;
+  const wait = Math.max(0, SESSIONS_RENDER_MIN_INTERVAL_MS - (Date.now() - _sessionsRenderLastTs));
+  _sessionsRenderTimer = setTimeout(() => {
+    _sessionsRenderTimer = null;
+    renderSessionsListNow();
+  }, wait);
 }
 
 function loadSessions(options = {}) {
