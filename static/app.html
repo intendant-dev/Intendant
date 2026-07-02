@@ -593,7 +593,7 @@ body.access-page #tab-access {
 /* ── Settings ── */
 .settings-pane-body {
   padding: 20px;
-  max-width: 640px;
+  max-width: 760px;
   overflow-y: auto;
   flex: 1;
 }
@@ -601,7 +601,7 @@ body.access-page #tab-access {
    the .daemon-row flex children (label + URL + capability badges +
    version + status chip + expand button + Remove button) only fit
    above ~900px. Account / Agent / Debug stay at the readability-
-   optimised 640px. */
+   optimised 760px. */
 .settings-pane-body--wide {
   max-width: 1024px;
 }
@@ -1095,6 +1095,8 @@ body.access-page #tab-access {
 }
 .acc-section-head:first-child, .ui-section-head:first-child { margin-top: 2px; }
 .acc-section-title, .ui-section-title {
+  /* margin reset lets headings (h3/h4) carry this class directly */
+  margin: 0;
   font-size: 14px;
   font-weight: 800;
   letter-spacing: 0.02em;
@@ -1640,6 +1642,9 @@ body.access-page #tab-access {
 .ui-empty-hint { max-width: 460px; font-size: 11.5px; line-height: 1.55; color: var(--subtext0); }
 .ui-empty-hint code { color: var(--blue); }
 .ui-empty-actions { display: flex; gap: 8px; margin-top: 6px; }
+/* Compact variant for empty slots inside cards (lists, small panes). */
+.ui-empty.compact { padding: 18px 16px; }
+.ui-section-sub code { color: var(--blue); }
 
 /* Stat tiles: label / value / optional sub or delta. Values use the font's
    proportional figures (tabular-nums is for aligned table columns only). */
@@ -1714,28 +1719,9 @@ body.access-page #tab-access {
   display: flex;
   gap: 8px;
   padding: 10px 20px;
-  border-top: 1px solid var(--surface0);
-  background: var(--mantle);
+  border-top: 1px solid var(--glass-hairline-bright);
+  background: var(--glass-bg);
   flex-shrink: 0;
-}
-.settings-save-row #settings-save-btn {
-  padding: 6px 16px;
-  border: none;
-  border-radius: 4px;
-  background: var(--blue);
-  color: var(--crust);
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 13px;
-}
-.settings-save-row #settings-reset-btn {
-  padding: 6px 16px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--text);
-  cursor: pointer;
-  font-size: 13px;
 }
 .settings-save-row #settings-status {
   align-self: center;
@@ -1789,23 +1775,55 @@ body.access-page #tab-access {
   width: 16px;
   height: 16px;
 }
+.settings-note {
+  margin: 0 0 14px;
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.settings-note code { color: var(--blue); }
+.settings-note a { color: var(--blue); }
+.ui-card + .settings-note { margin-top: 14px; }
+.settings-keys-actions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+  align-items: center;
+}
+.settings-keys-actions #settings-keys-status { font-size: 12px; }
+.settings-row-warning {
+  margin-left: 4px;
+  font-size: 11px;
+  color: var(--peach);
+}
+/* <a> styled as a ui-btn needs a non-inline display for min-height to apply */
+.settings-report-btn {
+  display: inline-flex;
+  align-items: center;
+  text-decoration: none;
+}
+.settings-env-overrides {
+  margin: 16px 0 0;
+  padding: 12px;
+  background: var(--mantle);
+  border-radius: 6px;
+}
+.settings-env-overrides h4 {
+  margin: 0 0 8px;
+  color: var(--peach);
+  font-size: 13px;
+}
+.settings-env-overrides #settings-env-list {
+  font-size: 12px;
+  color: var(--subtext0);
+}
 .files-pane {
   padding: 20px;
   max-width: 820px;
   overflow-y: auto;
   flex: 1;
 }
-.files-tool {
-  border: 1px solid var(--surface1);
-  border-radius: 6px;
-  padding: 14px 16px;
-  background: var(--base);
-}
-.files-tool h3 {
-  margin: 0 0 10px;
-  color: var(--text);
-  font-size: 15px;
-}
+/* .files-tool sections carry ui-card for their chrome; the class stays
+   only as a semantic hook so no border/background here (double borders). */
 .target-summary {
   --target-accent: var(--blue);
   display: grid;
@@ -1911,9 +1929,6 @@ body.access-page #tab-access {
 .target-chip.off {
   opacity: 0.72;
 }
-.files-tool + .files-tool {
-  margin-top: 14px;
-}
 .files-download-host-row {
   display: grid;
   grid-template-columns: auto minmax(0, 260px);
@@ -1946,7 +1961,8 @@ body.access-page #tab-access {
   display: grid;
   grid-template-columns: minmax(0, 1fr) auto auto auto;
   gap: 8px;
-  align-items: center;
+  /* stretch keeps the ui-btn buttons the same height as the path input */
+  align-items: stretch;
 }
 .files-download-row input {
   min-width: 0;
@@ -1962,33 +1978,6 @@ body.access-page #tab-access {
   outline: none;
   border-color: var(--blue);
 }
-.files-download-row button {
-  min-height: 34px;
-  padding: 7px 13px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--text);
-  cursor: pointer;
-  font-weight: 600;
-  font-size: 12px;
-}
-.files-download-row button.primary {
-  border-color: var(--blue);
-  background: var(--blue);
-  color: var(--crust);
-}
-.files-download-row button.danger {
-  border-color: var(--red);
-  color: var(--red);
-}
-.files-download-row button.hidden {
-  display: none;
-}
-.files-download-row button:disabled {
-  cursor: not-allowed;
-  opacity: 0.55;
-}
 .files-hidden-input {
   display: none;
 }
@@ -2003,12 +1992,9 @@ body.access-page #tab-access {
 .files-download-status.ok { color: var(--green); }
 .files-download-status.warn { color: var(--yellow); }
 .files-download-status.error { color: var(--red); }
+/* Track/height come from ui-meter; shown only while a download runs. */
 .files-download-meter {
-  height: 6px;
-  margin-top: 8px;
-  overflow: hidden;
-  border-radius: 999px;
-  background: var(--surface0);
+  margin-top: 10px;
 }
 .files-download-meter-fill {
   width: 0%;
@@ -2017,46 +2003,11 @@ body.access-page #tab-access {
   background: linear-gradient(90deg, var(--blue), var(--green));
   transition: width 0.12s ease;
 }
-.files-transfer-toolbar {
-  display: flex;
-  justify-content: space-between;
-  align-items: center;
-  gap: 8px;
-  margin-bottom: 8px;
-  flex-wrap: wrap;
-}
-.files-transfer-toolbar h3 {
-  margin: 0;
-}
-.files-transfer-toolbar button,
-.files-upload-actions button,
-.files-staged-row button,
-.files-transfer-actions button {
-  min-height: 28px;
-  padding: 5px 10px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--text);
-  cursor: pointer;
-  font-size: 12px;
-}
-.files-transfer-toolbar button:hover,
-.files-upload-actions button:hover,
-.files-staged-row button:hover,
-.files-transfer-actions button:hover {
-  border-color: var(--blue);
-}
 .files-transfer-list,
 .files-staged-list {
   display: flex;
   flex-direction: column;
   gap: 6px;
-}
-.files-transfer-empty,
-.files-staged-empty {
-  color: var(--subtext0);
-  font-size: 12px;
 }
 .files-transfer-row,
 .files-staged-row {
@@ -2118,11 +2069,6 @@ body.access-page #tab-access {
   gap: 6px;
   flex-wrap: wrap;
 }
-.files-transfer-actions button.danger,
-.files-staged-actions button.danger {
-  color: var(--red);
-  border-color: rgba(243, 139, 168, 0.55);
-}
 .files-upload-actions {
   justify-content: flex-start;
   margin-bottom: 9px;
@@ -2158,6 +2104,105 @@ body.access-page #tab-access {
   border-color: var(--blue);
   color: var(--text);
   background: color-mix(in srgb, var(--surface0) 82%, var(--blue) 18%);
+}
+/* ── Debug tab ── */
+.debug-pane {
+  padding: 20px;
+  max-width: 820px;
+  overflow-y: auto;
+  flex: 1;
+}
+.debug-status {
+  margin: 0 0 10px;
+  color: var(--subtext0);
+  font-size: 13px;
+}
+.debug-status.ok { color: var(--green); }
+.debug-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.debug-info {
+  margin-top: 10px;
+  padding: 8px 12px;
+  background: var(--mantle);
+  border-radius: 4px;
+  font-size: 12px;
+  color: var(--subtext1);
+}
+.debug-info p { margin: 4px 0; }
+.debug-info code { color: var(--blue); }
+.debug-workspace-form {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 8px;
+  align-items: end;
+  margin-bottom: 12px;
+}
+.debug-workspace-form label {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.debug-workspace-form input,
+.debug-workspace-form select {
+  padding: 7px 9px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 13px;
+}
+/* Create sits in a stretchy grid cell — size to content, align with inputs. */
+.debug-workspace-form .ui-btn { justify-self: start; min-height: 32px; }
+.debug-workspace-status {
+  margin-bottom: 8px;
+  color: var(--subtext0);
+  font-size: 12px;
+}
+.debug-workspace-list {
+  display: grid;
+  gap: 8px;
+}
+.debug-workspace-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  gap: 8px;
+  align-items: start;
+  padding: 10px;
+  border: 1px solid var(--glass-hairline);
+  border-radius: 6px;
+  background: rgba(24, 24, 37, 0.4);
+}
+.debug-workspace-row-main { min-width: 0; }
+.debug-workspace-row-title {
+  color: var(--text);
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.debug-workspace-row-url {
+  color: var(--subtext0);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.debug-workspace-row-meta {
+  margin-top: 4px;
+  color: var(--overlay1);
+  font-size: 11px;
+}
+.debug-workspace-row-actions {
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .connect-health-badges {
   display: flex;
@@ -8692,6 +8737,16 @@ body.context-focus-active {
 .terminal-container.terminal-container-disabled {
   visibility: hidden;
 }
+/* Idle notice for the TUI mirror: absolute overlay so xterm's fit()
+   geometry is untouched; pointer-events none so clicks reach the term.
+   Below .terminal-unavailable (z-index 2), which must stay on top. */
+.tui-empty-overlay {
+  position: absolute;
+  inset: 0;
+  z-index: 1;
+  align-content: center;
+  pointer-events: none;
+}
 .terminal-unavailable {
   position: absolute;
   inset: 0;
@@ -8947,14 +9002,9 @@ body.context-focus-active {
   align-items: center;
   justify-content: center;
 }
+/* Layout comes from ui-empty; the class remains for JS show/hide. */
 .displays-placeholder {
-  text-align: center;
   padding: 24px;
-}
-.displays-placeholder .icon {
-  font-size: 48px;
-  margin-bottom: 12px;
-  opacity: 0.5;
 }
 .display-slot {
   flex: 1;
@@ -10757,7 +10807,7 @@ body.display-fullscreen-open {
     <button class="tab-btn" data-tab="sessions" title="Browse, search, resume, and launch sessions">Sessions</button>
     <button class="tab-btn" data-tab="files" title="Browse and download files from this daemon or a peer">Files</button>
     <button class="tab-btn" data-tab="access" title="Who can reach this daemon and its fleet — people, peers, roles, and connection diagnostics">Access</button>
-    <button class="tab-btn" data-tab="debug" title="Daemon diagnostics and raw event streams">Debug</button>
+    <button class="tab-btn" data-tab="debug" title="Observer display and browser workspaces">Debug</button>
     <button class="tab-btn" data-tab="settings" title="Account, agent, and runtime settings">Settings</button>
   </nav>
 
@@ -11514,6 +11564,17 @@ body.display-fullscreen-open {
       <div class="subtab-panes">
         <div class="subtab-pane active" id="term-pane-tui">
           <div class="terminal-container" id="terminal-container"></div>
+          <div class="ui-empty tui-empty-overlay" id="tui-empty-state" aria-hidden="true">
+            <div class="ui-empty-glyph">
+              <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                <rect x="2.5" y="4" width="19" height="16" rx="2"/>
+                <path d="M6.5 9.5l3.5 3-3.5 3"/>
+                <path d="M12.5 15.5h5"/>
+              </svg>
+            </div>
+            <div class="ui-empty-title">TUI mirror idle</div>
+            <div class="ui-empty-hint">The agent's terminal appears here while a session is active. Use the Shell subtab for an interactive shell on this daemon.</div>
+          </div>
           <div class="terminal-unavailable hidden" id="terminal-tui-unavailable" role="status" aria-live="polite"></div>
         </div>
         <div class="subtab-pane" id="term-pane-shell">
@@ -11568,10 +11629,16 @@ body.display-fullscreen-open {
         </span>
       </div>
       <div class="displays-container" id="displays-container">
-        <div class="displays-placeholder" id="displays-placeholder">
-          <div class="icon">&#x1f5b5;</div>
-          <div>No displays active</div>
-          <div style="font-size:12px;margin-top:8px;color:var(--surface2)">Displays will appear when the agent launches a GUI</div>
+        <div class="displays-placeholder ui-empty" id="displays-placeholder">
+          <div class="ui-empty-glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <rect x="2.5" y="4.5" width="19" height="12.5" rx="2"/>
+              <path d="M12 17v3"/>
+              <path d="M8.5 20.5h7"/>
+            </svg>
+          </div>
+          <div class="ui-empty-title">No displays active</div>
+          <div class="ui-empty-hint">Displays will appear when the agent launches a GUI</div>
         </div>
       </div>
       <div class="displays-collapse-bar hidden" id="displays-collapse-bar">
@@ -12015,8 +12082,11 @@ body.display-fullscreen-open {
     <!-- Files Tab -->
     <div id="tab-files" class="tab-pane">
       <div class="files-pane">
-        <section class="files-tool" aria-labelledby="files-download-heading">
-          <h3 id="files-download-heading">Downloads</h3>
+        <section class="files-tool ui-card" aria-labelledby="files-download-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="files-download-heading">Downloads</h3>
+            <div class="ui-section-sub">Pull a file from a daemon to this browser.</div>
+          </div>
           <div class="files-download-host-row">
             <label for="files-download-host">Target</label>
             <select id="files-download-host" onchange="onFilesDownloadHostChanged()">
@@ -12026,30 +12096,34 @@ body.display-fullscreen-open {
           <div id="files-target-summary" class="target-summary" aria-live="polite"></div>
           <div class="files-download-row">
             <input id="files-download-path" type="text" autocomplete="off" spellcheck="false" placeholder="/path/to/file">
-            <button id="files-download-browse-btn" type="button" onclick="openFilesDownloadPicker()">Browse</button>
-            <button id="files-download-btn" class="primary" type="button" onclick="startFilesDownload()">Download</button>
+            <button id="files-download-browse-btn" class="ui-btn" type="button" onclick="openFilesDownloadPicker()">Browse</button>
+            <button id="files-download-btn" class="ui-btn primary" type="button" onclick="startFilesDownload()">Download</button>
           </div>
           <div id="files-download-status" class="files-download-status" aria-live="polite"></div>
-          <div class="files-download-meter" aria-hidden="true">
+          <div id="files-download-meter" class="files-download-meter ui-meter hidden" aria-hidden="true">
             <div id="files-download-progress" class="files-download-meter-fill"></div>
           </div>
         </section>
-        <section class="files-tool" aria-labelledby="files-transfers-heading">
-          <div class="files-transfer-toolbar">
-            <h3 id="files-transfers-heading">Transfers</h3>
-            <div class="files-transfer-actions">
-              <button id="files-transfer-refresh-btn" type="button" onclick="refreshFilesTransferJobs()">Refresh</button>
-              <button id="files-transfer-clear-btn" type="button" onclick="clearFilesTransferHistory()">Clear finished</button>
+        <section class="files-tool ui-card" aria-labelledby="files-transfers-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="files-transfers-heading">Transfers</h3>
+            <div class="ui-section-sub">Progress and history for downloads and uploads.</div>
+            <div class="ui-section-actions">
+              <button id="files-transfer-refresh-btn" class="ui-btn" type="button" onclick="refreshFilesTransferJobs()">Refresh</button>
+              <button id="files-transfer-clear-btn" class="ui-btn" type="button" onclick="clearFilesTransferHistory()">Clear finished</button>
             </div>
           </div>
           <div id="files-transfer-list" class="files-transfer-list"></div>
         </section>
-        <section class="files-tool" aria-labelledby="files-upload-heading">
-          <h3 id="files-upload-heading">Uploads</h3>
+        <section class="files-tool ui-card" aria-labelledby="files-upload-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="files-upload-heading">Uploads</h3>
+            <div class="ui-section-sub">Send files from this browser to the daemon — staged for the agent or written to a path.</div>
+          </div>
           <input id="files-upload-input" class="files-hidden-input" type="file" multiple>
           <div class="files-upload-config">
             <input id="files-upload-destination" type="text" autocomplete="off" spellcheck="false" placeholder="/destination/folder-or-file">
-            <button id="files-upload-destination-browse-btn" type="button" onclick="openFilesUploadDestinationPicker()">Browse</button>
+            <button id="files-upload-destination-browse-btn" class="ui-btn" type="button" onclick="openFilesUploadDestinationPicker()">Browse</button>
             <select id="files-upload-conflict" aria-label="Upload conflict policy">
               <option value="fail">Fail on conflict</option>
               <option value="rename">Rename</option>
@@ -12057,8 +12131,8 @@ body.display-fullscreen-open {
             </select>
           </div>
           <div class="files-upload-actions">
-            <button id="files-upload-choose-btn" type="button" onclick="chooseFilesForUpload()">Choose files</button>
-            <button id="files-staged-refresh-btn" type="button" onclick="refreshFilesStagedUploads()">Refresh staged</button>
+            <button id="files-upload-choose-btn" class="ui-btn" type="button" onclick="chooseFilesForUpload()">Choose files</button>
+            <button id="files-staged-refresh-btn" class="ui-btn" type="button" onclick="refreshFilesStagedUploads()">Refresh staged</button>
           </div>
           <div id="files-upload-dropzone" class="files-upload-dropzone">Drop files</div>
           <div id="files-upload-status" class="files-download-status" aria-live="polite"></div>
@@ -12069,37 +12143,47 @@ body.display-fullscreen-open {
 
     <!-- Debug Tab -->
     <div id="tab-debug" class="tab-pane">
-      <div style="padding:20px">
-        <h3 style="margin:0 0 12px;color:var(--text);font-size:16px">Observer Display</h3>
-        <p style="color:var(--subtext0);font-size:13px;margin:0 0 12px" id="debug-status">Not active</p>
-        <div style="display:flex;gap:8px;margin-bottom:16px">
-          <button id="debug-setup-btn" style="padding:8px 16px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer;font-size:13px" onclick="toggleDebugScreen()">Set up debug screen</button>
-          <button id="debug-record-btn" style="padding:8px 16px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer;font-size:13px" onclick="toggleDebugRecording()" disabled>Start recording</button>
-        </div>
-        <div id="debug-info" class="hidden" style="padding:8px 12px;background:var(--mantle);border-radius:4px;font-size:12px;color:var(--subtext1);margin-bottom:8px">
-          <p style="margin:4px 0">Display: <code style="color:var(--blue)">:<span id="debug-display-id"></span></code></p>
-        </div>
-        <h3 style="margin:20px 0 12px;color:var(--text);font-size:16px">Browser Workspaces</h3>
-        <div style="display:grid;grid-template-columns:repeat(auto-fit,minmax(160px,1fr));gap:8px;align-items:end;margin-bottom:12px">
-          <label style="display:flex;flex-direction:column;gap:4px;color:var(--overlay1);font-size:11px">URL
-            <input id="browser-workspace-url" type="text" placeholder="http://localhost:8765" autocomplete="off" style="padding:7px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text)">
-          </label>
-          <label style="display:flex;flex-direction:column;gap:4px;color:var(--overlay1);font-size:11px">Provider
-            <select id="browser-workspace-provider" style="padding:7px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text)">
-              <option value="auto">auto</option>
-              <option value="cdp">cdp</option>
-              <option value="system_cdp">system_cdp</option>
-              <option value="playwright">playwright</option>
-              <option value="agent_browser">agent_browser</option>
-            </select>
-          </label>
-          <label style="display:flex;flex-direction:column;gap:4px;color:var(--overlay1);font-size:11px">Label
-            <input id="browser-workspace-label" type="text" placeholder="Dashboard" autocomplete="off" style="padding:7px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text)">
-          </label>
-          <button type="button" onclick="createBrowserWorkspaceFromDebug()" style="padding:8px 16px;border:1px solid var(--surface1);border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Create</button>
-        </div>
-        <div id="browser-workspace-status" style="color:var(--subtext0);font-size:12px;margin-bottom:8px"></div>
-        <div id="browser-workspace-list" style="display:grid;gap:8px"></div>
+      <div class="debug-pane">
+        <section class="ui-card" aria-labelledby="debug-observer-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="debug-observer-heading">Observer Display</h3>
+            <div class="ui-section-sub">A headless debug screen the agent can draw on; recordable.</div>
+          </div>
+          <p id="debug-status" class="debug-status">Not active</p>
+          <div class="debug-actions">
+            <button id="debug-setup-btn" class="ui-btn" onclick="toggleDebugScreen()">Set up debug screen</button>
+            <button id="debug-record-btn" class="ui-btn" onclick="toggleDebugRecording()" disabled>Start recording</button>
+          </div>
+          <div id="debug-info" class="debug-info hidden">
+            <p>Display: <code>:<span id="debug-display-id"></span></code></p>
+          </div>
+        </section>
+        <section class="ui-card" aria-labelledby="debug-workspaces-heading">
+          <div class="ui-section-head">
+            <h3 class="ui-section-title" id="debug-workspaces-heading">Browser Workspaces</h3>
+            <div class="ui-section-sub">Managed Chrome instances the agent can drive.</div>
+          </div>
+          <div class="debug-workspace-form">
+            <label>URL
+              <input id="browser-workspace-url" type="text" placeholder="http://localhost:8765" autocomplete="off">
+            </label>
+            <label>Provider
+              <select id="browser-workspace-provider">
+                <option value="auto">auto</option>
+                <option value="cdp">cdp</option>
+                <option value="system_cdp">system_cdp</option>
+                <option value="playwright">playwright</option>
+                <option value="agent_browser">agent_browser</option>
+              </select>
+            </label>
+            <label>Label
+              <input id="browser-workspace-label" type="text" placeholder="Dashboard" autocomplete="off">
+            </label>
+            <button type="button" class="ui-btn primary" onclick="createBrowserWorkspaceFromDebug()">Create</button>
+          </div>
+          <div id="browser-workspace-status" class="debug-workspace-status"></div>
+          <div id="browser-workspace-list" class="debug-workspace-list"></div>
+        </section>
       </div>
     </div>
 
@@ -12401,11 +12485,11 @@ body.display-fullscreen-open {
         <!-- Account pane: API keys + anything else that identifies the user -->
         <div class="subtab-pane active" id="settings-pane-account">
           <div class="settings-pane-body">
-            <fieldset class="settings-group">
-              <legend>API Keys</legend>
-              <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
-                Saved to <code style="color:var(--blue)">~/.config/intendant/.env</code>
-              </p>
+            <section class="ui-card" aria-labelledby="settings-keys-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-keys-heading">API Keys</h3>
+                <div class="ui-section-sub">Provider credentials, saved to <code>~/.config/intendant/.env</code>.</div>
+              </div>
               <div class="settings-row">
                 <label>OpenAI</label>
                 <input type="password" id="settings-key-openai" placeholder="sk-..." autocomplete="off">
@@ -12421,26 +12505,26 @@ body.display-fullscreen-open {
                 <input type="password" id="settings-key-gemini" placeholder="AI..." autocomplete="off">
                 <span class="key-status" id="key-status-gemini"></span>
               </div>
-              <div style="display:flex;gap:8px;margin-top:8px;align-items:center">
-                <button id="settings-save-keys" style="padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);cursor:pointer;font-weight:600;font-size:13px">Save Keys</button>
-                <span id="settings-keys-status" style="font-size:12px"></span>
+              <div class="settings-keys-actions">
+                <button id="settings-save-keys" class="ui-btn primary">Save Keys</button>
+                <span id="settings-keys-status"></span>
               </div>
-            </fieldset>
+            </section>
           </div>
         </div>
 
         <!-- Agent pane: everything that configures how the agent behaves -->
         <div class="subtab-pane" id="settings-pane-agent">
           <div class="settings-pane-body">
-            <p style="color:var(--subtext0);font-size:12px;margin:0 0 16px">
-              Settings are saved to <code style="color:var(--blue)">intendant.toml</code> and take effect on the next task.
+            <p class="settings-note">
+              Settings are saved to <code>intendant.toml</code> and take effect on the next task.
             </p>
 
-            <fieldset class="settings-group">
-              <legend>External Agent</legend>
-              <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
-                Route tasks to an external agent backend. Takes effect on the next task.
-              </p>
+            <section class="ui-card" aria-labelledby="settings-external-agent-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-external-agent-heading">External Agent</h3>
+                <div class="ui-section-sub">Route tasks to an external coding agent instead of the internal loop.</div>
+              </div>
               <div class="settings-row">
                 <label>Backend</label>
                 <select id="set-external-agent">
@@ -12475,10 +12559,13 @@ body.display-fullscreen-open {
                   <option value="flex">Flex</option>
                 </select>
               </div>
-            </fieldset>
+            </section>
 
-            <fieldset class="settings-group">
-              <legend>Computer Use</legend>
+            <section class="ui-card" aria-labelledby="settings-cu-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-cu-heading">Computer Use</h3>
+                <div class="ui-section-sub">The model and display backend that drive screen control.</div>
+              </div>
               <div class="settings-row">
                 <label>Provider</label>
                 <select id="set-cu-provider">
@@ -12517,10 +12604,13 @@ body.display-fullscreen-open {
                   <option value="macos">macOS</option>
                 </select>
               </div>
-            </fieldset>
+            </section>
 
-            <fieldset class="settings-group">
-              <legend>Presence</legend>
+            <section class="ui-card" aria-labelledby="settings-presence-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-presence-heading">Presence</h3>
+                <div class="ui-section-sub">Text and live-voice models for the companion that mediates between you and the worker.</div>
+              </div>
               <div class="settings-row">
                 <label>Enabled</label>
                 <input id="set-presence-enabled" type="checkbox">
@@ -12578,10 +12668,13 @@ body.display-fullscreen-open {
                   </optgroup>
                 </select>
               </div>
-            </fieldset>
+            </section>
 
-            <fieldset class="settings-group">
-              <legend>Transcription</legend>
+            <section class="ui-card" aria-labelledby="settings-transcription-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-transcription-heading">Transcription</h3>
+                <div class="ui-section-sub">Speech-to-text for voice input and call audio.</div>
+              </div>
               <div class="settings-row">
                 <label>Enabled</label>
                 <input id="set-transcription-enabled" type="checkbox">
@@ -12606,10 +12699,13 @@ body.display-fullscreen-open {
                 <label>Language</label>
                 <input id="set-transcription-language" type="text" placeholder="Auto-detect">
               </div>
-            </fieldset>
+            </section>
 
-            <fieldset class="settings-group">
-              <legend>Recording</legend>
+            <section class="ui-card" aria-labelledby="settings-recording-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-recording-heading">Recording</h3>
+                <div class="ui-section-sub">Framerate and quality for display recordings.</div>
+              </div>
               <div class="settings-row">
                 <label>Enabled</label>
                 <input id="set-recording-enabled" type="checkbox">
@@ -12617,7 +12713,7 @@ body.display-fullscreen-open {
               <div class="settings-row">
                 <label>Framerate</label>
                 <input id="set-recording-framerate" type="number" min="1" max="60" placeholder="15">
-                <span id="framerate-warning" class="hidden" style="font-size:11px;color:var(--peach);margin-left:4px">screencapture backend caps at 15 fps</span>
+                <span id="framerate-warning" class="hidden settings-row-warning">screencapture backend caps at 15 fps</span>
               </div>
               <div class="settings-row">
                 <label>Quality</label>
@@ -12627,10 +12723,13 @@ body.display-fullscreen-open {
                   <option value="high">High</option>
                 </select>
               </div>
-            </fieldset>
+            </section>
 
-            <fieldset class="settings-group">
-              <legend>Live Audio</legend>
+            <section class="ui-card" aria-labelledby="settings-live-audio-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-live-audio-heading">Live Audio</h3>
+                <div class="ui-section-sub">Live voice sessions with the agent and their idle timeout.</div>
+              </div>
               <div class="settings-row">
                 <label>Enabled</label>
                 <input id="set-live-audio-enabled" type="checkbox">
@@ -12639,7 +12738,7 @@ body.display-fullscreen-open {
                 <label>Timeout (s)</label>
                 <input id="set-live-audio-timeout" type="number" min="30" max="3600" placeholder="300">
               </div>
-            </fieldset>
+            </section>
           </div>
         </div>
 
@@ -12647,29 +12746,28 @@ body.display-fullscreen-open {
         <!-- Debug pane: read-only diagnostics -->
         <div class="subtab-pane" id="settings-pane-debug">
           <div class="settings-pane-body">
-            <fieldset class="settings-group">
-              <legend>Session Report</legend>
-              <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
-                Downloads a zip of this session's logs (session.jsonl, turn
-                files, daemon stderr/stdout) for sharing with the dev.
-              </p>
+            <section class="ui-card" aria-labelledby="settings-report-heading">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title" id="settings-report-heading">Session Report</h3>
+                <div class="ui-section-sub">A zip of this session's logs (session.jsonl, turn files, daemon stderr/stdout) for sharing with the dev.</div>
+              </div>
               <a id="download-session-report-btn"
+                 class="ui-btn primary settings-report-btn"
                  href="/api/session/current/report"
-                 download
-                 style="display:inline-block;padding:6px 16px;border:none;border-radius:4px;background:var(--blue);color:var(--crust);font-weight:600;font-size:13px;text-decoration:none">
+                 download>
                 Download session report
               </a>
-            </fieldset>
-            <p style="color:var(--subtext0);font-size:12px;margin:0 0 8px">
+            </section>
+            <p class="settings-note">
               Connection diagnostics and self-tests live under
-              <a href="#access/diagnostics" style="color:var(--blue)">Access &rarr; Diagnostics</a>.
+              <a href="#access/diagnostics">Access &rarr; Diagnostics</a>.
             </p>
-            <div id="settings-env-overrides" class="hidden" style="margin:16px 0 0;padding:12px;background:var(--mantle);border-radius:6px">
-              <h4 style="margin:0 0 8px;color:var(--peach);font-size:13px">Environment Variable Overrides</h4>
-              <div id="settings-env-list" style="font-size:12px;color:var(--subtext0)"></div>
+            <div id="settings-env-overrides" class="hidden settings-env-overrides">
+              <h4>Environment Variable Overrides</h4>
+              <div id="settings-env-list"></div>
             </div>
-            <p id="debug-empty" style="color:var(--subtext0);font-size:12px;margin-top:16px">
-              No debug overrides active. Set environment variables before launching <code style="color:var(--blue)">intendant --web</code> to see them here.
+            <p id="debug-empty" class="settings-note">
+              No debug overrides active. Set environment variables before launching <code>intendant --web</code> to see them here.
             </p>
           </div>
         </div>
@@ -12678,8 +12776,8 @@ body.display-fullscreen-open {
 
       <!-- Save / Reset — outside subtab-panes so it's always visible. -->
       <div class="settings-save-row">
-        <button id="settings-save-btn">Save</button>
-        <button id="settings-reset-btn">Reset</button>
+        <button id="settings-save-btn" class="ui-btn primary">Save</button>
+        <button id="settings-reset-btn" class="ui-btn">Reset</button>
         <span id="settings-status"></span>
       </div>
     </div>
@@ -13109,6 +13207,11 @@ const LEVEL_TOOLTIPS = {
 let app = null;
 let activeTab = 'activity';
 let autoScroll = true;
+// Deep links (#settings, …) run switchTab during script evaluation, which
+// reads these once-per-page flags — declare them before that call, not
+// next to their loaders further down (TDZ).
+let settingsLoaded = false;
+let apiKeyStatusLoaded = false;
 
 // ── Hidden-pane render deferral ──
 // High-frequency events (transport ticks, update_usage, session refreshes)
@@ -13395,6 +13498,10 @@ let dashboardConnectReconnectNextUnixMs = 0;
 let filesDownloadAbort = null;
 let filesTransferSeq = 0;
 let filesTransferRunnerActive = false;
+// Declared with the rest of the transfer state: a #files deep link runs
+// switchTab('files') → renderFilesTransfers() during script evaluation,
+// before a declaration further down would have been initialized (TDZ).
+let filesTransfersRenderScheduled = false;
 const filesTransfers = [];
 const filesStagedUploads = new Map();
 const peerFileTransferConnections = new Map();
@@ -33550,7 +33657,14 @@ function base64ToBytes(base64data) {
   return bytes;
 }
 
+// The idle overlay stays until the first mirror frame proves a TUI is
+// attached; it never comes back for the life of the page.
+function hideTuiEmptyState() {
+  document.getElementById('tui-empty-state')?.classList.add('hidden');
+}
+
 function handleTermData(base64data) {
+  hideTuiEmptyState();
   if (term) {
     term.write(base64ToBytes(base64data));
   } else {
@@ -38280,6 +38394,7 @@ function initTerminal() {
       for (const b64 of termBuffer) {
         term.write(base64ToBytes(b64));
       }
+      if (termBuffer.length) hideTuiEmptyState();
       termBuffer = [];
       new ResizeObserver(() => {
         if (fitAddon && activeTab === 'terminal' && activeTermSubtab === 'tui') fitAddon.fit();
@@ -54973,7 +55088,7 @@ function renderStatsForActiveHost(options = {}) {
 }
 
 // ── Settings ──
-let settingsLoaded = false;
+// settingsLoaded lives with the minimal JS state block (deep-link TDZ).
 
 async function loadSettings() {
   try {
@@ -55214,7 +55329,7 @@ function updateFramerateWarning() {
 document.getElementById('set-recording-framerate').addEventListener('input', updateFramerateWarning);
 
 // ── API Keys ──
-let apiKeyStatusLoaded = false;
+// apiKeyStatusLoaded lives with the minimal JS state block (deep-link TDZ).
 
 async function loadApiKeyStatus() {
   try {
@@ -57893,12 +58008,16 @@ function setFilesDownloadBusy(busy) {
   const browse = document.getElementById('files-download-browse-btn');
   const download = document.getElementById('files-download-btn');
   const host = document.getElementById('files-download-host');
+  const meter = document.getElementById('files-download-meter');
   const peerSelected = !!filesDownloadSelectedPeerId();
   const hasPath = !!filesDownloadPathValue();
   if (input) input.disabled = !!busy;
   if (host) host.disabled = !!busy;
   if (browse) browse.disabled = !!busy || peerSelected;
   if (download) download.disabled = !!busy || !hasPath || !filesDownloadTunnelAvailable();
+  // Idle meter reads as a stray gray bar under the card — show it only
+  // while a download is actually running.
+  if (meter) meter.classList.toggle('hidden', !busy);
 }
 
 function refreshFilesDownloadAvailability() {
@@ -58285,7 +58404,6 @@ function pruneFinishedFilesTransfers() {
   }
 }
 
-let filesTransfersRenderScheduled = false;
 function renderFilesTransfers() {
   // Progress ticks re-render the whole list; while the Files pane is
   // hidden, remember one redraw for the next entry instead — and while
@@ -58309,8 +58427,9 @@ function renderFilesTransfersNow() {
   list.innerHTML = '';
   if (filesTransfers.length === 0) {
     const empty = document.createElement('div');
-    empty.className = 'files-transfer-empty';
-    empty.textContent = 'No transfers';
+    empty.className = 'files-transfer-empty ui-empty compact';
+    empty.innerHTML = '<div class="ui-empty-title">No transfers</div>' +
+      '<div class="ui-empty-hint">Downloads and uploads show up here with live progress.</div>';
     list.appendChild(empty);
     return;
   }
@@ -58350,7 +58469,7 @@ function renderFilesTransfersNow() {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.textContent = label;
-      if (className) btn.className = className;
+      btn.className = className ? `ui-btn ${className}` : 'ui-btn';
       btn.addEventListener('click', () => handler(transfer.id));
       actions.appendChild(btn);
     };
@@ -59064,8 +59183,9 @@ function renderFilesStagedUploads() {
     .sort((a, b) => filesStagedDescriptorName(a).localeCompare(filesStagedDescriptorName(b)));
   if (uploads.length === 0) {
     const empty = document.createElement('div');
-    empty.className = 'files-staged-empty';
-    empty.textContent = 'No staged uploads';
+    empty.className = 'files-staged-empty ui-empty compact';
+    empty.innerHTML = '<div class="ui-empty-title">No staged uploads</div>' +
+      '<div class="ui-empty-hint">Choose or drop files above to stage them for the agent.</div>';
     list.appendChild(empty);
     return;
   }
@@ -59090,7 +59210,7 @@ function renderFilesStagedUploads() {
       const btn = document.createElement('button');
       btn.type = 'button';
       btn.textContent = label;
-      if (className) btn.className = className;
+      btn.className = className ? `ui-btn ${className}` : 'ui-btn';
       btn.disabled = !id;
       btn.addEventListener('click', () => handler(id));
       actions.appendChild(btn);
@@ -59122,7 +59242,9 @@ async function refreshFilesStagedUploads() {
       if (upload?.id) filesStagedUploads.set(String(upload.id), upload);
     }
     renderFilesStagedUploads();
-    setFilesUploadStatus('ok', filesStagedUploads.size ? `${filesStagedUploads.size} staged upload${filesStagedUploads.size === 1 ? '' : 's'}` : 'No staged uploads');
+    // Empty state lives in the staged list (renderFilesStagedUploads);
+    // repeating it here printed "No staged uploads" twice.
+    setFilesUploadStatus('ok', filesStagedUploads.size ? `${filesStagedUploads.size} staged upload${filesStagedUploads.size === 1 ? '' : 's'}` : '');
     return uploads;
   } catch (err) {
     const message = err?.message || String(err);
@@ -60529,35 +60651,40 @@ function renderBrowserWorkspaces() {
     .filter(w => (w.status || '') !== 'closed')
     .sort((a, b) => String(b.updated_at || '').localeCompare(String(a.updated_at || '')));
   window.__stationBrowserWorkspaceCount = rows.length;
-  if (status) status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : 'No active browser workspaces';
+  // Zero-count wording lives in the list's empty state; repeating it here
+  // stacked two "no workspaces" lines.
+  if (status) status.textContent = rows.length ? `${rows.length} active workspace${rows.length === 1 ? '' : 's'}` : '';
   if (!rows.length) {
-    list.innerHTML = '<div style="color:var(--subtext0);font-size:12px;padding:10px;border:1px solid var(--surface0);border-radius:4px;background:var(--mantle)">No browser workspace yet</div>';
+    list.innerHTML = '<div class="ui-empty compact"><div class="ui-empty-title">No browser workspaces</div>' +
+      '<div class="ui-empty-hint">Create one above, or the agent will spawn its own when it needs a browser.</div></div>';
     return;
   }
   list.innerHTML = '';
   for (const w of rows) {
     const card = document.createElement('div');
-    card.style.cssText = 'border:1px solid var(--surface0);border-radius:6px;background:var(--mantle);padding:10px;display:grid;grid-template-columns:minmax(0,1fr) auto;gap:8px;align-items:start';
+    card.className = 'debug-workspace-row';
     const meta = document.createElement('div');
-    meta.style.minWidth = '0';
+    meta.className = 'debug-workspace-row-main';
     const lease = w.lease ? ` leased by ${w.lease.holder_id || 'unknown'}` : ' unleased';
     const url = w.url || 'about:blank';
     const executableSource = w.browser_executable_source ? ` · ${w.browser_executable_source}` : '';
     meta.innerHTML =
-      `<div style="font-weight:600;color:var(--text);overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(w.label || w.id)}</div>` +
-      `<div style="color:var(--subtext0);font-size:12px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${escapeHtml(url)}</div>` +
-      `<div style="color:var(--overlay1);font-size:11px;margin-top:4px">${escapeHtml(w.id || '')} · ${escapeHtml(w.provider || '')} · ${escapeHtml(w.status || '')}${escapeHtml(executableSource)} · ${escapeHtml(lease)}</div>`;
+      `<div class="debug-workspace-row-title">${escapeHtml(w.label || w.id)}</div>` +
+      `<div class="debug-workspace-row-url">${escapeHtml(url)}</div>` +
+      `<div class="debug-workspace-row-meta">${escapeHtml(w.id || '')} · ${escapeHtml(w.provider || '')} · ${escapeHtml(w.status || '')}${escapeHtml(executableSource)} · ${escapeHtml(lease)}</div>`;
     const actions = document.createElement('div');
-    actions.style.cssText = 'display:flex;gap:6px;flex-wrap:wrap;justify-content:flex-end';
+    actions.className = 'debug-workspace-row-actions';
     const take = document.createElement('button');
+    take.type = 'button';
+    take.className = 'ui-btn';
     take.textContent = w.lease ? 'Take' : 'Acquire';
     take.title = 'Acquire this browser workspace lease';
-    take.style.cssText = 'padding:5px 9px;border:1px solid var(--surface1);border-radius:4px;background:var(--surface0);color:var(--text);cursor:pointer';
     take.onclick = () => acquireBrowserWorkspace(w.id, true);
     const close = document.createElement('button');
+    close.type = 'button';
+    close.className = 'ui-btn danger';
     close.textContent = 'Close';
     close.title = 'Close this browser workspace';
-    close.style.cssText = 'padding:5px 9px;border:1px solid var(--red);border-radius:4px;background:transparent;color:var(--red);cursor:pointer';
     close.onclick = () => closeBrowserWorkspace(w.id);
     actions.appendChild(take);
     actions.appendChild(close);
@@ -60622,7 +60749,7 @@ window.createBrowserWorkspaceFromDebug = createBrowserWorkspaceFromDebug;
 function onDebugScreenReady(displayId) {
   debugScreenActive = true;
   document.getElementById('debug-status').textContent = 'Active';
-  document.getElementById('debug-status').style.color = 'var(--green)';
+  document.getElementById('debug-status').classList.add('ok');
   document.getElementById('debug-setup-btn').textContent = 'Tear down';
   document.getElementById('debug-record-btn').disabled = false;
   document.getElementById('debug-info').classList.remove('hidden');
@@ -60633,7 +60760,7 @@ function onDebugScreenTornDown() {
   debugScreenActive = false;
   debugRecording = false;
   document.getElementById('debug-status').textContent = 'Not active';
-  document.getElementById('debug-status').style.color = '';
+  document.getElementById('debug-status').classList.remove('ok');
   document.getElementById('debug-setup-btn').textContent = 'Set up debug screen';
   document.getElementById('debug-record-btn').disabled = true;
   document.getElementById('debug-record-btn').textContent = 'Start recording';
