@@ -12432,7 +12432,7 @@ body.display-fullscreen-open {
             <details class="acc-fold" id="access-org-join-fold">
               <summary>Join with an org grant</summary>
               <div class="acc-fold-body">
-                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails.</p>
+                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails. The document is also kept in this browser and presented automatically whenever you connect to a daemon that trusts the org, so you only do this once.</p>
                 <textarea id="access-org-join-doc" class="daemon-pairing-textarea" rows="6" placeholder='{"v":1,"kind":"org-grant", …}'></textarea>
                 <div class="acc-grant-flow-actions">
                   <button id="access-org-join-btn" class="acc-btn primary" type="button">Present grant</button>
@@ -14097,6 +14097,86 @@ async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
   } catch (err) {
     console.warn('[client-identity] offer signing failed:', err?.message || err);
     return {};
+  }
+}
+
+/* ── Stored org grant documents ──
+   Signed org-grant documents this browser holds, keyed by org handle
+   (trust architecture phase 6). A document pasted into the join fold is
+   kept here so later offers can carry it: first contact with any daemon
+   that trusts the org then materializes the grant and connects in one
+   round trip. Storage is convenience, not authority — every daemon
+   re-verifies the signature, expiry, and its own org trust on each
+   presentation, and only the bound subject key benefits. */
+
+const ORG_GRANTS_STORE_KEY = 'intendant_org_grants_v1';
+
+function orgGrantDocValid(doc) {
+  return Boolean(
+    doc && typeof doc === 'object' && !Array.isArray(doc) &&
+    doc.v === 1 && doc.kind === 'org-grant' &&
+    typeof doc.org?.handle === 'string' && doc.org.handle &&
+    typeof doc.subject?.client_key_fingerprint === 'string' &&
+    typeof doc.sig === 'string' && doc.sig &&
+    Number(doc.expires_at_unix_ms) > 0
+  );
+}
+
+/* Read the stored documents ({handle: doc}), pruning expired or malformed
+   entries as they age out. */
+function orgGrantsRead() {
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem(ORG_GRANTS_STORE_KEY) || '{}'); } catch {}
+  if (!map || typeof map !== 'object' || Array.isArray(map)) map = {};
+  const now = Date.now();
+  let dirty = false;
+  for (const [handle, doc] of Object.entries(map)) {
+    if (!orgGrantDocValid(doc) || Number(doc.expires_at_unix_ms) <= now) {
+      delete map[handle];
+      dirty = true;
+    }
+  }
+  if (dirty) {
+    try { localStorage.setItem(ORG_GRANTS_STORE_KEY, JSON.stringify(map)); } catch {}
+  }
+  return map;
+}
+
+/* Keep a document for automatic presentation on future offers. Returns
+   whether it was stored (valid shape, not yet expired). */
+function orgGrantStore(doc) {
+  if (!orgGrantDocValid(doc) || Number(doc.expires_at_unix_ms) <= Date.now()) return false;
+  try {
+    const map = orgGrantsRead();
+    map[doc.org.handle] = doc;
+    localStorage.setItem(ORG_GRANTS_STORE_KEY, JSON.stringify(map));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* The stored document to ride along on an offer to `daemonId` (pass '' on
+   the local same-origin path, where the daemon id is unknown client-side):
+   bound to THIS browser's identity key, unexpired, and targeted at the
+   daemon when its id is known. Latest issued wins when several match —
+   the daemon target-checks again either way. */
+async function orgGrantForOffer(daemonId) {
+  try {
+    const identity = await clientIdentityGet();
+    if (!identity) return null;
+    const now = Date.now();
+    let best = null;
+    for (const doc of Object.values(orgGrantsRead())) {
+      if (String(doc.subject?.client_key_fingerprint || '').trim() !== identity.fingerprint) continue;
+      if (Number(doc.expires_at_unix_ms) <= now) continue;
+      const targets = Array.isArray(doc.targets) ? doc.targets.map(t => String(t).trim()) : [];
+      if (daemonId && targets.length && !targets.includes('*') && !targets.includes(daemonId)) continue;
+      if (!best || Number(doc.issued_at_unix_ms || 0) > Number(best.issued_at_unix_ms || 0)) best = doc;
+    }
+    return best;
+  } catch {
+    return null;
   }
 }
 
@@ -37637,7 +37717,8 @@ function renderAccessOrganizations() {
     const kind = document.createElement('div');
     kind.className = 'acc-principal-kind';
     const key = accessModelLabel(org.root_key);
-    kind.textContent = `root key ${key.slice(0, 12)}…${key.slice(-4)}`;
+    const orlSeq = Number(org.last_orl_seq || 0);
+    kind.textContent = `root key ${key.slice(0, 12)}…${key.slice(-4)}${orlSeq > 0 ? ` · revocations seq ${orlSeq}` : ''}`;
     kind.title = key;
     nameWrap.append(name, kind);
     head.append(glyph, nameWrap);
@@ -37875,6 +37956,240 @@ function renderAccessOrganizations() {
     issue.appendChild(output);
     mount.appendChild(issue);
   }
+
+  // Membership revocation, only where an org root key lives: extend the
+  // root-signed revocation list, then carry it to consuming daemons.
+  if (issuers.length) {
+    const revokeFlow = document.createElement('div');
+    revokeFlow.className = 'acc-grant-flow';
+    revokeFlow.style.marginTop = '12px';
+    const rhead = document.createElement('div');
+    rhead.className = 'acc-grant-flow-head';
+    const rtitle = document.createElement('div');
+    rtitle.className = 'acc-grant-flow-title';
+    rtitle.textContent = 'Revoke org membership';
+    const rsub = document.createElement('div');
+    rsub.className = 'acc-grant-flow-sub';
+    rsub.textContent = 'Adds a document grant_id and/or a member key fingerprint to the root-signed revocation list. Copy the list and apply it on every daemon that trusts the org — renewal and re-presentation are refused from then on.';
+    rhead.append(rtitle, rsub);
+    revokeFlow.appendChild(rhead);
+    const rgrid = document.createElement('div');
+    rgrid.className = 'acc-field-grid';
+    const rHandleLabel = document.createElement('label');
+    rHandleLabel.textContent = 'Org';
+    const rHandleSelect = document.createElement('select');
+    rHandleSelect.id = 'access-org-orl-handle';
+    for (const handle of issuers) {
+      const option = document.createElement('option');
+      option.value = handle;
+      option.textContent = `@${handle}`;
+      rHandleSelect.appendChild(option);
+    }
+    rHandleLabel.appendChild(rHandleSelect);
+    rgrid.appendChild(rHandleLabel);
+    for (const [id, labelText, placeholder] of [
+      ['access-org-orl-grant-id', 'Document grant_id', 'from the issued document (optional)'],
+      ['access-org-orl-subject', 'Member key fingerprint', 'revokes every document for the key (optional)'],
+    ]) {
+      const label = document.createElement('label');
+      label.textContent = labelText;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = id;
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.placeholder = placeholder;
+      label.appendChild(input);
+      rgrid.appendChild(label);
+    }
+    revokeFlow.appendChild(rgrid);
+    const ractions = document.createElement('div');
+    ractions.className = 'acc-grant-flow-actions';
+    const orlOutput = document.createElement('textarea');
+    orlOutput.className = 'daemon-pairing-textarea';
+    orlOutput.rows = 5;
+    orlOutput.readOnly = true;
+    orlOutput.placeholder = 'Signed revocation list appears here';
+    orlOutput.style.marginTop = '10px';
+    const revokeMemberBtn = document.createElement('button');
+    revokeMemberBtn.type = 'button';
+    revokeMemberBtn.className = 'acc-btn danger';
+    revokeMemberBtn.textContent = 'Revoke & re-sign list';
+    revokeMemberBtn.disabled = !canManage;
+    revokeMemberBtn.addEventListener('click', async () => {
+      const grantId = document.getElementById('access-org-orl-grant-id')?.value?.trim();
+      const subject = document.getElementById('access-org-orl-subject')?.value?.trim();
+      if (!grantId && !subject) {
+        showControlToast?.('error', 'Provide a grant_id or a member key fingerprint');
+        return;
+      }
+      try {
+        const data = await accessOrgCall('api_access_org_revoke_member', '/api/access/org-grants/revoke-member', {
+          handle: document.getElementById('access-org-orl-handle')?.value,
+          ...(grantId ? { grant_id: grantId } : {}),
+          ...(subject ? { subject } : {}),
+        });
+        orlOutput.value = JSON.stringify(data.orl, null, 2);
+        const local = data.applied ? ` (${data.applied.revoked_grants} local grant${data.applied.revoked_grants === 1 ? '' : 's'} revoked here)` : '';
+        showControlToast?.('success', `Revocation list now at seq ${data.orl?.seq}${local} — apply it on the org's daemons`);
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Revocation failed');
+      }
+      await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+      renderAccessAdminSummaries();
+    });
+    const copyOrlBtn = document.createElement('button');
+    copyOrlBtn.type = 'button';
+    copyOrlBtn.className = 'acc-btn';
+    copyOrlBtn.textContent = 'Copy current list';
+    copyOrlBtn.addEventListener('click', async () => {
+      try {
+        const handle = document.getElementById('access-org-orl-handle')?.value;
+        const data = await accessOrgFetchOrl(handle);
+        orlOutput.value = JSON.stringify(data.orl, null, 2);
+        await navigator.clipboard?.writeText(orlOutput.value);
+        showControlToast?.('success', `Revocation list seq ${data.orl?.seq} copied`);
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Could not fetch the revocation list');
+      }
+    });
+    ractions.append(revokeMemberBtn, copyOrlBtn);
+    revokeFlow.appendChild(ractions);
+    revokeFlow.appendChild(orlOutput);
+    mount.appendChild(revokeFlow);
+
+    // Renewal, org daemon side: re-sign a still-valid document with a
+    // fresh window (same grant_id, so the revocation list keeps working).
+    const renewFlow = document.createElement('div');
+    renewFlow.className = 'acc-grant-flow';
+    renewFlow.style.marginTop = '12px';
+    const nhead = document.createElement('div');
+    nhead.className = 'acc-grant-flow-head';
+    const ntitle = document.createElement('div');
+    ntitle.className = 'acc-grant-flow-title';
+    ntitle.textContent = 'Renew a member document';
+    const nsub = document.createElement('div');
+    nsub.className = 'acc-grant-flow-sub';
+    nsub.textContent = 'Paste a still-valid document; it is re-signed with a fresh window and the same grant_id. Revoked grants and subjects are refused.';
+    nhead.append(ntitle, nsub);
+    renewFlow.appendChild(nhead);
+    const renewInput = document.createElement('textarea');
+    renewInput.className = 'daemon-pairing-textarea';
+    renewInput.id = 'access-org-renew-doc';
+    renewInput.rows = 5;
+    renewInput.placeholder = '{"v":1,"kind":"org-grant", …}';
+    renewFlow.appendChild(renewInput);
+    const nactions = document.createElement('div');
+    nactions.className = 'acc-grant-flow-actions';
+    const renewOutput = document.createElement('textarea');
+    renewOutput.className = 'daemon-pairing-textarea';
+    renewOutput.rows = 5;
+    renewOutput.readOnly = true;
+    renewOutput.placeholder = 'Renewed document appears here';
+    renewOutput.style.marginTop = '10px';
+    const renewBtn = document.createElement('button');
+    renewBtn.type = 'button';
+    renewBtn.className = 'acc-btn primary';
+    renewBtn.textContent = 'Renew & sign';
+    renewBtn.addEventListener('click', async () => {
+      let doc;
+      try { doc = JSON.parse(renewInput.value.trim()); } catch {
+        showControlToast?.('error', 'That is not valid JSON');
+        return;
+      }
+      try {
+        const data = await accessOrgCall('api_access_org_renew', '/api/access/org-grants/renew', doc);
+        renewOutput.value = JSON.stringify(data.document, null, 2);
+        showControlToast?.('success', 'Document renewed — send it back to the member');
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Renewal failed');
+      }
+    });
+    const copyRenewBtn = document.createElement('button');
+    copyRenewBtn.type = 'button';
+    copyRenewBtn.className = 'acc-btn';
+    copyRenewBtn.textContent = 'Copy';
+    copyRenewBtn.addEventListener('click', () => {
+      if (!renewOutput.value) return;
+      navigator.clipboard?.writeText(renewOutput.value)
+        .then(() => showControlToast?.('success', 'Renewed document copied'))
+        .catch(() => showControlToast?.('error', 'Copy failed'));
+    });
+    nactions.append(renewBtn, copyRenewBtn);
+    renewFlow.appendChild(nactions);
+    renewFlow.appendChild(renewOutput);
+    mount.appendChild(renewFlow);
+  }
+
+  // Applying a carried revocation list works on any daemon that trusts
+  // the org — the signature is the authority, so the endpoint is public
+  // and this flow is available to whoever carries the list here.
+  if (trusted.length) {
+    const applyFlow = document.createElement('div');
+    applyFlow.className = 'acc-grant-flow';
+    applyFlow.style.marginTop = '12px';
+    const ahead = document.createElement('div');
+    ahead.className = 'acc-grant-flow-head';
+    const atitle = document.createElement('div');
+    atitle.className = 'acc-grant-flow-title';
+    atitle.textContent = 'Apply a revocation list';
+    const asub = document.createElement('div');
+    asub.className = 'acc-grant-flow-sub';
+    asub.textContent = 'Paste the org’s current signed list. Matching materialized grants are revoked and listed entries are refused from now on; stale lists are rejected.';
+    ahead.append(atitle, asub);
+    applyFlow.appendChild(ahead);
+    const applyInput = document.createElement('textarea');
+    applyInput.className = 'daemon-pairing-textarea';
+    applyInput.id = 'access-org-orl-apply-doc';
+    applyInput.rows = 5;
+    applyInput.placeholder = '{"v":1,"kind":"org-revocations", …}';
+    applyFlow.appendChild(applyInput);
+    const aactions = document.createElement('div');
+    aactions.className = 'acc-grant-flow-actions';
+    const applyBtn = document.createElement('button');
+    applyBtn.type = 'button';
+    applyBtn.className = 'acc-btn primary';
+    applyBtn.textContent = 'Apply list';
+    applyBtn.addEventListener('click', async () => {
+      let orl;
+      try { orl = JSON.parse(applyInput.value.trim()); } catch {
+        showControlToast?.('error', 'That is not valid JSON');
+        return;
+      }
+      try {
+        const data = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', orl);
+        const applied = data.applied || {};
+        showControlToast?.(
+          'success',
+          applied.changed
+            ? `Applied @${applied.org_handle} revocations seq ${applied.seq} — ${applied.revoked_grants} grant${applied.revoked_grants === 1 ? '' : 's'} revoked`
+            : `Already at seq ${applied.seq} — nothing to do`
+        );
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Apply failed');
+      }
+      await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+      renderAccessAdminSummaries();
+    });
+    aactions.appendChild(applyBtn);
+    applyFlow.appendChild(aactions);
+    mount.appendChild(applyFlow);
+  }
+}
+
+/* Fetch an org's current signed revocation list from the daemon holding
+   its root key (RPC in tunnel mode, plain GET otherwise). */
+async function accessOrgFetchOrl(handle) {
+  const resp = await dashboardJsonFetch(
+    'api_access_org_orl',
+    { handle },
+    () => authedFetch(`/api/access/orgs/${encodeURIComponent(handle || '')}/revocations`),
+    'api_access_org_orl',
+    { fallbackAfterRpcFailure: false }
+  );
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+  return data;
 }
 
 /* Advanced: local IAM state card with raw links. */
@@ -46867,6 +47182,12 @@ window.intendantDashboardControl = {
   status() {
     return dashboardTransport.status();
   },
+  _debugClientIdentity() {
+    return clientIdentityGet();
+  },
+  _debugOrgGrantStore(doc) {
+    return orgGrantStore(doc);
+  },
   connectHealth() {
     return connectHealthState();
   },
@@ -48994,11 +49315,16 @@ class DashboardControlTransport {
         this.clientNonce,
         sdp
       );
+      // A stored org grant rides along so a daemon that trusts the org
+      // materializes it before resolving this very offer (one-round-trip
+      // first contact). The daemon re-verifies everything.
+      const orgGrant = await orgGrantForOffer(DASHBOARD_CONNECT_DAEMON_ID);
       const answer = await this.postConnectSignal('/api/browser/offer', {
         daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
         sdp,
         client_nonce: this.clientNonce,
         ...identity,
+        ...(orgGrant ? { org_grant: orgGrant } : {}),
       });
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
@@ -49006,11 +49332,16 @@ class DashboardControlTransport {
     }
     try {
       const identity = await clientIdentityOfferFields('', this.clientNonce, sdp);
+      const orgGrant = await orgGrantForOffer('');
       const answer = await this.postLocalSignal('/connect/dashboard/offer', {
         sdp,
         client_nonce: this.clientNonce,
         ...identity,
+        ...(orgGrant ? { org_grant: orgGrant } : {}),
       });
+      if (answer?.org_grant_error) {
+        console.warn('[dashboard-control] offer org grant not accepted:', answer.org_grant_error);
+      }
       this.signalingMode = 'local-http';
       dashboardUpdateTransportStatus();
       return answer;
@@ -49146,6 +49477,9 @@ class DashboardControlTransport {
       iceCandidatePair: this.iceCandidatePair,
       lastError: this.lastError,
       eventsActive: dashboardControlEventsActive,
+      grantKind: this.lastStatus?.grant_kind ?? null,
+      grantLabel: this.lastStatus?.grant_label ?? null,
+      accessPrincipal: this.lastStatus?.access_principal ?? null,
       apiAgentCardAvailable: this.lastStatus?.api_agent_card_available ?? null,
       apiCachedBootstrapEventsAvailable: this.lastStatus?.api_cached_bootstrap_events_available ?? null,
       apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
@@ -65736,13 +66070,17 @@ document.getElementById('access-org-join-btn')?.addEventListener('click', async 
     if (status) status.textContent = 'That is not valid JSON.';
     return;
   }
+  // Keep the document even if this daemon refuses it (it may simply not
+  // trust the org yet) — future offers to org daemons carry it.
+  const stored = orgGrantStore(doc);
   if (status) status.textContent = 'Presenting…';
   try {
     const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
-    if (status) status.textContent = `Granted via @${data.org_handle} — ${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}.`;
+    if (status) status.textContent = `Granted via @${data.org_handle} — ${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}.${stored ? ' Kept for automatic presentation on future connections.' : ''}`;
     showControlToast?.('success', 'Org grant accepted');
   } catch (err) {
-    if (status) status.textContent = err?.message || 'Presentation failed.';
+    const kept = stored ? ' The document is kept in this browser and will be presented automatically once a daemon trusts the org.' : '';
+    if (status) status.textContent = `${err?.message || 'Presentation failed.'}${kept}`;
   }
   await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
   renderAccessAdminSummaries();

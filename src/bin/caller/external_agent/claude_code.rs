@@ -883,15 +883,22 @@ mod tests {
     #[test]
     fn intendant_mcp_url_is_scoped_with_core_profile_and_token() {
         // Claude Code gets the same bootstrap treatment as managed Codex,
-        // minus the managed_context mode (server defaults to vanilla).
+        // minus the managed_context mode (server defaults to vanilla). The
+        // injected token is session-scoped, never the raw process token.
         let mut agent =
             ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], Some(8765));
         agent.mcp_session_id = Some("session with spaces".to_string());
         agent.mcp_auth_token = Some("token&symbols".to_string());
 
+        let expected_token = crate::web_gateway::session_scoped_mcp_token(
+            "token&symbols",
+            "session with spaces",
+        );
         assert_eq!(
             agent.intendant_mcp_url(8765),
-            "http://localhost:8765/mcp?session_id=session%20with%20spaces&tool_profile=core&mcp_token=token%26symbols"
+            format!(
+                "http://localhost:8765/mcp?session_id=session%20with%20spaces&tool_profile=core&mcp_token={expected_token}"
+            )
         );
     }
 

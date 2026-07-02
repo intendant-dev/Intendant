@@ -163,6 +163,10 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_access_org_revoke",
     "api_access_org_issue",
     "api_access_org_present",
+    "api_access_org_revoke_member",
+    "api_access_org_orl",
+    "api_access_org_orl_apply",
+    "api_access_org_renew",
     "api_dashboard_targets",
     "api_coordinator_route",
 ];
@@ -1984,10 +1988,14 @@ fn dashboard_control_method_operation(
         | "api_access_enrollment_decide"
         | "api_access_org_trust"
         | "api_access_org_revoke"
-        | "api_access_org_issue" => Some(PeerOperation::AccessManage),
-        // Presenting a signed org document only requires a session; the
-        // document itself is the authorization and is fully re-verified.
-        "api_access_org_present" => Some(PeerOperation::AccessInspect),
+        | "api_access_org_issue"
+        | "api_access_org_revoke_member" => Some(PeerOperation::AccessManage),
+        // Presenting a signed org document (or list) only requires a
+        // session; the document itself is the authorization and is fully
+        // re-verified. Same for reading the org's public revocation list
+        // and renewing a still-valid document.
+        "api_access_org_present" | "api_access_org_orl" | "api_access_org_orl_apply"
+        | "api_access_org_renew" => Some(PeerOperation::AccessInspect),
         "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
             Some(PeerOperation::AccessInspect)
         }
@@ -2286,7 +2294,8 @@ fn control_frame_response(
                     }
                 }
                 "api_access_org_trust" | "api_access_org_revoke" | "api_access_org_issue"
-                | "api_access_org_present" => {
+                | "api_access_org_present" | "api_access_org_revoke_member"
+                | "api_access_org_orl" | "api_access_org_orl_apply" | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let result = match method {
                         "api_access_org_trust" => {
@@ -2297,6 +2306,20 @@ fn control_frame_response(
                         }
                         "api_access_org_issue" => {
                             crate::web_gateway::access_org_issue_response_value(params)
+                        }
+                        "api_access_org_revoke_member" => {
+                            crate::web_gateway::access_org_revoke_member_response_value(params)
+                        }
+                        "api_access_org_orl" => {
+                            crate::web_gateway::access_org_orl_response_value(
+                                params.get("handle").and_then(|v| v.as_str()).unwrap_or(""),
+                            )
+                        }
+                        "api_access_org_orl_apply" => {
+                            crate::web_gateway::access_org_orl_apply_response_value(params)
+                        }
+                        "api_access_org_renew" => {
+                            crate::web_gateway::access_org_renew_response_value(params)
                         }
                         _ => crate::web_gateway::access_org_present_response_value(
                             params,
@@ -4005,6 +4028,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_access_org_revoke_available", access_manage),
         ("api_access_org_issue_available", access_manage),
         ("api_access_org_present_available", access_inspect),
+        ("api_access_org_revoke_member_available", access_manage),
+        ("api_access_org_orl_available", access_inspect),
+        ("api_access_org_orl_apply_available", access_inspect),
+        ("api_access_org_renew_available", access_inspect),
         (
             "api_access_iam_upsert_user_client_grant_available",
             access_manage,
@@ -8438,6 +8465,28 @@ async fn api_mcp_tool_call_response(
             id,
             400,
             mcp_error_body(mcp_id, -32602, "missing tool name"),
+            "mcp tool call",
+        );
+    }
+    // Layered on top of the dispatch-level `message.send` gate: the named
+    // tool must also clear its own IAM operation, so a principal scoped to
+    // messaging cannot reach display input or runtime control through the
+    // generic tool-call RPC.
+    let decision = runtime
+        .grant
+        .access_decision(crate::mcp::mcp_tool_operation(&name));
+    if !decision.allowed {
+        return http_body_response(
+            id,
+            403,
+            mcp_error_body(
+                mcp_id,
+                -32603,
+                &format!(
+                    "permission denied for tool '{name}': {} (permission {})",
+                    decision.reason, decision.permission
+                ),
+            ),
             "mcp tool call",
         );
     }

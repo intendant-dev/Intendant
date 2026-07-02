@@ -4215,16 +4215,81 @@ fn has_browser_origin_headers(header_text: &str) -> bool {
         || http_header_present(header_text, "sec-fetch-dest")
 }
 
-fn loopback_mcp_auth_matches(header_text: &str) -> bool {
+/// Derive the session-scoped MCP token injected into a supervised backend's
+/// bootstrap URL. Unlike the shared per-process token, possession of a
+/// derived token authenticates *which* supervised agent session is calling:
+/// it is preimage-bound to one session id, so a backend cannot present
+/// another session's identity (or recover the process token) from it.
+pub(crate) fn session_scoped_mcp_token(base_token: &str, session_id: &str) -> String {
+    let mut input = Vec::with_capacity(base_token.len() + session_id.len() + 1);
+    input.extend_from_slice(base_token.as_bytes());
+    input.push(0);
+    input.extend_from_slice(session_id.as_bytes());
+    ring::digest::digest(&ring::digest::SHA256, &input)
+        .as_ref()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect()
+}
+
+/// How a request authenticated against this daemon's MCP token, if at all.
+#[derive(Debug, PartialEq)]
+enum McpTokenBinding {
+    /// No MCP token material presented. A non-matching `Authorization:
+    /// Bearer` value deliberately lands here rather than in `Invalid`: that
+    /// header is shared with federation tokens, which the dashboard's
+    /// `authedFetch` attaches to every request when one is stored.
+    Missing,
+    /// The shared per-process token — daemon-minted, root-equivalent.
+    Process,
+    /// A token derived for exactly this request's (decoded) session id.
+    Session(String),
+    /// An explicit MCP token form (`mcp_token` query parameter or
+    /// `x-intendant-mcp-token` header) was presented and matched nothing.
+    Invalid,
+}
+
+fn mcp_request_token_binding(header_text: &str) -> McpTokenBinding {
     let expected = loopback_mcp_auth_token();
     let request_line = header_text.lines().next().unwrap_or("");
-    if query_param(request_line, "mcp_token").as_deref() == Some(expected) {
-        return true;
+    let (session_id, _, _) = mcp_context_from_request_line(request_line);
+    let derived = session_id
+        .as_deref()
+        .map(|sid| session_scoped_mcp_token(expected, sid));
+    let classify = |candidate: &str| {
+        if candidate == expected {
+            Some(McpTokenBinding::Process)
+        } else if derived.as_deref() == Some(candidate) {
+            session_id.clone().map(McpTokenBinding::Session)
+        } else {
+            None
+        }
+    };
+    let explicit = query_param(request_line, "mcp_token")
+        .or_else(|| http_header_value(header_text, "x-intendant-mcp-token").map(str::to_string));
+    if let Some(candidate) = explicit {
+        return classify(&candidate).unwrap_or(McpTokenBinding::Invalid);
     }
-    if http_header_value(header_text, "x-intendant-mcp-token") == Some(expected) {
-        return true;
+    let bearer = http_header_value(header_text, "authorization").and_then(|value| {
+        let value = value.trim();
+        value
+            .strip_prefix("Bearer ")
+            .or_else(|| value.strip_prefix("bearer "))
+            .map(|token| token.trim().to_string())
+    });
+    if let Some(candidate) = bearer {
+        if let Some(binding) = classify(&candidate) {
+            return binding;
+        }
     }
-    verify_bearer_token(header_text, Some(expected)).is_ok()
+    McpTokenBinding::Missing
+}
+
+fn loopback_mcp_auth_matches(header_text: &str) -> bool {
+    matches!(
+        mcp_request_token_binding(header_text),
+        McpTokenBinding::Process | McpTokenBinding::Session(_)
+    )
 }
 
 fn is_loopback_cleartext_mcp_request(
@@ -13088,6 +13153,7 @@ fn html_response(status: &str, body: String) -> String {
 async fn connect_dashboard_offer_response(
     dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
     body_text: &str,
+    agent_card: &serde_json::Value,
 ) -> String {
     let body = match serde_json::from_str::<serde_json::Value>(body_text) {
         Ok(body) => body,
@@ -13125,6 +13191,22 @@ async fn connect_dashboard_offer_response(
             )
         }
     };
+    // Org-grant ride-along (phase 6 step 4), same as the rendezvous path:
+    // materialize before grant resolution so a member's first offer binds
+    // its scoped principal instead of falling back to trusted-transport
+    // root. Failure changes nothing here — the transport already earned
+    // its authority — but the error is surfaced for the console.
+    let org_grant_error = body
+        .get("org_grant")
+        .filter(|doc| !doc.is_null())
+        .and_then(|doc| {
+            crate::access::org::present_org_grant_value(
+                doc,
+                &org_target_agent_card_ids(agent_card),
+                crate::access::client_key::now_unix_ms() as u64,
+            )
+            .err()
+        });
     let grant = match verified_client_key {
         Some(key) => {
             let cert_dir = crate::access::backend::select_backend().cert_dir();
@@ -13170,13 +13252,19 @@ async fn connect_dashboard_offer_response(
         .answer_offer_with_grant(sdp.to_string(), None, client_nonce, grant)
         .await
     {
-        Ok(answer) => json_ok(serde_json::json!({
-            "ok": true,
-            "signaling": "connect-bootstrap-local",
-            "session_id": answer.session_id,
-            "sdp": answer.sdp,
-            "binding": answer.binding,
-        })),
+        Ok(answer) => {
+            let mut response = serde_json::json!({
+                "ok": true,
+                "signaling": "connect-bootstrap-local",
+                "session_id": answer.session_id,
+                "sdp": answer.sdp,
+                "binding": answer.binding,
+            });
+            if let Some(org_error) = org_grant_error {
+                response["org_grant_error"] = serde_json::Value::String(org_error);
+            }
+            json_ok(response)
+        }
         Err(e) => json_error("500 Internal Server Error", e),
     }
 }
@@ -17041,12 +17129,66 @@ fn should_continue_after_accept_error(error: &std::io::Error) -> bool {
     }
 }
 
+/// CORS header segment for `/mcp` responses: echo the requesting origin
+/// only when it is this daemon's own origin or the app-bundle scheme (the
+/// macOS app's page is served from `intendant://` and genuinely needs the
+/// echo); every other origin — and non-browser clients — gets no
+/// `Access-Control-Allow-Origin` at all. The endpoint used to send the
+/// wildcard, which would have let any page read a response it somehow
+/// obtained; scoping the echo matches the access gate, which refuses
+/// foreign-origin requests anyway.
+fn mcp_cors_header_segment(header_text: &str, is_tls: bool) -> String {
+    match extract_origin_header(header_text)
+        .filter(|origin| is_own_or_app_origin(origin, is_tls, header_text))
+    {
+        Some(origin) => format!("Access-Control-Allow-Origin: {origin}\r\nVary: Origin\r\n"),
+        None => "Vary: Origin\r\n".to_string(),
+    }
+}
+
+/// Drop tool definitions the bound principal may not call. Root-compatible
+/// principals see everything; a scoped grant's `tools/list` matches what
+/// `tools/call` would actually allow, so clients never advertise tools that
+/// call-time enforcement will refuse.
+fn filter_mcp_tools_by_access(listed: &mut serde_json::Value, access: &HttpAccessContext) {
+    if let Some(tools) = listed.get_mut("tools").and_then(serde_json::Value::as_array_mut) {
+        tools.retain(|tool| {
+            tool.get("name")
+                .and_then(serde_json::Value::as_str)
+                .map(|name| access.decision(crate::mcp::mcp_tool_operation(name)).allowed)
+                .unwrap_or(false)
+        });
+    }
+}
+
+/// The agent-visible refusal for an IAM-denied tool call: an `isError` tool
+/// result (mirroring the managed-context gate) so supervised backends see
+/// the reason and adapt instead of treating it as a transport fault.
+fn mcp_permission_denied_result(
+    name: &str,
+    principal: &crate::access::iam::AccessPrincipal,
+    decision: &crate::access::iam::AccessDecision,
+) -> serde_json::Value {
+    serde_json::json!({
+        "content": [{
+            "type": "text",
+            "text": format!(
+                "Permission denied for tool '{name}': {} (principal {}, permission {}). \
+                 The daemon owner can adjust this principal's IAM grant under Access.",
+                decision.reason, principal.id, decision.permission,
+            ),
+        }],
+        "isError": true,
+    })
+}
+
 async fn handle_mcp_http_request(
     body: &str,
     server: &crate::mcp::IntendantServer,
     session_id: Option<&str>,
     codex_managed_context: Option<bool>,
     tool_profile: Option<&str>,
+    access: &HttpAccessContext,
 ) -> McpHttpOutcome {
     let request: McpHttpRequest = match serde_json::from_str(body) {
         Ok(r) => r,
@@ -17083,9 +17225,13 @@ async fn handle_mcp_http_request(
             // All notification methods: acknowledge and return 202.
             return McpHttpOutcome::Accepted;
         }
-        "tools/list" => Ok(server
-            .list_tools_json_for_session(session_id, codex_managed_context, tool_profile)
-            .await),
+        "tools/list" => {
+            let mut listed = server
+                .list_tools_json_for_session(session_id, codex_managed_context, tool_profile)
+                .await;
+            filter_mcp_tools_by_access(&mut listed, access);
+            Ok(listed)
+        }
         "tools/call" => {
             let params = request.params.unwrap_or_default();
             let name = params.get("name").and_then(|v| v.as_str()).unwrap_or("");
@@ -17093,6 +17239,19 @@ async fn handle_mcp_http_request(
                 .get("arguments")
                 .cloned()
                 .unwrap_or(serde_json::json!({}));
+            let decision = access.decision(crate::mcp::mcp_tool_operation(name));
+            if !decision.allowed {
+                return McpHttpOutcome::Response(McpHttpResponse {
+                    jsonrpc: "2.0".into(),
+                    id: request.id,
+                    result: Some(mcp_permission_denied_result(
+                        name,
+                        &access.principal,
+                        &decision,
+                    )),
+                    error: None,
+                });
+            }
             match server
                 .call_tool_by_name_for_session(name, args, session_id, codex_managed_context)
                 .await
@@ -21083,7 +21242,12 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = with_public_cors(
-                            connect_dashboard_offer_response(&dashboard_control, &body_text).await,
+                            connect_dashboard_offer_response(
+                                &dashboard_control,
+                                &body_text,
+                                &agent_card_value_for_targets,
+                            )
+                            .await,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
@@ -22864,9 +23028,73 @@ pub fn spawn_web_gateway(
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "GET"
+                        && req_path
+                            .strip_prefix("/api/access/orgs/")
+                            .and_then(|rest| rest.strip_suffix("/revocations"))
+                            .is_some()
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let handle = req_path
+                            .strip_prefix("/api/access/orgs/")
+                            .and_then(|rest| rest.strip_suffix("/revocations"))
+                            .unwrap_or("");
+                        let (status, body) = match access_org_orl_response_value(handle) {
+                            Ok(value) => (200, value.to_string()),
+                            Err(error) => (404, serde_json::json!({"error": error}).to_string()),
+                        };
+                        let response =
+                            with_public_cors(json_response(status_reason(status), body));
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_path == "/api/access/orgs/revocations/apply"
+                        || req_path == "/api/access/org-grants/renew"
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = if req_method != "POST" {
+                            json_response(
+                                "405 Method Not Allowed",
+                                serde_json::json!({"error": "method not allowed"}).to_string(),
+                            )
+                        } else {
+                            let cap = if req_path == "/api/access/orgs/revocations/apply" {
+                                crate::access::org::MAX_ORG_ORL_BYTES
+                            } else {
+                                crate::access::org::MAX_ORG_GRANT_DOC_BYTES
+                            };
+                            match read_request_body_capped(&mut stream, &header_text, cap).await {
+                                Ok(body_text) => {
+                                    let handler = if req_path == "/api/access/orgs/revocations/apply"
+                                    {
+                                        access_org_orl_apply_response_value
+                                            as fn(
+                                                serde_json::Value,
+                                            )
+                                                -> Result<serde_json::Value, String>
+                                    } else {
+                                        access_org_renew_response_value
+                                    };
+                                    let (status, body) = match serde_json::from_str::<
+                                        serde_json::Value,
+                                    >(&body_text)
+                                    .map_err(|e| format!("invalid JSON: {e}"))
+                                    .and_then(handler)
+                                    {
+                                        Ok(value) => (200, value.to_string()),
+                                        Err(error) => (
+                                            400,
+                                            serde_json::json!({"error": error}).to_string(),
+                                        ),
+                                    };
+                                    with_public_cors(json_response(status_reason(status), body))
+                                }
+                                Err((status, body)) => json_response(status_reason(status), body),
+                            }
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/api/access/orgs/trust"
                         || req_path == "/api/access/orgs/revoke"
                         || req_path == "/api/access/org-grants/issue"
+                        || req_path == "/api/access/org-grants/revoke-member"
                     {
                         use tokio::io::AsyncWriteExt;
                         if req_method != "POST" {
@@ -22896,6 +23124,9 @@ pub fn spawn_web_gateway(
                                     "/api/access/orgs/trust" => access_org_trust_response_value
                                         as fn(serde_json::Value) -> Result<serde_json::Value, String>,
                                     "/api/access/orgs/revoke" => access_org_revoke_response_value,
+                                    "/api/access/org-grants/revoke-member" => {
+                                        access_org_revoke_member_response_value
+                                    }
                                     _ => access_org_issue_response_value,
                                 };
                                 let (status, body) = match serde_json::from_str::<serde_json::Value>(
@@ -23475,6 +23706,50 @@ pub fn spawn_web_gateway(
                         //   - DELETE for session:    405 Method Not Allowed (stateless)
                         use tokio::io::{AsyncReadExt as _, AsyncWriteExt};
                         if let Some(ref mcp) = mcp_server {
+                            let mcp_cors = mcp_cors_header_segment(&header_text, is_tls);
+                            // Bind the request to an access principal before
+                            // touching the body. Loopback reachability or a
+                            // shared token alone no longer authorizes the
+                            // tool surface — see `mcp_http_access_context`.
+                            let cert_dir = crate::access::backend::select_backend().cert_dir();
+                            let mcp_access = match mcp_http_access_context(
+                                &cert_dir,
+                                peer_connection_identity.as_ref(),
+                                tls_client_cert_fingerprint.as_deref(),
+                                tls_client_cert_present,
+                                is_tls,
+                                peer_addr,
+                                &header_text,
+                            ) {
+                                Ok(access) => access,
+                                Err((status, message)) => {
+                                    let reason = match status {
+                                        401 => "Unauthorized",
+                                        403 => "Forbidden",
+                                        _ => "Error",
+                                    };
+                                    let body = serde_json::json!({
+                                        "jsonrpc": "2.0",
+                                        "id": serde_json::Value::Null,
+                                        "error": { "code": -32600, "message": message },
+                                    })
+                                    .to_string();
+                                    let response = format!(
+                                        "HTTP/1.1 {status} {reason}\r\n\
+                                         Content-Type: application/json\r\n\
+                                         {mcp_cors}\
+                                         Content-Length: {}\r\n\
+                                         Cache-Control: no-cache\r\n\
+                                         Connection: close\r\n\
+                                         \r\n\
+                                         {body}",
+                                        body.len(),
+                                    );
+                                    let _ = stream.write_all(response.as_bytes()).await;
+                                    finalize_http_stream(&mut stream).await;
+                                    return;
+                                }
+                            };
                             let content_length: usize = header_text
                                 .lines()
                                 .find(|l| l.to_lowercase().starts_with("content-length:"))
@@ -23505,6 +23780,7 @@ pub fn spawn_web_gateway(
                                 mcp_session_id.as_deref(),
                                 codex_managed_context,
                                 tool_profile.as_deref(),
+                                &mcp_access,
                             )
                             .await;
                             let http_response = match outcome {
@@ -23513,7 +23789,7 @@ pub fn spawn_web_gateway(
                                     format!(
                                         "HTTP/1.1 200 OK\r\n\
                                          Content-Type: application/json\r\n\
-                                         Access-Control-Allow-Origin: *\r\n\
+                                         {mcp_cors}\
                                          Content-Length: {}\r\n\
                                          \r\n\
                                          {}",
@@ -23521,11 +23797,12 @@ pub fn spawn_web_gateway(
                                         json,
                                     )
                                 }
-                                McpHttpOutcome::Accepted => "HTTP/1.1 202 Accepted\r\n\
-                                     Access-Control-Allow-Origin: *\r\n\
+                                McpHttpOutcome::Accepted => format!(
+                                    "HTTP/1.1 202 Accepted\r\n\
+                                     {mcp_cors}\
                                      Content-Length: 0\r\n\
                                      \r\n"
-                                    .to_string(),
+                                ),
                             };
                             let _ = stream.write_all(http_response.as_bytes()).await;
                         } else {
@@ -23549,10 +23826,13 @@ pub fn spawn_web_gateway(
                         // are not supported by our stateless endpoint.  Return 405 so rmcp
                         // gracefully falls back (skips SSE / ignores session delete).
                         use tokio::io::AsyncWriteExt;
-                        let http = "HTTP/1.1 405 Method Not Allowed\r\n\
-                                    Access-Control-Allow-Origin: *\r\n\
-                                    Content-Length: 0\r\n\
-                                    \r\n";
+                        let http = format!(
+                            "HTTP/1.1 405 Method Not Allowed\r\n\
+                             {}\
+                             Content-Length: 0\r\n\
+                             \r\n",
+                            mcp_cors_header_segment(&header_text, is_tls)
+                        );
                         let _ = stream.write_all(http.as_bytes()).await;
                     } else if let Some(response) = dashboard_local_file_response(request_line) {
                         use tokio::io::AsyncWriteExt;
@@ -24651,37 +24931,33 @@ fn with_fleet_cors(response: String, allowed_origin: Option<&str>) -> String {
     format!("{}{rest}", lines.join("\r\n"))
 }
 
-/// The names this daemon answers to when an org grant's `targets` list is
-/// matched: agent-card id and label, the stored host label, and the
-/// configured Connect daemon id.
-fn org_target_daemon_ids(agent_card: &serde_json::Value) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for key in ["id", "label"] {
-        if let Some(value) = agent_card.get(key).and_then(|v| v.as_str()) {
-            let value = value.trim();
-            if !value.is_empty() && !ids.iter().any(|existing| existing == value) {
-                ids.push(value.to_string());
-            }
-        }
-    }
-    if let Ok(connect_id) = std::env::var("INTENDANT_CONNECT_DAEMON_ID") {
-        let connect_id = connect_id.trim().to_string();
-        if !connect_id.is_empty() && !ids.iter().any(|existing| existing == &connect_id) {
-            ids.push(connect_id);
-        }
-    }
-    let host_label = crate::access::resolve_host_label();
-    if !host_label.trim().is_empty() && !ids.iter().any(|existing| existing == &host_label) {
-        ids.push(host_label);
-    }
-    ids
+/// The agent-card names this gateway adds to the shared org-grant target
+/// id set (`access::org::org_target_daemon_ids`): the card's id and label.
+fn org_target_agent_card_ids(agent_card: &serde_json::Value) -> Vec<String> {
+    ["id", "label"]
+        .iter()
+        .filter_map(|key| agent_card.get(key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
+/// The org doorbell surface: presentation, renewal, the served revocation
+/// list, and revocation-list delivery. All are public by design — the
+/// signed document/list is the authorization, and each is rate-limited
+/// and size-capped.
 pub(crate) fn is_public_org_grant_path(request_line: &str) -> bool {
     let Some(path) = request_line.split_whitespace().nth(1) else {
         return false;
     };
-    path.split('?').next().unwrap_or(path) == "/api/access/org-grants"
+    let path = path.split('?').next().unwrap_or(path);
+    path == "/api/access/org-grants"
+        || path == "/api/access/org-grants/renew"
+        || path == "/api/access/orgs/revocations/apply"
+        || (path.strip_prefix("/api/access/orgs/")
+            .and_then(|rest| rest.strip_suffix("/revocations"))
+            .is_some_and(|handle| crate::access::org::valid_org_handle(handle)))
 }
 
 /// Public presentation of a signed org grant document. The document itself
@@ -24692,20 +24968,11 @@ pub(crate) fn access_org_present_response_value(
     params: serde_json::Value,
     agent_card: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let now = crate::access::client_key::now_unix_ms() as u64;
-    if !crate::access::org::presentation_rate_ok(now) {
-        return Err("too many org grant presentations; retry shortly".to_string());
-    }
-    let doc: crate::access::org::OrgGrantDocument =
-        serde_json::from_value(params).map_err(|e| format!("invalid org grant document: {e}"))?;
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let daemon_ids = org_target_daemon_ids(agent_card);
-    let outcome = crate::access::org::materialize_org_grant(&mut state, &doc, &daemon_ids, now)
-        .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(&cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let outcome = crate::access::org::present_org_grant_value(
+        &params,
+        &org_target_agent_card_ids(agent_card),
+        crate::access::client_key::now_unix_ms() as u64,
+    )?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "materialized": true,
@@ -24828,6 +25095,154 @@ pub(crate) fn access_org_issue_response_value(
     Ok(serde_json::json!({
         "schema_version": 1,
         "document": doc,
+        "org_root_key": identity.public_key_b64u(),
+    }))
+}
+
+/// Public: the org daemon's current signed revocation list (signed empty
+/// seq-0 list when nothing was revoked yet). Only meaningful on the
+/// daemon holding the org root key.
+pub(crate) fn access_org_orl_response_value(handle: &str) -> Result<serde_json::Value, String> {
+    let handle = handle.trim();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let identity = crate::access::org::load_org_identity(&cert_dir, handle)?.ok_or_else(|| {
+        format!("this daemon holds no root key for org {handle:?}; fetch the revocation list from the org's daemon")
+    })?;
+    let orl = crate::access::org::load_or_init_orl(
+        &identity,
+        &cert_dir,
+        handle,
+        crate::access::client_key::now_unix_ms() as u64,
+    )?;
+    Ok(serde_json::json!({ "schema_version": 1, "orl": orl }))
+}
+
+/// Public doorbell: anyone may carry a signed revocation list here; the
+/// signature is the authority and a stale `seq` is refused, so the
+/// courier is irrelevant. A failure changes nothing.
+pub(crate) fn access_org_orl_apply_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let now = crate::access::client_key::now_unix_ms() as u64;
+    if !crate::access::org::presentation_rate_ok(now) {
+        return Err("too many org grant presentations; retry shortly".to_string());
+    }
+    if serde_json::to_string(&params)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > crate::access::org::MAX_ORG_ORL_BYTES
+    {
+        return Err("org revocation list is too large".to_string());
+    }
+    let orl: crate::access::org::OrgRevocationList = serde_json::from_value(params)
+        .map_err(|e| format!("invalid org revocation list: {e}"))?;
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let mut state = crate::access::iam::load_state(&cert_dir)
+        .map_err(|e| format!("load local IAM state: {e}"))?;
+    let applied = crate::access::org::apply_orl(&mut state, &orl, now).map_err(|e| e.to_string())?;
+    if applied.changed {
+        crate::access::iam::save_state(&cert_dir, &state)
+            .map_err(|e| format!("save local IAM state: {e}"))?;
+    }
+    Ok(serde_json::json!({ "schema_version": 1, "applied": applied }))
+}
+
+/// Org-daemon manage action: extend the revocation list (by document
+/// grant_id and/or subject fingerprint), bump `seq`, re-sign — then apply
+/// it to this daemon's own IAM as a best-effort courtesy when it trusts
+/// its own org, so the org daemon never lags its own list.
+pub(crate) fn access_org_revoke_member_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let handle = params
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut grant_ids: Vec<String> = params
+        .get("grant_ids")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(id) = params.get("grant_id").and_then(|v| v.as_str()) {
+        grant_ids.push(id.to_string());
+    }
+    let mut subjects: Vec<String> = params
+        .get("subjects")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(subject) = params.get("subject").and_then(|v| v.as_str()) {
+        subjects.push(subject.to_string());
+    }
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+        format!(
+            "this daemon holds no root key for org {handle:?}; revoke members from the org's designated daemon"
+        )
+    })?;
+    let now = crate::access::client_key::now_unix_ms() as u64;
+    let orl = crate::access::org::orl_revoke(&identity, &cert_dir, &handle, &grant_ids, &subjects, now)?;
+    let applied = crate::access::iam::load_state(&cert_dir)
+        .ok()
+        .and_then(|mut state| {
+            let applied = crate::access::org::apply_orl(&mut state, &orl, now).ok()?;
+            if applied.changed {
+                crate::access::iam::save_state(&cert_dir, &state).ok()?;
+            }
+            Some(applied)
+        });
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "orl": orl,
+        "applied": applied,
+    }))
+}
+
+/// Public doorbell on the org daemon: re-sign a still-valid document with
+/// a fresh window. Same grant_id, original lifetime span; the org's own
+/// revocation list gates it.
+pub(crate) fn access_org_renew_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let now = crate::access::client_key::now_unix_ms() as u64;
+    if !crate::access::org::presentation_rate_ok(now) {
+        return Err("too many org grant presentations; retry shortly".to_string());
+    }
+    if serde_json::to_string(&params)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > crate::access::org::MAX_ORG_GRANT_DOC_BYTES
+    {
+        return Err("org grant document is too large".to_string());
+    }
+    let doc: crate::access::org::OrgGrantDocument =
+        serde_json::from_value(params).map_err(|e| format!("invalid org grant document: {e}"))?;
+    let handle = doc.org.handle.trim().to_string();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+        format!(
+            "this daemon holds no root key for org {handle:?}; renew against the org's designated daemon"
+        )
+    })?;
+    let orl = crate::access::org::load_or_init_orl(&identity, &cert_dir, &handle, now)?;
+    let renewed = crate::access::org::renew_org_grant(&identity, &orl, &doc, now)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "document": renewed,
         "org_root_key": identity.public_key_b64u(),
     }))
 }
@@ -27478,7 +27893,8 @@ fn dashboard_http_operation(
         ("POST", "/api/access/enrollment-requests/decide")
         | ("POST", "/api/access/orgs/trust")
         | ("POST", "/api/access/orgs/revoke")
-        | ("POST", "/api/access/org-grants/issue") => {
+        | ("POST", "/api/access/org-grants/issue")
+        | ("POST", "/api/access/org-grants/revoke-member") => {
             return Some(PeerOperation::AccessManage)
         }
         ("GET", "/api/access/enrollment-requests") => return Some(PeerOperation::AccessInspect),
@@ -27555,6 +27971,7 @@ fn http_access_forbidden_response(
     )
 }
 
+#[derive(Debug)]
 struct HttpAccessContext {
     principal: crate::access::iam::AccessPrincipal,
     iam_state: Option<crate::access::iam::LocalIamState>,
@@ -27623,6 +28040,188 @@ fn http_access_context(
     };
     Ok(HttpAccessContext {
         principal: crate::access::iam::AccessPrincipal::root_dashboard_session(source, transport),
+        iam_state: None,
+    })
+}
+
+/// Bind a `POST /mcp` request to an access principal, the same way the
+/// dashboard HTTP APIs and federation surfaces bind theirs. Resolution
+/// order:
+///
+/// 1. **Peer daemons** (mTLS peer identity) keep their profile-scoped
+///    principal.
+/// 2. **MCP token holders**: a session-derived token authenticates that
+///    supervised agent session; the shared per-process token is
+///    root-equivalent possession (its `session_id`, when present, still
+///    scopes the request so owner grants apply). Both consult local IAM for
+///    an `agent_session` binding (exact session id, then the `"*"`
+///    wildcard). A known binding whose grant lapsed — expired or revoked —
+///    binds the scoped principal and is denied by the evaluator (the
+///    browser-cert pattern); only sessions with *no* binding at all fall
+///    back to the default transport-trusted principal. An
+///    explicit-but-wrong MCP token fails loud.
+/// 3. **Browser pages**: requests carrying browser origin markers must come
+///    from this daemon's own origin (or the app bundle scheme) and then
+///    bind exactly like any dashboard HTTP request (mTLS certificate
+///    principal or trusted-transport root). Foreign origins are refused —
+///    the same posture as the rest of `/api/*`.
+/// 4. **mTLS client certificates** bind to their IAM principal.
+/// 5. **Tokenless loopback** processes bind to the `local_process`
+///    principal — root-compatible by default so bare `intendant ctl` keeps
+///    working on a plain local daemon, scopeable/revocable via a local IAM
+///    grant (a lapsed grant denies; it does not restore the default). Once
+///    the owner has ever scoped agent sessions, this default fails closed
+///    instead (a scoped agent must not escape its grant by shedding its
+///    token — not even after its grant expires or is revoked), until an
+///    explicit `local_process` grant states what bare loopback callers
+///    get. Tokenless non-loopback requests are refused.
+fn mcp_http_access_context(
+    cert_dir: &std::path::Path,
+    identity: Option<&PeerConnectionIdentity>,
+    tls_client_cert_fingerprint: Option<&str>,
+    tls_client_cert_present: bool,
+    is_tls: bool,
+    peer_addr: std::net::SocketAddr,
+    header_text: &str,
+) -> Result<HttpAccessContext, (u16, String)> {
+    let dashboard_equivalent_context = || {
+        http_access_context(
+            cert_dir,
+            identity,
+            tls_client_cert_fingerprint,
+            tls_client_cert_present,
+            is_tls,
+        )
+        .map_err(|message| (500u16, message))
+    };
+    if identity.is_some() {
+        return dashboard_equivalent_context();
+    }
+    let transport = if is_tls { "https" } else { "http" };
+    let load_state =
+        || load_local_iam_state_for_request(cert_dir).map_err(|message| (500u16, message));
+    match mcp_request_token_binding(header_text) {
+        McpTokenBinding::Invalid => Err((
+            401,
+            "invalid mcp_token; use the URL Intendant injected (INTENDANT_MCP_URL)".to_string(),
+        )),
+        McpTokenBinding::Session(session_id) => {
+            mcp_agent_session_context(cert_dir, &session_id, transport, true)
+        }
+        McpTokenBinding::Process => {
+            let request_line = header_text.lines().next().unwrap_or("");
+            let (session_id, _, _) = mcp_context_from_request_line(request_line);
+            let Some(session_id) = session_id else {
+                return Ok(HttpAccessContext {
+                    principal: crate::access::iam::AccessPrincipal::mcp_token_holder(transport),
+                    iam_state: None,
+                });
+            };
+            mcp_agent_session_context(cert_dir, &session_id, transport, false)
+        }
+        McpTokenBinding::Missing => {
+            if has_browser_origin_headers(header_text) {
+                let origin_allowed = extract_origin_header(header_text)
+                    .map(|origin| is_own_or_app_origin(&origin, is_tls, header_text))
+                    .unwrap_or(false);
+                if !origin_allowed {
+                    return Err((
+                        403,
+                        "cross-origin /mcp requests are refused; only pages served by this \
+                         daemon (or its app bundle) may call /mcp without an mcp_token"
+                            .to_string(),
+                    ));
+                }
+                return dashboard_equivalent_context();
+            }
+            if tls_client_cert_fingerprint.is_some() {
+                return dashboard_equivalent_context();
+            }
+            if !peer_addr.ip().is_loopback() {
+                return Err((
+                    401,
+                    "mcp_token required: tokenless /mcp is only served to loopback clients"
+                        .to_string(),
+                ));
+            }
+            if let Some(state) = load_state()? {
+                if let Some(principal) =
+                    crate::access::iam::principal_for_loopback_mcp(&state, transport)
+                {
+                    return Ok(HttpAccessContext {
+                        principal,
+                        iam_state: Some(state),
+                    });
+                }
+                // A lapsed local_process grant binds and is denied by the
+                // evaluator; it never restores the open default.
+                if let Some(principal) =
+                    crate::access::iam::principal_for_loopback_mcp_any_status(&state, transport)
+                {
+                    return Ok(HttpAccessContext {
+                        principal,
+                        iam_state: Some(state),
+                    });
+                }
+                if crate::access::iam::agent_session_scoping_present(&state) {
+                    return Err((
+                        401,
+                        "agent sessions are scoped on this daemon, so tokenless loopback \
+                         /mcp is disabled; call with your injected INTENDANT_MCP_URL, or \
+                         create a local_process IAM grant to state what bare loopback \
+                         callers may do"
+                            .to_string(),
+                    ));
+                }
+            }
+            Ok(HttpAccessContext {
+                principal: crate::access::iam::AccessPrincipal::local_loopback_mcp_default(
+                    transport,
+                ),
+                iam_state: None,
+            })
+        }
+    }
+}
+
+/// Resolve a supervised agent session's `/mcp` access context: an active
+/// `agent_session` binding scopes it; a known-but-lapsed binding (expired
+/// or revoked grant) still binds the scoped principal so the evaluator
+/// denies with the real reason — expiry or revocation must never return an
+/// agent to implicit root; only a session with no binding at all gets the
+/// default transport-trusted principal.
+fn mcp_agent_session_context(
+    cert_dir: &std::path::Path,
+    session_id: &str,
+    transport: &str,
+    authenticated: bool,
+) -> Result<HttpAccessContext, (u16, String)> {
+    if let Some(state) =
+        load_local_iam_state_for_request(cert_dir).map_err(|message| (500u16, message))?
+    {
+        if let Some(principal) =
+            crate::access::iam::principal_for_agent_session(&state, session_id, transport)
+        {
+            return Ok(HttpAccessContext {
+                principal,
+                iam_state: Some(state),
+            });
+        }
+        if let Some(principal) = crate::access::iam::principal_for_agent_session_any_status(
+            &state, session_id, transport,
+        ) {
+            return Ok(HttpAccessContext {
+                principal,
+                iam_state: Some(state),
+            });
+        }
+    }
+    Ok(HttpAccessContext {
+        principal: crate::access::iam::AccessPrincipal::supervised_agent_session_default(
+            session_id,
+            transport,
+            authenticated,
+        ),
         iam_state: None,
     })
 }
@@ -34448,6 +35047,500 @@ mod tests {
                 "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: localhost\r\nSec-Fetch-Site: cross-site\r\n\r\n"
             )
         ));
+    }
+
+    #[test]
+    fn session_scoped_mcp_token_binds_one_session() {
+        let a = session_scoped_mcp_token("base", "session-a");
+        let b = session_scoped_mcp_token("base", "session-b");
+        assert_eq!(a, session_scoped_mcp_token("base", "session-a"));
+        assert_ne!(a, b);
+        assert_ne!(a, "base");
+        assert_ne!(a, session_scoped_mcp_token("other", "session-a"));
+        assert_eq!(a.len(), 64);
+    }
+
+    #[test]
+    fn mcp_request_token_binding_classifies_token_forms() {
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "child");
+
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Process
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp HTTP/1.1\r\nHost: h\r\nX-Intendant-Mcp-Token: {token}\r\n\r\n"
+            )),
+            McpTokenBinding::Process
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer {token}\r\n\r\n"
+            )),
+            McpTokenBinding::Process
+        );
+        // A session-derived token authenticates exactly its own session id.
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?session_id=child&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Session("child".to_string())
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?session_id=other&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Invalid
+        );
+        assert_eq!(
+            mcp_request_token_binding(&format!(
+                "POST /mcp?mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )),
+            McpTokenBinding::Invalid
+        );
+        // Wrong explicit token forms fail loud.
+        assert_eq!(
+            mcp_request_token_binding("POST /mcp?mcp_token=wrong HTTP/1.1\r\nHost: h\r\n\r\n"),
+            McpTokenBinding::Invalid
+        );
+        // A non-matching bearer is NOT an MCP auth attempt: the dashboard's
+        // authedFetch attaches stored federation tokens to every request.
+        assert_eq!(
+            mcp_request_token_binding(
+                "POST /mcp HTTP/1.1\r\nHost: h\r\nAuthorization: Bearer federation-token\r\n\r\n"
+            ),
+            McpTokenBinding::Missing
+        );
+        assert_eq!(
+            mcp_request_token_binding("POST /mcp HTTP/1.1\r\nHost: h\r\n\r\n"),
+            McpTokenBinding::Missing
+        );
+
+        // The derived token also satisfies the strict-TLS loopback
+        // cleartext exception, so supervised backends keep working against
+        // HTTPS-only daemons.
+        let loopback =
+            std::net::SocketAddr::new(std::net::Ipv4Addr::new(127, 0, 0, 1).into(), 43210);
+        assert!(is_loopback_cleartext_mcp_request(
+            loopback,
+            false,
+            &format!(
+                "POST /mcp?session_id=child&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            )
+        ));
+    }
+
+    #[test]
+    fn mcp_http_access_context_binds_token_origin_and_loopback_paths() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let lan = SocketAddr::new(Ipv4Addr::new(192, 168, 1, 9).into(), 4000);
+        let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+
+        // Tokenless loopback keeps working — bound to its own principal.
+        let local =
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
+                .unwrap();
+        assert_eq!(local.principal.id, "principal:local-process:loopback");
+        assert_eq!(local.principal.kind, "root_session");
+        assert!(
+            local
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+
+        // Tokenless non-loopback is refused.
+        let err = mcp_http_access_context(tmp.path(), None, None, false, false, lan, plain)
+            .unwrap_err();
+        assert_eq!(err.0, 401);
+
+        // A wrong explicit token fails loud even on loopback.
+        let err = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp?mcp_token=wrong HTTP/1.1\r\nHost: h\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 401);
+
+        // Foreign browser origins are refused; the daemon's own page binds
+        // like any dashboard HTTP request.
+        let err = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: https://evil.example\r\n\r\n",
+        )
+        .unwrap_err();
+        assert_eq!(err.0, 403);
+        let dash = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(dash.principal.id, "principal:root:dashboard");
+
+        // Process-token possession binds the token-holder principal; a
+        // session-derived token binds that agent session.
+        let token = loopback_mcp_auth_token();
+        let holder = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            lan,
+            &format!("POST /mcp?mcp_token={token} HTTP/1.1\r\nHost: h\r\n\r\n"),
+        )
+        .unwrap();
+        assert_eq!(holder.principal.id, "principal:mcp-token-holder");
+        let derived = session_scoped_mcp_token(token, "child-1");
+        let agent = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=child-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(agent.principal.id, "principal:agent-session:child-1");
+        assert_eq!(agent.principal.source, "mcp-session-token");
+        assert!(
+            agent
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn mcp_http_access_context_enforces_scoped_agent_and_loopback_grants() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
+
+        let mut state = crate::access::iam::LocalIamState::default();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("kid-1".to_string()),
+                role_id: Some("role:session-reader".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("*".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "local_process".to_string(),
+                role_id: Some("role:observer".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "kid-1");
+        let scoped = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(scoped.principal.kind, "agent_session");
+        assert!(
+            scoped
+                .decision(crate::peer::access_policy::PeerOperation::SessionInspect)
+                .allowed
+        );
+        assert!(
+            !scoped
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+
+        // Sessions without an exact binding fall to the wildcard grant.
+        let derived_other = session_scoped_mcp_token(token, "other");
+        let wildcard = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=other&mcp_token={derived_other} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(wildcard.principal.id, "principal:agent-session:any");
+        assert!(
+            wildcard
+                .decision(crate::peer::access_policy::PeerOperation::DisplayInput)
+                .allowed
+        );
+        assert!(
+            !wildcard
+                .decision(crate::peer::access_policy::PeerOperation::AccessManage)
+                .allowed
+        );
+
+        // The tokenless loopback path honors its local_process grant.
+        let local = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(local.principal.kind, "local_process");
+        assert!(
+            local
+                .decision(crate::peer::access_policy::PeerOperation::DisplayView)
+                .allowed
+        );
+        assert!(
+            !local
+                .decision(crate::peer::access_policy::PeerOperation::Terminal)
+                .allowed
+        );
+
+        // tools/list filtering matches what tools/call would allow.
+        let mut listed = serde_json::json!({
+            "tools": [
+                { "name": "get_status" },
+                { "name": "get_logs" },
+                { "name": "execute_cu_actions" },
+                { "name": "quit" },
+            ]
+        });
+        filter_mcp_tools_by_access(&mut listed, &scoped);
+        let names: Vec<&str> = listed["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|tool| tool.get("name").and_then(serde_json::Value::as_str))
+            .collect();
+        assert_eq!(names, vec!["get_status", "get_logs"]);
+    }
+
+    #[test]
+    fn tokenless_loopback_fails_closed_once_agent_sessions_are_scoped() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let plain = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
+
+        let mut state = crate::access::iam::LocalIamState::default();
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("*".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        // A scoped agent shedding its token no longer lands on a
+        // root-compatible default.
+        let err = mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
+            .unwrap_err();
+        assert_eq!(err.0, 401);
+        assert!(err.1.contains("local_process"), "guidance in: {}", err.1);
+
+        // Presenting the token still binds the (wildcard-scoped) session.
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "kid-9");
+        let agent = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=kid-9&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(agent.principal.id, "principal:agent-session:any");
+
+        // An explicit local_process grant states what bare loopback gets.
+        crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "local_process".to_string(),
+                role_id: Some("role:terminal".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+        let local =
+            mcp_http_access_context(tmp.path(), None, None, false, false, loopback, plain)
+                .unwrap();
+        assert_eq!(local.principal.kind, "local_process");
+        assert_eq!(local.principal.role_id, "role:terminal");
+    }
+
+    #[test]
+    fn lapsed_mcp_grants_bind_and_deny_instead_of_reopening_defaults() {
+        use std::net::{Ipv4Addr, SocketAddr};
+        let tmp = tempfile::TempDir::new().unwrap();
+        let loopback = SocketAddr::new(Ipv4Addr::new(127, 0, 0, 1).into(), 4000);
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session("test", "test");
+
+        let mut state = crate::access::iam::LocalIamState::default();
+        let agent_grant = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "agent_session".to_string(),
+                session_id: Some("kid-1".to_string()),
+                role_id: Some("role:operator".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        state
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == agent_grant.grant.id)
+            .unwrap()
+            .expires_at_unix_ms = Some(1);
+        let local_grant = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "local_process".to_string(),
+                role_id: Some("role:observer".to_string()),
+                status: Some("revoked".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert_eq!(local_grant.grant.status, "revoked");
+        crate::access::iam::save_state(tmp.path(), &state).unwrap();
+
+        // The agent whose grant expired binds its scoped principal and is
+        // denied — it does NOT return to the default root trust.
+        let token = loopback_mcp_auth_token();
+        let derived = session_scoped_mcp_token(token, "kid-1");
+        let agent = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            &format!(
+                "POST /mcp?session_id=kid-1&mcp_token={derived} HTTP/1.1\r\nHost: h\r\n\r\n"
+            ),
+        )
+        .unwrap();
+        assert_eq!(agent.principal.id, "principal:agent-session:kid-1");
+        assert_eq!(agent.principal.kind, "agent_session");
+        let decision = agent.decision(crate::peer::access_policy::PeerOperation::StatsRead);
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("expired"), "{}", decision.reason);
+
+        // The tokenless loopback caller with a revoked local_process grant
+        // binds that principal and is denied per-op — the open default does
+        // not return, and the agent-scoping 401 does not mask the real
+        // reason.
+        let local = mcp_http_access_context(
+            tmp.path(),
+            None,
+            None,
+            false,
+            false,
+            loopback,
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n",
+        )
+        .unwrap();
+        assert_eq!(local.principal.id, "principal:local-process:loopback");
+        assert!(
+            !local
+                .decision(crate::peer::access_policy::PeerOperation::StatsRead)
+                .allowed
+        );
+    }
+
+    #[test]
+    fn mcp_cors_segment_echoes_only_own_or_app_origin() {
+        let own =
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: http://localhost:8765\r\n\r\n";
+        assert_eq!(
+            mcp_cors_header_segment(own, false),
+            "Access-Control-Allow-Origin: http://localhost:8765\r\nVary: Origin\r\n"
+        );
+        let app = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: intendant://app\r\n\r\n";
+        assert!(mcp_cors_header_segment(app, false).contains("intendant://app"));
+        let foreign =
+            "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\nOrigin: https://evil.example\r\n\r\n";
+        assert_eq!(mcp_cors_header_segment(foreign, false), "Vary: Origin\r\n");
+        let no_origin = "POST /mcp HTTP/1.1\r\nHost: localhost:8765\r\n\r\n";
+        assert_eq!(mcp_cors_header_segment(no_origin, false), "Vary: Origin\r\n");
+        // Scheme must match the connection: an http origin cannot claim a
+        // TLS daemon's identity.
+        let tls_mismatch =
+            "POST /mcp HTTP/1.1\r\nHost: daemon.local:8765\r\nOrigin: http://daemon.local:8765\r\n\r\n";
+        assert_eq!(mcp_cors_header_segment(tls_mismatch, true), "Vary: Origin\r\n");
+        let tls_own =
+            "POST /mcp HTTP/1.1\r\nHost: daemon.local:8765\r\nOrigin: https://daemon.local:8765\r\n\r\n";
+        assert!(mcp_cors_header_segment(tls_own, true)
+            .contains("Access-Control-Allow-Origin: https://daemon.local:8765"));
     }
 
     /// A specific bind address is preserved verbatim in the

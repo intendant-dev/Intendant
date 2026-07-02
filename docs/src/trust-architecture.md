@@ -149,13 +149,14 @@ and first contact, honest about what it is.
 
 ## Phase 6 design: organization grants in detail
 
-> Status: **implemented** (v1: steps 1-4 of the rollout below). Grant
+> Status: **implemented** (v1: steps 1-5 of the rollout below). Grant
 > expiry, org root keys, signed grant documents, per-daemon trust with a
-> local cap, materialization, and the presentation/issue/trust/revoke
-> endpoints are live; signed revocation lists and renewal (step 5) and
-> peer-subject/issuer-key delegation (step 6) remain. This section is the
-> spec the code follows; the earlier "two lanes" section is the product
-> narrative it serves.
+> local cap, materialization, the presentation/issue/trust/revoke
+> endpoints, the offer ride-along (documents attached to dashboard-control
+> offers), and signed revocation lists + renewal are live;
+> peer-subject/issuer-key delegation (step 6) and revocation-list gossip
+> over peer links remain. This section is the spec the code follows; the
+> earlier "two lanes" section is the product narrative it serves.
 
 ### Objects
 
@@ -238,7 +239,33 @@ Presentation paths: an explicit `POST /api/access/org-grants` in the public
 doorbell class (rate-limited, size-capped — the document itself is the
 authorization), and an `org_grant` ride-along field on dashboard-control
 offers so an org member's *first* connection to an org daemon materializes
-the grant and proceeds in one round trip.
+the grant and proceeds in one round trip. The ride-along works the same on
+both offer doors — the hosted rendezvous (`connect_rendezvous.rs`, with
+`intendant-connect` relaying the field verbatim like the client-key
+fields) and the daemon's own `/connect/dashboard/offer` — and runs
+*before* grant resolution, so the freshly written grant resolves for the
+very offer that carried it. Presentation failure is non-fatal: if another
+identity resolves, the session proceeds (the error is logged and, on the
+local path, surfaced in the answer); only when nothing resolves does the
+org error ride back inside the refusal.
+
+Browser side, the join fold stores a pasted document in
+`localStorage` (`intendant_org_grants_v1`, keyed by org handle) even when
+the presenting daemon refuses it — the daemon may simply not trust the org
+yet. Offers then attach the freshest stored document that is unexpired,
+bound to *this* browser's identity key, and targeted at the daemon (when
+its id is known client-side). Since the identity key is origin-scoped,
+a stored document only ever helps the browser it was issued to.
+
+Because offers re-present automatically on every connect, materialization
+is idempotent-quiet and local-wins: an unchanged presentation neither
+rewrites `iam.json` nor grows the audit log, and a document whose
+materialized grant (or subject principal) was *locally revoked* is
+refused rather than resurrected — otherwise a member's browser would undo
+the owner's revocation on its next reconnect. The org's escape hatch is a
+fresh document (new `grant_id`); the owner's is re-enabling the grant from
+a root session. This same property is what lets the step-5 revocation
+list revoke by `grant_id` durably.
 
 ### Revocation
 
@@ -256,6 +283,61 @@ Layered, with the failure mode stated honestly:
 An unreachable revocation list plus a long expiry is a stale-authority
 window — hence the 90-day hard cap and the 30-day default.
 
+**ORL format and semantics.** The list is cumulative and self-contained:
+
+```json
+{
+  "v": 1,
+  "kind": "org-revocations",
+  "org": { "handle": "acme", "root_key": "<ed25519 b64u>" },
+  "seq": 4,                          // monotonic; consumers refuse stale
+  "revoked_grant_ids": ["…"],        // document grant_ids, not local grant ids
+  "revoked_subjects": ["…"],         // client key fingerprints — "member is out"
+  "issued_at_unix_ms": 0,
+  "sig": "<ed25519 over the newline payload>"
+}
+```
+
+The signing payload is newline-joined like every other protocol here. The
+org daemon persists the current list next to the root key
+(`org/<handle>/orl.json`), bumps `seq` on every change, and serves it at
+`GET /api/access/orgs/<handle>/revocations` (public — it is org-public
+data; an empty seq-0 list is signed lazily on first read).
+
+**Delivery is carried, not discovered (v1).** A consumer daemon has no
+address for "the org daemon" — there is no membership server to ask — so
+the list travels the same way grant documents do: anyone may push it to
+`POST /api/access/orgs/revocations/apply` (doorbell class:
+unauthenticated, rate-limited, size-capped — the signature is the
+authority, and replaying an old list is refused by `seq`). The org admin's
+browser fans it out to fleet daemons; peer-link gossip and periodic pull
+come later with step 6/phase 7 plumbing.
+
+**Application.** A daemon that trusts the org verifies the signature
+against its *trusted* key for that handle, requires `seq` strictly greater
+than the last applied (equal is an idempotent no-op), then persists the
+lists and the new `seq` on its `trusted_orgs` entry and revokes every
+materialized grant whose document `grant_id` or subject fingerprint is
+listed. Persisting matters beyond the sweep: **materialization and
+renewal both check the stored lists**, so a revoked grant_id or subject
+is refused *future* presentation too — combined with the no-resurrection
+rule above, an ORL revocation sticks even against a member who still
+holds a validly signed document.
+
+**Renewal.** A member (or anyone carrying the document) presents a
+still-valid document to the *org daemon* —
+`POST /api/access/org-grants/renew`, doorbell class — and receives a
+freshly signed copy: same subject, role, targets, and **the same
+`grant_id`**, with `issued_at` set to now and the original lifetime span
+preserved (capped at 90 days). Keeping `grant_id` stable is deliberate:
+ORL revocation by grant_id keeps working across renewals, and the
+document's identity is the grant, not the signature instance. The org
+daemon refuses renewal for anything its own ORL lists (by grant_id or
+subject) — expiry then retires the member within the document's remaining
+lifetime. Only the daemon holding the org root key can renew, and renewal
+grants nothing a fresh issue would not; it exists so membership can be
+kept short-lived without the issuer in the loop.
+
 ### Rollout
 
 1. ✅ Grant expiry in the IAM schema, evaluator, and UI.
@@ -266,10 +348,93 @@ window — hence the 90-day hard cap and the 30-day default.
    presentation endpoint is `POST /api/access/org-grants` (doorbell class:
    unauthenticated, rate-limited, 16 KiB cap — the document is the
    authorization); trust/revoke/issue require `access.manage`.
-4. ⏳ Offer ride-along (one-round-trip first contact) — presentation is
-   an explicit call for now.
-5. ⏳ Revocation list + renewal endpoint + peer gossip.
-6. ⏳ Peer-daemon subjects and issuer-key delegation.
+4. ✅ Offer ride-along (one-round-trip first contact): browsers store
+   pasted documents and attach them to dashboard-control offers on both
+   the hosted-rendezvous and local paths; daemons materialize before
+   grant resolution, idempotent-quiet, without resurrecting local
+   revocations. E2E: `scripts/validate-org-grants.cjs`.
+5. ✅ Revocation list + renewal: root-signed cumulative ORL maintained on
+   the org daemon (`orl.json`, served publicly), carried to consumers via
+   the public apply doorbell, enforced monotonically and persisted so
+   listed grant ids/subjects are refused at materialization and renewal;
+   renewal re-signs a still-valid document with the same `grant_id` and
+   its original lifetime span. UI: revoke-member / copy-list / apply-list
+   / renew flows under Access → Advanced → Organizations. Peer-link
+   gossip and periodic pull remain for later plumbing.
+6. ⏳ Peer-daemon subjects and issuer-key delegation — design proposed
+   below, awaiting sign-off.
+
+### Step 6 design: peer subjects and issuer keys (proposed, not built)
+
+**Peer-daemon subjects.** An org grant whose subject is a *peer daemon*
+materializes into the peer identity store
+(`peer/access_policy.rs::PeerIdentityRecord`), not IAM — daemons are
+peers, never people, and the peer lane's profile vocabulary is the right
+authority language for them. Format: `subject` carries
+`peer_fingerprint` instead of `client_key_fingerprint` (exactly one must
+be present), and the signing payload's subject-kind line — the literal
+`client_key` today, deliberately baked into every existing signature —
+becomes `peer_daemon`, so a signature can never be replayed across
+subject kinds. `role_id` uses a `peer:<profile>` namespace (e.g.
+`peer:session-reader`, the `profile_class` ladder) so a peer document
+cannot be confused with a human-role document even outside the payload.
+
+Materialization upserts an approved `PeerIdentityRecord` bound to the
+fingerprint. Two prerequisite schema steps, each valuable alone (the
+same pattern as grant expiry in step 1): the record gains
+`expires_at_unix` (org documents require expiry; enforcement treats an
+expired record as revoked) and `source` (`org:<handle>` provenance, so
+org revocation can sweep records it created and the UI can say where an
+identity came from). The org's cap for the peer lane is a separate
+`max_peer_profile` on the trusted-org entry — profile classes are a
+ladder, not a permission set, so the human `max_role` cannot express it —
+defaulting to `session-reader`; over-cap documents are rejected, not
+downgraded, like the human lane. Local rules carry over verbatim:
+locally revoked records are never resurrected, re-presentation is
+idempotent-quiet, and ORL `revoked_subjects` matches peer fingerprints
+exactly as it matches client keys.
+
+**Issuer-key delegation.** Day-to-day signing moves off the root: the
+root signs a delegation certificate
+
+```json
+{
+  "v": 1, "kind": "org-issuer",
+  "org": { "handle": "acme", "root_key": "…" },
+  "issuer_key": "<ed25519 b64u>", "label": "…",
+  "issued_at_unix_ms": 0,
+  "expires_at_unix_ms": 0,          // REQUIRED; suggested cap 365d
+  "max_role": "role:operator",      // optional scope; also caps peer:<profile>
+  "sig": "<root, newline payload>"
+}
+```
+
+and a document may then carry `chain: [<issuer-cert>]` (the array
+reserved since v1) with its own `sig` made by the issuer key.
+Verification walks outside-in: the *trusted* root key validates the
+cert, the cert must be unexpired and its `max_role` (when present) must
+contain the document's role, then the issuer key validates the document;
+everything else — org cap, targets, expiry, ORL — applies unchanged.
+One level only: an issuer cannot mint issuers.
+
+Revoking an issuer revokes everything it signed going forward: the ORL
+gains a `revoked_issuer_keys` list, which adds a line to the ORL signing
+payload. Nothing consuming v1 lists has shipped outside this branch, so
+the payload change lands as a plain extension of the v1 protocol before
+first release; were that no longer true it would ship as an explicit
+`v: 2` with dual-version acceptance. Materialized grants are swept by
+matching the `chain` recorded at materialization time — which means the
+materialization audit/grant record starts persisting the issuer key it
+accepted.
+
+**Open questions for sign-off.** (a) Should peer-subject documents also
+ride along on the peer doorbell/handshake the way client-key documents
+ride dashboard offers, or stay explicit-presentation-only in v1.1?
+(b) Is `session-reader` the right default `max_peer_profile`, or should
+trusting an org grant no peer authority at all until the owner raises it
+(fail-closed default)? (c) Should issuer certs be publishable next to
+the ORL (`GET /api/access/orgs/<handle>/issuers`) so consumers can
+prefetch, or only ever travel inside document chains?
 
 ## Mechanisms
 
@@ -326,6 +491,20 @@ The pieces that implement the model, mapped to the codebase:
   and cannot silently inject or relabel a daemon in your fleet view.
   Cross-device encryption of private fields (via passkey-PRF-derived keys)
   remains the follow-on step.
+- **MCP principal binding**: `/mcp` requests (supervised backends, `intendant
+  ctl`, the dashboard's tool RPC) enter the same evaluator as every other
+  surface. Supervised agents authenticate with a session-scoped token derived
+  from the daemon's per-process secret, binding them to
+  `principal:agent-session:<id>`; tokenless loopback callers bind to
+  `principal:local-process:loopback`; browser pages must present the daemon's
+  own origin. Each tool call is checked against a per-tool permission map at
+  call time, so `agent_session` / `local_process` grants scope what a given
+  supervised agent or local shell may reach. Defaults stay root-compatible on
+  a single-user daemon; once any agent session has ever been scoped, the
+  tokenless loopback default fails closed until a `local_process` grant
+  states what bare local callers get, and a lapsed grant (expired or
+  revoked) denies rather than restoring default trust. See
+  [MCP Server](./mcp-server.md#mcp-authorization).
 - **Org root keys**: membership and role assertions signed by the org key;
   daemons verify signatures rather than trusting a directory. The global
   directory maps handle → org root key and is cross-checkable; a

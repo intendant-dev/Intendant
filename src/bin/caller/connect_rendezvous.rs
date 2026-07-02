@@ -57,6 +57,8 @@ struct RendezvousEvent {
     #[serde(default)]
     client_key_ts: Option<i64>,
     #[serde(default)]
+    org_grant: Option<serde_json::Value>,
+    #[serde(default)]
     claim_id: Option<String>,
     #[serde(default)]
     challenge: Option<String>,
@@ -339,6 +341,28 @@ async fn handle_event(
                     return;
                 }
             };
+            // Org-grant ride-along (phase 6 step 4): a member's offer may
+            // carry its signed org grant document so first contact with a
+            // daemon that trusts the org is one round trip. Materialize it
+            // before grant resolution — the freshly written grant then
+            // resolves for this very offer. A failure is non-fatal: if
+            // another identity resolves the session proceeds, otherwise
+            // the error rides back inside the refusal.
+            let org_grant_error = event
+                .org_grant
+                .as_ref()
+                .filter(|doc| !doc.is_null())
+                .and_then(|doc| {
+                    crate::access::org::present_org_grant_value(
+                        doc,
+                        &[daemon_id.to_string()],
+                        crate::access::client_key::now_unix_ms() as u64,
+                    )
+                    .err()
+                });
+            if let Some(org_error) = org_grant_error.as_deref() {
+                eprintln!("[connect] offer org grant not accepted: {org_error}");
+            }
             let grant = match connect_dashboard_grant(
                 event.user_id.as_deref(),
                 event.account_name.as_deref(),
@@ -346,6 +370,12 @@ async fn handle_event(
             ) {
                 Ok(grant) => grant,
                 Err(e) => {
+                    let e = match org_grant_error {
+                        Some(org_error) => {
+                            format!("{e} The offer's org grant was not accepted: {org_error}")
+                        }
+                        None => e,
+                    };
                     // A verified key without a grant is an enrollment
                     // candidate: queue it so the owner can approve from an
                     // already-trusted Access session instead of copying the
