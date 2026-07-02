@@ -94,9 +94,15 @@ func loadClientIdentity(certDir: URL) -> (SecIdentity, [SecCertificate])? {
         return nil
     }
 
-    let options = [kSecImportExportPassphrase as String: password] as CFDictionary
+    var importOptions: [String: Any] = [kSecImportExportPassphrase as String: password]
+    if #available(macOS 15.0, *) {
+        // Keep the identity in process memory: no login-keychain item, so
+        // no per-binary "allow access to key" prompt on every rebuild, and
+        // TLS client signing works in headless/automation contexts too.
+        importOptions[kSecImportToMemoryOnly as String] = kCFBooleanTrue as Any
+    }
     var items: CFArray?
-    let status = SecPKCS12Import(p12 as CFData, options, &items)
+    let status = SecPKCS12Import(p12 as CFData, importOptions as CFDictionary, &items)
     guard status == errSecSuccess,
           let imported = items as? [[String: Any]],
           let first = imported.first,
@@ -254,11 +260,20 @@ class BackendSchemeHandler: NSObject, WKURLSchemeHandler {
 
 // MARK: - App Delegate
 
+final class ConsoleBridge: NSObject, WKScriptMessageHandler {
+    func userContentController(_ userContentController: WKUserContentController,
+                               didReceive message: WKScriptMessage) {
+        NSLog("[webview] \(message.body)")
+    }
+}
+
 class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDelegate {
+    let consoleBridge = ConsoleBridge()
     var window: NSWindow!
     var webView: WKWebView!
     var backendProcess: Process?
     var healthTimer: Timer?
+    var healthProbeFailures = 0
     var port: Int = 8765
     let portSearchLimit = 20
     var launchPlan: BackendLaunchPlan!
@@ -466,6 +481,17 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
     // these lines are what `open`-less smoke runs and Console.app get.
     func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
         NSLog("Dashboard loaded: \(webView.url?.absoluteString ?? "?")")
+        guard webView.url?.scheme == "intendant" else { return }
+        // Diagnostic snapshot: what transport did the dashboard end up on?
+        for delay in [4.0, 12.0] {
+            DispatchQueue.main.asyncAfter(deadline: .now() + delay) { [weak self] in
+                self?.webView.evaluateJavaScript(
+                    "(() => { const s = window.intendantDashboardControl?.status?.() || null; return s ? JSON.stringify({enabled: s.enabled, connected: s.connected, mode: s.signalingMode, err: s.lastError, pc: s.pcState}) : 'no-control-api'; })()"
+                ) { result, error in
+                    NSLog("Transport status (+\(Int(delay))s): \(result ?? error?.localizedDescription ?? "nil")")
+                }
+            }
+        }
     }
 
     func webView(_ webView: WKWebView,
@@ -612,6 +638,33 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         )
         config.userContentController.addUserScript(script)
 
+        // Forward page console output to NSLog so `Console.app` and
+        // terminal launches can see what the dashboard is doing — the
+        // WKWebView inspector is rarely attached when it matters.
+        config.userContentController.add(consoleBridge, name: "log")
+        let consoleScript = WKUserScript(
+            source: """
+            (() => {
+              const send = level => (...args) => {
+                try {
+                  window.webkit.messageHandlers.log.postMessage(level + ': ' + args.map(a => {
+                    try { return typeof a === 'string' ? a : JSON.stringify(a); } catch (e) { return String(a); }
+                  }).join(' '));
+                } catch (e) {}
+              };
+              for (const level of ['log', 'info', 'warn', 'error']) {
+                const original = console[level].bind(console);
+                console[level] = (...args) => { send(level)(...args); original(...args); };
+              }
+              window.addEventListener('error', e => send('pageerror')(e.message || String(e)));
+              window.addEventListener('unhandledrejection', e => send('unhandledrejection')(e.reason?.message || String(e.reason)));
+            })();
+            """,
+            injectionTime: .atDocumentStart,
+            forMainFrameOnly: true
+        )
+        config.userContentController.addUserScript(consoleScript)
+
         webView = WKWebView(frame: .zero, configuration: config)
         webView.uiDelegate = self
         webView.navigationDelegate = self
@@ -718,16 +771,28 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                 self.showBackendCrash()
                 return
             }
-            // Also ping the HTTP endpoint
+            // Also ping the HTTP endpoint. Probe failures are logged, never
+            // fatal: the process-liveness check above is the only thing
+            // allowed to declare a crash — a slow daemon or a stalled TLS
+            // probe must not replace a working dashboard with a false
+            // "Backend process exited" screen.
             let url = self.backendURL("/")
             var req = URLRequest(url: url, timeoutInterval: 2)
             req.httpMethod = "HEAD"
-            self.backendSession.dataTask(with: req) { _, response, _ in
+            self.backendSession.dataTask(with: req) { _, response, error in
                 let ok = (response as? HTTPURLResponse)?.statusCode == 200
-                if !ok {
-                    DispatchQueue.main.async {
-                        self.healthTimer?.invalidate()
-                        self.showBackendCrash()
+                DispatchQueue.main.async {
+                    if ok {
+                        if self.healthProbeFailures >= 3 {
+                            NSLog("Backend health probe recovered after \(self.healthProbeFailures) failures")
+                        }
+                        self.healthProbeFailures = 0
+                        return
+                    }
+                    self.healthProbeFailures += 1
+                    if self.healthProbeFailures == 3 || self.healthProbeFailures % 24 == 0 {
+                        let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                        NSLog("Backend health probe failing (\(self.healthProbeFailures) consecutive; status=\(status) error=\(error?.localizedDescription ?? "none")) — process is still running")
                     }
                 }
             }.resume()

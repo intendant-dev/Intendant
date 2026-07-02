@@ -21987,6 +21987,21 @@ async function main() {
       setConnectEventStatus('err', 'Hosted Connect dashboard events failed');
       scheduleDashboardConnectReconnect(err?.message || String(err), { delayMs: 1000 });
     }
+  } else if (window.__intendantPort && window.__intendantBackendTls) {
+    // macOS app over mTLS: a browser WebSocket cannot present the client
+    // certificate (the intendant:// proxy can't intercept WS upgrades),
+    // so the legacy event stream can never connect — the WebRTC control
+    // transport, whose signaling rides the proxy, carries events instead.
+    console.info('[app] mTLS bundle: skipping legacy WebSocket; events flow through the control transport');
+    try {
+      const [cfg, card] = await Promise.all([
+        fetch('/config').then(r => r.json()).catch(() => ({})),
+        fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
+      ]);
+      applyGatewayConfig(cfg);
+      applyAgentCardIdentity(card);
+    } catch {}
+    maybeStartDashboardControlTransport();
   } else {
     // Connect to server over the normal daemon-origin WebSocket.
     const wsUrl = buildWsUrl();
@@ -46730,6 +46745,11 @@ function dashboardServerMessageDedupeKey(message) {
 
 function dashboardControlTransportEnabled() {
   if (DASHBOARD_CONNECT_MODE) return true;
+  // macOS app over mTLS: the legacy WebSocket cannot present a client
+  // certificate, so the control transport is the only working event
+  // path — always on (localStorage is also unreliable on the custom
+  // intendant:// scheme, so this cannot be a stored preference there).
+  if (window.__intendantPort && window.__intendantBackendTls) return true;
   try {
     return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
   } catch {
