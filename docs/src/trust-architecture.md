@@ -361,13 +361,15 @@ kept short-lived without the issuer in the loop.
    its original lifetime span. UI: revoke-member / copy-list / apply-list
    / renew flows under Access → Advanced → Organizations. Peer-link
    gossip and periodic pull remain for later plumbing.
-6. 🟡 Peer-daemon subjects ✅ / issuer-key delegation ⏳. Peer subjects
-   are built per the design below (fail-closed `max_peer_profile`,
-   explicit presentation only — no peer-doorbell ride-along in v1.1, per
-   sign-off); issuer keys remain to build (chain-only, also per
-   sign-off). E2E: `scripts/validate-org-grants.cjs` scenario 4.
+6. ✅ Peer-daemon subjects and issuer-key delegation, per the design
+   below and its sign-off decisions: fail-closed `max_peer_profile`,
+   explicit presentation only (no peer-doorbell ride-along in v1.1), and
+   chain-only issuer certificates (deputies initialize a key, the root
+   delegates, documents carry the certificate; revocation lists revoke
+   issuers wholesale via recorded `issued_via`). Renewal stays root-only
+   for now. E2E: `scripts/validate-org-grants.cjs` scenarios 4–5.
 
-### Step 6 design: peer subjects (built) and issuer keys (accepted, not built)
+### Step 6 design: peer subjects and issuer keys (built)
 
 **Peer-daemon subjects.** An org grant whose subject is a *peer daemon*
 materializes into the peer identity store

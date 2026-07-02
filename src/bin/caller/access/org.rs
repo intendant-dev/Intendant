@@ -739,6 +739,82 @@ pub fn materialize_org_grant(
     })
 }
 
+pub fn issuer_key_path(cert_dir: &Path, handle: &str) -> PathBuf {
+    cert_dir.join("org").join(handle).join("issuer.pk8")
+}
+
+pub fn issuer_cert_path(cert_dir: &Path, handle: &str) -> PathBuf {
+    cert_dir.join("org").join(handle).join("issuer-cert.json")
+}
+
+/// Deputy-side: create (or return) this daemon's issuer keypair for an
+/// org. Holding a key grants nothing until the root signs a certificate
+/// for it and it is installed here.
+pub fn load_or_create_issuer_identity(
+    cert_dir: &Path,
+    handle: &str,
+) -> Result<DaemonIdentity, String> {
+    if !valid_org_handle(handle) {
+        return Err(format!(
+            "invalid org handle {handle:?}: use 2-40 chars of a-z, 0-9, and '-'"
+        ));
+    }
+    DaemonIdentity::load_or_create(issuer_key_path(cert_dir, handle))
+}
+
+pub fn load_issuer_identity(
+    cert_dir: &Path,
+    handle: &str,
+) -> Result<Option<DaemonIdentity>, String> {
+    if !valid_org_handle(handle) {
+        return Ok(None);
+    }
+    let path = issuer_key_path(cert_dir, handle);
+    if !path.exists() {
+        return Ok(None);
+    }
+    DaemonIdentity::load_or_create(path).map(Some)
+}
+
+pub fn load_issuer_cert(cert_dir: &Path, handle: &str) -> Result<Option<OrgIssuerCert>, String> {
+    let path = issuer_cert_path(cert_dir, handle);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let raw =
+        std::fs::read_to_string(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    serde_json::from_str(&raw)
+        .map(Some)
+        .map_err(|e| format!("parse {}: {e}", path.display()))
+}
+
+/// Deputy-side: persist the root-signed certificate for the local issuer
+/// key after verifying it actually names that key and its signature and
+/// window hold.
+pub fn install_issuer_cert(
+    cert_dir: &Path,
+    handle: &str,
+    cert: &OrgIssuerCert,
+    now_unix_ms: u64,
+) -> Result<(), String> {
+    let issuer = load_issuer_identity(cert_dir, handle)?
+        .ok_or_else(|| format!("this daemon holds no issuer key for org {handle:?}; initialize one first"))?;
+    if cert.issuer_key.trim() != issuer.public_key_b64u() {
+        return Err("the certificate names a different issuer key".to_string());
+    }
+    if cert.org.handle.trim() != handle.trim() {
+        return Err("the certificate belongs to a different org handle".to_string());
+    }
+    verify_org_issuer_cert(cert, now_unix_ms)?;
+    let path = issuer_cert_path(cert_dir, handle);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| format!("create {}: {e}", parent.display()))?;
+    }
+    let body = serde_json::to_string_pretty(cert).map_err(|e| e.to_string())?;
+    std::fs::write(&path, format!("{body}\n")).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(())
+}
+
 /// Outcome of materializing a peer-subject document into the peer
 /// identity store.
 #[derive(Clone, Debug, Serialize)]
@@ -866,7 +942,7 @@ pub fn materialize_org_peer_grant(
 #[derive(Clone, Debug, Serialize)]
 #[serde(untagged)]
 pub enum PresentedOrgGrant {
-    Human(MaterializedOrgGrant),
+    Human(Box<MaterializedOrgGrant>),
     Peer(MaterializedOrgPeerGrant),
 }
 
@@ -946,7 +1022,7 @@ pub fn present_org_grant_state(
             .map_err(|e| e.to_string())
     } else {
         materialize_org_grant(state, &doc, &daemon_ids, now_unix_ms)
-            .map(PresentedOrgGrant::Human)
+            .map(|outcome| PresentedOrgGrant::Human(Box::new(outcome)))
             .map_err(|e| e.to_string())
     }
 }

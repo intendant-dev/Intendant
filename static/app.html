@@ -38055,6 +38055,7 @@ function renderAccessOrganizations() {
     for (const [id, labelText, placeholder] of [
       ['access-org-orl-grant-id', 'Document grant_id', 'from the issued document (optional)'],
       ['access-org-orl-subject', 'Member key fingerprint', 'revokes every document for the key (optional)'],
+      ['access-org-orl-issuer', 'Issuer key', 'revokes everything a delegated issuer signed (optional)'],
     ]) {
       const label = document.createElement('label');
       label.textContent = labelText;
@@ -38084,8 +38085,9 @@ function renderAccessOrganizations() {
     revokeMemberBtn.addEventListener('click', async () => {
       const grantId = document.getElementById('access-org-orl-grant-id')?.value?.trim();
       const subject = document.getElementById('access-org-orl-subject')?.value?.trim();
-      if (!grantId && !subject) {
-        showControlToast?.('error', 'Provide a grant_id or a member key fingerprint');
+      const issuerKey = document.getElementById('access-org-orl-issuer')?.value?.trim();
+      if (!grantId && !subject && !issuerKey) {
+        showControlToast?.('error', 'Provide a grant_id, a member key fingerprint, or an issuer key');
         return;
       }
       try {
@@ -38093,6 +38095,7 @@ function renderAccessOrganizations() {
           handle: document.getElementById('access-org-orl-handle')?.value,
           ...(grantId ? { grant_id: grantId } : {}),
           ...(subject ? { subject } : {}),
+          ...(issuerKey ? { issuer_key: issuerKey } : {}),
         });
         orlOutput.value = JSON.stringify(data.orl, null, 2);
         const local = data.applied ? ` (${data.applied.revoked_grants} local grant${data.applied.revoked_grants === 1 ? '' : 's'} revoked here)` : '';
@@ -38184,6 +38187,166 @@ function renderAccessOrganizations() {
     renewFlow.appendChild(nactions);
     renewFlow.appendChild(renewOutput);
     mount.appendChild(renewFlow);
+
+    // Issuer delegation (root side): sign a certificate for a deputy
+    // daemon's issuer key so day-to-day signing moves off the root.
+    const delegateFlow = document.createElement('div');
+    delegateFlow.className = 'acc-grant-flow';
+    delegateFlow.style.marginTop = '12px';
+    const dhead = document.createElement('div');
+    dhead.className = 'acc-grant-flow-head';
+    const dtitle = document.createElement('div');
+    dtitle.className = 'acc-grant-flow-title';
+    dtitle.textContent = 'Delegate an issuer key';
+    const dsub = document.createElement('div');
+    dsub.className = 'acc-grant-flow-sub';
+    dsub.textContent = 'Paste a deputy daemon\u2019s issuer key (from its \u201cBecome an issuer\u201d flow). The certificate travels inside every document the deputy signs \u2014 nothing is published.';
+    dhead.append(dtitle, dsub);
+    delegateFlow.appendChild(dhead);
+    const dgrid = document.createElement('div');
+    dgrid.className = 'acc-field-grid';
+    for (const [id, labelText, placeholder] of [
+      ['access-org-delegate-key', 'Issuer key', 'ed25519 public key (base64url)'],
+      ['access-org-delegate-label', 'Label', 'e.g. CI signer'],
+      ['access-org-delegate-scope', 'Scope (optional)', 'role:… or peer:… — empty allows both lanes'],
+    ]) {
+      const label = document.createElement('label');
+      label.textContent = labelText;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = id;
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.placeholder = placeholder;
+      label.appendChild(input);
+      dgrid.appendChild(label);
+    }
+    delegateFlow.appendChild(dgrid);
+    const dactions = document.createElement('div');
+    dactions.className = 'acc-grant-flow-actions';
+    const delegateOutput = document.createElement('textarea');
+    delegateOutput.className = 'daemon-pairing-textarea';
+    delegateOutput.rows = 5;
+    delegateOutput.readOnly = true;
+    delegateOutput.placeholder = 'Signed issuer certificate appears here';
+    delegateOutput.style.marginTop = '10px';
+    const delegateBtn = document.createElement('button');
+    delegateBtn.type = 'button';
+    delegateBtn.className = 'acc-btn primary';
+    delegateBtn.textContent = 'Delegate & sign';
+    delegateBtn.disabled = !canManage;
+    delegateBtn.addEventListener('click', async () => {
+      try {
+        const data = await accessOrgCall('api_access_org_issuer_delegate', '/api/access/org-grants/issuers/delegate', {
+          handle: document.getElementById('access-org-orl-handle')?.value || document.getElementById('access-org-issue-handle')?.value,
+          issuer_key: document.getElementById('access-org-delegate-key')?.value?.trim(),
+          label: document.getElementById('access-org-delegate-label')?.value?.trim(),
+          max_role: document.getElementById('access-org-delegate-scope')?.value?.trim() || '',
+        });
+        delegateOutput.value = JSON.stringify(data.certificate, null, 2);
+        showControlToast?.('success', 'Issuer certificate signed \u2014 send it to the deputy daemon');
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Delegation failed');
+      }
+    });
+    const copyCertBtn = document.createElement('button');
+    copyCertBtn.type = 'button';
+    copyCertBtn.className = 'acc-btn';
+    copyCertBtn.textContent = 'Copy';
+    copyCertBtn.addEventListener('click', () => {
+      if (!delegateOutput.value) return;
+      navigator.clipboard?.writeText(delegateOutput.value)
+        .then(() => showControlToast?.('success', 'Certificate copied'))
+        .catch(() => showControlToast?.('error', 'Copy failed'));
+    });
+    dactions.append(delegateBtn, copyCertBtn);
+    delegateFlow.appendChild(dactions);
+    delegateFlow.appendChild(delegateOutput);
+    mount.appendChild(delegateFlow);
+  }
+
+  // Become an issuer (deputy side): mint a local issuer key, send it to
+  // the org root for delegation, then install the returned certificate.
+  {
+    const issuerFold = document.createElement('details');
+    issuerFold.className = 'acc-fold';
+    const issuerSummary = document.createElement('summary');
+    issuerSummary.textContent = 'Become an issuer for an org';
+    issuerFold.appendChild(issuerSummary);
+    const foldBody = document.createElement('div');
+    foldBody.className = 'acc-fold-body';
+    const hint = document.createElement('p');
+    hint.className = 'acc-fold-hint';
+    hint.textContent = 'Create this daemon\u2019s issuer key for an org, send the key to the org root for a delegation certificate, and paste the certificate back here. Documents you issue then carry the certificate; the root key stays offline.';
+    foldBody.appendChild(hint);
+    const grid = document.createElement('div');
+    grid.className = 'acc-field-grid';
+    const handleLabel = document.createElement('label');
+    handleLabel.textContent = 'Org handle';
+    const handleInput = document.createElement('input');
+    handleInput.type = 'text';
+    handleInput.id = 'access-org-issuer-handle';
+    handleInput.autocomplete = 'off';
+    handleInput.spellcheck = false;
+    handleInput.placeholder = 'e.g. acme';
+    handleLabel.appendChild(handleInput);
+    grid.appendChild(handleLabel);
+    foldBody.appendChild(grid);
+    const keyOut = document.createElement('textarea');
+    keyOut.className = 'daemon-pairing-textarea';
+    keyOut.rows = 2;
+    keyOut.readOnly = true;
+    keyOut.placeholder = 'Issuer key appears here \u2014 send it to the org root';
+    foldBody.appendChild(keyOut);
+    const certIn = document.createElement('textarea');
+    certIn.className = 'daemon-pairing-textarea';
+    certIn.rows = 4;
+    certIn.placeholder = 'Paste the root-signed issuer certificate here';
+    certIn.style.marginTop = '8px';
+    foldBody.appendChild(certIn);
+    const actions = document.createElement('div');
+    actions.className = 'acc-grant-flow-actions';
+    const initBtn = document.createElement('button');
+    initBtn.type = 'button';
+    initBtn.className = 'acc-btn primary';
+    initBtn.textContent = 'Create / show issuer key';
+    initBtn.addEventListener('click', async () => {
+      try {
+        const data = await accessOrgCall('api_access_org_issuer_init', '/api/access/org-grants/issuers/init', {
+          handle: handleInput.value?.trim(),
+        });
+        keyOut.value = data.issuer_key || '';
+        showControlToast?.('success', data.certificate_installed ? 'Issuer key ready (certificate already installed)' : 'Issuer key ready \u2014 send it to the org root');
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Issuer init failed');
+      }
+    });
+    const installBtn = document.createElement('button');
+    installBtn.type = 'button';
+    installBtn.className = 'acc-btn';
+    installBtn.textContent = 'Install certificate';
+    installBtn.addEventListener('click', async () => {
+      let cert;
+      try { cert = JSON.parse(certIn.value.trim()); } catch {
+        showControlToast?.('error', 'That is not valid JSON');
+        return;
+      }
+      try {
+        await accessOrgCall('api_access_org_issuer_install', '/api/access/org-grants/issuers/install', {
+          handle: handleInput.value?.trim(),
+          certificate: cert,
+        });
+        showControlToast?.('success', 'Issuer certificate installed \u2014 this daemon can now issue for the org');
+        await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+        renderAccessAdminSummaries();
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Install failed');
+      }
+    });
+    actions.append(initBtn, installBtn);
+    foldBody.appendChild(actions);
+    issuerFold.appendChild(foldBody);
+    mount.appendChild(issuerFold);
   }
 
   // Applying a carried revocation list works on any daemon that trusts

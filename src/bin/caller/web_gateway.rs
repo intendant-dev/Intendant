@@ -23095,6 +23095,9 @@ pub fn spawn_web_gateway(
                         || req_path == "/api/access/orgs/revoke"
                         || req_path == "/api/access/org-grants/issue"
                         || req_path == "/api/access/org-grants/revoke-member"
+                        || req_path == "/api/access/org-grants/issuers/init"
+                        || req_path == "/api/access/org-grants/issuers/delegate"
+                        || req_path == "/api/access/org-grants/issuers/install"
                     {
                         use tokio::io::AsyncWriteExt;
                         if req_method != "POST" {
@@ -23126,6 +23129,15 @@ pub fn spawn_web_gateway(
                                     "/api/access/orgs/revoke" => access_org_revoke_response_value,
                                     "/api/access/org-grants/revoke-member" => {
                                         access_org_revoke_member_response_value
+                                    }
+                                    "/api/access/org-grants/issuers/init" => {
+                                        access_org_issuer_init_response_value
+                                    }
+                                    "/api/access/org-grants/issuers/delegate" => {
+                                        access_org_issuer_delegate_response_value
+                                    }
+                                    "/api/access/org-grants/issuers/install" => {
+                                        access_org_issuer_install_response_value
                                     }
                                     _ => access_org_issue_response_value,
                                 };
@@ -25062,11 +25074,23 @@ pub(crate) fn access_org_issue_response_value(
         .trim()
         .to_string();
     let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
-        format!(
-            "this daemon holds no root key for org {handle:?}; run `intendant org init {handle}` on the org's designated daemon"
-        )
-    })?;
+    let root_identity = crate::access::org::load_org_identity(&cert_dir, &handle)?;
+    let deputy = if root_identity.is_none() {
+        match (
+            crate::access::org::load_issuer_identity(&cert_dir, &handle)?,
+            crate::access::org::load_issuer_cert(&cert_dir, &handle)?,
+        ) {
+            (Some(issuer), Some(cert)) => Some((issuer, cert)),
+            _ => None,
+        }
+    } else {
+        None
+    };
+    if root_identity.is_none() && deputy.is_none() {
+        return Err(format!(
+            "this daemon holds no root key or installed issuer certificate for org {handle:?}; run `intendant org init {handle}` on the org's designated daemon, or initialize + install a delegated issuer here"
+        ));
+    }
     let state = crate::access::iam::load_state(&cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
     let targets = params
@@ -25080,10 +25104,7 @@ pub(crate) fn access_org_issue_response_value(
                 .collect::<Vec<_>>()
         })
         .unwrap_or_default();
-    let doc = crate::access::org::issue_org_grant(
-        &identity,
-        &state,
-        crate::access::org::IssueOrgGrantRequest {
+    let request = crate::access::org::IssueOrgGrantRequest {
             handle: &handle,
             client_key_fingerprint: params
                 .get("client_key_fingerprint")
@@ -25100,14 +25121,112 @@ pub(crate) fn access_org_issue_response_value(
                 .unwrap_or("role:observer"),
             targets,
             ttl_ms: params.get("ttl_ms").and_then(|v| v.as_u64()),
-        },
-        crate::access::client_key::now_unix_ms() as u64,
-    )
-    .map_err(|e| e.to_string())?;
+    };
+    let now = crate::access::client_key::now_unix_ms() as u64;
+    let (doc, org_root_key) = if let Some(identity) = root_identity.as_ref() {
+        (
+            crate::access::org::issue_org_grant(identity, &state, request, now)
+                .map_err(|e| e.to_string())?,
+            identity.public_key_b64u(),
+        )
+    } else {
+        let (issuer, cert) = deputy.as_ref().expect("deputy checked above");
+        let root_key = cert.org.root_key.clone();
+        (
+            crate::access::org::issue_org_grant_via(issuer, cert, &state, request, now)
+                .map_err(|e| e.to_string())?,
+            root_key,
+        )
+    };
     Ok(serde_json::json!({
         "schema_version": 1,
         "document": doc,
-        "org_root_key": identity.public_key_b64u(),
+        "org_root_key": org_root_key,
+    }))
+}
+
+/// Deputy action: create (or show) this daemon's issuer keypair for an
+/// org. The key grants nothing until the org root signs a certificate
+/// for it and it is installed here.
+pub(crate) fn access_org_issuer_init_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let handle = params
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let issuer = crate::access::org::load_or_create_issuer_identity(&cert_dir, &handle)?;
+    let cert = crate::access::org::load_issuer_cert(&cert_dir, &handle)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "handle": handle,
+        "issuer_key": issuer.public_key_b64u(),
+        "certificate_installed": cert.is_some(),
+    }))
+}
+
+/// Root-daemon action: sign a delegation certificate for an issuer key.
+pub(crate) fn access_org_issuer_delegate_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let handle = params
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+        format!("this daemon holds no root key for org {handle:?}; delegate from the org's designated daemon")
+    })?;
+    let cert = crate::access::org::delegate_org_issuer(
+        &identity,
+        &handle,
+        params.get("issuer_key").and_then(|v| v.as_str()).unwrap_or(""),
+        params.get("label").and_then(|v| v.as_str()).unwrap_or(""),
+        params.get("max_role").and_then(|v| v.as_str()).unwrap_or(""),
+        params.get("ttl_ms").and_then(|v| v.as_u64()),
+        crate::access::client_key::now_unix_ms() as u64,
+    )?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "certificate": cert,
+    }))
+}
+
+/// Deputy action: install the root-signed certificate for the local
+/// issuer key.
+pub(crate) fn access_org_issuer_install_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let handle = params
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let cert: crate::access::org::OrgIssuerCert = serde_json::from_value(
+        params
+            .get("certificate")
+            .cloned()
+            .ok_or_else(|| "certificate is required".to_string())?,
+    )
+    .map_err(|e| format!("invalid issuer certificate: {e}"))?;
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    crate::access::org::install_issuer_cert(
+        &cert_dir,
+        &handle,
+        &cert,
+        crate::access::client_key::now_unix_ms() as u64,
+    )?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "installed": true,
+        "handle": handle,
+        "issuer_key": cert.issuer_key,
     }))
 }
 
@@ -27922,7 +28041,10 @@ fn dashboard_http_operation(
         | ("POST", "/api/access/orgs/trust")
         | ("POST", "/api/access/orgs/revoke")
         | ("POST", "/api/access/org-grants/issue")
-        | ("POST", "/api/access/org-grants/revoke-member") => {
+        | ("POST", "/api/access/org-grants/revoke-member")
+        | ("POST", "/api/access/org-grants/issuers/init")
+        | ("POST", "/api/access/org-grants/issuers/delegate")
+        | ("POST", "/api/access/org-grants/issuers/install") => {
             return Some(PeerOperation::AccessManage)
         }
         ("GET", "/api/access/enrollment-requests") => return Some(PeerOperation::AccessInspect),

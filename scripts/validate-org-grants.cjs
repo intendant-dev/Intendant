@@ -570,8 +570,59 @@ async function main() {
     const rePresent = await postJson(`${memberOrigin}/api/access/org-grants`, peerDoc);
     assert.strictEqual(rePresent.status, 400, `revoked peer doc re-materialized: ${JSON.stringify(rePresent.body)}`);
 
+    // ══ Scenario 5: issuer-key delegation (phase 6 step 6b) ══
+    // The member daemon becomes a deputy issuer; the org root delegates.
+    const issuerInit = await postJson(`${memberOrigin}/api/access/org-grants/issuers/init`, { handle: 'acme' });
+    assert.strictEqual(issuerInit.status, 200, `issuer init failed: ${JSON.stringify(issuerInit.body)}`);
+    const issuerKey = issuerInit.body.issuer_key;
+    const delegated = await postJson(`${orgApi}/api/access/org-grants/issuers/delegate`, {
+      handle: 'acme',
+      issuer_key: issuerKey,
+      label: 'E2E deputy',
+    });
+    assert.strictEqual(delegated.status, 200, `delegate failed: ${JSON.stringify(delegated.body)}`);
+    const installed = await postJson(`${memberOrigin}/api/access/org-grants/issuers/install`, {
+      handle: 'acme',
+      certificate: delegated.body.certificate,
+    });
+    assert.strictEqual(installed.status, 200, `install failed: ${JSON.stringify(installed.body)}`);
+
+    // The deputy (holding no root key) issues a chained document; the
+    // member daemon materializes it and records the issuer.
+    const deputyIssued = await postJson(`${memberOrigin}/api/access/org-grants/issue`, {
+      handle: 'acme',
+      client_key_fingerprint: 'deputy-signed-member',
+      label: 'Deputy Member',
+      role_id: 'role:session-reader',
+      targets: ['*'],
+      ttl_ms: 60 * 60 * 1000,
+    });
+    assert.strictEqual(deputyIssued.status, 200, `deputy issue failed: ${JSON.stringify(deputyIssued.body)}`);
+    assert.strictEqual((deputyIssued.body.document.chain || []).length, 1, 'deputy document missing chain');
+    assert.strictEqual(deputyIssued.body.org_root_key, rootKey, 'deputy document names wrong root');
+    const presentedDeputy = await postJson(`${memberOrigin}/api/access/org-grants`, deputyIssued.body.document);
+    assert.strictEqual(presentedDeputy.status, 200, `deputy doc present failed: ${JSON.stringify(presentedDeputy.body)}`);
+    assert.strictEqual(presentedDeputy.body.grant.issued_via, issuerKey, 'issued_via not recorded');
+
+    // Revoking the issuer key sweeps everything it signed and blocks
+    // both new materialization and renewal.
+    const revokeIssuer = await postJson(`${orgApi}/api/access/org-grants/revoke-member`, {
+      handle: 'acme',
+      issuer_key: issuerKey,
+    });
+    assert.strictEqual(revokeIssuer.status, 200, `issuer revoke failed: ${JSON.stringify(revokeIssuer.body)}`);
+    const appliedIssuer = await postJson(`${memberOrigin}/api/access/orgs/revocations/apply`, revokeIssuer.body.orl);
+    assert.strictEqual(appliedIssuer.status, 200, `issuer orl apply failed: ${JSON.stringify(appliedIssuer.body)}`);
+    assert(appliedIssuer.body.applied.revoked_grants >= 1, `issuer sweep missed the grant: ${JSON.stringify(appliedIssuer.body.applied)}`);
+    const rePresentDeputy = await postJson(`${memberOrigin}/api/access/org-grants`, deputyIssued.body.document);
+    assert.strictEqual(rePresentDeputy.status, 400, `revoked-issuer doc re-materialized: ${JSON.stringify(rePresentDeputy.body)}`);
+    assert(/issuer key/.test(String(rePresentDeputy.body.error)), `expected issuer refusal: ${JSON.stringify(rePresentDeputy.body)}`);
+    const renewDeputy = await postJson(`${orgApi}/api/access/org-grants/renew`, deputyIssued.body.document);
+    assert.strictEqual(renewDeputy.status, 400, `revoked-issuer doc renewed: ${JSON.stringify(renewDeputy.body)}`);
+
     console.log(JSON.stringify({
       ok: true,
+      issuer: { key: issuerKey, revoked: true },
       peer_subject: { fingerprint: peerFp, final_status: peerRecord.status },
       org_root_key: rootKey,
       local_fingerprint: fingerprintLocal,
