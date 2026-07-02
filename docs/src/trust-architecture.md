@@ -147,6 +147,105 @@ otherwise: the hosted dashboard survives as an explicitly labeled
 root by daemon-side policy (see role ceilings below), useful for emergencies
 and first contact, honest about what it is.
 
+## Phase 6 design: organization grants in detail
+
+> Status: **design for review** — not yet implemented. This section is the
+> spec the implementation will follow; the earlier "two lanes" section is
+> the product narrative it serves.
+
+### Objects
+
+**Org identity.** An organization is an Ed25519 root keypair plus a handle.
+The root key lives on an org-designated daemon
+(`intendant org init <handle>` →
+`~/.intendant/access-certs/org/<handle>/root.pk8`, 0600), following the
+existing daemon-identity custody pattern; it is exportable for offline
+custody. The format reserves a delegation chain so day-to-day signing can
+later move to issuer keys certified by the root — v1 signs with the root
+directly.
+
+**Org grant document.** A self-contained, signed statement a member presents
+to any daemon that trusts the org key:
+
+```json
+{
+  "v": 1,
+  "kind": "org-grant",
+  "org": { "handle": "acme", "root_key": "<ed25519 b64u>" },
+  "subject": {
+    "client_key_fingerprint": "…"        // or connect account {user_id, account_name}
+  },                                      // (peer_fingerprint subjects: v1.1)
+  "role_id": "role:session-reader",
+  "targets": ["*"],                       // or explicit daemon ids
+  "grant_id": "<uuid>",                   // stable id, used by revocation
+  "issued_at_unix_ms": 0,
+  "expires_at_unix_ms": 0,                // REQUIRED; hard cap 90d, default 30d
+  "sig": "<ed25519 over the canonical payload>"
+}
+```
+
+The signing payload is newline-joined fields (the protocol style already
+used by claim proofs and client-key offers), not canonical JSON. The
+document is *authorization*, not authentication: only the bound subject can
+use it, because sessions still authenticate the subject itself (client-key
+signature or Connect account) — a stolen document is useless to anyone
+else, and third-party replay just re-materializes the same grant.
+
+**Daemon-side org trust.** `iam.json` gains
+`trusted_orgs: [{handle, root_key, max_role, status, added_at}]`. Trusting
+an org is a root-session action on each daemon — one click across the fleet
+via the phase-4 fanout. `max_role` defaults to `role:operator`: an org can
+never hand out more authority on your daemon than you allowed it, and
+org-root requires an explicit local override (ceilings still apply on top,
+by binding provenance, as today).
+
+### Verification and materialization
+
+On presentation, the daemon verifies: signature against a *trusted* org
+root key → expiry → `targets` contains this daemon (or `*`) → role exists,
+is enforced, is not a peer profile for a human subject, and fits under the
+org's `max_role`. It then **materializes an ordinary local IAM grant**
+(`source: "org:acme"`, the document's `grant_id`, expiry recorded) rather
+than evaluating documents per-request — auditability and the existing
+evaluator come for free, and the local owner can revoke or re-role the
+materialized grant like any other; local IAM always wins.
+
+Prerequisite schema work, valuable on its own: `IamGrant` gains
+`expires_at_unix_ms: Option<u64>`, and enforcement treats an expired grant
+as inactive (temporary grants for humans drop out of this immediately).
+
+Presentation paths: an explicit `POST /api/access/org-grants` in the public
+doorbell class (rate-limited, size-capped — the document itself is the
+authorization), and an `org_grant` ride-along field on dashboard-control
+offers so an org member's *first* connection to an org daemon materializes
+the grant and proceeds in one round trip.
+
+### Revocation
+
+Layered, with the failure mode stated honestly:
+
+1. **Short expiries + renewal** are the primary mechanism. Documents are
+   cheap to re-issue; the org daemon serves renewals to still-valid members.
+2. **Org revocation list**: the root signs
+   `{org, seq, revoked_grant_ids[], revoked_subjects[]}`; org daemons serve
+   it publicly and gossip it over peer links; daemons enforce monotonic
+   `seq` and apply it by revoking materialized grants.
+3. **Local override** always works: any daemon root can revoke an
+   org-materialized grant locally, ORL or not.
+
+An unreachable revocation list plus a long expiry is a stale-authority
+window — hence the 90-day hard cap and the 30-day default.
+
+### Rollout
+
+1. Grant expiry in the IAM schema, evaluator, and UI.
+2. Org identity + `intendant org init` + `trusted_orgs` + Access UI section.
+3. Document format, verification, materialization endpoint, paste-to-join UI.
+4. Offer ride-along (one-round-trip first contact).
+5. Revocation list + renewal endpoint + peer gossip.
+6. Peer-daemon subjects (org grants that bridge into the peer identity
+   store) and issuer-key delegation.
+
 ## Mechanisms
 
 The pieces that implement the model, mapped to the codebase:
