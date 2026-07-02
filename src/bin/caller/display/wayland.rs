@@ -7,6 +7,7 @@
 
 use super::{DisplayBackend, Frame, FrameFormat, InputEvent};
 use crate::error::CallerError;
+use ashpd::desktop::clipboard::Clipboard;
 use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
@@ -48,6 +49,11 @@ struct PortalSession {
     remote_desktop: RemoteDesktop<'static>,
     /// The session handle obtained from `create_session()`.
     session: Session<'static, RemoteDesktop<'static>>,
+    /// Clipboard portal proxy, present when the session was armed for
+    /// clipboard access before `Start` (the portal requires the capability
+    /// request up front). Consumed by the paste path; `None` when the
+    /// portal backend lacks the Clipboard interface.
+    clipboard: Option<Clipboard<'static>>,
 }
 
 /// Wayland screen capture and input injection backend.
@@ -136,6 +142,25 @@ impl DisplayBackend for WaylandBackend {
             )
             .await
             .map_err(|e| CallerError::Display(format!("select sources: {e}")))?;
+
+        // --- Clipboard capability (optional, must precede Start) ---
+        // Arms the session for later paste operations; no clipboard data
+        // moves here. portal backends without the Clipboard interface
+        // (pre-45 portal-gnome, portal-gtk) leave it None and paste keeps
+        // its unsupported error while capture and input proceed normally.
+        let clipboard = match Clipboard::new().await {
+            Ok(proxy) => match proxy.request_clipboard(&session).await {
+                Ok(()) => Some(proxy),
+                Err(e) => {
+                    eprintln!("[display/wayland] clipboard portal request failed: {e}");
+                    None
+                }
+            },
+            Err(e) => {
+                eprintln!("[display/wayland] clipboard portal unavailable: {e}");
+                None
+            }
+        };
 
         let started = remote_desktop
             .start(&session, None)
@@ -227,6 +252,7 @@ impl DisplayBackend for WaylandBackend {
             pw_thread,
             remote_desktop,
             session,
+            clipboard,
         });
 
         Ok(rx)
