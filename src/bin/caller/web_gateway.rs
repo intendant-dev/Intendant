@@ -17374,9 +17374,34 @@ pub fn spawn_web_gateway(
         tls_acceptor.is_some(),
     );
     let agent_card = build_local_agent_card(advertise_urls, local_card_auth);
-    let agent_card_json = serde_json::to_string(&agent_card).unwrap_or_else(|_| "{}".to_string());
-    let agent_card_value =
+    let mut agent_card_value =
         serde_json::to_value(&agent_card).unwrap_or_else(|_| serde_json::json!({}));
+    // Phase 7: the signed card names the rendezvous this daemon actually
+    // polls, so browsers learn the signaling base from the daemon record
+    // instead of assuming the default hosted instance.
+    if config.connect.enabled {
+        if let Some(base) = config
+            .connect
+            .rendezvous_url
+            .as_deref()
+            .map(str::trim)
+            .filter(|url| !url.is_empty())
+        {
+            agent_card_value["rendezvous_base"] =
+                serde_json::Value::String(base.trim_end_matches('/').to_string());
+            if let Some(id) = config
+                .connect
+                .daemon_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|id| !id.is_empty())
+            {
+                agent_card_value["connect_daemon_id"] = serde_json::Value::String(id.to_string());
+            }
+        }
+    }
+    let agent_card_json =
+        serde_json::to_string(&agent_card_value).unwrap_or_else(|_| "{}".to_string());
     let agent_card_value_for_targets = agent_card_value.clone();
     let bootstrap_caches = crate::dashboard_control::DashboardBootstrapCaches::default();
 
