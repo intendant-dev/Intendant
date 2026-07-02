@@ -63,6 +63,12 @@ pub struct TrustedOrg {
     pub status: String,
     #[serde(default)]
     pub added_at_unix_ms: Option<u64>,
+    /// Cap for org grants whose subject is a peer daemon, in the peer
+    /// profile vocabulary. Empty means fail-closed: trusting an org grants
+    /// no daemon-to-daemon authority until the owner raises this — the
+    /// human and peer lanes are separate trust decisions.
+    #[serde(default)]
+    pub max_peer_profile: String,
     /// Highest org revocation list `seq` applied on this daemon; lists at
     /// or below it are idempotently ignored.
     #[serde(default)]

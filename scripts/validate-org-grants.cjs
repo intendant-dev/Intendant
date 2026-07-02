@@ -519,8 +519,60 @@ async function main() {
     iam = readMemberIam(memberHome);
     assert.strictEqual(iam.grants.find(g => g.id === hostedGrant.id).status, 'revoked', 'reconnect resurrected an ORL-revoked grant');
 
+    // ══ Scenario 4: peer-daemon subjects (phase 6 step 6a) ══
+    const peerFp = 'aa11bb22cc33dd44ee55ff66aa77bb88cc99dd00ee11ff22aa33bb44cc55dd66';
+    const issuedPeer = await postJson(`${orgApi}/api/access/org-grants/issue`, {
+      handle: 'acme',
+      peer_fingerprint: peerFp,
+      label: 'Build daemon',
+      role_id: 'peer:session-reader',
+      targets: ['*'],
+      ttl_ms: 60 * 60 * 1000,
+    });
+    assert.strictEqual(issuedPeer.status, 200, `peer issue failed: ${JSON.stringify(issuedPeer.body)}`);
+    const peerDoc = issuedPeer.body.document;
+
+    // Fail closed: the member daemon trusts the org for humans, but has
+    // granted it no peer authority — the document is refused.
+    const failClosed = await postJson(`${memberOrigin}/api/access/org-grants`, peerDoc);
+    assert.strictEqual(failClosed.status, 400, `peer doc accepted without a peer cap: ${JSON.stringify(failClosed.body)}`);
+    assert(/no peer authority/.test(String(failClosed.body.error)), `expected fail-closed refusal: ${JSON.stringify(failClosed.body)}`);
+
+    // The owner raises the peer cap (re-trust keeps applied ORL state).
+    const retrust = await postJson(`${memberOrigin}/api/access/orgs/trust`, {
+      handle: 'acme',
+      root_key: rootKey,
+      max_peer_profile: 'session-reader',
+    });
+    assert.strictEqual(retrust.status, 200, `re-trust failed: ${JSON.stringify(retrust.body)}`);
+
+    const presentedPeer = await postJson(`${memberOrigin}/api/access/org-grants`, peerDoc);
+    assert.strictEqual(presentedPeer.status, 200, `peer present failed: ${JSON.stringify(presentedPeer.body)}`);
+    assert.strictEqual(presentedPeer.body.peer_identity.profile, 'session-reader');
+    const peerRecordPath = path.join(memberHome, '.intendant', 'access-certs', 'peer-access-identities', `${peerFp}.json`);
+    let peerRecord = JSON.parse(fs.readFileSync(peerRecordPath, 'utf8'));
+    assert.strictEqual(peerRecord.status, 'approved');
+    assert.strictEqual(peerRecord.source, 'org:acme');
+    assert.strictEqual(peerRecord.org_grant_id, peerDoc.grant_id);
+    assert(Number(peerRecord.expires_at_unix) > Date.now() / 1000, 'peer record missing expiry');
+
+    // ORL subject revocation sweeps the peer identity store too.
+    const revokePeer = await postJson(`${orgApi}/api/access/org-grants/revoke-member`, {
+      handle: 'acme',
+      subject: peerFp,
+    });
+    assert.strictEqual(revokePeer.status, 200, `peer revoke-member failed: ${JSON.stringify(revokePeer.body)}`);
+    const appliedPeer = await postJson(`${memberOrigin}/api/access/orgs/revocations/apply`, revokePeer.body.orl);
+    assert.strictEqual(appliedPeer.status, 200, `peer orl apply failed: ${JSON.stringify(appliedPeer.body)}`);
+    assert.strictEqual(appliedPeer.body.applied.revoked_peer_identities, 1, `peer identity not swept: ${JSON.stringify(appliedPeer.body.applied)}`);
+    peerRecord = JSON.parse(fs.readFileSync(peerRecordPath, 'utf8'));
+    assert.strictEqual(peerRecord.status, 'revoked', 'peer record not revoked by ORL');
+    const rePresent = await postJson(`${memberOrigin}/api/access/org-grants`, peerDoc);
+    assert.strictEqual(rePresent.status, 400, `revoked peer doc re-materialized: ${JSON.stringify(rePresent.body)}`);
+
     console.log(JSON.stringify({
       ok: true,
+      peer_subject: { fingerprint: peerFp, final_status: peerRecord.status },
       org_root_key: rootKey,
       local_fingerprint: fingerprintLocal,
       hosted_fingerprint: fingerprintHosted,

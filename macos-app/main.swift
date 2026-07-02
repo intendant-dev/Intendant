@@ -462,6 +462,18 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
         webView.load(URLRequest(url: intendantBackendURL()))
     }
 
+    // Navigation outcomes are otherwise invisible from outside the app;
+    // these lines are what `open`-less smoke runs and Console.app get.
+    func webView(_ webView: WKWebView, didFinish navigation: WKNavigation!) {
+        NSLog("Dashboard loaded: \(webView.url?.absoluteString ?? "?")")
+    }
+
+    func webView(_ webView: WKWebView,
+                 didFailProvisionalNavigation navigation: WKNavigation!,
+                 withError error: Error) {
+        NSLog("Dashboard failed to load: \(error.localizedDescription)")
+    }
+
     // MARK: - Backend
 
     func startBackend() {
@@ -682,6 +694,12 @@ class AppDelegate: NSObject, NSApplicationDelegate, WKUIDelegate, WKNavigationDe
                     self.startHealthCheck()
                 }
             } else {
+                // Silent-by-default; the last attempts say why the failure
+                // page is about to render (slow cold start vs TLS refusal).
+                if attempts >= 28 {
+                    let status = (response as? HTTPURLResponse)?.statusCode ?? 0
+                    NSLog("Backend readiness poll failing (attempt \(attempts + 1)/30): status=\(status) error=\(error?.localizedDescription ?? "none")")
+                }
                 DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
                     self.poll(attempts: attempts + 1)
                 }

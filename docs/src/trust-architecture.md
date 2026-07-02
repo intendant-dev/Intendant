@@ -361,10 +361,13 @@ kept short-lived without the issuer in the loop.
    its original lifetime span. UI: revoke-member / copy-list / apply-list
    / renew flows under Access → Advanced → Organizations. Peer-link
    gossip and periodic pull remain for later plumbing.
-6. ⏳ Peer-daemon subjects and issuer-key delegation — design proposed
-   below, awaiting sign-off.
+6. 🟡 Peer-daemon subjects ✅ / issuer-key delegation ⏳. Peer subjects
+   are built per the design below (fail-closed `max_peer_profile`,
+   explicit presentation only — no peer-doorbell ride-along in v1.1, per
+   sign-off); issuer keys remain to build (chain-only, also per
+   sign-off). E2E: `scripts/validate-org-grants.cjs` scenario 4.
 
-### Step 6 design: peer subjects and issuer keys (proposed, not built)
+### Step 6 design: peer subjects (built) and issuer keys (accepted, not built)
 
 **Peer-daemon subjects.** An org grant whose subject is a *peer daemon*
 materializes into the peer identity store
@@ -427,14 +430,13 @@ matching the `chain` recorded at materialization time — which means the
 materialization audit/grant record starts persisting the issuer key it
 accepted.
 
-**Open questions for sign-off.** (a) Should peer-subject documents also
-ride along on the peer doorbell/handshake the way client-key documents
-ride dashboard offers, or stay explicit-presentation-only in v1.1?
-(b) Is `session-reader` the right default `max_peer_profile`, or should
-trusting an org grant no peer authority at all until the owner raises it
-(fail-closed default)? (c) Should issuer certs be publishable next to
-the ORL (`GET /api/access/orgs/<handle>/issuers`) so consumers can
-prefetch, or only ever travel inside document chains?
+**Decisions (signed off 2026-07-02).** (a) Explicit presentation only in
+v1.1 — a peer-doorbell ride-along would bypass the peer approval queue
+and needs its own design pass; (b) fail-closed: `max_peer_profile` is
+empty by default and trusting an org grants no daemon-to-daemon
+authority until the owner raises it — the two lanes are separate trust
+decisions; (c) chain-only issuer certs — a published list adds no
+verification value; documents stay self-contained.
 
 ## Mechanisms
 

@@ -37718,7 +37718,8 @@ function renderAccessOrganizations() {
     kind.className = 'acc-principal-kind';
     const key = accessModelLabel(org.root_key);
     const orlSeq = Number(org.last_orl_seq || 0);
-    kind.textContent = `root key ${key.slice(0, 12)}…${key.slice(-4)}${orlSeq > 0 ? ` · revocations seq ${orlSeq}` : ''}`;
+    const peerCap = String(org.max_peer_profile || '').trim();
+    kind.textContent = `root key ${key.slice(0, 12)}…${key.slice(-4)} · peer cap: ${peerCap || 'none'}${orlSeq > 0 ? ` · revocations seq ${orlSeq}` : ''}`;
     kind.title = key;
     nameWrap.append(name, kind);
     head.append(glyph, nameWrap);
@@ -37806,6 +37807,30 @@ function renderAccessOrganizations() {
   }
   capLabel.appendChild(capSelect);
   grid.appendChild(capLabel);
+  const peerCapLabel = document.createElement('label');
+  peerCapLabel.textContent = 'Peer cap';
+  peerCapLabel.title = 'Cap for org grants to member DAEMONS (peer profiles). Off by default: the human and peer lanes are separate trust decisions.';
+  const peerCapSelect = document.createElement('select');
+  peerCapSelect.id = 'access-org-trust-peer-cap';
+  for (const [value, text] of [
+    ['', 'No peer authority (default)'],
+    ['presence-only', 'presence-only'],
+    ['stats', 'stats'],
+    ['session-reader', 'session-reader'],
+    ['read-only-display', 'read-only-display'],
+    ['file-reader', 'file-reader'],
+    ['file-operator', 'file-operator'],
+    ['terminal-operator', 'terminal-operator'],
+    ['task-runner', 'task-runner'],
+    ['operator', 'operator'],
+  ]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    peerCapSelect.appendChild(option);
+  }
+  peerCapLabel.appendChild(peerCapSelect);
+  grid.appendChild(peerCapLabel);
   form.appendChild(grid);
   const actions = document.createElement('div');
   actions.className = 'acc-grant-flow-actions';
@@ -37826,6 +37851,7 @@ function renderAccessOrganizations() {
         handle,
         root_key: rootKey,
         max_role: document.getElementById('access-org-trust-cap')?.value || 'role:operator',
+        max_peer_profile: document.getElementById('access-org-trust-peer-cap')?.value || '',
       });
       showControlToast?.('success', `Org @${handle} trusted`);
     } catch (err) {
@@ -37867,6 +37893,21 @@ function renderAccessOrganizations() {
     }
     handleLabel.appendChild(handleSelect);
     igrid.appendChild(handleLabel);
+    const kindLabel = document.createElement('label');
+    kindLabel.textContent = 'Subject';
+    const kindSelect = document.createElement('select');
+    kindSelect.id = 'access-org-issue-kind';
+    for (const [value, text] of [
+      ['client_key', 'Member browser key'],
+      ['peer', 'Member daemon (peer certificate)'],
+    ]) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      kindSelect.appendChild(option);
+    }
+    kindLabel.appendChild(kindSelect);
+    igrid.appendChild(kindLabel);
     for (const [id, labelText, placeholder] of [
       ['access-org-issue-fingerprint', 'Member browser key fingerprint', 'from their Access page'],
       ['access-org-issue-label', 'Member label', 'e.g. Alice'],
@@ -37886,13 +37927,34 @@ function renderAccessOrganizations() {
     roleLabel.textContent = 'Role';
     const roleSelect = document.createElement('select');
     roleSelect.id = 'access-org-issue-role';
-    for (const role of accessAssignableIamRoles()) {
-      const option = document.createElement('option');
-      option.value = accessModelLabel(role.id);
-      option.textContent = accessModelLabel(role.label, role.id);
-      if (accessModelLabel(role.id) === 'role:observer') option.selected = true;
-      roleSelect.appendChild(option);
-    }
+    const rebuildRoleOptions = () => {
+      roleSelect.innerHTML = '';
+      if (kindSelect.value === 'peer') {
+        for (const profile of ['presence-only', 'stats', 'session-reader', 'read-only-display', 'file-reader', 'file-operator', 'terminal-operator', 'task-runner', 'operator']) {
+          const option = document.createElement('option');
+          option.value = `peer:${profile}`;
+          option.textContent = `peer:${profile}`;
+          if (profile === 'session-reader') option.selected = true;
+          roleSelect.appendChild(option);
+        }
+      } else {
+        for (const role of accessAssignableIamRoles()) {
+          const option = document.createElement('option');
+          option.value = accessModelLabel(role.id);
+          option.textContent = accessModelLabel(role.label, role.id);
+          if (accessModelLabel(role.id) === 'role:observer') option.selected = true;
+          roleSelect.appendChild(option);
+        }
+      }
+    };
+    rebuildRoleOptions();
+    kindSelect.addEventListener('change', () => {
+      rebuildRoleOptions();
+      const fp = document.getElementById('access-org-issue-fingerprint');
+      if (fp) fp.placeholder = kindSelect.value === 'peer' ? 'peer certificate SHA-256 (64 hex chars)' : 'from their Access page';
+      const fpLabel = fp?.closest('label');
+      if (fpLabel) fpLabel.firstChild.textContent = kindSelect.value === 'peer' ? 'Member daemon cert fingerprint' : 'Member browser key fingerprint';
+    });
     roleLabel.appendChild(roleSelect);
     igrid.appendChild(roleLabel);
     const ttlLabel = document.createElement('label');
@@ -37928,9 +37990,12 @@ function renderAccessOrganizations() {
     output.style.marginTop = '10px';
     issueBtn.addEventListener('click', async () => {
       try {
+        const issueKind = document.getElementById('access-org-issue-kind')?.value || 'client_key';
+        const issueFp = document.getElementById('access-org-issue-fingerprint')?.value?.trim();
         const data = await accessOrgCall('api_access_org_issue', '/api/access/org-grants/issue', {
           handle: document.getElementById('access-org-issue-handle')?.value,
-          client_key_fingerprint: document.getElementById('access-org-issue-fingerprint')?.value?.trim(),
+          client_key_fingerprint: issueKind === 'peer' ? '' : issueFp,
+          peer_fingerprint: issueKind === 'peer' ? issueFp : '',
           label: document.getElementById('access-org-issue-label')?.value?.trim(),
           role_id: document.getElementById('access-org-issue-role')?.value,
           ttl_ms: Number(document.getElementById('access-org-issue-ttl')?.value || 0) || undefined,
@@ -66076,7 +66141,10 @@ document.getElementById('access-org-join-btn')?.addEventListener('click', async 
   if (status) status.textContent = 'Presenting…';
   try {
     const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
-    if (status) status.textContent = `Granted via @${data.org_handle} — ${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}.${stored ? ' Kept for automatic presentation on future connections.' : ''}`;
+    const summary = data.peer_identity
+      ? `peer profile ${data.peer_identity.profile} for ${data.peer_identity.label} until ${new Date(Number(data.peer_identity.expires_at_unix || 0) * 1000).toLocaleString()}`
+      : `${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}`;
+    if (status) status.textContent = `Granted via @${data.org_handle} — ${summary}.${stored ? ' Kept for automatic presentation on future connections.' : ''}`;
     showControlToast?.('success', 'Org grant accepted');
   } catch (err) {
     const kept = stored ? ' The document is kept in this browser and will be presented automatically once a daemon trusts the org.' : '';

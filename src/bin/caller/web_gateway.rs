@@ -24874,11 +24874,9 @@ fn fleet_access_origin_allowed(
         }
     }
     if let Ok(identities) = crate::peer::access_policy::list_identities(cert_dir) {
+        let now_unix = crate::access::client_key::now_unix_ms() / 1000;
         for identity in identities {
-            if !matches!(
-                identity.status,
-                crate::peer::access_policy::PeerIdentityStatus::Approved
-            ) {
+            if !identity.is_active(now_unix) {
                 continue;
             }
             if let Some(card_url) = identity.card_url.as_deref() {
@@ -24973,13 +24971,21 @@ pub(crate) fn access_org_present_response_value(
         &org_target_agent_card_ids(agent_card),
         crate::access::client_key::now_unix_ms() as u64,
     )?;
-    Ok(serde_json::json!({
+    let mut response = serde_json::json!({
         "schema_version": 1,
         "materialized": true,
-        "org_handle": outcome.org_handle,
-        "principal": outcome.principal,
-        "grant": outcome.grant,
-    }))
+        "org_handle": outcome.org_handle(),
+    });
+    match &outcome {
+        crate::access::org::PresentedOrgGrant::Human(human) => {
+            response["principal"] = serde_json::to_value(&human.principal).unwrap_or_default();
+            response["grant"] = serde_json::to_value(&human.grant).unwrap_or_default();
+        }
+        crate::access::org::PresentedOrgGrant::Peer(peer) => {
+            response["peer_identity"] = serde_json::to_value(&peer.record).unwrap_or_default();
+        }
+    }
+    Ok(response)
 }
 
 pub(crate) fn access_org_trust_response_value(
@@ -25004,6 +25010,7 @@ pub(crate) fn access_org_trust_response_value(
         &handle,
         &root_key,
         max_role,
+        params.get("max_peer_profile").and_then(|v| v.as_str()),
         crate::access::client_key::now_unix_ms() as u64,
     )
     .map_err(|e| e.to_string())?;
@@ -25030,6 +25037,7 @@ pub(crate) fn access_org_revoke_response_value(
         .map_err(|e| format!("load local IAM state: {e}"))?;
     let revoked = crate::access::org::revoke_org(
         &mut state,
+        &cert_dir,
         &handle,
         crate::access::client_key::now_unix_ms() as u64,
     )
@@ -25079,6 +25087,10 @@ pub(crate) fn access_org_issue_response_value(
             handle: &handle,
             client_key_fingerprint: params
                 .get("client_key_fingerprint")
+                .and_then(|v| v.as_str())
+                .unwrap_or(""),
+            peer_fingerprint: params
+                .get("peer_fingerprint")
                 .and_then(|v| v.as_str())
                 .unwrap_or(""),
             subject_label: params.get("label").and_then(|v| v.as_str()).unwrap_or(""),
@@ -25139,7 +25151,7 @@ pub(crate) fn access_org_orl_apply_response_value(
     let cert_dir = crate::access::backend::select_backend().cert_dir();
     let mut state = crate::access::iam::load_state(&cert_dir)
         .map_err(|e| format!("load local IAM state: {e}"))?;
-    let applied = crate::access::org::apply_orl(&mut state, &orl, now).map_err(|e| e.to_string())?;
+    let applied = crate::access::org::apply_orl(&mut state, &cert_dir, &orl, now).map_err(|e| e.to_string())?;
     if applied.changed {
         crate::access::iam::save_state(&cert_dir, &state)
             .map_err(|e| format!("save local IAM state: {e}"))?;
@@ -25199,7 +25211,7 @@ pub(crate) fn access_org_revoke_member_response_value(
     let applied = crate::access::iam::load_state(&cert_dir)
         .ok()
         .and_then(|mut state| {
-            let applied = crate::access::org::apply_orl(&mut state, &orl, now).ok()?;
+            let applied = crate::access::org::apply_orl(&mut state, &cert_dir, &orl, now).ok()?;
             if applied.changed {
                 crate::access::iam::save_state(&cert_dir, &state).ok()?;
             }
@@ -28481,21 +28493,25 @@ fn resolve_peer_connection_identity_from_cert_dir(
 
     let record = crate::peer::access_policy::lookup_identity(&cert_dir, fingerprint)
         .map_err(|e| (500, serde_json::json!({"error": e.to_string()}).to_string()))?;
+    let now_unix = crate::access::client_key::now_unix_ms() / 1000;
     match record {
-        Some(record)
-            if record.status == crate::peer::access_policy::PeerIdentityStatus::Approved =>
-        {
-            Ok(Some(PeerConnectionIdentity {
-                fingerprint: record.fingerprint,
-                label: record.label,
-                profile: record.profile,
-                filesystem: record.filesystem,
-            }))
-        }
+        Some(record) if record.is_active(now_unix) => Ok(Some(PeerConnectionIdentity {
+            fingerprint: record.fingerprint,
+            label: record.label,
+            profile: record.profile,
+            filesystem: record.filesystem,
+        })),
         Some(record) => Err((
             403,
             serde_json::json!({
-                "error": "peer identity revoked",
+                "error": if matches!(
+                    record.status,
+                    crate::peer::access_policy::PeerIdentityStatus::Approved
+                ) {
+                    "peer identity expired"
+                } else {
+                    "peer identity revoked"
+                },
                 "fingerprint": record.fingerprint,
                 "label": record.label,
             })
