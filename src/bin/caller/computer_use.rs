@@ -398,7 +398,15 @@ pub async fn read_screen_elements(target: DisplayTarget) -> Result<ScreenElement
         .await
         .map_err(|e| format!("element read task failed: {e}"))?
     }
-    #[cfg(not(any(target_os = "macos", windows)))]
+    #[cfg(target_os = "linux")]
+    {
+        // AT-SPI observes the session accessibility bus, which is
+        // display-server-independent (X11 and Wayland alike) and
+        // session-scoped, so the display target does not select the tree.
+        let _ = target;
+        crate::atspi_read::read_frontmost(ELEMENT_TREE_MAX_DEPTH, ELEMENT_TREE_MAX_NODES).await
+    }
+    #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
         let _ = target;
         Err(

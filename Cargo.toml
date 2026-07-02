@@ -132,6 +132,10 @@ landlock = "0.4"
 ashpd = { version = "0.11", features = ["tokio"] }
 pipewire = "0.8"
 x11rb = { version = "0.13", features = ["shm", "damage", "xfixes", "xtest"] }
+# Pure-Rust AT-SPI2 (read_screen element trees on X11 + Wayland). Pinned to
+# the 0.28+ line so it shares ashpd 0.11's zbus 5.x — older atspi forks in a
+# second zbus stack.
+atspi = { version = "0.30", features = ["tokio"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 screencapturekit = "1.5"

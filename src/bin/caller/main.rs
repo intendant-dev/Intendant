@@ -2,6 +2,7 @@ mod access;
 mod agent_runner;
 mod app_state_pricing;
 mod approval;
+mod atspi_read;
 mod audio_routing;
 mod autonomy;
 #[cfg(target_os = "macos")]
