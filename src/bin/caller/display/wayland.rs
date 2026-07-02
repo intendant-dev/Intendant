@@ -53,8 +53,6 @@ struct PortalSession {
     /// clipboard access before `Start` (the portal requires the capability
     /// request up front). Consumed by the paste path; `None` when the
     /// portal backend lacks the Clipboard interface.
-    // W2 (paste_text) reads this; allow until that slice lands.
-    #[allow(dead_code)]
     clipboard: Option<Clipboard<'static>>,
 }
 
@@ -416,6 +414,50 @@ impl DisplayBackend for WaylandBackend {
         Ok(())
     }
 
+    async fn paste_text(&self, text: &str) -> Result<(), CallerError> {
+        // Paste gesture emulation, matching the Windows backend: (1) make
+        // exactly `text` the session's current paste payload, (2) press
+        // ctrl+v in the already-approved RemoteDesktop session. The payload
+        // is only handed out when the focused app asks for it during the
+        // paste — the portal transfer callback is not a monitor.
+        let guard = self.portal_session.lock().await;
+        let ps = guard.as_ref().ok_or_else(|| {
+            CallerError::Display("no active portal session for paste".to_string())
+        })?;
+        let Some(clipboard) = &ps.clipboard else {
+            return Err(CallerError::Display(
+                "the portal backend does not provide the Clipboard interface — \
+                 use a type action instead"
+                    .to_string(),
+            ));
+        };
+
+        set_paste_payload(clipboard, &ps.session, text).await?;
+
+        let rd = &ps.remote_desktop;
+        let session = &ps.session;
+        let ctrl = super::keymap::dom_code_to_evdev("ControlLeft")
+            .ok_or_else(|| CallerError::Display("keymap missing ControlLeft".to_string()))?
+            as i32;
+        let v = super::keymap::dom_code_to_evdev("KeyV")
+            .ok_or_else(|| CallerError::Display("keymap missing KeyV".to_string()))?
+            as i32;
+        rd.notify_keyboard_keycode(session, ctrl, KeyState::Pressed)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (ctrl down)", e))?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        rd.notify_keyboard_keycode(session, v, KeyState::Pressed)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (v down)", e))?;
+        rd.notify_keyboard_keycode(session, v, KeyState::Released)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (v up)", e))?;
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        rd.notify_keyboard_keycode(session, ctrl, KeyState::Released)
+            .await
+            .map_err(|e| wayland_input_error("paste chord (ctrl up)", e))
+    }
+
     fn resolution(&self) -> (u32, u32) {
         (
             self.shared_width.load(Ordering::SeqCst),
@@ -426,6 +468,20 @@ impl DisplayBackend for WaylandBackend {
     fn kind(&self) -> &'static str {
         "wayland"
     }
+}
+
+/// Make `text` the session's current paste payload (W3: `SetSelection` for
+/// text/plain, then answer this session's `SelectionTransfer` requests with
+/// the latest explicit payload via `selection_write`/`selection_write_done`).
+async fn set_paste_payload(
+    _clipboard: &Clipboard<'static>,
+    _session: &Session<'static, RemoteDesktop<'static>>,
+    _text: &str,
+) -> Result<(), CallerError> {
+    Err(CallerError::Display(
+        "Wayland paste payload serving is not implemented yet — use a type action instead"
+            .to_string(),
+    ))
 }
 
 async fn verify_remote_interaction(
