@@ -81,6 +81,38 @@ The top tab bar has ten tabs: **Activity**, **Stats**, **Terminal**,
 **Settings**. New events arriving while you are on another tab raise a
 notification badge.
 
+### One design language, bounded DOM
+
+Every tab speaks the design language introduced with the Access redesign:
+glass cards with a title + one-line explainer, chips for status (a chip
+always carries its label — never color alone), warm-scale badges for
+authority, folds for power-user surfaces, and real empty states. The
+shared component classes are `ui-*` (grouped-selector aliases of the
+Access `acc-*` rules — one source of truth); chart and heatmap colors come
+from the validated `--viz-*` ramp tokens in `:root`. Don't improvise new
+button/chip styles or viz colors — reuse these.
+
+Two invariants keep a long-lived dashboard responsive:
+
+- **Hidden panes don't render.** High-frequency events (transport status
+  ticks, `update_usage`, session refreshes, transfer progress) route
+  through `renderOrDefer(tab, key, fn)`: visible panes render immediately;
+  hidden panes remember only the latest render thunk per key and run it
+  once on the next pane entry (`switchTab` flush / `visibilitychange`).
+  Data merging still happens eagerly — only DOM work is deferred.
+- **Client state is bounded.** The live log DOM is capped (10k entries,
+  pruned with scroll compensation), session-window histories cap at 5000
+  items (older entries stay reachable via remote paging; replay dedup
+  survives the trim), finished file transfers prune beyond 100, and
+  per-display metric cards retire with their display.
+
+The log stream manages scroll position manually (`overflow-anchor: none`):
+when you scroll up to read, appends and prunes never move your view — new
+entries count on a bottom-center jump-to-live pill instead. QA harnesses
+can probe pane/render state and drive the real log append pipeline via
+`window.__intendantPaneDiag` (the app script is module-scoped, so probes
+cannot reach bindings by name).
+
 ### Activity
 
 The default tab. Five subtabs:
@@ -182,9 +214,13 @@ after each pane action, thread-action result, session start, and usage update.
 
 Token-consumption and cost tracking:
 
+- A KPI tile row up top: today / this-week / all-time cost, lifetime
+  tokens, active days (skeleton tiles while session stats stream in)
 - Per-model breakdown for the main and presence models (prompt, completion, and
-  cached token counts)
+  cached token counts), with a token-pressure meter per card
 - Cost estimates from a built-in pricing table (OpenAI, Anthropic, Gemini)
+- Token activity: a daily skyline and a GitHub-style year heatmap on the
+  validated single-hue `--viz-*` ramp, filterable by agent and period
 - All-sessions cumulative usage and disk usage
 - Display-transport metrics (frame rate, encode latency, bandwidth per display)
 
@@ -242,15 +278,23 @@ and density tuning.
 
 A browser of past and current sessions. Four subtabs:
 
-- **Recent** — recent sessions with metadata (task, duration, status); click one
-  to view its recordings and event log. Child sub-agent sessions are hidden by
-  default; enable **Show subagents** to include them. Fork and side sessions
-  stay visible with lineage chips that point back to their parent session.
+- **Recent** — recent sessions as calm three-line cards (title + status
+  chip + source badge; task snippet; compact meta) — the long tail (ids,
+  absolute dates, token breakdown, disk) lives in the meta tooltip and the
+  detail overlay. A stat-tile strip aggregates the filtered set. Lists
+  render 300 cards and grow with an explicit **Show more** control; the
+  first load shows skeleton rows while the list streams. Child sub-agent
+  sessions are hidden by default; enable **Show subagents** to include
+  them. Fork and side sessions stay visible with lineage chips that point
+  back to their parent session.
 - **Deep Search** — search across session history.
-- **Worktrees** — the git worktrees in use by sub-agents.
+- **Worktrees** — the git worktrees in use by sub-agents (same card +
+  Show-more treatment).
 - **New Session** — start a fresh session from the dashboard.
   External Codex sessions can choose both the binary path and the
-  `managed_context` mode (`vanilla` or `managed`) for that session.
+  `managed_context` mode (`vanilla` or `managed`) for that session; the
+  external-agent options sit in a fold that opens when an external
+  backend is selected.
 
 External-agent session cards and Activity windows also expose **Launch config**
 for per-session binary and managed-context settings. Use **Save** to update the
@@ -489,10 +533,11 @@ vocabulary.
 
 ### Debug
 
-A raw view of internal state — the same data as the `GET /debug` endpoint
-(agent state, voice connection, active browser), useful when diagnosing the
-gateway or presence wiring. It also includes a browser-workspace panel for
-manual smoke testing of local CDP-backed browser workspaces and their leases.
+Observer display and browser workspaces (daemon diagnostics and raw event
+streams live under **Access → Diagnostics**). The observer display is a
+headless debug screen the agent can draw on, recordable from here. The
+browser-workspace panel does manual smoke testing of local CDP-backed
+browser workspaces and their leases.
 CDP workspaces prefer managed Chromium/Chrome-for-Testing executables; on macOS
 system Chrome/Chromium apps require choosing `system_cdp` or setting
 `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1`. Run
