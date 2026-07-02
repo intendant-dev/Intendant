@@ -214,7 +214,7 @@ mod walk {
                 }
                 let title = win.name().await.unwrap_or_default();
                 if states.contains(State::Active) && active.is_none() {
-                    let pid = win.get_process_id().await.unwrap_or(0);
+                    let pid = pid_of(&conn, win.inner().destination().as_str()).await;
                     active = Some((app_name.clone(), pid, win, title));
                 } else if !title.trim().is_empty() && other_windows.len() < MAX_OTHER_WINDOWS {
                     other_windows.push(format!("{title} ({app_name})"));
@@ -240,7 +240,7 @@ mod walk {
 
         let mut budget = max_nodes;
         let mut truncated = false;
-        let root = walk_element(&conn, &window, max_depth, &mut budget, &mut truncated).await;
+        let root = walk_element(&conn, window, max_depth, &mut budget, &mut truncated).await;
 
         let mut truncated_msg = truncated.then(|| {
             format!("element tree truncated at {max_nodes} nodes / depth {max_depth}")
@@ -266,12 +266,28 @@ mod walk {
         })
     }
 
+    /// Resolve the pid behind a unique bus name on the accessibility bus
+    /// (AT-SPI's Accessible interface does not expose pids directly).
+    async fn pid_of(conn: &AccessibilityConnection, bus_name: &str) -> i32 {
+        let Ok(dbus) = ashpd::zbus::fdo::DBusProxy::new(conn.connection()).await else {
+            return 0;
+        };
+        let Ok(name) = ashpd::zbus::names::BusName::try_from(bus_name.to_string()) else {
+            return 0;
+        };
+        dbus.get_connection_unix_process_id(name)
+            .await
+            .map(|pid| pid as i32)
+            .unwrap_or(0)
+    }
+
     /// Depth-first bounded walk. Values (field contents) are deliberately not
     /// collected — roles, labels, and geometry are enough to act on, and keep
-    /// the observation metadata-only.
+    /// the observation metadata-only. Takes the proxy by value: the recursive
+    /// boxed future must not borrow loop-local children.
     fn walk_element<'a>(
         conn: &'a AccessibilityConnection,
-        el: &'a AccessibleProxy<'static>,
+        el: AccessibleProxy<'static>,
         depth_left: usize,
         budget: &'a mut usize,
         truncated: &'a mut bool,
@@ -298,7 +314,7 @@ mod walk {
                 return None;
             }
 
-            let extents = component_extents(conn, el).await.unwrap_or((0, 0, 0, 0));
+            let extents = component_extents(conn, &el).await.unwrap_or((0, 0, 0, 0));
 
             let mut children = Vec::new();
             if depth_left > 0 {
@@ -314,7 +330,7 @@ mod walk {
                             continue;
                         };
                         if let Some(child_el) =
-                            walk_element(conn, &child, depth_left - 1, budget, truncated).await
+                            walk_element(conn, child, depth_left - 1, budget, truncated).await
                         {
                             children.push(child_el);
                         }
