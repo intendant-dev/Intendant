@@ -13,31 +13,91 @@ the *model* seeing and acting, not the human-facing video transport.
 ## Computer Use
 
 The CU abstraction (`src/bin/caller/computer_use.rs`) gives any provider a
-common set of actions (click, type, key, scroll, move, drag, screenshot) and
-dispatches them through a platform backend. Provider-specific parsing of CU tool
-calls (OpenAI computer-use, Anthropic computer-use, Gemini) lives in
-`provider.rs`; the executor here is provider-neutral.
+common action set and dispatches it through a platform backend. Provider-
+specific parsing of CU tool calls (OpenAI computer-use, Anthropic
+`computer_20251124`, Gemini) lives in `provider.rs`; the executor here is
+provider-neutral. Anthropic `wait`/`hold_key` durations arrive in **seconds**
+and are converted to milliseconds (clamped to 30 s) at parse time.
+
+The full `CuAction` vocabulary (the same tagged JSON accepted by the MCP
+`execute_cu_actions` tool and `intendant ctl cu actions`):
+`click`, `double_click`, `triple_click`, `mouse_down`, `mouse_up`, `type`,
+`paste` (clipboard + paste chord — fast for long text; restores the previous
+clipboard text on the user's macOS session), `key`, `hold_key`, `scroll`,
+`move_mouse`, `drag`, `screenshot`, `zoom` (region capture at the highest
+resolution the platform can supply — native 2x pixels on Retina), and `wait`.
+`intendant ctl cu actions --help` prints the per-action field shapes with an
+example.
 
 ### Backends
 
 `DisplayBackend` (in `computer_use.rs`) is detected at runtime by
-`DisplayBackend::detect()` — macOS → `MacOS`; otherwise `WAYLAND_DISPLAY` set →
-`Wayland`; else `X11`. It can be forced via the `backend` config value.
+`DisplayBackend::detect()` — macOS → `MacOS`; Windows → `Windows`; otherwise
+`WAYLAND_DISPLAY` set → `Wayland`; else `X11`. It can be forced via the
+`backend` config value.
 
-| Backend | Screenshot capture       | Input injection | Platform        |
-|---------|--------------------------|-----------------|-----------------|
-| X11     | ImageMagick `import`     | `xdotool`       | Linux (X11)     |
-| Wayland | `grim`                   | `ydotool`       | Linux (Wayland) |
-| MacOS   | `screencapture`          | `cliclick`      | macOS           |
+| Backend | Screenshot capture                          | Input injection            | Platform        |
+|---------|---------------------------------------------|----------------------------|-----------------|
+| X11     | live session frame, else ImageMagick `import` | `xdotool`                | Linux (X11)     |
+| Wayland | live session frame (PipeWire portal)        | portal `InputEvent`s       | Linux (Wayland) |
+| MacOS   | live session frame, else `screencapture`    | in-process CGEvents        | macOS           |
+| Windows | live session frame (DXGI)                   | `SendInput` via session    | Windows         |
 
-> **Status note:** The `Wayland` backend's input path (`ydotool`, requires
-> `/dev/uinput`) is marked *not yet implemented* in the source. Virtual displays
-> are always Xvfb (X11), so even on a Wayland host a `Virtual` target is driven
-> with X11 tooling (`import` + `xdotool`).
+Wayland and Windows are **session-only** backends: both capture and input run
+through the live `DisplaySession` (WebRTC pipeline); without an active session
+the executor returns an actionable error naming the recovery path. X11 and
+macOS inject input directly — macOS posts CoreGraphics `CGEvent`s in-process
+(no `cliclick`/`osascript` subprocesses; key chords use ANSI-US virtual
+keycodes, unicode typing is layout-independent) — and prefer the in-memory
+frame of a live capture session for screenshots, falling back to the
+subprocess tools when no session exists.
+
+**Post-action freshness:** capture backends are damage-driven, so a screenshot
+taken right after an input action waits (bounded, 300 ms) for a frame captured
+*after* the action before falling back to the freshest available frame — the
+model never sees pre-click pixels after a click that changed the screen.
 
 Coordinates from the model are in the provider's logical screenshot space and
 are scaled to the backend's actual pixel/point space before dispatch (important
 on HiDPI and under the Wayland portal, which reports its own stream size).
+`zoom` is the deliberate exception: on macOS it captures raw physical pixels
+(2x on Retina) and crops the requested logical region, because detail is the
+point.
+
+### Element Observation (`read_screen`)
+
+`read_screen` is the cheap textual grounding path: a filtered accessibility
+tree of the frontmost application's focused window — roles, labels, values,
+and logical-point frames, plus a one-line summary of other visible windows —
+typically a few hundred tokens versus ~1.5k for a screenshot. Clicks ground
+deterministically: click the center of a reported frame. Depth/node caps are
+always announced in the output, never silent.
+
+Currently macOS-only (`src/bin/caller/ax.rs`, raw `accessibility-sys` bindings
+— the documented Unix `unsafe` exception; Windows UIA / Linux AT-SPI are
+future work), user-session display only, and it requires the same
+Accessibility (TCC) permission input injection already needs. Exposed as an
+MCP tool (in the `core` bootstrap profile) and as
+`intendant ctl cu elements [--format json]`. Pixels remain the fallback for
+visual verification and for apps with sparse accessibility trees (web views
+notably).
+
+### Who Can Call CU
+
+Every agent Intendant runs or supervises reaches the same executor:
+
+- **Native agent** — provider-native CU tool calls (`cu_enabled`), executed
+  in the controller.
+- **Codex / Claude Code (supervised)** — the MCP bootstrap set
+  (`tool_profile=core`) carries `read_screen`, `take_screenshot`, and
+  `execute_cu_actions`; the injected `$INTENDANT`/`INTENDANT_MCP_URL` env
+  makes `"$INTENDANT" ctl cu ...` work from their shells for the long tail.
+  See [External Agent Orchestration](./external-agent-orchestration.md).
+- **Anything with a shell** — `intendant ctl cu` speaks to the running
+  daemon's `/mcp` endpoint; discovery is lazy via `--help`.
+
+All paths execute under the same server-side autonomy/approval model
+(`DisplayControl` session grant for the user's display).
 
 ### Display Targets
 
@@ -60,6 +120,12 @@ can produce screenshots while leaving keyboard/mouse injection unavailable. See
 [TUI & Autonomy](./tui.md) for the approval surface.
 
 ### CU-First Routing
+
+> **Status note:** CU-first routing exists and is wired as described below,
+> but it has not been validated to perform well with current models and the
+> current runtime — treat it as experimental. The fast paths and observation
+> layer above are designed for the heavy agents (native, Codex, Claude Code)
+> as primary consumers and do not depend on this router.
 
 Display-oriented work is routed to a fast CU model first, with escalation to the
 heavy agent for anything that turns out to need code changes. The routing

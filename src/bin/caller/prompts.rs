@@ -5,8 +5,6 @@ use std::path::Path;
 const DEFAULT_LIVE_AUDIO_PROMPT: &str = include_str!("../../../SysPromptLiveAudio.md");
 const DEFAULT_PROMPT: &str = include_str!("../../../SysPrompt.md");
 const DEFAULT_PROMPT_TOOLS: &str = include_str!("../../../SysPrompt_tools.md");
-#[allow(dead_code)]
-const DEFAULT_USER_PROMPT: &str = include_str!("../../../SysPrompt_user.md");
 const DEFAULT_ORCHESTRATOR_PROMPT: &str = include_str!("../../../SysPrompt_orchestrator.md");
 const DEFAULT_RESEARCH_PROMPT: &str = include_str!("../../../SysPrompt_research.md");
 const DEFAULT_IMPLEMENTATION_PROMPT: &str = include_str!("../../../SysPrompt_implementation.md");
@@ -215,7 +213,6 @@ mod tests {
     fn compiled_defaults_are_non_empty() {
         assert!(!DEFAULT_PROMPT.is_empty());
         assert!(!DEFAULT_PROMPT_TOOLS.is_empty());
-        assert!(!DEFAULT_USER_PROMPT.is_empty());
         assert!(!DEFAULT_ORCHESTRATOR_PROMPT.is_empty());
         assert!(!DEFAULT_RESEARCH_PROMPT.is_empty());
         assert!(!DEFAULT_IMPLEMENTATION_PROMPT.is_empty());

@@ -24865,8 +24865,15 @@ async fn run_agent_loop(
             // --- Native tool call path ---
             let batch = assemble_batch_from_tool_calls(&response.tool_calls);
 
+            // Call IDs answered by a dedicated handler below. Every later
+            // catch-all result loop must skip these — a second result for the
+            // same tool_use_id is rejected by strict providers (Anthropic).
+            let mut handled_call_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
             for (call_id, tool_name, result_text) in &batch.precomputed_results {
                 conversation.add_tool_result(call_id, tool_name, result_text);
+                handled_call_ids.insert(call_id.clone());
             }
 
             // Apply context directives from manage_context tool call
@@ -24910,6 +24917,9 @@ async fn run_agent_loop(
                     &batch.nonce_to_call_id,
                     &batch.call_id_names,
                 ) {
+                    if handled_call_ids.contains(&call_id) {
+                        continue;
+                    }
                     conversation.add_tool_result(&call_id, &tool_name, "OK");
                 }
                 bus.send(AppEvent::DoneSignal {
@@ -24932,6 +24942,7 @@ async fn run_agent_loop(
                             Err(e) => format!("MCP tool error: {}", e),
                         };
                         conversation.add_tool_result(call_id, tool_name, &output);
+                        handled_call_ids.insert(call_id.clone());
                     }
                 } else {
                     for (call_id, tool_name, _) in &batch.mcp_calls {
@@ -24940,12 +24951,14 @@ async fn run_agent_loop(
                             tool_name,
                             "Error: MCP client not configured",
                         );
+                        handled_call_ids.insert(call_id.clone());
                     }
                 }
             }
 
             // Process invoke_skill tool calls (if any)
             for (call_id, skill_name, arguments) in &batch.skill_invocations {
+                handled_call_ids.insert(call_id.clone());
                 let discovered = skills::discover_skills(Some(&project.root));
                 match discovered.iter().find(|s| s.config.name == *skill_name) {
                     Some(skill) => {
@@ -24992,6 +25005,9 @@ async fn run_agent_loop(
 
             // Handle shared_view tool calls (dashboard coordination layer)
             if !batch.shared_view_calls.is_empty() {
+                for (call_id, _) in &batch.shared_view_calls {
+                    handled_call_ids.insert(call_id.clone());
+                }
                 handle_shared_view_calls(
                     &batch.shared_view_calls,
                     conversation,
@@ -25008,6 +25024,7 @@ async fn run_agent_loop(
 
             // Handle live audio spawn requests (blocking)
             for (call_id, session_id, args) in &batch.live_audio_spawns {
+                handled_call_ids.insert(call_id.clone());
                 let spec_result =
                     serde_json::from_value::<live_audio_types::LiveAudioSpec>(args.clone());
                 match spec_result {
@@ -25128,11 +25145,15 @@ async fn run_agent_loop(
             // If no runtime commands, just respond to tool calls with context update
             let Some(ref json_str) = batch.agent_input_json else {
                 empty_command_streak = 0;
-                // Respond to manage_context, MCP, or empty batch
+                // Respond to whatever no dedicated handler answered above
+                // (manage_context, or an empty batch).
                 for (call_id, tool_name) in &batch.call_id_names {
-                    if !mcp_client::McpClientManager::is_mcp_tool(tool_name) {
-                        conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
+                    if handled_call_ids.contains(call_id)
+                        || mcp_client::McpClientManager::is_mcp_tool(tool_name)
+                    {
+                        continue;
                     }
+                    conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
                 }
                 continue;
             };
@@ -25147,6 +25168,9 @@ async fn run_agent_loop(
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
                 for (call_id, tool_name) in &batch.call_id_names {
+                    if handled_call_ids.contains(call_id) {
+                        continue;
+                    }
                     conversation.add_tool_result(
                         call_id,
                         tool_name,
@@ -25378,6 +25402,9 @@ async fn run_agent_loop(
 
             if should_skip {
                 for (call_id, tool_name) in &batch.call_id_names {
+                    if handled_call_ids.contains(call_id) {
+                        continue;
+                    }
                     conversation.add_tool_result(call_id, tool_name, "Command skipped by user.");
                 }
                 continue;
@@ -25427,6 +25454,9 @@ async fn run_agent_loop(
             );
             let budget = conversation.budget_summary();
             for (call_id, tool_name, result_text) in &tool_results {
+                if handled_call_ids.contains(call_id) {
+                    continue;
+                }
                 let text = format!("{}\n\n{}", result_text, budget);
                 if tool_name == "capture_screen" {
                     if let Some(images) = encode_screenshot(result_text) {

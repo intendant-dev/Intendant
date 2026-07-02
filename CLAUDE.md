@@ -89,7 +89,7 @@ src/
     ├── external_agent/         # supervise Codex / Claude Code / Gemini CLI
     ├── peer/, lan/, web_tls.rs # peer federation; mTLS LAN proxy; native HTTPS/WSS
     ├── display/                # WebRTC: encode/{pool,vp8,h264_*}, tile/, capture/, webrtc, {x11,wayland,macos,windows}
-    ├── computer_use.rs, vision.rs, recording.rs, frames.rs
+    ├── computer_use.rs, ax.rs, vision.rs, recording.rs, frames.rs
     ├── presence.rs, live_audio.rs, audio_routing.rs, transcription.rs, quarantine.rs, schema_validator.rs
     ├── web_gateway.rs, mcp.rs, mcp_client.rs, control.rs
     ├── session_log.rs, session_names.rs, knowledge.rs, project.rs, app_state_pricing.rs
@@ -100,7 +100,7 @@ static/         # app.html dashboard SPA + compiled wasm-web/ + wasm-station/
 macos-app/      # native macOS WKWebView wrapper (built by scripts/bundle-macos.sh)
 vendor/         # vortex-guest-tools (macOS Vortex Audio HAL plugin)
 scripts/        # setup-{linux,macos,windows}, setup-lan*, bundle-macos, validate-dashboard.cjs (dashboard/Station QA), …
-skills/         # phone-call, voice-call-app, wayland-portal-e2e
+skills/         # intendant-cli, visual-collaboration, phone-call, voice-call-app, …
 docs/src/       # this project's mdBook — the deep reference (see the table above)
 SysPrompt*.md   # per-role system prompts (base, tools, user, orchestrator, research, implementation, presence, live audio)
 ```

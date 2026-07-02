@@ -110,7 +110,29 @@ loop.
 | Fork / side threads / review / goals / compact / fast / memory-reset | Yes (`thread_action`) | No | No |
 
 All three spawn through `crate::platform::spawn_command(&cfg.command)` with the
-working dir set to the project root, stdin/stdout piped, and stderr inherited.
+working dir set to the project root and stdin/stdout/stderr piped; stderr is
+forwarded into the session activity log line-by-line
+(`spawn_stderr_forwarder` in `external_agent/mod.rs`), so transport/auth
+failures are visible from every frontend.
+
+### Capability plumbing per backend
+
+What each supervised backend actually receives:
+
+| | **Codex** | **Claude Code** | **Gemini CLI** |
+|---|---|---|---|
+| MCP tool exposure | `tool_profile=core` (bootstrap set) | `tool_profile=core` (bootstrap set) | full tool list (no profile) |
+| Loopback `mcp_token` in URL | yes | yes | via `mcp_token` query when configured |
+| `session_id` scope in URL | yes | yes | no |
+| `$INTENDANT` + `INTENDANT_MCP_URL` env (`ctl` bootstrap) | yes (+ `INTENDANT_MANAGED_CONTEXT`) | yes | no |
+| Guidance channel | managed-context developer message | first-prompt bootstrap addendum | none |
+
+The bootstrap set for both Codex and Claude Code includes the CU path
+(`read_screen`, `take_screenshot`, `execute_cu_actions`, `list_displays`,
+`grant_user_display`, `revoke_user_display`) and the shared-view tools
+regardless of managed context; managed-context/fission tools remain
+managed-only. Gemini CLI is currently **unmaintained** in Intendant and keeps
+its historical full-list behavior.
 
 ### Codex (the reference backend)
 
@@ -149,15 +171,21 @@ features they lack.
   supervised launches preserve Codex's normal user configuration inheritance.
 
   Codex uses `tool_profile=core` by default to avoid MCP tool-schema bloat. The
-  core profile keeps a small bootstrap surface (`get_status`, shared-view tools,
-  and, when managed context is enabled, managed-context tools plus the minimal
-  display/CU path: `list_displays`, `grant_user_display`, `revoke_user_display`,
-  `take_screenshot`, and `execute_cu_actions`). Broad or rare Intendant
-  operations should be discovered lazily through `intendant ctl --help`,
-  `intendant ctl tools list`, and focused subcommand help. Supervised Codex
-  sessions receive `INTENDANT=/absolute/path/to/intendant`, `INTENDANT_MCP_URL`,
+  core profile keeps a small bootstrap surface: `get_status`, the shared-view
+  tools, and the minimal display/CU path (`list_displays`, `grant_user_display`,
+  `revoke_user_display`, `read_screen`, `take_screenshot`,
+  `execute_cu_actions`) for managed **and** vanilla sessions; managed context
+  additionally exposes the managed-context/fission tools. Broad or rare
+  Intendant operations should be discovered lazily through
+  `intendant ctl --help`, `intendant ctl tools list`, and focused subcommand
+  help. Supervised Codex sessions receive
+  `INTENDANT=/absolute/path/to/intendant`, `INTENDANT_MCP_URL`,
   `INTENDANT_SESSION_ID`, and `INTENDANT_MANAGED_CONTEXT`, so agent shells can
-  run `"$INTENDANT" ctl ...` without relying on user PATH setup.
+  run `"$INTENDANT" ctl ...` without relying on user PATH setup. Claude Code
+  gets the same treatment (scoped URL with `tool_profile=core` + `mcp_token` +
+  `session_id`, the `$INTENDANT`/`INTENDANT_MCP_URL`/`INTENDANT_SESSION_ID`
+  env, and a first-prompt bootstrap addendum naming the bootstrap tools and
+  the `ctl` discovery flow).
 
   For dashboard/browser validation against an already-running Intendant web port,
   managed agents should use the repository helper instead of generating ad-hoc
@@ -457,7 +485,13 @@ to 50 branches), rendered as the Managed tab's fission panel (see
 Spawned in non-interactive stream-json mode with `--permission-prompt-tool stdio`,
 so permission prompts come back over the JSON stream and become
 `AgentEvent::ApprovalRequest` / `FileApprovalRequest`. The Intendant MCP server is
-passed **inline** as a JSON string to `--mcp-config` (not a file path).
+passed **inline** as a JSON string to `--mcp-config` (not a file path); the URL
+is the scoped bootstrap endpoint (`session_id` + `tool_profile=core` +
+`mcp_token`), and the child gets `$INTENDANT`, `INTENDANT_MCP_URL`, and
+`INTENDANT_SESSION_ID` so `"$INTENDANT" ctl ...` works from its shell. The
+first user message carries a bootstrap addendum naming the MCP bootstrap tools
+(`read_screen`/`take_screenshot`/`execute_cu_actions`, shared-view), the lazy
+`ctl --help` discovery flow, and the dashboard-validation helper.
 `--permission-mode` and `--allowedTools` are added from config when set;
 `--resume <id>` resumes a prior session. Claude Code doesn't surface a real session
 id at thread start, so Intendant keeps its own log id canonical until a usable
