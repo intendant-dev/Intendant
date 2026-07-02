@@ -803,6 +803,7 @@ mod tests {
             reason: "test Connect account grant".to_string(),
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
         });
 
         let grant =
@@ -883,6 +884,7 @@ mod tests {
             reason: "test client key grant".to_string(),
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
         });
 
         let key = crate::access::client_key::VerifiedClientKey {
@@ -969,6 +971,7 @@ mod tests {
             reason: "revoked Connect account grant".to_string(),
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: Some(102),
+            expires_at_unix_ms: None,
         });
 
         let grant =

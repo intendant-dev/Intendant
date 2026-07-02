@@ -173,8 +173,9 @@ to any daemon that trusts the org key:
   "kind": "org-grant",
   "org": { "handle": "acme", "root_key": "<ed25519 b64u>" },
   "subject": {
-    "client_key_fingerprint": "…"        // or connect account {user_id, account_name}
-  },                                      // (peer_fingerprint subjects: v1.1)
+    "client_key_fingerprint": "…", "label": "…"
+  },                                      // client keys ONLY in v1 (see below);
+                                          // peer_fingerprint subjects: v1.1
   "role_id": "role:session-reader",
   "targets": ["*"],                       // or explicit daemon ids
   "grant_id": "<uuid>",                   // stable id, used by revocation
@@ -187,9 +188,19 @@ to any daemon that trusts the org key:
 The signing payload is newline-joined fields (the protocol style already
 used by claim proofs and client-key offers), not canonical JSON. The
 document is *authorization*, not authentication: only the bound subject can
-use it, because sessions still authenticate the subject itself (client-key
-signature or Connect account) — a stolen document is useless to anyone
-else, and third-party replay just re-materializes the same grant.
+use it, because sessions still authenticate the subject itself — a stolen
+document is useless to anyone else, and third-party replay just
+re-materializes the same grant.
+
+Subjects are **client keys only in v1**, deliberately: a Connect-account
+subject would make the org-grant path only as trustworthy as the
+rendezvous's account assertion — a compromised hosted service could claim
+to be a granted member and collect the org's authority on every daemon
+that trusts it. Client keys authenticate cryptographically end-to-end, and
+a member without a daemon still joins fine: any page mints a key, the org
+grants that key, and hosted-origin keys remain ceiling-capped. Account
+subjects can be added later as an explicit, documented weakening if a real
+need appears.
 
 **Daemon-side org trust.** `iam.json` gains
 `trusted_orgs: [{handle, root_key, max_role, status, added_at}]`. Trusting
@@ -197,7 +208,12 @@ an org is a root-session action on each daemon — one click across the fleet
 via the phase-4 fanout. `max_role` defaults to `role:operator`: an org can
 never hand out more authority on your daemon than you allowed it, and
 org-root requires an explicit local override (ceilings still apply on top,
-by binding provenance, as today).
+by binding provenance, as today). Operator is the right default because
+trusting an org is itself the consent moment, operator already excludes
+access/settings/runtime administration, and a lower default would make the
+org lane's normal grants (terminal, files, sessions) fail confusingly. A
+document whose role exceeds `max_role` is rejected at presentation rather
+than silently downgraded, so issuers learn the cap immediately.
 
 ### Verification and materialization
 

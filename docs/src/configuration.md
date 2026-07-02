@@ -608,7 +608,7 @@ Schema version 1 contains:
 | `schema_version` | State schema version; currently `1` |
 | `principals` | Local managed human/device principal records |
 | `roles` | Built-in or local role templates |
-| `grants` | Local IAM grant records targeting daemon IDs |
+| `grants` | Local IAM grant records targeting daemon IDs (optional `expires_at_unix_ms` stops enforcement after that instant; shown as `expired`) |
 | `audit_events` | Local IAM audit metadata |
 | `role_ceilings` | Per-binding-kind effective-role caps for low-provenance sessions (see below) |
 | `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |

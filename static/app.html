@@ -912,6 +912,7 @@ body.access-page #tab-access {
 }
 .access-model-status.offline,
 .access-model-status.planned,
+.access-model-status.expired,
 .access-model-status.draft {
   border-color: rgba(249, 226, 175, 0.28);
   color: var(--yellow);
@@ -35550,6 +35551,22 @@ function renderAccessUserClientGrantForm() {
     label.append(input, span);
     statusToggle.appendChild(label);
   }
+  const expirySelect = document.createElement('select');
+  expirySelect.id = 'access-user-client-expiry';
+  expirySelect.className = 'acc-btn';
+  expirySelect.title = 'The grant stops enforcing after this and shows as expired';
+  for (const [value, text] of [
+    ['', 'Never expires'],
+    [String(60 * 60 * 1000), 'Expires in 1 hour'],
+    [String(24 * 60 * 60 * 1000), 'Expires in 1 day'],
+    [String(7 * 24 * 60 * 60 * 1000), 'Expires in 7 days'],
+    [String(30 * 24 * 60 * 60 * 1000), 'Expires in 30 days'],
+  ]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    expirySelect.appendChild(option);
+  }
   const button = document.createElement('button');
   button.type = 'submit';
   button.className = 'acc-btn primary';
@@ -35561,7 +35578,7 @@ function renderAccessUserClientGrantForm() {
   message.textContent = canSubmit
     ? ''
     : 'This session may inspect access but not manage it.';
-  actions.append(statusToggle, button, message);
+  actions.append(statusToggle, expirySelect, button, message);
   form.appendChild(actions);
 
   const ceilingNote = document.createElement('div');
@@ -35670,6 +35687,10 @@ async function accessSubmitUserClientGrant(event) {
       : null,
     role_id: form.querySelector('input[name="access-user-client-role"]:checked')?.value || 'role:scoped-human',
     status: form.querySelector('input[name="access-user-client-status"]:checked')?.value || 'active',
+    expires_at_unix_ms: (() => {
+      const delta = Number(form.querySelector('#access-user-client-expiry')?.value || 0);
+      return delta > 0 ? Date.now() + delta : null;
+    })(),
   };
   if (kind === 'browser_certificate' && !payload.fingerprint) {
     showControlToast?.('error', 'Fingerprint is required');
@@ -36742,6 +36763,19 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
     chip.textContent = `ceiling: ${capped.ceiling.replace(/^role:/, '')}`;
     chip.title = `Sessions authenticated by this principal's ${capped.binding.replace(/_/g, ' ')} binding are capped at ${capped.ceiling} by this daemon's role_ceilings policy, regardless of the granted role.`;
     row.appendChild(chip);
+  }
+  const expiresAt = Number(grant.expires_at_unix_ms || 0);
+  if (expiresAt) {
+    const expires = document.createElement('span');
+    expires.className = 't';
+    const remaining = expiresAt - Date.now();
+    expires.textContent = remaining > 0
+      ? `expires in ${remaining > 86_400_000
+        ? `${Math.round(remaining / 86_400_000)}d`
+        : (remaining > 3_600_000 ? `${Math.round(remaining / 3_600_000)}h` : `${Math.max(1, Math.round(remaining / 60_000))}m`)}`
+      : 'expired';
+    expires.title = new Date(expiresAt).toLocaleString();
+    row.appendChild(expires);
   }
   const localIamGrant = accessModelLabel(grant.kind) === 'user_client_local_iam';
   if (localIamGrant && grantId) {

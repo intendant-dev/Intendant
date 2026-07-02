@@ -117,6 +117,25 @@ pub struct IamGrant {
     pub created_at_unix_ms: Option<u64>,
     #[serde(default)]
     pub revoked_at_unix_ms: Option<u64>,
+    /// When set, the grant stops being enforced after this instant without
+    /// changing its stored status; the overview then reports it as
+    /// `expired`. Backbone for temporary human grants and for org grants,
+    /// whose documents must carry an expiry.
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<u64>,
+}
+
+impl IamGrant {
+    /// Active right now: enforced status and not past expiry.
+    pub fn is_active_at(&self, now_unix_ms: i64) -> bool {
+        if !is_enforced_status(&self.status) {
+            return false;
+        }
+        match self.expires_at_unix_ms {
+            Some(expires) => (now_unix_ms as u128) < (expires as u128),
+            None => true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -177,6 +196,10 @@ pub struct UserClientGrantUpsertRequest {
     pub reason: Option<String>,
     #[serde(default)]
     pub target_id: Option<String>,
+    /// Optional absolute expiry; the grant stops enforcing after this
+    /// instant. Must be in the future when set.
+    #[serde(default)]
+    pub expires_at_unix_ms: Option<u64>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -589,6 +612,14 @@ pub fn upsert_user_client_grant(
         .unwrap_or("local IAM user/client grant")
         .to_string();
     let now = now_unix_ms();
+    let expires_at_unix_ms = match request.expires_at_unix_ms {
+        Some(expires) if expires <= now => {
+            return Err(AccessError(
+                "expires_at_unix_ms must be in the future".to_string(),
+            ));
+        }
+        other => other,
+    };
 
     let binding = build_user_client_binding(&kind, &request)?;
     let principal_id = binding.principal_id;
@@ -654,6 +685,7 @@ pub fn upsert_user_client_grant(
             existing.created_at_unix_ms = Some(now);
         }
         existing.revoked_at_unix_ms = if status == "revoked" { Some(now) } else { None };
+        existing.expires_at_unix_ms = expires_at_unix_ms;
         existing.clone()
     } else {
         created_grant = true;
@@ -668,6 +700,7 @@ pub fn upsert_user_client_grant(
             reason: reason.clone(),
             created_at_unix_ms: Some(now),
             revoked_at_unix_ms: if status == "revoked" { Some(now) } else { None },
+            expires_at_unix_ms,
         };
         state.grants.push(grant.clone());
         grant
@@ -1523,11 +1556,16 @@ pub fn evaluate_principal_operation_with_state(
             ),
         );
     }
-    if !is_enforced_status(&grant.status) {
+    if !grant.is_active_at(crate::access::client_key::now_unix_ms()) {
+        let expired = is_enforced_status(&grant.status);
         return AccessDecision::denied(
             principal,
             op,
-            format!("local IAM grant {} is not active", grant.id),
+            if expired {
+                format!("local IAM grant {} has expired", grant.id)
+            } else {
+                format!("local IAM grant {} is not active", grant.id)
+            },
         );
     }
 
@@ -1686,6 +1724,7 @@ pub fn principal_overview_values(state: &LocalIamState) -> Vec<Value> {
 }
 
 pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> Vec<Value> {
+    let now = crate::access::client_key::now_unix_ms();
     state
         .grants
         .iter()
@@ -1694,6 +1733,16 @@ pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> 
                 "role:scoped-human"
             } else {
                 grant.role_id.as_str()
+            };
+            // An expired grant keeps its stored status on disk but reports
+            // as `expired` so the UI never shows it as live.
+            let expired = is_enforced_status(&grant.status) && !grant.is_active_at(now);
+            let status = if grant.status.is_empty() {
+                "draft"
+            } else if expired {
+                "expired"
+            } else {
+                grant.status.as_str()
             };
             json!({
                 "id": grant.id.clone(),
@@ -1706,11 +1755,12 @@ pub fn grant_overview_values(state: &LocalIamState, default_target_id: &str) -> 
                 "role_label": role_label(state, role_id),
                 "transport_id": "transport:local-user-client-binding",
                 "source": if grant.source.is_empty() { "local_iam_state" } else { grant.source.as_str() },
-                "status": if grant.status.is_empty() { "draft" } else { grant.status.as_str() },
-                "enforced": is_enforced_status(&grant.status),
+                "status": status,
+                "enforced": grant.is_active_at(now),
                 "reason": grant.reason.clone(),
                 "created_at_unix_ms": grant.created_at_unix_ms,
-                "revoked_at_unix_ms": grant.revoked_at_unix_ms
+                "revoked_at_unix_ms": grant.revoked_at_unix_ms,
+                "expires_at_unix_ms": grant.expires_at_unix_ms
             })
         })
         .collect()
@@ -2056,10 +2106,11 @@ fn principal_for_authn(
                     && authn.get(key).and_then(Value::as_str) == Some(value)
             })
     })?;
+    let now = crate::access::client_key::now_unix_ms();
     let grant = state
         .grants
         .iter()
-        .find(|grant| grant.principal_id == principal.id && is_enforced_status(&grant.status))?;
+        .find(|grant| grant.principal_id == principal.id && grant.is_active_at(now))?;
     let mut access = AccessPrincipal::local_user_client(principal, grant, transport);
     access.authn_kind = Some(authn_kind.to_string());
     access.authn_origin = matched_authn_origin(principal, authn_kind, key, value);
@@ -2083,10 +2134,11 @@ fn principal_for_authn_any_status(
                 && authn.get(key).and_then(Value::as_str) == Some(value)
         })
     })?;
+    let now = crate::access::client_key::now_unix_ms();
     let grant = state
         .grants
         .iter()
-        .find(|grant| grant.principal_id == principal.id && is_enforced_status(&grant.status))
+        .find(|grant| grant.principal_id == principal.id && grant.is_active_at(now))
         .or_else(|| {
             state
                 .grants
@@ -2153,6 +2205,7 @@ mod tests {
             reason: "example".to_string(),
             created_at_unix_ms: Some(124),
             revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
         });
 
         save_state(tmp.path(), &state).unwrap();
@@ -2200,6 +2253,7 @@ mod tests {
             reason: String::new(),
             created_at_unix_ms: None,
             revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
         });
 
         let grants = grant_overview_values(&state, "local-daemon");
@@ -2237,6 +2291,7 @@ mod tests {
             reason: "test scoped browser certificate".to_string(),
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
         });
         state
     }
@@ -2317,6 +2372,65 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    #[test]
+    fn expired_grants_stop_enforcing_and_report_expired() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let now = now_unix_ms();
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("temp-key".to_string()),
+                role_id: Some("role:terminal".to_string()),
+                expires_at_unix_ms: Some(now + 60_000),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+
+        // Live before expiry.
+        let principal = principal_for_client_key(&state, "temp-key", "test").unwrap();
+        assert!(
+            evaluate_principal_operation_with_state(
+                &state,
+                &principal,
+                crate::peer::access_policy::PeerOperation::Terminal,
+            )
+            .allowed
+        );
+
+        // Force the grant into the past: enforcement denies with an expiry
+        // reason, resolution stops matching, and the overview reports
+        // `expired` without touching the stored status.
+        state.grants[0].expires_at_unix_ms = Some(now.saturating_sub(1));
+        let decision = evaluate_principal_operation_with_state(
+            &state,
+            &principal,
+            crate::peer::access_policy::PeerOperation::Terminal,
+        );
+        assert!(!decision.allowed);
+        assert!(decision.reason.contains("expired"), "{}", decision.reason);
+        assert!(principal_for_client_key(&state, "temp-key", "test").is_none());
+        let overview = grant_overview_values(&state, "local");
+        assert_eq!(overview[0]["status"], "expired");
+        assert_eq!(overview[0]["enforced"], false);
+        assert_eq!(state.grants[0].status, "active");
+
+        // Past expiries are rejected at write time.
+        let err = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                client_key_fingerprint: Some("temp-key-2".to_string()),
+                expires_at_unix_ms: Some(1),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("future"));
     }
 
     #[test]

@@ -37378,6 +37378,7 @@ mod tests {
             reason: "example future grant".to_string(),
             created_at_unix_ms: None,
             revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
         });
         let loaded = crate::access::iam::LoadedIamState {
             path: std::path::PathBuf::from("iam.json"),
@@ -38048,6 +38049,7 @@ mod tests {
             reason: "test scoped browser certificate".to_string(),
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
+            expires_at_unix_ms: None,
         });
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 
