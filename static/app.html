@@ -14299,6 +14299,74 @@ async function orgGrantForOffer(daemonId) {
   }
 }
 
+/* The rendezvous origin this page can reach for org bulletin lookups:
+   the current origin in hosted-connect mode, else the daemon-advertised
+   base carried in the URL. */
+function dashboardRendezvousBase() {
+  if (DASHBOARD_CONNECT_MODE) return DASHBOARD_CONNECT_SIGNALING_BASE || window.location.origin;
+  if (DASHBOARD_CONNECT_SIGNALING_BASE) return DASHBOARD_CONNECT_SIGNALING_BASE;
+  // Anchor pages: the daemon advertises the rendezvous it polls in its
+  // own dashboard targets (phase 7).
+  try {
+    const self = (dashboardAccessTargets || []).find(target => target?.local === true && target?.rendezvous_base);
+    return String(self?.rendezvous_base || '').trim().replace(/\/+$/, '');
+  } catch { return ''; }
+}
+
+/* Best-effort publish of a root-signed revocation list to the rendezvous
+   bulletin board, so member browsers everywhere pick it up. Zero
+   authority: the board verifies the signature only to stay clean, and
+   every daemon re-verifies on apply. */
+async function orgPublishRevocations(orl) {
+  const base = dashboardRendezvousBase();
+  if (!base || !orl) return false;
+  try {
+    const resp = await fetch(`${base}/api/orgs/revocations/publish`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(orl),
+    });
+    return resp.ok;
+  } catch (err) {
+    console.warn('[org] revocation publish failed:', err?.message || err);
+    return false;
+  }
+}
+
+/* Member-side courier: for each stored org document, fetch the org's
+   published revocation list from the rendezvous and hand it to the
+   daemon this page is connected to. The daemon enforces signature and
+   monotonic seq itself; an already-applied list is a quiet no-op. */
+async function orgRevocationCourier() {
+  const base = dashboardRendezvousBase();
+  if (!base) return;
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem(ORG_GRANTS_STORE_KEY) || '{}') || {}; } catch {}
+  for (const doc of Object.values(map)) {
+    const handle = String(doc?.org?.handle || '').trim();
+    const rootKey = String(doc?.org?.root_key || '').trim();
+    if (!handle || !rootKey) continue;
+    const throttleKey = `intendant_orl_courier:${handle}:${rootKey}`;
+    try {
+      const last = Number(sessionStorage.getItem(throttleKey) || 0);
+      if (Date.now() - last < 30 * 60 * 1000) continue;
+      sessionStorage.setItem(throttleKey, String(Date.now()));
+    } catch {}
+    try {
+      const resp = await fetch(`${base}/api/orgs/revocations?handle=${encodeURIComponent(handle)}&root_key=${encodeURIComponent(rootKey)}`);
+      if (!resp.ok) continue;
+      const body = await resp.json().catch(() => ({}));
+      if (!body?.orl) continue;
+      const applied = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', body.orl);
+      if (applied?.applied?.changed) {
+        console.info(`[org] carried @${handle} revocations seq ${applied.applied.seq} to this daemon (${applied.applied.revoked_grants} grants, ${applied.applied.revoked_peer_identities} peer identities revoked)`);
+      }
+    } catch (err) {
+      console.warn(`[org] revocation courier for @${handle} failed:`, err?.message || err);
+    }
+  }
+}
+
 function dashboardConnectMutationUnavailable(action, label = 'Dashboard control request', options = {}) {
   const actionLabel = action ? ` ${action}` : '';
   const message = `${label}${actionLabel} is unavailable until dashboard access is ready`;
@@ -38242,7 +38310,8 @@ function renderAccessOrganizations() {
         });
         orlOutput.value = JSON.stringify(data.orl, null, 2);
         const local = data.applied ? ` (${data.applied.revoked_grants} local grant${data.applied.revoked_grants === 1 ? '' : 's'} revoked here)` : '';
-        showControlToast?.('success', `Revocation list now at seq ${data.orl?.seq}${local} — apply it on the org's daemons`);
+        const published = await orgPublishRevocations(data.orl);
+        showControlToast?.('success', `Revocation list now at seq ${data.orl?.seq}${local}${published ? ' — published; member browsers will carry it to their daemons' : " — apply it on the org's daemons (no rendezvous reachable to publish through)"}`);
       } catch (err) {
         showControlToast?.('error', err?.message || 'Revocation failed');
       }
@@ -66487,6 +66556,9 @@ if (clientIdentitySupported()) {
     if (identity) renderAccessAdminSummaries();
   }).catch(() => {});
 }
+// Carry published org revocations to this daemon shortly after load —
+// after the control transport has had a chance to come up in connect mode.
+setTimeout(() => { orgRevocationCourier().catch(() => {}); }, 4000);
 syncAccessPageNavLink();
 
 // Auto-scroll detection

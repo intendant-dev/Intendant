@@ -60,6 +60,18 @@ daemon to it. Claiming grants **no authority** — sessions still resolve
 against the daemon's local IAM (see the role ceilings and org lanes in
 the trust chapter).
 
+## Revocation bulletin board
+
+The service stores each org's latest root-signed revocation list, blind:
+`POST /api/orgs/revocations/publish` accepts a list whose embedded
+signature verifies and whose `seq` is not lower than the stored one;
+`GET /api/orgs/revocations?handle=&root_key=` serves it publicly. Member
+browsers fetch the list for orgs they hold documents for and carry it to
+every daemon they visit (the daemon's own public apply endpoint enforces
+signature and monotonic `seq` again). A malicious board can only
+withhold — it cannot forge (root signature), roll back (`seq`), or read
+anything that is not already org-public.
+
 ## Discovery
 
 A daemon with Connect enabled advertises its rendezvous in its agent card

@@ -2000,8 +2000,13 @@ fn dashboard_control_method_operation(
         // session; the document itself is the authorization and is fully
         // re-verified. Same for reading the org's public revocation list
         // and renewing a still-valid document.
-        "api_access_org_present" | "api_access_org_orl" | "api_access_org_orl_apply"
-        | "api_access_org_renew" => Some(PeerOperation::AccessInspect),
+        "api_access_org_present" | "api_access_org_orl" | "api_access_org_renew" => {
+            Some(PeerOperation::AccessInspect)
+        }
+        // Applying a root-signed revocation list mirrors a PUBLIC doorbell
+        // (`POST /api/access/orgs/revocations/apply`): the signature is the
+        // authority, so any session may courier one through the tunnel.
+        "api_access_org_orl_apply" => Some(PeerOperation::PresenceRead),
         "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
             Some(PeerOperation::AccessInspect)
         }

@@ -305,14 +305,18 @@ org daemon persists the current list next to the root key
 `GET /api/access/orgs/<handle>/revocations` (public — it is org-public
 data; an empty seq-0 list is signed lazily on first read).
 
-**Delivery is carried, not discovered (v1).** A consumer daemon has no
+**Delivery is carried, not discovered.** A consumer daemon has no
 address for "the org daemon" — there is no membership server to ask — so
 the list travels the same way grant documents do: anyone may push it to
 `POST /api/access/orgs/revocations/apply` (doorbell class:
 unauthenticated, rate-limited, size-capped — the signature is the
-authority, and replaying an old list is refused by `seq`). The org admin's
-browser fans it out to fleet daemons; peer-link gossip and periodic pull
-come later with step 6/phase 7 plumbing.
+authority, and replaying an old list is refused by `seq`). Two couriers
+exist today: the org admin's browser publishes the list to the
+rendezvous **bulletin board** (blind storage — signature-checked and
+rollback-proof, so the board can only withhold), and every member's
+browser fetches it from there and hands it to each daemon it visits.
+Peer-link gossip can come later; with browsers as couriers, revocations
+already reach any daemon a member still talks to.
 
 **Application.** A daemon that trusts the org verifies the signature
 against its *trusted* key for that handle, requires `seq` strictly greater

@@ -501,12 +501,32 @@ async function main() {
     assert.strictEqual(renewRevoked.status, 400, `revoked renewal unexpectedly succeeded: ${JSON.stringify(renewRevoked.body)}`);
     assert(/revoked/.test(String(renewRevoked.body.error)), `expected revoked-refusal: ${JSON.stringify(renewRevoked.body)}`);
 
-    // Anyone can carry the list to the member daemon; the signature and
-    // monotonic seq make the courier irrelevant.
+    // The org daemon's admin publishes the list to the rendezvous
+    // bulletin board (zero authority: signature-checked, rollback-proof).
+    const published = await postJson(`${connectApi}/api/orgs/revocations/publish`, served.body.orl);
+    assert.strictEqual(published.status, 200, `orl publish failed: ${JSON.stringify(published.body)}`);
+    assert.strictEqual(published.body.stored, true);
+    const board = await fetchJson(`${connectApi}/api/orgs/revocations?handle=acme&root_key=${encodeURIComponent(rootKey)}`);
+    assert.strictEqual(board.status, 200, `orl board fetch failed: ${JSON.stringify(board.body)}`);
+    assert.deepStrictEqual(board.body.orl, served.body.orl, 'board serves a different list');
+    const stale = await postJson(`${connectApi}/api/orgs/revocations/publish`, revokedMember.body.orl);
+    assert.strictEqual(stale.body.stored, false, `re-publishing same seq should be a no-op: ${JSON.stringify(stale.body)}`);
+
+    // A member browser visiting the daemon carries the published list to
+    // it automatically — no explicit apply call anywhere.
+    const courier = await browser.newPage();
+    await courier.goto(`${memberOrigin}/`, { waitUntil: 'domcontentloaded', timeout: CONNECT_TIMEOUT_MS });
+    await waitFor(() => {
+      const iamNow = readMemberIam(memberHome);
+      const entry = (iamNow.trusted_orgs || []).find(o => o.handle === 'acme');
+      return entry && entry.last_orl_seq === 1;
+    }, CONNECT_TIMEOUT_MS, 'courier auto-apply of published revocations');
+    await courier.close();
+
+    // Re-applying the same list manually is an idempotent no-op.
     const applied = await postJson(`${memberOrigin}/api/access/orgs/revocations/apply`, served.body.orl);
     assert.strictEqual(applied.status, 200, `orl apply failed: ${JSON.stringify(applied.body)}`);
-    assert.strictEqual(applied.body.applied.changed, true);
-    assert.strictEqual(applied.body.applied.revoked_grants, 1, `expected exactly the hosted grant revoked: ${JSON.stringify(applied.body.applied)}`);
+    assert.strictEqual(applied.body.applied.changed, false, `courier should have applied seq 1 already: ${JSON.stringify(applied.body.applied)}`);
     iam = readMemberIam(memberHome);
     assert.strictEqual(
       iam.grants.find(g => g.id === hostedGrant.id).status,
@@ -516,10 +536,6 @@ async function main() {
     const trustedEntry = (iam.trusted_orgs || []).find(o => o.handle === 'acme');
     assert.strictEqual(trustedEntry.last_orl_seq, 1, 'seq not persisted');
     assert(trustedEntry.orl_revoked_subjects.includes(fingerprintHosted), 'subject not persisted');
-
-    // Re-applying the same seq is an idempotent no-op.
-    const reapplied = await postJson(`${memberOrigin}/api/access/orgs/revocations/apply`, served.body.orl);
-    assert.strictEqual(reapplied.body.applied.changed, false, `expected idempotent re-apply: ${JSON.stringify(reapplied.body)}`);
 
     // The revoked member reconnects with its still-signed document: the
     // ride-along is refused by the persisted list (daemon-side log), and

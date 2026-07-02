@@ -99,6 +99,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/claims/{claim_id}", get(api_claim_status))
         .route("/api/audit", get(api_audit))
         .route("/api/status", get(api_status))
+        .route(
+            "/api/orgs/revocations/publish",
+            post(orl_publish).options(orl_preflight),
+        )
+        .route(
+            "/api/orgs/revocations",
+            get(orl_fetch).options(orl_preflight),
+        )
         .route("/api/daemon/register", post(daemon_register))
         .route("/api/daemon/next", get(daemon_next))
         .route("/api/daemon/answer", post(daemon_answer))
@@ -273,6 +281,21 @@ struct Store {
     fleet_targets: Vec<FleetTargetRecord>,
     #[serde(default)]
     audit: Vec<AuditEvent>,
+    // Org revocation-list bulletin board (zero authority): the latest
+    // root-signed list per (handle, root key), stored blind. Signatures
+    // are checked only to keep the store clean and the sequence check
+    // only prevents rollback — consumers re-verify everything.
+    #[serde(default)]
+    orl_bulletins: Vec<OrlBulletinRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct OrlBulletinRecord {
+    handle: String,
+    root_key: String,
+    seq: u64,
+    list: serde_json::Value,
+    updated_unix_ms: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -2609,6 +2632,185 @@ struct BrowserOfferRequest {
     org_grant: Option<serde_json::Value>,
 }
 
+/// The exact byte string an org root signs over its revocation list —
+/// mirrors `access::org::orl_signing_payload` in the daemon. Stable
+/// protocol, replicated rather than shared: this binary interprets the
+/// list only enough to keep the bulletin board clean.
+fn orl_signing_payload(list: &serde_json::Value) -> Option<Vec<u8>> {
+    let org = list.get("org")?;
+    let join = |key: &str| -> Option<String> {
+        Some(
+            list.get(key)?
+                .as_array()?
+                .iter()
+                .map(|v| v.as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+                .join(","),
+        )
+    };
+    Some(
+        format!(
+            "intendant-org-orl-v1\n{}\n{}\n{}\n{}\n{}\n{}\n{}",
+            org.get("handle")?.as_str()?,
+            org.get("root_key")?.as_str()?,
+            list.get("seq")?.as_u64()?,
+            join("revoked_grant_ids")?,
+            join("revoked_subjects")?,
+            join("revoked_issuer_keys")?,
+            list.get("issued_at_unix_ms")?.as_u64()?,
+        )
+        .into_bytes(),
+    )
+}
+
+/// These two endpoints are cross-origin public by design: anchor-served
+/// dashboards publish and fetch lists here, and the payloads carry their
+/// own authority (a root signature) or none (a lookup of public data).
+fn orl_cors(response: Response) -> Response {
+    let mut response = response;
+    response.headers_mut().insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    response
+}
+
+async fn orl_preflight() -> Response {
+    let mut response = axum::http::StatusCode::NO_CONTENT.into_response();
+    let headers = response.headers_mut();
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_ORIGIN,
+        axum::http::HeaderValue::from_static("*"),
+    );
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_METHODS,
+        axum::http::HeaderValue::from_static("GET, POST, OPTIONS"),
+    );
+    headers.insert(
+        axum::http::header::ACCESS_CONTROL_ALLOW_HEADERS,
+        axum::http::HeaderValue::from_static("content-type"),
+    );
+    response
+}
+
+const MAX_ORL_BULLETIN_BYTES: usize = 64 * 1024;
+
+async fn orl_publish(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(list): Json<serde_json::Value>,
+) -> ApiResult<Response> {
+    check_rate_limit(&state, &headers, "orl_publish", 30, 60_000).await?;
+    if serde_json::to_string(&list).map(|s| s.len()).unwrap_or(usize::MAX) > MAX_ORL_BULLETIN_BYTES
+    {
+        return Err(ApiError::bad_request("revocation list is too large"));
+    }
+    if list.get("v").and_then(|v| v.as_u64()) != Some(1)
+        || list.get("kind").and_then(|v| v.as_str()) != Some("org-revocations")
+    {
+        return Err(ApiError::bad_request("not an org revocation list"));
+    }
+    let handle = list
+        .pointer("/org/handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let root_key = list
+        .pointer("/org/root_key")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let seq = list.get("seq").and_then(|v| v.as_u64()).unwrap_or(0);
+    if handle.is_empty() || root_key.is_empty() {
+        return Err(ApiError::bad_request("missing org handle or root key"));
+    }
+    let payload = orl_signing_payload(&list)
+        .ok_or_else(|| ApiError::bad_request("malformed revocation list"))?;
+    let key = b64u_decode(&root_key).map_err(|_| ApiError::bad_request("invalid root key"))?;
+    let sig = b64u_decode(list.get("sig").and_then(|v| v.as_str()).unwrap_or("").trim())
+        .map_err(|_| ApiError::bad_request("invalid signature encoding"))?;
+    ring::signature::UnparsedPublicKey::new(&ring::signature::ED25519, &key)
+        .verify(&payload, &sig)
+        .map_err(|_| ApiError::bad_request("signature verification failed"))?;
+
+    let mut store = state.store.lock().await;
+    let now = now_unix_ms();
+    let stored = if let Some(existing) = store
+        .orl_bulletins
+        .iter_mut()
+        .find(|b| b.handle == handle && b.root_key == root_key)
+    {
+        if seq < existing.seq {
+            return Err(ApiError::new(
+                StatusCode::CONFLICT,
+                format!("stale list: seq {seq} was already superseded by {}", existing.seq),
+            ));
+        }
+        let changed = seq > existing.seq;
+        if changed {
+            existing.seq = seq;
+            existing.list = list;
+            existing.updated_unix_ms = now;
+        }
+        changed
+    } else {
+        store.orl_bulletins.push(OrlBulletinRecord {
+            handle: handle.clone(),
+            root_key: root_key.clone(),
+            seq,
+            list,
+            updated_unix_ms: now,
+        });
+        true
+    };
+    if stored {
+        persist_locked(&state, &store)?;
+    }
+    Ok(orl_cors(
+        Json(json!({ "ok": true, "stored": stored, "seq": seq })).into_response(),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct OrlFetchQuery {
+    #[serde(default)]
+    handle: String,
+    #[serde(default)]
+    root_key: String,
+}
+
+async fn orl_fetch(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Query(query): Query<OrlFetchQuery>,
+) -> ApiResult<Response> {
+    check_rate_limit(&state, &headers, "orl_fetch", 240, 60_000).await?;
+    let handle = query.handle.trim();
+    let root_key = query.root_key.trim();
+    if handle.is_empty() || root_key.is_empty() {
+        return Err(ApiError::bad_request("handle and root_key are required"));
+    }
+    let store = state.store.lock().await;
+    let Some(record) = store
+        .orl_bulletins
+        .iter()
+        .find(|b| b.handle == handle && b.root_key == root_key)
+    else {
+        return Err(ApiError::not_found("no revocation list published for that org"));
+    };
+    Ok(orl_cors(
+        Json(json!({
+            "ok": true,
+            "seq": record.seq,
+            "updated_unix_ms": record.updated_unix_ms,
+            "orl": record.list,
+        }))
+        .into_response(),
+    ))
+}
+
 async fn browser_offer(
     State(state): State<Arc<AppState>>,
     headers: HeaderMap,
@@ -3814,6 +4016,7 @@ mod tests {
             ],
             fleet_targets: Vec::new(),
             audit: Vec::new(),
+            orl_bulletins: Vec::new(),
         };
         let hashes = active_claim_code_hashes(&store, "current", now);
         assert!(hashes.contains(&claim_code_hash(fresh)));
@@ -4033,6 +4236,7 @@ mod tests {
                 },
             ],
             audit: Vec::new(),
+            orl_bulletins: Vec::new(),
         };
         let config = ServiceConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 9876)),
