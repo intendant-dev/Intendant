@@ -72,6 +72,17 @@ signature and monotonic `seq` again). A malicious board can only
 withhold — it cannot forge (root signature), roll back (`seq`), or read
 anything that is not already org-public.
 
+## Notifications
+
+Signed-in browsers can opt into Web Push alerts (Advanced →
+Notifications): the service notifies when a claimed daemon stops polling
+(default: offline for 3 minutes; `INTENDANT_CONNECT_PRESENCE_OFFLINE_MS`)
+and when it returns. Alerts are composed purely from the polling
+presence the rendezvous already sees, payloads are encrypted to each
+browser subscription (RFC 8291 — the push relay carries ciphertext), and
+the VAPID signing key is generated automatically into the state file on
+first start. Dead subscriptions are pruned on 404/410.
+
 ## Discovery
 
 A daemon with Connect enabled advertises its rendezvous in its agent card
