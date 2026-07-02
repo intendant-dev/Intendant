@@ -99,6 +99,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/claims/{claim_id}", get(api_claim_status))
         .route("/api/audit", get(api_audit))
         .route("/api/status", get(api_status))
+        .route("/trust", get(trust_ui))
         .route(
             "/api/orgs/revocations/publish",
             post(orl_publish).options(orl_preflight),
@@ -320,6 +321,26 @@ struct DaemonRecord {
     registered_unix_ms: u64,
     last_seen_unix_ms: u64,
     updated_unix_ms: u64,
+    /// Hours (unix_ms / 3_600_000) in which this daemon polled at least
+    /// once — the last week of them. Pure display data: the service
+    /// already sees every poll; this just remembers which hours had one.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    presence_hours: Vec<u64>,
+}
+
+const PRESENCE_HOURS_KEPT: usize = 168; // 7 days
+
+fn record_presence_hour(hours: &mut Vec<u64>, now_unix_ms: u64) -> bool {
+    let hour = now_unix_ms / 3_600_000;
+    if hours.last() == Some(&hour) {
+        return false;
+    }
+    hours.push(hour);
+    if hours.len() > PRESENCE_HOURS_KEPT {
+        let excess = hours.len() - PRESENCE_HOURS_KEPT;
+        hours.drain(0..excess);
+    }
+    true
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -591,6 +612,7 @@ fn daemon_view(daemon: &DaemonRecord) -> serde_json::Value {
         "daemon_public_key": daemon.daemon_public_key,
         "claimed": daemon.owner_user_id.is_some(),
         "online": now.saturating_sub(daemon.last_seen_unix_ms) < 45_000,
+        "presence_hours": daemon.presence_hours,
         "registered_unix_ms": daemon.registered_unix_ms,
         "last_seen_unix_ms": daemon.last_seen_unix_ms,
     })
@@ -734,6 +756,10 @@ async fn connect_ui(State(state): State<Arc<AppState>>) -> Html<String> {
         "Intendant Connect",
         "Rendezvous account",
     ))
+}
+
+async fn trust_ui(State(state): State<Arc<AppState>>) -> Html<String> {
+    Html(trust_ui_html(&state.config.public_origin))
 }
 
 async fn access_ui(State(state): State<Arc<AppState>>) -> Html<String> {
@@ -2037,6 +2063,7 @@ async fn daemon_register(
             }
             existing.daemon_public_key = daemon_public_key.clone();
             existing.last_seen_unix_ms = now;
+            record_presence_hour(&mut existing.presence_hours, now);
             existing.updated_unix_ms = now;
             if existing.owner_user_id.is_none() {
                 claim_code = Some(ensure_claim_code(
@@ -2057,6 +2084,7 @@ async fn daemon_register(
                 registered_unix_ms: now,
                 last_seen_unix_ms: now,
                 updated_unix_ms: now,
+            presence_hours: Vec::new(),
             };
             claim_code = Some(ensure_claim_code(
                 &mut claim_codes,
@@ -2223,8 +2251,10 @@ async fn daemon_next(
 async fn touch_daemon(state: &AppState, daemon_id: &str) -> ApiResult<()> {
     let mut store = state.store.lock().await;
     if let Some(daemon) = store.daemons.iter_mut().find(|d| d.daemon_id == daemon_id) {
-        daemon.last_seen_unix_ms = now_unix_ms();
-        daemon.updated_unix_ms = daemon.last_seen_unix_ms;
+        let now = now_unix_ms();
+        daemon.last_seen_unix_ms = now;
+        daemon.updated_unix_ms = now;
+        record_presence_hour(&mut daemon.presence_hours, now);
         persist_locked(state, &store)?;
         Ok(())
     } else {
@@ -3009,6 +3039,84 @@ async fn ensure_owned_daemon(state: &AppState, user_id: Uuid, daemon_id: &str) -
     }
 }
 
+fn trust_ui_html(origin: &str) -> String {
+    format!(
+        r#"<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>How trust works — Intendant Connect</title>
+  <style>
+    :root {{
+      color-scheme: dark;
+      --bg: #11111b; --top: #181825; --surface: #1e1e2e; --surface-2: #313244;
+      --line: rgba(205, 214, 244, 0.09); --line-strong: rgba(205, 214, 244, 0.16);
+      --text: #cdd6f4; --muted: #a6adc8; --muted-2: #6c7086;
+      --accent: #89b4fa; --accent-hover: #74c7ec; --lavender: #b4befe;
+      --ok: #a6e3a1; --warn: #f9e2af; --err: #f38ba8;
+      font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: var(--bg); color: var(--text);
+    }}
+    * {{ box-sizing: border-box; }}
+    body {{ margin: 0; min-height: 100vh; background-color: var(--bg); background-image: radial-gradient(1100px 520px at 50% -160px, rgba(137, 180, 250, .12) 0%, rgba(137, 180, 250, 0) 62%); background-attachment: fixed; }}
+    a {{ color: var(--accent); }}
+    a:hover {{ color: var(--accent-hover); }}
+    code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
+    header {{ border-bottom: 1px solid var(--line); background: rgba(24, 24, 37, .82); }}
+    .topbar {{ width: min(760px, calc(100vw - 32px)); margin: 0 auto; min-height: 60px; display: flex; align-items: center; gap: 12px; }}
+    .brand-mark {{ width: 30px; height: 30px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 8px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 11px; font-weight: 800; }}
+    .topbar a {{ color: var(--text); text-decoration: none; font-weight: 700; font-size: 15px; }}
+    main {{ width: min(760px, calc(100vw - 32px)); margin: 0 auto; padding: 34px 0 72px; line-height: 1.62; font-size: 15px; }}
+    h1 {{ font-size: 28px; letter-spacing: -.015em; line-height: 1.15; margin: 0 0 8px; }}
+    .lede {{ color: var(--muted); font-size: 16px; margin: 0 0 26px; }}
+    h2 {{ font-size: 18px; margin: 34px 0 8px; letter-spacing: -.01em; }}
+    p {{ margin: 10px 0; color: var(--text); }}
+    p.dim, li span {{ color: var(--muted); }}
+    ol, ul {{ padding-left: 22px; margin: 10px 0; display: grid; gap: 8px; }}
+    li strong {{ display: block; }}
+    .card {{ border: 1px solid var(--line-strong); background: rgba(24, 24, 37, .6); border-radius: 12px; padding: 16px 18px; margin: 16px 0; }}
+    .card.good {{ border-color: rgba(166, 227, 161, .35); }}
+    .foot {{ margin-top: 34px; padding-top: 16px; border-top: 1px solid var(--line); color: var(--muted-2); font-size: 13px; }}
+  </style>
+</head>
+<body>
+  <header><div class="topbar"><div class="brand-mark" aria-hidden="true">IC</div><a href="/connect">Intendant Connect</a></div></header>
+  <main>
+    <h1>How trust works here</h1>
+    <p class="lede">The short version: this service makes introductions and carries ciphertext. Authority over your computers never lives here &mdash; not even when you sign in.</p>
+
+    <h2>What this service actually does</h2>
+    <p>Four jobs, all deliberately powerless: it <em>introduces</em> your browser to your computers (signaling), <em>relays</em> encrypted traffic when networks are awkward, <em>stores</em> your fleet list as client-signed records whose private fields are end-to-end encrypted, and <em>remembers</em> which computers your account claimed. Every session that reaches one of your computers is verified twice at the ends: your browser checks a signature made by the computer itself, and the computer checks a signature made by your browser&rsquo;s own key &mdash; a key that never leaves your device.</p>
+
+    <h2>"But I sign in with a passkey&hellip;"</h2>
+    <p>A fair question: doesn&rsquo;t signing in give the server something it could use?</p>
+    <p>A passkey never hands over a key. Your device signs a one-time challenge, bound to this origin &mdash; the server can&rsquo;t replay it anywhere, can&rsquo;t sign anything with it, and can&rsquo;t derive anything from it. The signature proves you <em>to the rendezvous, for rendezvous-scoped things</em>: your claim list, your encrypted fleet metadata, your signaling session. The encryption key for that metadata is computed inside your authenticator (the WebAuthn PRF extension) and handed only to the page in your browser &mdash; it is not part of what the server receives.</p>
+
+    <h2>If this service turned malicious</h2>
+    <ol>
+      <li><strong>It could lie in introductions.</strong><span>When relaying, it could claim your account is someone else &mdash; but computers treat account claims as the weakest identity there is: they only matter if the computer&rsquo;s owner already granted that account a role locally, hosted sessions are capped below full control by default, and the strong identity in every offer is your browser&rsquo;s end-to-end signature, which this service cannot forge.</span></li>
+      <li><strong>It could deny service.</strong><span>Any relay can. You would notice, and nothing would be exposed.</span></li>
+      <li><strong>It could serve this page with malicious code.</strong><span>The honest residual risk of any hosted web app. It is bounded on purpose: sessions from this origin are role-capped by every computer&rsquo;s own policy, your durable identity key is scoped to each origin (code served here can never wield the key your own computer&rsquo;s dashboard holds), and organization membership never flows through accounts. If you don&rsquo;t want to extend even this much trust, don&rsquo;t: browse via your own computer&rsquo;s address, or run your own rendezvous.</span></li>
+    </ol>
+
+    <div class="card good">
+      <strong>The rule the whole design follows:</strong> privileged code is served by you or by the resource owner; authority is only ever minted by the target computer&rsquo;s local access control; global services carry introductions, ciphertext, and signatures &mdash; nothing else.
+    </div>
+
+    <h2>Organizations</h2>
+    <p class="dim">Org membership is a document signed by the organization&rsquo;s own key, verified by each of its computers directly. This service stores at most the org&rsquo;s <em>revocation list</em> &mdash; also root-signed and rollback-protected, so the worst a malicious board can do is withhold it, never forge it.</p>
+
+    <h2>Verify all of this</h2>
+    <p class="dim">The component is open and self-hostable: <a href="https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">run your own rendezvous</a>, read the <a href="https://lovon-spec.github.io/Intendant/trust-architecture.html" target="_blank" rel="noopener">full trust architecture</a>, or audit the <a href="https://github.com/lovon-spec/Intendant" target="_blank" rel="noopener">source</a>.</p>
+
+    <div class="foot">This instance: <code>{origin}</code> &mdash; one deployment of an open component, not a chokepoint.</div>
+  </main>
+</body>
+</html>"#
+    )
+}
+
 fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) -> String {
     format!(
         r#"<!doctype html>
@@ -3114,6 +3222,11 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
     .computer-name .sub {{ color: var(--muted-2); font-size: 12px; }}
     .computer-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
     .computer-actions .open {{ flex: 1 1 auto; }}
+    .presence {{ display: grid; gap: 5px; }}
+    .presence-bars {{ display: flex; gap: 2px; align-items: flex-end; height: 14px; }}
+    .presence-bars span {{ flex: 1 1 auto; min-width: 2px; height: 5px; border-radius: 1px; background: var(--surface-3); }}
+    .presence-bars span.on {{ height: 14px; background: var(--ok); opacity: .75; }}
+    .presence-label {{ color: var(--muted-2); font-size: 11px; }}
     .computer-card details {{ border-top: 1px solid var(--line); padding-top: 10px; }}
     .computer-card summary {{ color: var(--muted-2); font-size: 12px; font-weight: 700; cursor: pointer; list-style: none; }}
     .computer-card summary::before {{ content: '▸ '; }}
@@ -3235,7 +3348,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
       </div>
       <ul class="feature-strip">
         <li><strong>Passkeys only</strong><span>No passwords. Your devices already sync the key.</span></li>
-        <li><strong>Holds no power</strong><span>An introducer and relay. Your computers check your identity themselves.</span></li>
+        <li><strong>Holds no power</strong><span>An introducer and relay. Your computers check your identity themselves &mdash; <a href="/trust">how trust works here</a>.</span></li>
         <li><strong>Self-hostable</strong><span>Run your own rendezvous &mdash; <a href="https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">read how</a>.</span></li>
       </ul>
     </section>
@@ -3302,7 +3415,7 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
         </div>
         <div class="advanced-block">
           <h3>What this account can and cannot do</h3>
-          <div class="sub">It is rendezvous and navigation only &mdash; it grants nothing by itself. Every daemon decides access through its own local IAM, dashboard sessions verify a signature from the daemon itself, and private fields in Saved places sync end&#8209;to&#8209;end encrypted when your passkey supports PRF.</div>
+          <div class="sub">It is rendezvous and navigation only &mdash; it grants nothing by itself. Every daemon decides access through its own local IAM, dashboard sessions verify a signature from the daemon itself, and private fields in Saved places sync end&#8209;to&#8209;end encrypted when your passkey supports PRF. <a href="/trust">The full story.</a></div>
         </div>
         <div class="advanced-block" id="audit-section">
           <h3>Audit</h3>
@@ -3696,6 +3809,7 @@ function renderDaemons() {{
         <button class="open" data-open="${{escapeAttr(daemonId)}}">Open</button>
         <button class="secondary" data-rename="${{escapeAttr(daemonId)}}">Rename</button>
       </div>
+      ${{presenceSparkline(daemon)}}
       <details>
         <summary>Details</summary>
         <div class="kv">
@@ -3800,6 +3914,29 @@ function renderAudit(events) {{
     div.innerHTML = `<div class="event-line"><span class="event-name">${{escapeHtml(name)}}</span><time>${{escapeHtml(date)}}</time></div><code>${{escapeHtml(event.daemon_id || '')}}</code>`;
     el.appendChild(div);
   }}
+}}
+
+/* Last 72 hours as tiny bars (present = the daemon polled that hour),
+   plus a 7-day availability figure. Display of data the rendezvous
+   already has from the polling it exists to do. */
+function presenceSparkline(daemon) {{
+  const hours = Array.isArray(daemon.presence_hours) ? daemon.presence_hours : [];
+  if (!hours.length) return '';
+  const seen = new Set(hours.map(Number));
+  const nowHour = Math.floor(Date.now() / 3600000);
+  const span = 72;
+  let bars = '';
+  for (let i = span - 1; i >= 0; i -= 1) {{
+    const hour = nowHour - i;
+    const on = seen.has(hour);
+    const when = new Date(hour * 3600000);
+    bars += `<span class="${{on ? 'on' : ''}}" title="${{escapeAttr(when.toLocaleString([], {{ weekday: 'short', hour: 'numeric' }}))}} — ${{on ? 'online' : 'offline'}}"></span>`;
+  }}
+  let weekSeen = 0;
+  for (let i = 0; i < 168; i += 1) if (seen.has(nowHour - i)) weekSeen += 1;
+  const tracked = Math.min(168, Math.max(1, nowHour - Math.min(...seen) + 1));
+  const pct = Math.round((weekSeen / Math.min(168, tracked)) * 100);
+  return `<div class="presence"><div class="presence-bars" aria-hidden="true">${{bars}}</div><div class="presence-label">last 3 days &middot; up ${{pct}}% of the ${{tracked >= 168 ? 'week' : 'time tracked'}}</div></div>`;
 }}
 
 function compactKey(value) {{
@@ -3931,7 +4068,22 @@ mod tests {
             registered_unix_ms: 1,
             last_seen_unix_ms: 1,
             updated_unix_ms: 1,
+            presence_hours: Vec::new(),
         }
+    }
+
+    #[test]
+    fn presence_hours_dedupe_and_cap_at_a_week() {
+        let mut hours = Vec::new();
+        assert!(record_presence_hour(&mut hours, 3_600_000));
+        assert!(!record_presence_hour(&mut hours, 3_700_000)); // same hour
+        assert!(record_presence_hour(&mut hours, 7_200_000));
+        assert_eq!(hours, vec![1, 2]);
+        for i in 0..200u64 {
+            record_presence_hour(&mut hours, (10 + i) * 3_600_000);
+        }
+        assert_eq!(hours.len(), PRESENCE_HOURS_KEPT);
+        assert_eq!(*hours.last().unwrap(), 209);
     }
 
     #[test]
@@ -3979,6 +4131,15 @@ mod tests {
         assert!(!valid_connect_app_query(Some("connect=1")));
         assert!(!valid_connect_app_query(Some("connect=0&daemon_id=daemon")));
         assert!(!valid_connect_app_query(Some("connect=1&daemon_id=%20")));
+    }
+
+    #[test]
+    fn trust_page_states_the_model() {
+        let html = trust_ui_html("https://connect.intendant.dev");
+        assert!(html.contains("<title>How trust works"));
+        assert!(html.contains("rendezvous-scoped things"));
+        assert!(html.contains("run your own rendezvous"));
+        assert!(html.contains("<code>https://connect.intendant.dev</code>"));
     }
 
     #[test]
@@ -4139,6 +4300,7 @@ mod tests {
                 registered_unix_ms: 10,
                 last_seen_unix_ms: now_unix_ms(),
                 updated_unix_ms: 20,
+            presence_hours: Vec::new(),
             }],
             fleet_targets: vec![
                 FleetTargetRecord {
