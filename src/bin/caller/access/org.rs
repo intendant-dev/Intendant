@@ -14,7 +14,7 @@ use crate::access::iam::{
     LocalIamState, TrustedOrg,
 };
 use crate::access::{AccessError, AccessResult};
-use crate::daemon_identity::{b64u, DaemonIdentity};
+use crate::daemon_identity::DaemonIdentity;
 use base64::Engine as _;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -239,6 +239,11 @@ pub struct MaterializedOrgGrant {
     pub principal: IamPrincipal,
     pub grant: IamGrant,
     pub org_handle: String,
+    /// False when the document was already materialized identically —
+    /// re-presentation (offers attach documents on every connect) must not
+    /// grow the audit log or rewrite state.
+    #[serde(skip)]
+    pub changed: bool,
 }
 
 /// Verify trust and write the local grant. `daemon_ids` are the names this
@@ -316,12 +321,25 @@ pub fn materialize_org_grant(
         doc.subject.label.trim().to_string()
     };
 
+    // Local IAM always wins over the document: a principal or grant the
+    // local owner revoked stays revoked. Without this, offers that carry
+    // the document would silently undo a local revocation on the next
+    // connect. The org's way out is a fresh document (new grant_id).
+    let mut changed = false;
     let principal = if let Some(existing) = state
         .principals
         .iter_mut()
         .find(|principal| principal.id == principal_id)
     {
-        existing.status = "active".to_string();
+        if existing.status == "revoked" {
+            return Err(AccessError(
+                "the subject key's principal was revoked locally on this daemon; a root session must re-activate it under Access → People & Devices".to_string(),
+            ));
+        }
+        if existing.status != "active" {
+            existing.status = "active".to_string();
+            changed = true;
+        }
         existing.clone()
     } else {
         let principal = IamPrincipal {
@@ -341,6 +359,7 @@ pub fn materialize_org_grant(
             created_at_unix_ms: Some(now_unix_ms),
         };
         state.principals.push(principal.clone());
+        changed = true;
         principal
     };
 
@@ -358,29 +377,130 @@ pub fn materialize_org_grant(
         revoked_at_unix_ms: None,
         expires_at_unix_ms: Some(doc.expires_at_unix_ms),
     };
-    if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id) {
-        *existing = grant.clone();
+    let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id)
+    {
+        if existing.status == "revoked" || existing.revoked_at_unix_ms.is_some() {
+            return Err(AccessError(format!(
+                "org grant {} was revoked locally on this daemon; local IAM wins — the org must issue a new grant, or a root session can re-enable this one",
+                doc.grant_id
+            )));
+        }
+        let identical = existing.role_id == grant.role_id
+            && existing.expires_at_unix_ms == grant.expires_at_unix_ms
+            && is_enforced_status(&existing.status);
+        if identical {
+            existing.clone()
+        } else {
+            *existing = grant.clone();
+            changed = true;
+            grant
+        }
     } else {
         state.grants.push(grant.clone());
-    }
+        changed = true;
+        grant
+    };
 
-    state.audit_events.push(IamAuditEvent {
-        id: format!("audit:{now_unix_ms}:{}", state.audit_events.len() + 1),
-        at_unix_ms: Some(now_unix_ms),
-        actor_principal_id: format!("org:{handle}"),
-        action: "materialize_org_grant".to_string(),
-        target_id: grant_id,
-        summary: format!(
-            "Materialized {} for {} from org {handle} (expires {})",
-            doc.role_id, principal.label, doc.expires_at_unix_ms
-        ),
-    });
+    if changed {
+        state.audit_events.push(IamAuditEvent {
+            id: format!("audit:{now_unix_ms}:{}", state.audit_events.len() + 1),
+            at_unix_ms: Some(now_unix_ms),
+            actor_principal_id: format!("org:{handle}"),
+            action: "materialize_org_grant".to_string(),
+            target_id: grant_id,
+            summary: format!(
+                "Materialized {} for {} from org {handle} (expires {})",
+                doc.role_id, principal.label, doc.expires_at_unix_ms
+            ),
+        });
+    }
 
     Ok(MaterializedOrgGrant {
         principal,
         grant,
         org_handle: handle,
+        changed,
     })
+}
+
+/// The names a daemon answers to when an org grant's `targets` list is
+/// matched. Callers pass their path-specific ids (the agent card id and
+/// label on the HTTP gateway, the configured rendezvous daemon id on the
+/// Connect client); every path shares the configured Connect daemon id,
+/// the stored host label, and the host's agent-card peer-id form, so a
+/// document targeting any of this daemon's names materializes no matter
+/// which door it arrives through.
+pub fn org_target_daemon_ids(extra_ids: &[String]) -> Vec<String> {
+    let mut ids: Vec<String> = Vec::new();
+    fn push(ids: &mut Vec<String>, value: &str) {
+        let value = value.trim();
+        if !value.is_empty() && !ids.iter().any(|existing| existing == value) {
+            ids.push(value.to_string());
+        }
+    }
+    for id in extra_ids {
+        push(&mut ids, id);
+    }
+    if let Ok(connect_id) = std::env::var("INTENDANT_CONNECT_DAEMON_ID") {
+        push(&mut ids, &connect_id);
+    }
+    let host_label = crate::access::resolve_host_label();
+    push(&mut ids, &host_label);
+    push(
+        &mut ids,
+        crate::peer::PeerId::new(crate::peer::PeerKind::Intendant, &host_label).as_str(),
+    );
+    ids
+}
+
+/// Documents ride along on dashboard-control offers, so cap what a relay
+/// can make a daemon parse. Matches the public endpoint's body cap.
+pub const MAX_ORG_GRANT_DOC_BYTES: usize = 16 * 1024;
+
+/// Parse and materialize a raw document value against the given state.
+/// The IO-free core of [`present_org_grant_value`], shared so tests and
+/// the offer ride-along paths exercise the same semantics.
+pub fn present_org_grant_state(
+    state: &mut LocalIamState,
+    doc_value: &serde_json::Value,
+    extra_daemon_ids: &[String],
+    now_unix_ms: u64,
+) -> Result<MaterializedOrgGrant, String> {
+    if serde_json::to_string(doc_value)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > MAX_ORG_GRANT_DOC_BYTES
+    {
+        return Err("org grant document is too large".to_string());
+    }
+    let doc: OrgGrantDocument = serde_json::from_value(doc_value.clone())
+        .map_err(|e| format!("invalid org grant document: {e}"))?;
+    let daemon_ids = org_target_daemon_ids(extra_daemon_ids);
+    materialize_org_grant(state, &doc, &daemon_ids, now_unix_ms).map_err(|e| e.to_string())
+}
+
+/// Present a raw org-grant document against this daemon's IAM state on
+/// disk: rate-limit, parse, verify, materialize, persist. Shared by the
+/// public presentation endpoint and the offer ride-along paths — the
+/// document is the authorization on all of them, and a failure changes
+/// nothing.
+pub fn present_org_grant_value(
+    doc_value: &serde_json::Value,
+    extra_daemon_ids: &[String],
+    now_unix_ms: u64,
+) -> Result<MaterializedOrgGrant, String> {
+    if !presentation_rate_ok(now_unix_ms) {
+        return Err("too many org grant presentations; retry shortly".to_string());
+    }
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let mut state = crate::access::iam::load_state(&cert_dir)
+        .map_err(|e| format!("load local IAM state: {e}"))?;
+    let outcome = present_org_grant_state(&mut state, doc_value, extra_daemon_ids, now_unix_ms)?;
+    if outcome.changed {
+        crate::access::iam::save_state(&cert_dir, &state)
+            .map_err(|e| format!("save local IAM state: {e}"))?;
+    }
+    Ok(outcome)
 }
 
 /// Root-session action: trust an org key on this daemon.
@@ -576,17 +696,111 @@ mod tests {
         )
         .allowed);
 
-        // Re-presentation is idempotent (same grant id, refreshed record).
+        // Re-presentation is idempotent (same grant id, refreshed record)
+        // and quiet: offers attach documents on every connect, so an
+        // unchanged presentation must not grow state or the audit log.
+        assert!(outcome.changed);
+        let audit_len = state.audit_events.len();
         let again =
             materialize_org_grant(&mut state, &doc, &["intendant:host-a".to_string()], test_now())
                 .unwrap();
         assert_eq!(again.grant.id, outcome.grant.id);
+        assert!(!again.changed);
+        assert_eq!(state.audit_events.len(), audit_len);
         assert_eq!(
             state
                 .grants
                 .iter()
                 .filter(|grant| grant.id == outcome.grant.id)
                 .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn re_presentation_cannot_resurrect_local_revocations() {
+        let identity = org_identity();
+        let mut state = LocalIamState::default();
+        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, test_now()).unwrap();
+        let doc = issue(&identity, &state, "role:session-reader");
+        let outcome =
+            materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now()).unwrap();
+
+        // Local owner revokes the materialized grant: the same document
+        // must not re-activate it (offers re-present automatically, so a
+        // resurrecting upsert would undo the revocation within seconds).
+        let grant = state
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == outcome.grant.id)
+            .unwrap();
+        grant.status = "revoked".to_string();
+        grant.revoked_at_unix_ms = Some(test_now());
+        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
+            .unwrap_err();
+        assert!(err.to_string().contains("revoked locally"), "{err}");
+
+        // A locally revoked principal is refused the same way.
+        let grant = state
+            .grants
+            .iter_mut()
+            .find(|grant| grant.id == outcome.grant.id)
+            .unwrap();
+        grant.status = "active".to_string();
+        grant.revoked_at_unix_ms = None;
+        state
+            .principals
+            .iter_mut()
+            .find(|principal| principal.id == outcome.principal.id)
+            .unwrap()
+            .status = "revoked".to_string();
+        let err = materialize_org_grant(&mut state, &doc, &["*".to_string()], test_now())
+            .unwrap_err();
+        assert!(err.to_string().contains("principal was revoked locally"), "{err}");
+    }
+
+    #[test]
+    fn present_org_grant_state_parses_verifies_and_caps_size() {
+        let identity = org_identity();
+        let mut state = LocalIamState::default();
+        trust_org(&mut state, "acme", &identity.public_key_b64u(), None, test_now()).unwrap();
+        let doc = issue(&identity, &state, "role:session-reader");
+        let value = serde_json::to_value(&doc).unwrap();
+
+        let outcome =
+            present_org_grant_state(&mut state, &value, &["ignored".to_string()], test_now())
+                .unwrap();
+        assert_eq!(outcome.org_handle, "acme");
+        assert!(outcome.changed);
+
+        // Malformed shape fails as a parse error, not a panic.
+        let err = present_org_grant_state(
+            &mut state,
+            &serde_json::json!({"kind": "org-grant"}),
+            &[],
+            test_now(),
+        )
+        .unwrap_err();
+        assert!(err.contains("invalid org grant document"), "{err}");
+
+        // Oversized documents are refused before parsing.
+        let mut huge = value.clone();
+        huge["sig"] = serde_json::Value::String("x".repeat(MAX_ORG_GRANT_DOC_BYTES + 1));
+        let err = present_org_grant_state(&mut state, &huge, &[], test_now()).unwrap_err();
+        assert!(err.contains("too large"), "{err}");
+    }
+
+    #[test]
+    fn org_target_daemon_ids_merges_extras_with_host_forms() {
+        let host_label = crate::access::resolve_host_label();
+        let extras = vec!["connect-id-1".to_string(), host_label.clone()];
+        let ids = org_target_daemon_ids(&extras);
+        assert_eq!(ids[0], "connect-id-1");
+        assert!(ids.contains(&host_label));
+        assert!(ids.contains(&format!("intendant:{host_label}")));
+        // Dedup: the host label passed as an extra appears once.
+        assert_eq!(
+            ids.iter().filter(|id| **id == host_label).count(),
             1
         );
     }

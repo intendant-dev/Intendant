@@ -12059,7 +12059,7 @@ body.display-fullscreen-open {
             <details class="acc-fold" id="access-org-join-fold">
               <summary>Join with an org grant</summary>
               <div class="acc-fold-body">
-                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails.</p>
+                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails. The document is also kept in this browser and presented automatically whenever you connect to a daemon that trusts the org, so you only do this once.</p>
                 <textarea id="access-org-join-doc" class="daemon-pairing-textarea" rows="6" placeholder='{"v":1,"kind":"org-grant", …}'></textarea>
                 <div class="acc-grant-flow-actions">
                   <button id="access-org-join-btn" class="acc-btn primary" type="button">Present grant</button>
@@ -13552,6 +13552,86 @@ async function clientIdentityOfferFields(daemonId, clientNonce, sdp) {
   } catch (err) {
     console.warn('[client-identity] offer signing failed:', err?.message || err);
     return {};
+  }
+}
+
+/* ── Stored org grant documents ──
+   Signed org-grant documents this browser holds, keyed by org handle
+   (trust architecture phase 6). A document pasted into the join fold is
+   kept here so later offers can carry it: first contact with any daemon
+   that trusts the org then materializes the grant and connects in one
+   round trip. Storage is convenience, not authority — every daemon
+   re-verifies the signature, expiry, and its own org trust on each
+   presentation, and only the bound subject key benefits. */
+
+const ORG_GRANTS_STORE_KEY = 'intendant_org_grants_v1';
+
+function orgGrantDocValid(doc) {
+  return Boolean(
+    doc && typeof doc === 'object' && !Array.isArray(doc) &&
+    doc.v === 1 && doc.kind === 'org-grant' &&
+    typeof doc.org?.handle === 'string' && doc.org.handle &&
+    typeof doc.subject?.client_key_fingerprint === 'string' &&
+    typeof doc.sig === 'string' && doc.sig &&
+    Number(doc.expires_at_unix_ms) > 0
+  );
+}
+
+/* Read the stored documents ({handle: doc}), pruning expired or malformed
+   entries as they age out. */
+function orgGrantsRead() {
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem(ORG_GRANTS_STORE_KEY) || '{}'); } catch {}
+  if (!map || typeof map !== 'object' || Array.isArray(map)) map = {};
+  const now = Date.now();
+  let dirty = false;
+  for (const [handle, doc] of Object.entries(map)) {
+    if (!orgGrantDocValid(doc) || Number(doc.expires_at_unix_ms) <= now) {
+      delete map[handle];
+      dirty = true;
+    }
+  }
+  if (dirty) {
+    try { localStorage.setItem(ORG_GRANTS_STORE_KEY, JSON.stringify(map)); } catch {}
+  }
+  return map;
+}
+
+/* Keep a document for automatic presentation on future offers. Returns
+   whether it was stored (valid shape, not yet expired). */
+function orgGrantStore(doc) {
+  if (!orgGrantDocValid(doc) || Number(doc.expires_at_unix_ms) <= Date.now()) return false;
+  try {
+    const map = orgGrantsRead();
+    map[doc.org.handle] = doc;
+    localStorage.setItem(ORG_GRANTS_STORE_KEY, JSON.stringify(map));
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/* The stored document to ride along on an offer to `daemonId` (pass '' on
+   the local same-origin path, where the daemon id is unknown client-side):
+   bound to THIS browser's identity key, unexpired, and targeted at the
+   daemon when its id is known. Latest issued wins when several match —
+   the daemon target-checks again either way. */
+async function orgGrantForOffer(daemonId) {
+  try {
+    const identity = await clientIdentityGet();
+    if (!identity) return null;
+    const now = Date.now();
+    let best = null;
+    for (const doc of Object.values(orgGrantsRead())) {
+      if (String(doc.subject?.client_key_fingerprint || '').trim() !== identity.fingerprint) continue;
+      if (Number(doc.expires_at_unix_ms) <= now) continue;
+      const targets = Array.isArray(doc.targets) ? doc.targets.map(t => String(t).trim()) : [];
+      if (daemonId && targets.length && !targets.includes('*') && !targets.includes(daemonId)) continue;
+      if (!best || Number(doc.issued_at_unix_ms || 0) > Number(best.issued_at_unix_ms || 0)) best = doc;
+    }
+    return best;
+  } catch {
+    return null;
   }
 }
 
@@ -46117,6 +46197,12 @@ window.intendantDashboardControl = {
   status() {
     return dashboardTransport.status();
   },
+  _debugClientIdentity() {
+    return clientIdentityGet();
+  },
+  _debugOrgGrantStore(doc) {
+    return orgGrantStore(doc);
+  },
   connectHealth() {
     return connectHealthState();
   },
@@ -48244,11 +48330,16 @@ class DashboardControlTransport {
         this.clientNonce,
         sdp
       );
+      // A stored org grant rides along so a daemon that trusts the org
+      // materializes it before resolving this very offer (one-round-trip
+      // first contact). The daemon re-verifies everything.
+      const orgGrant = await orgGrantForOffer(DASHBOARD_CONNECT_DAEMON_ID);
       const answer = await this.postConnectSignal('/api/browser/offer', {
         daemon_id: DASHBOARD_CONNECT_DAEMON_ID,
         sdp,
         client_nonce: this.clientNonce,
         ...identity,
+        ...(orgGrant ? { org_grant: orgGrant } : {}),
       });
       this.signalingMode = 'connect-rendezvous';
       dashboardUpdateTransportStatus();
@@ -48256,11 +48347,16 @@ class DashboardControlTransport {
     }
     try {
       const identity = await clientIdentityOfferFields('', this.clientNonce, sdp);
+      const orgGrant = await orgGrantForOffer('');
       const answer = await this.postLocalSignal('/connect/dashboard/offer', {
         sdp,
         client_nonce: this.clientNonce,
         ...identity,
+        ...(orgGrant ? { org_grant: orgGrant } : {}),
       });
+      if (answer?.org_grant_error) {
+        console.warn('[dashboard-control] offer org grant not accepted:', answer.org_grant_error);
+      }
       this.signalingMode = 'local-http';
       dashboardUpdateTransportStatus();
       return answer;
@@ -48396,6 +48492,9 @@ class DashboardControlTransport {
       iceCandidatePair: this.iceCandidatePair,
       lastError: this.lastError,
       eventsActive: dashboardControlEventsActive,
+      grantKind: this.lastStatus?.grant_kind ?? null,
+      grantLabel: this.lastStatus?.grant_label ?? null,
+      accessPrincipal: this.lastStatus?.access_principal ?? null,
       apiAgentCardAvailable: this.lastStatus?.api_agent_card_available ?? null,
       apiCachedBootstrapEventsAvailable: this.lastStatus?.api_cached_bootstrap_events_available ?? null,
       apiBrowserWorkspaceSnapshotAvailable: this.lastStatus?.api_browser_workspace_snapshot_available ?? null,
@@ -64829,13 +64928,17 @@ document.getElementById('access-org-join-btn')?.addEventListener('click', async 
     if (status) status.textContent = 'That is not valid JSON.';
     return;
   }
+  // Keep the document even if this daemon refuses it (it may simply not
+  // trust the org yet) — future offers to org daemons carry it.
+  const stored = orgGrantStore(doc);
   if (status) status.textContent = 'Presenting…';
   try {
     const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
-    if (status) status.textContent = `Granted via @${data.org_handle} — ${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}.`;
+    if (status) status.textContent = `Granted via @${data.org_handle} — ${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}.${stored ? ' Kept for automatic presentation on future connections.' : ''}`;
     showControlToast?.('success', 'Org grant accepted');
   } catch (err) {
-    if (status) status.textContent = err?.message || 'Presentation failed.';
+    const kept = stored ? ' The document is kept in this browser and will be presented automatically once a daemon trusts the org.' : '';
+    if (status) status.textContent = `${err?.message || 'Presentation failed.'}${kept}`;
   }
   await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
   renderAccessAdminSummaries();

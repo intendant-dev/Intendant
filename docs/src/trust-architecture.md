@@ -151,11 +151,12 @@ and first contact, honest about what it is.
 
 > Status: **implemented** (v1: steps 1-4 of the rollout below). Grant
 > expiry, org root keys, signed grant documents, per-daemon trust with a
-> local cap, materialization, and the presentation/issue/trust/revoke
-> endpoints are live; signed revocation lists and renewal (step 5) and
-> peer-subject/issuer-key delegation (step 6) remain. This section is the
-> spec the code follows; the earlier "two lanes" section is the product
-> narrative it serves.
+> local cap, materialization, the presentation/issue/trust/revoke
+> endpoints, and the offer ride-along (documents attached to
+> dashboard-control offers) are live; signed revocation lists and renewal
+> (step 5) and peer-subject/issuer-key delegation (step 6) remain. This
+> section is the spec the code follows; the earlier "two lanes" section is
+> the product narrative it serves.
 
 ### Objects
 
@@ -238,7 +239,33 @@ Presentation paths: an explicit `POST /api/access/org-grants` in the public
 doorbell class (rate-limited, size-capped — the document itself is the
 authorization), and an `org_grant` ride-along field on dashboard-control
 offers so an org member's *first* connection to an org daemon materializes
-the grant and proceeds in one round trip.
+the grant and proceeds in one round trip. The ride-along works the same on
+both offer doors — the hosted rendezvous (`connect_rendezvous.rs`, with
+`intendant-connect` relaying the field verbatim like the client-key
+fields) and the daemon's own `/connect/dashboard/offer` — and runs
+*before* grant resolution, so the freshly written grant resolves for the
+very offer that carried it. Presentation failure is non-fatal: if another
+identity resolves, the session proceeds (the error is logged and, on the
+local path, surfaced in the answer); only when nothing resolves does the
+org error ride back inside the refusal.
+
+Browser side, the join fold stores a pasted document in
+`localStorage` (`intendant_org_grants_v1`, keyed by org handle) even when
+the presenting daemon refuses it — the daemon may simply not trust the org
+yet. Offers then attach the freshest stored document that is unexpired,
+bound to *this* browser's identity key, and targeted at the daemon (when
+its id is known client-side). Since the identity key is origin-scoped,
+a stored document only ever helps the browser it was issued to.
+
+Because offers re-present automatically on every connect, materialization
+is idempotent-quiet and local-wins: an unchanged presentation neither
+rewrites `iam.json` nor grows the audit log, and a document whose
+materialized grant (or subject principal) was *locally revoked* is
+refused rather than resurrected — otherwise a member's browser would undo
+the owner's revocation on its next reconnect. The org's escape hatch is a
+fresh document (new `grant_id`); the owner's is re-enabling the grant from
+a root session. This same property is what lets the step-5 revocation
+list revoke by `grant_id` durably.
 
 ### Revocation
 
@@ -266,8 +293,11 @@ window — hence the 90-day hard cap and the 30-day default.
    presentation endpoint is `POST /api/access/org-grants` (doorbell class:
    unauthenticated, rate-limited, 16 KiB cap — the document is the
    authorization); trust/revoke/issue require `access.manage`.
-4. ⏳ Offer ride-along (one-round-trip first contact) — presentation is
-   an explicit call for now.
+4. ✅ Offer ride-along (one-round-trip first contact): browsers store
+   pasted documents and attach them to dashboard-control offers on both
+   the hosted-rendezvous and local paths; daemons materialize before
+   grant resolution, idempotent-quiet, without resurrecting local
+   revocations. E2E: `scripts/validate-org-grants.cjs`.
 5. ⏳ Revocation list + renewal endpoint + peer gossip.
 6. ⏳ Peer-daemon subjects and issuer-key delegation.
 

@@ -13088,6 +13088,7 @@ fn html_response(status: &str, body: String) -> String {
 async fn connect_dashboard_offer_response(
     dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
     body_text: &str,
+    agent_card: &serde_json::Value,
 ) -> String {
     let body = match serde_json::from_str::<serde_json::Value>(body_text) {
         Ok(body) => body,
@@ -13125,6 +13126,22 @@ async fn connect_dashboard_offer_response(
             )
         }
     };
+    // Org-grant ride-along (phase 6 step 4), same as the rendezvous path:
+    // materialize before grant resolution so a member's first offer binds
+    // its scoped principal instead of falling back to trusted-transport
+    // root. Failure changes nothing here — the transport already earned
+    // its authority — but the error is surfaced for the console.
+    let org_grant_error = body
+        .get("org_grant")
+        .filter(|doc| !doc.is_null())
+        .and_then(|doc| {
+            crate::access::org::present_org_grant_value(
+                doc,
+                &org_target_agent_card_ids(agent_card),
+                crate::access::client_key::now_unix_ms() as u64,
+            )
+            .err()
+        });
     let grant = match verified_client_key {
         Some(key) => {
             let cert_dir = crate::access::backend::select_backend().cert_dir();
@@ -13170,13 +13187,19 @@ async fn connect_dashboard_offer_response(
         .answer_offer_with_grant(sdp.to_string(), None, client_nonce, grant)
         .await
     {
-        Ok(answer) => json_ok(serde_json::json!({
-            "ok": true,
-            "signaling": "connect-bootstrap-local",
-            "session_id": answer.session_id,
-            "sdp": answer.sdp,
-            "binding": answer.binding,
-        })),
+        Ok(answer) => {
+            let mut response = serde_json::json!({
+                "ok": true,
+                "signaling": "connect-bootstrap-local",
+                "session_id": answer.session_id,
+                "sdp": answer.sdp,
+                "binding": answer.binding,
+            });
+            if let Some(org_error) = org_grant_error {
+                response["org_grant_error"] = serde_json::Value::String(org_error);
+            }
+            json_ok(response)
+        }
         Err(e) => json_error("500 Internal Server Error", e),
     }
 }
@@ -21083,7 +21106,12 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = with_public_cors(
-                            connect_dashboard_offer_response(&dashboard_control, &body_text).await,
+                            connect_dashboard_offer_response(
+                                &dashboard_control,
+                                &body_text,
+                                &agent_card_value_for_targets,
+                            )
+                            .await,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
@@ -24651,30 +24679,16 @@ fn with_fleet_cors(response: String, allowed_origin: Option<&str>) -> String {
     format!("{}{rest}", lines.join("\r\n"))
 }
 
-/// The names this daemon answers to when an org grant's `targets` list is
-/// matched: agent-card id and label, the stored host label, and the
-/// configured Connect daemon id.
-fn org_target_daemon_ids(agent_card: &serde_json::Value) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for key in ["id", "label"] {
-        if let Some(value) = agent_card.get(key).and_then(|v| v.as_str()) {
-            let value = value.trim();
-            if !value.is_empty() && !ids.iter().any(|existing| existing == value) {
-                ids.push(value.to_string());
-            }
-        }
-    }
-    if let Ok(connect_id) = std::env::var("INTENDANT_CONNECT_DAEMON_ID") {
-        let connect_id = connect_id.trim().to_string();
-        if !connect_id.is_empty() && !ids.iter().any(|existing| existing == &connect_id) {
-            ids.push(connect_id);
-        }
-    }
-    let host_label = crate::access::resolve_host_label();
-    if !host_label.trim().is_empty() && !ids.iter().any(|existing| existing == &host_label) {
-        ids.push(host_label);
-    }
-    ids
+/// The agent-card names this gateway adds to the shared org-grant target
+/// id set (`access::org::org_target_daemon_ids`): the card's id and label.
+fn org_target_agent_card_ids(agent_card: &serde_json::Value) -> Vec<String> {
+    ["id", "label"]
+        .iter()
+        .filter_map(|key| agent_card.get(key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 pub(crate) fn is_public_org_grant_path(request_line: &str) -> bool {
@@ -24692,20 +24706,11 @@ pub(crate) fn access_org_present_response_value(
     params: serde_json::Value,
     agent_card: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let now = crate::access::client_key::now_unix_ms() as u64;
-    if !crate::access::org::presentation_rate_ok(now) {
-        return Err("too many org grant presentations; retry shortly".to_string());
-    }
-    let doc: crate::access::org::OrgGrantDocument =
-        serde_json::from_value(params).map_err(|e| format!("invalid org grant document: {e}"))?;
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let daemon_ids = org_target_daemon_ids(agent_card);
-    let outcome = crate::access::org::materialize_org_grant(&mut state, &doc, &daemon_ids, now)
-        .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(&cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let outcome = crate::access::org::present_org_grant_value(
+        &params,
+        &org_target_agent_card_ids(agent_card),
+        crate::access::client_key::now_unix_ms() as u64,
+    )?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "materialized": true,
