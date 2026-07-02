@@ -1544,7 +1544,7 @@ fn append_manual_http_tool_definitions(
         "show_shared_view",
         manual_http_tool_definition!(
             "show_shared_view",
-            "Open the dashboard shared display view for agent-human collaboration.",
+            "Open the dashboard shared display view: give the user live visibility into an agent-owned display (sandbox, VM, virtual display) to demo results or let them follow GUI work. Sharing the user's own screen (user_session) is an explicit opt-in path, not a default.",
             ShowSharedViewParams
         ),
     );
@@ -1568,7 +1568,7 @@ fn append_manual_http_tool_definitions(
         "request_shared_view_input",
         manual_http_tool_definition!(
             "request_shared_view_input",
-            "Ask the user for input authority or human interaction on a shared display target.",
+            "Ask the user for input authority or human interaction on a shared display target. Input authority is only ever granted by the user clicking the dashboard control — this tool asks, it never grants.",
             RequestSharedViewInputParams
         ),
     );
@@ -8030,10 +8030,21 @@ fn clamp_shared_view_unit(value: f64) -> f64 {
 }
 
 fn normalize_shared_view_region(region: SharedViewRegionParams) -> crate::types::SharedViewRegion {
-    let x = clamp_shared_view_unit(region.x);
-    let y = clamp_shared_view_unit(region.y);
-    let width = clamp_shared_view_unit(region.width).min(1.0 - x);
-    let height = clamp_shared_view_unit(region.height).min(1.0 - y);
+    normalize_shared_view_region_xywh(region.x, region.y, region.width, region.height)
+}
+
+/// Clamp a raw x/y/width/height quadruple into a valid normalized region.
+/// Shared with the native `shared_view` tool handler.
+pub(crate) fn normalize_shared_view_region_xywh(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> crate::types::SharedViewRegion {
+    let x = clamp_shared_view_unit(x);
+    let y = clamp_shared_view_unit(y);
+    let width = clamp_shared_view_unit(width).min(1.0 - x);
+    let height = clamp_shared_view_unit(height).min(1.0 - y);
     crate::types::SharedViewRegion {
         x,
         y,
@@ -8124,7 +8135,7 @@ impl UserSessionDisplayActivationRequest {
     }
 }
 
-fn shared_view_display_target(
+pub(crate) fn shared_view_display_target(
     display_target: Option<String>,
     display_id: Option<u32>,
 ) -> Option<String> {
@@ -8134,7 +8145,10 @@ fn shared_view_display_target(
         .or_else(|| display_id.map(|id| format!(":{}", id)))
 }
 
-fn shared_view_display_id(display_target: Option<&str>, display_id: Option<u32>) -> Option<u32> {
+pub(crate) fn shared_view_display_id(
+    display_target: Option<&str>,
+    display_id: Option<u32>,
+) -> Option<u32> {
     if display_id.is_some() {
         return display_id;
     }
@@ -8150,7 +8164,10 @@ fn shared_view_display_id(display_target: Option<&str>, display_id: Option<u32>)
         .ok()
 }
 
-fn shared_view_target_label(display_id: Option<u32>, display_target: Option<&str>) -> String {
+pub(crate) fn shared_view_target_label(
+    display_id: Option<u32>,
+    display_target: Option<&str>,
+) -> String {
     if let Some(id) = display_id {
         return if id == 0 {
             "primary display".to_string()
@@ -10300,7 +10317,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Open the dashboard shared display view for agent-human collaboration. For user_session / primary-display targets, this also requests display-stream activation. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
+        description = "Open the dashboard shared display view: give the user live visibility into an agent-owned display (sandbox, VM, virtual display) to demo results or let them follow GUI work as it happens. Requests display-stream activation so connected dashboards show the display and optional focus region. Sharing the user's own screen (user_session) is an explicit opt-in path, not a default. This does not grant input authority — that is only ever granted by the user from the dashboard."
     )]
     async fn show_shared_view(
         &self,

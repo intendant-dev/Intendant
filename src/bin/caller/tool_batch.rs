@@ -22,6 +22,9 @@ pub struct ToolBatchResult {
     /// Skill invocations extracted from invoke_skill tool calls.
     /// Vec of (call_id, skill_name, arguments).
     pub skill_invocations: Vec<(String, String, String)>,
+    /// Shared-view calls extracted from shared_view tool calls.
+    /// Vec of (call_id, raw_args_json).
+    pub shared_view_calls: Vec<(String, serde_json::Value)>,
     /// Live audio spawn requests extracted from spawn_live_audio tool calls.
     /// Vec of (call_id, session_id, full_args_json).
     pub live_audio_spawns: Vec<(String, String, serde_json::Value)>,
@@ -39,6 +42,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
     let mut mcp_calls = Vec::new();
     let mut precomputed_results = Vec::new();
     let mut skill_invocations = Vec::new();
+    let mut shared_view_calls = Vec::new();
     let mut live_audio_spawns = Vec::new();
 
     for tc in tool_calls {
@@ -63,6 +67,11 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
                         .unwrap_or("")
                         .to_string();
                     skill_invocations.push((tc.call_id.clone(), skill_name, arguments));
+                }
+            }
+            "shared_view" => {
+                if let Ok(args) = serde_json::from_str::<serde_json::Value>(&tc.arguments) {
+                    shared_view_calls.push((tc.call_id.clone(), args));
                 }
             }
             "spawn_live_audio" => {
@@ -137,6 +146,7 @@ pub fn assemble_batch_from_tool_calls(tool_calls: &[provider::ToolCall]) -> Tool
         mcp_calls,
         precomputed_results,
         skill_invocations,
+        shared_view_calls,
         live_audio_spawns,
     }
 }
@@ -209,6 +219,7 @@ pub fn map_results_to_tool_responses(
         if tool_name == "manage_context"
             || tool_name == "signal_done"
             || tool_name == "invoke_skill"
+            || tool_name == "shared_view"
             || tool_name == "spawn_live_audio"
         {
             results.push((call_id.clone(), tool_name.clone(), "OK".to_string()));
@@ -231,4 +242,30 @@ pub fn map_results_to_tool_responses(
     }
 
     results
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn assemble_batch_collects_shared_view_call() {
+        let calls = vec![provider::ToolCall {
+            id: "call_1".to_string(),
+            call_id: "call_1".to_string(),
+            name: "shared_view".to_string(),
+            arguments: r#"{"action":"show","display_target":"user_session","reason":"demo"}"#
+                .to_string(),
+        }];
+        let result = assemble_batch_from_tool_calls(&calls);
+        assert_eq!(result.shared_view_calls.len(), 1);
+        let (call_id, args) = &result.shared_view_calls[0];
+        assert_eq!(call_id, "call_1");
+        assert_eq!(args["action"], "show");
+        assert_eq!(args["display_target"], "user_session");
+        assert!(
+            result.agent_input_json.is_none(),
+            "shared_view is caller-handled and must not reach the runtime"
+        );
+    }
 }

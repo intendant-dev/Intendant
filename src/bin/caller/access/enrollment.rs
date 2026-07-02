@@ -137,8 +137,22 @@ mod tests {
     fn enrollment_queue_lifecycle() {
         clear_for_tests();
         let now = 1_000_000;
-        record_refused_client_key("fp-a", "pk-a", "https://connect.intendant.dev", "connect-dashboard-control", "@alice", now);
-        record_refused_client_key("fp-a", "pk-a", "", "connect-dashboard-control", "", now + 10);
+        record_refused_client_key(
+            "fp-a",
+            "pk-a",
+            "https://connect.intendant.dev",
+            "connect-dashboard-control",
+            "@alice",
+            now,
+        );
+        record_refused_client_key(
+            "fp-a",
+            "pk-a",
+            "",
+            "connect-dashboard-control",
+            "",
+            now + 10,
+        );
         let pending = pending_enrollments(now + 20);
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].attempts, 2);

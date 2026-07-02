@@ -59,7 +59,7 @@ pub fn tool_name_to_function(tool_name: &str) -> Option<&'static str> {
     }
 }
 
-/// Returns all 12 tool definitions.
+/// Returns all 14 tool definitions.
 pub fn all_tools() -> Vec<ToolDefinition> {
     let mut tools = Vec::with_capacity(12);
 
@@ -368,7 +368,44 @@ pub fn all_tools() -> Vec<ToolDefinition> {
         }),
     });
 
-    // 13. spawn_live_audio (caller-handled, untrusted live audio sub-agent)
+    // 13. shared_view (caller-handled, not sent to runtime)
+    tools.push(ToolDefinition {
+        name: "shared_view".to_string(),
+        description: "Control the dashboard shared display view: give the user live visibility into an agent-owned display — a sandbox, VM, dedicated agent machine, or virtual display — to demo a result or let them follow GUI/browser work as it happens. Actions: show opens the shared view and requests display-stream activation, focus highlights a region, capture attaches the current frame, input asks the user to take input authority (granted only by the user clicking the dashboard control — never by the agent), hide dismisses the view when the moment is over. Sharing the user's own screen (user_session) is an explicit opt-in path for collaboration the user asked for, not a default and not unattended control of their machine.".to_string(),
+        parameters: json!({
+            "type": "object",
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["show", "focus", "capture", "input", "hide"],
+                    "description": "Shared-view verb to perform."
+                },
+                "display_target": {
+                    "type": "string",
+                    "description": "Display to share: \"display_99\" or \"99\" for an agent-owned virtual display (the primary case), or \"user_session\" only when the user has explicitly opted into sharing their own screen. Omit to auto-detect the agent's display."
+                },
+                "region": {
+                    "type": "object",
+                    "description": "Region to highlight as fractions from 0.0 to 1.0; required for the focus action.",
+                    "properties": {
+                        "x": {"type": "number"},
+                        "y": {"type": "number"},
+                        "width": {"type": "number"},
+                        "height": {"type": "number"}
+                    },
+                    "additionalProperties": false
+                },
+                "reason": {
+                    "type": "string",
+                    "description": "Short note shown to the user about what they are being shown and why."
+                }
+            },
+            "required": ["action"],
+            "additionalProperties": false
+        }),
+    });
+
+    // 14. spawn_live_audio (caller-handled, untrusted live audio sub-agent)
     tools.push(ToolDefinition {
         name: "spawn_live_audio".to_string(),
         description: "Spawn an untrusted live audio sub-agent to conduct a voice conversation through an app on the display. Connects to a live audio model (Gemini Live or OpenAI Realtime) and routes audio through virtual devices (PulseAudio on Linux, Vortex Audio on macOS). Requires virtual audio driver to be installed. The sub-agent has zero tools and zero file access. Returns structured data matching the response_schema, or quarantine references for unexpected content.".to_string(),
@@ -464,9 +501,9 @@ mod tests {
     use super::*;
 
     #[test]
-    fn all_tools_has_13_definitions() {
+    fn all_tools_has_14_definitions() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 13);
+        assert_eq!(tools.len(), 14);
     }
 
     #[test]
@@ -613,19 +650,19 @@ mod tests {
         let tools = all_tools();
 
         let oai_tools: Vec<Value> = tools.iter().map(|t| t.to_openai()).collect();
-        assert_eq!(oai_tools.len(), 13);
+        assert_eq!(oai_tools.len(), 14);
         for t in &oai_tools {
             assert_eq!(t["type"].as_str(), Some("function"));
         }
 
         let ant_tools: Vec<Value> = tools.iter().map(|t| t.to_anthropic()).collect();
-        assert_eq!(ant_tools.len(), 13);
+        assert_eq!(ant_tools.len(), 14);
         for t in &ant_tools {
             assert!(t["input_schema"].is_object());
         }
 
         let gem_tools: Vec<Value> = tools.iter().map(|t| t.to_gemini()).collect();
-        assert_eq!(gem_tools.len(), 13);
+        assert_eq!(gem_tools.len(), 14);
         for t in &gem_tools {
             assert!(t["parameters"].is_object());
         }

@@ -125,7 +125,9 @@ pub struct ClientKeyOfferFields {
 
 impl ClientKeyOfferFields {
     pub fn is_present(&self) -> bool {
-        self.client_key.as_deref().is_some_and(|v| !v.trim().is_empty())
+        self.client_key
+            .as_deref()
+            .is_some_and(|v| !v.trim().is_empty())
             || self
                 .client_key_sig
                 .as_deref()
@@ -156,8 +158,7 @@ impl ClientKeyOfferFields {
         let ts = self
             .client_key_ts
             .ok_or_else(|| "client key offer is missing its timestamp".to_string())?;
-        verify_client_key_offer(key, sig, ts, daemon_id, client_nonce, sdp, now_unix_ms)
-            .map(Some)
+        verify_client_key_offer(key, sig, ts, daemon_id, client_nonce, sdp, now_unix_ms).map(Some)
     }
 }
 
@@ -181,9 +182,8 @@ mod tests {
     fn generate_key() -> TestKey {
         let rng = ring::rand::SystemRandom::new();
         let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng).unwrap();
-        let pair =
-            EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
-                .unwrap();
+        let pair = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, pkcs8.as_ref(), &rng)
+            .unwrap();
         let raw_point_b64u = b64u(pair.public_key().as_ref());
         TestKey {
             pair,
@@ -224,11 +224,26 @@ mod tests {
         let ok = |daemon: &str, nonce: &str, sdp: &str, now: i64| {
             verify_client_key_offer(&key.raw_point_b64u, &sig, ts, daemon, nonce, sdp, now)
         };
-        assert!(ok("daemon-b", "nonce-1", "v=0 sdp", ts).is_err(), "daemon id must bind");
-        assert!(ok("daemon-a", "nonce-2", "v=0 sdp", ts).is_err(), "nonce must bind");
-        assert!(ok("daemon-a", "nonce-1", "v=1 sdp", ts).is_err(), "sdp must bind");
         assert!(
-            ok("daemon-a", "nonce-1", "v=0 sdp", ts + CLIENT_KEY_MAX_SKEW_MS + 1).is_err(),
+            ok("daemon-b", "nonce-1", "v=0 sdp", ts).is_err(),
+            "daemon id must bind"
+        );
+        assert!(
+            ok("daemon-a", "nonce-2", "v=0 sdp", ts).is_err(),
+            "nonce must bind"
+        );
+        assert!(
+            ok("daemon-a", "nonce-1", "v=1 sdp", ts).is_err(),
+            "sdp must bind"
+        );
+        assert!(
+            ok(
+                "daemon-a",
+                "nonce-1",
+                "v=0 sdp",
+                ts + CLIENT_KEY_MAX_SKEW_MS + 1
+            )
+            .is_err(),
             "stale timestamps must fail"
         );
         assert!(ok("daemon-a", "nonce-1", "v=0 sdp", ts).is_ok());
@@ -250,10 +265,16 @@ mod tests {
             ts
         )
         .is_err());
-        assert!(
-            verify_client_key_offer("not-base64!!", &sig, ts, "daemon-a", "nonce-1", "v=0 sdp", ts)
-                .is_err()
-        );
+        assert!(verify_client_key_offer(
+            "not-base64!!",
+            &sig,
+            ts,
+            "daemon-a",
+            "nonce-1",
+            "v=0 sdp",
+            ts
+        )
+        .is_err());
         assert!(verify_client_key_offer(
             &key.raw_point_b64u,
             "AAAA",
@@ -286,10 +307,13 @@ mod tests {
             client_key_ts: Some(ts),
         };
         let verified = fields.verify("d", "n", "sdp", ts).unwrap().unwrap();
-        assert_eq!(verified.fingerprint, client_key_fingerprint(
-            &base64::engine::general_purpose::URL_SAFE_NO_PAD
-                .decode(&key.raw_point_b64u)
-                .unwrap()
-        ));
+        assert_eq!(
+            verified.fingerprint,
+            client_key_fingerprint(
+                &base64::engine::general_purpose::URL_SAFE_NO_PAD
+                    .decode(&key.raw_point_b64u)
+                    .unwrap()
+            )
+        );
     }
 }

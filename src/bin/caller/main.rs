@@ -21338,6 +21338,85 @@ Also: {"source": "bare"}"#;
         }
     }
 
+    // --- handle_shared_view_calls tests ---
+
+    #[tokio::test]
+    async fn shared_view_calls_validate_and_gate_user_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(tmp.path().to_path_buf()).unwrap(),
+        ));
+        let mut conversation = Conversation::new("system".to_string(), 100_000);
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
+        let mut counter = 0u64;
+
+        let calls = vec![
+            ("c1".to_string(), serde_json::json!({"action": "hide"})),
+            // focus without a region must fail fast.
+            ("c2".to_string(), serde_json::json!({"action": "focus"})),
+            // user_session without the display grant is refused (explicit opt-in).
+            (
+                "c3".to_string(),
+                serde_json::json!({"action": "show", "display_target": "user_session"}),
+            ),
+            ("c4".to_string(), serde_json::json!({"action": "bogus"})),
+        ];
+        handle_shared_view_calls(
+            &calls,
+            &mut conversation,
+            &bus,
+            &autonomy,
+            None,
+            Some("sess-1".to_string()),
+            tmp.path(),
+            &mut counter,
+            &session_log,
+        )
+        .await;
+
+        let results: Vec<_> = conversation
+            .messages()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
+        assert_eq!(results.len(), 4, "one result per call");
+        assert!(
+            results[0].content.contains("dismissed"),
+            "{}",
+            results[0].content
+        );
+        assert!(
+            results[1].content.contains("requires a region"),
+            "{}",
+            results[1].content
+        );
+        assert!(
+            results[2].content.contains("explicit opt-in"),
+            "{}",
+            results[2].content
+        );
+        assert!(
+            results[3].content.contains("unknown shared_view action"),
+            "{}",
+            results[3].content
+        );
+
+        // Only the valid hide emitted a SharedView event; the gated and
+        // invalid calls must not reach the dashboard.
+        match rx.try_recv() {
+            Ok(AppEvent::SharedView {
+                action, session_id, ..
+            }) => {
+                assert_eq!(action, "hide");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+            }
+            other => panic!("expected SharedView hide event, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no further events expected");
+    }
+
     // --- map_results_to_tool_responses tests ---
 
     #[test]
@@ -24909,6 +24988,22 @@ async fn run_agent_loop(
                         );
                     }
                 }
+            }
+
+            // Handle shared_view tool calls (dashboard coordination layer)
+            if !batch.shared_view_calls.is_empty() {
+                handle_shared_view_calls(
+                    &batch.shared_view_calls,
+                    conversation,
+                    bus,
+                    &autonomy,
+                    session_registry,
+                    local_session_id.clone(),
+                    log_dir,
+                    &mut cu_action_counter,
+                    &session_log,
+                )
+                .await;
             }
 
             // Handle live audio spawn requests (blocking)
@@ -32976,6 +33071,178 @@ async fn run_cu_task(
 /// Execute native computer-use tool calls via the xdotool executor
 /// and add results (with screenshots) to the conversation.
 #[allow(clippy::too_many_arguments)]
+/// Handle native `shared_view` tool calls: dashboard visibility into
+/// agent-owned displays (sandboxes, VMs, virtual displays). Sharing the
+/// user's own screen is explicit opt-in — unlike the MCP path, this handler
+/// refuses to flip the display grant itself and instead tells the model the
+/// user must grant the display first; input authority is only ever granted
+/// by the user from the dashboard.
+#[allow(clippy::too_many_arguments)]
+async fn handle_shared_view_calls(
+    shared_view_calls: &[(String, serde_json::Value)],
+    conversation: &mut conversation::Conversation,
+    bus: &EventBus,
+    autonomy: &SharedAutonomy,
+    session_registry: Option<&display::SharedSessionRegistry>,
+    session_id: Option<String>,
+    log_dir: &std::path::Path,
+    cu_counter: &mut u64,
+    session_log: &SharedSessionLog,
+) {
+    for (call_id, args) in shared_view_calls {
+        let action = args
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or_default();
+        let display_target = args
+            .get("display_target")
+            .and_then(|s| s.as_str())
+            .map(str::to_string);
+        let reason = args
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .map(str::to_string);
+        let region = args.get("region").and_then(|r| {
+            Some(mcp::normalize_shared_view_region_xywh(
+                r.get("x")?.as_f64()?,
+                r.get("y")?.as_f64()?,
+                r.get("width")?.as_f64()?,
+                r.get("height")?.as_f64()?,
+            ))
+        });
+
+        let resolved_target = mcp::shared_view_display_target(display_target, None);
+        let display_id = mcp::shared_view_display_id(resolved_target.as_deref(), None);
+        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
+
+        // The user's own screen is an explicit opt-in path: require the
+        // existing display grant instead of flipping it from a tool call.
+        // Only display-exposing verbs gate — focus/input/hide operate on
+        // whatever view is already shown.
+        let effective_user_display = match display_id {
+            Some(0) => true,
+            Some(_) => false,
+            None => matches!(
+                resolve_cu_display_target(),
+                computer_use::DisplayTarget::UserSession
+            ),
+        };
+        if matches!(action, "show" | "capture")
+            && effective_user_display
+            && !autonomy.read().await.user_display_granted
+        {
+            conversation.add_tool_result(
+                call_id,
+                "shared_view",
+                "Error: sharing the user's own screen (user_session) is an explicit opt-in — \
+                 the user must grant their display first (dashboard grant or \
+                 grant_user_display). Share an agent-owned display instead, e.g. \
+                 display_target \"99\" for the virtual display you are working on.",
+            );
+            continue;
+        }
+
+        let emit = |action: &str, note: Option<String>| AppEvent::SharedView {
+            session_id: session_id.clone(),
+            action: action.to_string(),
+            display_target: resolved_target.clone(),
+            display_id,
+            reason: reason.clone(),
+            region: region.clone(),
+            note,
+        };
+
+        let output = match action {
+            "show" => {
+                // (Re)activate a granted user display whose session is gone;
+                // the grant listener owns the platform work.
+                if display_id == Some(0) {
+                    let session_missing = match session_registry {
+                        Some(registry) => registry.read().await.get(0).is_none(),
+                        None => false,
+                    };
+                    if session_missing {
+                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+                    }
+                }
+                bus.send(emit("show", None));
+                format!("Shared view shown for {label} — the dashboard is now streaming it.")
+            }
+            "focus" => match region {
+                Some(_) => {
+                    bus.send(emit("focus", None));
+                    format!("Focus highlighted on {label}.")
+                }
+                None => "Error: focus requires a region {x, y, width, height} with 0.0-1.0 \
+                         fractions."
+                    .to_string(),
+            },
+            "capture" => {
+                bus.send(emit("capture", None));
+                let target = match display_id {
+                    Some(0) => computer_use::DisplayTarget::UserSession,
+                    Some(id) => computer_use::DisplayTarget::Virtual { id },
+                    None => resolve_cu_display_target(),
+                };
+                let screenshot_dir = log_dir.join("screenshots");
+                let _ = std::fs::create_dir_all(&screenshot_dir);
+                let registry = session_registry.cloned();
+                let results = computer_use::execute_actions(
+                    &[computer_use::CuAction::Screenshot],
+                    target,
+                    computer_use::DisplayBackend::detect(),
+                    &screenshot_dir,
+                    cu_counter,
+                    &registry,
+                    None,
+                )
+                .await;
+                match results.first().and_then(|r| r.screenshot.as_ref()) {
+                    Some(shot) => {
+                        let images = vec![conversation::ImageData {
+                            media_type: "image/png".to_string(),
+                            data: shot.base64_png.clone(),
+                        }];
+                        conversation.add_tool_result_with_images(
+                            call_id,
+                            "shared_view",
+                            &format!("Captured the current frame of {label}."),
+                            images,
+                        );
+                        continue;
+                    }
+                    None => format!(
+                        "Error: no frame available for {label}: {}",
+                        results
+                            .first()
+                            .and_then(|r| r.error.as_deref())
+                            .unwrap_or("unknown capture failure")
+                    ),
+                }
+            }
+            "input" => {
+                bus.send(emit("input", None));
+                format!(
+                    "Input authority requested for {label}. The user must accept from the \
+                     dashboard control — continue only after they take over or respond."
+                )
+            }
+            "hide" => {
+                bus.send(emit("hide", None));
+                "Shared view dismissed.".to_string()
+            }
+            other => format!(
+                "Error: unknown shared_view action '{other}' — use show, focus, capture, \
+                 input, or hide."
+            ),
+        };
+        slog(session_log, |l| {
+            l.info(&format!("shared_view {action}: {label}"))
+        });
+        conversation.add_tool_result(call_id, "shared_view", &output);
+    }
+}
+
 async fn execute_cu_calls(
     cu_calls: &[computer_use::CuToolCall],
     conversation: &mut conversation::Conversation,
