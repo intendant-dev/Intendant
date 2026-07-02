@@ -475,6 +475,15 @@ The pieces that implement the model, mapped to the codebase:
   through the ordinary grant upsert with the key's route origin recorded, so
   ceilings and audit apply unchanged. The certificate ceremony happens once
   per *user*, not once per browser or per daemon.
+- **Encrypted fleet sync**: the private fields of a synced fleet record
+  (daemon URLs) are sealed with an AES-GCM key derived from the account
+  passkey via the WebAuthn PRF extension — a secret the browser evaluates
+  locally and the rendezvous never sees. Passkeys sync across the user's
+  devices, so each device derives the same key; the hosted store holds
+  ciphertext (`enc_fields`, signed as stored — fleet-record payload v3),
+  and a device without the key still verifies the record and simply shows
+  it locked. No PRF support degrades to plaintext-free sync of the public
+  fields only.
 - **Grant fanout**: the anchor-served Access page applies one grant across
   many daemons — an "Apply to" step in the grant flow calls each selected
   fleet daemon's IAM API directly (browser mTLS, cross-origin), with

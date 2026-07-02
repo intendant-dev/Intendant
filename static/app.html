@@ -13989,20 +13989,131 @@ async function clientIdentityReset() {
    target daemon. */
 
 function accessFleetRecordPayload(record, signedAt, version = 2) {
+  // v3 (encrypted records): the URL fields travel ONLY inside enc_fields,
+  // so the signed lines pin them to empty — decrypting into the in-memory
+  // record never invalidates the signature.
+  const enc = version >= 3 ? String(record.enc_fields || '') : '';
+  const blank = version >= 3 && enc;
   const lines = [
-    version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
+    version >= 3 ? 'intendant-fleet-record-v3'
+      : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
     String(record.host_id || record.id || ''),
     String(record.label || ''),
-    String(record.url || ''),
-    String(record.ws_url || ''),
-    String(record.browser_tcp_via_url || ''),
+    blank ? '' : String(record.url || ''),
+    blank ? '' : String(record.ws_url || ''),
+    blank ? '' : String(record.browser_tcp_via_url || ''),
     String(record.connect_daemon_id || ''),
   ];
   // v2 adds the daemon-advertised rendezvous base (phase 7) so a synced
   // device connects through the daemon's own rendezvous, not a default.
   if (version >= 2) lines.push(String(record.connect_signaling_base || ''));
+  if (version >= 3) lines.push(enc);
   lines.push(String(signedAt));
   return new TextEncoder().encode(lines.join('\n'));
+}
+
+/* ── Encrypted fleet sync (trust architecture phase 5 follow-on) ──
+   The WebAuthn PRF extension turns the account passkey into a secret the
+   server never sees; passkeys sync across a user's devices, so every
+   device can derive the same AES-GCM key and the hosted store holds only
+   ciphertext for the private fields (daemon URLs). No PRF support — or a
+   device that hasn't unlocked — degrades to blank URLs with the record
+   otherwise intact and verifiable. */
+
+const FLEET_PRF_SESSION_KEY = 'intendant_fleet_prf_v1';
+const FLEET_ENC_PREFIX = 'enc1:';
+let accessFleetAesKey = null;
+
+async function accessFleetEncryptionKey() {
+  if (accessFleetAesKey) return accessFleetAesKey;
+  try {
+    const prfB64u = sessionStorage.getItem(FLEET_PRF_SESSION_KEY) || '';
+    if (!prfB64u || !crypto?.subtle) return null;
+    const hkdf = await crypto.subtle.importKey(
+      'raw', dashboardBase64UrlToBytes(prfB64u), 'HKDF', false, ['deriveKey']
+    );
+    accessFleetAesKey = await crypto.subtle.deriveKey(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt: new TextEncoder().encode('intendant-fleet-sync-v1'),
+        info: new TextEncoder().encode('fleet-enc'),
+      },
+      hkdf,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+    return accessFleetAesKey;
+  } catch (err) {
+    console.warn('[fleet-sync] encryption key unavailable:', err?.message || err);
+    return null;
+  }
+}
+
+function accessFleetEncryptionAvailable() {
+  return Boolean(sessionStorage.getItem(FLEET_PRF_SESSION_KEY));
+}
+
+/* The hosted copy of a record: URL fields sealed into enc_fields when the
+   key is present; the local store keeps plaintext. */
+async function accessFleetEncryptRecord(record) {
+  const key = await accessFleetEncryptionKey();
+  if (!key) return record;
+  const secret = {
+    url: String(record.url || ''),
+    ws_url: String(record.ws_url || ''),
+    browser_tcp_via_url: String(record.browser_tcp_via_url || ''),
+  };
+  if (!secret.url && !secret.ws_url && !secret.browser_tcp_via_url && !record.enc_fields) {
+    return record;
+  }
+  try {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      new TextEncoder().encode(JSON.stringify(secret))
+    );
+    return {
+      ...record,
+      url: '',
+      ws_url: '',
+      browser_tcp_via_url: '',
+      enc_fields: `${FLEET_ENC_PREFIX}${dashboardBytesToBase64Url(iv)}:${dashboardBytesToBase64Url(new Uint8Array(ciphertext))}`,
+    };
+  } catch (err) {
+    console.warn('[fleet-sync] record encryption failed:', err?.message || err);
+    return record;
+  }
+}
+
+/* Fill the in-memory record from its envelope when the key is available;
+   otherwise mark it locked (URLs stay blank, everything else works). */
+async function accessFleetDecryptRecord(record) {
+  const enc = String(record?.enc_fields || '');
+  if (!enc.startsWith(FLEET_ENC_PREFIX)) return record;
+  const key = await accessFleetEncryptionKey();
+  if (!key) return { ...record, fleet_locked: true };
+  try {
+    const [ivB64u, ctB64u] = enc.slice(FLEET_ENC_PREFIX.length).split(':');
+    const plaintext = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: dashboardBase64UrlToBytes(ivB64u) },
+      key,
+      dashboardBase64UrlToBytes(ctB64u)
+    );
+    const secret = JSON.parse(new TextDecoder().decode(plaintext));
+    return {
+      ...record,
+      url: String(secret.url || ''),
+      ws_url: String(secret.ws_url || ''),
+      browser_tcp_via_url: String(secret.browser_tcp_via_url || ''),
+      fleet_locked: false,
+    };
+  } catch (err) {
+    console.warn('[fleet-sync] record decryption failed:', err?.message || err);
+    return { ...record, fleet_locked: true };
+  }
 }
 
 async function accessFleetSignRecord(record) {
@@ -14013,7 +14124,7 @@ async function accessFleetSignRecord(record) {
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
       identity.privateKey,
-      accessFleetRecordPayload(record, signedAt)
+      accessFleetRecordPayload(record, signedAt, record.enc_fields ? 3 : 2)
     );
     return {
       ...record,
@@ -14044,19 +14155,15 @@ async function accessFleetVerifyRecord(record) {
       false,
       ['verify']
     );
-    let valid = await crypto.subtle.verify(
-      { name: 'ECDSA', hash: 'SHA-256' },
-      publicKey,
-      dashboardBase64UrlToBytes(sig),
-      accessFleetRecordPayload(record, signedAt, 2)
-    );
-    if (!valid) {
+    let valid = false;
+    for (const version of record.enc_fields ? [3, 2, 1] : [2, 1]) {
       valid = await crypto.subtle.verify(
         { name: 'ECDSA', hash: 'SHA-256' },
         publicKey,
         dashboardBase64UrlToBytes(sig),
-        accessFleetRecordPayload(record, signedAt, 1)
+        accessFleetRecordPayload(record, signedAt, version)
       );
+      if (valid) break;
     }
     if (!valid) return 'unverified';
     const mine = clientIdentityCache?.publicRawB64u === key;
@@ -34174,7 +34281,12 @@ async function accessFleetHydrateFromHosted() {
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets'));
     const body = await resp.json().catch(() => ({}));
     if (resp.ok && body.ok !== false) {
-      accessFleetMergeHostedTargets(body.targets || []);
+      const targets = await Promise.all(
+        (body.targets || []).map(target => accessFleetDecryptRecord(target))
+      );
+      const locked = targets.filter(t => t?.fleet_locked).length;
+      if (locked) console.info(`[fleet-sync] ${locked} record(s) hold encrypted fields; sign in with the account passkey on this device to unlock`);
+      accessFleetMergeHostedTargets(targets);
       accessFleetRefreshProvenance().catch(() => {});
     }
   } catch (err) {
@@ -34208,7 +34320,8 @@ async function accessFleetPushToHosted() {
     // Sign just-in-time so the pushed record always covers its current
     // content; browsers without WebCrypto push unsigned (shown as such).
     const targets = await Promise.all(
-      (accessFleetRead().targets || []).map(target => accessFleetSignRecord(target))
+      (accessFleetRead().targets || []).map(async target =>
+        accessFleetSignRecord(await accessFleetEncryptRecord(target)))
     );
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets/sync'), {
       method: 'POST',
@@ -34217,7 +34330,10 @@ async function accessFleetPushToHosted() {
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
-    accessFleetMergeHostedTargets(body.targets || []);
+    const merged = await Promise.all(
+      (body.targets || []).map(target => accessFleetDecryptRecord(target))
+    );
+    accessFleetMergeHostedTargets(merged);
     accessFleetRefreshProvenance().catch(() => {});
   } finally {
     accessFleetHostedSyncInFlight = false;
@@ -47440,6 +47556,12 @@ window.intendantDashboardControl = {
   },
   _debugOrgGrantStore(doc) {
     return orgGrantStore(doc);
+  },
+  _debugFleetEncryptRecord(record) {
+    return accessFleetEncryptRecord(record);
+  },
+  _debugFleetDecryptRecord(record) {
+    return accessFleetDecryptRecord(record);
   },
   connectHealth() {
     return connectHealthState();

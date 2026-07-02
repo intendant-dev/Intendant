@@ -38,6 +38,9 @@ const FLEET_TARGET_LIMIT: usize = 100;
 /// presentation endpoint body cap).
 const MAX_ORG_GRANT_RELAY_BYTES: usize = 16 * 1024;
 const FLEET_TEXT_MAX: usize = 160;
+/// AES-GCM envelope for the owner-encrypted private fields (three URLs
+/// plus overhead, base64url) — roomy but bounded.
+const FLEET_ENC_MAX: usize = 4096;
 // Raw P-256 point (65B) and fixed-form signature (64B) are 87/86 chars in
 // base64url; leave headroom without letting the field grow unbounded.
 const FLEET_SIG_MAX: usize = 200;
@@ -329,6 +332,15 @@ struct FleetTargetRecord {
     ws_url: String,
     #[serde(default)]
     browser_tcp_via_url: String,
+    // The daemon-advertised rendezvous base (phase 7) — part of the signed
+    // v2 record payload, relayed verbatim.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    connect_signaling_base: String,
+    // Owner-encrypted private fields (phase 5 follow-on): an opaque
+    // envelope only devices holding the passkey-PRF key can open. The
+    // service stores it blind.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    enc_fields: String,
     #[serde(default)]
     origin: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -627,6 +639,8 @@ fn fleet_target_view(target: &FleetTargetRecord) -> serde_json::Value {
         "url": target.url,
         "ws_url": target.ws_url,
         "browser_tcp_via_url": target.browser_tcp_via_url,
+        "connect_signaling_base": target.connect_signaling_base,
+        "enc_fields": target.enc_fields,
         "origin": target.origin,
         "connect_daemon_id": target.connect_daemon_id,
         "capabilities": target.capabilities,
@@ -1319,6 +1333,10 @@ struct FleetTargetInput {
     ws_url: String,
     #[serde(default)]
     browser_tcp_via_url: String,
+    #[serde(default, alias = "connectSignalingBase")]
+    connect_signaling_base: String,
+    #[serde(default, alias = "encFields")]
+    enc_fields: String,
     #[serde(default)]
     origin: String,
     #[serde(default, alias = "connectDaemonId")]
@@ -1569,6 +1587,8 @@ fn normalize_fleet_target_input(
         url: clean_fleet_url(&input.url),
         ws_url: clean_fleet_url(&input.ws_url),
         browser_tcp_via_url: clean_fleet_url(&input.browser_tcp_via_url),
+        connect_signaling_base: clean_fleet_url(&input.connect_signaling_base),
+        enc_fields: clean_fleet_text(&input.enc_fields, FLEET_ENC_MAX),
         origin: clean_fleet_url(&input.origin),
         connect_daemon_id: if connect_daemon_id.is_empty() {
             None
@@ -3103,6 +3123,33 @@ function authenticationCredentialJSON(credential) {{
   }};
 }}
 
+// Fleet-sync encryption (trust architecture phase 5 follow-on): evaluate
+// the WebAuthn PRF extension during the passkey ceremony and stash the
+// per-tab secret; /app derives an AES key from it so private fleet fields
+// sync end-to-end encrypted. The server never sees the PRF output.
+const FLEET_PRF_SALT = new TextEncoder().encode('intendant-fleet-sync-v1');
+
+function prfExtensions() {{
+  return {{ prf: {{ eval: {{ first: FLEET_PRF_SALT }} }} }};
+}}
+
+function stashPrfSecret(credential) {{
+  try {{
+    const results = credential.getClientExtensionResults?.();
+    const first = results?.prf?.results?.first;
+    if (!first) return;
+    const bytes = new Uint8Array(first);
+    let bin = '';
+    for (const b of bytes) bin += String.fromCharCode(b);
+    sessionStorage.setItem(
+      'intendant_fleet_prf_v1',
+      btoa(bin).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '')
+    );
+  }} catch (err) {{
+    console.warn('PRF secret unavailable:', err?.message || err);
+  }}
+}}
+
 async function createPasskey() {{
   const account = $('account').value.trim();
   if (!account) throw new Error('Account handle is required');
@@ -3113,7 +3160,8 @@ async function createPasskey() {{
       method: 'POST',
       body: JSON.stringify({{ account_name: account }}),
     }});
-    const credential = await navigator.credentials.create({{ publicKey: publicKeyOptions(start) }});
+    const credential = await navigator.credentials.create({{ publicKey: {{ ...publicKeyOptions(start), extensions: prfExtensions() }} }});
+    stashPrfSecret(credential);
     const done = await api('/api/auth/register/finish', {{
       method: 'POST',
       body: JSON.stringify({{
@@ -3140,7 +3188,8 @@ async function login() {{
       method: 'POST',
       body: JSON.stringify({{ account_name: account }}),
     }});
-    const credential = await navigator.credentials.get({{ publicKey: publicKeyOptions(start) }});
+    const credential = await navigator.credentials.get({{ publicKey: {{ ...publicKeyOptions(start), extensions: prfExtensions() }} }});
+    stashPrfSecret(credential);
     const done = await api('/api/auth/login/finish', {{
       method: 'POST',
       body: JSON.stringify({{
@@ -3636,6 +3685,8 @@ mod tests {
                 url: "javascript:alert(1)".to_string(),
                 ws_url: "wss://example.test/ws".to_string(),
                 browser_tcp_via_url: "/app?connect=1&daemon_id=daemon".to_string(),
+                connect_signaling_base: String::new(),
+                enc_fields: String::new(),
                 origin: "https://intendant.dev".to_string(),
                 connect_daemon_id: " daemon ".to_string(),
                 record_key: String::new(),
@@ -3707,6 +3758,8 @@ mod tests {
                     url: "/app?connect=1&daemon_id=daemon-1".to_string(),
                     ws_url: String::new(),
                     browser_tcp_via_url: String::new(),
+                    connect_signaling_base: String::new(),
+                    enc_fields: String::new(),
                     origin: "https://intendant.dev".to_string(),
                     connect_daemon_id: Some("daemon-1".to_string()),
                     capabilities: Vec::new(),
@@ -3736,6 +3789,8 @@ mod tests {
                     url: "/app?connect=1&daemon_id=daemon-1".to_string(),
                     ws_url: String::new(),
                     browser_tcp_via_url: String::new(),
+                    connect_signaling_base: String::new(),
+                    enc_fields: String::new(),
                     origin: "https://connect.intendant.dev".to_string(),
                     connect_daemon_id: Some("daemon-1".to_string()),
                     capabilities: Vec::new(),
@@ -3765,6 +3820,8 @@ mod tests {
                     url: "https://manual.example".to_string(),
                     ws_url: String::new(),
                     browser_tcp_via_url: String::new(),
+                    connect_signaling_base: String::new(),
+                    enc_fields: String::new(),
                     origin: "https://intendant.dev".to_string(),
                     connect_daemon_id: None,
                     capabilities: Vec::new(),

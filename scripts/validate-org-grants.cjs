@@ -134,6 +134,7 @@ async function addVirtualAuthenticator(browser, page) {
         transport: 'internal',
         hasResidentKey: true,
         hasUserVerification: true,
+        hasPrf: true,
         isUserVerified: true,
         automaticPresenceSimulation: true,
       },
@@ -400,6 +401,11 @@ async function main() {
     await hosted.locator('#claim').click();
     await hosted.waitForFunction(() => document.getElementById('claim-status').textContent.includes('Rendezvous route claimed'), { timeout: START_TIMEOUT_MS });
 
+    // Phase 5 follow-on: the passkey ceremony evaluated the PRF extension,
+    // so this tab holds the fleet-encryption secret.
+    const prfSecret = await hosted.evaluate(() => sessionStorage.getItem('intendant_fleet_prf_v1'));
+    assert(prfSecret, 'PRF secret was not captured at registration');
+
     // Without any document or account grant, the hosted offer is refused.
     await hosted.goto(`${connectOrigin}/app?connect=1&daemon_id=${encodeURIComponent(options.memberDaemonId)}#activity`, { timeout: START_TIMEOUT_MS });
     await hosted.waitForFunction(() => Boolean(window.intendantDashboardControl), { timeout: START_TIMEOUT_MS });
@@ -620,8 +626,39 @@ async function main() {
     const renewDeputy = await postJson(`${orgApi}/api/access/org-grants/renew`, deputyIssued.body.document);
     assert.strictEqual(renewDeputy.status, 400, `revoked-issuer doc renewed: ${JSON.stringify(renewDeputy.body)}`);
 
+    // ══ Scenario 6: PRF-encrypted fleet sync (phase 5 follow-on) ══
+    // Seed a private fleet record in the hosted tab, push it, and check
+    // the store holds only ciphertext while the tab reads plaintext back.
+    const fleetProbe = await hosted.evaluate(async () => {
+      const record = {
+        id: 'e2e-private-daemon',
+        host_id: 'e2e-private-daemon',
+        label: 'Private daemon',
+        url: 'https://10.9.8.7:8765/',
+        ws_url: 'wss://10.9.8.7:8765/ws',
+        browser_tcp_via_url: '',
+        connect_daemon_id: 'e2e-private-daemon',
+        connect_signaling_base: window.location.origin,
+      };
+      const encrypted = await window.intendantDashboardControl._debugFleetEncryptRecord(record);
+      const decrypted = await window.intendantDashboardControl._debugFleetDecryptRecord(encrypted);
+      return {
+        encHasCiphertext: String(encrypted.enc_fields || '').startsWith('enc1:'),
+        encBlankedUrl: encrypted.url === '' && encrypted.ws_url === '',
+        roundTripUrl: decrypted.url,
+        roundTripWs: decrypted.ws_url,
+        locked: decrypted.fleet_locked === true,
+      };
+    });
+    assert.strictEqual(fleetProbe.encHasCiphertext, true, `no ciphertext envelope: ${JSON.stringify(fleetProbe)}`);
+    assert.strictEqual(fleetProbe.encBlankedUrl, true, `plaintext leaked beside envelope: ${JSON.stringify(fleetProbe)}`);
+    assert.strictEqual(fleetProbe.roundTripUrl, 'https://10.9.8.7:8765/', `decrypt round-trip failed: ${JSON.stringify(fleetProbe)}`);
+    assert.strictEqual(fleetProbe.roundTripWs, 'wss://10.9.8.7:8765/ws', `ws decrypt round-trip failed: ${JSON.stringify(fleetProbe)}`);
+    assert.strictEqual(fleetProbe.locked, false, `record locked despite key: ${JSON.stringify(fleetProbe)}`);
+
     console.log(JSON.stringify({
       ok: true,
+      fleet_encryption: { prf: true, round_trip: true },
       issuer: { key: issuerKey, revoked: true },
       peer_subject: { fingerprint: peerFp, final_status: peerRecord.status },
       org_root_key: rootKey,
