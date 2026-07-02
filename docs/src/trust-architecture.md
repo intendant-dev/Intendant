@@ -91,9 +91,10 @@ user controls — the **anchor**:
 The hosted service keeps exactly four jobs, all zero-authority:
 introductions (signaling for endpoints that authenticate each other
 end-to-end), blind relay, encrypted/signed fleet-metadata backup, and a name
-directory. The rendezvous component is self-hostable, and a daemon's signed
-agent card states *which* rendezvous it uses — `connect.intendant.dev` is the
-default instance of an open component, not a chokepoint.
+directory. The rendezvous component is self-hostable ([how](./self-hosted-rendezvous.md)),
+and a daemon's agent card states *which* rendezvous it uses
+(`rendezvous_base`) — `connect.intendant.dev` is the default instance of an
+open component, not a chokepoint.
 
 ## The trust ledger
 

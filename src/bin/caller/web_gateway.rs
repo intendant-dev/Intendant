@@ -24200,7 +24200,7 @@ pub(crate) fn dashboard_targets_response_value(
         .cloned()
         .unwrap_or_default();
 
-    let mut targets = vec![serde_json::json!({
+    let mut local_target = serde_json::json!({
         "id": local_id,
         "host_id": local_id,
         "label": local_label,
@@ -24217,7 +24217,15 @@ pub(crate) fn dashboard_targets_response_value(
         "connected": true,
         "connection_state": { "state": "connected" },
         "capabilities": local_capabilities,
-    })];
+    });
+    // Phase 7: surface the advertised rendezvous so the dashboard's fleet
+    // records learn the signaling base from the daemon itself.
+    for key in ["rendezvous_base", "connect_daemon_id"] {
+        if let Some(value) = agent_card.get(key).and_then(|v| v.as_str()) {
+            local_target[key] = serde_json::Value::String(value.to_string());
+        }
+    }
+    let mut targets = vec![local_target];
 
     if let Some(registry) = registry {
         for handle in registry.list() {

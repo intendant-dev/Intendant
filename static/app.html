@@ -13988,17 +13988,21 @@ async function clientIdentityReset() {
    Provenance is display metadata only — authority always stays with the
    target daemon. */
 
-function accessFleetRecordPayload(record, signedAt) {
-  return new TextEncoder().encode([
-    'intendant-fleet-record-v1',
+function accessFleetRecordPayload(record, signedAt, version = 2) {
+  const lines = [
+    version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
     String(record.host_id || record.id || ''),
     String(record.label || ''),
     String(record.url || ''),
     String(record.ws_url || ''),
     String(record.browser_tcp_via_url || ''),
     String(record.connect_daemon_id || ''),
-    String(signedAt),
-  ].join('\n'));
+  ];
+  // v2 adds the daemon-advertised rendezvous base (phase 7) so a synced
+  // device connects through the daemon's own rendezvous, not a default.
+  if (version >= 2) lines.push(String(record.connect_signaling_base || ''));
+  lines.push(String(signedAt));
+  return new TextEncoder().encode(lines.join('\n'));
 }
 
 async function accessFleetSignRecord(record) {
@@ -14040,12 +14044,20 @@ async function accessFleetVerifyRecord(record) {
       false,
       ['verify']
     );
-    const valid = await crypto.subtle.verify(
+    let valid = await crypto.subtle.verify(
       { name: 'ECDSA', hash: 'SHA-256' },
       publicKey,
       dashboardBase64UrlToBytes(sig),
-      accessFleetRecordPayload(record, signedAt)
+      accessFleetRecordPayload(record, signedAt, 2)
     );
+    if (!valid) {
+      valid = await crypto.subtle.verify(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        publicKey,
+        dashboardBase64UrlToBytes(sig),
+        accessFleetRecordPayload(record, signedAt, 1)
+      );
+    }
     if (!valid) return 'unverified';
     const mine = clientIdentityCache?.publicRawB64u === key;
     return mine ? 'verified' : 'signed';
@@ -34233,7 +34245,11 @@ function accessFleetTargetUrl(target) {
   const explicit = target?.url || target?.browser_tcp_via_url || target?.ws_url || '';
   if (explicit) return explicit;
   if (target?.local && DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
-    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}`;
+    const base = String(target?.connect_signaling_base || '').trim().replace(/\/+$/, '');
+    const extra = base && base !== window.location.origin
+      ? `&connect_base=${encodeURIComponent(base)}`
+      : '';
+    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}${extra}`;
   }
   if (target?.local && window.location.origin) return window.location.origin;
   return '';
@@ -34272,6 +34288,15 @@ function accessFleetRecordFromTarget(target) {
     capabilities: normalized.capabilities || [],
     origin: window.location.origin || '',
     connect_daemon_id: connectDaemonId,
+    // Phase 7: the rendezvous this daemon is reachable through — from its
+    // agent card (rendezvous_base) or, when browsing through a rendezvous
+    // right now, the one in use.
+    connect_signaling_base: String(
+      normalized.connect_signaling_base || normalized.rendezvous_base ||
+      (normalized.local && DASHBOARD_CONNECT_MODE
+        ? (DASHBOARD_CONNECT_SIGNALING_BASE || window.location.origin)
+        : '')
+    ).trim().replace(/\/+$/, ''),
     first_seen_unix_ms: normalized.first_seen_unix_ms || now,
     last_seen_unix_ms: now,
   };
