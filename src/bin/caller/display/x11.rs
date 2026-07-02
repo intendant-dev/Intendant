@@ -778,74 +778,32 @@ mod tests {
     use super::*;
 
     #[test]
-    fn dom_code_to_xdotool_key_letters() {
-        assert_eq!(dom_code_to_xdotool_key("KeyA"), Some("a"));
-        assert_eq!(dom_code_to_xdotool_key("KeyZ"), Some("z"));
-        assert_eq!(dom_code_to_xdotool_key("KeyM"), Some("m"));
+    fn browser_key_codes_map_to_x11_keycodes() {
+        use crate::display::keymap::dom_code_to_x11_keycode;
+        // Spot-check well-known evdev+8 keycodes across the key classes the
+        // browser input path sends; the full table (and its per-row tests)
+        // lives in display/keymap.rs.
+        assert_eq!(dom_code_to_x11_keycode("KeyA"), Some(38));
+        assert_eq!(dom_code_to_x11_keycode("Digit1"), Some(10));
+        assert_eq!(dom_code_to_x11_keycode("F1"), Some(67));
+        assert_eq!(dom_code_to_x11_keycode("ShiftLeft"), Some(50));
+        assert_eq!(dom_code_to_x11_keycode("ControlRight"), Some(105));
+        assert_eq!(dom_code_to_x11_keycode("Enter"), Some(36));
+        assert_eq!(dom_code_to_x11_keycode("Space"), Some(65));
+        assert_eq!(dom_code_to_x11_keycode("ArrowUp"), Some(111));
+        assert_eq!(dom_code_to_x11_keycode("PageDown"), Some(117));
+        assert_eq!(dom_code_to_x11_keycode("NumpadEnter"), Some(104));
+        assert_eq!(dom_code_to_x11_keycode("NumpadDecimal"), Some(91));
+        assert_eq!(dom_code_to_x11_keycode("BogusKey"), None);
+        assert_eq!(dom_code_to_x11_keycode(""), None);
     }
 
     #[test]
-    fn dom_code_to_xdotool_key_digits() {
-        assert_eq!(dom_code_to_xdotool_key("Digit1"), Some("1"));
-        assert_eq!(dom_code_to_xdotool_key("Digit0"), Some("0"));
-    }
-
-    #[test]
-    fn dom_code_to_xdotool_key_function_keys() {
-        assert_eq!(dom_code_to_xdotool_key("F1"), Some("F1"));
-        assert_eq!(dom_code_to_xdotool_key("F12"), Some("F12"));
-    }
-
-    #[test]
-    fn dom_code_to_xdotool_key_modifiers() {
-        assert_eq!(dom_code_to_xdotool_key("ShiftLeft"), Some("Shift_L"));
-        assert_eq!(dom_code_to_xdotool_key("ShiftRight"), Some("Shift_R"));
-        assert_eq!(dom_code_to_xdotool_key("ControlLeft"), Some("Control_L"));
-        assert_eq!(dom_code_to_xdotool_key("ControlRight"), Some("Control_R"));
-        assert_eq!(dom_code_to_xdotool_key("AltLeft"), Some("Alt_L"));
-        assert_eq!(dom_code_to_xdotool_key("AltRight"), Some("Alt_R"));
-        assert_eq!(dom_code_to_xdotool_key("MetaLeft"), Some("Super_L"));
-        assert_eq!(dom_code_to_xdotool_key("MetaRight"), Some("Super_R"));
-    }
-
-    #[test]
-    fn dom_code_to_xdotool_key_special() {
-        assert_eq!(dom_code_to_xdotool_key("Escape"), Some("Escape"));
-        assert_eq!(dom_code_to_xdotool_key("Enter"), Some("Return"));
-        assert_eq!(dom_code_to_xdotool_key("Backspace"), Some("BackSpace"));
-        assert_eq!(dom_code_to_xdotool_key("Tab"), Some("Tab"));
-        assert_eq!(dom_code_to_xdotool_key("Space"), Some("space"));
-        assert_eq!(dom_code_to_xdotool_key("CapsLock"), Some("Caps_Lock"));
-    }
-
-    #[test]
-    fn dom_code_to_xdotool_key_navigation() {
-        assert_eq!(dom_code_to_xdotool_key("ArrowUp"), Some("Up"));
-        assert_eq!(dom_code_to_xdotool_key("ArrowDown"), Some("Down"));
-        assert_eq!(dom_code_to_xdotool_key("ArrowLeft"), Some("Left"));
-        assert_eq!(dom_code_to_xdotool_key("ArrowRight"), Some("Right"));
-        assert_eq!(dom_code_to_xdotool_key("Insert"), Some("Insert"));
-        assert_eq!(dom_code_to_xdotool_key("Delete"), Some("Delete"));
-        assert_eq!(dom_code_to_xdotool_key("Home"), Some("Home"));
-        assert_eq!(dom_code_to_xdotool_key("End"), Some("End"));
-        assert_eq!(dom_code_to_xdotool_key("PageUp"), Some("Prior"));
-        assert_eq!(dom_code_to_xdotool_key("PageDown"), Some("Next"));
-    }
-
-    #[test]
-    fn dom_code_to_xdotool_key_numpad() {
-        assert_eq!(dom_code_to_xdotool_key("NumLock"), Some("Num_Lock"));
-        assert_eq!(dom_code_to_xdotool_key("Numpad0"), Some("KP_0"));
-        assert_eq!(dom_code_to_xdotool_key("Numpad5"), Some("KP_5"));
-        assert_eq!(dom_code_to_xdotool_key("NumpadEnter"), Some("KP_Enter"));
-        assert_eq!(dom_code_to_xdotool_key("NumpadAdd"), Some("KP_Add"));
-        assert_eq!(dom_code_to_xdotool_key("NumpadDecimal"), Some("KP_Decimal"));
-    }
-
-    #[test]
-    fn dom_code_to_xdotool_key_unknown() {
-        assert_eq!(dom_code_to_xdotool_key("BogusKey"), None);
-        assert_eq!(dom_code_to_xdotool_key(""), None);
+    fn browser_buttons_map_to_x11_buttons() {
+        assert_eq!(x11_button_from_browser(0), 1);
+        assert_eq!(x11_button_from_browser(1), 2);
+        assert_eq!(x11_button_from_browser(2), 3);
+        assert_eq!(x11_button_from_browser(9), 1);
     }
 
     #[test]
