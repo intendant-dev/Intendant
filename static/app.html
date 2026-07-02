@@ -12056,6 +12056,17 @@ body.display-fullscreen-open {
             <div id="access-people-current" class="acc-hero-grid"></div>
             <div id="access-enrollment-requests"></div>
             <div id="access-user-client-grant-form"></div>
+            <details class="acc-fold" id="access-org-join-fold">
+              <summary>Join with an org grant</summary>
+              <div class="acc-fold-body">
+                <p class="acc-fold-hint">Paste the signed document an organization issued for this browser's key. This daemon verifies it against its trusted org keys and writes a normal, expiring IAM grant — nothing changes if verification fails.</p>
+                <textarea id="access-org-join-doc" class="daemon-pairing-textarea" rows="6" placeholder='{"v":1,"kind":"org-grant", …}'></textarea>
+                <div class="acc-grant-flow-actions">
+                  <button id="access-org-join-btn" class="acc-btn primary" type="button">Present grant</button>
+                  <span id="access-org-join-status" class="acc-grant-flow-msg"></span>
+                </div>
+              </div>
+            </details>
             <div class="acc-section-head">
               <div class="acc-section-title">Who has access</div>
               <div class="acc-section-sub">Every user/client principal this daemon knows, with its grants. Draft and revoked grants stay visible for review.</div>
@@ -12219,6 +12230,12 @@ body.display-fullscreen-open {
               <div class="acc-section-sub">Every grant with its principal, target, policy, transport, and the reason it exists.</div>
             </div>
             <div id="access-grant-details" class="access-detail-grid"></div>
+
+            <div class="acc-section-head">
+              <div class="acc-section-title">Organizations</div>
+              <div class="acc-section-sub">Orgs whose signed grant documents this daemon accepts, each under a local role cap. Trust is a per-daemon decision — use the grant flow's Apply-to to trust an org across the fleet.</div>
+            </div>
+            <div id="access-organizations"></div>
 
             <div class="acc-section-head">
               <div class="acc-section-title">Model inspector</div>
@@ -36858,6 +36875,284 @@ function renderAccessRoleCatalog() {
   }
 }
 
+/* Advanced: trusted organizations + issuance. */
+async function accessOrgCall(method, path, payload) {
+  const resp = await dashboardJsonFetch(method, payload, () => authedFetch(path, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(payload),
+  }), method, { fallbackAfterRpcFailure: false });
+  const data = await resp.json().catch(() => ({}));
+  if (!resp.ok) throw new Error(data?.error || `request failed (${resp.status})`);
+  return data;
+}
+
+function renderAccessOrganizations() {
+  const mount = document.getElementById('access-organizations');
+  if (!mount) return;
+  mount.innerHTML = '';
+  const iam = accessIamModel(accessOverviewModel());
+  const trusted = Array.isArray(iam.trusted_orgs) ? iam.trusted_orgs : [];
+  const issuers = Array.isArray(iam.org_issuers) ? iam.org_issuers : [];
+  const canManage = dashboardControlTransport?.lastStatus?.api_access_org_trust_available !== false;
+
+  const list = document.createElement('div');
+  list.className = 'acc-principal-list';
+  for (const org of trusted) {
+    const card = document.createElement('div');
+    card.className = 'acc-principal-card';
+    const head = document.createElement('div');
+    head.className = 'acc-principal-head';
+    const glyph = document.createElement('div');
+    glyph.className = 'acc-principal-glyph kind-human';
+    glyph.textContent = 'ORG';
+    const nameWrap = document.createElement('div');
+    const name = document.createElement('div');
+    name.className = 'acc-principal-name';
+    name.textContent = `@${accessModelLabel(org.handle)}`;
+    const kind = document.createElement('div');
+    kind.className = 'acc-principal-kind';
+    const key = accessModelLabel(org.root_key);
+    kind.textContent = `root key ${key.slice(0, 12)}…${key.slice(-4)}`;
+    kind.title = key;
+    nameWrap.append(name, kind);
+    head.append(glyph, nameWrap);
+    head.appendChild(accessRoleBadge(accessModelLabel(org.max_role, 'role:operator'), `cap: ${accessModelLabel(org.max_role, 'role:operator').replace(/^role:/, '')}`));
+    head.appendChild(accessModelCreateStatus(org.status || 'active'));
+    if (accessModelLabel(org.status, 'active') !== 'revoked') {
+      const revoke = document.createElement('button');
+      revoke.type = 'button';
+      revoke.className = 'acc-btn danger';
+      revoke.textContent = 'Revoke trust';
+      revoke.disabled = !canManage;
+      revoke.addEventListener('click', async () => {
+        const ok = await showDashboardConfirm({
+          title: `Revoke org @${org.handle}`,
+          message: 'Every grant this org materialized here is revoked immediately; new documents are refused.',
+          confirmLabel: 'Revoke org',
+          cancelLabel: 'Cancel',
+          danger: true,
+        });
+        if (!ok) return;
+        try {
+          await accessOrgCall('api_access_org_revoke', '/api/access/orgs/revoke', { handle: org.handle });
+          showControlToast?.('success', `Org @${org.handle} revoked`);
+        } catch (err) {
+          showControlToast?.('error', err?.message || 'Org revoke failed');
+        }
+        await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+        renderAccessAdminSummaries();
+      });
+      head.appendChild(revoke);
+    }
+    card.appendChild(head);
+    list.appendChild(card);
+  }
+  if (!trusted.length) {
+    const empty = document.createElement('div');
+    empty.className = 'access-empty';
+    empty.textContent = 'No organizations trusted on this daemon.';
+    list.appendChild(empty);
+  }
+  mount.appendChild(list);
+
+  // Trust form.
+  const form = document.createElement('div');
+  form.className = 'acc-grant-flow';
+  form.style.marginTop = '12px';
+  const head = document.createElement('div');
+  head.className = 'acc-grant-flow-head';
+  const title = document.createElement('div');
+  title.className = 'acc-grant-flow-title';
+  title.textContent = 'Trust an organization';
+  const sub = document.createElement('div');
+  sub.className = 'acc-grant-flow-sub';
+  sub.textContent = 'Its signed documents can then grant roles here, up to the cap you set.';
+  head.append(title, sub);
+  form.appendChild(head);
+  const grid = document.createElement('div');
+  grid.className = 'acc-field-grid';
+  const fields = [
+    ['access-org-trust-handle', 'Org handle', 'e.g. acme'],
+    ['access-org-trust-key', 'Org root key', 'ed25519 public key (base64url)'],
+  ];
+  for (const [id, labelText, placeholder] of fields) {
+    const label = document.createElement('label');
+    label.textContent = labelText;
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.id = id;
+    input.autocomplete = 'off';
+    input.spellcheck = false;
+    input.placeholder = placeholder;
+    label.appendChild(input);
+    grid.appendChild(label);
+  }
+  const capLabel = document.createElement('label');
+  capLabel.textContent = 'Role cap';
+  const capSelect = document.createElement('select');
+  capSelect.id = 'access-org-trust-cap';
+  for (const role of accessAssignableIamRoles()) {
+    const option = document.createElement('option');
+    option.value = accessModelLabel(role.id);
+    option.textContent = accessModelLabel(role.label, role.id);
+    if (accessModelLabel(role.id) === 'role:operator') option.selected = true;
+    capSelect.appendChild(option);
+  }
+  capLabel.appendChild(capSelect);
+  grid.appendChild(capLabel);
+  form.appendChild(grid);
+  const actions = document.createElement('div');
+  actions.className = 'acc-grant-flow-actions';
+  const trustBtn = document.createElement('button');
+  trustBtn.type = 'button';
+  trustBtn.className = 'acc-btn primary';
+  trustBtn.textContent = 'Trust org';
+  trustBtn.disabled = !canManage;
+  trustBtn.addEventListener('click', async () => {
+    const handle = document.getElementById('access-org-trust-handle')?.value?.trim();
+    const rootKey = document.getElementById('access-org-trust-key')?.value?.trim();
+    if (!handle || !rootKey) {
+      showControlToast?.('error', 'Handle and root key are required');
+      return;
+    }
+    try {
+      await accessOrgCall('api_access_org_trust', '/api/access/orgs/trust', {
+        handle,
+        root_key: rootKey,
+        max_role: document.getElementById('access-org-trust-cap')?.value || 'role:operator',
+      });
+      showControlToast?.('success', `Org @${handle} trusted`);
+    } catch (err) {
+      showControlToast?.('error', err?.message || 'Org trust failed');
+    }
+    await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+    renderAccessAdminSummaries();
+  });
+  actions.appendChild(trustBtn);
+  form.appendChild(actions);
+  mount.appendChild(form);
+
+  // Issuance card, only where an org root key lives.
+  if (issuers.length) {
+    const issue = document.createElement('div');
+    issue.className = 'acc-grant-flow';
+    issue.style.marginTop = '12px';
+    const ihead = document.createElement('div');
+    ihead.className = 'acc-grant-flow-head';
+    const ititle = document.createElement('div');
+    ititle.className = 'acc-grant-flow-title';
+    ititle.textContent = 'Issue an org grant';
+    const isub = document.createElement('div');
+    isub.className = 'acc-grant-flow-sub';
+    isub.textContent = 'Signs a document with this daemon\u2019s org root key. Send it to the member; they present it on any daemon that trusts the org.';
+    ihead.append(ititle, isub);
+    issue.appendChild(ihead);
+    const igrid = document.createElement('div');
+    igrid.className = 'acc-field-grid';
+    const handleLabel = document.createElement('label');
+    handleLabel.textContent = 'Org';
+    const handleSelect = document.createElement('select');
+    handleSelect.id = 'access-org-issue-handle';
+    for (const handle of issuers) {
+      const option = document.createElement('option');
+      option.value = handle;
+      option.textContent = `@${handle}`;
+      handleSelect.appendChild(option);
+    }
+    handleLabel.appendChild(handleSelect);
+    igrid.appendChild(handleLabel);
+    for (const [id, labelText, placeholder] of [
+      ['access-org-issue-fingerprint', 'Member browser key fingerprint', 'from their Access page'],
+      ['access-org-issue-label', 'Member label', 'e.g. Alice'],
+    ]) {
+      const label = document.createElement('label');
+      label.textContent = labelText;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = id;
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.placeholder = placeholder;
+      label.appendChild(input);
+      igrid.appendChild(label);
+    }
+    const roleLabel = document.createElement('label');
+    roleLabel.textContent = 'Role';
+    const roleSelect = document.createElement('select');
+    roleSelect.id = 'access-org-issue-role';
+    for (const role of accessAssignableIamRoles()) {
+      const option = document.createElement('option');
+      option.value = accessModelLabel(role.id);
+      option.textContent = accessModelLabel(role.label, role.id);
+      if (accessModelLabel(role.id) === 'role:observer') option.selected = true;
+      roleSelect.appendChild(option);
+    }
+    roleLabel.appendChild(roleSelect);
+    igrid.appendChild(roleLabel);
+    const ttlLabel = document.createElement('label');
+    ttlLabel.textContent = 'Valid for';
+    const ttlSelect = document.createElement('select');
+    ttlSelect.id = 'access-org-issue-ttl';
+    for (const [value, text] of [
+      [String(7 * 24 * 60 * 60 * 1000), '7 days'],
+      [String(30 * 24 * 60 * 60 * 1000), '30 days (default)'],
+      [String(90 * 24 * 60 * 60 * 1000), '90 days (max)'],
+    ]) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      if (text.includes('default')) option.selected = true;
+      ttlSelect.appendChild(option);
+    }
+    ttlLabel.appendChild(ttlSelect);
+    igrid.appendChild(ttlLabel);
+    issue.appendChild(igrid);
+    const iactions = document.createElement('div');
+    iactions.className = 'acc-grant-flow-actions';
+    const issueBtn = document.createElement('button');
+    issueBtn.type = 'button';
+    issueBtn.className = 'acc-btn primary';
+    issueBtn.textContent = 'Issue & sign';
+    issueBtn.disabled = !canManage;
+    const output = document.createElement('textarea');
+    output.className = 'daemon-pairing-textarea';
+    output.rows = 5;
+    output.readOnly = true;
+    output.placeholder = 'Signed document appears here';
+    output.style.marginTop = '10px';
+    issueBtn.addEventListener('click', async () => {
+      try {
+        const data = await accessOrgCall('api_access_org_issue', '/api/access/org-grants/issue', {
+          handle: document.getElementById('access-org-issue-handle')?.value,
+          client_key_fingerprint: document.getElementById('access-org-issue-fingerprint')?.value?.trim(),
+          label: document.getElementById('access-org-issue-label')?.value?.trim(),
+          role_id: document.getElementById('access-org-issue-role')?.value,
+          ttl_ms: Number(document.getElementById('access-org-issue-ttl')?.value || 0) || undefined,
+        });
+        output.value = JSON.stringify(data.document, null, 2);
+        showControlToast?.('success', 'Org grant signed — send it to the member');
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Issue failed');
+      }
+    });
+    const copyBtn = document.createElement('button');
+    copyBtn.type = 'button';
+    copyBtn.className = 'acc-btn';
+    copyBtn.textContent = 'Copy';
+    copyBtn.addEventListener('click', () => {
+      if (!output.value) return;
+      navigator.clipboard?.writeText(output.value)
+        .then(() => showControlToast?.('success', 'Document copied'))
+        .catch(() => showControlToast?.('error', 'Copy failed'));
+    });
+    iactions.append(issueBtn, copyBtn);
+    issue.appendChild(iactions);
+    issue.appendChild(output);
+    mount.appendChild(issue);
+  }
+}
+
 /* Advanced: local IAM state card with raw links. */
 function renderAccessIamStateCard() {
   const mount = document.getElementById('access-iam-state-card');
@@ -36912,6 +37207,7 @@ function renderAccessAdminSummaries() {
   accessRenderDetailCards('access-peer-details', accessPeerTrustDetailCards());
   accessRenderCards('access-diagnostics-overview', accessDiagnosticsCards());
   renderAccessRoleCatalog();
+  renderAccessOrganizations();
   renderAccessPermissionMatrix();
   accessRenderDetailCards('access-grant-details', accessAuditGrantCards());
   renderAccessIamStateCard();
@@ -64517,6 +64813,33 @@ document.getElementById('sb-hosts-group').addEventListener('click', () => {
 document.getElementById('sb-access-page-link')?.addEventListener('click', openAccessHome);
 document.getElementById('sb-dashboard-transport')?.addEventListener('click', () => routeTo('access', 'diagnostics'));
 document.getElementById('access-link-daemon-btn')?.addEventListener('click', () => routeTo('access', 'peers'));
+
+// Join-with-an-org-grant: present the pasted document to this daemon. The
+// endpoint is public by design (the document is the authorization); using
+// authedFetch keeps it working identically on the trusted paths.
+document.getElementById('access-org-join-btn')?.addEventListener('click', async () => {
+  const status = document.getElementById('access-org-join-status');
+  const raw = document.getElementById('access-org-join-doc')?.value?.trim();
+  if (!raw) {
+    if (status) status.textContent = 'Paste a signed org grant document first.';
+    return;
+  }
+  let doc;
+  try { doc = JSON.parse(raw); } catch {
+    if (status) status.textContent = 'That is not valid JSON.';
+    return;
+  }
+  if (status) status.textContent = 'Presenting…';
+  try {
+    const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
+    if (status) status.textContent = `Granted via @${data.org_handle} — ${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}.`;
+    showControlToast?.('success', 'Org grant accepted');
+  } catch (err) {
+    if (status) status.textContent = err?.message || 'Presentation failed.';
+  }
+  await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+  renderAccessAdminSummaries();
+});
 
 // Warm the browser identity key early: transports sign offers with it, and
 // the Access renderers read the cache synchronously once it resolves.

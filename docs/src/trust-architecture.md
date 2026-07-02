@@ -149,9 +149,13 @@ and first contact, honest about what it is.
 
 ## Phase 6 design: organization grants in detail
 
-> Status: **design for review** — not yet implemented. This section is the
-> spec the implementation will follow; the earlier "two lanes" section is
-> the product narrative it serves.
+> Status: **implemented** (v1: steps 1-4 of the rollout below). Grant
+> expiry, org root keys, signed grant documents, per-daemon trust with a
+> local cap, materialization, and the presentation/issue/trust/revoke
+> endpoints are live; signed revocation lists and renewal (step 5) and
+> peer-subject/issuer-key delegation (step 6) remain. This section is the
+> spec the code follows; the earlier "two lanes" section is the product
+> narrative it serves.
 
 ### Objects
 
@@ -254,13 +258,18 @@ window — hence the 90-day hard cap and the 30-day default.
 
 ### Rollout
 
-1. Grant expiry in the IAM schema, evaluator, and UI.
-2. Org identity + `intendant org init` + `trusted_orgs` + Access UI section.
-3. Document format, verification, materialization endpoint, paste-to-join UI.
-4. Offer ride-along (one-round-trip first contact).
-5. Revocation list + renewal endpoint + peer gossip.
-6. Peer-daemon subjects (org grants that bridge into the peer identity
-   store) and issuer-key delegation.
+1. ✅ Grant expiry in the IAM schema, evaluator, and UI.
+2. ✅ Org identity + `intendant org init` + `trusted_orgs` + Access →
+   Advanced → Organizations (trust / revoke / issue).
+3. ✅ Document format, verification against trusted org keys,
+   materialization into local IAM, and paste-to-join UI. The public
+   presentation endpoint is `POST /api/access/org-grants` (doorbell class:
+   unauthenticated, rate-limited, 16 KiB cap — the document is the
+   authorization); trust/revoke/issue require `access.manage`.
+4. ⏳ Offer ride-along (one-round-trip first contact) — presentation is
+   an explicit call for now.
+5. ⏳ Revocation list + renewal endpoint + peer gossip.
+6. ⏳ Peer-daemon subjects and issuer-key delegation.
 
 ## Mechanisms
 

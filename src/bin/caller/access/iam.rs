@@ -46,6 +46,23 @@ pub struct LocalIamState {
     /// on a client key's enrollment binding.
     #[serde(default = "default_hosted_origins")]
     pub hosted_origins: Vec<String>,
+    /// Organizations whose signed grant documents this daemon accepts
+    /// (phase 6). Trusting an org is a local root-session decision, and
+    /// `max_role` caps what its documents may grant here.
+    #[serde(default)]
+    pub trusted_orgs: Vec<TrustedOrg>,
+}
+
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+pub struct TrustedOrg {
+    pub handle: String,
+    pub root_key: String,
+    #[serde(default)]
+    pub max_role: String,
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub added_at_unix_ms: Option<u64>,
 }
 
 fn default_role_ceilings() -> std::collections::BTreeMap<String, String> {
@@ -476,6 +493,7 @@ impl Default for LocalIamState {
             audit_events: Vec::new(),
             role_ceilings: default_role_ceilings(),
             hosted_origins: default_hosted_origins(),
+            trusted_orgs: Vec::new(),
         }
     }
 }
@@ -1277,7 +1295,7 @@ fn organization_metadata(request: &UserClientGrantUpsertRequest) -> Option<Value
     Some(Value::Object(org))
 }
 
-fn policy_for_role(role_id: &str) -> String {
+pub fn policy_for_role(role_id: &str) -> String {
     match role_id {
         "role:root" => "policy:root".to_string(),
         "role:peer-profile" => "policy:peer-profile".to_string(),
@@ -1372,7 +1390,13 @@ pub fn overview_metadata(load: &LoadedIamState) -> Value {
             "reason": "The daemon enforces trusted owner/root dashboard sessions, daemon peer profiles, and active local IAM user/client grants when requests bind to browser identity keys, browser mTLS certificates, or Connect account identities."
         },
         "role_ceilings": load.state.role_ceilings.clone(),
-        "hosted_origins": load.state.hosted_origins.clone()
+        "hosted_origins": load.state.hosted_origins.clone(),
+        "trusted_orgs": load.state.trusted_orgs.clone(),
+        "org_issuers": load
+            .path
+            .parent()
+            .map(crate::access::org::local_org_handles)
+            .unwrap_or_default()
     })
 }
 

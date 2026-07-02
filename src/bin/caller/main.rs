@@ -33167,6 +33167,38 @@ async fn main() -> Result<(), CallerError> {
         std::process::exit(1);
     }
 
+    // Intercept `intendant org init <handle>` — creates (or prints) an org
+    // root key on this daemon. Like `access`, this is a local path with no
+    // project or provider setup. See docs/src/trust-architecture.md.
+    if env::args().nth(1).as_deref() == Some("org") {
+        let action = env::args().nth(2).unwrap_or_default();
+        let handle = env::args().nth(3).unwrap_or_default();
+        if action != "init" || handle.trim().is_empty() {
+            eprintln!("usage: intendant org init <handle>");
+            std::process::exit(2);
+        }
+        let cert_dir = access::backend::select_backend().cert_dir();
+        return match access::org::load_or_create_org_identity(&cert_dir, handle.trim()) {
+            Ok(identity) => {
+                println!("org handle:   {}", handle.trim());
+                println!("org root key: {}", identity.public_key_b64u());
+                println!(
+                    "key file:     {}",
+                    access::org::org_key_path(&cert_dir, handle.trim()).display()
+                );
+                println!();
+                println!(
+                    "Daemons accept this org's grants after a root session trusts the key\n                     (Access → Advanced → Organizations, or POST /api/access/orgs/trust).\n                     Issue member grants from this daemon's Access page or\n                     POST /api/access/org-grants/issue."
+                );
+                Ok(())
+            }
+            Err(e) => {
+                eprintln!("error: {e}");
+                std::process::exit(1);
+            }
+        };
+    }
+
     // Intercept `intendant access <action>` before the main runtime setup.
     // This is a local certificate/enrollment path with no project, no .env,
     // and no provider selection.

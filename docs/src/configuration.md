@@ -612,6 +612,7 @@ Schema version 1 contains:
 | `audit_events` | Local IAM audit metadata |
 | `role_ceilings` | Per-binding-kind effective-role caps for low-provenance sessions (see below) |
 | `hosted_origins` | Origins treated as hosted app sources when recorded on client-key bindings |
+| `trusted_orgs` | Organizations whose signed grant documents this daemon accepts, each with a local `max_role` cap (phase 6; see [Trust Architecture](./trust-architecture.md)) |
 
 The daemon loads this file into `/api/access/overview` under the `iam` object
 and exposes the raw state through `GET /api/access/iam/state`. Root dashboard

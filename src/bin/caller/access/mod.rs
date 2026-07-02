@@ -24,6 +24,7 @@ pub mod certs;
 pub mod client_key;
 pub mod enrollment;
 pub mod iam;
+pub mod org;
 pub mod state;
 #[cfg(not(target_os = "windows"))]
 pub mod wizard;

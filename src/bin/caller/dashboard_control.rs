@@ -159,6 +159,10 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_access_enrollment_decide",
     "api_access_iam_upsert_user_client_grant",
     "api_access_iam_update_grant",
+    "api_access_org_trust",
+    "api_access_org_revoke",
+    "api_access_org_issue",
+    "api_access_org_present",
     "api_dashboard_targets",
     "api_coordinator_route",
 ];
@@ -1977,7 +1981,13 @@ fn dashboard_control_method_operation(
         | "api_dashboard_targets" => Some(PeerOperation::AccessInspect),
         "api_access_iam_upsert_user_client_grant"
         | "api_access_iam_update_grant"
-        | "api_access_enrollment_decide" => Some(PeerOperation::AccessManage),
+        | "api_access_enrollment_decide"
+        | "api_access_org_trust"
+        | "api_access_org_revoke"
+        | "api_access_org_issue" => Some(PeerOperation::AccessManage),
+        // Presenting a signed org document only requires a session; the
+        // document itself is the authorization and is fully re-verified.
+        "api_access_org_present" => Some(PeerOperation::AccessInspect),
         "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
             Some(PeerOperation::AccessInspect)
         }
@@ -2261,6 +2271,39 @@ fn control_frame_response(
                         params,
                         &runtime.grant.access_principal(),
                     ) {
+                        Ok(result) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": true,
+                            "result": result,
+                        })),
+                        Err(error) => Some(serde_json::json!({
+                            "t": "response",
+                            "id": id,
+                            "ok": false,
+                            "error": error,
+                        })),
+                    }
+                }
+                "api_access_org_trust" | "api_access_org_revoke" | "api_access_org_issue"
+                | "api_access_org_present" => {
+                    let params = params.unwrap_or_else(|| serde_json::json!({}));
+                    let result = match method {
+                        "api_access_org_trust" => {
+                            crate::web_gateway::access_org_trust_response_value(params)
+                        }
+                        "api_access_org_revoke" => {
+                            crate::web_gateway::access_org_revoke_response_value(params)
+                        }
+                        "api_access_org_issue" => {
+                            crate::web_gateway::access_org_issue_response_value(params)
+                        }
+                        _ => crate::web_gateway::access_org_present_response_value(
+                            params,
+                            &runtime.agent_card,
+                        ),
+                    };
+                    match result {
                         Ok(result) => Some(serde_json::json!({
                             "t": "response",
                             "id": id,
@@ -3958,6 +4001,10 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_access_iam_state_available", access_inspect),
         ("api_access_enrollment_requests_available", access_inspect),
         ("api_access_enrollment_decide_available", access_manage),
+        ("api_access_org_trust_available", access_manage),
+        ("api_access_org_revoke_available", access_manage),
+        ("api_access_org_issue_available", access_manage),
+        ("api_access_org_present_available", access_inspect),
         (
             "api_access_iam_upsert_user_client_grant_available",
             access_manage,

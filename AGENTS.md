@@ -68,6 +68,7 @@ Common invocations (full flag reference in `docs/src/getting-started.md`):
 ./target/release/intendant --agent codex "task"    # supervise an external coding CLI
 ./target/release/intendant --mcp "task"            # MCP server on stdio
 ./target/release/intendant --continue "..."        # resume most recent session
+./target/release/intendant org init <handle>       # create an org root key on this daemon (trust model)
 ```
 
 Requires an API key in `.env` (searched: cwd + parents → project root → `~/.config/intendant/.env`). `.env` and `intendant.toml` are git-ignored.
