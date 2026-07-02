@@ -12,8 +12,10 @@ use ashpd::desktop::remote_desktop::{Axis, DeviceType, KeyState, RemoteDesktop};
 use ashpd::desktop::screencast::{CursorMode, Screencast, SourceType};
 use ashpd::desktop::{PersistMode, Session};
 use async_trait::async_trait;
+use futures_util::StreamExt;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::sync::Arc;
+use tokio::io::AsyncWriteExt;
 use tokio::sync::{mpsc, Mutex, RwLock};
 
 /// Enumerate Wayland displays.
@@ -432,7 +434,13 @@ impl DisplayBackend for WaylandBackend {
             ));
         };
 
-        set_paste_payload(clipboard, &ps.session, text).await?;
+        let transfers = clipboard
+            .receive_selection_transfer()
+            .await
+            .map_err(|e| CallerError::Display(format!("clipboard SelectionTransfer: {e}")))?;
+        futures_util::pin_mut!(transfers);
+
+        set_paste_payload(clipboard, &ps.session).await?;
 
         let rd = &ps.remote_desktop;
         let session = &ps.session;
@@ -455,7 +463,38 @@ impl DisplayBackend for WaylandBackend {
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         rd.notify_keyboard_keycode(session, ctrl, KeyState::Released)
             .await
-            .map_err(|e| wayland_input_error("paste chord (ctrl up)", e))
+            .map_err(|e| wayland_input_error("paste chord (ctrl up)", e))?;
+
+        let session_id = format!("{:?}", ps.session);
+        let deadline = tokio::time::sleep(PASTE_TRANSFER_DEADLINE);
+        tokio::pin!(deadline);
+        let mut served = 0usize;
+
+        while served < MAX_PASTE_TRANSFERS {
+            tokio::select! {
+                _ = &mut deadline => break,
+                transfer = transfers.next() => {
+                    let Some((transfer_session, mime_type, serial)) = transfer else {
+                        break;
+                    };
+                    if format!("{transfer_session:?}") != session_id
+                        || !is_text_plain_mime(&mime_type)
+                    {
+                        continue;
+                    }
+                    write_paste_transfer(clipboard, session, serial, text).await?;
+                    served += 1;
+                }
+            }
+        }
+
+        if served == 0 {
+            return Err(CallerError::Display(
+                "the focused app never requested the paste payload".to_string(),
+            ));
+        }
+
+        Ok(())
     }
 
     fn resolution(&self) -> (u32, u32) {
@@ -490,22 +529,48 @@ fn is_text_plain_mime(mime: &str) -> bool {
     m == "text/plain" || m.starts_with("text/plain;")
 }
 
-/// Make `text` the session's current paste payload (W3: `SetSelection` for
-/// text/plain, then answer this session's `SelectionTransfer` requests with
-/// the latest explicit payload via `selection_write`/`selection_write_done`).
+/// Advertise this session as the owner of a text/plain paste payload. The
+/// bytes themselves are written only when the focused app requests them during
+/// the call-local paste window.
 async fn set_paste_payload(
-    _clipboard: &Clipboard<'static>,
-    _session: &Session<'static, RemoteDesktop<'static>>,
-    _text: &str,
+    clipboard: &Clipboard<'static>,
+    session: &Session<'static, RemoteDesktop<'static>>,
 ) -> Result<(), CallerError> {
-    _clipboard
-        .set_selection(_session, &["text/plain;charset=utf-8", "text/plain"])
+    clipboard
+        .set_selection(session, &["text/plain;charset=utf-8", "text/plain"])
         .await
-        .map_err(|e| CallerError::Display(format!("clipboard SetSelection: {e}")))?;
-    Err(CallerError::Display(
-        "Wayland paste payload serving is not implemented yet — use a type action instead"
-            .to_string(),
-    ))
+        .map_err(|e| CallerError::Display(format!("clipboard SetSelection: {e}")))
+}
+
+async fn write_paste_transfer(
+    clipboard: &Clipboard<'static>,
+    session: &Session<'static, RemoteDesktop<'static>>,
+    serial: u32,
+    text: &str,
+) -> Result<(), CallerError> {
+    let fd = clipboard
+        .selection_write(session, serial)
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard SelectionWrite: {e}")))?;
+    let fd: std::os::fd::OwnedFd = fd.into();
+    let file = std::fs::File::from(fd);
+    let mut file = tokio::fs::File::from_std(file);
+
+    let write_result = async {
+        file.write_all(text.as_bytes()).await?;
+        file.flush().await?;
+        file.shutdown().await
+    }
+    .await;
+    drop(file);
+
+    let success = write_result.is_ok();
+    clipboard
+        .selection_write_done(session, serial, success)
+        .await
+        .map_err(|e| CallerError::Display(format!("clipboard SelectionWriteDone: {e}")))?;
+
+    write_result.map_err(|e| CallerError::Display(format!("clipboard transfer write: {e}")))
 }
 
 async fn verify_remote_interaction(
@@ -545,7 +610,6 @@ fn wayland_input_error(action: &str, error: impl std::fmt::Display) -> CallerErr
 fn wayland_input_recovery_hint() -> &'static str {
     "Wayland portal input is not active. Revoke and grant the user display again, then approve the GNOME portal with Allow Remote Interaction enabled; screenshot-only approval is insufficient for Computer Use input."
 }
-
 
 /// Manually mmap an fd-backed buffer (DMA-BUF or MemFd), copy the pixel region,
 /// and munmap. Returns `None` on any failure so the caller can skip the frame.
