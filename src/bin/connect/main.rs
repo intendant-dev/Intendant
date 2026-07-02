@@ -34,6 +34,9 @@ const CLAIM_CODE_GENERATION_ATTEMPTS: usize = 32;
 const ACTIVE_DASHBOARD_SESSION_TTL_MS: u64 = 24 * 60 * 60 * 1000;
 const CSRF_HEADER: &str = "x-intendant-csrf";
 const FLEET_TARGET_LIMIT: usize = 100;
+/// Cap on a relayed org-grant document (matches the daemon's public
+/// presentation endpoint body cap).
+const MAX_ORG_GRANT_RELAY_BYTES: usize = 16 * 1024;
 const FLEET_TEXT_MAX: usize = 160;
 // Raw P-256 point (65B) and fixed-form signature (64B) are 87/86 chars in
 // base64url; leave headroom without letting the field grow unbounded.
@@ -2213,6 +2216,11 @@ struct RendezvousEvent {
     client_key_sig: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     client_key_ts: Option<i64>,
+    // Signed org-grant document, also relayed verbatim: the daemon verifies
+    // it against the org keys it locally trusts, so this service can
+    // neither mint nor amplify one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    org_grant: Option<serde_json::Value>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     claim_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -2577,6 +2585,8 @@ struct BrowserOfferRequest {
     client_key_sig: Option<String>,
     #[serde(default)]
     client_key_ts: Option<i64>,
+    #[serde(default)]
+    org_grant: Option<serde_json::Value>,
 }
 
 async fn browser_offer(
@@ -2643,6 +2653,13 @@ async fn browser_offer(
                 .filter(|v| !v.is_empty())
                 .map(str::to_string),
             client_key_ts: body.client_key_ts,
+            // Opaque passthrough, size-capped so the relay cannot be used
+            // to firehose daemons; the daemon re-verifies and rate-limits.
+            org_grant: body.org_grant.filter(|doc| {
+                !doc.is_null()
+                    && serde_json::to_string(doc).map(|s| s.len()).unwrap_or(usize::MAX)
+                        <= MAX_ORG_GRANT_RELAY_BYTES
+            }),
             ..RendezvousEvent::default()
         },
     )

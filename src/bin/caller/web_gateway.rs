@@ -13153,6 +13153,7 @@ fn html_response(status: &str, body: String) -> String {
 async fn connect_dashboard_offer_response(
     dashboard_control: &Arc<crate::dashboard_control::DashboardControlRegistry>,
     body_text: &str,
+    agent_card: &serde_json::Value,
 ) -> String {
     let body = match serde_json::from_str::<serde_json::Value>(body_text) {
         Ok(body) => body,
@@ -13190,6 +13191,22 @@ async fn connect_dashboard_offer_response(
             )
         }
     };
+    // Org-grant ride-along (phase 6 step 4), same as the rendezvous path:
+    // materialize before grant resolution so a member's first offer binds
+    // its scoped principal instead of falling back to trusted-transport
+    // root. Failure changes nothing here — the transport already earned
+    // its authority — but the error is surfaced for the console.
+    let org_grant_error = body
+        .get("org_grant")
+        .filter(|doc| !doc.is_null())
+        .and_then(|doc| {
+            crate::access::org::present_org_grant_value(
+                doc,
+                &org_target_agent_card_ids(agent_card),
+                crate::access::client_key::now_unix_ms() as u64,
+            )
+            .err()
+        });
     let grant = match verified_client_key {
         Some(key) => {
             let cert_dir = crate::access::backend::select_backend().cert_dir();
@@ -13235,13 +13252,19 @@ async fn connect_dashboard_offer_response(
         .answer_offer_with_grant(sdp.to_string(), None, client_nonce, grant)
         .await
     {
-        Ok(answer) => json_ok(serde_json::json!({
-            "ok": true,
-            "signaling": "connect-bootstrap-local",
-            "session_id": answer.session_id,
-            "sdp": answer.sdp,
-            "binding": answer.binding,
-        })),
+        Ok(answer) => {
+            let mut response = serde_json::json!({
+                "ok": true,
+                "signaling": "connect-bootstrap-local",
+                "session_id": answer.session_id,
+                "sdp": answer.sdp,
+                "binding": answer.binding,
+            });
+            if let Some(org_error) = org_grant_error {
+                response["org_grant_error"] = serde_json::Value::String(org_error);
+            }
+            json_ok(response)
+        }
         Err(e) => json_error("500 Internal Server Error", e),
     }
 }
@@ -21219,7 +21242,12 @@ pub fn spawn_web_gateway(
                         use tokio::io::AsyncWriteExt;
                         let body_text = read_post_body(&header_text, &mut stream).await;
                         let response = with_public_cors(
-                            connect_dashboard_offer_response(&dashboard_control, &body_text).await,
+                            connect_dashboard_offer_response(
+                                &dashboard_control,
+                                &body_text,
+                                &agent_card_value_for_targets,
+                            )
+                            .await,
                         );
                         let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_method == "POST" && req_path == "/connect/dashboard/ice" {
@@ -23000,9 +23028,73 @@ pub fn spawn_web_gateway(
                             }
                         };
                         let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_method == "GET"
+                        && req_path
+                            .strip_prefix("/api/access/orgs/")
+                            .and_then(|rest| rest.strip_suffix("/revocations"))
+                            .is_some()
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let handle = req_path
+                            .strip_prefix("/api/access/orgs/")
+                            .and_then(|rest| rest.strip_suffix("/revocations"))
+                            .unwrap_or("");
+                        let (status, body) = match access_org_orl_response_value(handle) {
+                            Ok(value) => (200, value.to_string()),
+                            Err(error) => (404, serde_json::json!({"error": error}).to_string()),
+                        };
+                        let response =
+                            with_public_cors(json_response(status_reason(status), body));
+                        let _ = stream.write_all(response.as_bytes()).await;
+                    } else if req_path == "/api/access/orgs/revocations/apply"
+                        || req_path == "/api/access/org-grants/renew"
+                    {
+                        use tokio::io::AsyncWriteExt;
+                        let response = if req_method != "POST" {
+                            json_response(
+                                "405 Method Not Allowed",
+                                serde_json::json!({"error": "method not allowed"}).to_string(),
+                            )
+                        } else {
+                            let cap = if req_path == "/api/access/orgs/revocations/apply" {
+                                crate::access::org::MAX_ORG_ORL_BYTES
+                            } else {
+                                crate::access::org::MAX_ORG_GRANT_DOC_BYTES
+                            };
+                            match read_request_body_capped(&mut stream, &header_text, cap).await {
+                                Ok(body_text) => {
+                                    let handler = if req_path == "/api/access/orgs/revocations/apply"
+                                    {
+                                        access_org_orl_apply_response_value
+                                            as fn(
+                                                serde_json::Value,
+                                            )
+                                                -> Result<serde_json::Value, String>
+                                    } else {
+                                        access_org_renew_response_value
+                                    };
+                                    let (status, body) = match serde_json::from_str::<
+                                        serde_json::Value,
+                                    >(&body_text)
+                                    .map_err(|e| format!("invalid JSON: {e}"))
+                                    .and_then(handler)
+                                    {
+                                        Ok(value) => (200, value.to_string()),
+                                        Err(error) => (
+                                            400,
+                                            serde_json::json!({"error": error}).to_string(),
+                                        ),
+                                    };
+                                    with_public_cors(json_response(status_reason(status), body))
+                                }
+                                Err((status, body)) => json_response(status_reason(status), body),
+                            }
+                        };
+                        let _ = stream.write_all(response.as_bytes()).await;
                     } else if req_path == "/api/access/orgs/trust"
                         || req_path == "/api/access/orgs/revoke"
                         || req_path == "/api/access/org-grants/issue"
+                        || req_path == "/api/access/org-grants/revoke-member"
                     {
                         use tokio::io::AsyncWriteExt;
                         if req_method != "POST" {
@@ -23032,6 +23124,9 @@ pub fn spawn_web_gateway(
                                     "/api/access/orgs/trust" => access_org_trust_response_value
                                         as fn(serde_json::Value) -> Result<serde_json::Value, String>,
                                     "/api/access/orgs/revoke" => access_org_revoke_response_value,
+                                    "/api/access/org-grants/revoke-member" => {
+                                        access_org_revoke_member_response_value
+                                    }
                                     _ => access_org_issue_response_value,
                                 };
                                 let (status, body) = match serde_json::from_str::<serde_json::Value>(
@@ -24836,37 +24931,33 @@ fn with_fleet_cors(response: String, allowed_origin: Option<&str>) -> String {
     format!("{}{rest}", lines.join("\r\n"))
 }
 
-/// The names this daemon answers to when an org grant's `targets` list is
-/// matched: agent-card id and label, the stored host label, and the
-/// configured Connect daemon id.
-fn org_target_daemon_ids(agent_card: &serde_json::Value) -> Vec<String> {
-    let mut ids: Vec<String> = Vec::new();
-    for key in ["id", "label"] {
-        if let Some(value) = agent_card.get(key).and_then(|v| v.as_str()) {
-            let value = value.trim();
-            if !value.is_empty() && !ids.iter().any(|existing| existing == value) {
-                ids.push(value.to_string());
-            }
-        }
-    }
-    if let Ok(connect_id) = std::env::var("INTENDANT_CONNECT_DAEMON_ID") {
-        let connect_id = connect_id.trim().to_string();
-        if !connect_id.is_empty() && !ids.iter().any(|existing| existing == &connect_id) {
-            ids.push(connect_id);
-        }
-    }
-    let host_label = crate::access::resolve_host_label();
-    if !host_label.trim().is_empty() && !ids.iter().any(|existing| existing == &host_label) {
-        ids.push(host_label);
-    }
-    ids
+/// The agent-card names this gateway adds to the shared org-grant target
+/// id set (`access::org::org_target_daemon_ids`): the card's id and label.
+fn org_target_agent_card_ids(agent_card: &serde_json::Value) -> Vec<String> {
+    ["id", "label"]
+        .iter()
+        .filter_map(|key| agent_card.get(key).and_then(|v| v.as_str()))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
+/// The org doorbell surface: presentation, renewal, the served revocation
+/// list, and revocation-list delivery. All are public by design — the
+/// signed document/list is the authorization, and each is rate-limited
+/// and size-capped.
 pub(crate) fn is_public_org_grant_path(request_line: &str) -> bool {
     let Some(path) = request_line.split_whitespace().nth(1) else {
         return false;
     };
-    path.split('?').next().unwrap_or(path) == "/api/access/org-grants"
+    let path = path.split('?').next().unwrap_or(path);
+    path == "/api/access/org-grants"
+        || path == "/api/access/org-grants/renew"
+        || path == "/api/access/orgs/revocations/apply"
+        || (path.strip_prefix("/api/access/orgs/")
+            .and_then(|rest| rest.strip_suffix("/revocations"))
+            .is_some_and(|handle| crate::access::org::valid_org_handle(handle)))
 }
 
 /// Public presentation of a signed org grant document. The document itself
@@ -24877,20 +24968,11 @@ pub(crate) fn access_org_present_response_value(
     params: serde_json::Value,
     agent_card: &serde_json::Value,
 ) -> Result<serde_json::Value, String> {
-    let now = crate::access::client_key::now_unix_ms() as u64;
-    if !crate::access::org::presentation_rate_ok(now) {
-        return Err("too many org grant presentations; retry shortly".to_string());
-    }
-    let doc: crate::access::org::OrgGrantDocument =
-        serde_json::from_value(params).map_err(|e| format!("invalid org grant document: {e}"))?;
-    let cert_dir = crate::access::backend::select_backend().cert_dir();
-    let mut state = crate::access::iam::load_state(&cert_dir)
-        .map_err(|e| format!("load local IAM state: {e}"))?;
-    let daemon_ids = org_target_daemon_ids(agent_card);
-    let outcome = crate::access::org::materialize_org_grant(&mut state, &doc, &daemon_ids, now)
-        .map_err(|e| e.to_string())?;
-    crate::access::iam::save_state(&cert_dir, &state)
-        .map_err(|e| format!("save local IAM state: {e}"))?;
+    let outcome = crate::access::org::present_org_grant_value(
+        &params,
+        &org_target_agent_card_ids(agent_card),
+        crate::access::client_key::now_unix_ms() as u64,
+    )?;
     Ok(serde_json::json!({
         "schema_version": 1,
         "materialized": true,
@@ -25013,6 +25095,154 @@ pub(crate) fn access_org_issue_response_value(
     Ok(serde_json::json!({
         "schema_version": 1,
         "document": doc,
+        "org_root_key": identity.public_key_b64u(),
+    }))
+}
+
+/// Public: the org daemon's current signed revocation list (signed empty
+/// seq-0 list when nothing was revoked yet). Only meaningful on the
+/// daemon holding the org root key.
+pub(crate) fn access_org_orl_response_value(handle: &str) -> Result<serde_json::Value, String> {
+    let handle = handle.trim();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let identity = crate::access::org::load_org_identity(&cert_dir, handle)?.ok_or_else(|| {
+        format!("this daemon holds no root key for org {handle:?}; fetch the revocation list from the org's daemon")
+    })?;
+    let orl = crate::access::org::load_or_init_orl(
+        &identity,
+        &cert_dir,
+        handle,
+        crate::access::client_key::now_unix_ms() as u64,
+    )?;
+    Ok(serde_json::json!({ "schema_version": 1, "orl": orl }))
+}
+
+/// Public doorbell: anyone may carry a signed revocation list here; the
+/// signature is the authority and a stale `seq` is refused, so the
+/// courier is irrelevant. A failure changes nothing.
+pub(crate) fn access_org_orl_apply_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let now = crate::access::client_key::now_unix_ms() as u64;
+    if !crate::access::org::presentation_rate_ok(now) {
+        return Err("too many org grant presentations; retry shortly".to_string());
+    }
+    if serde_json::to_string(&params)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > crate::access::org::MAX_ORG_ORL_BYTES
+    {
+        return Err("org revocation list is too large".to_string());
+    }
+    let orl: crate::access::org::OrgRevocationList = serde_json::from_value(params)
+        .map_err(|e| format!("invalid org revocation list: {e}"))?;
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let mut state = crate::access::iam::load_state(&cert_dir)
+        .map_err(|e| format!("load local IAM state: {e}"))?;
+    let applied = crate::access::org::apply_orl(&mut state, &orl, now).map_err(|e| e.to_string())?;
+    if applied.changed {
+        crate::access::iam::save_state(&cert_dir, &state)
+            .map_err(|e| format!("save local IAM state: {e}"))?;
+    }
+    Ok(serde_json::json!({ "schema_version": 1, "applied": applied }))
+}
+
+/// Org-daemon manage action: extend the revocation list (by document
+/// grant_id and/or subject fingerprint), bump `seq`, re-sign — then apply
+/// it to this daemon's own IAM as a best-effort courtesy when it trusts
+/// its own org, so the org daemon never lags its own list.
+pub(crate) fn access_org_revoke_member_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let handle = params
+        .get("handle")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .trim()
+        .to_string();
+    let mut grant_ids: Vec<String> = params
+        .get("grant_ids")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(id) = params.get("grant_id").and_then(|v| v.as_str()) {
+        grant_ids.push(id.to_string());
+    }
+    let mut subjects: Vec<String> = params
+        .get("subjects")
+        .and_then(|v| v.as_array())
+        .map(|values| {
+            values
+                .iter()
+                .filter_map(|v| v.as_str())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default();
+    if let Some(subject) = params.get("subject").and_then(|v| v.as_str()) {
+        subjects.push(subject.to_string());
+    }
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+        format!(
+            "this daemon holds no root key for org {handle:?}; revoke members from the org's designated daemon"
+        )
+    })?;
+    let now = crate::access::client_key::now_unix_ms() as u64;
+    let orl = crate::access::org::orl_revoke(&identity, &cert_dir, &handle, &grant_ids, &subjects, now)?;
+    let applied = crate::access::iam::load_state(&cert_dir)
+        .ok()
+        .and_then(|mut state| {
+            let applied = crate::access::org::apply_orl(&mut state, &orl, now).ok()?;
+            if applied.changed {
+                crate::access::iam::save_state(&cert_dir, &state).ok()?;
+            }
+            Some(applied)
+        });
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "orl": orl,
+        "applied": applied,
+    }))
+}
+
+/// Public doorbell on the org daemon: re-sign a still-valid document with
+/// a fresh window. Same grant_id, original lifetime span; the org's own
+/// revocation list gates it.
+pub(crate) fn access_org_renew_response_value(
+    params: serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let now = crate::access::client_key::now_unix_ms() as u64;
+    if !crate::access::org::presentation_rate_ok(now) {
+        return Err("too many org grant presentations; retry shortly".to_string());
+    }
+    if serde_json::to_string(&params)
+        .map(|s| s.len())
+        .unwrap_or(usize::MAX)
+        > crate::access::org::MAX_ORG_GRANT_DOC_BYTES
+    {
+        return Err("org grant document is too large".to_string());
+    }
+    let doc: crate::access::org::OrgGrantDocument =
+        serde_json::from_value(params).map_err(|e| format!("invalid org grant document: {e}"))?;
+    let handle = doc.org.handle.trim().to_string();
+    let cert_dir = crate::access::backend::select_backend().cert_dir();
+    let identity = crate::access::org::load_org_identity(&cert_dir, &handle)?.ok_or_else(|| {
+        format!(
+            "this daemon holds no root key for org {handle:?}; renew against the org's designated daemon"
+        )
+    })?;
+    let orl = crate::access::org::load_or_init_orl(&identity, &cert_dir, &handle, now)?;
+    let renewed = crate::access::org::renew_org_grant(&identity, &orl, &doc, now)?;
+    Ok(serde_json::json!({
+        "schema_version": 1,
+        "document": renewed,
         "org_root_key": identity.public_key_b64u(),
     }))
 }
@@ -27663,7 +27893,8 @@ fn dashboard_http_operation(
         ("POST", "/api/access/enrollment-requests/decide")
         | ("POST", "/api/access/orgs/trust")
         | ("POST", "/api/access/orgs/revoke")
-        | ("POST", "/api/access/org-grants/issue") => {
+        | ("POST", "/api/access/org-grants/issue")
+        | ("POST", "/api/access/org-grants/revoke-member") => {
             return Some(PeerOperation::AccessManage)
         }
         ("GET", "/api/access/enrollment-requests") => return Some(PeerOperation::AccessInspect),
