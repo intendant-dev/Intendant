@@ -143,8 +143,8 @@ pub async fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<Screen
 mod walk {
     use super::{make_element, ScreenElements, UiElement};
     use atspi::connection::AccessibilityConnection;
-    use atspi::proxies::accessible::AccessibleProxy;
-    use atspi::proxies::component::ComponentProxy;
+    use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
+    use atspi::proxy::component::ComponentProxy;
     use atspi::{CoordType, State};
 
     /// Caps on the application/toplevel scan (before the element walk).
