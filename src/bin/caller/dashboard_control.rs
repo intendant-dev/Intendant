@@ -9376,8 +9376,14 @@ async fn api_sessions_response(
     let params = params.cloned().unwrap_or_else(|| serde_json::json!({}));
     let limit = control_session_limit(&params);
     let ids = control_session_ids(&params);
+    let usage_view = params.get("view").and_then(|v| v.as_str()) == Some("usage");
     let body = tokio::task::spawn_blocking(move || {
-        crate::web_gateway::sessions_list_response_body(limit, &ids)
+        let body = crate::web_gateway::sessions_list_response_body(limit, &ids);
+        if usage_view {
+            crate::web_gateway::session_list_body_usage_view(&body)
+        } else {
+            body
+        }
     })
     .await;
     let body = match body {
