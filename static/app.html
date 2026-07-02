@@ -13222,6 +13222,12 @@ let sessionWindowGridFitRenderHandle = 0;
 let sessionGoalTicker = null;
 const SESSION_WINDOW_RENDER_LIMIT = 600;
 const SESSION_WINDOW_PREPEND_CHUNK = 300;
+// In-memory history behind the render window. Long-running sessions used
+// to grow this without bound; beyond the limit the head is dropped (older
+// entries remain reachable through the remote paging path) with hysteresis
+// so the trim doesn't run on every append.
+const SESSION_WINDOW_HISTORY_LIMIT = 5000;
+const SESSION_WINDOW_HISTORY_RETAIN = 4000;
 const SESSION_WINDOW_TOP_LOAD_THRESHOLD_PX = 64;
 const SESSION_WINDOW_STATE_KEY = 'intendant_session_windows_v1';
 const SESSION_WINDOW_RESTORE_LIMIT = 6;
@@ -29224,6 +29230,39 @@ function ensureSessionWindowHistory(win) {
   return win.logHistory;
 }
 
+// Drop the history head once it outgrows the cap, rebasing the render
+// indices and the rendered nodes' data-history-index. Skipped while the
+// reader is paging inside the region that would be dropped (they can only
+// be there after deep back-paging; the trim resumes when they move on).
+function trimSessionWindowHistoryIfNeeded(win) {
+  const history = ensureSessionWindowHistory(win);
+  if (history.length <= SESSION_WINDOW_HISTORY_LIMIT) return;
+  const drop = history.length - SESSION_WINDOW_HISTORY_RETAIN;
+  if (win.renderStart < drop) return;
+  // Dropped entries stay in the replay-dedup set as bare signatures, so a
+  // reconnect replay can't re-append them as fresh content.
+  if (!(win.trimmedHistorySignatures instanceof Set)) win.trimmedHistorySignatures = new Set();
+  for (let i = 0; i < drop; i++) {
+    addSessionWindowHistorySignatures(win.trimmedHistorySignatures, history[i], win.sessionId);
+  }
+  if (win.trimmedHistorySignatures.size > 40000) {
+    let excess = win.trimmedHistorySignatures.size - 30000;
+    for (const sig of win.trimmedHistorySignatures) {
+      if (excess-- <= 0) break;
+      win.trimmedHistorySignatures.delete(sig);
+    }
+  }
+  win.logHistory = history.slice(drop);
+  win.renderStart -= drop;
+  win.renderEnd -= drop;
+  if (win.log) {
+    for (const child of win.log.children) {
+      const idx = Number(child.dataset?.historyIndex);
+      if (Number.isInteger(idx)) child.dataset.historyIndex = String(idx - drop);
+    }
+  }
+}
+
 function sessionWindowHistoryNode(item) {
   return item instanceof Node ? item : null;
 }
@@ -29696,7 +29735,10 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
     win.sessionId
   );
   const signatures = sessionWindowHistorySignatureSet(win, win.sessionId);
-  if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) return;
+  if (
+    sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)
+    || sessionWindowHistoryHasMatchingSignature(win.trimmedHistorySignatures, item, win.sessionId)
+  ) return;
   stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
   history.push(item);
   const renderedIncrementally = wasRenderingTail
@@ -29705,6 +29747,7 @@ function appendSessionWindowHistory(win, entry, shouldFollow) {
     renderSessionWindowTail(win);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
+  trimSessionWindowHistoryIfNeeded(win);
 }
 
 function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
@@ -29720,7 +29763,10 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
       prepareSessionWindowHistoryItem(entry),
       win.sessionId
     );
-    if (sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)) continue;
+    if (
+      sessionWindowHistoryHasMatchingSignature(signatures, item, win.sessionId)
+      || sessionWindowHistoryHasMatchingSignature(win.trimmedHistorySignatures, item, win.sessionId)
+    ) continue;
     stationTrackSessionWindowHistoryAnchor(item, win.sessionId);
     history.push(item);
     items.push(item);
@@ -29734,6 +29780,7 @@ function appendSessionWindowHistoryBatch(win, entries, shouldFollow) {
     renderSessionWindowTail(win);
   }
   applySessionWindowOutputScroll(win, shouldFollow);
+  trimSessionWindowHistoryIfNeeded(win);
 }
 
 function loadOlderSessionWindowEntries(win) {
@@ -33508,6 +33555,9 @@ function handleTermData(base64data) {
     term.write(base64ToBytes(base64data));
   } else {
     termBuffer.push(base64data);
+    // Frames buffered before xterm initializes; keep only a recent tail
+    // (xterm's own scrollback caps what a longer buffer could show).
+    if (termBuffer.length > 500) termBuffer.splice(0, termBuffer.length - 500);
   }
 }
 
@@ -39718,6 +39768,10 @@ function removeDisplaySlot(displayId) {
     clearSharedViewDecorations();
   }
   removeDisplayThumb(displayId);
+  // Retire the Stats "Display Transport" card for this display; the set
+  // and sections used to leak across display close/reopen cycles.
+  displayMetricsIds.delete(displayId);
+  document.getElementById('display-metrics-' + displayId)?.remove();
   stationUnregisterVideoSource(`local:${displayId}`);
   stationScheduleUpdate();
   if (displaySlots.size === 0) {
@@ -42202,6 +42256,7 @@ const savedAnnotations = [];
 
 function addAnnotationRef(frameId, injected) {
   savedAnnotations.push({ frameId, injected });
+  if (savedAnnotations.length > 100) savedAnnotations.splice(0, savedAnnotations.length - 100);
   renderAnnotationRefs();
 }
 
@@ -43260,6 +43315,7 @@ const savedClips = [];
 
 function addClipRef(clipId, frameCount, injected) {
   savedClips.push({ clipId, frameCount, injected });
+  if (savedClips.length > 100) savedClips.splice(0, savedClips.length - 100);
   renderClipRefs();
 }
 
@@ -58207,13 +58263,47 @@ async function refreshFilesTransferJobs() {
   }
 }
 
+// Finished transfers accumulate for the lifetime of the page; keep the
+// list bounded (active/queued/paused transfers are never pruned).
+const FILES_TRANSFER_TERMINAL_STATUSES = new Set(['completed', 'cancelled', 'failed']);
+const FILES_TRANSFER_HISTORY_LIMIT = 100;
+function pruneFinishedFilesTransfers() {
+  let terminal = 0;
+  for (let i = 0; i < filesTransfers.length; i++) {
+    if (!FILES_TRANSFER_TERMINAL_STATUSES.has(filesTransfers[i].status)) continue;
+    terminal++;
+    if (terminal > FILES_TRANSFER_HISTORY_LIMIT) {
+      // Newest sit at the front (unshift); everything from here back that
+      // is terminal is the oldest history — drop it.
+      for (let j = filesTransfers.length - 1; j >= i; j--) {
+        if (FILES_TRANSFER_TERMINAL_STATUSES.has(filesTransfers[j].status)) {
+          filesTransfers.splice(j, 1);
+        }
+      }
+      break;
+    }
+  }
+}
+
+let filesTransfersRenderScheduled = false;
 function renderFilesTransfers() {
   // Progress ticks re-render the whole list; while the Files pane is
-  // hidden, remember one redraw for the next entry instead.
+  // hidden, remember one redraw for the next entry instead — and while
+  // visible, coalesce bursts (each chunk of a download fires a render)
+  // into one rebuild per frame.
   if (!paneIsVisible('files')) {
-    renderOrDefer('files', 'transfers', renderFilesTransfers);
+    renderOrDefer('files', 'transfers', renderFilesTransfersNow);
     return;
   }
+  if (filesTransfersRenderScheduled) return;
+  filesTransfersRenderScheduled = true;
+  requestAnimationFrame(() => {
+    filesTransfersRenderScheduled = false;
+    renderFilesTransfersNow();
+  });
+}
+function renderFilesTransfersNow() {
+  pruneFinishedFilesTransfers();
   const list = document.getElementById('files-transfer-list');
   if (!list) return;
   list.innerHTML = '';
