@@ -8,6 +8,7 @@ mod autonomy;
 mod ax;
 mod browser_workspace;
 mod computer_use;
+mod windows_uia;
 #[cfg(target_os = "linux")]
 mod x11_input;
 mod connect_rendezvous;

@@ -382,7 +382,23 @@ pub async fn read_screen_elements(target: DisplayTarget) -> Result<ScreenElement
         .await
         .map_err(|e| format!("element read task failed: {e}"))?
     }
-    #[cfg(not(target_os = "macos"))]
+    #[cfg(windows)]
+    {
+        if !target.is_user_session() {
+            return Err(
+                "element trees are only available for the user session display on Windows \
+                 (virtual displays are Xvfb/Linux); use display_target=\"user_session\""
+                    .to_string(),
+            );
+        }
+        // The UIA walk is a series of blocking COM cross-process calls.
+        tokio::task::spawn_blocking(|| {
+            crate::windows_uia::read_frontmost(ELEMENT_TREE_MAX_DEPTH, ELEMENT_TREE_MAX_NODES)
+        })
+        .await
+        .map_err(|e| format!("element read task failed: {e}"))?
+    }
+    #[cfg(not(any(target_os = "macos", windows)))]
     {
         let _ = target;
         Err(
