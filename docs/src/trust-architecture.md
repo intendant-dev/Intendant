@@ -91,9 +91,10 @@ user controls — the **anchor**:
 The hosted service keeps exactly four jobs, all zero-authority:
 introductions (signaling for endpoints that authenticate each other
 end-to-end), blind relay, encrypted/signed fleet-metadata backup, and a name
-directory. The rendezvous component is self-hostable, and a daemon's signed
-agent card states *which* rendezvous it uses — `connect.intendant.dev` is the
-default instance of an open component, not a chokepoint.
+directory. The rendezvous component is self-hostable ([how](./self-hosted-rendezvous.md)),
+and a daemon's agent card states *which* rendezvous it uses
+(`rendezvous_base`) — `connect.intendant.dev` is the default instance of an
+open component, not a chokepoint.
 
 ## The trust ledger
 
@@ -304,14 +305,18 @@ org daemon persists the current list next to the root key
 `GET /api/access/orgs/<handle>/revocations` (public — it is org-public
 data; an empty seq-0 list is signed lazily on first read).
 
-**Delivery is carried, not discovered (v1).** A consumer daemon has no
+**Delivery is carried, not discovered.** A consumer daemon has no
 address for "the org daemon" — there is no membership server to ask — so
 the list travels the same way grant documents do: anyone may push it to
 `POST /api/access/orgs/revocations/apply` (doorbell class:
 unauthenticated, rate-limited, size-capped — the signature is the
-authority, and replaying an old list is refused by `seq`). The org admin's
-browser fans it out to fleet daemons; peer-link gossip and periodic pull
-come later with step 6/phase 7 plumbing.
+authority, and replaying an old list is refused by `seq`). Two couriers
+exist today: the org admin's browser publishes the list to the
+rendezvous **bulletin board** (blind storage — signature-checked and
+rollback-proof, so the board can only withhold), and every member's
+browser fetches it from there and hands it to each daemon it visits.
+Peer-link gossip can come later; with browsers as couriers, revocations
+already reach any daemon a member still talks to.
 
 **Application.** A daemon that trusts the org verifies the signature
 against its *trusted* key for that handle, requires `seq` strictly greater
@@ -361,10 +366,15 @@ kept short-lived without the issuer in the loop.
    its original lifetime span. UI: revoke-member / copy-list / apply-list
    / renew flows under Access → Advanced → Organizations. Peer-link
    gossip and periodic pull remain for later plumbing.
-6. ⏳ Peer-daemon subjects and issuer-key delegation — design proposed
-   below, awaiting sign-off.
+6. ✅ Peer-daemon subjects and issuer-key delegation, per the design
+   below and its sign-off decisions: fail-closed `max_peer_profile`,
+   explicit presentation only (no peer-doorbell ride-along in v1.1), and
+   chain-only issuer certificates (deputies initialize a key, the root
+   delegates, documents carry the certificate; revocation lists revoke
+   issuers wholesale via recorded `issued_via`). Renewal stays root-only
+   for now. E2E: `scripts/validate-org-grants.cjs` scenarios 4–5.
 
-### Step 6 design: peer subjects and issuer keys (proposed, not built)
+### Step 6 design: peer subjects and issuer keys (built)
 
 **Peer-daemon subjects.** An org grant whose subject is a *peer daemon*
 materializes into the peer identity store
@@ -427,14 +437,13 @@ matching the `chain` recorded at materialization time — which means the
 materialization audit/grant record starts persisting the issuer key it
 accepted.
 
-**Open questions for sign-off.** (a) Should peer-subject documents also
-ride along on the peer doorbell/handshake the way client-key documents
-ride dashboard offers, or stay explicit-presentation-only in v1.1?
-(b) Is `session-reader` the right default `max_peer_profile`, or should
-trusting an org grant no peer authority at all until the owner raises it
-(fail-closed default)? (c) Should issuer certs be publishable next to
-the ORL (`GET /api/access/orgs/<handle>/issuers`) so consumers can
-prefetch, or only ever travel inside document chains?
+**Decisions (signed off 2026-07-02).** (a) Explicit presentation only in
+v1.1 — a peer-doorbell ride-along would bypass the peer approval queue
+and needs its own design pass; (b) fail-closed: `max_peer_profile` is
+empty by default and trusting an org grants no daemon-to-daemon
+authority until the owner raises it — the two lanes are separate trust
+decisions; (c) chain-only issuer certs — a published list adds no
+verification value; documents stay self-contained.
 
 ## Mechanisms
 
@@ -470,6 +479,15 @@ The pieces that implement the model, mapped to the codebase:
   through the ordinary grant upsert with the key's route origin recorded, so
   ceilings and audit apply unchanged. The certificate ceremony happens once
   per *user*, not once per browser or per daemon.
+- **Encrypted fleet sync**: the private fields of a synced fleet record
+  (daemon URLs) are sealed with an AES-GCM key derived from the account
+  passkey via the WebAuthn PRF extension — a secret the browser evaluates
+  locally and the rendezvous never sees. Passkeys sync across the user's
+  devices, so each device derives the same key; the hosted store holds
+  ciphertext (`enc_fields`, signed as stored — fleet-record payload v3),
+  and a device without the key still verifies the record and simply shows
+  it locked. No PRF support degrades to plaintext-free sync of the public
+  fields only.
 - **Grant fanout**: the anchor-served Access page applies one grant across
   many daemons — an "Apply to" step in the grant flow calls each selected
   fleet daemon's IAM API directly (browser mTLS, cross-origin), with

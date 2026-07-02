@@ -39,6 +39,35 @@ pub struct PeerIdentityRecord {
     pub created_at_unix: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub revoked_at_unix: Option<i64>,
+    /// Unix seconds after which the identity no longer authenticates.
+    /// Org-materialized identities always carry one (documents expire);
+    /// manually approved identities may not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expires_at_unix: Option<i64>,
+    /// Provenance, e.g. `org:acme` for identities materialized from an
+    /// org grant document. Org trust revocation and revocation lists
+    /// sweep by this.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// The org grant document id that materialized this identity, so a
+    /// revocation list can revoke it by grant id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub org_grant_id: Option<String>,
+    /// The delegated issuer key that signed the materialized document,
+    /// when it was not the org root (phase 6 step 6b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_via: Option<String>,
+}
+
+impl PeerIdentityRecord {
+    /// Approved and unexpired — the only state that authenticates.
+    pub fn is_active(&self, now_unix: i64) -> bool {
+        matches!(self.status, PeerIdentityStatus::Approved)
+            && self
+                .expires_at_unix
+                .map(|expires| expires > now_unix)
+                .unwrap_or(true)
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
@@ -117,6 +146,37 @@ pub fn normalize_profile(raw: &str) -> Result<String, CallerError> {
         ));
     }
     Ok(profile.to_ascii_lowercase())
+}
+
+pub const ALL_OPERATIONS: [PeerOperation; 18] = [
+    PeerOperation::PresenceRead,
+    PeerOperation::StatsRead,
+    PeerOperation::DisplayView,
+    PeerOperation::DisplayInput,
+    PeerOperation::Message,
+    PeerOperation::Task,
+    PeerOperation::Approval,
+    PeerOperation::AccessInspect,
+    PeerOperation::AccessManage,
+    PeerOperation::PeerInspect,
+    PeerOperation::PeerManage,
+    PeerOperation::SessionInspect,
+    PeerOperation::SessionManage,
+    PeerOperation::Terminal,
+    PeerOperation::Settings,
+    PeerOperation::RuntimeControl,
+    PeerOperation::FilesystemRead,
+    PeerOperation::FilesystemWrite,
+];
+
+/// True when `granted` allows no operation that `cap` does not. Profiles
+/// are not a strict ladder (file-reader and session-reader are siblings),
+/// so the cap relation is operation-set containment, mirroring how role
+/// ceilings intersect permissions in the human lane.
+pub fn profile_fits_under(granted: &str, cap: &str) -> bool {
+    ALL_OPERATIONS.iter().all(|op| {
+        !profile_allows_operation(granted, *op) || profile_allows_operation(cap, *op)
+    })
 }
 
 pub fn profile_class(profile: &str) -> ProfileClass {
@@ -379,6 +439,10 @@ pub fn write_approved_identity(
         filesystem: FilesystemAccessPolicy::default(),
         created_at_unix: crate::peer::pairing::unix_timestamp(),
         revoked_at_unix: None,
+        expires_at_unix: None,
+        source: None,
+        org_grant_id: None,
+        issued_via: None,
     };
     write_identity_record(cert_dir, &record)?;
     Ok(record)
@@ -477,7 +541,10 @@ pub fn fingerprint_pem(pem_text: &str) -> Result<String, CallerError> {
     Ok(fingerprint_der(pem.contents()))
 }
 
-fn write_identity_record(cert_dir: &Path, record: &PeerIdentityRecord) -> Result<(), CallerError> {
+pub fn write_identity_record(
+    cert_dir: &Path,
+    record: &PeerIdentityRecord,
+) -> Result<(), CallerError> {
     std::fs::create_dir_all(identities_dir(cert_dir))?;
     let body = serde_json::to_string_pretty(record)?;
     std::fs::write(identity_path(cert_dir, &record.fingerprint), body)?;
@@ -504,7 +571,7 @@ fn nearest_existing_path(path: &Path) -> Option<PathBuf> {
     }
 }
 
-fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
+pub fn normalize_fingerprint(raw: &str) -> Result<String, CallerError> {
     let fp = raw
         .trim()
         .chars()

@@ -63,6 +63,12 @@ pub struct TrustedOrg {
     pub status: String,
     #[serde(default)]
     pub added_at_unix_ms: Option<u64>,
+    /// Cap for org grants whose subject is a peer daemon, in the peer
+    /// profile vocabulary. Empty means fail-closed: trusting an org grants
+    /// no daemon-to-daemon authority until the owner raises this — the
+    /// human and peer lanes are separate trust decisions.
+    #[serde(default)]
+    pub max_peer_profile: String,
     /// Highest org revocation list `seq` applied on this daemon; lists at
     /// or below it are idempotently ignored.
     #[serde(default)]
@@ -74,6 +80,8 @@ pub struct TrustedOrg {
     pub orl_revoked_grant_ids: Vec<String>,
     #[serde(default)]
     pub orl_revoked_subjects: Vec<String>,
+    #[serde(default)]
+    pub orl_revoked_issuer_keys: Vec<String>,
 }
 
 fn default_role_ceilings() -> std::collections::BTreeMap<String, String> {
@@ -151,6 +159,10 @@ pub struct IamGrant {
     /// whose documents must carry an expiry.
     #[serde(default)]
     pub expires_at_unix_ms: Option<u64>,
+    /// The delegated issuer key that signed the org document this grant
+    /// was materialized from, when it was not the org root (step 6b).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub issued_via: Option<String>,
 }
 
 impl IamGrant {
@@ -799,6 +811,7 @@ pub fn upsert_user_client_grant(
             created_at_unix_ms: Some(now),
             revoked_at_unix_ms: if status == "revoked" { Some(now) } else { None },
             expires_at_unix_ms,
+            issued_via: None,
         };
         state.grants.push(grant.clone());
         grant
@@ -2479,6 +2492,7 @@ mod tests {
             created_at_unix_ms: Some(124),
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
 
         save_state(tmp.path(), &state).unwrap();
@@ -2527,6 +2541,7 @@ mod tests {
             created_at_unix_ms: None,
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
 
         let grants = grant_overview_values(&state, "local-daemon");
@@ -2565,6 +2580,7 @@ mod tests {
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
         state
     }

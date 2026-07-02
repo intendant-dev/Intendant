@@ -13988,17 +13988,132 @@ async function clientIdentityReset() {
    Provenance is display metadata only — authority always stays with the
    target daemon. */
 
-function accessFleetRecordPayload(record, signedAt) {
-  return new TextEncoder().encode([
-    'intendant-fleet-record-v1',
+function accessFleetRecordPayload(record, signedAt, version = 2) {
+  // v3 (encrypted records): the URL fields travel ONLY inside enc_fields,
+  // so the signed lines pin them to empty — decrypting into the in-memory
+  // record never invalidates the signature.
+  const enc = version >= 3 ? String(record.enc_fields || '') : '';
+  const blank = version >= 3 && enc;
+  const lines = [
+    version >= 3 ? 'intendant-fleet-record-v3'
+      : version >= 2 ? 'intendant-fleet-record-v2' : 'intendant-fleet-record-v1',
     String(record.host_id || record.id || ''),
     String(record.label || ''),
-    String(record.url || ''),
-    String(record.ws_url || ''),
-    String(record.browser_tcp_via_url || ''),
+    blank ? '' : String(record.url || ''),
+    blank ? '' : String(record.ws_url || ''),
+    blank ? '' : String(record.browser_tcp_via_url || ''),
     String(record.connect_daemon_id || ''),
-    String(signedAt),
-  ].join('\n'));
+  ];
+  // v2 adds the daemon-advertised rendezvous base (phase 7) so a synced
+  // device connects through the daemon's own rendezvous, not a default.
+  if (version >= 2) lines.push(String(record.connect_signaling_base || ''));
+  if (version >= 3) lines.push(enc);
+  lines.push(String(signedAt));
+  return new TextEncoder().encode(lines.join('\n'));
+}
+
+/* ── Encrypted fleet sync (trust architecture phase 5 follow-on) ──
+   The WebAuthn PRF extension turns the account passkey into a secret the
+   server never sees; passkeys sync across a user's devices, so every
+   device can derive the same AES-GCM key and the hosted store holds only
+   ciphertext for the private fields (daemon URLs). No PRF support — or a
+   device that hasn't unlocked — degrades to blank URLs with the record
+   otherwise intact and verifiable. */
+
+const FLEET_PRF_SESSION_KEY = 'intendant_fleet_prf_v1';
+const FLEET_ENC_PREFIX = 'enc1:';
+let accessFleetAesKey = null;
+
+async function accessFleetEncryptionKey() {
+  if (accessFleetAesKey) return accessFleetAesKey;
+  try {
+    const prfB64u = sessionStorage.getItem(FLEET_PRF_SESSION_KEY) || '';
+    if (!prfB64u || !crypto?.subtle) return null;
+    const hkdf = await crypto.subtle.importKey(
+      'raw', dashboardBase64UrlToBytes(prfB64u), 'HKDF', false, ['deriveKey']
+    );
+    accessFleetAesKey = await crypto.subtle.deriveKey(
+      {
+        name: 'HKDF',
+        hash: 'SHA-256',
+        salt: new TextEncoder().encode('intendant-fleet-sync-v1'),
+        info: new TextEncoder().encode('fleet-enc'),
+      },
+      hkdf,
+      { name: 'AES-GCM', length: 256 },
+      false,
+      ['encrypt', 'decrypt']
+    );
+    return accessFleetAesKey;
+  } catch (err) {
+    console.warn('[fleet-sync] encryption key unavailable:', err?.message || err);
+    return null;
+  }
+}
+
+function accessFleetEncryptionAvailable() {
+  return Boolean(sessionStorage.getItem(FLEET_PRF_SESSION_KEY));
+}
+
+/* The hosted copy of a record: URL fields sealed into enc_fields when the
+   key is present; the local store keeps plaintext. */
+async function accessFleetEncryptRecord(record) {
+  const key = await accessFleetEncryptionKey();
+  if (!key) return record;
+  const secret = {
+    url: String(record.url || ''),
+    ws_url: String(record.ws_url || ''),
+    browser_tcp_via_url: String(record.browser_tcp_via_url || ''),
+  };
+  if (!secret.url && !secret.ws_url && !secret.browser_tcp_via_url && !record.enc_fields) {
+    return record;
+  }
+  try {
+    const iv = crypto.getRandomValues(new Uint8Array(12));
+    const ciphertext = await crypto.subtle.encrypt(
+      { name: 'AES-GCM', iv },
+      key,
+      new TextEncoder().encode(JSON.stringify(secret))
+    );
+    return {
+      ...record,
+      url: '',
+      ws_url: '',
+      browser_tcp_via_url: '',
+      enc_fields: `${FLEET_ENC_PREFIX}${dashboardBytesToBase64Url(iv)}:${dashboardBytesToBase64Url(new Uint8Array(ciphertext))}`,
+    };
+  } catch (err) {
+    console.warn('[fleet-sync] record encryption failed:', err?.message || err);
+    return record;
+  }
+}
+
+/* Fill the in-memory record from its envelope when the key is available;
+   otherwise mark it locked (URLs stay blank, everything else works). */
+async function accessFleetDecryptRecord(record) {
+  const enc = String(record?.enc_fields || '');
+  if (!enc.startsWith(FLEET_ENC_PREFIX)) return record;
+  const key = await accessFleetEncryptionKey();
+  if (!key) return { ...record, fleet_locked: true };
+  try {
+    const [ivB64u, ctB64u] = enc.slice(FLEET_ENC_PREFIX.length).split(':');
+    const plaintext = await crypto.subtle.decrypt(
+      { name: 'AES-GCM', iv: dashboardBase64UrlToBytes(ivB64u) },
+      key,
+      dashboardBase64UrlToBytes(ctB64u)
+    );
+    const secret = JSON.parse(new TextDecoder().decode(plaintext));
+    return {
+      ...record,
+      url: String(secret.url || ''),
+      ws_url: String(secret.ws_url || ''),
+      browser_tcp_via_url: String(secret.browser_tcp_via_url || ''),
+      fleet_locked: false,
+    };
+  } catch (err) {
+    console.warn('[fleet-sync] record decryption failed:', err?.message || err);
+    return { ...record, fleet_locked: true };
+  }
 }
 
 async function accessFleetSignRecord(record) {
@@ -14009,7 +14124,7 @@ async function accessFleetSignRecord(record) {
     const signature = await crypto.subtle.sign(
       { name: 'ECDSA', hash: 'SHA-256' },
       identity.privateKey,
-      accessFleetRecordPayload(record, signedAt)
+      accessFleetRecordPayload(record, signedAt, record.enc_fields ? 3 : 2)
     );
     return {
       ...record,
@@ -14040,12 +14155,16 @@ async function accessFleetVerifyRecord(record) {
       false,
       ['verify']
     );
-    const valid = await crypto.subtle.verify(
-      { name: 'ECDSA', hash: 'SHA-256' },
-      publicKey,
-      dashboardBase64UrlToBytes(sig),
-      accessFleetRecordPayload(record, signedAt)
-    );
+    let valid = false;
+    for (const version of record.enc_fields ? [3, 2, 1] : [2, 1]) {
+      valid = await crypto.subtle.verify(
+        { name: 'ECDSA', hash: 'SHA-256' },
+        publicKey,
+        dashboardBase64UrlToBytes(sig),
+        accessFleetRecordPayload(record, signedAt, version)
+      );
+      if (valid) break;
+    }
     if (!valid) return 'unverified';
     const mine = clientIdentityCache?.publicRawB64u === key;
     return mine ? 'verified' : 'signed';
@@ -14177,6 +14296,74 @@ async function orgGrantForOffer(daemonId) {
     return best;
   } catch {
     return null;
+  }
+}
+
+/* The rendezvous origin this page can reach for org bulletin lookups:
+   the current origin in hosted-connect mode, else the daemon-advertised
+   base carried in the URL. */
+function dashboardRendezvousBase() {
+  if (DASHBOARD_CONNECT_MODE) return DASHBOARD_CONNECT_SIGNALING_BASE || window.location.origin;
+  if (DASHBOARD_CONNECT_SIGNALING_BASE) return DASHBOARD_CONNECT_SIGNALING_BASE;
+  // Anchor pages: the daemon advertises the rendezvous it polls in its
+  // own dashboard targets (phase 7).
+  try {
+    const self = (dashboardAccessTargets || []).find(target => target?.local === true && target?.rendezvous_base);
+    return String(self?.rendezvous_base || '').trim().replace(/\/+$/, '');
+  } catch { return ''; }
+}
+
+/* Best-effort publish of a root-signed revocation list to the rendezvous
+   bulletin board, so member browsers everywhere pick it up. Zero
+   authority: the board verifies the signature only to stay clean, and
+   every daemon re-verifies on apply. */
+async function orgPublishRevocations(orl) {
+  const base = dashboardRendezvousBase();
+  if (!base || !orl) return false;
+  try {
+    const resp = await fetch(`${base}/api/orgs/revocations/publish`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify(orl),
+    });
+    return resp.ok;
+  } catch (err) {
+    console.warn('[org] revocation publish failed:', err?.message || err);
+    return false;
+  }
+}
+
+/* Member-side courier: for each stored org document, fetch the org's
+   published revocation list from the rendezvous and hand it to the
+   daemon this page is connected to. The daemon enforces signature and
+   monotonic seq itself; an already-applied list is a quiet no-op. */
+async function orgRevocationCourier() {
+  const base = dashboardRendezvousBase();
+  if (!base) return;
+  let map = {};
+  try { map = JSON.parse(localStorage.getItem(ORG_GRANTS_STORE_KEY) || '{}') || {}; } catch {}
+  for (const doc of Object.values(map)) {
+    const handle = String(doc?.org?.handle || '').trim();
+    const rootKey = String(doc?.org?.root_key || '').trim();
+    if (!handle || !rootKey) continue;
+    const throttleKey = `intendant_orl_courier:${handle}:${rootKey}`;
+    try {
+      const last = Number(sessionStorage.getItem(throttleKey) || 0);
+      if (Date.now() - last < 30 * 60 * 1000) continue;
+      sessionStorage.setItem(throttleKey, String(Date.now()));
+    } catch {}
+    try {
+      const resp = await fetch(`${base}/api/orgs/revocations?handle=${encodeURIComponent(handle)}&root_key=${encodeURIComponent(rootKey)}`);
+      if (!resp.ok) continue;
+      const body = await resp.json().catch(() => ({}));
+      if (!body?.orl) continue;
+      const applied = await accessOrgCall('api_access_org_orl_apply', '/api/access/orgs/revocations/apply', body.orl);
+      if (applied?.applied?.changed) {
+        console.info(`[org] carried @${handle} revocations seq ${applied.applied.seq} to this daemon (${applied.applied.revoked_grants} grants, ${applied.applied.revoked_peer_identities} peer identities revoked)`);
+      }
+    } catch (err) {
+      console.warn(`[org] revocation courier for @${handle} failed:`, err?.message || err);
+    }
   }
 }
 
@@ -21800,6 +21987,21 @@ async function main() {
       setConnectEventStatus('err', 'Hosted Connect dashboard events failed');
       scheduleDashboardConnectReconnect(err?.message || String(err), { delayMs: 1000 });
     }
+  } else if (window.__intendantPort && window.__intendantBackendTls) {
+    // macOS app over mTLS: a browser WebSocket cannot present the client
+    // certificate (the intendant:// proxy can't intercept WS upgrades),
+    // so the legacy event stream can never connect — the WebRTC control
+    // transport, whose signaling rides the proxy, carries events instead.
+    console.info('[app] mTLS bundle: skipping legacy WebSocket; events flow through the control transport');
+    try {
+      const [cfg, card] = await Promise.all([
+        fetch('/config').then(r => r.json()).catch(() => ({})),
+        fetch('/.well-known/agent-card.json').then(r => r.json()).catch(() => null),
+      ]);
+      applyGatewayConfig(cfg);
+      applyAgentCardIdentity(card);
+    } catch {}
+    maybeStartDashboardControlTransport();
   } else {
     // Connect to server over the normal daemon-origin WebSocket.
     const wsUrl = buildWsUrl();
@@ -34164,7 +34366,12 @@ async function accessFleetHydrateFromHosted() {
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets'));
     const body = await resp.json().catch(() => ({}));
     if (resp.ok && body.ok !== false) {
-      accessFleetMergeHostedTargets(body.targets || []);
+      const targets = await Promise.all(
+        (body.targets || []).map(target => accessFleetDecryptRecord(target))
+      );
+      const locked = targets.filter(t => t?.fleet_locked).length;
+      if (locked) console.info(`[fleet-sync] ${locked} record(s) hold encrypted fields; sign in with the account passkey on this device to unlock`);
+      accessFleetMergeHostedTargets(targets);
       accessFleetRefreshProvenance().catch(() => {});
     }
   } catch (err) {
@@ -34198,7 +34405,8 @@ async function accessFleetPushToHosted() {
     // Sign just-in-time so the pushed record always covers its current
     // content; browsers without WebCrypto push unsigned (shown as such).
     const targets = await Promise.all(
-      (accessFleetRead().targets || []).map(target => accessFleetSignRecord(target))
+      (accessFleetRead().targets || []).map(async target =>
+        accessFleetSignRecord(await accessFleetEncryptRecord(target)))
     );
     const resp = await fetch(accessFleetHostedUrl('/api/fleet/targets/sync'), {
       method: 'POST',
@@ -34207,7 +34415,10 @@ async function accessFleetPushToHosted() {
     });
     const body = await resp.json().catch(() => ({}));
     if (!resp.ok || body.ok === false) throw new Error(body.error || `HTTP ${resp.status}`);
-    accessFleetMergeHostedTargets(body.targets || []);
+    const merged = await Promise.all(
+      (body.targets || []).map(target => accessFleetDecryptRecord(target))
+    );
+    accessFleetMergeHostedTargets(merged);
     accessFleetRefreshProvenance().catch(() => {});
   } finally {
     accessFleetHostedSyncInFlight = false;
@@ -34235,7 +34446,11 @@ function accessFleetTargetUrl(target) {
   const explicit = target?.url || target?.browser_tcp_via_url || target?.ws_url || '';
   if (explicit) return explicit;
   if (target?.local && DASHBOARD_CONNECT_MODE && DASHBOARD_CONNECT_DAEMON_ID) {
-    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}`;
+    const base = String(target?.connect_signaling_base || '').trim().replace(/\/+$/, '');
+    const extra = base && base !== window.location.origin
+      ? `&connect_base=${encodeURIComponent(base)}`
+      : '';
+    return `/app?connect=1&daemon_id=${encodeURIComponent(DASHBOARD_CONNECT_DAEMON_ID)}${extra}`;
   }
   if (target?.local && window.location.origin) return window.location.origin;
   return '';
@@ -34274,6 +34489,15 @@ function accessFleetRecordFromTarget(target) {
     capabilities: normalized.capabilities || [],
     origin: window.location.origin || '',
     connect_daemon_id: connectDaemonId,
+    // Phase 7: the rendezvous this daemon is reachable through — from its
+    // agent card (rendezvous_base) or, when browsing through a rendezvous
+    // right now, the one in use.
+    connect_signaling_base: String(
+      normalized.connect_signaling_base || normalized.rendezvous_base ||
+      (normalized.local && DASHBOARD_CONNECT_MODE
+        ? (DASHBOARD_CONNECT_SIGNALING_BASE || window.location.origin)
+        : '')
+    ).trim().replace(/\/+$/, ''),
     first_seen_unix_ms: normalized.first_seen_unix_ms || now,
     last_seen_unix_ms: now,
   };
@@ -37720,7 +37944,8 @@ function renderAccessOrganizations() {
     kind.className = 'acc-principal-kind';
     const key = accessModelLabel(org.root_key);
     const orlSeq = Number(org.last_orl_seq || 0);
-    kind.textContent = `root key ${key.slice(0, 12)}…${key.slice(-4)}${orlSeq > 0 ? ` · revocations seq ${orlSeq}` : ''}`;
+    const peerCap = String(org.max_peer_profile || '').trim();
+    kind.textContent = `root key ${key.slice(0, 12)}…${key.slice(-4)} · peer cap: ${peerCap || 'none'}${orlSeq > 0 ? ` · revocations seq ${orlSeq}` : ''}`;
     kind.title = key;
     nameWrap.append(name, kind);
     head.append(glyph, nameWrap);
@@ -37808,6 +38033,30 @@ function renderAccessOrganizations() {
   }
   capLabel.appendChild(capSelect);
   grid.appendChild(capLabel);
+  const peerCapLabel = document.createElement('label');
+  peerCapLabel.textContent = 'Peer cap';
+  peerCapLabel.title = 'Cap for org grants to member DAEMONS (peer profiles). Off by default: the human and peer lanes are separate trust decisions.';
+  const peerCapSelect = document.createElement('select');
+  peerCapSelect.id = 'access-org-trust-peer-cap';
+  for (const [value, text] of [
+    ['', 'No peer authority (default)'],
+    ['presence-only', 'presence-only'],
+    ['stats', 'stats'],
+    ['session-reader', 'session-reader'],
+    ['read-only-display', 'read-only-display'],
+    ['file-reader', 'file-reader'],
+    ['file-operator', 'file-operator'],
+    ['terminal-operator', 'terminal-operator'],
+    ['task-runner', 'task-runner'],
+    ['operator', 'operator'],
+  ]) {
+    const option = document.createElement('option');
+    option.value = value;
+    option.textContent = text;
+    peerCapSelect.appendChild(option);
+  }
+  peerCapLabel.appendChild(peerCapSelect);
+  grid.appendChild(peerCapLabel);
   form.appendChild(grid);
   const actions = document.createElement('div');
   actions.className = 'acc-grant-flow-actions';
@@ -37828,6 +38077,7 @@ function renderAccessOrganizations() {
         handle,
         root_key: rootKey,
         max_role: document.getElementById('access-org-trust-cap')?.value || 'role:operator',
+        max_peer_profile: document.getElementById('access-org-trust-peer-cap')?.value || '',
       });
       showControlToast?.('success', `Org @${handle} trusted`);
     } catch (err) {
@@ -37869,6 +38119,21 @@ function renderAccessOrganizations() {
     }
     handleLabel.appendChild(handleSelect);
     igrid.appendChild(handleLabel);
+    const kindLabel = document.createElement('label');
+    kindLabel.textContent = 'Subject';
+    const kindSelect = document.createElement('select');
+    kindSelect.id = 'access-org-issue-kind';
+    for (const [value, text] of [
+      ['client_key', 'Member browser key'],
+      ['peer', 'Member daemon (peer certificate)'],
+    ]) {
+      const option = document.createElement('option');
+      option.value = value;
+      option.textContent = text;
+      kindSelect.appendChild(option);
+    }
+    kindLabel.appendChild(kindSelect);
+    igrid.appendChild(kindLabel);
     for (const [id, labelText, placeholder] of [
       ['access-org-issue-fingerprint', 'Member browser key fingerprint', 'from their Access page'],
       ['access-org-issue-label', 'Member label', 'e.g. Alice'],
@@ -37888,13 +38153,34 @@ function renderAccessOrganizations() {
     roleLabel.textContent = 'Role';
     const roleSelect = document.createElement('select');
     roleSelect.id = 'access-org-issue-role';
-    for (const role of accessAssignableIamRoles()) {
-      const option = document.createElement('option');
-      option.value = accessModelLabel(role.id);
-      option.textContent = accessModelLabel(role.label, role.id);
-      if (accessModelLabel(role.id) === 'role:observer') option.selected = true;
-      roleSelect.appendChild(option);
-    }
+    const rebuildRoleOptions = () => {
+      roleSelect.innerHTML = '';
+      if (kindSelect.value === 'peer') {
+        for (const profile of ['presence-only', 'stats', 'session-reader', 'read-only-display', 'file-reader', 'file-operator', 'terminal-operator', 'task-runner', 'operator']) {
+          const option = document.createElement('option');
+          option.value = `peer:${profile}`;
+          option.textContent = `peer:${profile}`;
+          if (profile === 'session-reader') option.selected = true;
+          roleSelect.appendChild(option);
+        }
+      } else {
+        for (const role of accessAssignableIamRoles()) {
+          const option = document.createElement('option');
+          option.value = accessModelLabel(role.id);
+          option.textContent = accessModelLabel(role.label, role.id);
+          if (accessModelLabel(role.id) === 'role:observer') option.selected = true;
+          roleSelect.appendChild(option);
+        }
+      }
+    };
+    rebuildRoleOptions();
+    kindSelect.addEventListener('change', () => {
+      rebuildRoleOptions();
+      const fp = document.getElementById('access-org-issue-fingerprint');
+      if (fp) fp.placeholder = kindSelect.value === 'peer' ? 'peer certificate SHA-256 (64 hex chars)' : 'from their Access page';
+      const fpLabel = fp?.closest('label');
+      if (fpLabel) fpLabel.firstChild.textContent = kindSelect.value === 'peer' ? 'Member daemon cert fingerprint' : 'Member browser key fingerprint';
+    });
     roleLabel.appendChild(roleSelect);
     igrid.appendChild(roleLabel);
     const ttlLabel = document.createElement('label');
@@ -37930,9 +38216,12 @@ function renderAccessOrganizations() {
     output.style.marginTop = '10px';
     issueBtn.addEventListener('click', async () => {
       try {
+        const issueKind = document.getElementById('access-org-issue-kind')?.value || 'client_key';
+        const issueFp = document.getElementById('access-org-issue-fingerprint')?.value?.trim();
         const data = await accessOrgCall('api_access_org_issue', '/api/access/org-grants/issue', {
           handle: document.getElementById('access-org-issue-handle')?.value,
-          client_key_fingerprint: document.getElementById('access-org-issue-fingerprint')?.value?.trim(),
+          client_key_fingerprint: issueKind === 'peer' ? '' : issueFp,
+          peer_fingerprint: issueKind === 'peer' ? issueFp : '',
           label: document.getElementById('access-org-issue-label')?.value?.trim(),
           role_id: document.getElementById('access-org-issue-role')?.value,
           ttl_ms: Number(document.getElementById('access-org-issue-ttl')?.value || 0) || undefined,
@@ -37992,6 +38281,7 @@ function renderAccessOrganizations() {
     for (const [id, labelText, placeholder] of [
       ['access-org-orl-grant-id', 'Document grant_id', 'from the issued document (optional)'],
       ['access-org-orl-subject', 'Member key fingerprint', 'revokes every document for the key (optional)'],
+      ['access-org-orl-issuer', 'Issuer key', 'revokes everything a delegated issuer signed (optional)'],
     ]) {
       const label = document.createElement('label');
       label.textContent = labelText;
@@ -38021,8 +38311,9 @@ function renderAccessOrganizations() {
     revokeMemberBtn.addEventListener('click', async () => {
       const grantId = document.getElementById('access-org-orl-grant-id')?.value?.trim();
       const subject = document.getElementById('access-org-orl-subject')?.value?.trim();
-      if (!grantId && !subject) {
-        showControlToast?.('error', 'Provide a grant_id or a member key fingerprint');
+      const issuerKey = document.getElementById('access-org-orl-issuer')?.value?.trim();
+      if (!grantId && !subject && !issuerKey) {
+        showControlToast?.('error', 'Provide a grant_id, a member key fingerprint, or an issuer key');
         return;
       }
       try {
@@ -38030,10 +38321,12 @@ function renderAccessOrganizations() {
           handle: document.getElementById('access-org-orl-handle')?.value,
           ...(grantId ? { grant_id: grantId } : {}),
           ...(subject ? { subject } : {}),
+          ...(issuerKey ? { issuer_key: issuerKey } : {}),
         });
         orlOutput.value = JSON.stringify(data.orl, null, 2);
         const local = data.applied ? ` (${data.applied.revoked_grants} local grant${data.applied.revoked_grants === 1 ? '' : 's'} revoked here)` : '';
-        showControlToast?.('success', `Revocation list now at seq ${data.orl?.seq}${local} — apply it on the org's daemons`);
+        const published = await orgPublishRevocations(data.orl);
+        showControlToast?.('success', `Revocation list now at seq ${data.orl?.seq}${local}${published ? ' — published; member browsers will carry it to their daemons' : " — apply it on the org's daemons (no rendezvous reachable to publish through)"}`);
       } catch (err) {
         showControlToast?.('error', err?.message || 'Revocation failed');
       }
@@ -38121,6 +38414,166 @@ function renderAccessOrganizations() {
     renewFlow.appendChild(nactions);
     renewFlow.appendChild(renewOutput);
     mount.appendChild(renewFlow);
+
+    // Issuer delegation (root side): sign a certificate for a deputy
+    // daemon's issuer key so day-to-day signing moves off the root.
+    const delegateFlow = document.createElement('div');
+    delegateFlow.className = 'acc-grant-flow';
+    delegateFlow.style.marginTop = '12px';
+    const dhead = document.createElement('div');
+    dhead.className = 'acc-grant-flow-head';
+    const dtitle = document.createElement('div');
+    dtitle.className = 'acc-grant-flow-title';
+    dtitle.textContent = 'Delegate an issuer key';
+    const dsub = document.createElement('div');
+    dsub.className = 'acc-grant-flow-sub';
+    dsub.textContent = 'Paste a deputy daemon\u2019s issuer key (from its \u201cBecome an issuer\u201d flow). The certificate travels inside every document the deputy signs \u2014 nothing is published.';
+    dhead.append(dtitle, dsub);
+    delegateFlow.appendChild(dhead);
+    const dgrid = document.createElement('div');
+    dgrid.className = 'acc-field-grid';
+    for (const [id, labelText, placeholder] of [
+      ['access-org-delegate-key', 'Issuer key', 'ed25519 public key (base64url)'],
+      ['access-org-delegate-label', 'Label', 'e.g. CI signer'],
+      ['access-org-delegate-scope', 'Scope (optional)', 'role:… or peer:… — empty allows both lanes'],
+    ]) {
+      const label = document.createElement('label');
+      label.textContent = labelText;
+      const input = document.createElement('input');
+      input.type = 'text';
+      input.id = id;
+      input.autocomplete = 'off';
+      input.spellcheck = false;
+      input.placeholder = placeholder;
+      label.appendChild(input);
+      dgrid.appendChild(label);
+    }
+    delegateFlow.appendChild(dgrid);
+    const dactions = document.createElement('div');
+    dactions.className = 'acc-grant-flow-actions';
+    const delegateOutput = document.createElement('textarea');
+    delegateOutput.className = 'daemon-pairing-textarea';
+    delegateOutput.rows = 5;
+    delegateOutput.readOnly = true;
+    delegateOutput.placeholder = 'Signed issuer certificate appears here';
+    delegateOutput.style.marginTop = '10px';
+    const delegateBtn = document.createElement('button');
+    delegateBtn.type = 'button';
+    delegateBtn.className = 'acc-btn primary';
+    delegateBtn.textContent = 'Delegate & sign';
+    delegateBtn.disabled = !canManage;
+    delegateBtn.addEventListener('click', async () => {
+      try {
+        const data = await accessOrgCall('api_access_org_issuer_delegate', '/api/access/org-grants/issuers/delegate', {
+          handle: document.getElementById('access-org-orl-handle')?.value || document.getElementById('access-org-issue-handle')?.value,
+          issuer_key: document.getElementById('access-org-delegate-key')?.value?.trim(),
+          label: document.getElementById('access-org-delegate-label')?.value?.trim(),
+          max_role: document.getElementById('access-org-delegate-scope')?.value?.trim() || '',
+        });
+        delegateOutput.value = JSON.stringify(data.certificate, null, 2);
+        showControlToast?.('success', 'Issuer certificate signed \u2014 send it to the deputy daemon');
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Delegation failed');
+      }
+    });
+    const copyCertBtn = document.createElement('button');
+    copyCertBtn.type = 'button';
+    copyCertBtn.className = 'acc-btn';
+    copyCertBtn.textContent = 'Copy';
+    copyCertBtn.addEventListener('click', () => {
+      if (!delegateOutput.value) return;
+      navigator.clipboard?.writeText(delegateOutput.value)
+        .then(() => showControlToast?.('success', 'Certificate copied'))
+        .catch(() => showControlToast?.('error', 'Copy failed'));
+    });
+    dactions.append(delegateBtn, copyCertBtn);
+    delegateFlow.appendChild(dactions);
+    delegateFlow.appendChild(delegateOutput);
+    mount.appendChild(delegateFlow);
+  }
+
+  // Become an issuer (deputy side): mint a local issuer key, send it to
+  // the org root for delegation, then install the returned certificate.
+  {
+    const issuerFold = document.createElement('details');
+    issuerFold.className = 'acc-fold';
+    const issuerSummary = document.createElement('summary');
+    issuerSummary.textContent = 'Become an issuer for an org';
+    issuerFold.appendChild(issuerSummary);
+    const foldBody = document.createElement('div');
+    foldBody.className = 'acc-fold-body';
+    const hint = document.createElement('p');
+    hint.className = 'acc-fold-hint';
+    hint.textContent = 'Create this daemon\u2019s issuer key for an org, send the key to the org root for a delegation certificate, and paste the certificate back here. Documents you issue then carry the certificate; the root key stays offline.';
+    foldBody.appendChild(hint);
+    const grid = document.createElement('div');
+    grid.className = 'acc-field-grid';
+    const handleLabel = document.createElement('label');
+    handleLabel.textContent = 'Org handle';
+    const handleInput = document.createElement('input');
+    handleInput.type = 'text';
+    handleInput.id = 'access-org-issuer-handle';
+    handleInput.autocomplete = 'off';
+    handleInput.spellcheck = false;
+    handleInput.placeholder = 'e.g. acme';
+    handleLabel.appendChild(handleInput);
+    grid.appendChild(handleLabel);
+    foldBody.appendChild(grid);
+    const keyOut = document.createElement('textarea');
+    keyOut.className = 'daemon-pairing-textarea';
+    keyOut.rows = 2;
+    keyOut.readOnly = true;
+    keyOut.placeholder = 'Issuer key appears here \u2014 send it to the org root';
+    foldBody.appendChild(keyOut);
+    const certIn = document.createElement('textarea');
+    certIn.className = 'daemon-pairing-textarea';
+    certIn.rows = 4;
+    certIn.placeholder = 'Paste the root-signed issuer certificate here';
+    certIn.style.marginTop = '8px';
+    foldBody.appendChild(certIn);
+    const actions = document.createElement('div');
+    actions.className = 'acc-grant-flow-actions';
+    const initBtn = document.createElement('button');
+    initBtn.type = 'button';
+    initBtn.className = 'acc-btn primary';
+    initBtn.textContent = 'Create / show issuer key';
+    initBtn.addEventListener('click', async () => {
+      try {
+        const data = await accessOrgCall('api_access_org_issuer_init', '/api/access/org-grants/issuers/init', {
+          handle: handleInput.value?.trim(),
+        });
+        keyOut.value = data.issuer_key || '';
+        showControlToast?.('success', data.certificate_installed ? 'Issuer key ready (certificate already installed)' : 'Issuer key ready \u2014 send it to the org root');
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Issuer init failed');
+      }
+    });
+    const installBtn = document.createElement('button');
+    installBtn.type = 'button';
+    installBtn.className = 'acc-btn';
+    installBtn.textContent = 'Install certificate';
+    installBtn.addEventListener('click', async () => {
+      let cert;
+      try { cert = JSON.parse(certIn.value.trim()); } catch {
+        showControlToast?.('error', 'That is not valid JSON');
+        return;
+      }
+      try {
+        await accessOrgCall('api_access_org_issuer_install', '/api/access/org-grants/issuers/install', {
+          handle: handleInput.value?.trim(),
+          certificate: cert,
+        });
+        showControlToast?.('success', 'Issuer certificate installed \u2014 this daemon can now issue for the org');
+        await refreshAccessOverviewFromApi({ silent: true }).catch(() => null);
+        renderAccessAdminSummaries();
+      } catch (err) {
+        showControlToast?.('error', err?.message || 'Install failed');
+      }
+    });
+    actions.append(initBtn, installBtn);
+    foldBody.appendChild(actions);
+    issuerFold.appendChild(foldBody);
+    mount.appendChild(issuerFold);
   }
 
   // Applying a carried revocation list works on any daemon that trusts
@@ -46292,6 +46745,11 @@ function dashboardServerMessageDedupeKey(message) {
 
 function dashboardControlTransportEnabled() {
   if (DASHBOARD_CONNECT_MODE) return true;
+  // macOS app over mTLS: the legacy WebSocket cannot present a client
+  // certificate, so the control transport is the only working event
+  // path — always on (localStorage is also unreliable on the custom
+  // intendant:// scheme, so this cannot be a stored preference there).
+  if (window.__intendantPort && window.__intendantBackendTls) return true;
   try {
     return localStorage.getItem(DASHBOARD_TRANSPORT_KEY) === 'webrtc-control';
   } catch {
@@ -47189,6 +47647,12 @@ window.intendantDashboardControl = {
   },
   _debugOrgGrantStore(doc) {
     return orgGrantStore(doc);
+  },
+  _debugFleetEncryptRecord(record) {
+    return accessFleetEncryptRecord(record);
+  },
+  _debugFleetDecryptRecord(record) {
+    return accessFleetDecryptRecord(record);
   },
   connectHealth() {
     return connectHealthState();
@@ -66092,7 +66556,10 @@ document.getElementById('access-org-join-btn')?.addEventListener('click', async 
   if (status) status.textContent = 'Presenting…';
   try {
     const data = await accessOrgCall('api_access_org_present', '/api/access/org-grants', doc);
-    if (status) status.textContent = `Granted via @${data.org_handle} — ${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}.${stored ? ' Kept for automatic presentation on future connections.' : ''}`;
+    const summary = data.peer_identity
+      ? `peer profile ${data.peer_identity.profile} for ${data.peer_identity.label} until ${new Date(Number(data.peer_identity.expires_at_unix || 0) * 1000).toLocaleString()}`
+      : `${String(data.grant?.role_id || '').replace(/^role:/, '')} until ${new Date(Number(data.grant?.expires_at_unix_ms || 0)).toLocaleString()}`;
+    if (status) status.textContent = `Granted via @${data.org_handle} — ${summary}.${stored ? ' Kept for automatic presentation on future connections.' : ''}`;
     showControlToast?.('success', 'Org grant accepted');
   } catch (err) {
     const kept = stored ? ' The document is kept in this browser and will be presented automatically once a daemon trusts the org.' : '';
@@ -66109,6 +66576,9 @@ if (clientIdentitySupported()) {
     if (identity) renderAccessAdminSummaries();
   }).catch(() => {});
 }
+// Carry published org revocations to this daemon shortly after load —
+// after the control transport has had a chance to come up in connect mode.
+setTimeout(() => { orgRevocationCourier().catch(() => {}); }, 4000);
 syncAccessPageNavLink();
 
 // Auto-scroll detection

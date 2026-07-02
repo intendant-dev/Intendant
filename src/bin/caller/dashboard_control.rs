@@ -164,6 +164,9 @@ const CONTROL_FEATURES: &[&str] = &[
     "api_access_org_issue",
     "api_access_org_present",
     "api_access_org_revoke_member",
+    "api_access_org_issuer_init",
+    "api_access_org_issuer_delegate",
+    "api_access_org_issuer_install",
     "api_access_org_orl",
     "api_access_org_orl_apply",
     "api_access_org_renew",
@@ -1989,13 +1992,21 @@ fn dashboard_control_method_operation(
         | "api_access_org_trust"
         | "api_access_org_revoke"
         | "api_access_org_issue"
-        | "api_access_org_revoke_member" => Some(PeerOperation::AccessManage),
+        | "api_access_org_revoke_member"
+        | "api_access_org_issuer_init"
+        | "api_access_org_issuer_delegate"
+        | "api_access_org_issuer_install" => Some(PeerOperation::AccessManage),
         // Presenting a signed org document (or list) only requires a
         // session; the document itself is the authorization and is fully
         // re-verified. Same for reading the org's public revocation list
         // and renewing a still-valid document.
-        "api_access_org_present" | "api_access_org_orl" | "api_access_org_orl_apply"
-        | "api_access_org_renew" => Some(PeerOperation::AccessInspect),
+        "api_access_org_present" | "api_access_org_orl" | "api_access_org_renew" => {
+            Some(PeerOperation::AccessInspect)
+        }
+        // Applying a root-signed revocation list mirrors a PUBLIC doorbell
+        // (`POST /api/access/orgs/revocations/apply`): the signature is the
+        // authority, so any session may courier one through the tunnel.
+        "api_access_org_orl_apply" => Some(PeerOperation::PresenceRead),
         "api_peer_pairing_requests" | "api_peer_pairing_identities" => {
             Some(PeerOperation::AccessInspect)
         }
@@ -2295,6 +2306,8 @@ fn control_frame_response(
                 }
                 "api_access_org_trust" | "api_access_org_revoke" | "api_access_org_issue"
                 | "api_access_org_present" | "api_access_org_revoke_member"
+                | "api_access_org_issuer_init" | "api_access_org_issuer_delegate"
+                | "api_access_org_issuer_install"
                 | "api_access_org_orl" | "api_access_org_orl_apply" | "api_access_org_renew" => {
                     let params = params.unwrap_or_else(|| serde_json::json!({}));
                     let result = match method {
@@ -2309,6 +2322,15 @@ fn control_frame_response(
                         }
                         "api_access_org_revoke_member" => {
                             crate::web_gateway::access_org_revoke_member_response_value(params)
+                        }
+                        "api_access_org_issuer_init" => {
+                            crate::web_gateway::access_org_issuer_init_response_value(params)
+                        }
+                        "api_access_org_issuer_delegate" => {
+                            crate::web_gateway::access_org_issuer_delegate_response_value(params)
+                        }
+                        "api_access_org_issuer_install" => {
+                            crate::web_gateway::access_org_issuer_install_response_value(params)
                         }
                         "api_access_org_orl" => {
                             crate::web_gateway::access_org_orl_response_value(
@@ -4029,6 +4051,9 @@ fn status_response_frame(id: String, runtime: &ControlRuntime) -> serde_json::Va
         ("api_access_org_issue_available", access_manage),
         ("api_access_org_present_available", access_inspect),
         ("api_access_org_revoke_member_available", access_manage),
+        ("api_access_org_issuer_init_available", access_manage),
+        ("api_access_org_issuer_delegate_available", access_manage),
+        ("api_access_org_issuer_install_available", access_manage),
         ("api_access_org_orl_available", access_inspect),
         ("api_access_org_orl_apply_available", access_inspect),
         ("api_access_org_renew_available", access_inspect),
@@ -9893,6 +9918,7 @@ mod tests {
             created_at_unix_ms: Some(101),
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
+            issued_via: None,
         });
         let principal =
             crate::access::iam::principal_for_browser_mtls_cert(&iam_state, "ab123", "https")
