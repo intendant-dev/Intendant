@@ -149,7 +149,7 @@ impl DisplayBackend for WaylandBackend {
         // (pre-45 portal-gnome, portal-gtk) leave it None and paste keeps
         // its unsupported error while capture and input proceed normally.
         let clipboard = match Clipboard::new().await {
-            Ok(proxy) => match proxy.request_clipboard(&session).await {
+            Ok(proxy) => match proxy.request(&session).await {
                 Ok(()) => Some(proxy),
                 Err(e) => {
                     eprintln!("[display/wayland] clipboard portal request failed: {e}");
