@@ -1701,52 +1701,111 @@ impl DisplaySession {
             .latest_frame()
             .await
             .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))?;
-
-        let (w, h) = (frame.width, frame.height);
-
-        // Convert from BGRA (or RGBA) to tightly-packed RGBA for the image crate.
-        // If stride > width * 4 the rows have alignment padding that must be stripped.
-        let row_bytes = w as usize * 4;
-        let stride = frame.stride as usize;
-
-        let rgba_data = match frame.format {
-            FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
-            FrameFormat::Rgba => {
-                let mut tight = Vec::with_capacity(row_bytes * h as usize);
-                for row in 0..h as usize {
-                    let start = row * stride;
-                    tight.extend_from_slice(&frame.data[start..start + row_bytes]);
-                }
-                tight
-            }
-            FrameFormat::Bgra => {
-                let mut tight = Vec::with_capacity(row_bytes * h as usize);
-                for row in 0..h as usize {
-                    let start = row * stride;
-                    for col in 0..w as usize {
-                        let px = start + col * 4;
-                        // Swap B <-> R while copying
-                        tight.push(frame.data[px + 2]); // R
-                        tight.push(frame.data[px + 1]); // G
-                        tight.push(frame.data[px]); // B
-                        tight.push(frame.data[px + 3]); // A
-                    }
-                }
-                tight
-            }
-        };
-
-        let img = image::RgbaImage::from_raw(w, h, rgba_data).ok_or_else(|| {
-            CallerError::Display("failed to construct image from frame data".into())
-        })?;
-
-        let mut png_buf = std::io::Cursor::new(Vec::new());
-        img.write_to(&mut png_buf, image::ImageFormat::Png)
-            .map_err(|e| CallerError::Display(format!("PNG encode: {e}")))?;
-
-        Ok(png_buf.into_inner())
+        encode_frame_png(&frame)
     }
 
+    /// Encode a PNG screenshot from a frame captured at or after `min_timestamp`,
+    /// waiting up to `timeout` for one to arrive.
+    ///
+    /// Capture backends are damage-driven: after an input action the next frame
+    /// arrives within a vsync or two *if the action changed any pixels*, but no
+    /// frame arrives at all when nothing changed. Both outcomes are handled:
+    /// a fresh frame is returned as soon as it lands, and on timeout the most
+    /// recent frame is returned instead — pixel-accurate in the nothing-changed
+    /// case. Errors only when the session has never captured a frame.
+    pub async fn screenshot_fresh(
+        &self,
+        min_timestamp: Instant,
+        timeout: Duration,
+    ) -> Result<Vec<u8>, CallerError> {
+        // Subscribe before checking latest_frame so a frame landing between
+        // the check and the subscription is not missed.
+        let mut frames = self.subscribe_frames();
+
+        let newest = self.latest_frame().await;
+        if let Some(ref frame) = newest {
+            if frame.timestamp >= min_timestamp {
+                return encode_frame_png(frame);
+            }
+        }
+
+        let deadline = tokio::time::sleep(timeout);
+        tokio::pin!(deadline);
+        let mut newest = newest;
+        loop {
+            tokio::select! {
+                recv = frames.recv() => match recv {
+                    Ok(frame) => {
+                        if frame.timestamp >= min_timestamp {
+                            return encode_frame_png(&frame);
+                        }
+                        newest = Some(frame);
+                    }
+                    Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break,
+                },
+                _ = &mut deadline => break,
+            }
+        }
+
+        // Timed out (or the capture stream ended): fall back to the freshest
+        // frame seen, which is content-accurate when the screen did not change.
+        let frame = match self.latest_frame().await {
+            Some(frame) => Some(frame),
+            None => newest,
+        }
+        .ok_or_else(|| CallerError::Display("no frame available for screenshot".into()))?;
+        encode_frame_png(&frame)
+    }
+}
+
+/// Encode a raw captured frame as PNG bytes.
+fn encode_frame_png(frame: &Frame) -> Result<Vec<u8>, CallerError> {
+    let (w, h) = (frame.width, frame.height);
+
+    // Convert from BGRA (or RGBA) to tightly-packed RGBA for the image crate.
+    // If stride > width * 4 the rows have alignment padding that must be stripped.
+    let row_bytes = w as usize * 4;
+    let stride = frame.stride as usize;
+
+    let rgba_data = match frame.format {
+        FrameFormat::Rgba if stride == row_bytes => frame.data.clone(),
+        FrameFormat::Rgba => {
+            let mut tight = Vec::with_capacity(row_bytes * h as usize);
+            for row in 0..h as usize {
+                let start = row * stride;
+                tight.extend_from_slice(&frame.data[start..start + row_bytes]);
+            }
+            tight
+        }
+        FrameFormat::Bgra => {
+            let mut tight = Vec::with_capacity(row_bytes * h as usize);
+            for row in 0..h as usize {
+                let start = row * stride;
+                for col in 0..w as usize {
+                    let px = start + col * 4;
+                    // Swap B <-> R while copying
+                    tight.push(frame.data[px + 2]); // R
+                    tight.push(frame.data[px + 1]); // G
+                    tight.push(frame.data[px]); // B
+                    tight.push(frame.data[px + 3]); // A
+                }
+            }
+            tight
+        }
+    };
+
+    let img = image::RgbaImage::from_raw(w, h, rgba_data)
+        .ok_or_else(|| CallerError::Display("failed to construct image from frame data".into()))?;
+
+    let mut png_buf = std::io::Cursor::new(Vec::new());
+    img.write_to(&mut png_buf, image::ImageFormat::Png)
+        .map_err(|e| CallerError::Display(format!("PNG encode: {e}")))?;
+
+    Ok(png_buf.into_inner())
+}
+
+impl DisplaySession {
     /// Handle a WebRTC SDP offer from a browser peer.
     ///
     /// Per-peer codec selection via the encoder pool: each peer's

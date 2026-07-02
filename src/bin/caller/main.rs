@@ -4,6 +4,8 @@ mod app_state_pricing;
 mod approval;
 mod audio_routing;
 mod autonomy;
+#[cfg(target_os = "macos")]
+mod ax;
 mod browser_workspace;
 mod computer_use;
 mod connect_rendezvous;
@@ -1424,7 +1426,7 @@ async fn create_external_agent(
                 codex_managed_context: false,
                 web_port,
                 mcp_auth_token: mcp_auth_token.clone(),
-                mcp_session_id: None,
+                mcp_session_id: mcp_session_id.clone(),
                 resume_session: resume_session.clone(),
                 codex_home: None,
             };
@@ -11670,6 +11672,7 @@ struct DaemonConfig {
     shared_codex_config: control_plane::SharedCodexConfig,
     shared_gemini_config: control_plane::SharedGeminiConfig,
     frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    session_registry: Option<display::SharedSessionRegistry>,
     web_port: Option<u16>,
     flags_direct: bool,
     /// Optional shared session state for headless mode (cleared between tasks).
@@ -11694,6 +11697,7 @@ async fn run_daemon_loop(config: DaemonConfig) {
         shared_codex_config: config.shared_codex_config,
         shared_gemini_config: config.shared_gemini_config,
         frame_registry: config.frame_registry,
+        session_registry: config.session_registry,
         web_port: config.web_port,
         flags_direct: config.flags_direct,
         shared_session: config.shared_session,
@@ -21334,6 +21338,85 @@ Also: {"source": "bare"}"#;
         }
     }
 
+    // --- handle_shared_view_calls tests ---
+
+    #[tokio::test]
+    async fn shared_view_calls_validate_and_gate_user_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        let session_log: SharedSessionLog = Arc::new(Mutex::new(
+            session_log::SessionLog::open(tmp.path().to_path_buf()).unwrap(),
+        ));
+        let mut conversation = Conversation::new("system".to_string(), 100_000);
+        let bus = EventBus::new();
+        let mut rx = bus.subscribe();
+        let autonomy = autonomy::shared_autonomy(autonomy::AutonomyState::default());
+        let mut counter = 0u64;
+
+        let calls = vec![
+            ("c1".to_string(), serde_json::json!({"action": "hide"})),
+            // focus without a region must fail fast.
+            ("c2".to_string(), serde_json::json!({"action": "focus"})),
+            // user_session without the display grant is refused (explicit opt-in).
+            (
+                "c3".to_string(),
+                serde_json::json!({"action": "show", "display_target": "user_session"}),
+            ),
+            ("c4".to_string(), serde_json::json!({"action": "bogus"})),
+        ];
+        handle_shared_view_calls(
+            &calls,
+            &mut conversation,
+            &bus,
+            &autonomy,
+            None,
+            Some("sess-1".to_string()),
+            tmp.path(),
+            &mut counter,
+            &session_log,
+        )
+        .await;
+
+        let results: Vec<_> = conversation
+            .messages()
+            .iter()
+            .filter(|m| m.role == "tool")
+            .collect();
+        assert_eq!(results.len(), 4, "one result per call");
+        assert!(
+            results[0].content.contains("dismissed"),
+            "{}",
+            results[0].content
+        );
+        assert!(
+            results[1].content.contains("requires a region"),
+            "{}",
+            results[1].content
+        );
+        assert!(
+            results[2].content.contains("explicit opt-in"),
+            "{}",
+            results[2].content
+        );
+        assert!(
+            results[3].content.contains("unknown shared_view action"),
+            "{}",
+            results[3].content
+        );
+
+        // Only the valid hide emitted a SharedView event; the gated and
+        // invalid calls must not reach the dashboard.
+        match rx.try_recv() {
+            Ok(AppEvent::SharedView {
+                action, session_id, ..
+            }) => {
+                assert_eq!(action, "hide");
+                assert_eq!(session_id.as_deref(), Some("sess-1"));
+            }
+            other => panic!("expected SharedView hide event, got {other:?}"),
+        }
+        assert!(rx.try_recv().is_err(), "no further events expected");
+    }
+
     // --- map_results_to_tool_responses tests ---
 
     #[test]
@@ -24286,6 +24369,7 @@ async fn run_agent_loop(
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
     mut xvfb_guard: &mut Option<vision::XvfbGuard>,
+    session_registry: Option<&display::SharedSessionRegistry>,
     // When true, askHuman is unavailable and approvals without a json_approval
     // slot are auto-denied (headless non-JSON mode).
     headless: bool,
@@ -24781,8 +24865,15 @@ async fn run_agent_loop(
             // --- Native tool call path ---
             let batch = assemble_batch_from_tool_calls(&response.tool_calls);
 
+            // Call IDs answered by a dedicated handler below. Every later
+            // catch-all result loop must skip these — a second result for the
+            // same tool_use_id is rejected by strict providers (Anthropic).
+            let mut handled_call_ids: std::collections::HashSet<String> =
+                std::collections::HashSet::new();
+
             for (call_id, tool_name, result_text) in &batch.precomputed_results {
                 conversation.add_tool_result(call_id, tool_name, result_text);
+                handled_call_ids.insert(call_id.clone());
             }
 
             // Apply context directives from manage_context tool call
@@ -24826,6 +24917,9 @@ async fn run_agent_loop(
                     &batch.nonce_to_call_id,
                     &batch.call_id_names,
                 ) {
+                    if handled_call_ids.contains(&call_id) {
+                        continue;
+                    }
                     conversation.add_tool_result(&call_id, &tool_name, "OK");
                 }
                 bus.send(AppEvent::DoneSignal {
@@ -24848,6 +24942,7 @@ async fn run_agent_loop(
                             Err(e) => format!("MCP tool error: {}", e),
                         };
                         conversation.add_tool_result(call_id, tool_name, &output);
+                        handled_call_ids.insert(call_id.clone());
                     }
                 } else {
                     for (call_id, tool_name, _) in &batch.mcp_calls {
@@ -24856,12 +24951,14 @@ async fn run_agent_loop(
                             tool_name,
                             "Error: MCP client not configured",
                         );
+                        handled_call_ids.insert(call_id.clone());
                     }
                 }
             }
 
             // Process invoke_skill tool calls (if any)
             for (call_id, skill_name, arguments) in &batch.skill_invocations {
+                handled_call_ids.insert(call_id.clone());
                 let discovered = skills::discover_skills(Some(&project.root));
                 match discovered.iter().find(|s| s.config.name == *skill_name) {
                     Some(skill) => {
@@ -24906,8 +25003,28 @@ async fn run_agent_loop(
                 }
             }
 
+            // Handle shared_view tool calls (dashboard coordination layer)
+            if !batch.shared_view_calls.is_empty() {
+                for (call_id, _) in &batch.shared_view_calls {
+                    handled_call_ids.insert(call_id.clone());
+                }
+                handle_shared_view_calls(
+                    &batch.shared_view_calls,
+                    conversation,
+                    bus,
+                    &autonomy,
+                    session_registry,
+                    local_session_id.clone(),
+                    log_dir,
+                    &mut cu_action_counter,
+                    &session_log,
+                )
+                .await;
+            }
+
             // Handle live audio spawn requests (blocking)
             for (call_id, session_id, args) in &batch.live_audio_spawns {
+                handled_call_ids.insert(call_id.clone());
                 let spec_result =
                     serde_json::from_value::<live_audio_types::LiveAudioSpec>(args.clone());
                 match spec_result {
@@ -25028,11 +25145,15 @@ async fn run_agent_loop(
             // If no runtime commands, just respond to tool calls with context update
             let Some(ref json_str) = batch.agent_input_json else {
                 empty_command_streak = 0;
-                // Respond to manage_context, MCP, or empty batch
+                // Respond to whatever no dedicated handler answered above
+                // (manage_context, or an empty batch).
                 for (call_id, tool_name) in &batch.call_id_names {
-                    if !mcp_client::McpClientManager::is_mcp_tool(tool_name) {
-                        conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
+                    if handled_call_ids.contains(call_id)
+                        || mcp_client::McpClientManager::is_mcp_tool(tool_name)
+                    {
+                        continue;
                     }
+                    conversation.add_tool_result(call_id, tool_name, "OK — context updated.");
                 }
                 continue;
             };
@@ -25047,6 +25168,9 @@ async fn run_agent_loop(
                     l.warn("askHuman requested in headless mode; prompting model to continue")
                 });
                 for (call_id, tool_name) in &batch.call_id_names {
+                    if handled_call_ids.contains(call_id) {
+                        continue;
+                    }
                     conversation.add_tool_result(
                         call_id,
                         tool_name,
@@ -25278,6 +25402,9 @@ async fn run_agent_loop(
 
             if should_skip {
                 for (call_id, tool_name) in &batch.call_id_names {
+                    if handled_call_ids.contains(call_id) {
+                        continue;
+                    }
                     conversation.add_tool_result(call_id, tool_name, "Command skipped by user.");
                 }
                 continue;
@@ -25327,6 +25454,9 @@ async fn run_agent_loop(
             );
             let budget = conversation.budget_summary();
             for (call_id, tool_name, result_text) in &tool_results {
+                if handled_call_ids.contains(call_id) {
+                    continue;
+                }
                 let text = format!("{}\n\n{}", result_text, budget);
                 if tool_name == "capture_screen" {
                     if let Some(images) = encode_screenshot(result_text) {
@@ -25346,6 +25476,7 @@ async fn run_agent_loop(
                     log_dir,
                     &mut cu_action_counter,
                     &session_log,
+                    session_registry,
                 )
                 .await;
             }
@@ -25358,6 +25489,7 @@ async fn run_agent_loop(
                 log_dir,
                 &mut cu_action_counter,
                 &session_log,
+                session_registry,
             )
             .await;
         } else {
@@ -25809,6 +25941,7 @@ async fn run_round_loop(
     json_approval: Option<&JsonApprovalSlot>,
     approval_registry: &event::ApprovalRegistry,
     context_injection: &event::ContextInjectionQueue,
+    session_registry: Option<&display::SharedSessionRegistry>,
     headless: bool,
 ) -> Result<LoopStats, CallerError> {
     let mut round = 1usize;
@@ -25833,6 +25966,7 @@ async fn run_round_loop(
             approval_registry,
             context_injection,
             &mut xvfb_guard,
+            session_registry,
             headless,
         )
         .await?;
@@ -26133,6 +26267,7 @@ All relative paths and commands execute from this directory.",
         &sub_agent_registry,
         &event::ContextInjectionQueue::default(),
         &mut None, // sub-agents get their own display if needed
+        None,      // sub-agent processes have no in-process display sessions
         true,      // headless (sub-agents have no interactive UI)
     )
     .await;
@@ -28511,7 +28646,8 @@ async fn run_with_presence(
                 None, // no JSON approval
                 &approval_registry,
                 &context_injection, // shared with presence
-                false,              // not headless
+                Some(&session_registry),
+                false, // not headless
             )
             .await;
 
@@ -28850,6 +28986,7 @@ async fn run_direct_mode(
     json_approval: Option<JsonApprovalSlot>,
     approval_registry: event::ApprovalRegistry,
     context_injection: event::ContextInjectionQueue,
+    session_registry: Option<display::SharedSessionRegistry>,
     headless: bool,
     attachments: UserAttachments,
 ) -> Result<LoopStats, CallerError> {
@@ -28954,6 +29091,7 @@ async fn run_direct_mode(
         json_approval.as_ref(),
         &approval_registry,
         &context_injection,
+        session_registry.as_ref(),
         headless,
     )
     .await
@@ -32103,6 +32241,7 @@ async fn try_cu_first(
             bus,
             &proj.config.computer_use,
             None, // auto-resolve display target
+            Some(session_registry),
         )
         .await,
     )
@@ -32672,7 +32811,10 @@ async fn run_cu_task(
     bus: &event::EventBus,
     cu_config: &project::ComputerUseConfig,
     target_override: Option<computer_use::DisplayTarget>,
+    session_registry: Option<&display::SharedSessionRegistry>,
 ) -> Result<CuTaskResult, CallerError> {
+    // Owned form for execute_actions, which wants `&Option<_>`.
+    let session_registry = session_registry.cloned();
     let mut stats = LoopStats::default();
     let mut cu_counter = 0u64;
     let backend = computer_use::DisplayBackend::from_config(&cu_config.backend);
@@ -32910,7 +33052,7 @@ async fn run_cu_task(
                     backend,
                     log_dir,
                     &mut cu_counter,
-                    &None,
+                    &session_registry,
                     None,
                 )
                 .await;
@@ -32959,6 +33101,178 @@ async fn run_cu_task(
 /// Execute native computer-use tool calls via the xdotool executor
 /// and add results (with screenshots) to the conversation.
 #[allow(clippy::too_many_arguments)]
+/// Handle native `shared_view` tool calls: dashboard visibility into
+/// agent-owned displays (sandboxes, VMs, virtual displays). Sharing the
+/// user's own screen is explicit opt-in — unlike the MCP path, this handler
+/// refuses to flip the display grant itself and instead tells the model the
+/// user must grant the display first; input authority is only ever granted
+/// by the user from the dashboard.
+#[allow(clippy::too_many_arguments)]
+async fn handle_shared_view_calls(
+    shared_view_calls: &[(String, serde_json::Value)],
+    conversation: &mut conversation::Conversation,
+    bus: &EventBus,
+    autonomy: &SharedAutonomy,
+    session_registry: Option<&display::SharedSessionRegistry>,
+    session_id: Option<String>,
+    log_dir: &std::path::Path,
+    cu_counter: &mut u64,
+    session_log: &SharedSessionLog,
+) {
+    for (call_id, args) in shared_view_calls {
+        let action = args
+            .get("action")
+            .and_then(|a| a.as_str())
+            .unwrap_or_default();
+        let display_target = args
+            .get("display_target")
+            .and_then(|s| s.as_str())
+            .map(str::to_string);
+        let reason = args
+            .get("reason")
+            .and_then(|s| s.as_str())
+            .map(str::to_string);
+        let region = args.get("region").and_then(|r| {
+            Some(mcp::normalize_shared_view_region_xywh(
+                r.get("x")?.as_f64()?,
+                r.get("y")?.as_f64()?,
+                r.get("width")?.as_f64()?,
+                r.get("height")?.as_f64()?,
+            ))
+        });
+
+        let resolved_target = mcp::shared_view_display_target(display_target, None);
+        let display_id = mcp::shared_view_display_id(resolved_target.as_deref(), None);
+        let label = mcp::shared_view_target_label(display_id, resolved_target.as_deref());
+
+        // The user's own screen is an explicit opt-in path: require the
+        // existing display grant instead of flipping it from a tool call.
+        // Only display-exposing verbs gate — focus/input/hide operate on
+        // whatever view is already shown.
+        let effective_user_display = match display_id {
+            Some(0) => true,
+            Some(_) => false,
+            None => matches!(
+                resolve_cu_display_target(),
+                computer_use::DisplayTarget::UserSession
+            ),
+        };
+        if matches!(action, "show" | "capture")
+            && effective_user_display
+            && !autonomy.read().await.user_display_granted
+        {
+            conversation.add_tool_result(
+                call_id,
+                "shared_view",
+                "Error: sharing the user's own screen (user_session) is an explicit opt-in — \
+                 the user must grant their display first (dashboard grant or \
+                 grant_user_display). Share an agent-owned display instead, e.g. \
+                 display_target \"99\" for the virtual display you are working on.",
+            );
+            continue;
+        }
+
+        let emit = |action: &str, note: Option<String>| AppEvent::SharedView {
+            session_id: session_id.clone(),
+            action: action.to_string(),
+            display_target: resolved_target.clone(),
+            display_id,
+            reason: reason.clone(),
+            region: region.clone(),
+            note,
+        };
+
+        let output = match action {
+            "show" => {
+                // (Re)activate a granted user display whose session is gone;
+                // the grant listener owns the platform work.
+                if display_id == Some(0) {
+                    let session_missing = match session_registry {
+                        Some(registry) => registry.read().await.get(0).is_none(),
+                        None => false,
+                    };
+                    if session_missing {
+                        bus.send(AppEvent::UserDisplayGranted { display_id: 0 });
+                    }
+                }
+                bus.send(emit("show", None));
+                format!("Shared view shown for {label} — the dashboard is now streaming it.")
+            }
+            "focus" => match region {
+                Some(_) => {
+                    bus.send(emit("focus", None));
+                    format!("Focus highlighted on {label}.")
+                }
+                None => "Error: focus requires a region {x, y, width, height} with 0.0-1.0 \
+                         fractions."
+                    .to_string(),
+            },
+            "capture" => {
+                bus.send(emit("capture", None));
+                let target = match display_id {
+                    Some(0) => computer_use::DisplayTarget::UserSession,
+                    Some(id) => computer_use::DisplayTarget::Virtual { id },
+                    None => resolve_cu_display_target(),
+                };
+                let screenshot_dir = log_dir.join("screenshots");
+                let _ = std::fs::create_dir_all(&screenshot_dir);
+                let registry = session_registry.cloned();
+                let results = computer_use::execute_actions(
+                    &[computer_use::CuAction::Screenshot],
+                    target,
+                    computer_use::DisplayBackend::detect(),
+                    &screenshot_dir,
+                    cu_counter,
+                    &registry,
+                    None,
+                )
+                .await;
+                match results.first().and_then(|r| r.screenshot.as_ref()) {
+                    Some(shot) => {
+                        let images = vec![conversation::ImageData {
+                            media_type: "image/png".to_string(),
+                            data: shot.base64_png.clone(),
+                        }];
+                        conversation.add_tool_result_with_images(
+                            call_id,
+                            "shared_view",
+                            &format!("Captured the current frame of {label}."),
+                            images,
+                        );
+                        continue;
+                    }
+                    None => format!(
+                        "Error: no frame available for {label}: {}",
+                        results
+                            .first()
+                            .and_then(|r| r.error.as_deref())
+                            .unwrap_or("unknown capture failure")
+                    ),
+                }
+            }
+            "input" => {
+                bus.send(emit("input", None));
+                format!(
+                    "Input authority requested for {label}. The user must accept from the \
+                     dashboard control — continue only after they take over or respond."
+                )
+            }
+            "hide" => {
+                bus.send(emit("hide", None));
+                "Shared view dismissed.".to_string()
+            }
+            other => format!(
+                "Error: unknown shared_view action '{other}' — use show, focus, capture, \
+                 input, or hide."
+            ),
+        };
+        slog(session_log, |l| {
+            l.info(&format!("shared_view {action}: {label}"))
+        });
+        conversation.add_tool_result(call_id, "shared_view", &output);
+    }
+}
+
 async fn execute_cu_calls(
     cu_calls: &[computer_use::CuToolCall],
     conversation: &mut conversation::Conversation,
@@ -32966,7 +33280,10 @@ async fn execute_cu_calls(
     log_dir: &std::path::Path,
     counter: &mut u64,
     session_log: &SharedSessionLog,
+    session_registry: Option<&display::SharedSessionRegistry>,
 ) {
+    // Owned form for execute_actions, which wants `&Option<_>`.
+    let session_registry = session_registry.cloned();
     let display_target = if cu_display.is_some() {
         resolve_cu_display_target()
     } else {
@@ -33003,6 +33320,25 @@ async fn execute_cu_calls(
                     end_x,
                     end_y,
                 } => format!("drag({},{}->{},{})", start_x, start_y, end_x, end_y),
+                computer_use::CuAction::TripleClick { x, y, .. } => {
+                    format!("triple_click({},{})", x, y)
+                }
+                computer_use::CuAction::MouseDown { x, y, .. } => {
+                    format!("mouse_down({},{})", x, y)
+                }
+                computer_use::CuAction::MouseUp { x, y, .. } => format!("mouse_up({},{})", x, y),
+                computer_use::CuAction::Paste { text } => {
+                    format!("paste(\"{}\")", &text[..text.len().min(50)])
+                }
+                computer_use::CuAction::HoldKey { key, ms } => {
+                    format!("hold_key({},{}ms)", key, ms)
+                }
+                computer_use::CuAction::Zoom {
+                    x,
+                    y,
+                    width,
+                    height,
+                } => format!("zoom({},{} {}x{})", x, y, width, height),
                 computer_use::CuAction::Screenshot => "screenshot".to_string(),
                 computer_use::CuAction::Wait { ms } => format!("wait({}ms)", ms),
             })
@@ -33017,7 +33353,7 @@ async fn execute_cu_calls(
             backend,
             log_dir,
             counter,
-            &None,
+            &session_registry,
             None,
         )
         .await;
@@ -33803,6 +34139,7 @@ async fn main() -> Result<(), CallerError> {
             shared_codex_config,
             shared_gemini_config,
             frame_registry,
+            session_registry: Some(session_registry.clone()),
             web_port: web_port_for_agent,
             flags_direct: flags.direct,
             shared_session: Some(shared_session),
@@ -34031,6 +34368,7 @@ async fn main() -> Result<(), CallerError> {
         let session_log_for_launcher = session_log.clone();
         let log_dir_for_launcher = log_dir.clone();
         let mcp_state_for_launcher = mcp_state.clone();
+        let session_registry_for_launcher = session_registry.clone();
         #[allow(clippy::async_yields_async)]
         let launcher: mcp::TaskLauncher = Box::new(move |task_str: String, bus: EventBus| {
             let project_root = project_root.clone();
@@ -34038,6 +34376,7 @@ async fn main() -> Result<(), CallerError> {
             let session_log = session_log_for_launcher.clone();
             let _parent_log_dir = log_dir_for_launcher.clone();
             let mcp_state = mcp_state_for_launcher.clone();
+            let session_registry = session_registry_for_launcher.clone();
             Box::pin(async move {
                 // Each MCP task gets a fresh session directory so conversations
                 // don't bleed between tasks (reasoning items, tool calls, etc.).
@@ -34165,6 +34504,7 @@ async fn main() -> Result<(), CallerError> {
                             None, // no JSON approval in MCP mode
                             approval_registry,
                             event::ContextInjectionQueue::default(),
+                            Some(session_registry),
                             false, // not headless — MCP has interactive approval
                             UserAttachments::default(),
                         )
@@ -34621,6 +34961,7 @@ async fn main() -> Result<(), CallerError> {
         let log_dir_clone = log_dir.clone();
         let approval_registry_clone = app.approval_registry.clone();
         let context_injection_clone = app.context_injection.clone();
+        let session_registry_clone = session_registry.clone();
         let mcp_mgr = if !project.config.mcp_servers.is_empty() {
             Some(mcp_client::McpClientManager::connect_all(&project.config.mcp_servers).await)
         } else {
@@ -34692,6 +35033,7 @@ async fn main() -> Result<(), CallerError> {
                         shared_codex_config: shared_codex_config.clone(),
                         shared_gemini_config: shared_gemini_config.clone(),
                         frame_registry: frame_registry.clone(),
+                        session_registry: Some(session_registry.clone()),
                         web_port: web_port_for_agent,
                         flags_direct: flags.direct,
                         shared_session: web_shared_session_for_supervisor.clone(),
@@ -34760,6 +35102,7 @@ async fn main() -> Result<(), CallerError> {
             let shared_external_agent_for_presence = shared_external_agent.clone();
             let shared_codex_config_for_presence = shared_codex_config.clone();
             let shared_gemini_config_for_presence = shared_gemini_config.clone();
+            let session_registry_for_presence = session_registry.clone();
             tokio::spawn(async move {
                 let result = run_with_presence(
                     task,
@@ -34779,7 +35122,7 @@ async fn main() -> Result<(), CallerError> {
                     approval_registry_clone,
                     frame_registry.clone(),
                     context_injection_clone,
-                    session_registry.clone(),
+                    session_registry_for_presence,
                     agent_backend_for_presence,
                     shared_external_agent_for_presence,
                     shared_codex_config_for_presence,
@@ -34889,6 +35232,7 @@ async fn main() -> Result<(), CallerError> {
                             None, // no JSON approval in TUI mode
                             approval_registry_clone,
                             context_injection_clone,
+                            Some(session_registry_clone),
                             false, // not headless — TUI handles approval
                             UserAttachments::default(),
                         )
@@ -34981,6 +35325,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_codex_config: shared_codex_config.clone(),
                 shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry_for_events.clone(),
+                session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: None,
@@ -35381,6 +35726,7 @@ async fn main() -> Result<(), CallerError> {
                     json_approval_slot,
                     event::ApprovalRegistry::default(),
                     event::ContextInjectionQueue::default(),
+                    Some(session_registry.clone()),
                     true, // headless mode
                     UserAttachments::default(),
                 )
@@ -35443,6 +35789,7 @@ async fn main() -> Result<(), CallerError> {
                 shared_codex_config: shared_codex_config.clone(),
                 shared_gemini_config: shared_gemini_config.clone(),
                 frame_registry: frame_registry.clone(),
+                session_registry: Some(session_registry.clone()),
                 web_port: web_port_for_agent,
                 flags_direct: flags.direct,
                 shared_session: headless_shared_session.clone(),

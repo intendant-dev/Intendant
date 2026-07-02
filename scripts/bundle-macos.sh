@@ -15,8 +15,8 @@
 #   2. Compiling a small Swift wrapper (macos-app/main.swift) that
 #      hosts a WKWebView loading the dashboard and spawns the Rust
 #      daemon as a child — so TCC grants to the .app flow through
-#      to the daemon and its subprocesses (ffmpeg, screencapture,
-#      cliclick, etc.) via inheritance.
+#      to the daemon (in-process CGEvent/AX computer use) and its
+#      subprocesses (ffmpeg, screencapture, etc.) via inheritance.
 #   3. Code-signing with a stable local identity stored in
 #      ~/.intendant/signing.keychain-db. A cert-based Designated
 #      Requirement survives rebuilds, so a one-time TCC grant keeps

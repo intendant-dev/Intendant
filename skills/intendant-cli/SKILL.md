@@ -7,7 +7,7 @@ description: Use when an agent needs Intendant control beyond the small MCP boot
 
 Use `intendant ctl` for Intendant control that is not already available as a small MCP bootstrap tool. The CLI talks to the running dashboard/MCP endpoint and exposes broad capabilities lazily through subcommand help.
 
-When `$INTENDANT` is set, run `"$INTENDANT" ctl ...`; Intendant sets it for supervised Codex sessions so the exact controller binary is available even when `intendant` is not on PATH. Otherwise use `intendant ctl ...`.
+When `$INTENDANT` is set, run `"$INTENDANT" ctl ...`; Intendant sets it for supervised Codex and Claude Code sessions so the exact controller binary is available even when `intendant` is not on PATH (the injected `INTENDANT_MCP_URL` also carries the loopback auth token and session scope). Otherwise use `intendant ctl ...`.
 
 Start with:
 
@@ -22,7 +22,7 @@ Useful groups:
 - `"${INTENDANT:-intendant}" ctl display --help` for displays, frames, screenshots, and display claims.
 - `"${INTENDANT:-intendant}" ctl browser --help` for browser workspaces, including local CDP-backed browsers and lease management.
   CDP workspaces prefer managed Chromium/Chrome-for-Testing; run `"${INTENDANT:-intendant}" setup browsers` to install/repair the managed browser cache, and use `--provider system_cdp` or `INTENDANT_BROWSER_WORKSPACE_ALLOW_SYSTEM_BROWSER=1` to opt into system Chrome/Chromium on macOS.
-- `"${INTENDANT:-intendant}" ctl cu --help` for computer-use actions.
+- `"${INTENDANT:-intendant}" ctl cu --help` for computer-use actions; `ctl cu actions --help` prints the per-action JSON shapes with an example. `ctl cu elements` reads the frontmost app's UI element tree (cheap textual grounding — click the center of a reported frame; macOS user session).
 - `"${INTENDANT:-intendant}" ctl shared --help` for shared display collaboration.
 - `"${INTENDANT:-intendant}" ctl approval --help` and `"${INTENDANT:-intendant}" ctl input --help` for pending approval/input flows.
 - `"${INTENDANT:-intendant}" ctl context --help` for managed-context rewind/backout.

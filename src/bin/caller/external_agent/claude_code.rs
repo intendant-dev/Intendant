@@ -16,19 +16,23 @@ use super::{
 };
 
 /// Appended to the first user message when an Intendant web port is
-/// available, pointing Claude Code at the dashboard validation helper
-/// instead of ad-hoc Chromium/CDP scripting.
-const CLAUDE_CODE_VALIDATION_ADDENDUM: &str = "\n\n\
-### Dashboard Validation\n\
-For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` \
-and prefer its named probes such as `--station-probe rendered` over ad-hoc \
-Chromium/CDP scripts; its `--help` is the authoritative flag reference, and \
-docs/src/external-agent-orchestration.md has the full Station QA recipes. For a \
-temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard \
---port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in \
-the foreground while separate CU/browser steps run against the printed URL, \
-then interrupted for helper-owned cleanup. Do not start a separate \
-foreground/nohup/setsid dashboard just so another tool can connect.\n";
+/// available: the capability bootstrap (Claude Code's equivalent of the
+/// Codex managed developer instructions) plus the dashboard-validation
+/// pointer. This is the gradual-discovery entry point — the small MCP
+/// bootstrap set is named directly, everything else routes through
+/// `"$INTENDANT" ctl --help`.
+const CLAUDE_CODE_BOOTSTRAP_ADDENDUM: &str = r#"
+
+### Intendant Supervision
+This session runs under Intendant, which adds desktop and display capabilities beyond your own tools:
+- The connected `intendant` MCP server carries the bootstrap set: `read_screen` for the frontmost app's UI element tree (cheap textual grounding — click the center of a reported frame), `take_screenshot` and `execute_cu_actions` for desktop computer use (screenshots return as images), `list_displays`/`grant_user_display` for display access, and the shared-view tools (`show_shared_view`, `focus_shared_view`, `capture_shared_view_frame`, `request_shared_view_input`, `hide_shared_view`) for giving the user live dashboard visibility into agent-owned displays (sandboxes, VMs, virtual displays). Sharing the user's own screen (`user_session`) is an explicit opt-in the user initiates; input authority is only ever granted by the user from the dashboard.
+- The broad control surface (browser workspaces, frames, approvals, tasks, audio) is discovered lazily through the CLI: run `"$INTENDANT" ctl --help`, then focused help like `"$INTENDANT" ctl cu actions --help`. `ctl tools list` / `ctl tools schema TOOL` / `ctl tools call TOOL` cover anything not wrapped.
+- When the user should visually stay in the loop (demoing a result, watching you operate a GUI or browser, an auth handoff), open the shared view with `show_shared_view` before acting and `hide_shared_view` when the moment is over.
+- Do not drive the desktop with `cliclick`/`osascript`/`xdotool` or ad-hoc scripts — go through the Intendant tools so actions run under the user's approval settings.
+
+### Dashboard Validation
+For browser/dashboard/Station validation, use `node scripts/validate-dashboard.cjs` and prefer its named probes such as `--station-probe rendered` over ad-hoc Chromium/CDP scripts; its `--help` is the authoritative flag reference, and docs/src/external-agent-orchestration.md has the full Station QA recipes. For a temporary dashboard, use the helper's owned lifecycle: `--launch-dashboard --port <throwaway_port>` for a one-shot smoke, or `--hold-dashboard` kept in the foreground while separate CU/browser steps run against the printed URL, then interrupted for helper-owned cleanup. Do not start a separate foreground/nohup/setsid dashboard just so another tool can connect.
+"#;
 
 // ---------------------------------------------------------------------------
 // Claude Code JSONL protocol types (stdin/stdout)
@@ -134,8 +138,12 @@ pub struct ClaudeCodeAgent {
     reader_handle: Option<tokio::task::JoinHandle<()>>,
     /// Session ID from the first result message, used for multi-turn.
     session_id: Option<String>,
-    /// Whether the first prompt (carrying the validation addendum) was sent.
+    /// Whether the first prompt (carrying the bootstrap addendum) was sent.
     prompt_sent: bool,
+    /// Loopback MCP auth token from the daemon, baked into the injected URL.
+    mcp_auth_token: Option<String>,
+    /// Intendant session id scoping the injected MCP URL and ctl env.
+    mcp_session_id: Option<String>,
 }
 
 impl ClaudeCodeAgent {
@@ -160,7 +168,22 @@ impl ClaudeCodeAgent {
             reader_handle: None,
             session_id: None,
             prompt_sent: false,
+            mcp_auth_token: None,
+            mcp_session_id: None,
         }
+    }
+
+    /// The scoped loopback MCP URL injected into `--mcp-config` and the ctl
+    /// env. Claude Code has no managed-context mode, so the server treats the
+    /// session as vanilla; `tool_profile=core` keeps the advertised tool list
+    /// to the bootstrap set (full surface stays callable via `ctl tools`).
+    fn intendant_mcp_url(&self, port: u16) -> String {
+        super::intendant_bootstrap_mcp_url(
+            port,
+            self.mcp_session_id.as_deref(),
+            None,
+            self.mcp_auth_token.as_deref(),
+        )
     }
 }
 
@@ -425,6 +448,8 @@ impl ExternalAgent for ClaudeCodeAgent {
     ) -> Result<mpsc::UnboundedReceiver<AgentEvent>, CallerError> {
         self.working_dir = Some(config.working_dir.clone());
         self.session_id = config.resume_session;
+        self.mcp_auth_token = config.mcp_auth_token;
+        self.mcp_session_id = config.mcp_session_id;
 
         // Build command args
         let mut args = vec![
@@ -459,7 +484,9 @@ impl ExternalAgent for ClaudeCodeAgent {
             args.push(self.allowed_tools.join(","));
         }
 
-        // MCP config for Intendant display/CU tools
+        // MCP config for Intendant display/CU tools: the scoped bootstrap URL
+        // (session id + tool_profile=core + loopback auth token), same
+        // treatment as managed Codex.
         let web_port = config.web_port.or(self.web_port);
         self.web_port = web_port;
         if let Some(port) = web_port {
@@ -467,7 +494,7 @@ impl ExternalAgent for ClaudeCodeAgent {
                 "mcpServers": {
                     "intendant": {
                         "type": "http",
-                        "url": format!("http://localhost:{}/mcp", port)
+                        "url": self.intendant_mcp_url(port)
                     }
                 }
             });
@@ -483,6 +510,15 @@ impl ExternalAgent for ClaudeCodeAgent {
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::piped());
+        // `"$INTENDANT" ctl ...` bootstrap env, so the lazy CLI surface works
+        // from Claude Code's shell without any PATH or port assumptions.
+        if let Some(port) = web_port {
+            super::add_intendant_bootstrap_env(
+                &mut command,
+                &self.intendant_mcp_url(port),
+                self.mcp_session_id.as_deref(),
+            );
+        }
         crate::platform::die_with_parent(&mut command);
         #[cfg(target_os = "linux")]
         crate::linux_display_env::apply_to_tokio_command(&mut command);
@@ -543,7 +579,7 @@ impl ExternalAgent for ClaudeCodeAgent {
         // as the Gemini CU addendum).
         let augmented = if self.web_port.is_some() && !self.prompt_sent {
             self.prompt_sent = true;
-            format!("{}{}", message, CLAUDE_CODE_VALIDATION_ADDENDUM)
+            format!("{}{}", message, CLAUDE_CODE_BOOTSTRAP_ADDENDUM)
         } else {
             message.to_string()
         };
@@ -841,6 +877,49 @@ mod tests {
                 );
             }
             other => panic!("expected ExternalAgent error, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn intendant_mcp_url_is_scoped_with_core_profile_and_token() {
+        // Claude Code gets the same bootstrap treatment as managed Codex,
+        // minus the managed_context mode (server defaults to vanilla).
+        let mut agent =
+            ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], Some(8765));
+        agent.mcp_session_id = Some("session with spaces".to_string());
+        agent.mcp_auth_token = Some("token&symbols".to_string());
+
+        assert_eq!(
+            agent.intendant_mcp_url(8765),
+            "http://localhost:8765/mcp?session_id=session%20with%20spaces&tool_profile=core&mcp_token=token%26symbols"
+        );
+    }
+
+    #[test]
+    fn intendant_mcp_url_without_scope_still_carries_core_profile() {
+        let agent = ClaudeCodeAgent::new("claude".into(), None, "default".into(), vec![], None);
+        assert_eq!(
+            agent.intendant_mcp_url(9000),
+            "http://localhost:9000/mcp?tool_profile=core"
+        );
+    }
+
+    #[test]
+    fn bootstrap_addendum_names_ctl_and_bootstrap_tools() {
+        // The addendum is Claude Code's capability-discovery entry point;
+        // keep the load-bearing pointers present.
+        for needle in [
+            "\"$INTENDANT\" ctl --help",
+            "read_screen",
+            "take_screenshot",
+            "execute_cu_actions",
+            "show_shared_view",
+            "validate-dashboard.cjs",
+        ] {
+            assert!(
+                CLAUDE_CODE_BOOTSTRAP_ADDENDUM.contains(needle),
+                "bootstrap addendum lost its pointer to {needle}"
+            );
         }
     }
 }

@@ -23,6 +23,9 @@ pub struct SessionSupervisorConfig {
     pub shared_codex_config: control_plane::SharedCodexConfig,
     pub shared_gemini_config: control_plane::SharedGeminiConfig,
     pub frame_registry: Arc<tokio::sync::RwLock<frames::FrameRegistry>>,
+    /// Live display sessions, when the daemon runs a display pipeline. CU
+    /// screenshots prefer their in-memory frames over subprocess capture.
+    pub session_registry: Option<display::SharedSessionRegistry>,
     pub web_port: Option<u16>,
     pub flags_direct: bool,
     pub shared_session: Option<web_gateway::SharedActiveSession>,
@@ -1569,6 +1572,7 @@ impl SessionSupervisor {
                         None,
                         approval_registry,
                         context_injection,
+                        supervisor.config.session_registry.clone(),
                         true,
                         attachments,
                     )
@@ -1657,6 +1661,7 @@ impl SessionSupervisor {
         let log_dir = log_dir.to_path_buf();
         let bus = self.config.bus.clone();
         let cu_config = project.config.computer_use.clone();
+        let session_registry = self.config.session_registry.clone();
         tokio::spawn(async move {
             bus.send(AppEvent::PresenceLog {
                 message: format!("Starting CU task: {}", task),
@@ -1674,6 +1679,7 @@ impl SessionSupervisor {
                 &bus,
                 &cu_config,
                 cu_target,
+                session_registry.as_ref(),
             )
             .await;
 
@@ -4475,6 +4481,7 @@ mod tests {
             bus,
             project_root,
             autonomy: crate::autonomy::shared_autonomy(crate::autonomy::AutonomyState::default()),
+            session_registry: None,
             shared_external_agent: Arc::new(tokio::sync::RwLock::new(None)),
             shared_codex_config: Arc::new(tokio::sync::RwLock::new(
                 control_plane::CodexRuntimeConfig {

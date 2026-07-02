@@ -5,8 +5,6 @@ use std::path::Path;
 const DEFAULT_LIVE_AUDIO_PROMPT: &str = include_str!("../../../SysPromptLiveAudio.md");
 const DEFAULT_PROMPT: &str = include_str!("../../../SysPrompt.md");
 const DEFAULT_PROMPT_TOOLS: &str = include_str!("../../../SysPrompt_tools.md");
-#[allow(dead_code)]
-const DEFAULT_USER_PROMPT: &str = include_str!("../../../SysPrompt_user.md");
 const DEFAULT_ORCHESTRATOR_PROMPT: &str = include_str!("../../../SysPrompt_orchestrator.md");
 const DEFAULT_RESEARCH_PROMPT: &str = include_str!("../../../SysPrompt_research.md");
 const DEFAULT_IMPLEMENTATION_PROMPT: &str = include_str!("../../../SysPrompt_implementation.md");
@@ -102,12 +100,13 @@ fn substitute_platform(prompt: &str) -> String {
         (
             "macOS",
             "You run as an unprivileged user. \
-             Screenshots use `screencapture`, input automation uses `cliclick`, \
-             and `osascript` is available for AppleScript. \
              There is no X11 — do NOT use xdotool, xrandr, or import. \
-             IMPORTANT: On Retina displays, `screencapture` produces images at 2x resolution \
-             but `cliclick` uses logical (1x) coordinates. Divide screenshot pixel coordinates \
-             by 2 before passing to `cliclick`.",
+             Do NOT drive the GUI with `cliclick` or `osascript` — use your native \
+             click/type/screenshot actions (or Intendant's take_screenshot / \
+             execute_cu_actions tools), which inject events in-process and take \
+             logical (1x) coordinates matching their own screenshots. \
+             If you capture raw images with `screencapture` yourself, remember \
+             Retina output is 2x the logical coordinate space.",
         )
     } else if cfg!(target_os = "windows") {
         (
@@ -214,7 +213,6 @@ mod tests {
     fn compiled_defaults_are_non_empty() {
         assert!(!DEFAULT_PROMPT.is_empty());
         assert!(!DEFAULT_PROMPT_TOOLS.is_empty());
-        assert!(!DEFAULT_USER_PROMPT.is_empty());
         assert!(!DEFAULT_ORCHESTRATOR_PROMPT.is_empty());
         assert!(!DEFAULT_RESEARCH_PROMPT.is_empty());
         assert!(!DEFAULT_IMPLEMENTATION_PROMPT.is_empty());

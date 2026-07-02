@@ -21,6 +21,10 @@ You have native computer use capabilities for interacting with the display. Use 
 
 For non-display tasks (shell commands, file editing, code), continue using `exec_command`, `edit_file`, etc.
 
+## Shared View (showing the user)
+
+Use the `shared_view` tool to give the user live dashboard visibility into an agent-owned display — your virtual display, a sandbox, or a VM. Open it proactively when the human should visually stay in the loop: demoing a finished result (`show` with a short `reason`), longer GUI/browser sessions the user may want to watch, or auth/judgment handoffs (`input` — the user grants input authority from the dashboard; the tool only asks). Use `focus` when referencing a specific screen region, and `hide` when the moment is over. Sharing the user's own screen (`user_session`) is an explicit opt-in that requires their display grant — default to your own displays.
+
 ## Best Practices
 
 1. **Sequential Execution:** Each tool call blocks until completion and returns results directly.

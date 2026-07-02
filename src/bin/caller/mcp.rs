@@ -1405,20 +1405,22 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "request_shared_view_input"
                     | "capture_shared_view_frame"
                     | "hide_shared_view"
+                    // Minimal display/CU surface for every supervised backend
+                    // (managed or vanilla): screenshots and input actions are
+                    // the highest-frequency capabilities and return images,
+                    // which only travel well as MCP content blocks. The broad
+                    // control surface stays behind `intendant ctl`.
+                    | "list_displays"
+                    | "grant_user_display"
+                    | "revoke_user_display"
+                    | "take_screenshot"
+                    | "read_screen"
+                    | "execute_cu_actions"
             ) || (managed_context
                 // Keep managed rewind + fission tools reachable from Codex's
                 // small MCP profile; descriptions and status decide when
                 // normal turns should use them.
-                && (managed_context_tool(name)
-                    || fission_tool(name)
-                    || matches!(
-                        name,
-                        "list_displays"
-                            | "grant_user_display"
-                            | "revoke_user_display"
-                            | "take_screenshot"
-                            | "execute_cu_actions"
-                    )))
+                && (managed_context_tool(name) || fission_tool(name)))
         }
         "screen" | "display" => {
             matches!(
@@ -1434,6 +1436,7 @@ fn tool_allowed_for_profile(name: &str, managed_context: bool, profile: Option<&
                     | "grant_user_display"
                     | "revoke_user_display"
                     | "take_screenshot"
+                    | "read_screen"
                     | "execute_cu_actions"
                     | "list_frames"
                     | "read_frame"
@@ -1541,7 +1544,7 @@ fn append_manual_http_tool_definitions(
         "show_shared_view",
         manual_http_tool_definition!(
             "show_shared_view",
-            "Open the dashboard shared display view for agent-human collaboration.",
+            "Open the dashboard shared display view: give the user live visibility into an agent-owned display (sandbox, VM, virtual display) to demo results or let them follow GUI work. Sharing the user's own screen (user_session) is an explicit opt-in path, not a default.",
             ShowSharedViewParams
         ),
     );
@@ -1565,7 +1568,7 @@ fn append_manual_http_tool_definitions(
         "request_shared_view_input",
         manual_http_tool_definition!(
             "request_shared_view_input",
-            "Ask the user for input authority or human interaction on a shared display target.",
+            "Ask the user for input authority or human interaction on a shared display target. Input authority is only ever granted by the user clicking the dashboard control — this tool asks, it never grants.",
             RequestSharedViewInputParams
         ),
     );
@@ -1607,6 +1610,14 @@ fn append_manual_http_tool_definitions(
             "take_screenshot",
             "Take a screenshot of a display. Returns an MCP image content block.",
             TakeScreenshotParams
+        ),
+    );
+    push(
+        "read_screen",
+        manual_http_tool_definition!(
+            "read_screen",
+            "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. Currently macOS user-session only.",
+            ReadScreenParams
         ),
     );
     push(
@@ -7032,6 +7043,17 @@ pub struct TakeScreenshotParams {
 }
 
 #[derive(Debug, Deserialize, schemars::JsonSchema)]
+pub struct ReadScreenParams {
+    /// Display target: "user_session" (the only target supported on macOS).
+    /// Defaults to the user session display.
+    #[serde(default)]
+    pub display_target: Option<String>,
+    /// "text" (default) for the compact indented tree, or "json".
+    #[serde(default)]
+    pub format: Option<String>,
+}
+
+#[derive(Debug, Deserialize, schemars::JsonSchema)]
 pub struct CreateBrowserWorkspaceParams {
     /// URL to open in the browser workspace. Omit for about:blank.
     #[serde(default)]
@@ -7817,6 +7839,10 @@ impl IntendantServer {
                     .await
                     .map_err(|e| e.to_string())
             }
+            "read_screen" => {
+                let params = parse_params::<ReadScreenParams>(args)?;
+                self.read_screen(params).await.map_err(|e| e.to_string())
+            }
             "execute_cu_actions" => {
                 let params = parse_params::<ExecuteCuActionsParams>(args)?;
                 self.execute_cu_actions_with_output(params, managed_context_override == Some(true))
@@ -8004,10 +8030,21 @@ fn clamp_shared_view_unit(value: f64) -> f64 {
 }
 
 fn normalize_shared_view_region(region: SharedViewRegionParams) -> crate::types::SharedViewRegion {
-    let x = clamp_shared_view_unit(region.x);
-    let y = clamp_shared_view_unit(region.y);
-    let width = clamp_shared_view_unit(region.width).min(1.0 - x);
-    let height = clamp_shared_view_unit(region.height).min(1.0 - y);
+    normalize_shared_view_region_xywh(region.x, region.y, region.width, region.height)
+}
+
+/// Clamp a raw x/y/width/height quadruple into a valid normalized region.
+/// Shared with the native `shared_view` tool handler.
+pub(crate) fn normalize_shared_view_region_xywh(
+    x: f64,
+    y: f64,
+    width: f64,
+    height: f64,
+) -> crate::types::SharedViewRegion {
+    let x = clamp_shared_view_unit(x);
+    let y = clamp_shared_view_unit(y);
+    let width = clamp_shared_view_unit(width).min(1.0 - x);
+    let height = clamp_shared_view_unit(height).min(1.0 - y);
     crate::types::SharedViewRegion {
         x,
         y,
@@ -8098,7 +8135,7 @@ impl UserSessionDisplayActivationRequest {
     }
 }
 
-fn shared_view_display_target(
+pub(crate) fn shared_view_display_target(
     display_target: Option<String>,
     display_id: Option<u32>,
 ) -> Option<String> {
@@ -8108,7 +8145,10 @@ fn shared_view_display_target(
         .or_else(|| display_id.map(|id| format!(":{}", id)))
 }
 
-fn shared_view_display_id(display_target: Option<&str>, display_id: Option<u32>) -> Option<u32> {
+pub(crate) fn shared_view_display_id(
+    display_target: Option<&str>,
+    display_id: Option<u32>,
+) -> Option<u32> {
     if display_id.is_some() {
         return display_id;
     }
@@ -8124,7 +8164,10 @@ fn shared_view_display_id(display_target: Option<&str>, display_id: Option<u32>)
         .ok()
 }
 
-fn shared_view_target_label(display_id: Option<u32>, display_target: Option<&str>) -> String {
+pub(crate) fn shared_view_target_label(
+    display_id: Option<u32>,
+    display_target: Option<&str>,
+) -> String {
     if let Some(id) = display_id {
         return if id == 0 {
             "primary display".to_string()
@@ -10274,7 +10317,7 @@ impl IntendantServer {
     }
 
     #[tool(
-        description = "Open the dashboard shared display view for agent-human collaboration. For user_session / primary-display targets, this also requests display-stream activation. This does not grant input authority; it asks connected dashboards to show the relevant display and optional focus region."
+        description = "Open the dashboard shared display view: give the user live visibility into an agent-owned display (sandbox, VM, virtual display) to demo results or let them follow GUI work as it happens. Requests display-stream activation so connected dashboards show the display and optional focus region. Sharing the user's own screen (user_session) is an explicit opt-in path, not a default. This does not grant input authority — that is only ever granted by the user from the dashboard."
     )]
     async fn show_shared_view(
         &self,
@@ -10484,6 +10527,33 @@ impl IntendantServer {
         }
 
         Ok(text_tool_error("No screenshot result"))
+    }
+
+    #[tool(
+        description = "Read the frontmost application's UI element tree (roles, labels, values, and logical-point frames) from the platform accessibility API. Cheap textual grounding for computer use: click the center of a reported frame. Fall back to take_screenshot for visual verification or apps with poor accessibility support. Currently macOS user-session only."
+    )]
+    async fn read_screen(
+        &self,
+        Parameters(params): Parameters<ReadScreenParams>,
+    ) -> Result<CallToolResult, McpError> {
+        // Element trees only exist for the real session; default there rather
+        // than to a virtual display like the pixel tools do.
+        let target = match params.display_target.as_deref() {
+            None => crate::computer_use::DisplayTarget::UserSession,
+            some => resolve_display_target(some),
+        };
+        match crate::computer_use::read_screen_elements(target).await {
+            Ok(snapshot) => {
+                let body = if params.format.as_deref() == Some("json") {
+                    serde_json::to_string_pretty(&snapshot)
+                        .unwrap_or_else(|e| format!("serialize error: {e}"))
+                } else {
+                    crate::computer_use::format_screen_elements(&snapshot)
+                };
+                Ok(text_tool_result(body))
+            }
+            Err(e) => Ok(text_tool_error(format!("read_screen error: {e}"))),
+        }
     }
 
     #[tool(
@@ -11062,7 +11132,11 @@ fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32,
     let dn_x = |x: &mut i32| *x = (*x as f64 * screen_w as f64 / 1000.0) as i32;
     let dn_y = |y: &mut i32| *y = (*y as f64 * screen_h as f64 / 1000.0) as i32;
     match action {
-        CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => {
+        CuAction::Click { x, y, .. }
+        | CuAction::DoubleClick { x, y, .. }
+        | CuAction::TripleClick { x, y, .. }
+        | CuAction::MouseDown { x, y, .. }
+        | CuAction::MouseUp { x, y, .. } => {
             dn_x(x);
             dn_y(y);
         }
@@ -11085,7 +11159,24 @@ fn denormalize_action(action: &mut crate::computer_use::CuAction, screen_w: u32,
             dn_x(end_x);
             dn_y(end_y);
         }
-        _ => {} // Type, Key, Screenshot, Wait — no coordinates
+        CuAction::Zoom {
+            x,
+            y,
+            width,
+            height,
+        } => {
+            dn_x(x);
+            dn_y(y);
+            *width = (*width as f64 * screen_w as f64 / 1000.0) as u32;
+            *height = (*height as f64 * screen_h as f64 / 1000.0) as u32;
+        }
+        // Type, Paste, Key, HoldKey, Screenshot, Wait — no coordinates.
+        CuAction::Type { .. }
+        | CuAction::Paste { .. }
+        | CuAction::Key { .. }
+        | CuAction::HoldKey { .. }
+        | CuAction::Screenshot
+        | CuAction::Wait { .. } => {}
     }
 }
 
@@ -11117,6 +11208,22 @@ fn format_cu_action_brief(action: &crate::computer_use::CuAction) -> String {
         } => {
             format!("(drag {},{}->{},{})", start_x, start_y, end_x, end_y)
         }
+        CuAction::TripleClick { x, y, button } => {
+            format!("(tripleclick {},{} {:?})", x, y, button)
+        }
+        CuAction::MouseDown { x, y, button } => format!("(mousedown {},{} {:?})", x, y, button),
+        CuAction::MouseUp { x, y, button } => format!("(mouseup {},{} {:?})", x, y, button),
+        CuAction::Paste { text } => {
+            let preview = if text.len() > 30 { &text[..30] } else { text };
+            format!("(paste \"{}\")", preview)
+        }
+        CuAction::HoldKey { key, ms } => format!("(holdkey {} {}ms)", key, ms),
+        CuAction::Zoom {
+            x,
+            y,
+            width,
+            height,
+        } => format!("(zoom {},{} {}x{})", x, y, width, height),
         CuAction::Screenshot => "(screenshot)".to_string(),
         CuAction::Wait { ms } => format!("(wait {}ms)", ms),
     }
@@ -11142,7 +11249,10 @@ fn annotate_screenshot_with_clicks(
     let clicks: Vec<(i32, i32)> = actions
         .iter()
         .filter_map(|a| match a {
-            CuAction::Click { x, y, .. } | CuAction::DoubleClick { x, y, .. } => Some((*x, *y)),
+            CuAction::Click { x, y, .. }
+            | CuAction::DoubleClick { x, y, .. }
+            | CuAction::TripleClick { x, y, .. }
+            | CuAction::MouseDown { x, y, .. } => Some((*x, *y)),
             _ => None,
         })
         .collect();
@@ -12437,10 +12547,18 @@ mod tests {
             assert!(vanilla_names.contains(&"request_shared_view_input"));
             assert!(vanilla_names.contains(&"capture_shared_view_frame"));
             assert!(vanilla_names.contains(&"hide_shared_view"));
-            assert!(!vanilla_names.contains(&"grant_user_display"));
-            assert!(!vanilla_names.contains(&"revoke_user_display"));
-            assert!(!vanilla_names.contains(&"execute_cu_actions"));
+            // The minimal display/CU surface is part of the bootstrap set for
+            // vanilla sessions too — every supervised backend gets screenshots
+            // and input actions over MCP; only managed rewind/fission tools
+            // stay behind managed context.
+            assert!(vanilla_names.contains(&"list_displays"));
+            assert!(vanilla_names.contains(&"grant_user_display"));
+            assert!(vanilla_names.contains(&"revoke_user_display"));
+            assert!(vanilla_names.contains(&"take_screenshot"));
+            assert!(vanilla_names.contains(&"read_screen"));
+            assert!(vanilla_names.contains(&"execute_cu_actions"));
             assert!(!vanilla_names.contains(&"spawn_live_audio"));
+            assert!(!vanilla_names.contains(&"list_frames"));
             assert!(!vanilla_names.contains(&"list_rewind_anchors"));
             assert!(!vanilla_names.contains(&"rewind_context"));
             assert!(!vanilla_names.contains(&"fission_spawn"));
@@ -12467,6 +12585,7 @@ mod tests {
             assert!(managed_names.contains(&"grant_user_display"));
             assert!(managed_names.contains(&"revoke_user_display"));
             assert!(managed_names.contains(&"take_screenshot"));
+            assert!(managed_names.contains(&"read_screen"));
             assert!(managed_names.contains(&"execute_cu_actions"));
             assert!(!managed_names.contains(&"spawn_live_audio"));
 

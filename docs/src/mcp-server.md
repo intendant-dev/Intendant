@@ -59,12 +59,17 @@ Add Intendant to your MCP client config (Claude Code
 The full MCP tool surface (dispatched in `call_tool_by_name`) is broad. For
 model clients that front-load tool schemas into every request, prefer the
 HTTP transport's `tool_profile=core` query parameter and the `intendant ctl`
-CLI for lazy discovery. `tool_profile=core` advertises only status, shared-view
-collaboration, and, when managed context is enabled, managed-context
-rewind/backout plus the minimal real-display/CU tools (`list_displays`,
-`grant_user_display`, `revoke_user_display`, `take_screenshot`,
-`execute_cu_actions`); omitting `tool_profile` keeps the historical full tool
-list.
+CLI for lazy discovery. `tool_profile=core` advertises the bootstrap set:
+status, shared-view collaboration, and the minimal real-display/CU tools
+(`list_displays`, `grant_user_display`, `revoke_user_display`, `read_screen`,
+`take_screenshot`, `execute_cu_actions`) — managed and vanilla alike; managed
+context additionally advertises the managed-context rewind/backout and fission
+tools. Omitting `tool_profile` keeps the historical full tool list. Filtering
+applies to `tools/list` only — hidden tools remain callable (that is the lazy
+`ctl tools call` path). Note that `/mcp` authorization is the loopback
+`mcp_token` / transport security, **not** the local IAM principal system that
+gates the dashboard and federation surfaces — a known gap to close as IAM
+coverage expands.
 With the patched managed Codex binary, `rewind_backout mode="fork"` creates a
 new Codex thread while inheriting the lineage prompt-cache key from the saved
 rollout; same-thread `restore` remains available when the current thread should
@@ -117,6 +122,7 @@ Full MCP tool groups:
 | `grant_user_display` | Grant access to the user's real display session; on Wayland, enable **Allow Remote Interaction** in the GNOME portal before clicking **Share** so CU input works. | `display_id?` |
 | `revoke_user_display` | Revoke access to the user's real display session. | `display_id?`, `note?` |
 | `take_screenshot`    | Capture a screenshot (returns image content). | display params |
+| `read_screen`        | Frontmost app's accessibility element tree — cheap textual grounding (macOS user session). | `display_target?`, `format?` |
 | `execute_cu_actions` | Run a batch of [computer-use](./computer-use-and-audio.md) actions. | CU action params |
 | `list_frames`        | List captured video frames. | filter params |
 | `read_frame`         | Read a specific frame. | `frame_id` |

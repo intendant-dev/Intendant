@@ -924,9 +924,7 @@ fn normalize_user_client_kind(request: &UserClientGrantUpsertRequest) -> AccessR
         "browser_certificate" | "browser_mtls_cert" | "browser-mtls-cert" => {
             Ok("browser_certificate".to_string())
         }
-        "client_key" | "client-key" | "browser_key" | "browser-key" => {
-            Ok("client_key".to_string())
-        }
+        "client_key" | "client-key" | "browser_key" | "browser-key" => Ok("client_key".to_string()),
         "connect_account" | "connect-account" | "passkey_account" | "passkey-account" => {
             Ok("connect_account".to_string())
         }
@@ -1642,8 +1640,7 @@ pub fn evaluate_principal_operation_with_state(
     // for the binding that authenticated it. The grant stays intact; only
     // this session's authority is bounded.
     if let Some(ceiling_role_id) = role_ceiling_for_session(state, principal) {
-        let Some(ceiling_role) = state.roles.iter().find(|role| role.id == ceiling_role_id)
-        else {
+        let Some(ceiling_role) = state.roles.iter().find(|role| role.id == ceiling_role_id) else {
             return AccessDecision::denied(
                 principal,
                 op,
@@ -2100,7 +2097,12 @@ pub fn principal_for_connect_account_any_status(
     })
 }
 
-fn matched_authn_origin(principal: &IamPrincipal, authn_kind: &str, key: &str, value: &str) -> Option<String> {
+fn matched_authn_origin(
+    principal: &IamPrincipal,
+    authn_kind: &str,
+    key: &str,
+    value: &str,
+) -> Option<String> {
     principal
         .authn
         .iter()
@@ -2536,7 +2538,10 @@ mod tests {
 
         // Anchor-origin keys are anchor-grade: no ceiling.
         let anchor = principal_for_client_key(&state, "anchor-key", "connect").unwrap();
-        assert_eq!(anchor.authn_origin.as_deref(), Some("https://anchor.local:8765"));
+        assert_eq!(
+            anchor.authn_origin.as_deref(),
+            Some("https://anchor.local:8765")
+        );
         assert!(
             evaluate_principal_operation_with_state(
                 &state,
@@ -2594,8 +2599,7 @@ mod tests {
         assert_eq!(authn["public_key"], "BPubKeyRaw");
 
         let principal =
-            principal_for_client_key(&state, "Fp_Base64-Url", "connect-dashboard-control")
-                .unwrap();
+            principal_for_client_key(&state, "Fp_Base64-Url", "connect-dashboard-control").unwrap();
         assert_eq!(principal.id, result.principal.id);
         assert!(
             evaluate_principal_operation_with_state(

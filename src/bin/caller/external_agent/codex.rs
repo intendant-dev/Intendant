@@ -56,7 +56,7 @@ Intendant, not Codex automatic compaction, owns long-task context density. This 
 
 Keep the live transcript informationally dense:
 - Prefer targeted reads and searches over dumping large files, logs, or generated artifacts.
-- For GUI inspection in Intendant-managed sessions, use Intendant MCP `take_screenshot` and `execute_cu_actions` directly. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, accessibility queries, or app binary inspection for GUI interaction.
+- For GUI inspection in Intendant-managed sessions, use Intendant MCP tools directly: `read_screen` first for the frontmost app's UI element tree (roles, labels, values, frames — a few hundred tokens; click the center of a reported frame), `take_screenshot` when pixels are needed for visual verification or the element tree is sparse, and `execute_cu_actions` for input. Do not enumerate desktop apps or read bulky browser/computer-use plugin manuals when those direct tools are available; use Browser/Chrome/plugin CU only when their specialized capabilities are actually required. Do not use shell-driven GUI fallbacks such as `open`, `cliclick`, `osascript`, ad-hoc accessibility queries, or app binary inspection for GUI interaction.
 - Do not use broad argv-pattern process cleanup such as `pkill -f intendant` or `pkill -f <script-name>`. Managed controller argv can contain the task prompt, and prompts often include command examples, so `pkill -f` can match and kill the controller supervising you. Prefer helper-owned cleanup, tracked child PIDs, process groups created by the command you launched, temporary workspace/profile directories, or exact PIDs you verified with `ps`.
 - Browser/GUI validation retry discipline: run one primary validation attempt. If it fails or times out, run at most one compact diagnostic retry. Then either make a targeted code fix from those facts, or report a clear partial-validation conclusion with the failure reason and relevant logs/diagnostics. Do not cycle through multiple automation stacks unless the user explicitly asks for deeper manual investigation or the validation tool itself is the suspected broken component.
 - After a successful build, run dev servers through already-built binaries or quiet commands when possible. Avoid re-running build commands that stream known warnings only to launch a server; if a noisy command is unavoidable, preserve only the durable result and compact immediately.
@@ -1727,37 +1727,12 @@ impl CodexAgent {
     }
 
     fn intendant_mcp_url(&self, port: u16) -> String {
-        let base_url = Self::intendant_mcp_base_url(port);
-        let mode = if self.managed_context {
-            "managed"
-        } else {
-            "vanilla"
-        };
-        let mut params: Vec<(&str, String)> = Vec::new();
-        if let Some(session_id) = self
-            .mcp_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            params.push(("session_id", encode_mcp_query_value(session_id)));
-        }
-        params.push(("managed_context", mode.to_string()));
-        params.push(("tool_profile", "core".to_string()));
-        if let Some(token) = self
-            .mcp_auth_token
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            params.push(("mcp_token", encode_mcp_query_value(token)));
-        }
-        let query = params
-            .into_iter()
-            .map(|(key, value)| format!("{key}={value}"))
-            .collect::<Vec<_>>()
-            .join("&");
-        format!("{base_url}?{query}")
+        super::intendant_bootstrap_mcp_url(
+            port,
+            self.mcp_session_id.as_deref(),
+            Some(self.intendant_managed_context_mode()),
+            self.mcp_auth_token.as_deref(),
+        )
     }
 
     fn intendant_mcp_base_url(port: u16) -> String {
@@ -1773,22 +1748,15 @@ impl CodexAgent {
     }
 
     fn add_intendant_ctl_env(&self, command: &mut tokio::process::Command, port: u16) {
-        command.env("INTENDANT_MCP_URL", self.intendant_mcp_url(port));
+        super::add_intendant_bootstrap_env(
+            command,
+            &self.intendant_mcp_url(port),
+            self.mcp_session_id.as_deref(),
+        );
         command.env(
             "INTENDANT_MANAGED_CONTEXT",
             self.intendant_managed_context_mode(),
         );
-        if let Some(session_id) = self
-            .mcp_session_id
-            .as_deref()
-            .map(str::trim)
-            .filter(|s| !s.is_empty())
-        {
-            command.env("INTENDANT_SESSION_ID", session_id);
-        }
-        if let Ok(current_exe) = std::env::current_exe() {
-            command.env("INTENDANT", current_exe);
-        }
     }
 
     fn apply_codex_home_env(command: &mut tokio::process::Command, codex_home: Option<&Path>) {
@@ -11381,6 +11349,7 @@ error: build failed
         assert!(developer_instructions.contains("Existing developer policy."));
         assert!(developer_instructions.contains("managed_context=managed"));
         assert!(developer_instructions.contains("Keep the live transcript informationally dense"));
+        assert!(developer_instructions.contains("read_screen"));
         assert!(developer_instructions.contains("take_screenshot"));
         assert!(developer_instructions.contains("execute_cu_actions"));
         assert!(developer_instructions.contains("pkill -f intendant"));

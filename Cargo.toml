@@ -138,6 +138,7 @@ screencapturekit = "1.5"
 core-graphics = { version = "0.25", features = ["highsierra"] }
 core-foundation = "0.10"
 shiguredo_video_toolbox = "2026.1"
+accessibility-sys = "0.2"
 
 # Native dep that has no Windows backend yet (Tier-0 Windows port defers the
 # VP8/libvpx encoder). Gated to non-Windows so the MSVC target doesn't try to

@@ -576,9 +576,7 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 .one("--actions")
                 .ok_or_else(|| "cu actions requires --actions JSON".to_string())
                 .and_then(read_json_value)?;
-            if !actions.is_array() {
-                return Err("--actions must be a JSON array".to_string());
-            }
+            validate_cu_actions(&actions)?;
             let mut map = Map::new();
             map.insert("actions".to_string(), actions);
             insert_string(&mut map, "display_target", args.one("--target"));
@@ -592,6 +590,14 @@ async fn run_cu(client: &reqwest::Client, config: &Config, raw: &[String]) -> Re
                 .chain(raw[1..].iter().cloned())
                 .collect::<Vec<_>>();
             run_display(client, config, &next).await?;
+        }
+        "elements" | "read-screen" => {
+            let args = parse_command_args(&raw[1..], &["--target", "--format"], &[])?;
+            let mut map = Map::new();
+            insert_string(&mut map, "display_target", args.one("--target"));
+            insert_string(&mut map, "format", args.one("--format"));
+            let response = call_tool(client, config, "read_screen", Value::Object(map)).await?;
+            print_tool_response(response, config, None)?;
         }
         other => return Err(format!("unknown cu command '{other}'")),
     }
@@ -1368,6 +1374,29 @@ fn print_json(value: &Value) -> Result<(), String> {
     Ok(())
 }
 
+/// Validate a cu-actions JSON array against the real `CuAction` type before
+/// sending, so shape mistakes fail fast with the expected shapes echoed back
+/// instead of surfacing as an opaque server-side deserialization error.
+/// Uses the same type the server deserializes into — no schema duplication.
+fn validate_cu_actions(actions: &Value) -> Result<(), String> {
+    let items = actions
+        .as_array()
+        .ok_or_else(|| format!("--actions must be a JSON array\n\n{CU_ACTION_SHAPES}"))?;
+    if items.is_empty() {
+        return Err("--actions array is empty; provide at least one action".to_string());
+    }
+    for (i, item) in items.iter().enumerate() {
+        if let Err(e) = serde_json::from_value::<crate::computer_use::CuAction>(item.clone()) {
+            return Err(format!(
+                "actions[{i}] is not a valid CU action: {e}\n\n{CU_ACTION_SHAPES}\n\n\
+                 For the raw JSON schema: intendant ctl tools schema execute_cu_actions\n\
+                 To bypass client validation: intendant ctl tools call execute_cu_actions --args JSON"
+            ));
+        }
+    }
+    Ok(())
+}
+
 fn tool_arguments_from_flags(args: &CommandArgs) -> Result<Value, String> {
     let mut map = match args.one("--args") {
         Some(value) => match read_json_value(value)? {
@@ -1650,18 +1679,55 @@ CDP uses a managed Chromium/Chrome-for-Testing executable by default. Use --prov
     );
 }
 
+/// Canonical shape reference for the cu-actions JSON — shown by
+/// `cu actions --help` and echoed on validation errors. Kept in sync with
+/// `crate::computer_use::CuAction` by the round-trip test on
+/// [`CU_ACTIONS_EXAMPLE`].
+const CU_ACTION_SHAPES: &str = r#"Actions are a JSON array of tagged objects (coordinates in pixels unless
+--coordinate-space normalized_1000 maps 0-1000 onto the display):
+  {"type":"click","x":N,"y":N}                    optional "button": left|right|middle
+  {"type":"double_click","x":N,"y":N}             optional "button"
+  {"type":"triple_click","x":N,"y":N}             optional "button"
+  {"type":"mouse_down","x":N,"y":N}               press without releasing; optional "button"
+  {"type":"mouse_up","x":N,"y":N}                 release; optional "button"
+  {"type":"type","text":"..."}                    trailing \n presses Enter
+  {"type":"paste","text":"..."}                   clipboard+paste; fast for long text
+  {"type":"key","key":"Return"}                   key or chord, e.g. "ctrl+shift+t"
+  {"type":"hold_key","key":"shift","ms":N}        hold a key/chord for N ms
+  {"type":"scroll","x":N,"y":N,"direction":"up|down|left|right"}  optional "amount" (default 3)
+  {"type":"move_mouse","x":N,"y":N}
+  {"type":"drag","start_x":N,"start_y":N,"end_x":N,"end_y":N}
+  {"type":"screenshot"}
+  {"type":"zoom","x":N,"y":N,"width":N,"height":N}  region capture at native (Retina) detail
+  {"type":"wait","ms":N}
+A screenshot of the final state is captured automatically after the last action (unless it was already a screenshot/zoom)."#;
+
+/// A working example covering common actions, shown in help and parsed by a
+/// unit test to guarantee the documented shapes match `CuAction`.
+const CU_ACTIONS_EXAMPLE: &str = r#"[{"type":"click","x":120,"y":260},{"type":"type","text":"hello"},{"type":"key","key":"Return"}]"#;
+
 fn help_cu() {
     println!(
         "Usage:\n\
   intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
-  intendant ctl cu screenshot [--target TARGET] [--output out.png]"
+  intendant ctl cu screenshot [--target TARGET] [--output out.png]\n\
+  intendant ctl cu elements [--target TARGET] [--format text|json]\n\
+\n\
+Run `intendant ctl cu actions --help` for the action JSON shapes.\n\
+`cu elements` reads the frontmost app's UI element tree (roles, labels, values, frames) — \n\
+cheap textual grounding: click the center of a reported frame. macOS user-session only for now.\n\
+Targets: user_session (needs display grant), 99/display_99 (virtual). Omit to auto-detect."
     );
 }
 
 fn help_cu_actions() {
     println!(
-        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000]\n\
-Actions are the same tagged objects accepted by execute_cu_actions: click, double_click, type, key, scroll, move_mouse, drag, screenshot, wait."
+        "Usage: intendant ctl cu actions --actions JSON|@file|- [--target TARGET] [--coordinate-space pixel|normalized_1000] [--output out.png]\n\
+\n\
+{CU_ACTION_SHAPES}\n\
+\n\
+Example:\n\
+  intendant ctl cu actions --actions '{CU_ACTIONS_EXAMPLE}' --output after.png"
     );
 }
 
@@ -1753,6 +1819,84 @@ mod tests {
 
     fn args(values: &[&str]) -> Vec<String> {
         values.iter().map(|value| value.to_string()).collect()
+    }
+
+    #[test]
+    fn cu_actions_example_matches_cu_action_type() {
+        // Guards the documented example (and by extension CU_ACTION_SHAPES)
+        // against drifting from the real CuAction enum.
+        let value: Value = serde_json::from_str(CU_ACTIONS_EXAMPLE).expect("example parses");
+        validate_cu_actions(&value).expect("example validates");
+    }
+
+    #[test]
+    fn cu_action_shapes_cover_every_variant() {
+        // One canonical instance per CuAction variant; adding a variant to the
+        // enum without updating CU_ACTION_SHAPES should trip a reviewer here.
+        let all = serde_json::json!([
+            {"type":"click","x":1,"y":2,"button":"middle"},
+            {"type":"double_click","x":1,"y":2},
+            {"type":"triple_click","x":1,"y":2},
+            {"type":"mouse_down","x":1,"y":2,"button":"left"},
+            {"type":"mouse_up","x":1,"y":2},
+            {"type":"type","text":"hello\n"},
+            {"type":"paste","text":"long text"},
+            {"type":"key","key":"ctrl+shift+t"},
+            {"type":"hold_key","key":"shift","ms":500},
+            {"type":"scroll","x":3,"y":4,"direction":"down","amount":2},
+            {"type":"move_mouse","x":5,"y":6},
+            {"type":"drag","start_x":1,"start_y":2,"end_x":3,"end_y":4},
+            {"type":"screenshot"},
+            {"type":"zoom","x":10,"y":20,"width":300,"height":200},
+            {"type":"wait","ms":100},
+        ]);
+        validate_cu_actions(&all).expect("all shapes validate");
+        let listed = |name: &str| {
+            assert!(
+                CU_ACTION_SHAPES.contains(&format!("\"type\":\"{name}\"")),
+                "CU_ACTION_SHAPES is missing the {name} action"
+            );
+        };
+        for name in [
+            "click",
+            "double_click",
+            "triple_click",
+            "mouse_down",
+            "mouse_up",
+            "type",
+            "paste",
+            "key",
+            "hold_key",
+            "scroll",
+            "move_mouse",
+            "drag",
+            "screenshot",
+            "zoom",
+            "wait",
+        ] {
+            listed(name);
+        }
+    }
+
+    #[test]
+    fn invalid_cu_action_error_names_index_and_echoes_shapes() {
+        let bad = serde_json::json!([
+            {"type":"click","x":1,"y":2},
+            {"type":"clik","x":1,"y":2},
+        ]);
+        let err = validate_cu_actions(&bad).expect_err("bad action rejected");
+        assert!(err.contains("actions[1]"), "error names the index: {err}");
+        assert!(
+            err.contains("\"type\":\"click\""),
+            "error echoes the shapes: {err}"
+        );
+    }
+
+    #[test]
+    fn non_array_and_empty_cu_actions_rejected() {
+        let obj = serde_json::json!({"type":"click","x":1,"y":2});
+        assert!(validate_cu_actions(&obj).is_err());
+        assert!(validate_cu_actions(&serde_json::json!([])).is_err());
     }
 
     #[test]
