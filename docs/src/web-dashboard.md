@@ -278,6 +278,17 @@ and density tuning.
 
 A browser of past and current sessions. Four subtabs:
 
+Listing is fast by construction: per-session summaries (tokens, costs,
+day buckets, disk sizes) are persisted under
+`~/.intendant/cache/session_index/` keyed by exact file fingerprints
+(length/mtime/ctime/dev/inode), so a daemon restart re-parses only
+sessions that actually changed instead of every log in every store. The
+daemon warms the list at startup, responses are served
+stale-while-revalidate (an expired cache answers instantly and refreshes
+in the background), and the Stats tab fetches a slim `view=usage`
+variant (~a tenth of the full-row payload) for its whole-corpus fold.
+The index directory is safe to delete; it rebuilds on the next scan.
+
 - **Recent** — recent sessions as calm three-line cards (title + status
   chip + source badge; task snippet; compact meta) — the long tail (ids,
   absolute dates, token breakdown, disk) lives in the meta tooltip and the

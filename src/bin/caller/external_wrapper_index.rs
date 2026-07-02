@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
@@ -8,6 +9,77 @@ const INDEX_FILE: &str = "external_wrapper_index.json";
 const INDEX_VERSION: u32 = 1;
 
 static INDEX_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+// Session-list scans consult this index once per external row; re-reading
+// and re-parsing the whole file each time made listing quadratic in the
+// session count. The parsed index is cached per path and revalidated by
+// file length + mtime, so cross-process writers are still picked up.
+// Lock order is always INDEX_LOCK -> INDEX_CACHE.
+static INDEX_CACHE: OnceLock<Mutex<HashMap<PathBuf, CachedWrapperIndex>>> = OnceLock::new();
+
+struct CachedWrapperIndex {
+    len: u64,
+    mtime_nanos: u128,
+    index: ExternalWrapperIndex,
+}
+
+fn index_file_fingerprint(path: &Path) -> (u64, u128) {
+    match fs::metadata(path) {
+        Ok(meta) => (
+            meta.len(),
+            meta.modified()
+                .ok()
+                .and_then(|mtime| mtime.duration_since(UNIX_EPOCH).ok())
+                .map(|d| d.as_nanos())
+                .unwrap_or(0),
+        ),
+        Err(_) => (0, 0),
+    }
+}
+
+fn index_cache() -> &'static Mutex<HashMap<PathBuf, CachedWrapperIndex>> {
+    INDEX_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Run `f` against the current index without cloning it. Callers must hold
+/// INDEX_LOCK.
+fn with_index_unlocked<R>(home: &Path, f: impl FnOnce(&ExternalWrapperIndex) -> R) -> R {
+    let path = index_path(home);
+    let (len, mtime_nanos) = index_file_fingerprint(&path);
+    let mut cache = index_cache().lock().unwrap_or_else(|e| e.into_inner());
+    let cached_valid = cache
+        .get(&path)
+        .is_some_and(|entry| entry.len == len && entry.mtime_nanos == mtime_nanos);
+    if !cached_valid {
+        let index = read_index_from_disk(&path);
+        cache.insert(
+            path.clone(),
+            CachedWrapperIndex {
+                len,
+                mtime_nanos,
+                index,
+            },
+        );
+    }
+    f(&cache
+        .get(&path)
+        .expect("wrapper index cache entry just ensured")
+        .index)
+}
+
+fn note_index_written(home: &Path, index: &ExternalWrapperIndex) {
+    let path = index_path(home);
+    let (len, mtime_nanos) = index_file_fingerprint(&path);
+    let mut cache = index_cache().lock().unwrap_or_else(|e| e.into_inner());
+    cache.insert(
+        path,
+        CachedWrapperIndex {
+            len,
+            mtime_nanos,
+            index: index.clone(),
+        },
+    );
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ExternalWrapperRecord {
@@ -103,17 +175,23 @@ pub fn upsert(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut index = read_index_unlocked(home);
+    let mut index = with_index_unlocked(home, |index| index.clone());
     let log_path = log_dir.to_string_lossy().to_string();
     let updated_at_secs =
         file_mtime_secs(&log_dir.join("session.jsonl")).max(file_mtime_secs(log_dir));
     let project_root = project_root.map(|path| path.to_string_lossy().to_string());
+
+    // Session-list scans upsert every external row on every pass; rewriting
+    // the whole index per unchanged row made listing quadratic. Track
+    // whether anything actually changed and skip the write when not.
+    let mut dirty = false;
 
     for record in index.wrappers.iter_mut().filter(|record| {
         record.source == source
             && record.backend_session_id == backend_session_id
             && record.intendant_session_id != stored_intendant_session_id
     }) {
+        dirty |= record.updated_at_secs != 0;
         record.updated_at_secs = 0;
     }
 
@@ -122,6 +200,7 @@ pub fn upsert(
             && record.intendant_session_id == stored_intendant_session_id
             && record.backend_session_id != backend_session_id
     }) {
+        dirty |= record.updated_at_secs != 0;
         record.updated_at_secs = 0;
     }
 
@@ -130,10 +209,14 @@ pub fn upsert(
             && record.backend_session_id == backend_session_id
             && record.intendant_session_id == stored_intendant_session_id
     }) {
+        dirty |= existing.log_path != log_path
+            || existing.project_root != project_root
+            || existing.updated_at_secs != updated_at_secs;
         existing.log_path = log_path;
         existing.project_root = project_root;
         existing.updated_at_secs = updated_at_secs;
     } else {
+        dirty = true;
         index.wrappers.push(ExternalWrapperRecord {
             source,
             backend_session_id: backend_session_id.to_string(),
@@ -144,7 +227,12 @@ pub fn upsert(
         });
     }
 
-    write_index_unlocked(home, &index)
+    if !dirty {
+        return Ok(());
+    }
+    write_index_unlocked(home, &index)?;
+    note_index_written(home, &index);
+    Ok(())
 }
 
 pub fn wrappers_for(
@@ -161,17 +249,19 @@ pub fn wrappers_for(
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut records: Vec<_> = read_index_unlocked(home)
-        .wrappers
-        .into_iter()
-        .filter_map(|record| {
-            (record.source == source
-                && record.backend_session_id == backend_session_id
-                && Path::new(&record.log_path).is_dir())
-            .then(|| normalize_log_identity(record))
-            .flatten()
-        })
-        .collect();
+    let mut records: Vec<_> = with_index_unlocked(home, |index| {
+        index
+            .wrappers
+            .iter()
+            .filter_map(|record| {
+                (record.source == source
+                    && record.backend_session_id == backend_session_id
+                    && Path::new(&record.log_path).is_dir())
+                .then(|| normalize_log_identity(record.clone()))
+                .flatten()
+            })
+            .collect()
+    });
     records.sort_by(|a, b| {
         b.updated_at_secs
             .cmp(&a.updated_at_secs)
@@ -189,15 +279,17 @@ pub fn wrappers_for_source(home: &Path, source: &str) -> Vec<ExternalWrapperReco
         .get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let mut records: Vec<_> = read_index_unlocked(home)
-        .wrappers
-        .into_iter()
-        .filter_map(|record| {
-            (record.source == source && Path::new(&record.log_path).is_dir())
-                .then(|| normalize_log_identity(record))
-                .flatten()
-        })
-        .collect();
+    let mut records: Vec<_> = with_index_unlocked(home, |index| {
+        index
+            .wrappers
+            .iter()
+            .filter_map(|record| {
+                (record.source == source && Path::new(&record.log_path).is_dir())
+                    .then(|| normalize_log_identity(record.clone()))
+                    .flatten()
+            })
+            .collect()
+    });
     records.sort_by(|a, b| {
         b.updated_at_secs
             .cmp(&a.updated_at_secs)
@@ -217,8 +309,7 @@ pub fn record_to_json(record: &ExternalWrapperRecord) -> serde_json::Value {
     })
 }
 
-fn read_index_unlocked(home: &Path) -> ExternalWrapperIndex {
-    let path = index_path(home);
+fn read_index_from_disk(path: &Path) -> ExternalWrapperIndex {
     let Ok(contents) = fs::read_to_string(path) else {
         return ExternalWrapperIndex::default();
     };

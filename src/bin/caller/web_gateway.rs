@@ -215,7 +215,7 @@ struct SessionListRowCacheEntry {
     row: serde_json::Value,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug, Default, Serialize, Deserialize)]
 struct SessionLineageMetadata {
     parent_id: Option<String>,
     relationship: Option<String>,
@@ -278,7 +278,7 @@ impl SessionLineageMetadata {
     }
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CodexSessionListSummary {
     id: String,
     created_at: Option<String>,
@@ -297,7 +297,7 @@ struct CodexSessionListSummary {
     bytes: u64,
 }
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 struct CodexUsageEvent {
     timestamp: Option<String>,
     usage: SessionUsage,
@@ -315,21 +315,45 @@ struct CodexParentUsageBaselineCacheEntry {
     usage: Option<SessionUsage>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionDirFingerprint {
     path: String,
     entries: Vec<SessionFileFingerprint>,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionFileFingerprint {
     rel: String,
-    len: u64,
+    // 128-bit timestamps ride as strings: serde_json's Number cannot hold
+    // them without the arbitrary_precision feature.
+    #[serde(with = "string_u128")]
     mtime_nanos: u128,
+    #[serde(with = "string_i128")]
     ctime_nanos: i128,
+    len: u64,
     dev: u64,
     ino: u64,
     is_dir: bool,
+}
+
+mod string_u128 {
+    pub fn serialize<S: serde::Serializer>(v: &u128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<u128, D::Error> {
+        let raw = <std::borrow::Cow<'_, str> as serde::Deserialize>::deserialize(d)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
+}
+
+mod string_i128 {
+    pub fn serialize<S: serde::Serializer>(v: &i128, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&v.to_string())
+    }
+    pub fn deserialize<'de, D: serde::Deserializer<'de>>(d: D) -> Result<i128, D::Error> {
+        let raw = <std::borrow::Cow<'_, str> as serde::Deserialize>::deserialize(d)?;
+        raw.parse().map_err(serde::de::Error::custom)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -6685,22 +6709,349 @@ fn session_list_cache_slot(key: &SessionListCacheKey) -> String {
     format!("{}\0{}\0{}", key.namespace, key.path, key.extra)
 }
 
+// ── Persistent session-list index ──
+// The per-session caches below already carry exact invalidation
+// (len/mtime/ctime/dev/ino fingerprints); persisting the entries makes
+// that validity survive daemon restarts, so a cold start re-parses only
+// sessions that actually changed instead of every log in every store
+// (~tens of seconds on a real corpus). One small JSON file per entry,
+// written atomically via tempfile+rename: daemons sharing a HOME can only
+// race toward equivalent content, never corrupt an entry. External
+// stores (~/.codex, ~/.claude, ~/.gemini) are never written — the index
+// mirrors them under ~/.intendant/cache/session_index/.
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSessionCacheKey {
+    namespace: String,
+    path: String,
+    len: u64,
+    #[serde(with = "string_u128")]
+    mtime_nanos: u128,
+    #[serde(with = "string_i128")]
+    ctime_nanos: i128,
+    dev: u64,
+    ino: u64,
+    extra: String,
+}
+
+impl PersistedSessionCacheKey {
+    fn of(key: &SessionListCacheKey) -> Self {
+        Self {
+            namespace: key.namespace.to_string(),
+            path: key.path.clone(),
+            len: key.len,
+            mtime_nanos: key.mtime_nanos,
+            ctime_nanos: key.ctime_nanos,
+            dev: key.dev,
+            ino: key.ino,
+            extra: key.extra.clone(),
+        }
+    }
+
+    fn matches(&self, key: &SessionListCacheKey) -> bool {
+        self.namespace == key.namespace
+            && self.path == key.path
+            && self.len == key.len
+            && self.mtime_nanos == key.mtime_nanos
+            && self.ctime_nanos == key.ctime_nanos
+            && self.dev == key.dev
+            && self.ino == key.ino
+            && self.extra == key.extra
+    }
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedSessionCacheEntry<T> {
+    key: PersistedSessionCacheKey,
+    value: T,
+}
+
+#[derive(Serialize, Deserialize)]
+struct PersistedIntendantSessionEntry {
+    fingerprint: SessionDirFingerprint,
+    row: serde_json::Value,
+}
+
+fn session_index_dir() -> PathBuf {
+    crate::platform::home_dir()
+        .join(".intendant")
+        .join("cache")
+        .join("session_index")
+}
+
+fn session_index_entry_path_in(base: &Path, namespace: &str, slot: &str) -> PathBuf {
+    let digest = ring::digest::digest(&ring::digest::SHA256, slot.as_bytes());
+    let mut name = String::with_capacity(digest.as_ref().len() * 2 + 5);
+    for byte in digest.as_ref() {
+        name.push_str(&format!("{byte:02x}"));
+    }
+    name.push_str(".json");
+    base.join(namespace).join(name)
+}
+
+fn session_index_entry_path(namespace: &str, slot: &str) -> PathBuf {
+    session_index_entry_path_in(&session_index_dir(), namespace, slot)
+}
+
+fn write_session_index_entry(path: &Path, body: &[u8]) {
+    static WRITE_SEQ: AtomicU64 = AtomicU64::new(0);
+    let Some(parent) = path.parent() else { return };
+    if std::fs::create_dir_all(parent).is_err() {
+        return;
+    }
+    let tmp = parent.join(format!(
+        ".tmp.{}.{}",
+        std::process::id(),
+        WRITE_SEQ.fetch_add(1, Ordering::Relaxed)
+    ));
+    if std::fs::write(&tmp, body).is_ok() && std::fs::rename(&tmp, path).is_err() {
+        let _ = std::fs::remove_file(&tmp);
+    }
+}
+
+fn load_persisted_session_entry_in<T: serde::de::DeserializeOwned>(
+    base: &Path,
+    key: &SessionListCacheKey,
+) -> Option<T> {
+    let path = session_index_entry_path_in(base, key.namespace, &session_list_cache_slot(key));
+    let bytes = std::fs::read(path).ok()?;
+    let entry: PersistedSessionCacheEntry<T> = serde_json::from_slice(&bytes).ok()?;
+    entry.key.matches(key).then_some(entry.value)
+}
+
+fn load_persisted_session_entry<T: serde::de::DeserializeOwned>(
+    key: &SessionListCacheKey,
+) -> Option<T> {
+    load_persisted_session_entry_in(&session_index_dir(), key)
+}
+
+fn store_persisted_session_entry_in<T: Serialize>(
+    base: &Path,
+    key: &SessionListCacheKey,
+    value: &T,
+) {
+    let entry = PersistedSessionCacheEntry {
+        key: PersistedSessionCacheKey::of(key),
+        value,
+    };
+    let Ok(body) = serde_json::to_vec(&entry) else {
+        return;
+    };
+    let path = session_index_entry_path_in(base, key.namespace, &session_list_cache_slot(key));
+    write_session_index_entry(&path, &body);
+}
+
+fn store_persisted_session_entry<T: Serialize>(key: &SessionListCacheKey, value: &T) {
+    store_persisted_session_entry_in(&session_index_dir(), key, value);
+}
+
+fn load_persisted_intendant_row(fingerprint: &SessionDirFingerprint) -> Option<serde_json::Value> {
+    let path = session_index_entry_path("intendant-row", &fingerprint.path);
+    let bytes = std::fs::read(path).ok()?;
+    let entry: PersistedIntendantSessionEntry = serde_json::from_slice(&bytes).ok()?;
+    (&entry.fingerprint == fingerprint).then_some(entry.row)
+}
+
+fn store_persisted_intendant_row(fingerprint: &SessionDirFingerprint, row: &serde_json::Value) {
+    let entry = PersistedIntendantSessionEntry {
+        fingerprint: fingerprint.clone(),
+        row: row.clone(),
+    };
+    let Ok(body) = serde_json::to_vec(&entry) else {
+        return;
+    };
+    let path = session_index_entry_path("intendant-row", &fingerprint.path);
+    write_session_index_entry(&path, &body);
+}
+
+fn remove_persisted_intendant_row(dir: &Path) {
+    let path = session_index_entry_path("intendant-row", &session_list_path_key(dir));
+    let _ = std::fs::remove_file(path);
+}
+
+/// Bulk-load the on-disk session index into the in-memory caches once per
+/// process. Thousands of lazy per-entry reads during the first list scan
+/// cost seconds sequentially; one parallel sweep up front costs a fraction
+/// of that. Entries land exactly as `store_*` would have put them — the
+/// normal lookup path still validates every fingerprint against the live
+/// filesystem, so a stale preloaded entry can never be served.
+fn preload_session_index() {
+    static PRELOADED: std::sync::Once = std::sync::Once::new();
+    PRELOADED.call_once(|| {
+        let base = session_index_dir();
+        let namespaces: [(&'static str, fn(&'static str, &[u8])); 4] = [
+            ("codex", preload_codex_entry),
+            ("claude-code", preload_row_entry),
+            ("gemini", preload_row_entry),
+            ("codex-parent-baseline", preload_baseline_entry),
+        ];
+        std::thread::scope(|scope| {
+            for (namespace, apply) in namespaces {
+                let dir = base.join(namespace);
+                scope.spawn(move || preload_namespace_dir(&dir, namespace, apply));
+            }
+            let intendant_dir = base.join("intendant-row");
+            scope.spawn(move || preload_namespace_dir(&intendant_dir, "intendant-row", preload_intendant_entry));
+        });
+    });
+}
+
+fn preload_namespace_dir(dir: &Path, namespace: &'static str, apply: fn(&'static str, &[u8])) {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+    let paths: Vec<PathBuf> = entries
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("json"))
+        .collect();
+    if paths.is_empty() {
+        return;
+    }
+    // The largest namespace holds thousands of entries; a few reader
+    // threads keep the preload in the hundreds of milliseconds.
+    let chunk = paths.len().div_ceil(4).max(1);
+    std::thread::scope(|scope| {
+        for slice in paths.chunks(chunk) {
+            scope.spawn(move || {
+                for path in slice {
+                    if let Ok(bytes) = std::fs::read(path) {
+                        apply(namespace, &bytes);
+                    }
+                }
+            });
+        }
+    });
+}
+
+fn runtime_session_cache_key(
+    namespace: &'static str,
+    key: PersistedSessionCacheKey,
+) -> Option<SessionListCacheKey> {
+    if key.namespace != namespace {
+        return None;
+    }
+    Some(SessionListCacheKey {
+        namespace,
+        path: key.path,
+        len: key.len,
+        mtime_nanos: key.mtime_nanos,
+        ctime_nanos: key.ctime_nanos,
+        dev: key.dev,
+        ino: key.ino,
+        extra: key.extra,
+    })
+}
+
+fn preload_row_entry(namespace: &'static str, bytes: &[u8]) {
+    let Ok(entry) = serde_json::from_slice::<PersistedSessionCacheEntry<serde_json::Value>>(bytes)
+    else {
+        return;
+    };
+    let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
+        return;
+    };
+    let slot = session_list_cache_slot(&key);
+    let mut cache = session_list_row_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(slot)
+        .or_insert(SessionListRowCacheEntry {
+            key,
+            row: entry.value,
+        });
+}
+
+fn preload_codex_entry(namespace: &'static str, bytes: &[u8]) {
+    let Ok(entry) =
+        serde_json::from_slice::<PersistedSessionCacheEntry<CodexSessionListSummary>>(bytes)
+    else {
+        return;
+    };
+    let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
+        return;
+    };
+    let slot = session_list_cache_slot(&key);
+    let mut cache = codex_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.entry(slot).or_insert(CodexSessionListCacheEntry {
+        key,
+        summary: entry.value,
+    });
+}
+
+fn preload_baseline_entry(namespace: &'static str, bytes: &[u8]) {
+    let Ok(entry) =
+        serde_json::from_slice::<PersistedSessionCacheEntry<Option<SessionUsage>>>(bytes)
+    else {
+        return;
+    };
+    let Some(key) = runtime_session_cache_key(namespace, entry.key) else {
+        return;
+    };
+    let slot = session_list_cache_slot(&key);
+    let mut cache = codex_parent_usage_baseline_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache
+        .entry(slot)
+        .or_insert(CodexParentUsageBaselineCacheEntry {
+            key,
+            usage: entry.value,
+        });
+}
+
+fn preload_intendant_entry(_namespace: &'static str, bytes: &[u8]) {
+    let Ok(entry) = serde_json::from_slice::<PersistedIntendantSessionEntry>(bytes) else {
+        return;
+    };
+    let slot = entry.fingerprint.path.clone();
+    let mut cache = intendant_session_list_cache()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    cache.entry(slot).or_insert(IntendantSessionListCacheEntry {
+        fingerprint: entry.fingerprint,
+        row: entry.row,
+    });
+}
+
 fn session_list_row_cache() -> &'static Mutex<HashMap<String, SessionListRowCacheEntry>> {
     SESSION_LIST_ROW_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn cached_session_list_row(key: &SessionListCacheKey) -> Option<serde_json::Value> {
     let slot = session_list_cache_slot(key);
-    let cache = session_list_row_cache()
+    {
+        let cache = session_list_row_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(&slot).filter(|entry| &entry.key == key) {
+            return Some(entry.row.clone());
+        }
+    }
+    // Miss in memory (fresh process): try the on-disk index before paying
+    // a full re-parse. A hit re-seeds the in-memory tier.
+    let row = load_persisted_session_entry::<serde_json::Value>(key)?;
+    let mut cache = session_list_row_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    cache
-        .get(&slot)
-        .filter(|entry| &entry.key == key)
-        .map(|entry| entry.row.clone())
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        SessionListRowCacheEntry {
+            key: key.clone(),
+            row: row.clone(),
+        },
+    );
+    Some(row)
 }
 
 fn store_session_list_row(key: SessionListCacheKey, row: &serde_json::Value) {
+    store_persisted_session_entry(&key, row);
     let slot = session_list_cache_slot(&key);
     let mut cache = session_list_row_cache()
         .lock()
@@ -6725,13 +7076,31 @@ fn cached_codex_session_list_entry(
     key: &SessionListCacheKey,
 ) -> Option<CodexSessionListCacheEntry> {
     let slot = session_list_cache_slot(key);
-    let cache = codex_session_list_cache()
+    {
+        let cache = codex_session_list_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(&slot).filter(|entry| &entry.key == key) {
+            return Some(entry.clone());
+        }
+    }
+    let summary = load_persisted_session_entry::<CodexSessionListSummary>(key)?;
+    let entry = CodexSessionListCacheEntry {
+        key: key.clone(),
+        summary,
+    };
+    let mut cache = codex_session_list_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    cache.get(&slot).filter(|entry| &entry.key == key).cloned()
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(slot, entry.clone());
+    Some(entry)
 }
 
 fn store_codex_session_list_entry(key: SessionListCacheKey, summary: CodexSessionListSummary) {
+    store_persisted_session_entry(&key, &summary);
     let slot = session_list_cache_slot(&key);
     let mut cache = codex_session_list_cache()
         .lock()
@@ -6749,16 +7118,33 @@ fn codex_parent_usage_baseline_cache(
 
 fn cached_codex_parent_usage_baseline(key: &SessionListCacheKey) -> Option<Option<SessionUsage>> {
     let slot = session_list_cache_slot(key);
-    let cache = codex_parent_usage_baseline_cache()
+    {
+        let cache = codex_parent_usage_baseline_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache.get(&slot).filter(|entry| &entry.key == key) {
+            return Some(entry.usage);
+        }
+    }
+    let usage = load_persisted_session_entry::<Option<SessionUsage>>(key)?;
+    let mut cache = codex_parent_usage_baseline_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    cache
-        .get(&slot)
-        .filter(|entry| &entry.key == key)
-        .map(|entry| entry.usage)
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        CodexParentUsageBaselineCacheEntry {
+            key: key.clone(),
+            usage,
+        },
+    );
+    Some(usage)
 }
 
 fn store_codex_parent_usage_baseline(key: SessionListCacheKey, usage: Option<SessionUsage>) {
+    store_persisted_session_entry(&key, &usage);
     let slot = session_list_cache_slot(&key);
     let mut cache = codex_parent_usage_baseline_cache()
         .lock()
@@ -6777,16 +7163,37 @@ fn intendant_session_list_cache() -> &'static Mutex<HashMap<String, IntendantSes
 fn cached_intendant_session_list_row(
     fingerprint: &SessionDirFingerprint,
 ) -> Option<serde_json::Value> {
-    let cache = intendant_session_list_cache()
+    {
+        let cache = intendant_session_list_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(entry) = cache
+            .get(&fingerprint.path)
+            .filter(|entry| &entry.fingerprint == fingerprint)
+        {
+            return Some(entry.row.clone());
+        }
+    }
+    let row = load_persisted_intendant_row(fingerprint)?;
+    let slot = fingerprint.path.clone();
+    let mut cache = intendant_session_list_cache()
         .lock()
         .unwrap_or_else(|e| e.into_inner());
-    cache
-        .get(&fingerprint.path)
-        .filter(|entry| &entry.fingerprint == fingerprint)
-        .map(|entry| entry.row.clone())
+    if cache.len() >= SESSION_LIST_ROW_CACHE_LIMIT && !cache.contains_key(&slot) {
+        cache.clear();
+    }
+    cache.insert(
+        slot,
+        IntendantSessionListCacheEntry {
+            fingerprint: fingerprint.clone(),
+            row: row.clone(),
+        },
+    );
+    Some(row)
 }
 
 fn store_intendant_session_list_row(fingerprint: SessionDirFingerprint, row: &serde_json::Value) {
+    store_persisted_intendant_row(&fingerprint, row);
     let slot = fingerprint.path.clone();
     let mut cache = intendant_session_list_cache()
         .lock()
@@ -6898,7 +7305,7 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|m| m.len()).unwrap_or(0)
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
 struct SessionUsage {
     total_tokens: u64,
     prompt_tokens: u64,
@@ -9966,28 +10373,91 @@ fn cached_limited_session_list_cache(
     SESSION_LIST_LIMITED_RESPONSE_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+// Stale-while-revalidate: within the TTL a cached list is fresh; past it
+// (up to the stale ceiling) the cached body is served IMMEDIATELY and one
+// background refresh is kicked, so an interactive dashboard never blocks
+// on a rescan. Only a very stale (or absent) entry rebuilds inline.
+const SESSION_LIST_RESPONSE_STALE_MAX_SECS: u64 = 15 * 60;
+
+fn session_list_refresh_inflight() -> &'static Mutex<HashSet<usize>> {
+    static INFLIGHT: OnceLock<Mutex<HashSet<usize>>> = OnceLock::new();
+    INFLIGHT.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+/// Slot key for the single-flight guard: real limits are 1..SESSION_LIST_LIMIT,
+/// the unlimited list uses SESSION_LIST_LIMIT itself.
+fn spawn_session_list_refresh(limit_slot: usize) {
+    {
+        let mut inflight = session_list_refresh_inflight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if !inflight.insert(limit_slot) {
+            return;
+        }
+    }
+    std::thread::spawn(move || {
+        let body = if limit_slot >= SESSION_LIST_LIMIT {
+            list_sessions()
+        } else {
+            list_sessions_from_home_with_limit(&crate::platform::home_dir(), Some(limit_slot))
+        };
+        store_session_list_response(limit_slot, body);
+        let mut inflight = session_list_refresh_inflight()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        inflight.remove(&limit_slot);
+    });
+}
+
+fn store_session_list_response(limit_slot: usize, body: String) {
+    let entry = SessionListResponseCacheEntry {
+        generated_at: std::time::Instant::now(),
+        body,
+    };
+    if limit_slot >= SESSION_LIST_LIMIT {
+        let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
+        *cache.lock().unwrap_or_else(|e| e.into_inner()) = Some(entry);
+    } else {
+        let mut guard = cached_limited_session_list_cache()
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if guard.len() >= 16 && !guard.contains_key(&limit_slot) {
+            guard.clear();
+        }
+        guard.insert(limit_slot, entry);
+    }
+}
+
+/// fresh -> serve; stale-but-usable -> serve + background refresh;
+/// too stale/absent -> rebuild inline.
+fn serve_session_list_cache_entry(
+    limit_slot: usize,
+    entry: Option<&SessionListResponseCacheEntry>,
+) -> Option<String> {
+    let entry = entry?;
+    let age = entry.generated_at.elapsed();
+    if age <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS) {
+        return Some(entry.body.clone());
+    }
+    if age <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_STALE_MAX_SECS) {
+        let body = entry.body.clone();
+        spawn_session_list_refresh(limit_slot);
+        return Some(body);
+    }
+    None
+}
+
 fn cached_list_sessions() -> String {
     let cache = SESSION_LIST_RESPONSE_CACHE.get_or_init(|| Mutex::new(None));
     {
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.as_ref() {
-            if entry.generated_at.elapsed()
-                <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
-            {
-                return entry.body.clone();
-            }
+        if let Some(body) = serve_session_list_cache_entry(SESSION_LIST_LIMIT, guard.as_ref()) {
+            return body;
         }
     }
 
     let body = list_sessions();
     let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entry) = guard.as_ref() {
-        if entry.generated_at.elapsed()
-            <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
-        {
-            return entry.body.clone();
-        }
-    }
     *guard = Some(SessionListResponseCacheEntry {
         generated_at: std::time::Instant::now(),
         body: body.clone(),
@@ -10004,34 +10474,13 @@ fn cached_list_sessions_with_limit(limit: usize) -> String {
     let cache = cached_limited_session_list_cache();
     {
         let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(entry) = guard.get(&limit) {
-            if entry.generated_at.elapsed()
-                <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
-            {
-                return entry.body.clone();
-            }
+        if let Some(body) = serve_session_list_cache_entry(limit, guard.get(&limit)) {
+            return body;
         }
     }
 
     let body = list_sessions_from_home_with_limit(&crate::platform::home_dir(), Some(limit));
-    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
-    if let Some(entry) = guard.get(&limit) {
-        if entry.generated_at.elapsed()
-            <= std::time::Duration::from_secs(SESSION_LIST_RESPONSE_CACHE_TTL_SECS)
-        {
-            return entry.body.clone();
-        }
-    }
-    if guard.len() >= 16 && !guard.contains_key(&limit) {
-        guard.clear();
-    }
-    guard.insert(
-        limit,
-        SessionListResponseCacheEntry {
-            generated_at: std::time::Instant::now(),
-            body: body.clone(),
-        },
-    );
+    store_session_list_response(limit, body.clone());
     body
 }
 
@@ -10245,6 +10694,55 @@ pub(crate) fn sessions_list_response_body(limit: Option<usize>, ids: &[String]) 
     } else {
         cached_list_sessions()
     }
+}
+
+/// Strip session rows down to what the Stats tab folds: usage, costs,
+/// per-day buckets, and disk sizes. Full rows carry tasks, paths, goals,
+/// and lineage that make a whole-corpus fetch megabytes; the usage view
+/// is the same cached data at ~a tenth of the payload.
+pub(crate) fn session_list_body_usage_view(body: &str) -> String {
+    const KEEP: [&str; 19] = [
+        "id",
+        "session_id",
+        "source",
+        "turns",
+        "total_tokens",
+        "prompt_tokens",
+        "completion_tokens",
+        "cached_tokens",
+        "cache_creation_tokens",
+        "estimated_cost",
+        "pricing_known",
+        "created_at",
+        "updated_at",
+        "daily_usage",
+        "recording_bytes",
+        "frames_bytes",
+        "turns_bytes",
+        "logs_bytes",
+        "total_bytes",
+    ];
+    let Ok(mut rows) = serde_json::from_str::<Vec<serde_json::Value>>(body) else {
+        return body.to_string();
+    };
+    for row in rows.iter_mut() {
+        if let Some(obj) = row.as_object_mut() {
+            obj.retain(|key, _| KEEP.contains(&key.as_str()));
+        }
+    }
+    serde_json::to_string(&rows).unwrap_or_else(|_| body.to_string())
+}
+
+fn session_list_usage_view_from_request(request_line: &str) -> bool {
+    let Some(path) = request_line.split_whitespace().nth(1) else {
+        return false;
+    };
+    let Some(query) = path.split('?').nth(1) else {
+        return false;
+    };
+    query
+        .split('&')
+        .any(|pair| pair == "view=usage" || pair.starts_with("view=usage&"))
 }
 
 fn push_unique_session_row_for_ids(
@@ -11641,6 +12139,7 @@ fn list_sessions_from_home_impl(
     external_scan_limit: usize,
     requested_limit: Option<usize>,
 ) -> String {
+    preload_session_index();
     let logs_dir = home_path.join(".intendant").join("logs");
     let mut external_sessions = Vec::new();
     external_sessions.extend(list_codex_sessions_with_limit(
@@ -16398,6 +16897,7 @@ pub(crate) fn delete_session_data(session_id: &str, target: &str) -> String {
                         }
                     }
                     invalidate_session_list_response_cache();
+                    remove_persisted_intendant_row(&dir);
                     body.to_string()
                 }
                 Err(e) => serde_json::json!({"ok": false, "error": e.to_string()}).to_string(),
@@ -17404,6 +17904,19 @@ pub fn spawn_web_gateway(
         serde_json::to_string(&agent_card_value).unwrap_or_else(|_| "{}".to_string());
     let agent_card_value_for_targets = agent_card_value.clone();
     let bootstrap_caches = crate::dashboard_control::DashboardBootstrapCaches::default();
+
+    // Warm the session list in the background so the first dashboard
+    // request doesn't pay the initial scan. The persistent per-session
+    // index makes this mostly stat calls + one parallel index sweep; the
+    // results land in the ordinary response caches.
+    tokio::task::spawn_blocking(|| {
+        preload_session_index();
+        // 600 matches the dashboard's default recent-list request size;
+        // the unlimited list feeds the Stats tab's usage view. Sequential
+        // so the second scan reuses everything the first one warmed.
+        let _ = cached_list_sessions_with_limit(SESSION_LIST_STREAM_QUICK_LIMIT);
+        let _ = cached_list_sessions();
+    });
 
     // Pre-build ICE config for WebRTC display sessions from the gateway config.
     let ice_config = crate::display::IceConfig {
@@ -23666,6 +24179,7 @@ pub fn spawn_web_gateway(
                         // Sessions" and "Disk Usage" cards per host.
                         let ids_filter = session_ids_filter_from_request(request_line);
                         let limit = session_list_limit_from_request(request_line);
+                        let usage_view = session_list_usage_view_from_request(request_line);
                         let body = match tokio::task::spawn_blocking(move || {
                             let body = match ids_filter {
                                 Some(ids) => cached_list_sessions_for_ids(&ids),
@@ -23674,7 +24188,12 @@ pub fn spawn_web_gateway(
                                     None => cached_list_sessions(),
                                 },
                             };
-                            limit_session_list_body(&body, limit)
+                            let body = limit_session_list_body(&body, limit);
+                            if usage_view {
+                                session_list_body_usage_view(&body)
+                            } else {
+                                body
+                            }
                         })
                         .await
                         {
@@ -43992,5 +44511,109 @@ mod tests {
         let auth = map.read().unwrap_or_else(|e| e.into_inner());
         let snaps = compute_bootstrap_authority_snapshots([] as [u32; 0], &auth, "conn-A");
         assert!(snaps.is_empty());
+    }
+
+    fn persisted_test_key(extra: &str) -> SessionListCacheKey {
+        SessionListCacheKey {
+            namespace: "test-rows",
+            path: "/tmp/example/session.jsonl".to_string(),
+            len: 1234,
+            mtime_nanos: 111_222_333_444_555_666_777,
+            ctime_nanos: -42,
+            dev: 7,
+            ino: 99,
+            extra: extra.to_string(),
+        }
+    }
+
+    #[test]
+    fn persisted_session_entry_round_trips_and_validates_fingerprint() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = persisted_test_key("v1");
+        let row = serde_json::json!({"session_id": "s-1", "total_tokens": 42});
+
+        assert!(load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &key).is_none());
+        store_persisted_session_entry_in(dir.path(), &key, &row);
+        assert_eq!(
+            load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &key),
+            Some(row.clone())
+        );
+
+        // Any fingerprint drift (here: file length) must invalidate the entry.
+        let mut stale = key.clone();
+        stale.len += 1;
+        assert!(load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &stale).is_none());
+        // A different `extra` is a different slot entirely.
+        let other = persisted_test_key("v2");
+        assert!(load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &other).is_none());
+    }
+
+    #[test]
+    fn persisted_session_entry_survives_128_bit_timestamps() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut key = persisted_test_key("wide");
+        key.mtime_nanos = u128::MAX;
+        key.ctime_nanos = i128::MIN;
+        let usage: Option<SessionUsage> = Some(SessionUsage {
+            total_tokens: 10,
+            prompt_tokens: 6,
+            completion_tokens: 4,
+            cache_creation_tokens: 0,
+            cached_tokens: 2,
+        });
+        store_persisted_session_entry_in(dir.path(), &key, &usage);
+        assert_eq!(
+            load_persisted_session_entry_in::<Option<SessionUsage>>(dir.path(), &key),
+            Some(usage)
+        );
+    }
+
+    #[test]
+    fn usage_view_strips_heavy_row_fields() {
+        let body = serde_json::json!([{
+            "session_id": "s-1",
+            "source": "codex",
+            "task": "a very long task description",
+            "cwd": "/somewhere/deep",
+            "goal": {"objective": "x"},
+            "turns": 3,
+            "total_tokens": 100,
+            "estimated_cost": 1.25,
+            "daily_usage": [{"day": "2026-07-01", "total_tokens": 100}],
+            "total_bytes": 2048,
+        }])
+        .to_string();
+        let slim = session_list_body_usage_view(&body);
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&slim).unwrap();
+        let row = rows[0].as_object().unwrap();
+        assert!(row.contains_key("session_id"));
+        assert!(row.contains_key("daily_usage"));
+        assert!(row.contains_key("total_bytes"));
+        assert!(!row.contains_key("task"));
+        assert!(!row.contains_key("cwd"));
+        assert!(!row.contains_key("goal"));
+    }
+
+    #[test]
+    fn usage_view_request_detection() {
+        assert!(session_list_usage_view_from_request(
+            "GET /api/sessions?limit=all&view=usage HTTP/1.1"
+        ));
+        assert!(!session_list_usage_view_from_request(
+            "GET /api/sessions?limit=all HTTP/1.1"
+        ));
+        assert!(!session_list_usage_view_from_request(
+            "GET /api/sessions?view=usagex HTTP/1.1"
+        ));
+    }
+
+    #[test]
+    fn persisted_entry_rejects_corrupt_body() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = persisted_test_key("corrupt");
+        let path = session_index_entry_path_in(dir.path(), key.namespace, &session_list_cache_slot(&key));
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"{not json").unwrap();
+        assert!(load_persisted_session_entry_in::<serde_json::Value>(dir.path(), &key).is_none());
     }
 }
