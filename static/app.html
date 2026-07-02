@@ -5945,6 +5945,37 @@ body.context-focus-active {
   align-items: end;
   gap: 8px;
 }
+/* Toolbar field headings share the ui-field-grid label voice. */
+.sessions-toolbar .sessions-search > span,
+.sessions-toolbar .sessions-control > span,
+.sessions-toolbar .sessions-sort > span {
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--overlay1);
+  white-space: nowrap;
+}
+.sessions-sort {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-width: 0;
+  font-size: 11px;
+  color: var(--overlay0);
+}
+.sessions-sort select {
+  height: 28px;
+  min-width: 0;
+  padding: 2px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 11px;
+}
+.sessions-sort select:focus { outline: none; border-color: var(--blue); }
 .sessions-search {
   display: flex;
   flex-direction: column;
@@ -5981,10 +6012,8 @@ body.context-focus-active {
 .sessions-project-filter {
   min-width: 180px;
 }
-.sessions-subagent-toggle {
-  min-width: 124px;
-  height: 28px;
-  align-self: end;
+.sessions-toggle-field .sessions-toggle {
+  align-self: start;
 }
 .sessions-multi-filter-btn {
   height: 28px;
@@ -6086,6 +6115,10 @@ body.context-focus-active {
 .sessions-toggle input[type="checkbox"] {
   accent-color: var(--blue);
   margin: 0;
+}
+.sessions-toggle:has(input:checked) {
+  border-color: rgba(137, 180, 250, 0.45);
+  color: var(--subtext1);
 }
 .sessions-deep-search {
   display: flex;
@@ -6190,9 +6223,6 @@ body.context-focus-active {
   flex-direction: column;
   gap: 14px;
 }
-.sessions-new-panel .sessions-title {
-  margin-bottom: 2px;
-}
 .sessions-new-task {
   display: flex;
   align-items: stretch;
@@ -6215,6 +6245,22 @@ body.context-focus-active {
 .sessions-new-session-field select {
   text-transform: none;
 }
+.sessions-new-session-field > select {
+  height: 28px;
+  padding: 4px 8px;
+  border: 1px solid var(--surface1);
+  border-radius: 4px;
+  background: var(--surface0);
+  color: var(--text);
+  font-family: inherit;
+  font-size: 12px;
+  box-sizing: border-box;
+}
+.sessions-new-session-field > select:disabled {
+  color: var(--overlay0);
+  cursor: not-allowed;
+  opacity: 0.75;
+}
 .sessions-new-session-task {
   width: 100%;
 }
@@ -6226,6 +6272,20 @@ body.context-focus-active {
   grid-template-columns: minmax(130px, 0.34fr) minmax(210px, 1fr) minmax(120px, 0.34fr) minmax(120px, 0.34fr) minmax(90px, 0.22fr);
   gap: 10px;
   align-items: end;
+}
+/* Agent picker sits alone; the dependent external-agent controls live in
+   the ui-fold below it. */
+.sessions-new-agent-row.sessions-new-agent-picker {
+  grid-template-columns: minmax(200px, 340px);
+}
+.sessions-new-external-fold {
+  margin: 0;
+}
+.sessions-new-agent-row.sessions-new-external-grid {
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+}
+.sessions-new-external-grid .sessions-new-session-field:first-child {
+  grid-column: 1 / -1;
 }
 .sessions-new-fast-toggle {
   height: 28px;
@@ -6482,22 +6542,11 @@ body.context-focus-active {
 @keyframes sessions-spawn-spin {
   to { transform: rotate(360deg); }
 }
+/* Refresh/Scan/Cached buttons are ui-btn; only sizing + pending live here. */
 .sessions-refresh {
   flex: 0 0 auto;
   height: 28px;
-  padding: 3px 10px;
-  background: var(--surface0);
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  color: var(--subtext0);
-  font-family: inherit;
   font-size: 11px;
-  cursor: pointer;
-  transition: background 0.15s, color 0.15s;
-}
-.sessions-refresh:hover {
-  background: var(--surface1);
-  color: var(--text);
 }
 .sessions-refresh:disabled,
 .sessions-refresh.pending {
@@ -6589,39 +6638,25 @@ body.context-focus-active {
   0% { transform: translateX(-120%); }
   100% { transform: translateX(260%); }
 }
+/* Aggregate strips are ui-stat tiles (label/value/sub); only the grid
+   shell and the streaming-hydration state live here. */
 .sessions-aggregate {
   display: grid;
-  grid-template-columns: repeat(6, minmax(0, 1fr));
-  gap: 8px;
-  margin: 8px 0 12px;
-}
-.sessions-aggregate .agg-card {
-  min-width: 0;
-  background: color-mix(in srgb, var(--surface0) 76%, transparent);
-  border: 1px solid var(--surface1);
-  border-radius: 6px;
-  padding: 8px 10px;
-}
-.sessions-aggregate .agg-label {
-  font-size: 10px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--overlay1);
-  margin-bottom: 2px;
+  grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+  gap: 10px;
+  margin: 8px 0 14px;
 }
 .sessions-aggregate .agg-value {
-  font-size: 14px;
-  line-height: 1.15;
-  font-weight: 600;
-  color: var(--text);
   overflow: hidden;
   text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .sessions-aggregate .agg-card.loading {
   border-color: rgba(137, 180, 250, 0.22);
-  background: color-mix(in srgb, var(--blue) 6%, var(--surface0));
 }
 .sessions-aggregate .agg-card.loading .agg-value {
+  font-size: 13px;
+  font-weight: 600;
   color: var(--overlay1);
 }
 .sessions-list {
@@ -6629,6 +6664,28 @@ body.context-focus-active {
   flex-direction: column;
   gap: 6px;
 }
+/* Card-shaped shimmer placeholders while the first stream loads. */
+.sessions-skel-card {
+  height: 64px;
+  border-radius: 10px;
+}
+/* "Show N more" row below capped list renders. */
+.sessions-show-more {
+  display: flex;
+  justify-content: center;
+  padding: 10px 0 4px;
+}
+/* Long-tail stats inside the session-detail overlay. */
+.sd-meta-strip {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 3px 14px;
+  margin-top: 5px;
+  font-size: 11px;
+  line-height: 1.4;
+}
+.sd-meta-strip .label { color: var(--overlay0); margin-right: 4px; }
+.sd-meta-strip .value { color: var(--subtext0); user-select: text; }
 .worktrees-list {
   display: flex;
   flex-direction: column;
@@ -6645,15 +6702,15 @@ body.context-focus-active {
 }
 .session-card.worktree-card {
   cursor: default;
-  padding: 9px 12px;
+  padding: 10px 14px;
 }
 .session-card.worktree-card.queued {
   border-color: var(--overlay1);
-  background: color-mix(in srgb, var(--surface2) 18%, var(--surface0));
+  background: color-mix(in srgb, var(--surface2) 18%, var(--glass-bg));
 }
 .session-card.worktree-card.removing {
   border-color: var(--blue);
-  background: color-mix(in srgb, var(--blue) 8%, var(--surface0));
+  background: color-mix(in srgb, var(--blue) 8%, var(--glass-bg));
 }
 .session-card.worktree-card .sc-actions {
   position: static;
@@ -6661,7 +6718,7 @@ body.context-focus-active {
   top: auto;
   padding-top: 6px;
   margin-top: 8px;
-  border-top: 1px solid var(--surface1);
+  border-top: 1px solid var(--glass-hairline);
 }
 .worktree-card.safe {
   border-color: color-mix(in srgb, var(--green) 50%, var(--surface1));
@@ -7187,10 +7244,11 @@ body.context-focus-active {
 .sd-frame-group.collapsed .sd-frames-gallery { display: none; }
 .sd-frame-group-badge { font-size: 11px; color: var(--overlay0); }
 .session-card {
-  background: var(--surface0);
-  border: 1px solid var(--surface1);
-  border-radius: 6px;
-  padding: 9px 270px 9px 12px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 10px;
+  box-shadow: var(--glass-highlight);
+  padding: 10px 270px 10px 14px;
   cursor: default;
   position: relative;
   transition: border-color 0.15s;
@@ -7200,13 +7258,13 @@ body.context-focus-active {
 }
 .session-card.current {
   border-color: var(--blue);
-  background: color-mix(in srgb, var(--blue) 8%, var(--surface0));
+  background: color-mix(in srgb, var(--blue) 9%, var(--glass-bg));
 }
 .session-card.partial {
   border-color: rgba(137, 180, 250, 0.22);
   background:
     linear-gradient(90deg, rgba(137, 180, 250, 0.055), transparent 36%),
-    var(--surface0);
+    var(--glass-bg);
 }
 .session-card .sc-top {
   display: flex;
@@ -7234,9 +7292,9 @@ body.context-focus-active {
   color: var(--text);
   font-weight: 600;
   line-height: 1.3;
-  overflow-wrap: anywhere;
-  word-break: break-word;
-  white-space: normal;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
 .session-card .sc-id {
   font-size: 11px;
@@ -7247,71 +7305,21 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-card .sc-status {
+/* Status/source/role marks compose with the .ui-chip / .ui-badge
+   primitives (tone classes carry the color); only card-specific layout
+   lives here. */
+.session-card .sc-status,
+.session-card .sc-source,
+.session-card .sc-role,
+.session-card .sc-current-badge {
   flex: 0 0 auto;
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 1px 6px;
-  border-radius: 4px;
-  font-weight: 600;
-}
-.session-card .sc-status.completed {
-  background: color-mix(in srgb, var(--green) 15%, transparent);
-  color: var(--green);
-}
-.session-card .sc-status.in_progress {
-  background: color-mix(in srgb, var(--yellow) 15%, transparent);
-  color: var(--yellow);
-}
-.session-card .sc-status.idle {
-  background: color-mix(in srgb, var(--overlay0) 15%, transparent);
-  color: var(--overlay0);
-}
-.session-card .sc-status.abandoned {
-  background: color-mix(in srgb, var(--surface2) 15%, transparent);
-  color: var(--surface2);
-}
-.session-card .sc-status.interrupted {
-  background: color-mix(in srgb, var(--peach) 15%, transparent);
-  color: var(--peach);
-}
-.session-card .sc-status.external {
-  background: color-mix(in srgb, var(--sapphire) 15%, transparent);
-  color: var(--sapphire);
-}
-.session-card .sc-source {
-  flex: 0 0 auto;
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--teal) 15%, transparent);
-  color: var(--teal);
-  font-weight: 600;
-}
-.session-card .sc-source.local {
-  background: color-mix(in srgb, var(--surface2) 16%, transparent);
-  color: var(--overlay1);
-}
-.session-card .sc-role {
-  flex: 0 0 auto;
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--mauve) 15%, transparent);
-  color: var(--mauve);
 }
 .session-card button.sc-role {
-  border: 0;
   font-family: inherit;
   cursor: pointer;
 }
 .session-card button.sc-role:hover {
-  background: color-mix(in srgb, var(--blue) 16%, transparent);
+  border-color: var(--blue);
   color: var(--blue);
 }
 .session-card .sc-lineage-chip {
@@ -7320,25 +7328,6 @@ body.context-focus-active {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
-.session-card .sc-lineage-children {
-  background: color-mix(in srgb, var(--green) 12%, transparent);
-  color: var(--green);
-}
-.session-card .sc-loading-chip {
-  background: color-mix(in srgb, var(--blue) 13%, transparent);
-  color: var(--blue);
-}
-.session-card .sc-current-badge {
-  flex: 0 0 auto;
-  font-size: 9px;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
-  padding: 1px 6px;
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--blue) 20%, transparent);
-  color: var(--blue);
-  font-weight: 600;
-}
 .session-card .sc-task {
   font-size: 12px;
   color: var(--subtext0);
@@ -7346,9 +7335,7 @@ body.context-focus-active {
   line-height: 1.3;
   overflow: hidden;
   text-overflow: ellipsis;
-  display: -webkit-box;
-  -webkit-line-clamp: 2;
-  -webkit-box-orient: vertical;
+  white-space: nowrap;
 }
 .session-card .sc-search-hit {
   display: flex;
@@ -7401,6 +7388,13 @@ body.context-focus-active {
 }
 .session-card .sc-meta .provider-val { color: var(--blue); }
 .session-card .sc-meta .model-val { color: var(--green); }
+/* Meta value tones (replace per-site inline colors). */
+.session-card .sc-meta .v-green { color: var(--green); }
+.session-card .sc-meta .v-blue { color: var(--blue); }
+.session-card .sc-meta .v-peach { color: var(--peach); }
+.session-card .sc-meta .v-red { color: var(--red); }
+.session-card .sc-meta .v-yellow { color: var(--yellow); }
+.session-card .sc-meta .v-dim { color: var(--overlay1); }
 .session-card .sc-meta .sc-loading-meta .value {
   color: var(--blue);
 }
@@ -7419,24 +7413,17 @@ body.context-focus-active {
   right: 12px;
   top: 34px;
 }
-.sc-delete-btn,
-.sc-rename-btn {
+/* Card action buttons are compact ui-btn variants; ui-btn (+.danger)
+   carries look and hover states. */
+.session-card .sc-actions .ui-btn {
+  min-height: 24px;
+  padding: 3px 9px;
   font-size: 11px;
-  padding: 2px 7px;
-  border: 1px solid var(--surface1);
-  border-radius: 4px;
-  background: var(--surface0);
-  color: var(--overlay0);
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.sc-delete-btn:hover {
-  border-color: var(--red);
-  color: var(--red);
 }
 .sc-delete-btn:disabled,
 .sc-delete-btn.pending,
-.sc-resume-btn:disabled {
+.sc-resume-btn:disabled,
+.sc-copy-btn:disabled {
   opacity: 0.65;
   cursor: progress;
 }
@@ -7444,31 +7431,6 @@ body.context-focus-active {
   border-color: var(--blue);
   background: color-mix(in srgb, var(--blue) 12%, transparent);
   color: var(--blue);
-}
-.sc-rename-btn {
-  border-color: color-mix(in srgb, var(--mauve) 55%, var(--surface1));
-  background: color-mix(in srgb, var(--mauve) 12%, transparent);
-  color: var(--mauve);
-  font-weight: 600;
-}
-.sc-rename-btn:hover {
-  border-color: var(--mauve);
-  background: color-mix(in srgb, var(--mauve) 18%, transparent);
-  color: var(--mauve);
-}
-.sc-resume-btn {
-  font-size: 11px;
-  padding: 2px 7px;
-  border: 1px solid var(--green);
-  border-radius: 4px;
-  background: color-mix(in srgb, var(--green) 12%, transparent);
-  color: var(--green);
-  cursor: pointer;
-  transition: all 0.15s;
-}
-.sc-resume-btn:hover {
-  background: color-mix(in srgb, var(--green) 20%, transparent);
-  border-color: var(--green);
 }
 .sc-delete-menu {
   position: absolute;
@@ -9650,6 +9612,11 @@ body.display-fullscreen-open {
   font-size: 11px;
 }
 .pending-attachments-bar.hidden { display: none; }
+.pending-attachments-list {
+  display: flex;
+  gap: 4px;
+  flex-wrap: wrap;
+}
 .pending-attachments-label {
   color: var(--subtext1);
   font-weight: 600;
@@ -10576,7 +10543,9 @@ body.display-fullscreen-open {
   .sessions-search { max-width: none; margin-left: 0; }
   .sessions-new-task { width: 100%; min-width: 0; }
   .sessions-new-session-field { flex: 1 1 100%; max-width: none; }
-  .sessions-new-agent-row { grid-template-columns: 1fr; }
+  .sessions-new-agent-row,
+  .sessions-new-agent-row.sessions-new-agent-picker,
+  .sessions-new-agent-row.sessions-new-external-grid { grid-template-columns: 1fr; }
   .sessions-project-row { flex-wrap: wrap; }
   .sessions-project-browse, .sessions-project-create-label { flex: 0 0 auto; }
   .sessions-start-btn { width: 100%; }
@@ -11800,7 +11769,7 @@ body.display-fullscreen-open {
             <div class="sessions-header">
               <div class="sessions-title-line">
                 <span class="sessions-title">Recent Sessions</span>
-                <button class="sessions-refresh" onclick="loadSessions()" title="Reload session list">Refresh</button>
+                <button class="ui-btn sessions-refresh" onclick="loadSessions()" title="Reload session list">Refresh</button>
               </div>
               <div class="sessions-toolbar">
                 <label class="sessions-search" for="sessions-search">
@@ -11834,11 +11803,15 @@ body.display-fullscreen-open {
                     <label><input type="checkbox" value="interrupted"> Interrupted</label>
                   </div>
                 </div>
-                <label class="sessions-control sessions-toggle sessions-subagent-toggle" title="Include child agent sessions in Recent">
-                  <input type="checkbox" id="sessions-show-subagents">
-                  <span>Show subagents</span>
-                </label>
-                <label class="sessions-sort">Sort
+                <div class="sessions-control sessions-toggle-field">
+                  <span>Subagents</span>
+                  <label class="sessions-toggle sessions-subagent-toggle" title="Include child agent sessions in Recent">
+                    <input type="checkbox" id="sessions-show-subagents">
+                    <span>Show</span>
+                  </label>
+                </div>
+                <label class="sessions-sort">
+                  <span>Sort</span>
                   <select id="sort-sessions">
                     <option value="updated-desc" selected>Date changed (newest)</option>
                     <option value="updated-asc">Date changed (oldest)</option>
@@ -11859,7 +11832,7 @@ body.display-fullscreen-open {
             <div class="sessions-list" id="sessions-list">
               <div class="empty-state">Loading sessions...</div>
             </div>
-            <div class="session-detail" id="session-detail" style="display:none">
+            <div class="session-detail hidden" id="session-detail">
               <div class="session-detail-header">
                 <button class="session-back-btn" onclick="closeSessionDetail()">&larr; Back</button>
                 <span class="session-detail-title" id="session-detail-title"></span>
@@ -11868,7 +11841,7 @@ body.display-fullscreen-open {
                 <button class="session-detail-action-btn session-rename-btn" id="session-detail-rename" type="button" title="Rename this session">Rename</button>
               </div>
               <div class="session-detail-body" id="session-detail-body">
-                <div class="sd-section" id="sd-recordings" style="display:none">
+                <div class="sd-section hidden" id="sd-recordings">
                   <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
                     <span class="sd-section-chevron">&#x25BE;</span>
                     <span class="sd-section-title">Recordings</span>
@@ -11876,7 +11849,7 @@ body.display-fullscreen-open {
                   </div>
                   <div class="sd-section-content" id="session-detail-recordings"></div>
                 </div>
-                <div class="sd-section" id="sd-frames" style="display:none">
+                <div class="sd-section hidden" id="sd-frames">
                   <div class="sd-section-header" onclick="this.parentElement.classList.toggle('collapsed')">
                     <span class="sd-section-chevron">&#x25BE;</span>
                     <span class="sd-section-title">Frames</span>
@@ -11899,7 +11872,7 @@ body.display-fullscreen-open {
             <div class="sessions-header">
               <div class="sessions-title-line">
                 <span class="sessions-title">Deep Search</span>
-                <button class="sessions-refresh" onclick="loadSessions()" title="Reload session list metadata">Refresh</button>
+                <button class="ui-btn sessions-refresh" onclick="loadSessions()" title="Reload session list metadata">Refresh</button>
               </div>
               <div class="sessions-deep-search" id="sessions-deep-search-panel">
                 <div class="sessions-deep-search-row">
@@ -11959,7 +11932,8 @@ body.display-fullscreen-open {
                     <label><input type="checkbox" value="interrupted"> Interrupted</label>
                   </div>
                 </div>
-                <label class="sessions-sort">Sort
+                <label class="sessions-sort">
+                  <span>Sort</span>
                   <select id="sort-sessions-deep">
                     <option value="updated-desc" selected>Date changed (newest)</option>
                     <option value="updated-asc">Date changed (oldest)</option>
@@ -11983,19 +11957,20 @@ body.display-fullscreen-open {
             <div class="sessions-header worktrees-header">
               <div class="sessions-title-line">
                 <span class="sessions-title">Worktrees</span>
-                <button class="sessions-refresh" id="worktrees-scan-btn" title="Scan known worktree roots">Scan</button>
+                <button class="ui-btn sessions-refresh" id="worktrees-scan-btn" title="Scan known worktree roots">Scan</button>
               </div>
               <div class="sessions-toolbar">
                 <label class="sessions-search" for="worktrees-search">
                   <span>Search</span>
                   <input type="search" id="worktrees-search" placeholder="Path, branch, repo, label..." autocomplete="off" spellcheck="false">
                 </label>
-                <button class="sessions-refresh" id="worktrees-refresh-btn" title="Reload the last cached scan">Cached</button>
+                <button class="ui-btn sessions-refresh" id="worktrees-refresh-btn" title="Reload the last cached scan">Cached</button>
                 <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-active" checked> Active</label>
                 <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-dirty" checked> Dirty</label>
                 <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-unmerged" checked> Unmerged</label>
                 <label class="sessions-toggle"><input type="checkbox" id="filter-worktrees-main"> Main</label>
-                <label class="sessions-sort">Sort
+                <label class="sessions-sort">
+                  <span>Sort</span>
                   <select id="sort-worktrees">
                     <option value="size-desc" selected>Size (largest)</option>
                     <option value="changed-desc">Changed (newest)</option>
@@ -12018,8 +11993,11 @@ body.display-fullscreen-open {
             </div>
           </div>
           <div class="subtab-pane sessions-new-pane" id="sessions-pane-new">
-            <div class="sessions-new-panel">
-              <span class="sessions-title">New Session</span>
+            <div class="sessions-new-panel ui-card">
+              <div class="ui-section-head">
+                <h3 class="ui-section-title">New session</h3>
+                <div class="ui-section-sub">Start a fresh session on this daemon — internal agent or a supervised external CLI.</div>
+              </div>
               <div class="sessions-new-task">
                 <label class="sessions-new-session-field" for="new-session-name">
                   Session name
@@ -12034,7 +12012,7 @@ body.display-fullscreen-open {
                   <div class="pending-attachments-bar hidden" id="new-session-attachments-bar">
                     <span class="pending-attachments-label">Attachments</span>
                     <span class="pending-attachments-count" id="new-session-attachments-count">0</span>
-                    <div id="new-session-attachments-list" style="display:flex;gap:4px;flex-wrap:wrap"></div>
+                    <div id="new-session-attachments-list" class="pending-attachments-list"></div>
                     <button type="button" class="pending-attachments-clear" id="new-session-attachments-clear" data-pending-attachments-clear title="Remove all attachments">Clear</button>
                   </div>
                 </div>
@@ -12051,7 +12029,7 @@ body.display-fullscreen-open {
                   <div id="new-session-project-status" class="sessions-project-status"></div>
                   <datalist id="new-session-project-options"></datalist>
                 </div>
-                <div class="sessions-new-agent-row">
+                <div class="sessions-new-agent-row sessions-new-agent-picker">
                   <label class="sessions-new-session-field" for="new-session-agent">
                     Agent
                     <select id="new-session-agent" class="sessions-agent-select">
@@ -12062,54 +12040,62 @@ body.display-fullscreen-open {
                       <option value="gemini">Gemini CLI</option>
                     </select>
                   </label>
-                  <div class="sessions-new-session-field">
-                    <label for="new-session-agent-command">Binary path</label>
-                    <div class="sessions-agent-command-row">
-                      <input id="new-session-agent-command" class="sessions-agent-command-input" type="text" autocomplete="off" spellcheck="false" placeholder="Select an external agent" disabled>
-                      <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
-                    </div>
-                  </div>
-                  <label class="sessions-new-session-field" for="new-session-codex-sandbox">
-                    Sandbox
-                    <select id="new-session-codex-sandbox" disabled>
-                      <option value="workspace-write">workspace-write</option>
-                      <option value="danger-full-access">danger-full-access</option>
-                      <option value="read-only">read-only</option>
-                    </select>
-                  </label>
-                  <label class="sessions-new-session-field" for="new-session-codex-approval-policy">
-                    Approval
-                    <select id="new-session-codex-approval-policy" disabled>
-                      <option value="on-request">on-request</option>
-                      <option value="never">never</option>
-                      <option value="untrusted">untrusted</option>
-                      <option value="on-failure">on-failure</option>
-                    </select>
-                  </label>
-                  <label class="sessions-new-session-field" for="new-session-codex-managed-context">
-                    Managed context
-                    <select id="new-session-codex-managed-context" class="sessions-agent-managed-context-select" disabled>
-                      <option value="vanilla">vanilla</option>
-                      <option value="managed">managed</option>
-                    </select>
-                  </label>
-                  <label class="sessions-new-session-field" for="new-session-codex-context-archive">
-                    Context replay
-                    <select id="new-session-codex-context-archive" class="sessions-agent-context-archive-select" disabled>
-                      <option value="summary">summary</option>
-                      <option value="exact">exact</option>
-                      <option value="off">off</option>
-                    </select>
-                  </label>
-                  <div class="sessions-new-session-field">
-                    Service tier
-                    <label class="sessions-new-fast-toggle disabled" id="new-session-codex-fast-wrap" title="Start the new Codex session with Fast service tier">
-                      <input id="new-session-codex-fast" type="checkbox" disabled>
-                      Fast
-                    </label>
-                  </div>
                 </div>
-                <div id="new-session-managed-context-note" class="sessions-agent-note"></div>
+                <details class="ui-fold sessions-new-external-fold" id="new-session-external-fold">
+                  <summary>External agent options</summary>
+                  <div class="ui-fold-body">
+                    <p class="ui-fold-hint">These apply to external agents — pick Codex, Claude Code, or Gemini above to enable.</p>
+                    <div class="sessions-new-agent-row sessions-new-external-grid">
+                      <div class="sessions-new-session-field">
+                        <label for="new-session-agent-command">Binary path</label>
+                        <div class="sessions-agent-command-row">
+                          <input id="new-session-agent-command" class="sessions-agent-command-input" type="text" autocomplete="off" spellcheck="false" placeholder="Select an external agent" disabled>
+                          <button type="button" id="new-session-agent-command-browse" class="sessions-project-browse" onclick="openAgentBinaryPicker()" disabled>Browse</button>
+                        </div>
+                      </div>
+                      <label class="sessions-new-session-field" for="new-session-codex-sandbox">
+                        Sandbox
+                        <select id="new-session-codex-sandbox" disabled>
+                          <option value="workspace-write">workspace-write</option>
+                          <option value="danger-full-access">danger-full-access</option>
+                          <option value="read-only">read-only</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-approval-policy">
+                        Approval
+                        <select id="new-session-codex-approval-policy" disabled>
+                          <option value="on-request">on-request</option>
+                          <option value="never">never</option>
+                          <option value="untrusted">untrusted</option>
+                          <option value="on-failure">on-failure</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-managed-context">
+                        Managed context
+                        <select id="new-session-codex-managed-context" class="sessions-agent-managed-context-select" disabled>
+                          <option value="vanilla">vanilla</option>
+                          <option value="managed">managed</option>
+                        </select>
+                      </label>
+                      <label class="sessions-new-session-field" for="new-session-codex-context-archive">
+                        Context replay
+                        <select id="new-session-codex-context-archive" class="sessions-agent-context-archive-select" disabled>
+                          <option value="summary">summary</option>
+                          <option value="exact">exact</option>
+                          <option value="off">off</option>
+                        </select>
+                      </label>
+                      <div class="sessions-new-session-field">
+                        Service tier
+                        <label class="sessions-new-fast-toggle disabled" id="new-session-codex-fast-wrap" title="Start the new Codex session with Fast service tier">
+                          <input id="new-session-codex-fast" type="checkbox" disabled>
+                          Fast
+                        </label>
+                      </div>
+                    </div>
+                    <div id="new-session-managed-context-note" class="sessions-agent-note"></div>
+                  </div>
+                </details>
                 <button class="sessions-start-btn" id="new-session-start-btn" onclick="startNewSession()">Start session</button>
                 <div class="sessions-spawn-notice hidden" id="new-session-spawn-notice" role="status" aria-live="polite">
                   <span class="sessions-spawn-spinner" aria-hidden="true"></span>
@@ -13255,6 +13241,60 @@ let autoScroll = true;
 // next to their loaders further down (TDZ).
 let settingsLoaded = false;
 let apiKeyStatusLoaded = false;
+// Deep-linking #sessions (and #sessions/worktrees) runs loadSessions /
+// loadWorktrees synchronously on that same script-evaluation path — all
+// sessions/worktrees module state they touch must be declared up here,
+// not next to their renderers (TDZ).
+const SESSION_LIST_RECENT_LIMIT = 600;
+const SESSION_CARD_RENDER_LIMIT = 300;
+const WORKTREE_CARD_RENDER_LIMIT = 200;
+// Show-more render windows: how many cards the list renderers paint before
+// offering a "Show N more" button. Reset on filter/search/sort changes and
+// on a fresh (uncached) list load.
+let sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+let worktreesRenderWindow = WORKTREE_CARD_RENDER_LIMIT;
+let _sessionsLoadToken = 0;
+let _sessionsStreamAbort = null;
+let _sessionDeepSearchToken = 0;
+let _sessionDeepSearchAbort = null;
+let _sessionDeepSearch = {
+  query: '',
+  mode: 'all_keywords',
+  sourceFilter: 'all',
+  active: false,
+  loading: false,
+  waiting: false,
+  loaded: false,
+  error: null,
+  projectFilter: [],
+  searched: 0,
+  truncated: false,
+  limit: 0,
+  truncatedFiles: 0,
+  results: new Map(),
+};
+let _sessionsHydrationHideTimer = null;
+let _sessionsHydrationState = {
+  active: false,
+  done: false,
+  error: '',
+  phase: 'idle',
+  received: 0,
+  limit: SESSION_LIST_RECENT_LIMIT,
+};
+let _sessionsRenderTimer = null;
+let _sessionsRenderLastTs = 0;
+const SESSIONS_RENDER_MIN_INTERVAL_MS = 250;
+let worktreesRequestSerial = 0;
+let worktreesActivityClearTimeout = null;
+let worktreesLoadPromise = null;
+const pendingWorktreeRemovals = new Set();
+const worktreeRemovalQueue = [];
+let activeWorktreeRemovalPath = '';
+// #sessions/new runs updateNewSessionProjectPrefills → the project-status
+// debounce on the same eval path.
+let newSessionProjectStatusTimer = null;
+let newSessionProjectObservedValue = null;
 
 // ── Hidden-pane render deferral ──
 // High-frequency events (transport ticks, update_usage, session refreshes)
@@ -14093,7 +14133,6 @@ const peerDisplayConnections = new Map(); // sessionKey -> PeerDisplayConnection
 // the lower dashboard sections finish registering their helpers.
 const sessionsListCache = new Map();
 const sessionsListInflight = new Map();
-const SESSION_LIST_RECENT_LIMIT = 600;
 const SESSION_HYDRATION_DONE_HIDE_MS = 900;
 let sessionsRecentLimit = SESSION_LIST_RECENT_LIMIT;
 
@@ -57468,8 +57507,8 @@ function setNewSessionProjectRoot(root) {
   scheduleNewSessionProjectStatusRefresh({ hideWhileChecking: true });
 }
 
-let newSessionProjectStatusTimer = null;
-let newSessionProjectObservedValue = null;
+// (newSessionProjectStatusTimer / newSessionProjectObservedValue live in
+// the early client-state block — #sessions/new deep-link TDZ.)
 let fsPickerCurrentPath = '';
 let fsPickerSelectedPath = '';
 let fsPickerMode = 'directory';
@@ -60408,6 +60447,14 @@ function renderNewSessionAgentControls(options = {}) {
   const selectedAgent = normalizeAgentId(select.value);
   const effectiveAgent = effectiveNewSessionAgentId();
   const hasExternalAgent = !!selectedAgent;
+  // The external-options fold follows the backend choice: open while an
+  // external agent is selected (or is the configured default), closed for
+  // the internal agent.
+  const externalFold = document.getElementById('new-session-external-fold');
+  if (externalFold) {
+    externalFold.open = hasExternalAgent ||
+      (!!effectiveAgent && effectiveAgent !== 'internal' && effectiveAgent !== 'intendant');
+  }
   commandInput.disabled = !hasExternalAgent;
   if (browseBtn) browseBtn.disabled = !hasExternalAgent;
   commandInput.placeholder = hasExternalAgent
@@ -60876,42 +60923,8 @@ function onDebugScreenTornDown() {
 }
 
 // ── Sessions Tab ──
-let worktreesRequestSerial = 0;
-let worktreesActivityClearTimeout = null;
-let worktreesLoadPromise = null;
-const pendingWorktreeRemovals = new Set();
-const worktreeRemovalQueue = [];
-let activeWorktreeRemovalPath = '';
-const SESSION_CARD_RENDER_LIMIT = 300;
-let _sessionsLoadToken = 0;
-let _sessionsStreamAbort = null;
-let _sessionDeepSearchToken = 0;
-let _sessionDeepSearchAbort = null;
-let _sessionDeepSearch = {
-  query: '',
-  mode: 'all_keywords',
-  sourceFilter: 'all',
-  active: false,
-  loading: false,
-  waiting: false,
-  loaded: false,
-  error: null,
-  projectFilter: [],
-  searched: 0,
-  truncated: false,
-  limit: 0,
-  truncatedFiles: 0,
-  results: new Map(),
-};
-let _sessionsHydrationHideTimer = null;
-let _sessionsHydrationState = {
-  active: false,
-  done: false,
-  error: '',
-  phase: 'idle',
-  received: 0,
-  limit: SESSION_LIST_RECENT_LIMIT,
-};
+// (State lives in the early client-state block near `let activeTab` —
+// the #sessions deep link reaches this code during script evaluation.)
 
 function sessionListLimitLabel(limit) {
   if (limit === 'all') return 'full history';
@@ -61035,10 +61048,8 @@ function applyLoadedSessions(sessions, aggEl) {
 // batches and background refreshes merge into _cachedSessions eagerly, but
 // the (expensive, full-list) DOM rebuild runs at most every 250ms, and only
 // while the Sessions pane is actually visible — otherwise one render is
-// deferred to the next pane entry.
-let _sessionsRenderTimer = null;
-let _sessionsRenderLastTs = 0;
-const SESSIONS_RENDER_MIN_INTERVAL_MS = 250;
+// deferred to the next pane entry. (Timer state sits in the early
+// client-state block — deep-link TDZ.)
 function renderSessionsListNow() {
   _sessionsRenderLastTs = Date.now();
   renderSessionsAggregate(_cachedSessions || [], document.getElementById('sessions-aggregate'));
@@ -61067,7 +61078,9 @@ function loadSessions(options = {}) {
   if (cached) {
     applyLoadedSessions(cached, aggEl);
   } else if (listEl) {
-    listEl.innerHTML = '<div class="empty-state">Loading sessions...</div>';
+    // Fresh (uncached) load replaces the list — reset the Show-more window.
+    sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
+    listEl.innerHTML = '<div class="ui-skel sessions-skel-card"></div>'.repeat(6);
   }
 
   const token = ++_sessionsLoadToken;
@@ -61383,7 +61396,7 @@ function sessionLineageOpenSession(sourceSession, targetSession, targetId, ev = 
 
 function createSessionLineageListChip(sourceSession, targetSession, targetId, text, title) {
   const chip = document.createElement(targetId ? 'button' : 'span');
-  chip.className = 'sc-role sc-lineage-chip';
+  chip.className = 'ui-chip muted sc-role sc-lineage-chip';
   chip.textContent = text;
   chip.title = title || text;
   if (targetId) {
@@ -61512,12 +61525,16 @@ function renderSessionsViews() {
   }
 }
 
+// Data-change rerender: keeps the user's expanded Show-more window.
 function _refilterSessions() {
   if (sessionsLoaded) {
     renderSessionsViews();
   }
 }
+// Filter/search/sort change: the visible set changes shape, so the
+// Show-more window snaps back to the default page size.
 function _refreshSessionsFilters() {
+  sessionsRenderWindow = SESSION_CARD_RENDER_LIMIT;
   _refilterSessions();
 }
 
@@ -61776,23 +61793,23 @@ function setupSessionMultiFilter(kind, onChange) {
 }
 
 setupSessionMultiFilter('source', _refreshSessionsFilters);
-setupSessionMultiFilter('status', _refilterSessions);
+setupSessionMultiFilter('status', _refreshSessionsFilters);
 setupSessionMultiFilter('project', _refreshSessionsFilters);
-setupSessionMultiFilter('deep-project', _refilterSessions);
-setupSessionMultiFilter('deep-source', _refilterSessions);
-setupSessionMultiFilter('deep-status', _refilterSessions);
+setupSessionMultiFilter('deep-project', _refreshSessionsFilters);
+setupSessionMultiFilter('deep-source', _refreshSessionsFilters);
+setupSessionMultiFilter('deep-status', _refreshSessionsFilters);
 document.addEventListener('click', () => closeSessionMultiFilterMenus());
 document.addEventListener('keydown', (ev) => {
   if (ev.key === 'Escape') closeSessionMultiFilterMenus();
 });
-document.getElementById('sort-sessions')?.addEventListener('change', _refilterSessions);
+document.getElementById('sort-sessions')?.addEventListener('change', _refreshSessionsFilters);
 document.getElementById('sessions-search')?.addEventListener('input', _refreshSessionsFilters);
 document.getElementById('sessions-show-subagents')?.addEventListener('change', (ev) => {
   localStorage.setItem(SESSIONS_SHOW_SUBAGENTS_KEY, String(!!ev.target.checked));
-  _refilterSessions();
+  _refreshSessionsFilters();
 });
-document.getElementById('sort-sessions-deep')?.addEventListener('change', _refilterSessions);
-document.getElementById('sessions-deep-result-search')?.addEventListener('input', _refilterSessions);
+document.getElementById('sort-sessions-deep')?.addEventListener('change', _refreshSessionsFilters);
+document.getElementById('sessions-deep-result-search')?.addEventListener('input', _refreshSessionsFilters);
 document.getElementById('sessions-deep-search-run')?.addEventListener('click', () => runSessionDeepSearch());
 document.getElementById('sessions-deep-search-cancel')?.addEventListener('click', () => cancelSessionDeepSearch('Deep search cancelled.'));
 document.getElementById('sessions-deep-search-clear')?.addEventListener('click', clearSessionDeepSearch);
@@ -61869,7 +61886,7 @@ document.getElementById('sessions-search')?.addEventListener('keydown', (ev) => 
 document.getElementById('sessions-deep-result-search')?.addEventListener('keydown', (ev) => {
   if (ev.key !== 'Escape' || !ev.currentTarget.value) return;
   ev.currentTarget.value = '';
-  _refilterSessions();
+  _refreshSessionsFilters();
   ev.stopPropagation();
 });
 
@@ -61881,6 +61898,50 @@ function sessionDateSortValue(session, field) {
     : raw;
   const parsed = Date.parse(normalized);
   return Number.isNaN(parsed) ? 0 : parsed;
+}
+
+// Status tones are reserved meaning (see the .ui-* primitives): ok=finished,
+// info=running, err=failed/interrupted, muted=idle/unknown.
+function sessionStatusChipTone(status) {
+  switch (status) {
+    case 'completed':
+    case 'done':
+      return 'ok';
+    case 'in_progress':
+    case 'running':
+    case 'active':
+      return 'info';
+    case 'failed':
+    case 'error':
+      return 'err';
+    case 'interrupted':
+      return 'warn';
+    default:
+      return 'muted';
+  }
+}
+
+// "3m ago" style label for card meta rows; absolute timestamps stay in the
+// tooltip. Falls back to '' (caller shows the raw value) if unparseable.
+function sessionRelativeLabel(value) {
+  if (!value) return '';
+  const normalized = typeof value === 'string' && value.includes(' ') && !value.includes('T')
+    ? value.replace(' ', 'T')
+    : value;
+  const parsed = Date.parse(normalized);
+  if (Number.isNaN(parsed)) return '';
+  const diff = Date.now() - parsed;
+  if (diff < 0) return 'just now';
+  const mins = Math.floor(diff / 60000);
+  if (mins < 1) return 'just now';
+  if (mins < 60) return `${mins}m ago`;
+  const hours = Math.floor(mins / 60);
+  if (hours < 24) return `${hours}h ago`;
+  const days = Math.floor(hours / 24);
+  if (days < 30) return `${days}d ago`;
+  const months = Math.floor(days / 30);
+  if (months < 12) return `${months}mo ago`;
+  return `${Math.floor(days / 365)}y ago`;
 }
 
 function sessionSearchQuery() {
@@ -62141,7 +62202,7 @@ function runSessionDeepSearch() {
       };
       _sessionDeepSearchAbort = null;
       setSessionDeepSearchLoading(false);
-      _refilterSessions();
+      _refreshSessionsFilters();
     });
   };
   executeSearch();
@@ -62165,7 +62226,7 @@ function cancelSessionDeepSearch(message = '') {
     results: new Map(),
   };
   setSessionDeepSearchLoading(false);
-  _refilterSessions();
+  _refreshSessionsFilters();
 }
 
 function clearSessionDeepSearch() {
@@ -62188,7 +62249,7 @@ function clearSessionDeepSearch() {
     truncatedFiles: 0,
     results: new Map(),
   };
-  _refilterSessions();
+  _refreshSessionsFilters();
 }
 
 function sessionDeepSearchHit(session, source) {
@@ -62290,8 +62351,12 @@ function renderSessionsAggregate(sessions, el) {
   const totalDiskBytes = sessions.reduce((sum, s) => sum + (s.total_bytes || 0), 0);
   const loadingValue = 'Loading';
 
+  const sessionsSubParts = [];
+  if (detailsLoading) sessionsSubParts.push('visible so far');
+  if (externalSessions > 0) sessionsSubParts.push(`${externalSessions.toLocaleString()} external`);
+  if (activeSessions > 0) sessionsSubParts.push(`${activeSessions.toLocaleString()} active`);
   const cards = [
-    { label: 'Sessions', value: totalSessions.toLocaleString() + (detailsLoading ? ' visible' : '') + (externalSessions > 0 ? ` (${externalSessions} external)` : '') + (activeSessions > 0 ? ` (${activeSessions} active)` : '') },
+    { label: 'Sessions', value: totalSessions.toLocaleString(), sub: sessionsSubParts.join(' · ') },
     { label: 'Total Tokens', value: detailsLoading ? loadingValue : totalTokens.toLocaleString(), loading: detailsLoading },
     { label: 'Input', value: detailsLoading ? loadingValue : totalInput.toLocaleString(), loading: detailsLoading },
     { label: 'Cached', value: detailsLoading ? loadingValue : totalCached.toLocaleString(), loading: detailsLoading },
@@ -62299,17 +62364,29 @@ function renderSessionsAggregate(sessions, el) {
     { label: 'Disk', value: detailsLoading ? loadingValue : _fmtBytes(totalDiskBytes), loading: detailsLoading },
   ];
 
+  renderAggregateStatTiles(el, cards);
+}
+
+// Shared ui-stat tile builder for the Sessions/Worktrees aggregate strips.
+// Tiles keep the legacy .agg-* classes (JS/QA hooks) alongside .ui-stat.
+function renderAggregateStatTiles(el, cards) {
   for (const c of cards) {
     const card = document.createElement('div');
-    card.className = 'agg-card' + (c.loading ? ' loading' : '');
+    card.className = 'ui-stat agg-card' + (c.loading ? ' loading' : '');
     const labelEl = document.createElement('div');
-    labelEl.className = 'agg-label';
+    labelEl.className = 'ui-stat-label agg-label';
     labelEl.textContent = c.label;
     const valueEl = document.createElement('div');
-    valueEl.className = 'agg-value';
+    valueEl.className = 'ui-stat-value agg-value';
     valueEl.textContent = c.value;
     card.appendChild(labelEl);
     card.appendChild(valueEl);
+    if (c.sub) {
+      const subEl = document.createElement('div');
+      subEl.className = 'ui-stat-sub agg-sub';
+      subEl.textContent = c.sub;
+      card.appendChild(subEl);
+    }
     el.appendChild(card);
   }
 }
@@ -62430,7 +62507,7 @@ function renderSessionsList(sessions, el, options = {}) {
     }
 
     matchedCount += 1;
-    if (renderedCount >= SESSION_CARD_RENDER_LIMIT) continue;
+    if (renderedCount >= sessionsRenderWindow) continue;
     renderedCount += 1;
 
     const rowIsPartial = s.partial === true;
@@ -62473,12 +62550,12 @@ function renderSessionsList(sessions, el, options = {}) {
     top.appendChild(titleBlock);
 
     const statusEl = document.createElement('span');
-    statusEl.className = 'sc-status ' + displayStatus;
+    statusEl.className = `ui-chip ${sessionStatusChipTone(displayStatus)} sc-status ${displayStatus}`;
     statusEl.textContent = displayStatus.replace('_', ' ');
     top.appendChild(statusEl);
 
     const sourceEl = document.createElement('span');
-    sourceEl.className = 'sc-source' + (isExternal ? '' : ' local');
+    sourceEl.className = 'ui-badge sc-source' + (isExternal ? '' : ' local');
     sourceEl.textContent = isExternal
       ? (
         s.source_label ||
@@ -62496,7 +62573,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
     if (rowIsPartial) {
       const loadingEl = document.createElement('span');
-      loadingEl.className = 'sc-role sc-loading-chip';
+      loadingEl.className = 'ui-chip info sc-role sc-loading-chip';
       loadingEl.textContent = 'loading details';
       loadingEl.title = 'Tokens, costs, lineage, and disk sizes are still hydrating';
       top.appendChild(loadingEl);
@@ -62504,7 +62581,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
     if (s.role) {
       const roleEl = document.createElement('span');
-      roleEl.className = 'sc-role';
+      roleEl.className = 'ui-chip muted sc-role';
       roleEl.textContent = s.role;
       top.appendChild(roleEl);
     }
@@ -62531,7 +62608,7 @@ function renderSessionsList(sessions, el, options = {}) {
       .filter(child => !hideSubagents || sessionRelationshipKindForRow(child) !== 'subagent');
     if (lineageChildren.length > 0) {
       const childrenEl = document.createElement('span');
-      childrenEl.className = 'sc-role sc-lineage-chip sc-lineage-children';
+      childrenEl.className = 'ui-chip muted sc-role sc-lineage-chip sc-lineage-children';
       childrenEl.textContent = lineageChildren.length === 1 ? '1 child' : `${lineageChildren.length} children`;
       childrenEl.title = lineageChildren
         .slice(0, 8)
@@ -62546,7 +62623,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
     if (isCurrent) {
       const badge = document.createElement('span');
-      badge.className = 'sc-current-badge';
+      badge.className = 'ui-chip info sc-current-badge';
       badge.textContent = 'current';
       top.appendChild(badge);
     }
@@ -62579,51 +62656,32 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(hitEl);
     }
 
-    // Meta row
+    // Meta row — compact essentials only; the long tail (id, absolute
+    // dates, provider, token breakdown, disk) moves to the row tooltip and
+    // stays visible in the session-detail overlay.
     const meta = document.createElement('div');
     meta.className = 'sc-meta';
-
-    if (sessionId || shortId) {
-      const id = document.createElement('span');
-      const idLabel = document.createElement('span');
-      idLabel.className = 'label';
-      idLabel.textContent = 'id';
-      const idVal = document.createElement('span');
-      idVal.className = 'value sc-id';
-      idVal.textContent = sessionId || shortId;
-      idVal.title = sessionId || shortId;
-      id.appendChild(idLabel);
-      id.appendChild(idVal);
-      meta.appendChild(id);
-    }
-
-    if (s.created_at) {
-      const ts = document.createElement('span');
-      const tsLabel = document.createElement('span');
-      tsLabel.className = 'label';
-      tsLabel.textContent = 'created';
-      const tsVal = document.createElement('span');
-      tsVal.className = 'value';
-      tsVal.textContent = s.created_at;
-      ts.appendChild(tsLabel);
-      ts.appendChild(tsVal);
-      meta.appendChild(ts);
-    }
+    const addMetaField = (label, value, valueClass, valueTitle) => {
+      if (value === null || value === undefined || value === '') return;
+      const span = document.createElement('span');
+      const l = document.createElement('span');
+      l.className = 'label';
+      l.textContent = label;
+      const v = document.createElement('span');
+      v.className = 'value' + (valueClass ? ` ${valueClass}` : '');
+      v.textContent = value;
+      if (valueTitle) v.title = valueTitle;
+      span.appendChild(l);
+      span.appendChild(v);
+      meta.appendChild(span);
+    };
 
     const changedAt = s.updated_at || s.changed_at;
-    if (changedAt) {
-      const ts = document.createElement('span');
-      const tsLabel = document.createElement('span');
-      tsLabel.className = 'label';
-      tsLabel.textContent = 'changed';
-      const tsVal = document.createElement('span');
-      tsVal.className = 'value';
-      tsVal.textContent = changedAt;
-      ts.appendChild(tsLabel);
-      ts.appendChild(tsVal);
-      meta.appendChild(ts);
-    }
-
+    if (changedAt) addMetaField('changed', sessionRelativeLabel(changedAt) || changedAt, null, changedAt);
+    const projectPath = sessionProjectDirectory(s);
+    if (projectPath) addMetaField('project', compactPathLabel(projectPath), null, projectPath);
+    if (s.model) addMetaField('model', s.model, 'model-val');
+    if (s.turns > 0) addMetaField('turns', s.turns);
     if (rowIsPartial) {
       const loading = document.createElement('span');
       loading.className = 'sc-loading-meta';
@@ -62636,102 +62694,45 @@ function renderSessionsList(sessions, el, options = {}) {
       loading.appendChild(loadingLabel);
       loading.appendChild(loadingVal);
       meta.appendChild(loading);
+    } else {
+      if (s.total_tokens > 0) addMetaField('tokens', s.total_tokens.toLocaleString());
+      if (s.estimated_cost > 0) addMetaField('cost', formatUsd(s.estimated_cost, 2));
     }
 
-    if (s.provider) {
-      const prov = document.createElement('span');
-      const provLabel = document.createElement('span');
-      provLabel.className = 'label';
-      provLabel.textContent = 'provider';
-      const provVal = document.createElement('span');
-      provVal.className = 'value provider-val';
-      provVal.textContent = s.provider;
-      prov.appendChild(provLabel);
-      prov.appendChild(provVal);
-      meta.appendChild(prov);
-    }
-
-    if (s.model) {
-      const mod = document.createElement('span');
-      const modLabel = document.createElement('span');
-      modLabel.className = 'label';
-      modLabel.textContent = 'model';
-      const modVal = document.createElement('span');
-      modVal.className = 'value model-val';
-      modVal.textContent = s.model;
-      mod.appendChild(modLabel);
-      mod.appendChild(modVal);
-      meta.appendChild(mod);
-    }
-
-    if (s.turns > 0) {
-      const turns = document.createElement('span');
-      const turnsLabel = document.createElement('span');
-      turnsLabel.className = 'label';
-      turnsLabel.textContent = 'turns';
-      const turnsVal = document.createElement('span');
-      turnsVal.className = 'value';
-      turnsVal.textContent = s.turns;
-      turns.appendChild(turnsLabel);
-      turns.appendChild(turnsVal);
-      meta.appendChild(turns);
-    }
-
+    const tipParts = [];
+    if (sessionId || shortId) tipParts.push(`id: ${sessionId || shortId}`);
+    if (s.created_at) tipParts.push(`created: ${s.created_at}`);
+    if (changedAt) tipParts.push(`changed: ${changedAt}`);
+    if (s.provider) tipParts.push(`provider: ${s.provider}`);
     if (!rowIsPartial && s.total_tokens > 0) {
-      const addTokField = (label, value, color) => {
-        const span = document.createElement('span');
-        const l = document.createElement('span');
-        l.className = 'label';
-        l.textContent = label;
-        const v = document.createElement('span');
-        v.className = 'value';
-        v.textContent = value.toLocaleString();
-        if (color) v.style.color = color;
-        span.appendChild(l);
-        span.appendChild(v);
-        meta.appendChild(span);
-      };
-      addTokField('in', s.prompt_tokens || 0);
-      if (s.cached_tokens > 0) addTokField('cached', s.cached_tokens, 'var(--green)');
-      addTokField('out', s.completion_tokens || 0);
+      tipParts.push(`tokens: ${(s.prompt_tokens || 0).toLocaleString()} in${s.cached_tokens > 0 ? ` (${s.cached_tokens.toLocaleString()} cached)` : ''} / ${(s.completion_tokens || 0).toLocaleString()} out`);
     }
-
-    if (!rowIsPartial && s.estimated_cost > 0) {
-      const cost = document.createElement('span');
-      const costLabel = document.createElement('span');
-      costLabel.className = 'label';
-      costLabel.textContent = 'cost';
-      const costVal = document.createElement('span');
-      costVal.className = 'value';
-      costVal.style.color = 'var(--green)';
-      costVal.textContent = formatUsd(s.estimated_cost, 4);
-      cost.appendChild(costLabel);
-      cost.appendChild(costVal);
-      meta.appendChild(cost);
-    }
+    if (!rowIsPartial && s.total_bytes > 0) tipParts.push(`disk: ${_fmtBytes(s.total_bytes)}`);
+    if (projectPath) tipParts.push(`project: ${projectPath}`);
+    if (tipParts.length) meta.title = tipParts.join('\n');
+    card.appendChild(meta);
 
     // Media stats row (recordings, annotations, clips) + total session size
     const hasMedia = (s.recordings > 0 || s.annotations > 0 || s.clips > 0);
-    if (!rowIsPartial && (hasMedia || s.total_bytes > 0)) {
+    if (!rowIsPartial && hasMedia) {
       const mediaMeta = document.createElement('div');
       mediaMeta.className = 'sc-meta sc-media';
-      const addMediaField = (label, value, color) => {
+      const addMediaField = (label, value, valueClass) => {
         const span = document.createElement('span');
         const l = document.createElement('span');
         l.className = 'label';
         l.textContent = label;
         const v = document.createElement('span');
-        v.className = 'value';
+        v.className = 'value' + (valueClass ? ` ${valueClass}` : '');
         v.textContent = value;
-        if (color) v.style.color = color;
         span.appendChild(l);
         span.appendChild(v);
         mediaMeta.appendChild(span);
       };
-      if (s.recordings > 0) addMediaField('recordings', s.recordings, 'var(--blue)');
-      if (s.annotations > 0) addMediaField('annotations', s.annotations, 'var(--peach)');
-      if (s.clips > 0) addMediaField('clips', s.clips, 'var(--peach)');
-      if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'var(--overlay1)');
+      if (s.recordings > 0) addMediaField('recordings', s.recordings, 'v-blue');
+      if (s.annotations > 0) addMediaField('annotations', s.annotations, 'v-peach');
+      if (s.clips > 0) addMediaField('clips', s.clips, 'v-peach');
+      if (s.total_bytes > 0) addMediaField('size', _fmtBytes(s.total_bytes), 'v-dim');
       card.appendChild(mediaMeta);
     }
 
@@ -62742,7 +62743,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
       if (s.can_resume !== false) {
         const resumeBtn = document.createElement('button');
-        resumeBtn.className = 'sc-resume-btn';
+        resumeBtn.className = 'ui-btn sc-resume-btn';
         resumeBtn.textContent = 'Resume session';
         resumeBtn.title = 'Resume this session in Activity';
         resumeBtn.addEventListener('click', (e) => {
@@ -62754,7 +62755,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
       if (sessionId) {
         const renameBtn = document.createElement('button');
-        renameBtn.className = 'sc-rename-btn';
+        renameBtn.className = 'ui-btn sc-rename-btn';
         renameBtn.textContent = 'Rename';
         renameBtn.title = 'Rename this session';
         renameBtn.addEventListener('click', (e) => {
@@ -62766,7 +62767,7 @@ function renderSessionsList(sessions, el, options = {}) {
 
       if (sessionId && configSource && configSource !== 'intendant') {
         const configBtn = document.createElement('button');
-        configBtn.className = 'sc-rename-btn';
+        configBtn.className = 'ui-btn sc-rename-btn';
         configBtn.textContent = 'Configure';
         configBtn.title = 'Configure binary and managed context for this session';
         configBtn.addEventListener('click', (e) => {
@@ -62787,7 +62788,7 @@ function renderSessionsList(sessions, el, options = {}) {
           ? s.total_bytes
           : (s.intendant_total_bytes || 0);
         const btn = document.createElement('button');
-        btn.className = 'sc-delete-btn';
+        btn.className = 'ui-btn danger sc-delete-btn';
         btn.textContent = 'Delete...';
         btn.addEventListener('click', (e) => {
           e.stopPropagation();
@@ -62837,7 +62838,6 @@ function renderSessionsList(sessions, el, options = {}) {
       card.appendChild(actions);
     }
 
-    card.appendChild(meta);
     card.addEventListener('click', () => openSessionDetail(s));
     fragment.appendChild(card);
   }
@@ -62860,16 +62860,27 @@ function renderSessionsList(sessions, el, options = {}) {
   } else {
     el.appendChild(fragment);
     if (matchedCount > renderedCount) {
-      const limitNotice = document.createElement('div');
-      limitNotice.className = 'empty-state';
-      limitNotice.textContent = `Showing ${renderedCount.toLocaleString()} of ${matchedCount.toLocaleString()} matching sessions. Refine filters to narrow results.`;
-      el.appendChild(limitNotice);
+      const remaining = matchedCount - renderedCount;
+      const moreRow = document.createElement('div');
+      moreRow.className = 'sessions-show-more';
+      const moreBtn = document.createElement('button');
+      moreBtn.type = 'button';
+      moreBtn.className = 'ui-btn sessions-show-more-btn';
+      moreBtn.textContent = `Show ${Math.min(SESSION_CARD_RENDER_LIMIT, remaining).toLocaleString()} more (${remaining.toLocaleString()} remaining)`;
+      moreBtn.onclick = () => {
+        sessionsRenderWindow += SESSION_CARD_RENDER_LIMIT;
+        renderSessionsViews();
+      };
+      moreRow.appendChild(moreBtn);
+      el.appendChild(moreRow);
     }
   }
 
 }
 
 function _refilterWorktrees() {
+  // Filter/search/sort change — snap the Show-more window back.
+  worktreesRenderWindow = WORKTREE_CARD_RENDER_LIMIT;
   if (worktreesLoaded && _cachedWorktreeScan) {
     renderWorktrees(_cachedWorktreeScan);
   }
@@ -62930,10 +62941,9 @@ function loadWorktrees(options = {}) {
   if (!listEl) return Promise.resolve(null);
   if (worktreesLoadInFlight === 'scan') {
     setWorktreesLoadPending(true, 'scan');
+    // The activity banner is the single scan-progress surface; the
+    // #worktrees-status text line only reports scan results/errors.
     setWorktreesActivityNotice('pending', 'Scanning worktrees...');
-    if (activeSessionsSubtab === 'worktrees') {
-      setWorktreesStatus('Scanning worktrees...');
-    }
     return worktreesLoadPromise || Promise.resolve(_cachedWorktreeScan);
   }
   if (worktreesLoadInFlight === 'cache' && !forceScan) {
@@ -63029,21 +63039,9 @@ function renderWorktreesAggregate(scan, el) {
     { label: 'Dirty', value: Number(summary.dirty || 0).toLocaleString() },
     { label: 'Unmerged', value: Number(summary.unmerged || 0).toLocaleString() },
     { label: 'Active', value: Number(summary.active || 0).toLocaleString() },
-    { label: 'Candidates', value: Number(summary.cleanup_candidates || 0).toLocaleString() },
+    { label: 'Candidates', value: Number(summary.cleanup_candidates || 0).toLocaleString(), sub: summary.cleanup_candidates > 0 ? 'safe to remove' : '' },
   ];
-  for (const c of cards) {
-    const card = document.createElement('div');
-    card.className = 'agg-card';
-    const labelEl = document.createElement('div');
-    labelEl.className = 'agg-label';
-    labelEl.textContent = c.label;
-    const valueEl = document.createElement('div');
-    valueEl.className = 'agg-value';
-    valueEl.textContent = c.value;
-    card.appendChild(labelEl);
-    card.appendChild(valueEl);
-    el.appendChild(card);
-  }
+  renderAggregateStatTiles(el, cards);
 }
 
 function worktreeDate(value) {
@@ -63331,7 +63329,7 @@ function renderWorktreeInspectCommands(wt) {
     main.appendChild(code);
     const copy = document.createElement('button');
     copy.type = 'button';
-    copy.className = 'sc-resume-btn';
+    copy.className = 'ui-btn sc-resume-btn';
     copy.textContent = 'Copy';
     copy.addEventListener('click', () => {
       copyTextToClipboard(item.command).then(
@@ -63590,6 +63588,11 @@ function renderWorktreesList(scan, el) {
     return;
   }
 
+  const totalRows = rows.length;
+  if (rows.length > worktreesRenderWindow) {
+    rows = rows.slice(0, worktreesRenderWindow);
+  }
+
   for (const wt of rows) {
     const pathKey = String(wt.path || '');
     const removalState = worktreeRemovalState(pathKey);
@@ -63628,8 +63631,9 @@ function renderWorktreesList(scan, el) {
     titleBlock.appendChild(pathEl);
     top.appendChild(titleBlock);
 
+    const wtStatus = removalState ? 'in_progress' : (wt.safe_to_remove ? 'completed' : (wt.dirty || wt.merge_status === 'unmerged' ? 'interrupted' : 'idle'));
     const statusEl = document.createElement('span');
-    statusEl.className = 'sc-status ' + (removalState ? 'in_progress' : (wt.safe_to_remove ? 'completed' : (wt.dirty || wt.merge_status === 'unmerged' ? 'interrupted' : 'idle')));
+    statusEl.className = `ui-chip ${sessionStatusChipTone(wtStatus)} sc-status ${wtStatus}`;
     statusEl.textContent = removalState || (wt.safe_to_remove ? 'candidate' : wt.recommended_action || 'review');
     top.appendChild(statusEl);
     card.appendChild(top);
@@ -63651,35 +63655,34 @@ function renderWorktreesList(scan, el) {
 
     const meta = document.createElement('div');
     meta.className = 'sc-meta';
-    const addMeta = (label, value, color, title) => {
+    const addMeta = (label, value, valueClass, title) => {
       if (value === null || value === undefined || value === '') return;
       const span = document.createElement('span');
       const l = document.createElement('span');
       l.className = 'label';
       l.textContent = label;
       const v = document.createElement('span');
-      v.className = 'value';
+      v.className = 'value' + (valueClass ? ` ${valueClass}` : '');
       v.textContent = value;
       if (title) v.title = title;
-      if (color) v.style.color = color;
       span.appendChild(l);
       span.appendChild(v);
       meta.appendChild(span);
     };
     addMeta('repo', wt.repo_name);
-    addMeta('size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''), wt.safe_to_remove ? 'var(--green)' : null);
+    addMeta('size', _fmtBytes(wt.size_bytes || 0) + (wt.size_truncated ? ' +' : ''), wt.safe_to_remove ? 'v-green' : null);
     addMeta('changed', fmtWorktreeMinute(wt.last_changed_at), null, wt.last_changed_at || '');
     addMeta('commit', fmtWorktreeMinute(wt.head_author_time), null, wt.head_author_time || '');
-    addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'var(--green)' : (wt.merge_status === 'unmerged' ? 'var(--red)' : null));
+    addMeta('merge', wt.merge_status, wt.merge_status === 'merged' ? 'v-green' : (wt.merge_status === 'unmerged' ? 'v-red' : null));
     if (wt.default_branch && (wt.default_ahead || wt.default_behind)) {
-      addMeta('base', formatWorktreeDivergence(wt.default_branch, wt.default_ahead, wt.default_behind), (wt.default_behind || 0) > 0 ? 'var(--yellow)' : null, wt.default_branch);
+      addMeta('base', formatWorktreeDivergence(wt.default_branch, wt.default_ahead, wt.default_behind), (wt.default_behind || 0) > 0 ? 'v-yellow' : null, wt.default_branch);
     }
     if (wt.upstream && (!wt.default_branch || wt.upstream !== wt.default_branch) && (wt.ahead || wt.behind)) {
       addMeta('tracking', formatWorktreeDivergence(wt.upstream, wt.ahead, wt.behind), null, wt.upstream);
     }
-    if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'var(--red)');
+    if (wt.dirty) addMeta('changes', `${wt.staged || 0} staged, ${wt.unstaged || 0} unstaged, ${wt.untracked || 0} untracked`, 'v-red');
     if ((wt.active_sessions || 0) > 0 || (wt.related_session_count || 0) > 0) {
-      addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'var(--yellow)' : null);
+      addMeta('sessions', `${wt.active_sessions || 0} active / ${wt.related_session_count || 0} related`, (wt.active_sessions || 0) > 0 ? 'v-yellow' : null);
     }
     addMeta('files', `${Number(wt.file_count || 0).toLocaleString()} files`);
     card.appendChild(meta);
@@ -63687,7 +63690,7 @@ function renderWorktreesList(scan, el) {
     const actions = document.createElement('div');
     actions.className = 'sc-actions';
     const copyPath = document.createElement('button');
-    copyPath.className = 'sc-delete-btn';
+    copyPath.className = 'ui-btn sc-copy-btn';
     copyPath.textContent = 'Copy path';
     copyPath.addEventListener('click', (ev) => {
       ev.stopPropagation();
@@ -63699,7 +63702,7 @@ function renderWorktreesList(scan, el) {
     actions.appendChild(copyPath);
 
     const inspectBtn = document.createElement('button');
-    inspectBtn.className = 'sc-resume-btn';
+    inspectBtn.className = 'ui-btn sc-resume-btn';
     inspectBtn.textContent = 'Inspect';
     inspectBtn.title = 'Inspect review reasons, dirty files, and cleanup commands';
     inspectBtn.addEventListener('click', (ev) => {
@@ -63711,7 +63714,7 @@ function renderWorktreesList(scan, el) {
     if (wt.safe_to_remove) {
       const command = worktreeRemoveCommand(wt);
       const removeBtn = document.createElement('button');
-      removeBtn.className = 'sc-delete-btn';
+      removeBtn.className = 'ui-btn danger sc-delete-btn';
       removeBtn.textContent = queued ? 'Queued...' : (removing ? 'Removing...' : 'Remove worktree...');
       removeBtn.title = 'Re-check safety and remove this worktree';
       removeBtn.disabled = !!removalState;
@@ -63723,7 +63726,7 @@ function renderWorktreesList(scan, el) {
       actions.appendChild(removeBtn);
 
       const copyCmd = document.createElement('button');
-      copyCmd.className = 'sc-resume-btn';
+      copyCmd.className = 'ui-btn sc-copy-btn';
       copyCmd.textContent = 'Copy remove command';
       copyCmd.disabled = !!removalState;
       copyCmd.addEventListener('click', (ev) => {
@@ -63742,6 +63745,22 @@ function renderWorktreesList(scan, el) {
     }
     card.appendChild(actions);
     el.appendChild(card);
+  }
+
+  if (totalRows > rows.length) {
+    const remaining = totalRows - rows.length;
+    const moreRow = document.createElement('div');
+    moreRow.className = 'sessions-show-more';
+    const moreBtn = document.createElement('button');
+    moreBtn.type = 'button';
+    moreBtn.className = 'ui-btn sessions-show-more-btn';
+    moreBtn.textContent = `Show ${Math.min(WORKTREE_CARD_RENDER_LIMIT, remaining).toLocaleString()} more (${remaining.toLocaleString()} remaining)`;
+    moreBtn.onclick = () => {
+      worktreesRenderWindow += WORKTREE_CARD_RENDER_LIMIT;
+      if (_cachedWorktreeScan) renderWorktrees(_cachedWorktreeScan);
+    };
+    moreRow.appendChild(moreBtn);
+    el.appendChild(moreRow);
   }
 }
 
@@ -63932,6 +63951,39 @@ function renderSessionDetailTitle(session) {
     subline.appendChild(subText);
     titleEl.appendChild(subline);
   }
+
+  // Long-tail stats trimmed from the list cards stay visible here.
+  const stats = document.createElement('div');
+  stats.className = 'sd-meta-strip';
+  const addStat = (label, value, valueTitle) => {
+    if (value === null || value === undefined || value === '') return;
+    const span = document.createElement('span');
+    const l = document.createElement('span');
+    l.className = 'label';
+    l.textContent = label;
+    const v = document.createElement('span');
+    v.className = 'value';
+    v.textContent = value;
+    if (valueTitle) v.title = valueTitle;
+    span.appendChild(l);
+    span.appendChild(v);
+    stats.appendChild(span);
+  };
+  addStat('created', session.created_at);
+  addStat('changed', session.updated_at || session.changed_at);
+  addStat('provider', session.provider);
+  addStat('model', session.model);
+  if (session.turns > 0) addStat('turns', session.turns);
+  if (session.total_tokens > 0) {
+    addStat('in', (session.prompt_tokens || 0).toLocaleString());
+    if (session.cached_tokens > 0) addStat('cached', session.cached_tokens.toLocaleString());
+    addStat('out', (session.completion_tokens || 0).toLocaleString());
+    addStat('total', session.total_tokens.toLocaleString());
+  }
+  if (session.estimated_cost > 0) addStat('cost', formatUsd(session.estimated_cost, 4));
+  if (session.total_bytes > 0) addStat('disk', _fmtBytes(session.total_bytes));
+  if (stats.children.length > 0) titleEl.appendChild(stats);
+
   renderSessionDetailLineage(titleEl, session);
 
   const renameBtn = document.getElementById('session-detail-rename');
@@ -64003,7 +64055,7 @@ function openSessionDetail(sessionOrId, taskArg) {
   const detailContext = sessionDetailContextForSubtab(detailSubtab);
   if (!detailEl || !logsEl || !prepareSessionDetailContext(detailContext, detailEl)) return;
 
-  detailEl.style.display = 'flex';
+  detailEl.classList.remove('hidden');
   currentSessionDetail = { ...session, source };
   renderSessionDetailTitle(currentSessionDetail);
   logsEl.innerHTML = '<div class="empty-state">Loading...</div>';
@@ -64011,8 +64063,8 @@ function openSessionDetail(sessionOrId, taskArg) {
 
   // Reset sections
   revokeSessionFrameObjectUrls();
-  document.getElementById('sd-recordings').style.display = 'none';
-  document.getElementById('sd-frames').style.display = 'none';
+  document.getElementById('sd-recordings').classList.add('hidden');
+  document.getElementById('sd-frames').classList.add('hidden');
   document.getElementById('session-detail-frames').innerHTML = '';
 
   const detailSessionId = sessionId;
@@ -64059,11 +64111,11 @@ function closeSessionDetail() {
   revokeSessionFrameObjectUrls();
   document.getElementById('session-detail-recordings').innerHTML = '';
   document.getElementById('session-detail-frames').innerHTML = '';
-  document.getElementById('sd-recordings').style.display = 'none';
-  document.getElementById('sd-frames').style.display = 'none';
+  document.getElementById('sd-recordings').classList.add('hidden');
+  document.getElementById('sd-frames').classList.add('hidden');
 
   restoreSessionDetailContext(currentSessionDetailContext || sessionDetailContextForSubtab(activeSessionsSubtab));
-  document.getElementById('session-detail').style.display = 'none';
+  document.getElementById('session-detail').classList.add('hidden');
   currentSessionDetail = null;
   currentSessionDetailContext = null;
   sessionDetailLogView = null;
@@ -64132,7 +64184,7 @@ async function sessionFrameAssetObjectUrl(sessionId, filename) {
 async function loadSessionRecordings(sessionId) {
   const container = document.getElementById('session-detail-recordings');
   const section = document.getElementById('sd-recordings');
-  section.style.display = 'none';
+  section.classList.add('hidden');
   container.innerHTML = '';
 
   let streams;
@@ -64145,7 +64197,7 @@ async function loadSessionRecordings(sessionId) {
   if (!Array.isArray(streams) || streams.length === 0) return;
 
   // Show the section
-  section.style.display = '';
+  section.classList.remove('hidden');
   const totalDur = streams.reduce((s, st) => s + (st.total_duration_secs || 0), 0);
   document.getElementById('sd-recordings-badge').textContent =
     streams.length + ' stream' + (streams.length > 1 ? 's' : '') +
@@ -64229,7 +64281,7 @@ function renderSessionFrames(sessionId, frames) {
   const container = document.getElementById('session-detail-frames');
   revokeSessionFrameObjectUrls();
   container.innerHTML = '';
-  section.style.display = '';
+  section.classList.remove('hidden');
 
   // Group frames by category
   const annotations = frames.filter(f => f.startsWith('ann-'));
