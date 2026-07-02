@@ -6217,6 +6217,40 @@ fn translate_notification_with_scope(
             );
         }
 
+        // Interrupted and failed turns terminate WITHOUT a `turn/completed`.
+        // They must still complete the drain: the terminal-observation dedup
+        // upstream marks the turn terminal on these methods and from then on
+        // suppresses the `thread/status/changed: idle` fallback, so a missing
+        // arm here strands the session in a running/thinking phase forever
+        // (stale dashboard status, follow-ups misrouted as steers).
+        "turn/interrupted" | "turn/failed" => {
+            if method == "turn/failed" {
+                let message = params
+                    .pointer("/error/message")
+                    .or_else(|| params.get("message"))
+                    .and_then(|v| v.as_str())
+                    .map(str::trim)
+                    .filter(|s| !s.is_empty())
+                    .unwrap_or("codex reported the turn as failed")
+                    .to_string();
+                send_scoped_agent_event(
+                    event_tx,
+                    thread_id,
+                    turn_id,
+                    AgentEvent::Log {
+                        level: "error".to_string(),
+                        message: format!("Codex turn failed: {message}"),
+                    },
+                );
+            }
+            send_scoped_agent_event(
+                event_tx,
+                thread_id,
+                turn_id,
+                AgentEvent::TurnCompleted { message: None },
+            );
+        }
+
         "turn/diff/updated" => {
             let unified_diff = params
                 .get("diff")
@@ -10022,6 +10056,59 @@ error: build failed
             AgentEvent::TurnCompleted { message } => {
                 assert_eq!(message, None);
             }
+            other => panic!("expected TurnCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_turn_interrupted_completes_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({"threadId": "thread-1", "turnId": "turn-1"});
+        translate_notification("turn/interrupted", &params, &tx);
+        let event = rx.try_recv().unwrap().into_scope().2;
+        match event {
+            AgentEvent::TurnCompleted { message } => assert_eq!(message, None),
+            other => panic!("expected TurnCompleted, got {:?}", other),
+        }
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[test]
+    fn translate_turn_failed_logs_error_and_completes_turn() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({
+            "threadId": "thread-1",
+            "turnId": "turn-1",
+            "error": {"message": "model backend exploded"},
+        });
+        translate_notification("turn/failed", &params, &tx);
+        let first = rx.try_recv().unwrap().into_scope().2;
+        match first {
+            AgentEvent::Log { level, message } => {
+                assert_eq!(level, "error");
+                assert!(message.contains("model backend exploded"), "log: {message}");
+            }
+            other => panic!("expected Log, got {:?}", other),
+        }
+        let second = rx.try_recv().unwrap().into_scope().2;
+        match second {
+            AgentEvent::TurnCompleted { message } => assert_eq!(message, None),
+            other => panic!("expected TurnCompleted, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn translate_turn_failed_without_error_message_still_completes() {
+        let (tx, mut rx) = mpsc::unbounded_channel();
+        let params = serde_json::json!({});
+        translate_notification("turn/failed", &params, &tx);
+        let first = rx.try_recv().unwrap();
+        match first {
+            AgentEvent::Log { level, .. } => assert_eq!(level, "error"),
+            other => panic!("expected Log, got {:?}", other),
+        }
+        match rx.try_recv().unwrap() {
+            AgentEvent::TurnCompleted { message } => assert_eq!(message, None),
             other => panic!("expected TurnCompleted, got {:?}", other),
         }
     }

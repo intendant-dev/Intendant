@@ -4517,6 +4517,9 @@ body.context-focus-active {
   flex: 1;
   min-height: 0;
   overflow-y: auto;
+  /* Scroll position is managed manually (trim/prune compensation, prepend
+     anchors) — native anchoring would double-adjust where it exists. */
+  overflow-anchor: none;
   padding: 3px 0;
 }
 .session-window:not(.header-collapsed):not(.minimized) .session-window-log {
@@ -4570,7 +4573,12 @@ body.context-focus-active {
   overflow-y: auto;
   overflow-x: hidden;
   padding: 4px 0;
-  scroll-behavior: smooth;
+  /* Scroll position is managed manually (pin-to-live, prune compensation).
+     Smooth behavior would animate programmatic pins — the scroll listener
+     then samples intermediate positions and un-pins mid-animation — and
+     native anchoring would double-adjust the manual compensation. */
+  scroll-behavior: auto;
+  overflow-anchor: none;
 }
 .log-entry {
   display: flex;
@@ -5197,13 +5205,19 @@ body.context-focus-active {
 .scroll-bottom-btn {
   position: absolute;
   bottom: 12px;
-  right: 20px;
-  width: 36px; height: 36px;
-  border-radius: 50%;
+  /* Bottom-center: the bottom-right corner belongs to the floating voice
+     overlay, which would sit on top of this pill and swallow its clicks. */
+  left: 50%;
+  transform: translateX(-50%);
+  min-width: 36px; height: 36px;
+  padding: 0 10px;
+  border-radius: 999px;
   background: var(--surface0);
   border: 1px solid var(--surface1);
   color: var(--text);
-  font-size: 16px;
+  font-size: 13px;
+  font-weight: 700;
+  white-space: nowrap;
   cursor: pointer;
   display: none;
   align-items: center;
@@ -13139,7 +13153,44 @@ window.__intendantPaneDiag = {
     for (const [tab, pending] of paneDeferredRenders) out[tab] = pending.size;
     return out;
   },
+  // QA hooks for the log scroll behavior (real append pipeline).
+  logAppendTest: (n = 50, text = 'synthetic log entry') => {
+    for (let i = 0; i < n; i++) {
+      renderLogEntry({ level: 'info', source: 'debug', content: `${text} ${i}` });
+    }
+  },
+  logMetrics: () => {
+    const s = document.getElementById('log-stream');
+    return {
+      scrollTop: s ? s.scrollTop : -1,
+      scrollHeight: s ? s.scrollHeight : -1,
+      clientHeight: s ? s.clientHeight : -1,
+      autoScroll,
+      logEntryCount,
+      newBelow: logNewBelowCount,
+    };
+  },
 };
+
+// While the reader is scrolled up in the live log, arriving entries never
+// move the view; they are counted on the jump-to-live button instead.
+let logNewBelowCount = 0;
+function noteMainLogNewBelow(count = 1) {
+  if (autoScroll || concurrentLogDetachedFragment) return;
+  logNewBelowCount += count;
+  const btn = document.getElementById('scroll-bottom');
+  if (!btn) return;
+  btn.classList.add('visible');
+  btn.textContent = (logNewBelowCount > 99 ? '99+' : String(logNewBelowCount)) + ' ↓';
+  btn.title = `${logNewBelowCount} new ${logNewBelowCount === 1 ? 'entry' : 'entries'} below — jump to live`;
+}
+function resetMainLogNewBelow() {
+  logNewBelowCount = 0;
+  const btn = document.getElementById('scroll-bottom');
+  if (!btn) return;
+  btn.textContent = '↓';
+  btn.title = 'Scroll to bottom';
+}
 
 let logEntryCount = 0;
 let commandOutputGroupSeq = 0;
@@ -21538,7 +21589,10 @@ function processCommands(cmds) {
         renderTurnSeparator(c.turn);
         break;
       case 'update_status_bar':
-        if (!processingLogReplay) recordRecentSessionStatusPhase(c.session_id, c.phase);
+        if (!processingLogReplay) {
+          recordRecentSessionStatusPhase(c.session_id, c.phase);
+          applyServerPhaseToSessionWindow(c.session_id, c.phase);
+        }
         pendingStatusPhaseGuard = { allow: shouldApplyStatusPhaseForSession(c.session_id) };
         updateStatusBar(c);
         stationScheduleUpdate();
@@ -26196,7 +26250,29 @@ function isSessionWindowSteerActive(sessionId) {
   if (hasPendingActiveSessionWindow(sid)) return true;
   const win = sessionWindows.get(sid);
   if (!win || !win.phase) return false;
+  // An external session still parked on its optimistic 'thinking' after the
+  // pending window expired is UNCERTAIN, not known-active: route the next
+  // message as a plain follow-up instead of a steer. (A wrong follow-up
+  // just starts the turn; a wrong steer stalls in the 2s fallback and is
+  // logged with steer semantics — the confusing case users hit.)
+  if (win.optimisticActiveExpired && normalizeSessionPhase(win.phase) === 'thinking') {
+    return false;
+  }
   return isSteerPhase(win.phase);
+}
+
+// Server status updates name their session: keep that window's phase
+// truthful even when it is not the prompt target (the global banner stays
+// gated on the target in the set_phase command). A server phase is
+// authoritative — it also retires the optimistic-active guard.
+function applyServerPhaseToSessionWindow(sessionId, phase) {
+  const sid = String(sessionId || '').trim();
+  if (!sid || !phase) return;
+  const win = sessionWindows.get(sid);
+  if (!win) return;
+  win.optimisticActiveExpired = false;
+  if (!isAgentActivePhase(normalizeSessionPhase(phase))) win.pendingActiveUntil = 0;
+  updateSessionWindow(sid, { phase });
 }
 
 function clearSessionWindowPendingActive(sessionId, phase = '') {
@@ -26233,6 +26309,7 @@ function markSessionWindowPendingActive(sessionId) {
   const win = ensureSessionWindow(sid, { phase: 'thinking', ended: false });
   if (!win) return;
   win.pendingActiveUntil = expiresAt;
+  win.optimisticActiveExpired = false;
   updateSessionWindow(sid, { phase: 'thinking', ended: false });
   if (sid === resolvePromptTargetSessionId()) {
     setPhase('thinking');
@@ -26243,7 +26320,11 @@ function markSessionWindowPendingActive(sessionId) {
     const latest = sessionWindows.get(sid);
     if (!latest || latest.pendingActiveUntil !== expiresAt) return;
     if (shouldKeepSilentExternalSessionActive(sid, latest)) {
+      // Keep DISPLAYING the window as thinking (silent external runtimes
+      // are often mid-turn without log lines), but flag the phase as
+      // unconfirmed so the steer/follow-up decision stops trusting it.
       latest.pendingActiveUntil = 0;
+      latest.optimisticActiveExpired = true;
       persistSessionWindowState();
       return;
     }
@@ -27911,11 +27992,23 @@ function clearMainLogContainers() {
 
 function pruneMainLogContainer(container = currentMainLogContainer()) {
   if (!container) return;
-  while (logEntryCount > 10000) {
-    const first = container.querySelector('.log-entry, .log-turn-sep');
-    if (!first) break;
-    first.remove();
-    logEntryCount--;
+  const removeExcess = () => {
+    while (logEntryCount > 10000) {
+      const first = container.querySelector('.log-entry, .log-turn-sep');
+      if (!first) break;
+      first.remove();
+      logEntryCount--;
+    }
+  };
+  // When the user is scrolled up in the live stream, pruning from the top
+  // must not drag their view — compensate scrollTop for the removed height.
+  const scroller = container.nodeType === 1 && container.id === 'log-stream' && !autoScroll
+    ? container
+    : null;
+  if (scroller) {
+    adjustScrollForRemovedAbove(scroller, removeExcess);
+  } else {
+    removeExcess();
   }
 }
 
@@ -29100,6 +29193,24 @@ function sessionWindowLogIsAtBottom(log) {
   return log.scrollHeight - log.scrollTop - log.clientHeight <= SESSION_WINDOW_BOTTOM_THRESHOLD_PX;
 }
 
+// Keep the reader's place when nodes are removed ABOVE the viewport
+// (render-window trims, log prunes): shrink scrollTop by exactly the
+// removed height. Native scroll anchoring is unreliable for removals and
+// absent in WebKit, so the log containers set `overflow-anchor: none`
+// and this manual adjustment is the single source of truth.
+function adjustScrollForRemovedAbove(scroller, mutate) {
+  if (!scroller || typeof scroller.scrollHeight !== 'number') {
+    mutate();
+    return;
+  }
+  const before = scroller.scrollHeight;
+  mutate();
+  const delta = before - scroller.scrollHeight;
+  if (delta > 0) {
+    scroller.scrollTop = Math.max(0, scroller.scrollTop - delta);
+  }
+}
+
 function sessionWindowShouldFollowNextOutput(win) {
   if (!win || !win.log) return true;
   return !!win.followOutput || (sessionWindowIsRenderingTail(win) && sessionWindowLogIsAtBottom(win.log));
@@ -29427,7 +29538,29 @@ function renderSessionWindowTail(win) {
   ) {
     return;
   }
+  // A tail re-render rebuilds the whole window. If the reader is scrolled
+  // up, anchor on their first visible entry and restore its on-screen
+  // offset afterwards — otherwise the rebuild dumps them at an arbitrary
+  // (usually much older) position.
+  const log = win.log;
+  let anchorIndex = -1;
+  let anchorTop = 0;
+  if (log && !sessionWindowShouldFollowNextOutput(win)) {
+    for (const child of log.children) {
+      const idx = Number(child.dataset?.historyIndex);
+      if (!Number.isInteger(idx)) continue;
+      if (child.offsetTop + child.offsetHeight > log.scrollTop) {
+        anchorIndex = idx;
+        anchorTop = child.offsetTop - log.scrollTop;
+        break;
+      }
+    }
+  }
   renderSessionWindowRange(win, start);
+  if (log && anchorIndex >= 0) {
+    const nextAnchor = log.querySelector(`[data-history-index="${anchorIndex}"]`);
+    if (nextAnchor) log.scrollTop = Math.max(0, nextAnchor.offsetTop - anchorTop);
+  }
 }
 
 function appendSessionWindowRenderedTailItem(win, item, index, historyLength) {
@@ -29439,11 +29572,13 @@ function appendSessionWindowRenderedTailItem(win, item, index, historyLength) {
   }
   win.log.appendChild(node);
   win.renderEnd = index + 1;
-  const targetStart = sessionWindowTailStart(historyLength);
-  while (win.renderStart < targetStart && win.log.firstElementChild) {
-    win.log.firstElementChild.remove();
-    win.renderStart += 1;
-  }
+  adjustScrollForRemovedAbove(win.log, () => {
+    const targetStart = sessionWindowTailStart(historyLength);
+    while (win.renderStart < targetStart && win.log.firstElementChild) {
+      win.log.firstElementChild.remove();
+      win.renderStart += 1;
+    }
+  });
   scheduleSessionWindowGridFit();
   return true;
 }
@@ -29463,11 +29598,13 @@ function appendSessionWindowRenderedTailItems(win, items, startIndex, historyLen
   }
   if (appended === 0) return false;
   win.renderEnd = startIndex + items.length;
-  const targetStart = sessionWindowTailStart(historyLength);
-  while (win.renderStart < targetStart && win.log.firstElementChild) {
-    win.log.firstElementChild.remove();
-    win.renderStart += 1;
-  }
+  adjustScrollForRemovedAbove(win.log, () => {
+    const targetStart = sessionWindowTailStart(historyLength);
+    while (win.renderStart < targetStart && win.log.firstElementChild) {
+      win.log.firstElementChild.remove();
+      win.renderStart += 1;
+    }
+  });
   scheduleSessionWindowGridFit();
   return true;
 }
@@ -31144,7 +31281,11 @@ function updateSessionWindow(sessionId, meta = {}) {
     if (win.ended) win.pendingActiveUntil = 0;
   }
   if (meta.phase) {
-    win.phase = normalizeSessionPhase(meta.phase);
+    const nextPhase = normalizeSessionPhase(meta.phase);
+    // A real phase transition is fresh evidence about the session; it
+    // retires the "optimistic thinking expired" steer demotion below.
+    if (win.phase !== nextPhase) win.optimisticActiveExpired = false;
+    win.phase = nextPhase;
     if (win.phase === 'idle' || win.phase === 'done' || win.phase === 'interrupted') {
       win.pendingActiveUntil = 0;
     }
@@ -32105,7 +32246,11 @@ function appendLogEntryElement(entry, sessionRecord = null) {
   }
   logEntryCount++;
   pruneMainLogContainer(container);
-  if (!concurrentLogDetachedFragment && autoScroll && stream) stream.scrollTop = stream.scrollHeight;
+  if (!concurrentLogDetachedFragment && autoScroll && stream) {
+    stream.scrollTop = stream.scrollHeight;
+  } else if (!processingLogReplay) {
+    noteMainLogNewBelow();
+  }
 }
 
 function commandOutputCloneViews(group) {
@@ -65089,10 +65234,12 @@ syncAccessPageNavLink();
     const atBottom = stream.scrollHeight - stream.scrollTop - stream.clientHeight < 30;
     autoScroll = atBottom;
     btn.classList.toggle('visible', !atBottom);
-  });
+    if (atBottom) resetMainLogNewBelow();
+  }, { passive: true });
   btn.addEventListener('click', () => {
     stream.scrollTop = stream.scrollHeight;
     autoScroll = true; btn.classList.remove('visible');
+    resetMainLogNewBelow();
   });
 })();
 

@@ -10714,6 +10714,24 @@ async fn drain_external_agent_events_with_prefetched(
                         recovery_hint,
                     });
                 }
+                // A fatal (non-retryable) backend error can be the LAST thing
+                // the runtime says about the turn — no trailing
+                // `turn/completed` follows. Complete the round through the
+                // normal grace path so the session returns to idle instead of
+                // stranding the drain with a stale running/thinking phase
+                // (which also misroutes the next follow-up as a steer). A
+                // late real completion within the grace window simply
+                // overwrites the buffered one; a pending recovery outcome
+                // still takes precedence at the exit.
+                if !will_retry && event_is_primary && pending_turn_completion.is_none() {
+                    pending_turn_completion = Some((None, turns_in_round));
+                    if active_side_turns.is_empty() {
+                        post_turn_sleep_active = true;
+                        post_turn_sleep
+                            .as_mut()
+                            .reset(tokio::time::Instant::now() + EXTERNAL_POST_TURN_DRAIN_GRACE);
+                    }
+                }
             }
             external_agent::AgentEvent::SubAgentToolCall {
                 item_id,
