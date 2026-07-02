@@ -99,6 +99,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/claims/{claim_id}", get(api_claim_status))
         .route("/api/audit", get(api_audit))
         .route("/api/status", get(api_status))
+        .route("/api/admin/invites", post(admin_invites_mint).get(admin_invites_list))
+        .route("/api/admin/invites/revoke", post(admin_invites_revoke))
         .route("/trust", get(trust_ui))
         .route(
             "/api/orgs/revocations/publish",
@@ -139,6 +141,10 @@ struct ServiceConfig {
     data_file: PathBuf,
     daemon_token: Option<String>,
     cookie_secure: bool,
+    /// Refuse new-account registration without a valid invite code.
+    /// Off by default so self-hosted instances stay zero-friction; the
+    /// hosted instance turns it on. Existing accounts are unaffected.
+    invite_required: bool,
 }
 
 impl ServiceConfig {
@@ -159,6 +165,9 @@ impl ServiceConfig {
         let mut data_file = std::env::var("INTENDANT_CONNECT_DATA_FILE")
             .map(PathBuf::from)
             .unwrap_or_else(|_| default_data_file());
+        let mut invite_required = std::env::var("INTENDANT_CONNECT_INVITE_REQUIRED")
+            .map(|v| matches!(v.trim(), "1" | "true" | "yes"))
+            .unwrap_or(false);
         let mut daemon_token = std::env::var("INTENDANT_CONNECT_TOKEN")
             .ok()
             .map(|v| v.trim().to_string())
@@ -189,6 +198,9 @@ impl ServiceConfig {
                 "--daemon-token" => {
                     daemon_token = Some(args.next().ok_or("--daemon-token requires a token")?);
                 }
+                "--invite-required" => {
+                    invite_required = true;
+                }
                 "--help" | "-h" => {
                     print_help();
                     std::process::exit(0);
@@ -217,6 +229,7 @@ impl ServiceConfig {
             static_root,
             data_file,
             daemon_token,
+            invite_required,
             cookie_secure,
         })
     }
@@ -288,6 +301,61 @@ struct Store {
     // only prevents rollback — consumers re-verify everything.
     #[serde(default)]
     orl_bulletins: Vec<OrlBulletinRecord>,
+    // Invite codes for gated registration. Only hashes are stored; a
+    // code is a bearer secret shown once at mint time.
+    #[serde(default)]
+    invites: Vec<InviteRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct InviteRecord {
+    code_hash: String,
+    #[serde(default)]
+    label: String,
+    created_unix_ms: u64,
+    max_uses: u32,
+    #[serde(default)]
+    used_count: u32,
+    #[serde(default)]
+    revoked: bool,
+}
+
+fn invite_usable(invite: &InviteRecord) -> bool {
+    !invite.revoked && invite.used_count < invite.max_uses
+}
+
+/// Handles nobody should be able to squat: infrastructure names, major
+/// brands, and anything that reads as official. Short handles (< 3
+/// chars) are reserved wholesale by the length rule.
+const RESERVED_HANDLES: &[&str] = &[
+    "admin", "administrator", "root", "system", "staff", "official", "support",
+    "help", "security", "abuse", "moderator", "mod", "team", "info", "contact",
+    "billing", "payments", "postmaster", "webmaster", "hostmaster", "noreply",
+    "no-reply", "mail", "email", "api", "www", "app", "web", "dashboard",
+    "status", "blog", "docs", "news", "dev", "test", "demo", "example",
+    "intendant", "connect", "rendezvous", "daemon", "trust", "access",
+    "google", "github", "apple", "microsoft", "amazon", "meta", "facebook",
+    "openai", "anthropic", "claude", "gemini", "codex", "twitter", "x",
+];
+
+/// Account handles: 3-32 chars of a-z, 0-9, and '-' (no leading/trailing
+/// dash), and not on the reserved list.
+fn validate_account_name(name: &str) -> Result<(), String> {
+    if name.len() < 3 || name.len() > 32 {
+        return Err("handle must be 3-32 characters".to_string());
+    }
+    if !name
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-')
+        || name.starts_with('-')
+        || name.ends_with('-')
+    {
+        return Err("handle may use a-z, 0-9, and '-' (not at the ends)".to_string());
+    }
+    if RESERVED_HANDLES.contains(&name) {
+        return Err("that handle is reserved".to_string());
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -444,6 +512,8 @@ struct PendingRegistration {
     user_id: Uuid,
     account_name: String,
     display_name: String,
+    new_account: bool,
+    invite_code_hash: Option<String>,
     state: RegistrationState,
     expires_unix_ms: u64,
 }
@@ -902,6 +972,135 @@ async fn create_session(state: &Arc<AppState>, user_id: Uuid) -> (String, String
     (token, csrf_token)
 }
 
+/// Admin surface: operator-only, authenticated by the daemon bearer
+/// token. Unlike the daemon polling endpoints (which stay open when no
+/// token is configured, for local dev), admin actions REQUIRE a
+/// configured token — an unset token must not mean an open admin API.
+fn require_admin_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
+    if state.config.daemon_token.is_none() {
+        return Err(ApiError::new(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "admin endpoints require the service to be started with --daemon-token",
+        ));
+    }
+    require_daemon_auth(state, headers)
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteMintRequest {
+    #[serde(default)]
+    count: u32,
+    #[serde(default)]
+    label: String,
+    #[serde(default)]
+    max_uses: u32,
+}
+
+async fn admin_invites_mint(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<InviteMintRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_auth(&state, &headers)?;
+    let count = body.count.clamp(1, 50);
+    let max_uses = body.max_uses.clamp(1, 1000);
+    let label = body.label.trim().to_string();
+    let now = now_unix_ms();
+    let mut codes = Vec::new();
+    {
+        let mut store = state.store.lock().await;
+        for _ in 0..count {
+            let code = random_b64u(12);
+            store.invites.push(InviteRecord {
+                code_hash: sha256_b64u(code.as_bytes()),
+                label: label.clone(),
+                created_unix_ms: now,
+                max_uses,
+                used_count: 0,
+                revoked: false,
+            });
+            codes.push(code);
+        }
+        audit(
+            &mut store,
+            "invites_minted",
+            None,
+            None,
+            json!({ "count": count, "label": label, "max_uses": max_uses }),
+        );
+        persist_locked(&state, &store)?;
+    }
+    Ok(Json(json!({ "ok": true, "codes": codes, "max_uses": max_uses })))
+}
+
+async fn admin_invites_list(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_auth(&state, &headers)?;
+    let store = state.store.lock().await;
+    let invites: Vec<_> = store
+        .invites
+        .iter()
+        .map(|invite| {
+            json!({
+                "code_hash": invite.code_hash,
+                "label": invite.label,
+                "created_unix_ms": invite.created_unix_ms,
+                "max_uses": invite.max_uses,
+                "used_count": invite.used_count,
+                "revoked": invite.revoked,
+                "usable": invite_usable(invite),
+            })
+        })
+        .collect();
+    Ok(Json(json!({ "ok": true, "invite_required": state.config.invite_required, "invites": invites })))
+}
+
+#[derive(Debug, Deserialize)]
+struct InviteRevokeRequest {
+    #[serde(default)]
+    code_hash: String,
+    #[serde(default)]
+    label: String,
+}
+
+async fn admin_invites_revoke(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<InviteRevokeRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    require_admin_auth(&state, &headers)?;
+    let code_hash = body.code_hash.trim();
+    let label = body.label.trim();
+    if code_hash.is_empty() && label.is_empty() {
+        return Err(ApiError::bad_request("code_hash or label is required"));
+    }
+    let mut revoked = 0;
+    {
+        let mut store = state.store.lock().await;
+        for invite in store.invites.iter_mut() {
+            let matched = (!code_hash.is_empty() && invite.code_hash == code_hash)
+                || (!label.is_empty() && invite.label == label);
+            if matched && !invite.revoked {
+                invite.revoked = true;
+                revoked += 1;
+            }
+        }
+        if revoked > 0 {
+            audit(
+                &mut store,
+                "invites_revoked",
+                None,
+                None,
+                json!({ "count": revoked }),
+            );
+            persist_locked(&state, &store)?;
+        }
+    }
+    Ok(Json(json!({ "ok": true, "revoked": revoked })))
+}
+
 fn require_daemon_auth(state: &AppState, headers: &HeaderMap) -> ApiResult<()> {
     let Some(token) = state.config.daemon_token.as_deref() else {
         return Ok(());
@@ -1008,7 +1207,11 @@ fn log_json(event: &str, detail: serde_json::Value) {
 
 async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiResult<Response> {
     let Some(user) = optional_user(&state, &headers).await else {
-        return Ok(Json(json!({ "authenticated": false })).into_response());
+        return Ok(Json(json!({
+            "authenticated": false,
+            "invite_required": state.config.invite_required,
+        }))
+        .into_response());
     };
     let csrf_token = if let Some(token) = cookie_value(&headers, COOKIE_NAME) {
         state
@@ -1023,6 +1226,7 @@ async fn api_me(State(state): State<Arc<AppState>>, headers: HeaderMap) -> ApiRe
     };
     Ok(Json(json!({
         "authenticated": true,
+        "invite_required": state.config.invite_required,
         "user": user_view(&user),
         "csrf_token": csrf_token,
     }))
@@ -1046,6 +1250,8 @@ struct RegisterStartRequest {
     account_name: String,
     #[serde(default)]
     display_name: String,
+    #[serde(default)]
+    invite_code: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1061,20 +1267,51 @@ async fn auth_register_start(
     Json(body): Json<RegisterStartRequest>,
 ) -> ApiResult<Json<ChallengeStartResponse>> {
     require_same_origin(&state.config, &headers)?;
-    check_rate_limit(&state, &headers, "auth_register_start", 20, 60_000).await?;
+    check_rate_limit(&state, &headers, "auth_register_start", 10, 600_000).await?;
     let account_name = normalize_account_name(&body.account_name);
     if account_name.is_empty() {
         return Err(ApiError::bad_request("account_name is required"));
     }
+    validate_account_name(&account_name).map_err(ApiError::bad_request)?;
+    // Adding a passkey to an EXISTING handle is a signed-in, same-account
+    // action — otherwise anyone could attach their passkey to any handle.
+    let session_user = optional_user(&state, &headers).await;
+    let invite_code = body.invite_code.trim().to_string();
     let display_name = body.display_name.trim();
     let display_name = if display_name.is_empty() {
         account_name.clone()
     } else {
         display_name.to_string()
     };
-    let (user_id, exclude_credentials) = {
+    let (user_id, exclude_credentials, new_account, invite_code_hash) = {
         let store = state.store.lock().await;
         let existing = store.users.iter().find(|u| u.account_name == account_name);
+        if let Some(existing) = existing {
+            if session_user.as_ref().map(|u| u.id) != Some(existing.id) {
+                return Err(ApiError::conflict(
+                    "that handle is taken; to add a passkey to it, sign in to the account first",
+                ));
+            }
+        }
+        let new_account = existing.is_none();
+        let invite_code_hash = if new_account && state.config.invite_required {
+            let hash = sha256_b64u(invite_code.as_bytes());
+            let usable = !invite_code.is_empty()
+                && store
+                    .invites
+                    .iter()
+                    .find(|invite| invite.code_hash == hash)
+                    .map(invite_usable)
+                    .unwrap_or(false);
+            if !usable {
+                return Err(ApiError::forbidden(
+                    "registration is invite-only right now; ask an existing user or the operator for an invite code",
+                ));
+            }
+            Some(hash)
+        } else {
+            None
+        };
         let user_id = existing.map(|u| u.id).unwrap_or_else(Uuid::new_v4);
         let exclude = existing
             .map(|u| {
@@ -1084,7 +1321,7 @@ async fn auth_register_start(
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        (user_id, exclude)
+        (user_id, exclude, new_account, invite_code_hash)
     };
     let (options, registration) = state.webauthn.start_registration(
         user_id.as_bytes(),
@@ -1097,6 +1334,8 @@ async fn auth_register_start(
         user_id,
         account_name,
         display_name,
+        new_account,
+        invite_code_hash,
         state: registration,
         expires_unix_ms: now_unix_ms().saturating_add(300_000),
     };
@@ -1147,6 +1386,32 @@ async fn auth_register_finish(
             .any(|pk| pk.id == passkey.id)
         {
             return Err(ApiError::conflict("passkey is already registered"));
+        }
+        if pending.new_account
+            && store
+                .users
+                .iter()
+                .any(|u| u.account_name == pending.account_name)
+        {
+            return Err(ApiError::conflict("that handle was taken while you registered"));
+        }
+        // Consume the invite now, inside the store lock, so a code's uses
+        // can't be overspent by concurrent registrations.
+        if pending.new_account && state.config.invite_required {
+            let Some(hash) = pending.invite_code_hash.as_deref() else {
+                return Err(ApiError::forbidden("registration is invite-only right now"));
+            };
+            let Some(invite) = store
+                .invites
+                .iter_mut()
+                .find(|invite| invite.code_hash == hash)
+            else {
+                return Err(ApiError::forbidden("that invite code no longer exists"));
+            };
+            if !invite_usable(invite) {
+                return Err(ApiError::forbidden("that invite code has been used up or revoked"));
+            }
+            invite.used_count += 1;
         }
         let now = now_unix_ms();
         if let Some(user) = store.users.iter_mut().find(|u| u.id == pending.user_id) {
@@ -3340,6 +3605,10 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
             <button id="login">Sign in</button>
           </div>
         </div>
+        <div id="invite-row" class="hidden">
+          <label for="invite-code">Invite code</label>
+          <input id="invite-code" autocomplete="off" autocapitalize="none" spellcheck="false" placeholder="registration is invite-only during the alpha">
+        </div>
         <div id="auth-actions" class="auth-alt">
           <span>New here?</span>
           <button id="register" class="linklike">Create your account with a passkey</button>
@@ -3541,7 +3810,10 @@ async function createPasskey() {{
   try {{
     const start = await api('/api/auth/register/start', {{
       method: 'POST',
-      body: JSON.stringify({{ account_name: account }}),
+      body: JSON.stringify({{
+        account_name: account,
+        invite_code: ($('invite-code')?.value || '').trim(),
+      }}),
     }});
     const credential = await navigator.credentials.create({{ publicKey: {{ ...publicKeyOptions(start), extensions: prfExtensions() }} }});
     stashPrfSecret(credential);
@@ -3729,6 +4001,7 @@ async function refreshAll() {{
     const me = await api('/api/me');
     state.csrfToken = me.csrf_token || '';
     state.user = me.authenticated ? me.user : null;
+    state.inviteRequired = me.invite_required === true;
     renderAuth();
     if (!state.user) return;
     const [daemons, fleet, audit] = await Promise.all([
@@ -3749,6 +4022,7 @@ async function refreshAll() {{
 
 function renderAuth() {{
   const authed = Boolean(state.user);
+  $('invite-row').classList.toggle('hidden', authed || !state.inviteRequired);
   document.body.classList.toggle('signed-out', !authed);
   document.body.classList.toggle('signed-in', authed);
   $('manage').classList.toggle('hidden', !authed);
@@ -4073,6 +4347,41 @@ mod tests {
     }
 
     #[test]
+    fn account_handles_enforce_charset_length_and_reservations() {
+        assert!(validate_account_name("lenny").is_ok());
+        assert!(validate_account_name("a-b-1").is_ok());
+        assert!(validate_account_name("ab").is_err(), "too short");
+        assert!(validate_account_name(&"a".repeat(33)).is_err(), "too long");
+        assert!(validate_account_name("-abc").is_err(), "leading dash");
+        assert!(validate_account_name("abc-").is_err(), "trailing dash");
+        assert!(validate_account_name("Upper").is_err(), "uppercase");
+        assert!(validate_account_name("a b").is_err(), "space");
+        for reserved in ["admin", "google", "intendant", "support"] {
+            assert!(validate_account_name(reserved).is_err(), "{reserved} must be reserved");
+        }
+    }
+
+    #[test]
+    fn invites_are_single_purpose_bearer_records() {
+        let mut invite = InviteRecord {
+            code_hash: sha256_b64u(b"code"),
+            label: "alpha".to_string(),
+            created_unix_ms: 1,
+            max_uses: 2,
+            used_count: 0,
+            revoked: false,
+        };
+        assert!(invite_usable(&invite));
+        invite.used_count = 1;
+        assert!(invite_usable(&invite));
+        invite.used_count = 2;
+        assert!(!invite_usable(&invite), "exhausted");
+        invite.used_count = 0;
+        invite.revoked = true;
+        assert!(!invite_usable(&invite), "revoked");
+    }
+
+    #[test]
     fn presence_hours_dedupe_and_cap_at_a_week() {
         let mut hours = Vec::new();
         assert!(record_presence_hour(&mut hours, 3_600_000));
@@ -4178,6 +4487,7 @@ mod tests {
             fleet_targets: Vec::new(),
             audit: Vec::new(),
             orl_bulletins: Vec::new(),
+            invites: Vec::new(),
         };
         let hashes = active_claim_code_hashes(&store, "current", now);
         assert!(hashes.contains(&claim_code_hash(fresh)));
@@ -4399,6 +4709,7 @@ mod tests {
             ],
             audit: Vec::new(),
             orl_bulletins: Vec::new(),
+            invites: Vec::new(),
         };
         let config = ServiceConfig {
             listen: SocketAddr::from(([127, 0, 0, 1], 9876)),
@@ -4407,6 +4718,7 @@ mod tests {
             static_root: PathBuf::from("static"),
             data_file: PathBuf::from("state.json"),
             daemon_token: None,
+            invite_required: false,
             cookie_secure: true,
         };
 
