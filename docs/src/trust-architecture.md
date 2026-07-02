@@ -361,7 +361,80 @@ kept short-lived without the issuer in the loop.
    its original lifetime span. UI: revoke-member / copy-list / apply-list
    / renew flows under Access → Advanced → Organizations. Peer-link
    gossip and periodic pull remain for later plumbing.
-6. ⏳ Peer-daemon subjects and issuer-key delegation.
+6. ⏳ Peer-daemon subjects and issuer-key delegation — design proposed
+   below, awaiting sign-off.
+
+### Step 6 design: peer subjects and issuer keys (proposed, not built)
+
+**Peer-daemon subjects.** An org grant whose subject is a *peer daemon*
+materializes into the peer identity store
+(`peer/access_policy.rs::PeerIdentityRecord`), not IAM — daemons are
+peers, never people, and the peer lane's profile vocabulary is the right
+authority language for them. Format: `subject` carries
+`peer_fingerprint` instead of `client_key_fingerprint` (exactly one must
+be present), and the signing payload's subject-kind line — the literal
+`client_key` today, deliberately baked into every existing signature —
+becomes `peer_daemon`, so a signature can never be replayed across
+subject kinds. `role_id` uses a `peer:<profile>` namespace (e.g.
+`peer:session-reader`, the `profile_class` ladder) so a peer document
+cannot be confused with a human-role document even outside the payload.
+
+Materialization upserts an approved `PeerIdentityRecord` bound to the
+fingerprint. Two prerequisite schema steps, each valuable alone (the
+same pattern as grant expiry in step 1): the record gains
+`expires_at_unix` (org documents require expiry; enforcement treats an
+expired record as revoked) and `source` (`org:<handle>` provenance, so
+org revocation can sweep records it created and the UI can say where an
+identity came from). The org's cap for the peer lane is a separate
+`max_peer_profile` on the trusted-org entry — profile classes are a
+ladder, not a permission set, so the human `max_role` cannot express it —
+defaulting to `session-reader`; over-cap documents are rejected, not
+downgraded, like the human lane. Local rules carry over verbatim:
+locally revoked records are never resurrected, re-presentation is
+idempotent-quiet, and ORL `revoked_subjects` matches peer fingerprints
+exactly as it matches client keys.
+
+**Issuer-key delegation.** Day-to-day signing moves off the root: the
+root signs a delegation certificate
+
+```json
+{
+  "v": 1, "kind": "org-issuer",
+  "org": { "handle": "acme", "root_key": "…" },
+  "issuer_key": "<ed25519 b64u>", "label": "…",
+  "issued_at_unix_ms": 0,
+  "expires_at_unix_ms": 0,          // REQUIRED; suggested cap 365d
+  "max_role": "role:operator",      // optional scope; also caps peer:<profile>
+  "sig": "<root, newline payload>"
+}
+```
+
+and a document may then carry `chain: [<issuer-cert>]` (the array
+reserved since v1) with its own `sig` made by the issuer key.
+Verification walks outside-in: the *trusted* root key validates the
+cert, the cert must be unexpired and its `max_role` (when present) must
+contain the document's role, then the issuer key validates the document;
+everything else — org cap, targets, expiry, ORL — applies unchanged.
+One level only: an issuer cannot mint issuers.
+
+Revoking an issuer revokes everything it signed going forward: the ORL
+gains a `revoked_issuer_keys` list, which adds a line to the ORL signing
+payload. Nothing consuming v1 lists has shipped outside this branch, so
+the payload change lands as a plain extension of the v1 protocol before
+first release; were that no longer true it would ship as an explicit
+`v: 2` with dual-version acceptance. Materialized grants are swept by
+matching the `chain` recorded at materialization time — which means the
+materialization audit/grant record starts persisting the issuer key it
+accepted.
+
+**Open questions for sign-off.** (a) Should peer-subject documents also
+ride along on the peer doorbell/handshake the way client-key documents
+ride dashboard offers, or stay explicit-presentation-only in v1.1?
+(b) Is `session-reader` the right default `max_peer_profile`, or should
+trusting an org grant no peer authority at all until the owner raises it
+(fail-closed default)? (c) Should issuer certs be publishable next to
+the ORL (`GET /api/access/orgs/<handle>/issuers`) so consumers can
+prefetch, or only ever travel inside document chains?
 
 ## Mechanisms
 
