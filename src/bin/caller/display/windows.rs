@@ -593,14 +593,17 @@ fn mouse_up_flag(b: u8) -> MOUSE_EVENT_FLAGS {
 
 /// Inject a single keyboard event (down or up) for a DOM `code`.
 ///
-/// Unknown codes are silently ignored (matching the x11/macos backends, which
-/// no-op when the keymap returns `None`). The `KEYEVENTF_EXTENDEDKEY` flag is
-/// applied for keys in the extended block so the right-hand modifiers, arrows,
-/// navigation cluster, and numpad enter/divide resolve to the correct physical
-/// key.
+/// Unknown codes are an error: silently swallowing them let a CU `key` action
+/// report "ok" while injecting nothing (the same false-OK class that was
+/// fixed on the Wayland backend). The `KEYEVENTF_EXTENDEDKEY` flag is applied
+/// for keys in the extended block so the right-hand modifiers, arrows,
+/// navigation cluster, and numpad enter/divide resolve to the correct
+/// physical key.
 fn inject_key(code: &str, key_up: bool) -> Result<(), CallerError> {
     let Some(vk) = super::windows_keymap::dom_code_to_vk(code) else {
-        return Ok(());
+        return Err(CallerError::Display(format!(
+            "unsupported Windows key code: {code}"
+        )));
     };
 
     let mut flags = KEYBD_EVENT_FLAGS(0);

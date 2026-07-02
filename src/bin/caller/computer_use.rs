@@ -1690,8 +1690,9 @@ async fn take_screenshot(
         ));
     }
 
-    // Read file, resize to logical display size (so model coordinates =
-    // input-injection coordinates), and encode as base64.
+    // Read file, downscale Retina captures to logical size (macOS-only; a
+    // no-op elsewhere so model coordinates = capture = injection space), and
+    // encode as base64.
     let raw_bytes = tokio::fs::read(&path)
         .await
         .map_err(|e| format!("read screenshot: {}", e))?;
@@ -1715,7 +1716,16 @@ async fn take_screenshot(
 /// (Retina/HiDPI captures at physical resolution), so model coordinates land
 /// in the same logical space the input tools consume. Returns the input
 /// unchanged when it already fits or cannot be decoded.
+///
+/// macOS-only by design: it exists for the Retina physical-vs-logical split.
+/// On X11 the capture resolution *is* the input-injection space, so any
+/// resize would desync model coordinates from where clicks land (this used
+/// to squish every capture wider than 1024px into the 1024x768
+/// `logical_display_size()` fallback — a 16:9 desktop became 4:3).
 fn normalize_png_to_logical(raw_bytes: Vec<u8>) -> Vec<u8> {
+    if !cfg!(target_os = "macos") {
+        return raw_bytes;
+    }
     let (raw_w, _) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
     let (logical_w, logical_h) = logical_display_size();
     if raw_w > logical_w && logical_w > 0 && logical_h > 0 {
@@ -2087,13 +2097,45 @@ async fn execute_via_session(
                 let mut success = events.is_ok();
                 let mut error = events.as_ref().err().cloned();
                 if let Ok(events) = events {
+                    // Track pressed keys whose release hasn't been injected
+                    // yet, so a mid-sequence failure never strands a key — a
+                    // stuck modifier corrupts every subsequent input action.
+                    let mut outstanding: Vec<crate::display::InputEvent> = Vec::new();
                     for event in events {
+                        let up_counterpart = match &event {
+                            crate::display::InputEvent::KeyDown {
+                                code,
+                                key: key_label,
+                                ..
+                            } => Some(crate::display::InputEvent::KeyUp {
+                                code: code.clone(),
+                                key: key_label.clone(),
+                                shift: false,
+                                ctrl: false,
+                                alt: false,
+                                meta: false,
+                            }),
+                            _ => None,
+                        };
+                        let is_up = matches!(&event, crate::display::InputEvent::KeyUp { .. });
                         if let Err(e) = session.inject_input(event).await {
                             success = false;
                             error = Some(e.to_string());
                             break;
                         }
+                        if let Some(up) = up_counterpart {
+                            outstanding.push(up);
+                        } else if is_up {
+                            outstanding.pop();
+                        }
                         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    if !success {
+                        // Best-effort release of whatever went down before
+                        // the failure, most recent first.
+                        while let Some(up) = outstanding.pop() {
+                            let _ = session.inject_input(up).await;
+                        }
                     }
                 }
                 results.push(CuActionResult {
@@ -2105,36 +2147,50 @@ async fn execute_via_session(
             }
             CuAction::HoldKey { key, ms } => {
                 let events = key_action_events(key);
-                let mut success = events.is_ok();
-                let mut error = events.as_ref().err().cloned();
+                let mut errors: Vec<String> = match &events {
+                    Ok(_) => Vec::new(),
+                    Err(e) => vec![e.clone()],
+                };
                 if let Ok(events) = events {
                     let (downs, ups): (Vec<_>, Vec<_>) = events
                         .into_iter()
                         .partition(|e| matches!(e, crate::display::InputEvent::KeyDown { .. }));
-                    'inject: {
-                        for event in downs {
-                            if let Err(e) = session.inject_input(event).await {
-                                success = false;
-                                error = Some(e.to_string());
-                                break 'inject;
-                            }
-                            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    let mut pressed_any = false;
+                    for event in downs {
+                        if let Err(e) = session.inject_input(event).await {
+                            errors.push(format!("key down: {e}"));
+                            // Don't press further chord keys after a failure.
+                            break;
                         }
+                        pressed_any = true;
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                    }
+                    if pressed_any && errors.is_empty() {
                         tokio::time::sleep(std::time::Duration::from_millis(*ms)).await;
+                    }
+                    if pressed_any {
+                        // Always release once anything went down — a stuck
+                        // key floods X11 auto-repeat and corrupts every later
+                        // action. Releasing a key that never went down is a
+                        // harmless no-op, and `ups` is already in
+                        // reverse-chord order by construction.
                         for event in ups {
                             if let Err(e) = session.inject_input(event).await {
-                                success = false;
-                                error = Some(e.to_string());
-                                break 'inject;
+                                errors.push(format!("key up: {e}"));
                             }
                             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
                         }
                     }
                 }
+                let success = errors.is_empty();
                 results.push(CuActionResult {
                     success,
                     screenshot: None,
-                    error,
+                    error: if success {
+                        None
+                    } else {
+                        Some(errors.join("; "))
+                    },
                 });
                 needs_auto_screenshot = true;
             }
@@ -2451,7 +2507,15 @@ async fn capture_zoom_screenshot(
         }
     };
 
-    let cropped = crop_png_region(&raw, region, logical_display_size())?;
+    // Crop reference: on macOS the model's region is in logical points while
+    // `raw` may be a physical-resolution capture (2x Retina), so the region
+    // must be scaled up. Everywhere else the model saw the capture at native
+    // size — the region already is in capture pixels (scale = 1).
+    let crop_ref = match backend {
+        DisplayBackend::MacOS => logical_display_size(),
+        _ => png_dimensions(&raw).unwrap_or_else(logical_display_size),
+    };
+    let cropped = crop_png_region(&raw, region, crop_ref)?;
     *counter += 1;
     let path = screenshot_dir.join(format!("cu_zoom_{}.png", counter));
     std::fs::write(&path, &cropped).map_err(|e| format!("write zoom screenshot: {e}"))?;

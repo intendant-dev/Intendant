@@ -295,15 +295,17 @@ impl DisplayBackend for WaylandBackend {
                 .map_err(|e| wayland_input_error("pointer inject", e))?;
             }
             InputEvent::MouseDown { x, y, b } => {
-                // Move to position first (best-effort).
-                let _ = rd
-                    .notify_pointer_motion_absolute(
-                        session,
-                        node_id,
-                        x * width as f64,
-                        y * height as f64,
-                    )
-                    .await;
+                // Move to position first. If the reposition fails, the press
+                // would land wherever the pointer happens to be — propagate
+                // the error instead of clicking a place the model never chose.
+                rd.notify_pointer_motion_absolute(
+                    session,
+                    node_id,
+                    x * width as f64,
+                    y * height as f64,
+                )
+                .await
+                .map_err(|e| wayland_input_error("pointer move (before press)", e))?;
                 // Linux evdev button codes: BTN_LEFT=0x110, BTN_MIDDLE=0x112, BTN_RIGHT=0x111
                 let button_code: i32 = match b {
                     0 => 0x110,
@@ -316,14 +318,14 @@ impl DisplayBackend for WaylandBackend {
                     .map_err(|e| wayland_input_error("button inject", e))?;
             }
             InputEvent::MouseUp { x, y, b } => {
-                let _ = rd
-                    .notify_pointer_motion_absolute(
-                        session,
-                        node_id,
-                        x * width as f64,
-                        y * height as f64,
-                    )
-                    .await;
+                rd.notify_pointer_motion_absolute(
+                    session,
+                    node_id,
+                    x * width as f64,
+                    y * height as f64,
+                )
+                .await
+                .map_err(|e| wayland_input_error("pointer move (before release)", e))?;
                 let button_code: i32 = match b {
                     0 => 0x110,
                     1 => 0x112,
