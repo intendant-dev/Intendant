@@ -470,6 +470,26 @@ impl DisplayBackend for WaylandBackend {
     }
 }
 
+/// Bounded serving window for one paste gesture: the focused app must ask
+/// for the payload within this deadline, then serving stops regardless.
+// W3c (the call-local transfer loop) consumes these; allow until it lands.
+#[allow(dead_code)]
+const PASTE_TRANSFER_DEADLINE: std::time::Duration = std::time::Duration::from_secs(3);
+/// A single paste legitimately fires at most a couple of transfer requests
+/// (some apps ask once per advertised mime type); serving stops after this
+/// many even inside the deadline.
+#[allow(dead_code)]
+const MAX_PASTE_TRANSFERS: usize = 2;
+
+/// Whether a `SelectionTransfer` mime type is one of the text/plain forms we
+/// advertise (exact or parameterized, e.g. `text/plain;charset=utf-8`).
+/// Non-text requests are ignored by the paste serving loop.
+#[cfg_attr(not(test), allow(dead_code))]
+fn is_text_plain_mime(mime: &str) -> bool {
+    let m = mime.trim().to_ascii_lowercase();
+    m == "text/plain" || m.starts_with("text/plain;")
+}
+
 /// Make `text` the session's current paste payload (W3: `SetSelection` for
 /// text/plain, then answer this session's `SelectionTransfer` requests with
 /// the latest explicit payload via `selection_write`/`selection_write_done`).
@@ -916,9 +936,22 @@ fn target_pipewire_framerate(fps: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        target_pipewire_framerate, wayland_input_error, wayland_remote_interaction_error,
+        is_text_plain_mime, target_pipewire_framerate, wayland_input_error,
+        wayland_remote_interaction_error,
     };
     use crate::display::keymap::char_to_x11_keysym;
+
+    #[test]
+    fn paste_mime_matching() {
+        assert!(is_text_plain_mime("text/plain"));
+        assert!(is_text_plain_mime("text/plain;charset=utf-8"));
+        assert!(is_text_plain_mime("TEXT/PLAIN"));
+        assert!(is_text_plain_mime(" text/plain "));
+        assert!(!is_text_plain_mime("text/html"));
+        assert!(!is_text_plain_mime("text/plainx"));
+        assert!(!is_text_plain_mime("image/png"));
+        assert!(!is_text_plain_mime(""));
+    }
 
     #[test]
     fn target_pipewire_framerate_clamps_to_supported_range() {
