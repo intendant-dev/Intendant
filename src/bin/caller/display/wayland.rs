@@ -53,6 +53,8 @@ struct PortalSession {
     /// clipboard access before `Start` (the portal requires the capability
     /// request up front). Consumed by the paste path; `None` when the
     /// portal backend lacks the Clipboard interface.
+    // W2 (paste_text) reads this; allow until that slice lands.
+    #[allow(dead_code)]
     clipboard: Option<Clipboard<'static>>,
 }
 
