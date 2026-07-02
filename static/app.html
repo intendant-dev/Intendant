@@ -5429,27 +5429,37 @@ body.context-focus-active {
 .input-area button:hover { opacity: 0.9; }
 
 /* ── Usage Tab ── */
+/* Every section starts hidden; renderers drive visibility with inline
+   display so a fresh pane shows only the empty state. */
+#stats-host-bar, #usage-cards, #cost-section, #token-history,
+#stats-session-loading, #token-activity-section, #token-activity-detail,
+#all-sessions-usage, #daily-usage-section, #agent-usage-section,
+#disk-usage-section { display: none; }
 .stats-host-bar {
-  display: flex;
   align-items: center;
   gap: 8px;
-  padding: 6px 12px;
+  padding: 8px 12px;
   background: var(--mantle);
   border-bottom: 1px solid var(--surface0);
   flex-shrink: 0;
 }
+/* Label + select match the ui-field-grid control look. */
 .stats-host-bar .stats-host-label {
-  font-size: 11px;
-  color: var(--overlay0);
+  font-size: 10.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--overlay1);
 }
 .stats-host-select {
-  padding: 2px 6px;
-  background: var(--surface0);
+  min-height: 26px;
+  padding: 3px 9px;
+  background: rgba(17, 17, 27, 0.55);
   border: 1px solid var(--surface1);
-  border-radius: 4px;
-  color: var(--subtext0);
+  border-radius: 5px;
+  color: var(--text);
   font-family: inherit;
-  font-size: 11px;
+  font-size: 12px;
   cursor: pointer;
 }
 .stats-host-select:focus { outline: none; border-color: var(--blue); }
@@ -5462,20 +5472,34 @@ body.context-focus-active {
   overflow-y: auto;
   flex: 1;
 }
+/* Uniform card rhythm regardless of which sections are visible (adjacent
+   ui-card margins don't survive the non-card loading pill in between). */
+.usage-container > .ui-card { margin-top: 12px; }
+#display-metrics-container .ui-card { margin-top: 12px; }
+#stats-kpi-row:empty { display: none; }
+.stats-kpi-skel-label { width: 64px; min-height: 10px; }
+.stats-kpi-skel-value { width: 88px; min-height: 20px; }
+#usage-empty {
+  min-height: 100%;
+  align-content: center;
+}
+/* While the session fetch is in flight (aria-busy), the skeleton KPI
+   tiles + loading pill own the wait — "No usage yet" would be a lie. */
+#usage-container[aria-busy="true"] #usage-empty { display: none !important; }
 .usage-cards {
   display: flex;
-  gap: 16px;
+  gap: 12px;
   flex-wrap: wrap;
-  margin-bottom: 24px;
 }
 .usage-card {
   flex: 1;
   min-width: 280px;
   max-width: 420px;
-  background: var(--mantle);
-  border: 1px solid var(--surface0);
-  border-radius: 8px;
-  padding: 16px;
+  background: var(--glass-bg);
+  border: 1px solid var(--glass-hairline-bright);
+  border-radius: 10px;
+  box-shadow: var(--glass-highlight);
+  padding: 14px 16px;
 }
 .usage-card .card-title {
   font-size: 11px;
@@ -5492,7 +5516,8 @@ body.context-focus-active {
 .usage-card .card-model .provider { color: var(--blue); }
 .usage-card .card-model .model-name { color: var(--green); }
 
-/* Token progress bar */
+/* Token pressure bar: severity lives in the ui-meter fill, the % text
+   stays in text ink. */
 .token-bar {
   margin-bottom: 12px;
 }
@@ -5503,19 +5528,7 @@ body.context-focus-active {
   margin-bottom: 4px;
 }
 .token-bar .bar-label .tokens { color: var(--text); }
-.token-bar .bar-label .pct { font-weight: 600; }
-.token-bar .bar-track {
-  width: 100%;
-  height: 8px;
-  background: var(--surface0);
-  border-radius: 4px;
-  overflow: hidden;
-}
-.token-bar .bar-fill {
-  height: 100%;
-  border-radius: 4px;
-  transition: width 0.3s, background 0.3s;
-}
+.token-bar .bar-label .pct { font-weight: 600; color: var(--text); }
 
 /* Token breakdown */
 .token-breakdown {
@@ -5525,23 +5538,20 @@ body.context-focus-active {
   font-size: 12px;
 }
 .token-breakdown .label { color: var(--overlay1); }
-.token-breakdown .value { color: var(--text); text-align: right; }
+.token-breakdown .value {
+  color: var(--text);
+  text-align: right;
+  font-variant-numeric: tabular-nums;
+}
+.token-breakdown .label.sub { padding-left: 12px; }
+.token-breakdown .total-row {
+  border-top: 1px solid var(--surface0);
+  padding-top: 4px;
+  margin-top: 4px;
+}
 
-/* Cost summary */
-.cost-section {
-  margin-top: 24px;
-  padding: 16px;
-  background: var(--mantle);
-  border: 1px solid var(--surface0);
-  border-radius: 8px;
-}
-.cost-section .cost-title {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--overlay1);
-  margin-bottom: 12px;
-}
+/* Cost/usage grids. Section chrome comes from ui-card; values wear text
+   ink (tabular figures for column alignment), never data colors. */
 .cost-grid {
   display: grid;
   grid-template-columns: auto 1fr;
@@ -5549,44 +5559,56 @@ body.context-focus-active {
   font-size: 13px;
 }
 .cost-grid .label { color: var(--overlay1); }
-.cost-grid .value { text-align: right; color: var(--green); font-weight: 600; }
+.cost-grid .value {
+  text-align: right;
+  color: var(--text);
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+}
+.cost-grid .head {
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--overlay1);
+}
+.cost-grid .sub { font-size: 11px; }
+.cost-grid .label.sub { padding-left: 12px; }
+.cost-grid .value.sub { font-weight: 400; }
+.cost-grid .label.strong { font-weight: 600; color: var(--text); }
+.cost-grid .err { color: var(--red); }
+.cost-grid .unpriced {
+  display: block;
+  font-size: 10px;
+  font-weight: 400;
+  color: var(--yellow);
+}
+.cost-grid .total-row {
+  font-weight: 600;
+  color: var(--text);
+  border-top: 1px solid var(--surface0);
+  padding-top: 6px;
+  margin-top: 4px;
+}
+.cost-grid .value.total { font-weight: 700; }
 #daily-usage-grid .label.today {
   color: var(--text);
   font-weight: 650;
 }
-#daily-usage-grid .value.total {
-  color: var(--text);
-}
 #agent-usage-grid .period {
   color: var(--subtext0);
   font-weight: 600;
-}
-#agent-usage-grid .value.total,
-#all-sessions-grid .value.total {
-  color: var(--text);
 }
 
 /* Token activity */
 .token-activity-section {
   overflow: hidden;
 }
-.token-activity-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: 12px;
-  margin-bottom: 12px;
-}
-.token-activity-head .cost-title {
-  margin-bottom: 0;
-}
 .token-activity-controls {
-  display: flex;
   align-items: center;
   gap: 6px;
   flex-wrap: wrap;
   justify-content: flex-end;
 }
+/* Segmented pickers: ui-btn metrics in a compact grouped shell. */
 .token-activity-segment {
   display: inline-flex;
   align-items: center;
@@ -5597,14 +5619,14 @@ body.context-focus-active {
   border-radius: 6px;
 }
 .token-activity-segment button {
-  height: 24px;
-  padding: 0 8px;
+  min-height: 24px;
+  padding: 4px 10px;
   border: 0;
   border-radius: 4px;
   background: transparent;
-  color: var(--overlay1);
-  font: inherit;
-  font-size: 11px;
+  color: var(--subtext0);
+  font-family: inherit;
+  font-size: 11.5px;
   line-height: 1;
   cursor: pointer;
 }
@@ -5622,6 +5644,7 @@ body.context-focus-active {
 .token-activity-segment button.active {
   color: var(--crust);
   background: var(--blue);
+  font-weight: 800;
 }
 .token-activity-stats {
   display: grid;
@@ -5670,15 +5693,15 @@ body.context-focus-active {
   margin-bottom: 12px;
   border-bottom: 1px solid var(--surface0);
 }
+/* Single-series bars: one hue (the validated ramp top step), rounded
+   top, square baseline. Magnitude is height alone. */
 .token-activity-skyline-bar {
   min-height: 2px;
   border-radius: 3px 3px 0 0;
-  background: linear-gradient(180deg, var(--peach), var(--blue));
-  opacity: 0.82;
+  background: var(--viz-ramp-5);
 }
 .token-activity-skyline-bar.empty {
-  background: var(--surface0);
-  opacity: 0.75;
+  background: var(--viz-empty);
 }
 .token-activity-heatmap-wrap {
   overflow-x: auto;
@@ -5710,7 +5733,7 @@ body.context-focus-active {
   width: 100%;
   height: 12px;
   border-radius: 3px;
-  background: var(--surface0);
+  background: var(--viz-empty);
   border: 1px solid transparent;
 }
 .token-activity-day.future {
@@ -5728,11 +5751,13 @@ body.context-focus-active {
   border-color: var(--text);
   box-shadow: 0 0 0 2px color-mix(in srgb, var(--blue) 45%, transparent);
 }
-.token-activity-day.level-1 { background: color-mix(in srgb, var(--blue) 22%, var(--surface0)); }
-.token-activity-day.level-2 { background: color-mix(in srgb, var(--sapphire) 42%, var(--surface0)); }
-.token-activity-day.level-3 { background: color-mix(in srgb, var(--green) 56%, var(--surface0)); }
-.token-activity-day.level-4 { background: color-mix(in srgb, var(--yellow) 72%, var(--surface0)); }
-.token-activity-day.level-5 { background: color-mix(in srgb, var(--peach) 88%, var(--surface0)); }
+/* Ordinal ramp, one hue: level 0 = --viz-empty, 1..5 = --viz-ramp-1..5
+   (validated steps — don't improvise). */
+.token-activity-day.level-1 { background: var(--viz-ramp-1); }
+.token-activity-day.level-2 { background: var(--viz-ramp-2); }
+.token-activity-day.level-3 { background: var(--viz-ramp-3); }
+.token-activity-day.level-4 { background: var(--viz-ramp-4); }
+.token-activity-day.level-5 { background: var(--viz-ramp-5); }
 .token-activity-detail {
   margin-top: 14px;
   padding: 10px 12px;
@@ -5783,12 +5808,9 @@ body.context-focus-active {
   font-size: 13px;
 }
 @media (max-width: 760px) {
-  .token-activity-head {
-    align-items: flex-start;
-    flex-direction: column;
-  }
   .token-activity-controls {
     justify-content: flex-start;
+    margin-left: 0;
   }
   .token-activity-stats {
     grid-template-columns: repeat(2, minmax(0, 1fr));
@@ -5833,17 +5855,6 @@ body.context-focus-active {
   padding-left: 4px;
 }
 
-/* Token history */
-.token-history {
-  margin-top: 24px;
-}
-.token-history .history-title {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.05em;
-  color: var(--overlay1);
-  margin-bottom: 8px;
-}
 .stats-loading {
   display: flex;
   align-items: center;
@@ -5887,13 +5898,14 @@ body.context-focus-active {
   height: 80px;
   padding: 0 4px;
 }
+/* Tokens-per-turn: single-hue bars off the validated ramp. */
 .history-bar {
   flex: 1;
   min-width: 3px;
   max-width: 12px;
-  background: var(--blue);
-  border-radius: 2px 2px 0 0;
-  opacity: 0.7;
+  background: var(--viz-ramp-5);
+  border-radius: 3px 3px 0 0;
+  opacity: 0.85;
   transition: height 0.3s, opacity 0.15s;
 }
 .history-bar:hover { opacity: 1; }
@@ -11485,34 +11497,53 @@ body.display-fullscreen-open {
 
     <!-- Stats Tab -->
     <div id="tab-stats" class="tab-pane">
-      <div class="stats-host-bar" id="stats-host-bar" style="display:none">
-        <label class="stats-host-label">Host:</label>
+      <div class="stats-host-bar" id="stats-host-bar">
+        <label class="stats-host-label" for="stats-host-select">Host</label>
         <select class="stats-host-select" id="stats-host-select">
           <option value="">(self)</option>
         </select>
       </div>
       <div class="usage-container" id="usage-container">
-        <div class="empty-state" id="usage-empty">Waiting for usage data...</div>
-        <div class="usage-cards" id="usage-cards" style="display:none"></div>
-        <div class="cost-section" id="cost-section" style="display:none">
-          <div class="cost-title">Estimated Cost</div>
+        <div class="ui-stat-row" id="stats-kpi-row"></div>
+        <div class="ui-empty" id="usage-empty">
+          <div class="ui-empty-glyph" aria-hidden="true">
+            <svg viewBox="0 0 24 24" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+              <path d="M4 20.5h16"/>
+              <path d="M7 20.5v-6.5"/>
+              <path d="M12 20.5v-11"/>
+              <path d="M17 20.5v-15"/>
+            </svg>
+          </div>
+          <div class="ui-empty-title">No usage yet</div>
+          <div class="ui-empty-hint">Token and cost stats appear when a session runs.</div>
+        </div>
+        <div class="usage-cards" id="usage-cards"></div>
+        <div class="cost-section ui-card" id="cost-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Estimated Cost</div>
+            <div class="ui-section-sub">Estimated spend from recorded token usage.</div>
+          </div>
           <div class="cost-grid" id="cost-grid"></div>
         </div>
-        <div class="token-history" id="token-history" style="display:none">
-          <div class="history-title">Tokens per Turn</div>
+        <div class="token-history ui-card" id="token-history">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Tokens per Turn</div>
+            <div class="ui-section-sub">Context size sent on each turn of this session.</div>
+          </div>
           <div class="history-chart" id="history-chart"></div>
         </div>
-        <div class="stats-loading" id="stats-session-loading" style="display:none" role="status" aria-live="polite">
+        <div class="stats-loading" id="stats-session-loading" role="status" aria-live="polite">
           <span class="stats-loading-spinner" aria-hidden="true"></span>
           <span>
             <span class="stats-loading-title">Loading session stats...</span>
             <span class="stats-loading-detail">More usage sections will appear here.</span>
           </span>
         </div>
-        <div class="cost-section token-activity-section" id="token-activity-section" style="display:none">
-          <div class="token-activity-head">
-            <div class="cost-title" id="token-activity-title">Token Activity</div>
-            <div class="token-activity-controls">
+        <div class="cost-section token-activity-section ui-card" id="token-activity-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title" id="token-activity-title">Token Activity</div>
+            <div class="ui-section-sub">Daily token volume across this host's sessions.</div>
+            <div class="ui-section-actions token-activity-controls">
               <div class="token-activity-segment" id="token-activity-agent" role="tablist" aria-label="Token activity agent">
                 <button type="button" data-agent="codex">Codex</button>
                 <button type="button" data-agent="all">All</button>
@@ -11532,22 +11563,34 @@ body.display-fullscreen-open {
             <div class="token-activity-months" id="token-activity-months"></div>
             <div class="token-activity-heatmap" id="token-activity-heatmap"></div>
           </div>
-          <div class="token-activity-detail" id="token-activity-detail" style="display:none"></div>
+          <div class="token-activity-detail" id="token-activity-detail"></div>
         </div>
-        <div class="cost-section" id="all-sessions-usage" style="display:none">
-          <div class="cost-title">All Sessions</div>
+        <div class="cost-section ui-card" id="all-sessions-usage">
+          <div class="ui-section-head">
+            <div class="ui-section-title">All Sessions</div>
+            <div class="ui-section-sub">Aggregate usage across every stored session.</div>
+          </div>
           <div class="cost-grid" id="all-sessions-grid"></div>
         </div>
-        <div class="cost-section" id="daily-usage-section" style="display:none">
-          <div class="cost-title">Daily Usage</div>
+        <div class="cost-section ui-card" id="daily-usage-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Daily Usage</div>
+            <div class="ui-section-sub">The most recent active days, newest first.</div>
+          </div>
           <div class="cost-grid" id="daily-usage-grid"></div>
         </div>
-        <div class="cost-section" id="agent-usage-section" style="display:none">
-          <div class="cost-title">By Agent And Period</div>
+        <div class="cost-section ui-card" id="agent-usage-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">By Agent And Period</div>
+            <div class="ui-section-sub">Usage split by agent for today, this week, and all time.</div>
+          </div>
           <div class="cost-grid" id="agent-usage-grid"></div>
         </div>
-        <div class="cost-section" id="disk-usage-section" style="display:none">
-          <div class="cost-title">Disk Usage</div>
+        <div class="cost-section ui-card" id="disk-usage-section">
+          <div class="ui-section-head">
+            <div class="ui-section-title">Disk Usage</div>
+            <div class="ui-section-sub">Space used by session recordings, frames, turns, and logs.</div>
+          </div>
           <div class="cost-grid" id="disk-usage-grid"></div>
         </div>
         <div id="display-metrics-container"></div>
@@ -33516,7 +33559,7 @@ function renderUsageTab(c) {
   const historyEl = document.getElementById('token-history');
 
   if (!c.main_json) {
-    emptyEl.style.display = 'flex';
+    emptyEl.style.display = 'grid';
     cardsEl.style.display = 'none';
     costEl.style.display = 'none';
     historyEl.style.display = 'none';
@@ -33547,39 +33590,41 @@ function renderUsageTab(c) {
       liveCard.innerHTML = `
         <div class="card-title">Live Model</div>
         <div class="card-model">
-          <span class="provider" style="color:var(--green)">${providerLabel}</span>
+          <span class="provider">${providerLabel}</span>
           <span class="model">${modelLabel}</span>
         </div>
         <div class="token-breakdown">
           <span class="label">Input tokens</span>
           <span class="value">${ld.input_tokens.toLocaleString()}</span>
-          <span class="label" style="padding-left:12px">Cached</span>
-          <span class="value" style="color:var(--green)">${ld.cached_tokens.toLocaleString()}</span>
+          <span class="label sub">Cached</span>
+          <span class="value">${ld.cached_tokens.toLocaleString()}</span>
           <span class="label">Output tokens</span>
           <span class="value">${ld.output_tokens.toLocaleString()}</span>
           ${ld.thinking_tokens > 0 ? `<span class="label">Thinking tokens</span><span class="value">${ld.thinking_tokens.toLocaleString()}</span>` : ''}
-          <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Total</span>
-          <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${ld.total_tokens.toLocaleString()}</span>
+          <span class="label total-row">Total</span>
+          <span class="value total-row">${ld.total_tokens.toLocaleString()}</span>
         </div>
       `;
       cardsEl.appendChild(liveCard);
     }
   }
 
-  // Cost
+  // Cost — build the whole grid, then assign once (update_usage fires on
+  // every token tick; incremental innerHTML += reparses the grid N times).
   if (c.cost_json) {
     const cost = JSON.parse(c.cost_json);
     costEl.style.display = 'block';
     const grid = document.getElementById('cost-grid');
-    grid.innerHTML = '';
+    const cells = [];
     for (const cl of cost.lines) {
-      grid.innerHTML += `<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`;
-      grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Input</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.input_cost.toFixed(4)}</span>`;
-      grid.innerHTML += `<span class="label" style="padding-left:12px;font-size:11px">Output</span><span class="value" style="font-size:11px;font-weight:normal">$${cl.output_cost.toFixed(4)}</span>`;
+      cells.push(`<span class="label">${cl.label}</span><span class="value">$${cl.cost.toFixed(4)}</span>`);
+      cells.push(`<span class="label sub">Input</span><span class="value sub">$${cl.input_cost.toFixed(4)}</span>`);
+      cells.push(`<span class="label sub">Output</span><span class="value sub">$${cl.output_cost.toFixed(4)}</span>`);
     }
     if (cost.lines.length > 1) {
-      grid.innerHTML += `<span class="label" style="font-weight:600;color:var(--text)">Total</span><span class="value">$${cost.total.toFixed(4)}</span>`;
+      cells.push(`<span class="label strong">Total</span><span class="value">$${cost.total.toFixed(4)}</span>`);
     }
+    grid.innerHTML = cells.join('');
   } else {
     costEl.style.display = 'none';
   }
@@ -33590,14 +33635,15 @@ function renderUsageTab(c) {
     historyEl.style.display = 'block';
     const chart = document.getElementById('history-chart');
     const maxTokens = Math.max(...history.map(h => h.tokens), 1);
-    chart.innerHTML = '';
+    const frag = document.createDocumentFragment();
     for (const h of history) {
       const bar = document.createElement('div');
       bar.className = 'history-bar';
       bar.style.height = Math.max((h.tokens / maxTokens) * 100, 2) + '%';
       bar.title = `Turn ${h.turn}: ${h.tokens.toLocaleString()} tokens`;
-      chart.appendChild(bar);
+      frag.appendChild(bar);
     }
+    chart.replaceChildren(frag);
   } else {
     historyEl.style.display = 'none';
   }
@@ -33617,13 +33663,14 @@ function renderUsageCard(label, data) {
   const hardPct = pctForWindow(data.tokens_used, hardWindow);
   const displayPct = Number.isFinite(effectivePct) ? effectivePct : data.usage_pct;
   const pressurePct = Number.isFinite(displayPct) ? displayPct : 0;
-  const color = pressurePct < 50 ? '#a6e3a1' : pressurePct < 85 ? '#f9e2af' : '#f38ba8';
+  // Same thresholds as before: <50 calm, 50-85 warn, >=85 danger.
+  const meterTone = pressurePct >= 85 ? ' danger' : pressurePct >= 50 ? ' warn' : '';
   const remainingEffective = Math.max(0, effectiveWindow - data.tokens_used);
   const remainingHard = hardWindow ? Math.max(0, hardWindow - data.tokens_used) : null;
   const effectivePctText = Number.isFinite(displayPct) ? `${displayPct.toFixed(1)}% effective` : '--';
   const hardLine = hardWindow && hardWindow !== effectiveWindow
     ? `<span class="label">Hard limit</span><span class="value">${hardWindow.toLocaleString()}</span>
-      <span class="label" style="padding-left:12px">Hard usage</span><span class="value">${hardPct === null ? '--' : hardPct.toFixed(1) + '%'}</span>
+      <span class="label sub">Hard usage</span><span class="value">${hardPct === null ? '--' : hardPct.toFixed(1) + '%'}</span>
       <span class="label">Hard remaining</span><span class="value">${remainingHard.toLocaleString()}</span>`
     : '';
   card.innerHTML = `
@@ -33632,20 +33679,21 @@ function renderUsageCard(label, data) {
     <div class="token-bar">
       <div class="bar-label">
         <span class="tokens">${data.tokens_used.toLocaleString()} / ${effectiveWindow.toLocaleString()} effective</span>
-        <span class="pct" style="color:${color}">${effectivePctText}</span>
+        <span class="pct">${effectivePctText}</span>
       </div>
-      <div class="bar-track"><div class="bar-fill" style="width:${Math.min(pressurePct, 100)}%;background:${color}"></div></div>
+      <div class="ui-meter${meterTone}"><i></i></div>
     </div>
     <div class="token-breakdown">
       <span class="label">Input tokens</span><span class="value">${prompt.toLocaleString()}</span>
-      <span class="label" style="padding-left:12px">Cached</span>
-      <span class="value" style="color:var(--green)">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
-      <span class="label" style="padding-left:12px">Uncached</span><span class="value">${uncachedInput.toLocaleString()}</span>
+      <span class="label sub">Cached</span>
+      <span class="value">${cached.toLocaleString()}${prompt > 0 ? ' (' + (cached / prompt * 100).toFixed(0) + '%)' : ''}</span>
+      <span class="label sub">Uncached</span><span class="value">${uncachedInput.toLocaleString()}</span>
       <span class="label">Output tokens</span><span class="value">${completion.toLocaleString()}</span>
       ${hardLine}
-      <span class="label" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">Effective remaining</span>
-      <span class="value" style="border-top:1px solid var(--surface0);padding-top:4px;margin-top:4px">${remainingEffective.toLocaleString()}</span>
+      <span class="label total-row">Effective remaining</span>
+      <span class="value total-row">${remainingEffective.toLocaleString()}</span>
     </div>`;
+  card.querySelector('.ui-meter > i').style.width = `${Math.min(pressurePct, 100)}%`;
   return card;
 }
 
@@ -55608,10 +55656,50 @@ function renderStatsSessionSections(sessions) {
     return;
   }
   setStatsSessionLoading(currentStatsHostKey(), false);
+  renderStatsKpiRow(sessions);
   renderTokenActivity(sessions);
   renderAllSessionsUsage(sessions);
   renderDailyUsage(sessions);
   renderDiskUsage(sessions);
+}
+
+// Headline KPI tiles at the top of the Stats tab, derived from the same
+// per-session usage entries the section renderers consume.
+function statsKpiTileHtml(label, value) {
+  return `
+    <div class="ui-stat">
+      <span class="ui-stat-label">${escapeHtml(label)}</span>
+      <span class="ui-stat-value">${escapeHtml(value)}</span>
+    </div>`;
+}
+
+function renderStatsKpiRow(sessions) {
+  const row = document.getElementById('stats-kpi-row');
+  if (!row) return;
+  if (!Array.isArray(sessions) || sessions.length === 0) {
+    row.innerHTML = '';
+    return;
+  }
+  const totals = summarizeSessionUsage(sessions);
+  const activeDays = Array.from(buildDailyUsageBuckets(sessions, 'all').values())
+    .filter(bucket => bucket.total > 0).length;
+  row.innerHTML = [
+    statsKpiTileHtml('Today cost', formatUsdCompact(totals.todayCost)),
+    statsKpiTileHtml('Week cost', formatUsdCompact(totals.weekCost)),
+    statsKpiTileHtml('All-time cost', formatUsdCompact(totals.allCost)),
+    statsKpiTileHtml('Lifetime tokens', formatCompactNumber(totals.allTokens)),
+    statsKpiTileHtml('Active days', activeDays.toLocaleString()),
+  ].join('');
+}
+
+function renderStatsKpiSkeleton() {
+  const row = document.getElementById('stats-kpi-row');
+  if (!row) return;
+  row.innerHTML = Array.from({ length: 5 }, () => `
+    <div class="ui-stat">
+      <span class="ui-skel stats-kpi-skel-label"></span>
+      <span class="ui-skel stats-kpi-skel-value"></span>
+    </div>`).join('');
 }
 
 function clearStatsSessionSections() {
@@ -55626,6 +55714,7 @@ function clearStatsSessionSections() {
     if (el) el.style.display = 'none';
   }
   for (const id of [
+    'stats-kpi-row',
     'token-activity-stats',
     'token-activity-skyline',
     'token-activity-months',
@@ -55652,6 +55741,9 @@ function setStatsSessionLoading(hostId, loading) {
   const currentHost = currentStatsHostKey();
   if (normalizedHost !== currentHost) return;
   el.style.display = loading ? 'flex' : 'none';
+  // KPI tiles shimmer while the session fetch is in flight; the section
+  // renderers (or the error path) replace them.
+  if (loading) renderStatsKpiSkeleton();
   const container = document.getElementById('usage-container');
   if (container) {
     if (loading) container.setAttribute('aria-busy', 'true');
@@ -55689,6 +55781,19 @@ function formatUsd(value, digits) {
   if (!Number.isFinite(n)) return '$--';
   const places = digits != null ? digits : (Math.abs(n) > 0 && Math.abs(n) < 1 ? 4 : 2);
   return '$' + n.toFixed(places);
+}
+
+// Stat-tile costs: compact above $1K ($93.2K), exact below ($264.82).
+function formatUsdCompact(value) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return '$--';
+  if (Math.abs(n) >= 1000) {
+    return '$' + new Intl.NumberFormat(undefined, {
+      notation: 'compact',
+      maximumFractionDigits: 1,
+    }).format(n);
+  }
+  return formatUsd(n, 2);
 }
 
 function sessionDate(session) {
@@ -56280,7 +56385,7 @@ function renderStatsSummaryCard(title, subtitle, rows) {
   card.className = 'usage-card';
   const rowsHtml = rows.map(row => `
     <span class="label">${escapeHtml(row.label)}</span>
-    <span class="value"${row.color ? ` style="color:${row.color}"` : ''}>${escapeHtml(row.value)}</span>
+    <span class="value">${escapeHtml(row.value)}</span>
   `).join('');
   card.innerHTML = `
     <div class="card-title">${escapeHtml(title)}</div>
@@ -56309,7 +56414,7 @@ function renderSessionStatsFallback(sessions) {
     { label: 'Sessions', value: totals.sessions.toLocaleString() },
     { label: 'Turns', value: totals.turns.toLocaleString() },
     { label: 'Input tokens', value: totals.allInput.toLocaleString() },
-    { label: 'Cached', value: totals.allCached.toLocaleString(), color: 'var(--green)' },
+    { label: 'Cached', value: totals.allCached.toLocaleString() },
     { label: 'Output tokens', value: totals.allOutput.toLocaleString() },
     { label: 'Total tokens', value: totals.allTokens.toLocaleString() },
   ]));
@@ -56323,10 +56428,10 @@ function renderSessionStatsFallback(sessions) {
     const total = sessionNumber(latest.total_tokens) || input + output;
     cardsEl.appendChild(renderStatsSummaryCard('Latest Session', `${provider} / ${model}`, [
       { label: 'Input tokens', value: input.toLocaleString() },
-      { label: 'Cached', value: cached.toLocaleString(), color: 'var(--green)' },
+      { label: 'Cached', value: cached.toLocaleString() },
       { label: 'Output tokens', value: output.toLocaleString() },
       { label: 'Total tokens', value: total.toLocaleString() },
-      { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost), 4), color: 'var(--green)' },
+      { label: 'Estimated cost', value: formatUsd(sessionCost(latest.estimated_cost), 4) },
     ]));
   }
 
@@ -56336,9 +56441,9 @@ function renderSessionStatsFallback(sessions) {
     if (grid) {
       grid.style.gridTemplateColumns = 'auto 1fr';
       grid.innerHTML = `
-        <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost, 4)}</span>
-        <span class="label">This Week</span><span class="value">${formatUsd(totals.weekCost, 4)}</span>
-        <span class="label" style="font-weight:600;color:var(--text)">All Time</span><span class="value">${formatUsd(totals.allCost, 4)}</span>
+        <span class="label">Today</span><span class="value">${formatUsd(totals.todayCost, 2)}</span>
+        <span class="label">This Week</span><span class="value">${formatUsd(totals.weekCost, 2)}</span>
+        <span class="label strong">All Time</span><span class="value">${formatUsd(totals.allCost, 2)}</span>
       `;
     }
   }
@@ -56386,9 +56491,11 @@ function renderAllSessionsUsageError(message) {
   const dailyEl = document.getElementById('daily-usage-section');
   if (!el || !grid) return;
   if (emptyEl) emptyEl.style.display = 'none';
+  const kpiRow = document.getElementById('stats-kpi-row');
+  if (kpiRow) kpiRow.innerHTML = '';
   el.style.display = 'block';
   grid.style.gridTemplateColumns = '1fr';
-  grid.innerHTML = `<span class="label" style="color:var(--red)">${escapeHtml(message)}</span>`;
+  grid.innerHTML = `<span class="label err">${escapeHtml(message)}</span>`;
   if (dailyEl) dailyEl.style.display = 'none';
   if (agentEl) agentEl.style.display = 'none';
   if (diskEl) diskEl.style.display = 'none';
@@ -56434,7 +56541,7 @@ function renderAllSessionsUsage(sessions) {
   }
 
   el.style.display = 'block';
-  grid.innerHTML = '';
+  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr 1fr 1fr';
 
   const rows = [
     ['Today', todayTotal, todayInput, todayCached, todayOutput, todayCost],
@@ -56442,27 +56549,25 @@ function renderAllSessionsUsage(sessions) {
     ['All Time', allTotal, allInput, allCached, allOutput, allCost],
   ];
 
-  // Header
-  grid.innerHTML = `
-    <span class="label" style="font-weight:600"></span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Total</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
-  `;
-  grid.style.gridTemplateColumns = 'auto 1fr 1fr 1fr 1fr 1fr';
-
+  const cells = [`
+    <span class="label head"></span>
+    <span class="value head">Total</span>
+    <span class="value head">Input</span>
+    <span class="value head">Cached</span>
+    <span class="value head">Output</span>
+    <span class="value head">Est. Cost</span>
+  `];
   for (const [label, total, input, cached, output, cost] of rows) {
-    grid.innerHTML += `
+    cells.push(`
       <span class="label">${label}</span>
       <span class="value total">${total.toLocaleString()}</span>
       <span class="value">${input.toLocaleString()}</span>
-      <span class="value" style="color:var(--green)">${cached.toLocaleString()}</span>
+      <span class="value">${cached.toLocaleString()}</span>
       <span class="value">${output.toLocaleString()}</span>
-      <span class="value" style="color:var(--green)">${formatUsd(cost)}</span>
-    `;
+      <span class="value">${formatUsd(cost)}</span>
+    `);
   }
+  grid.innerHTML = cells.join('');
 }
 
 function renderDailyUsage(sessions) {
@@ -56484,28 +56589,29 @@ function renderDailyUsage(sessions) {
 
   el.style.display = 'block';
   grid.style.gridTemplateColumns = 'auto 0.75fr 1fr 1fr 1fr 1fr 1fr';
-  grid.innerHTML = `
-    <span class="label" style="font-weight:600"></span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Sessions</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Total</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
-  `;
 
+  const cells = [`
+    <span class="label head"></span>
+    <span class="value head">Sessions</span>
+    <span class="value head">Total</span>
+    <span class="value head">Input</span>
+    <span class="value head">Cached</span>
+    <span class="value head">Output</span>
+    <span class="value head">Est. Cost</span>
+  `];
   for (const row of rows) {
     const isToday = row.day === todayIso;
-    grid.innerHTML += `
+    cells.push(`
       <span class="label${isToday ? ' today' : ''}" title="${escapeHtml(row.day)}">${escapeHtml(formatDailyUsageDay(row.day, todayIso))}</span>
       <span class="value">${exactNumber(row.sessions)}</span>
       <span class="value total">${exactNumber(row.total)}</span>
       <span class="value">${exactNumber(row.input)}</span>
-      <span class="value" style="color:var(--green)">${exactNumber(row.cached)}</span>
+      <span class="value">${exactNumber(row.cached)}</span>
       <span class="value">${exactNumber(row.output)}</span>
-      <span class="value" style="color:var(--green)">${formatUsd(row.cost, 4)}</span>
-    `;
+      <span class="value">${formatUsd(row.cost, 4)}</span>
+    `);
   }
+  grid.innerHTML = cells.join('');
 }
 
 function renderAgentUsage(sessions) {
@@ -56521,33 +56627,34 @@ function renderAgentUsage(sessions) {
   }
 
   el.style.display = 'block';
-  grid.innerHTML = `
-    <span class="label" style="font-weight:600">Agent</span>
-    <span class="label" style="font-weight:600">Period</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Sessions</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Total</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Input</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Cached</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Output</span>
-    <span class="value" style="font-size:10px;color:var(--overlay1)">Est. Cost</span>
-  `;
   grid.style.gridTemplateColumns = 'minmax(90px, auto) minmax(72px, auto) 0.75fr 1fr 1fr 1fr 1fr 1fr';
 
+  const cells = [`
+    <span class="label head">Agent</span>
+    <span class="label head">Period</span>
+    <span class="value head">Sessions</span>
+    <span class="value head">Total</span>
+    <span class="value head">Input</span>
+    <span class="value head">Cached</span>
+    <span class="value head">Output</span>
+    <span class="value head">Est. Cost</span>
+  `];
   for (const b of buckets) {
     const unpriced = b.unpricedTokens > 0
-      ? `<span style="display:block;font-size:10px;color:var(--yellow)">+ ${b.unpricedTokens.toLocaleString()} tokens not priced</span>`
+      ? `<span class="unpriced">+ ${b.unpricedTokens.toLocaleString()} tokens not priced</span>`
       : '';
-    grid.innerHTML += `
+    cells.push(`
       <span class="label">${escapeHtml(b.label)}</span>
       <span class="label period">${escapeHtml(b.periodLabel)}</span>
       <span class="value">${b.sessions.toLocaleString()}</span>
       <span class="value total">${b.total.toLocaleString()}</span>
       <span class="value">${b.input.toLocaleString()}</span>
-      <span class="value" style="color:var(--green)">${b.cached.toLocaleString()}</span>
+      <span class="value">${b.cached.toLocaleString()}</span>
       <span class="value">${b.output.toLocaleString()}</span>
-      <span class="value" style="color:var(--green)">${formatUsd(b.cost)}${unpriced}</span>
-    `;
+      <span class="value">${formatUsd(b.cost)}${unpriced}</span>
+    `);
   }
+  grid.innerHTML = cells.join('');
 }
 
 function renderDiskUsage(sessions) {
@@ -56571,7 +56678,6 @@ function renderDiskUsage(sessions) {
   }
 
   el.style.display = 'block';
-  grid.innerHTML = '';
   grid.style.gridTemplateColumns = 'auto 1fr';
 
   const rows = [
@@ -56581,17 +56687,19 @@ function renderDiskUsage(sessions) {
     ['Logs', totalLogs],
   ];
 
+  const cells = [];
   for (const [label, bytes] of rows) {
     if (bytes === 0) continue;
-    grid.innerHTML += `
+    cells.push(`
       <span class="label">${label}</span>
       <span class="value">${_fmtBytes(bytes)}</span>
-    `;
+    `);
   }
-  grid.innerHTML += `
-    <span class="label" style="font-weight:600;color:var(--text);border-top:1px solid var(--surface0);padding-top:6px;margin-top:4px">Total</span>
-    <span class="value" style="font-weight:600;color:var(--text);border-top:1px solid var(--surface0);padding-top:6px;margin-top:4px">${_fmtBytes(totalBytes)}</span>
-  `;
+  cells.push(`
+    <span class="label total-row">Total</span>
+    <span class="value total-row">${_fmtBytes(totalBytes)}</span>
+  `);
+  grid.innerHTML = cells.join('');
 }
 
 function selectTokenActivityDayFromCell(cell) {
@@ -65087,12 +65195,15 @@ function updateDisplayMetrics(d) {
     displayMetricsIds.add(did);
     section = document.createElement('div');
     section.id = sectionId;
-    section.className = 'cost-section';
+    section.className = 'cost-section ui-card';
+    const head = document.createElement('div');
+    head.className = 'ui-section-head';
     const title = document.createElement('div');
-    title.className = 'cost-title';
+    title.className = 'ui-section-title';
     title.id = sectionId + '-title';
     title.textContent = 'Display Transport';
-    section.appendChild(title);
+    head.appendChild(title);
+    section.appendChild(head);
     const table = document.createElement('table');
     table.className = 'display-metrics-table';
     table.innerHTML =
