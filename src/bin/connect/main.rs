@@ -85,6 +85,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     });
 
     tokio::spawn(presence_alert_monitor(state.clone()));
+    tokio::spawn(handle_reclaim_monitor(state.clone()));
 
     let app = Router::new()
         .route("/", get(connect_ui))
@@ -112,6 +113,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/api/claims/{claim_id}", get(api_claim_status))
         .route("/api/audit", get(api_audit))
         .route("/api/status", get(api_status))
+        .route("/api/attest/dns", post(attest_dns))
+        .route("/api/attest/github", post(attest_github))
+        .route("/api/directory/{handle}", get(directory_lookup).options(orl_preflight))
         .route("/api/log/sth", get(log_sth).options(orl_preflight))
         .route("/api/log/entries", get(log_entries).options(orl_preflight))
         .route("/api/log/proof", get(log_proof).options(orl_preflight))
@@ -454,6 +458,21 @@ struct UserRecord {
     passkeys: Vec<PasskeyCredential>,
     created_unix_ms: u64,
     updated_unix_ms: u64,
+    #[serde(default)]
+    last_login_unix_ms: u64,
+    #[serde(default)]
+    attestations: Vec<AttestationRecord>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct AttestationRecord {
+    /// "dns" or "github".
+    kind: String,
+    /// The external identity: a domain, or "github:<user>".
+    subject: String,
+    verified_unix_ms: u64,
+    /// Where the proof lives (TXT record name / raw file URL).
+    proof: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -750,6 +769,11 @@ fn user_view(user: &UserRecord) -> serde_json::Value {
         "account_name": user.account_name,
         "display_name": user.display_name,
         "passkey_count": user.passkeys.len(),
+        "attestations": user
+            .attestations
+            .iter()
+            .map(|a| json!({ "kind": a.kind, "subject": a.subject, "verified_unix_ms": a.verified_unix_ms }))
+            .collect::<Vec<_>>(),
     })
 }
 
@@ -1149,7 +1173,10 @@ fn log_consistency_proof(m: usize, leaves: &[[u8; 32]]) -> Vec<[u8; 32]> {
     subproof(m, leaves, true)
 }
 
-/// Inclusion verification per RFC 9162 §2.1.3.2.
+/// Inclusion verification per RFC 9162 §2.1.3.2. The service only ever
+/// PRODUCES proofs (browsers and the E2E validator verify with their own
+/// implementations); this verifier exists to test the producers against.
+#[cfg(test)]
 fn log_verify_inclusion(
     leaf: &[u8; 32],
     index: usize,
@@ -1167,10 +1194,10 @@ fn log_verify_inclusion(
         if sn == 0 {
             return false;
         }
-        if fn_ % 2 == 1 || fn_ == sn {
+        if !fn_.is_multiple_of(2) || fn_ == sn {
             r = log_node_hash(p, &r);
-            if fn_ % 2 == 0 {
-                while fn_ % 2 == 0 && fn_ != 0 {
+            if fn_.is_multiple_of(2) {
+                while fn_.is_multiple_of(2) && fn_ != 0 {
                     fn_ >>= 1;
                     sn >>= 1;
                 }
@@ -1184,7 +1211,8 @@ fn log_verify_inclusion(
     sn == 0 && r == *root
 }
 
-/// Consistency verification per RFC 9162 §2.1.4.2.
+/// Consistency verification per RFC 9162 §2.1.4.2 (test-only; see above).
+#[cfg(test)]
 fn log_verify_consistency(
     old_size: usize,
     new_size: usize,
@@ -1212,7 +1240,7 @@ fn log_verify_consistency(
     };
     let mut fn_ = old_size - 1;
     let mut sn = new_size - 1;
-    while fn_ % 2 == 1 {
+    while !fn_.is_multiple_of(2) {
         fn_ >>= 1;
         sn >>= 1;
     }
@@ -1222,11 +1250,11 @@ fn log_verify_consistency(
         if sn == 0 {
             return false;
         }
-        if fn_ % 2 == 1 || fn_ == sn {
+        if !fn_.is_multiple_of(2) || fn_ == sn {
             fr = log_node_hash(p, &fr);
             sr = log_node_hash(p, &sr);
-            if fn_ % 2 == 0 {
-                while fn_ % 2 == 0 && fn_ != 0 {
+            if fn_.is_multiple_of(2) {
+                while fn_.is_multiple_of(2) && fn_ != 0 {
                     fn_ >>= 1;
                     sn >>= 1;
                 }
@@ -1445,6 +1473,241 @@ fn load_or_create_vapid_keypair(
         &rng,
     )
     .map_err(|_| "stored VAPID key is invalid".to_string())
+}
+
+// ── Attestations: bind a handle to an external identity, as decoration ──
+//
+// Verification never gates anything: handles stay first-come and keys
+// stay the identity. An attestation is a checkable claim ("this handle
+// is held by whoever controls example.com / github.com/user") shown as
+// a badge and committed to the transparency log.
+
+/// The exact string a proof must contain, e.g.
+/// `intendant-handle=lenny@connect.intendant.dev`.
+fn attestation_claim_string(config: &ServiceConfig, handle: &str) -> String {
+    // Mirrors the browser's `location.host`: hostname plus the port
+    // when it is not the scheme default.
+    let host = Url::parse(&config.public_origin)
+        .ok()
+        .and_then(|u| {
+            u.host_str().map(|h| match u.port() {
+                Some(port) => format!("{h}:{port}"),
+                None => h.to_string(),
+            })
+        })
+        .unwrap_or_default();
+    format!("intendant-handle={handle}@{host}")
+}
+
+fn upsert_attestation(user: &mut UserRecord, kind: &str, subject: String, proof: String) {
+    user.attestations
+        .retain(|a| !(a.kind == kind && a.subject == subject));
+    user.attestations.push(AttestationRecord {
+        kind: kind.to_string(),
+        subject,
+        verified_unix_ms: now_unix_ms(),
+        proof,
+    });
+}
+
+async fn record_verified_attestation(
+    state: &Arc<AppState>,
+    user_id: Uuid,
+    kind: &str,
+    subject: &str,
+    proof: &str,
+) -> ApiResult<serde_json::Value> {
+    let mut store = state.store.lock().await;
+    let handle = {
+        let user = store
+            .users
+            .iter_mut()
+            .find(|u| u.id == user_id)
+            .ok_or_else(|| ApiError::not_found("account not found"))?;
+        upsert_attestation(user, kind, subject.to_string(), proof.to_string());
+        user.account_name.clone()
+    };
+    append_log_entry(
+        &mut store,
+        "attestation",
+        json!({ "handle": handle, "attestation_kind": kind, "subject": subject }),
+    );
+    audit(
+        &mut store,
+        "attestation_verified",
+        Some(user_id),
+        None,
+        json!({ "kind": kind, "subject": subject }),
+    );
+    persist_locked(state, &store)?;
+    Ok(json!({ "ok": true, "kind": kind, "subject": subject }))
+}
+
+#[derive(Debug, Deserialize)]
+struct AttestDnsRequest {
+    domain: String,
+}
+
+/// Verify a `_intendant.<domain>` TXT record via DNS-over-HTTPS (no
+/// resolver dependency; override the DoH URL for tests/self-hosters
+/// with INTENDANT_CONNECT_DOH_URL).
+async fn attest_dns(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AttestDnsRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "attest", 10, 600_000).await?;
+    let domain = body.domain.trim().trim_end_matches('.').to_ascii_lowercase();
+    if domain.is_empty()
+        || domain.len() > 253
+        || !domain.contains('.')
+        || !domain
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '.')
+    {
+        return Err(ApiError::bad_request("that does not look like a domain"));
+    }
+    let expected = attestation_claim_string(&state.config, &user.account_name);
+    let doh_base = std::env::var("INTENDANT_CONNECT_DOH_URL")
+        .unwrap_or_else(|_| "https://cloudflare-dns.com/dns-query".to_string());
+    let response = state
+        .push_http
+        .get(&doh_base)
+        .query(&[("name", format!("_intendant.{domain}")), ("type", "TXT".to_string())])
+        .header("accept", "application/dns-json")
+        .send()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("DNS lookup failed: {e}")))?;
+    let answer: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("DNS response unreadable: {e}")))?;
+    let found = answer
+        .get("Answer")
+        .and_then(|a| a.as_array())
+        .map(|records| {
+            records.iter().any(|record| {
+                record
+                    .get("data")
+                    .and_then(|d| d.as_str())
+                    .map(|txt| txt.trim_matches('"').trim() == expected)
+                    .unwrap_or(false)
+            })
+        })
+        .unwrap_or(false);
+    if !found {
+        return Err(ApiError::bad_request(format!(
+            "TXT record not found. Create a TXT record at _intendant.{domain} with the exact value: {expected}"
+        )));
+    }
+    Ok(Json(
+        record_verified_attestation(&state, user.id, "dns", &domain, &format!("_intendant.{domain}"))
+            .await?,
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+struct AttestGithubRequest {
+    gist_raw_url: String,
+}
+
+/// Verify a public gist raw URL containing the claim string. The gist
+/// owner (from the URL path) becomes the attested subject.
+async fn attest_github(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    Json(body): Json<AttestGithubRequest>,
+) -> ApiResult<Json<serde_json::Value>> {
+    let user = require_user(&state, &headers).await?;
+    require_csrf(&state, &headers).await?;
+    check_rate_limit(&state, &headers, "attest", 10, 600_000).await?;
+    let raw_url = body.gist_raw_url.trim().to_string();
+    let allowed_base = std::env::var("INTENDANT_CONNECT_GIST_BASE")
+        .unwrap_or_else(|_| "https://gist.githubusercontent.com/".to_string());
+    if !raw_url.starts_with(&allowed_base) {
+        return Err(ApiError::bad_request(format!(
+            "URL must be a raw gist URL starting with {allowed_base}"
+        )));
+    }
+    let parsed = Url::parse(&raw_url).map_err(|_| ApiError::bad_request("invalid URL"))?;
+    let gh_user = parsed
+        .path_segments()
+        .and_then(|mut segments| segments.next())
+        .map(|owner| owner.to_ascii_lowercase())
+        .filter(|owner| {
+            !owner.is_empty()
+                && owner
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        })
+        .ok_or_else(|| ApiError::bad_request("could not read the gist owner from the URL"))?;
+    let expected = attestation_claim_string(&state.config, &user.account_name);
+    let content = state
+        .push_http
+        .get(parsed.clone())
+        .send()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("gist fetch failed: {e}")))?
+        .text()
+        .await
+        .map_err(|e| ApiError::bad_request(format!("gist unreadable: {e}")))?;
+    if content.len() > 65_536 || !content.contains(&expected) {
+        return Err(ApiError::bad_request(format!(
+            "the gist does not contain the exact claim line: {expected}"
+        )));
+    }
+    let subject = format!("github:{gh_user}");
+    Ok(Json(
+        record_verified_attestation(&state, user.id, "github", &subject, &raw_url).await?,
+    ))
+}
+
+/// Public directory: what this service will say about a handle. Zero
+/// authority; all of it is re-checkable (attestation proofs are
+/// external, log entries carry inclusion proofs).
+async fn directory_lookup(
+    State(state): State<Arc<AppState>>,
+    headers: HeaderMap,
+    axum::extract::Path(handle): axum::extract::Path<String>,
+) -> ApiResult<Response> {
+    check_rate_limit(&state, &headers, "directory", 120, 60_000).await?;
+    let handle = normalize_account_name(&handle);
+    let store = state.store.lock().await;
+    let Some(user) = store.users.iter().find(|u| u.account_name == handle) else {
+        return Ok(orl_cors(
+            Json(json!({ "ok": true, "found": false })).into_response(),
+        ));
+    };
+    let attestations: Vec<serde_json::Value> = user
+        .attestations
+        .iter()
+        .map(|a| {
+            json!({
+                "kind": a.kind,
+                "subject": a.subject,
+                "verified_unix_ms": a.verified_unix_ms,
+                "proof": a.proof,
+            })
+        })
+        .collect();
+    Ok(orl_cors(
+        Json(json!({
+            "ok": true,
+            "found": true,
+            "handle": user.account_name,
+            "display_name": user.display_name,
+            "created_unix_ms": user.created_unix_ms,
+            "attestations": attestations,
+            "claimed_daemons": store
+                .daemons
+                .iter()
+                .filter(|d| d.owner_user_id == Some(user.id))
+                .count(),
+        }))
+        .into_response(),
+    ))
 }
 
 fn log_leaves(store: &Store) -> Vec<[u8; 32]> {
@@ -1730,18 +1993,18 @@ async fn push_unsubscribe(
     let user = require_user(&state, &headers).await?;
     require_csrf(&state, &headers).await?;
     let endpoint = body.endpoint.trim();
-    let mut removed = 0;
-    {
+    let removed = {
         let mut store = state.store.lock().await;
         let before = store.push_subscriptions.len();
         store.push_subscriptions.retain(|record| {
             !(record.user_id == user.id && (endpoint.is_empty() || record.endpoint == endpoint))
         });
-        removed = before - store.push_subscriptions.len();
+        let removed = before - store.push_subscriptions.len();
         if removed > 0 {
             persist_locked(&state, &store)?;
         }
-    }
+        removed
+    };
     Ok(Json(json!({ "ok": true, "removed": removed })))
 }
 
@@ -1883,6 +2146,74 @@ async fn presence_alert_monitor(state: Arc<AppState>) {
                 .retain(|record| !dead.contains(&record.endpoint));
             let _ = persist_locked(&state, &store);
         }
+    }
+}
+
+/// Dormant-handle reclamation (stated policy; enforcement is opt-in via
+/// INTENDANT_CONNECT_RECLAIM_AFTER_MS, 0/unset = off): an account with
+/// zero claimed daemons and no sign-in past the threshold loses its
+/// handle — the account survives, renamed to user-<id-prefix>, and the
+/// reclamation is committed to the transparency log. Squatted-but-unused
+/// names do not keep.
+async fn handle_reclaim_monitor(state: Arc<AppState>) {
+    let after_ms: u64 = std::env::var("INTENDANT_CONNECT_RECLAIM_AFTER_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    if after_ms == 0 {
+        return;
+    }
+    let poll_ms: u64 = std::env::var("INTENDANT_CONNECT_RECLAIM_POLL_MS")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(6 * 3600 * 1000);
+    loop {
+        tokio::time::sleep(Duration::from_millis(poll_ms.max(60_000))).await;
+        let now = now_unix_ms();
+        let mut store = state.store.lock().await;
+        let owners: std::collections::HashSet<Uuid> = store
+            .daemons
+            .iter()
+            .filter_map(|d| d.owner_user_id)
+            .collect();
+        let mut reclaimed = Vec::new();
+        for user in store.users.iter_mut() {
+            if user.account_name.starts_with("user-") || owners.contains(&user.id) {
+                continue;
+            }
+            let last_active = user
+                .last_login_unix_ms
+                .max(user.updated_unix_ms)
+                .max(user.created_unix_ms);
+            if now.saturating_sub(last_active) < after_ms {
+                continue;
+            }
+            let freed = user.account_name.clone();
+            let mut short = user.id.simple().to_string();
+            short.truncate(8);
+            user.account_name = format!("user-{short}");
+            user.updated_unix_ms = now;
+            reclaimed.push((freed, user.account_name.clone(), user.id));
+        }
+        if reclaimed.is_empty() {
+            continue;
+        }
+        for (freed, renamed_to, user_id) in &reclaimed {
+            append_log_entry(
+                &mut store,
+                "handle_reclaimed",
+                json!({ "handle": freed, "renamed_to": renamed_to }),
+            );
+            audit(
+                &mut store,
+                "handle_reclaimed",
+                Some(*user_id),
+                None,
+                json!({ "handle": freed }),
+            );
+            eprintln!("[reclaim] freed dormant handle {freed} (account renamed to {renamed_to})");
+        }
+        let _ = persist_locked(&state, &store);
     }
 }
 
@@ -2355,6 +2686,8 @@ async fn auth_register_finish(
                 passkeys: vec![passkey],
                 created_unix_ms: now,
                 updated_unix_ms: now,
+                last_login_unix_ms: now,
+                attestations: Vec::new(),
             });
             append_log_entry(
                 &mut store,
@@ -2480,6 +2813,7 @@ async fn auth_login_finish(
             .map_err(|e| ApiError::bad_request(format!("finish passkey login: {e}")))?;
         stored.counter = auth_result.new_counter;
         user.updated_unix_ms = now_unix_ms();
+        user.last_login_unix_ms = user.updated_unix_ms;
         let user = user.clone();
         audit(
             &mut store,
@@ -4322,6 +4656,9 @@ fn trust_ui_html(origin: &str) -> String {
     <h2>Notifications</h2>
     <p class="dim">Optional Web Push alerts ("your computer went offline") are composed from the polling presence this service already sees &mdash; no new knowledge &mdash; and each payload is encrypted to your browser&rsquo;s subscription, so the push relays in between carry ciphertext.</p>
 
+    <h2>Names are checkable here</h2>
+    <p class="dim">Every name binding this service hands out &mdash; which key a computer had when claimed, handle creations, revocation lists, verified badges &mdash; is committed to an append-only transparency log. Your browser pins the signed tree head and re-verifies on every visit that history only ever grew. Handles can carry <em>verified identity</em> badges (a DNS record or GitHub gist you control); verification is decoration, never authority. Dormant handles with no computers and no sign-ins are eventually freed &mdash; squatted names don&rsquo;t keep.</p>
+
     <h2>Organizations</h2>
     <p class="dim">Org membership is a document signed by the organization&rsquo;s own key, verified by each of its computers directly. This service stores at most the org&rsquo;s <em>revocation list</em> &mdash; also root-signed and rollback-protected, so the worst a malicious board can do is withhold it, never forge it.</p>
 
@@ -4639,6 +4976,25 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
           <h3>What this account can and cannot do</h3>
           <div class="sub">It is rendezvous and navigation only &mdash; it grants nothing by itself. Every daemon decides access through its own local IAM, dashboard sessions verify a signature from the daemon itself, and private fields in Saved places sync end&#8209;to&#8209;end encrypted when your passkey supports PRF. <a href="/trust">The full story.</a></div>
         </div>
+        <div class="advanced-block" id="identity-block">
+          <h3>Verified identity</h3>
+          <div class="sub">Optionally prove this handle is yours by publishing a claim you control. Verification is decoration &mdash; keys stay the identity &mdash; and every verified badge is committed to this service&rsquo;s public transparency log. Your claim line: <code id="attest-claim"></code></div>
+          <div class="metric-row" id="attest-badges"></div>
+          <div class="kv-row">
+            <input id="attest-domain" autocomplete="off" spellcheck="false" placeholder="example.com &mdash; needs TXT at _intendant.example.com">
+            <button id="attest-dns-btn" class="ghost">Verify domain</button>
+          </div>
+          <div class="kv-row">
+            <input id="attest-gist" autocomplete="off" spellcheck="false" placeholder="https://gist.githubusercontent.com/&lt;you&gt;/&hellip;/raw &mdash; containing the claim line">
+            <button id="attest-github-btn" class="ghost">Verify GitHub</button>
+          </div>
+          <div id="attest-status" class="sub"></div>
+        </div>
+        <div class="advanced-block" id="log-block">
+          <h3>Transparency log</h3>
+          <div class="sub">Every name binding this service hands out (which key a computer had when claimed, handle creations, revocation lists, badges) is committed to an append-only log. Your browser pins the signed tree head and re-verifies consistency on every visit &mdash; rewriting history here is detectable, not just forbidden.</div>
+          <div class="metric-row"><span id="log-pill" class="pill">checking&hellip;</span></div>
+        </div>
         <div class="advanced-block" id="push-block">
           <h3>Notifications</h3>
           <div class="sub">Get a notification on this browser when one of your computers goes offline or comes back. Alerts are composed from presence the rendezvous already sees, and delivered encrypted to this browser alone.</div>
@@ -4930,6 +5286,113 @@ async function renderOrgs() {{
   }});
 }}
 
+/* ── Transparency log client: RFC 9162 verification in WebCrypto ── */
+const LOG_STH_KEY = 'intendant_log_sth_v1';
+
+async function logSha(bytes) {{
+  return new Uint8Array(await crypto.subtle.digest('SHA-256', bytes));
+}}
+
+async function logNodeHash(left, right) {{
+  const buf = new Uint8Array(1 + left.length + right.length);
+  buf[0] = 0x01; buf.set(left, 1); buf.set(right, 1 + left.length);
+  return logSha(buf);
+}}
+
+function bytesEqual(a, b) {{
+  if (!a || !b || a.length !== b.length) return false;
+  let diff = 0;
+  for (let i = 0; i < a.length; i += 1) diff |= a[i] ^ b[i];
+  return diff === 0;
+}}
+
+async function logVerifyConsistency(oldSize, newSize, oldRoot, newRoot, proof) {{
+  if (oldSize === newSize) return bytesEqual(oldRoot, newRoot) && proof.length === 0;
+  if (oldSize === 0 || oldSize > newSize) return false;
+  const complete = (oldSize & (oldSize - 1)) === 0;
+  let i = 0;
+  const first = complete ? oldRoot : proof[i++];
+  if (!first) return false;
+  let fn = oldSize - 1, sn = newSize - 1;
+  while (fn % 2 === 1) {{ fn = Math.floor(fn / 2); sn = Math.floor(sn / 2); }}
+  let fr = first, sr = first;
+  for (; i < proof.length; i += 1) {{
+    if (sn === 0) return false;
+    const p = proof[i];
+    if (fn % 2 === 1 || fn === sn) {{
+      fr = await logNodeHash(p, fr);
+      sr = await logNodeHash(p, sr);
+      if (fn % 2 === 0) while (fn % 2 === 0 && fn !== 0) {{ fn = Math.floor(fn / 2); sn = Math.floor(sn / 2); }}
+    }} else {{
+      sr = await logNodeHash(sr, p);
+    }}
+    fn = Math.floor(fn / 2); sn = Math.floor(sn / 2);
+  }}
+  return bytesEqual(fr, oldRoot) && bytesEqual(sr, newRoot) && sn === 0;
+}}
+
+async function logVerifySthSignature(sth) {{
+  try {{
+    const key = await crypto.subtle.importKey(
+      'raw', b64uToBuf(sth.public_key),
+      {{ name: 'ECDSA', namedCurve: 'P-256' }}, false, ['verify']);
+    const payload = new TextEncoder().encode(
+      `intendant-log-sth-v1\n${{sth.size}}\n${{sth.root}}\n${{sth.unix_ms}}`);
+    return await crypto.subtle.verify(
+      {{ name: 'ECDSA', hash: 'SHA-256' }}, key, b64uToBuf(sth.signature), payload);
+  }} catch {{
+    return false;
+  }}
+}}
+
+/* Pin the signed tree head; on every visit verify the log only ever
+   appended since last time. A failed check is loud and sticky. */
+async function transparencyCheck() {{
+  const pill = $('log-pill');
+  try {{
+    const sth = await api('/api/log/sth');
+    if (!(await logVerifySthSignature(sth))) throw new Error('tree head signature invalid');
+    let pinned = null;
+    try {{ pinned = JSON.parse(localStorage.getItem(LOG_STH_KEY) || 'null'); }} catch {{}}
+    if (pinned && pinned.public_key === sth.public_key && pinned.size > 0) {{
+      if (sth.size < pinned.size) throw new Error('log shrank — history was rewritten');
+      const proof = await api(`/api/log/consistency?old=${{pinned.size}}&new=${{sth.size}}`);
+      const asBytes = value => new Uint8Array(b64uToBuf(value));
+      const consistent = await logVerifyConsistency(
+        pinned.size, sth.size,
+        asBytes(pinned.root), asBytes(sth.root),
+        (proof.proof || []).map(asBytes));
+      if (!consistent) throw new Error('consistency proof failed — history was rewritten');
+    }}
+    localStorage.setItem(LOG_STH_KEY, JSON.stringify({{
+      size: sth.size, root: sth.root, public_key: sth.public_key,
+      pinned_unix_ms: pinned?.pinned_unix_ms || Date.now(),
+    }}));
+    if (pill) {{
+      const since = pinned?.pinned_unix_ms ? new Date(pinned.pinned_unix_ms).toLocaleDateString() : 'today';
+      pill.textContent = `${{sth.size}} entries · consistent since ${{since}}`;
+      pill.className = 'pill ok';
+    }}
+  }} catch (err) {{
+    console.warn('[transparency] check failed:', err);
+    if (pill) {{
+      pill.textContent = 'VERIFICATION FAILED: ' + err.message;
+      pill.className = 'pill err';
+    }}
+  }}
+}}
+
+function renderAttestations() {{
+  const claim = $('attest-claim');
+  const badges = $('attest-badges');
+  if (!claim || !badges || !state.user) return;
+  claim.textContent = `intendant-handle=${{state.user.account_name}}@${{location.host}}`;
+  const list = state.user.attestations || [];
+  badges.innerHTML = list.length
+    ? list.map(a => `<span class="pill ok" title="verified ${{new Date(a.verified_unix_ms).toLocaleDateString()}}">&#10003; ${{escapeHtml(a.kind === 'dns' ? a.subject : a.subject.replace('github:', 'github.com/'))}}</span>`).join('')
+    : '<span class="sub">no verifications yet</span>';
+}}
+
 async function pushSubscriptionState() {{
   if (!('serviceWorker' in navigator) || !('PushManager' in window)) return {{ supported: false }};
   const registration = await navigator.serviceWorker.getRegistration('/');
@@ -5056,6 +5519,7 @@ function renderAuth() {{
   $('account').disabled = authed;
   if (!authed) $('fleet-section').classList.add('hidden');
   if (authed) renderPushBlock().catch(() => {{}});
+  if (authed) renderAttestations();
   if (authed) {{
     $('account').value = state.user.account_name || '';
     $('session-chip-handle').textContent = '@' + state.user.account_name;
@@ -5272,6 +5736,27 @@ function escapeHtml(value) {{
 }}
 function escapeAttr(value) {{ return escapeHtml(value); }}
 
+$('attest-dns-btn').addEventListener('click', async () => {{
+  const domain = $('attest-domain').value.trim();
+  if (!domain) return;
+  setStatus('attest-status', 'checking TXT record\u2026', '');
+  try {{
+    const r = await api('/api/attest/dns', {{ method: 'POST', body: JSON.stringify({{ domain }}) }});
+    setStatus('attest-status', `verified ${{r.subject}}`, 'ok');
+    await refreshAll();
+  }} catch (err) {{ setStatus('attest-status', err.message, 'err'); }}
+}});
+$('attest-github-btn').addEventListener('click', async () => {{
+  const gist_raw_url = $('attest-gist').value.trim();
+  if (!gist_raw_url) return;
+  setStatus('attest-status', 'fetching gist\u2026', '');
+  try {{
+    const r = await api('/api/attest/github', {{ method: 'POST', body: JSON.stringify({{ gist_raw_url }}) }});
+    setStatus('attest-status', `verified ${{r.subject}}`, 'ok');
+    await refreshAll();
+  }} catch (err) {{ setStatus('attest-status', err.message, 'err'); }}
+}});
+transparencyCheck();
 $('push-enable').addEventListener('click', () => enablePushNotifications().then(renderPushBlock).catch(err => alert('Notifications: ' + err.message)));
 $('push-disable').addEventListener('click', () => disablePushNotifications().then(renderPushBlock).catch(() => renderPushBlock()));
 $('push-test').addEventListener('click', async () => {{

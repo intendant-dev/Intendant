@@ -83,6 +83,32 @@ browser subscription (RFC 8291 — the push relay carries ciphertext), and
 the VAPID signing key is generated automatically into the state file on
 first start. Dead subscriptions are pruned on 404/410.
 
+## Transparency log and attestations
+
+Every name binding the service hands out is committed to an append-only
+RFC 6962-shaped Merkle log: which public key a computer had when it was
+claimed, handle creations, org revocation-list publications, verified
+badges, and handle reclamations. The signed tree head is public
+(`/api/log/sth`, ES256 key auto-generated into the state file) along
+with entries, inclusion proofs, and consistency proofs
+(`/api/log/{entries,proof,consistency,find}`). Browsers pin the tree
+head and verify consistency on every visit (Advanced → Transparency
+log), so rewriting history is detectable, not merely forbidden.
+
+Accounts can attach verified identities as decoration (Advanced →
+Verified identity): a `_intendant.<domain>` TXT record checked over
+DNS-over-HTTPS (`INTENDANT_CONNECT_DOH_URL` overrides the resolver) or
+a public gist containing the claim line
+(`INTENDANT_CONNECT_GIST_BASE`). Badges appear in the public directory
+(`/api/directory/<handle>`) and in the log. Verification never gates
+anything — keys stay the identity.
+
+Dormant-handle reclamation is stated policy: an account with zero
+claimed daemons and no sign-in for the configured window loses its
+handle (the account survives, renamed). Enforcement is opt-in via
+`INTENDANT_CONNECT_RECLAIM_AFTER_MS` (unset/0 = off) and every
+reclamation is logged.
+
 ## Discovery
 
 A daemon with Connect enabled advertises its rendezvous in its agent card

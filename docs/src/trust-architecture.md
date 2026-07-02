@@ -109,7 +109,7 @@ fully rolled out:
 | Rendezvous / signaling | Denial of service; first-introduction name games | Channels bind to daemon keys; claim phrases bind keys out of band |
 | TURN relay | Denial of service; traffic analysis | Sees only ciphertext |
 | Fleet metadata store | Denial of service | Records are client-signed (and encrypted where private); clients verify |
-| Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; transparency log later |
+| Name directory | Handle confusion at first introduction | Key-first identity; handles are labels; org keys sign membership; append-only transparency log over all name bindings (STH pinned + consistency-verified by browsers; inclusion proofs on claims), optional DNS/GitHub attestation badges, invite-gated registration + reserved handles + dormant-handle reclamation |
 | Hosted dashboard origin (degraded lane) | The session's granted authority | Sessions are principal-marked and role-capped below root by daemon policy |
 
 Trust scales with the blast radius of the relationship: a global service that
