@@ -146,6 +146,7 @@ mod walk {
     use atspi::proxy::accessible::{AccessibleProxy, ObjectRefExt};
     use atspi::proxy::component::ComponentProxy;
     use atspi::{CoordType, State};
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     /// Caps on the application/toplevel scan (before the element walk).
     const MAX_APPS: usize = 128;
@@ -191,7 +192,7 @@ mod walk {
 
         // Scan applications for the toplevel window carrying the Active
         // state; collect other visible toplevels for orientation.
-        let mut active: Option<(String, i32, AccessibleProxy<'static>, String)> = None;
+        let mut active = None;
         let mut other_windows: Vec<String> = Vec::new();
         for app_ref in apps.into_iter().take(MAX_APPS) {
             let Ok(app_proxy) = app_ref.clone().into_accessible_proxy(conn.connection()).await
@@ -238,9 +239,10 @@ mod walk {
             });
         };
 
-        let mut budget = max_nodes;
-        let mut truncated = false;
-        let root = walk_element(&conn, window, max_depth, &mut budget, &mut truncated).await;
+        let budget = AtomicUsize::new(max_nodes);
+        let truncated = AtomicBool::new(false);
+        let root = walk_element(&conn, window, max_depth, &budget, &truncated).await;
+        let truncated = truncated.load(Ordering::SeqCst);
 
         let mut truncated_msg = truncated.then(|| {
             format!("element tree truncated at {max_nodes} nodes / depth {max_depth}")
@@ -283,21 +285,24 @@ mod walk {
 
     /// Depth-first bounded walk. Values (field contents) are deliberately not
     /// collected — roles, labels, and geometry are enough to act on, and keep
-    /// the observation metadata-only. Takes the proxy by value: the recursive
-    /// boxed future must not borrow loop-local children.
+    /// the observation metadata-only. Proxies borrow the connection (`'a`);
+    /// the budget/truncated flags are atomics so the recursive boxed future
+    /// stays `Send` without `&mut` reborrow gymnastics.
     fn walk_element<'a>(
         conn: &'a AccessibilityConnection,
-        el: AccessibleProxy<'static>,
+        el: AccessibleProxy<'a>,
         depth_left: usize,
-        budget: &'a mut usize,
-        truncated: &'a mut bool,
-    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<UiElement>> + 'a>> {
+        budget: &'a AtomicUsize,
+        truncated: &'a AtomicBool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<UiElement>> + Send + 'a>> {
         Box::pin(async move {
-            if *budget == 0 {
-                *truncated = true;
+            if budget
+                .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |v| v.checked_sub(1))
+                .is_err()
+            {
+                truncated.store(true, Ordering::SeqCst);
                 return None;
             }
-            *budget -= 1;
 
             let role = el.get_role_name().await.unwrap_or_default();
             let name = el.name().await.ok();
@@ -320,8 +325,8 @@ mod walk {
             if depth_left > 0 {
                 if let Ok(child_refs) = el.get_children().await {
                     for child_ref in child_refs {
-                        if *budget == 0 {
-                            *truncated = true;
+                        if budget.load(Ordering::SeqCst) == 0 {
+                            truncated.store(true, Ordering::SeqCst);
                             break;
                         }
                         let Ok(child) =
@@ -337,7 +342,7 @@ mod walk {
                     }
                 }
             } else if el.child_count().await.unwrap_or(0) > 0 {
-                *truncated = true;
+                truncated.store(true, Ordering::SeqCst);
             }
 
             Some(make_element(
@@ -350,7 +355,7 @@ mod walk {
     /// element doesn't implement it (pure structural nodes).
     async fn component_extents(
         conn: &AccessibilityConnection,
-        el: &AccessibleProxy<'static>,
+        el: &AccessibleProxy<'_>,
     ) -> Option<(i32, i32, i32, i32)> {
         let component = ComponentProxy::builder(conn.connection())
             .destination(el.inner().destination().to_owned())
