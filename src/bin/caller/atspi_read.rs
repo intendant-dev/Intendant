@@ -114,16 +114,238 @@ fn make_element(
     }
 }
 
+/// Hard wall-clock bound on one whole read: a hung app's accessibility
+/// interface must not stall the tool (macOS bounds per-element at 1s; here
+/// one deadline covers the bounded walk).
+#[cfg(target_os = "linux")]
+const READ_DEADLINE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Read the active window's element tree from the session accessibility bus.
-// The caller is the cfg(linux) arm of read_screen_elements.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+///
+/// One bounded walk per explicit call — no background polling, no caching.
+/// The first call flips `org.a11y.Status.IsEnabled` (the platform mechanism
+/// that makes toolkits expose trees); apps already running may need a restart
+/// to honor it, which the result's hint text explains.
+#[cfg(target_os = "linux")]
 pub async fn read_frontmost(max_depth: usize, max_nodes: usize) -> Result<ScreenElements, String> {
-    let _ = (max_depth, max_nodes);
-    Err(
-        "element-tree observation via AT-SPI is not implemented yet — \
-         use take_screenshot instead"
-            .to_string(),
-    )
+    tokio::time::timeout(READ_DEADLINE, walk::read_frontmost(max_depth, max_nodes))
+        .await
+        .map_err(|_| {
+            format!(
+                "AT-SPI read timed out after {}s — an application's accessibility \
+                 interface may be hung; retry, or use take_screenshot instead",
+                READ_DEADLINE.as_secs()
+            )
+        })?
+}
+
+#[cfg(target_os = "linux")]
+mod walk {
+    use super::{make_element, ScreenElements, UiElement};
+    use atspi::connection::AccessibilityConnection;
+    use atspi::proxies::accessible::AccessibleProxy;
+    use atspi::proxies::component::ComponentProxy;
+    use atspi::{CoordType, State};
+
+    /// Caps on the application/toplevel scan (before the element walk).
+    const MAX_APPS: usize = 128;
+    const MAX_WINDOWS_PER_APP: usize = 32;
+    const MAX_OTHER_WINDOWS: usize = 10;
+
+    /// Enable session accessibility once per process, on demand. Toolkits
+    /// consult `org.a11y.Status.IsEnabled` at startup; without it GTK still
+    /// registers but Qt and some browsers expose nothing.
+    async fn ensure_session_accessibility() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static DONE: AtomicBool = AtomicBool::new(false);
+        if DONE.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        if let Err(e) = atspi::connection::set_session_accessibility(true).await {
+            eprintln!("[read_screen] could not enable org.a11y.Status.IsEnabled: {e}");
+        }
+    }
+
+    pub(super) async fn read_frontmost(
+        max_depth: usize,
+        max_nodes: usize,
+    ) -> Result<ScreenElements, String> {
+        ensure_session_accessibility().await;
+
+        let conn = AccessibilityConnection::new().await.map_err(|e| {
+            format!(
+                "no session accessibility bus: {e} — AT-SPI needs a desktop session \
+                 with at-spi2-core (Debian: `apt install at-spi2-core`, present on \
+                 GNOME/KDE by default)"
+            )
+        })?;
+
+        let registry_root = conn
+            .root_accessible_on_registry()
+            .await
+            .map_err(|e| format!("accessibility registry root: {e}"))?;
+        let apps = registry_root
+            .get_children()
+            .await
+            .map_err(|e| format!("list accessible applications: {e}"))?;
+
+        // Scan applications for the toplevel window carrying the Active
+        // state; collect other visible toplevels for orientation.
+        let mut active: Option<(String, i32, AccessibleProxy<'static>, String)> = None;
+        let mut other_windows: Vec<String> = Vec::new();
+        for app_ref in apps.into_iter().take(MAX_APPS) {
+            let Ok(app_proxy) = app_ref.clone().into_accessible_proxy(conn.connection()).await
+            else {
+                continue;
+            };
+            let app_name = app_proxy.name().await.unwrap_or_default();
+            let Ok(windows) = app_proxy.get_children().await else {
+                continue;
+            };
+            for win_ref in windows.into_iter().take(MAX_WINDOWS_PER_APP) {
+                let Ok(win) = win_ref.into_accessible_proxy(conn.connection()).await else {
+                    continue;
+                };
+                let Ok(states) = win.get_state().await else {
+                    continue;
+                };
+                if !states.contains(State::Showing) {
+                    continue;
+                }
+                let title = win.name().await.unwrap_or_default();
+                if states.contains(State::Active) && active.is_none() {
+                    let pid = win.get_process_id().await.unwrap_or(0);
+                    active = Some((app_name.clone(), pid, win, title));
+                } else if !title.trim().is_empty() && other_windows.len() < MAX_OTHER_WINDOWS {
+                    other_windows.push(format!("{title} ({app_name})"));
+                }
+            }
+        }
+
+        let Some((app, pid, window, title)) = active else {
+            return Ok(ScreenElements {
+                app: "(no active window)".to_string(),
+                pid: 0,
+                window_title: None,
+                root: None,
+                other_windows,
+                truncated: Some(
+                    "no toplevel reports the Active state — focus the target window; \
+                     apps started before accessibility was enabled may need a restart \
+                     (Qt: QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1)"
+                        .to_string(),
+                ),
+            });
+        };
+
+        let mut budget = max_nodes;
+        let mut truncated = false;
+        let root = walk_element(&conn, &window, max_depth, &mut budget, &mut truncated).await;
+
+        let mut truncated_msg = truncated.then(|| {
+            format!("element tree truncated at {max_nodes} nodes / depth {max_depth}")
+        });
+        if let Some(root_el) = &root {
+            if root_el.children.is_empty() && truncated_msg.is_none() {
+                truncated_msg = Some(
+                    "the active window exposes no child elements — if the app predates \
+                     accessibility enablement, restart it (Qt: \
+                     QT_LINUX_ACCESSIBILITY_ALWAYS_ON=1)"
+                        .to_string(),
+                );
+            }
+        }
+
+        Ok(ScreenElements {
+            app,
+            pid,
+            window_title: (!title.trim().is_empty()).then_some(title),
+            root,
+            other_windows,
+            truncated: truncated_msg,
+        })
+    }
+
+    /// Depth-first bounded walk. Values (field contents) are deliberately not
+    /// collected — roles, labels, and geometry are enough to act on, and keep
+    /// the observation metadata-only.
+    fn walk_element<'a>(
+        conn: &'a AccessibilityConnection,
+        el: &'a AccessibleProxy<'static>,
+        depth_left: usize,
+        budget: &'a mut usize,
+        truncated: &'a mut bool,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<UiElement>> + 'a>> {
+        Box::pin(async move {
+            if *budget == 0 {
+                *truncated = true;
+                return None;
+            }
+            *budget -= 1;
+
+            let role = el.get_role_name().await.unwrap_or_default();
+            let name = el.name().await.ok();
+            let states = el.get_state().await.ok();
+            let (focused, enabled, showing) = match &states {
+                Some(s) => (
+                    s.contains(State::Focused),
+                    s.contains(State::Enabled) || s.contains(State::Sensitive),
+                    s.contains(State::Showing),
+                ),
+                None => (false, true, true),
+            };
+            if !showing {
+                return None;
+            }
+
+            let extents = component_extents(conn, el).await.unwrap_or((0, 0, 0, 0));
+
+            let mut children = Vec::new();
+            if depth_left > 0 {
+                if let Ok(child_refs) = el.get_children().await {
+                    for child_ref in child_refs {
+                        if *budget == 0 {
+                            *truncated = true;
+                            break;
+                        }
+                        let Ok(child) =
+                            child_ref.into_accessible_proxy(conn.connection()).await
+                        else {
+                            continue;
+                        };
+                        if let Some(child_el) =
+                            walk_element(conn, &child, depth_left - 1, budget, truncated).await
+                        {
+                            children.push(child_el);
+                        }
+                    }
+                }
+            } else if el.child_count().await.unwrap_or(0) > 0 {
+                *truncated = true;
+            }
+
+            Some(make_element(
+                &role, name, None, extents, focused, enabled, children,
+            ))
+        })
+    }
+
+    /// Screen-space extents via the Component interface; `None` when the
+    /// element doesn't implement it (pure structural nodes).
+    async fn component_extents(
+        conn: &AccessibilityConnection,
+        el: &AccessibleProxy<'static>,
+    ) -> Option<(i32, i32, i32, i32)> {
+        let component = ComponentProxy::builder(conn.connection())
+            .destination(el.inner().destination().to_owned())
+            .ok()?
+            .path(el.inner().path().to_owned())
+            .ok()?
+            .build()
+            .await
+            .ok()?;
+        component.get_extents(CoordType::Screen).await.ok()
+    }
 }
 
 #[cfg(test)]
