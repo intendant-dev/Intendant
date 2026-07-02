@@ -2831,113 +2831,156 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
       --accent: #89b4fa;
       --accent-hover: #74c7ec;
       --accent-ink: #11111b;
+      --lavender: #b4befe;
       --ok: #a6e3a1;
       --warn: #f9e2af;
       --err: #f38ba8;
       --focus: #f9e2af;
       --shadow: 0 18px 50px rgba(0, 0, 0, .35);
+      --radius: 12px;
       font-family: ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
       background: var(--bg);
       color: var(--text);
     }}
     * {{ box-sizing: border-box; }}
     html {{ min-height: 100%; }}
-    body {{ margin: 0; min-height: 100vh; background-color: var(--bg); background-image: radial-gradient(ellipse at 50% -12%, #1e1e2e 0%, #11111b 72%); background-attachment: fixed; background-repeat: no-repeat; background-size: cover; }}
+    body {{ margin: 0; min-height: 100vh; background-color: var(--bg); background-image: radial-gradient(1100px 520px at 50% -160px, rgba(137, 180, 250, .14) 0%, rgba(137, 180, 250, 0) 62%), radial-gradient(ellipse at 50% -12%, #1e1e2e 0%, #11111b 72%); background-attachment: fixed; background-repeat: no-repeat; }}
     button, input {{ font: inherit; }}
-    button {{ height: 38px; padding: 0 14px; color: var(--accent-ink); background: var(--accent); border: 1px solid transparent; border-radius: 7px; font-weight: 700; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease, transform .12s ease; white-space: nowrap; }}
-    button:hover:not(:disabled) {{ background: var(--accent-hover); transform: translateY(-1px); }}
-    button:focus-visible, input:focus-visible {{ outline: 2px solid var(--focus); outline-offset: 2px; }}
+    button {{ height: 38px; padding: 0 15px; color: var(--accent-ink); background: var(--accent); border: 1px solid transparent; border-radius: 8px; font-weight: 700; cursor: pointer; transition: background .16s ease, border-color .16s ease, color .16s ease, transform .12s ease, box-shadow .16s ease; white-space: nowrap; }}
+    button:hover:not(:disabled) {{ background: var(--accent-hover); transform: translateY(-1px); box-shadow: 0 6px 18px rgba(137, 180, 250, .25); }}
+    button:focus-visible, input:focus-visible, a:focus-visible, summary:focus-visible {{ outline: 2px solid var(--focus); outline-offset: 2px; border-radius: 6px; }}
     button.secondary {{ color: var(--text); background: var(--surface-2); border-color: var(--line-strong); }}
-    button.secondary:hover:not(:disabled) {{ background: var(--surface-3); }}
+    button.secondary:hover:not(:disabled) {{ background: var(--surface-3); box-shadow: none; }}
     button.ghost {{ color: var(--muted); background: transparent; border-color: var(--line); }}
-    button.ghost:hover:not(:disabled) {{ color: var(--text); background: var(--surface-2); }}
-    button.danger {{ color: var(--err); background: rgba(243, 139, 168, .08); border-color: rgba(243, 139, 168, .5); }}
-    button.danger:hover:not(:disabled) {{ background: rgba(243, 139, 168, .16); }}
-    button:disabled {{ opacity: .58; cursor: default; transform: none; }}
-    input {{ width: 100%; min-width: 0; height: 42px; padding: 9px 12px; color: var(--text); background: #11111b; border: 1px solid var(--line-strong); border-radius: 7px; }}
+    button.ghost:hover:not(:disabled) {{ color: var(--text); background: var(--surface-2); box-shadow: none; }}
+    button.danger {{ color: var(--err); background: rgba(243, 139, 168, .08); border-color: rgba(243, 139, 168, .45); }}
+    button.danger:hover:not(:disabled) {{ background: rgba(243, 139, 168, .16); box-shadow: none; }}
+    button.linklike {{ height: auto; padding: 0; color: var(--accent); background: none; border: 0; font-weight: 700; }}
+    button.linklike:hover:not(:disabled) {{ color: var(--accent-hover); transform: none; box-shadow: none; text-decoration: underline; }}
+    button:disabled {{ opacity: .58; cursor: default; transform: none; box-shadow: none; }}
+    input {{ width: 100%; min-width: 0; height: 42px; padding: 9px 12px; color: var(--text); background: rgba(17, 17, 27, .8); border: 1px solid var(--line-strong); border-radius: 8px; transition: border-color .16s ease; }}
+    input:hover {{ border-color: rgba(205, 214, 244, .26); }}
     input::placeholder {{ color: var(--muted-2); }}
-    header {{ border-bottom: 1px solid var(--line); background: var(--top); }}
-    .topbar {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; min-height: 72px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
+    a {{ color: var(--accent); }}
+    a:hover {{ color: var(--accent-hover); }}
+    code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
+
+    header {{ border-bottom: 1px solid var(--line); background: rgba(24, 24, 37, .82); backdrop-filter: blur(10px); position: sticky; top: 0; z-index: 5; }}
+    .topbar {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; min-height: 64px; display: flex; align-items: center; justify-content: space-between; gap: 18px; }}
     .brand {{ display: flex; align-items: center; gap: 12px; min-width: 0; }}
-    .brand-mark {{ width: 36px; height: 36px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 8px; color: #b4befe; background: #1e1e2e; font-size: 13px; font-weight: 800; letter-spacing: 0; }}
-    .brand h1 {{ font-size: 20px; line-height: 1.15; margin: 0; letter-spacing: 0; }}
-    .origin-chip {{ min-width: 0; display: flex; align-items: center; gap: 8px; color: var(--muted); font-size: 12px; }}
-    .origin-chip code {{ max-width: min(48vw, 420px); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
-    main.shell {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 22px 0 44px; display: grid; grid-template-columns: minmax(280px, 340px) minmax(0, 1fr); gap: 16px; align-items: start; }}
-    body.signed-out main.shell {{ width: min(440px, calc(100vw - 32px)); grid-template-columns: 1fr; padding-top: 54px; }}
-    section {{ min-width: 0; border: 1px solid var(--line-strong); background: rgba(24, 24, 37, 0.72); border-radius: 10px; box-shadow: var(--shadow); }}
-    .panel-header {{ min-height: 62px; padding: 16px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 14px; }}
-    .panel-title {{ min-width: 0; }}
-    h2 {{ font-size: 15px; line-height: 1.25; margin: 0; letter-spacing: 0; }}
-    .sub {{ color: var(--muted); font-size: 13px; line-height: 1.35; margin-top: 4px; }}
-    .panel-body {{ padding: 18px; }}
-    .stack {{ display: grid; gap: 14px; }}
-    .row {{ display: flex; gap: 9px; align-items: center; flex-wrap: wrap; }}
-    .split {{ display: flex; justify-content: space-between; gap: 12px; align-items: center; }}
+    .brand-mark {{ width: 34px; height: 34px; display: grid; place-items: center; flex: 0 0 auto; border: 1px solid var(--line-strong); border-radius: 9px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 12px; font-weight: 800; }}
+    .brand h1 {{ font-size: 17px; line-height: 1.15; margin: 0; }}
+    .brand-sub {{ color: var(--muted-2); font-size: 12px; margin-top: 2px; }}
+    .top-actions {{ display: flex; align-items: center; gap: 9px; }}
+    .session-chip {{ display: inline-flex; align-items: center; gap: 8px; min-height: 32px; padding: 0 12px; border: 1px solid var(--line-strong); border-radius: 999px; background: var(--surface); color: var(--text); font-size: 13px; font-weight: 700; }}
+    .session-chip .dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--ok); }}
+
+    main.shell {{ width: min(1180px, calc(100vw - 32px)); margin: 0 auto; padding: 26px 0 56px; display: grid; gap: 18px; animation: rise .35s ease; }}
+    @keyframes rise {{ from {{ opacity: 0; transform: translateY(6px); }} to {{ opacity: 1; transform: none; }} }}
+    @media (prefers-reduced-motion: reduce) {{ main.shell {{ animation: none; }} button:hover:not(:disabled) {{ transform: none; }} }}
+
+    /* ── Signed out: hero ── */
+    body.signed-out main.shell {{ width: min(560px, calc(100vw - 32px)); padding-top: 7vh; }}
+    .hero {{ text-align: center; display: grid; gap: 14px; justify-items: center; padding: 8px 0 22px; }}
+    .hero-mark {{ width: 58px; height: 58px; display: grid; place-items: center; border: 1px solid var(--line-strong); border-radius: 16px; color: var(--lavender); background: linear-gradient(160deg, #1e1e2e, #24273a); font-size: 20px; font-weight: 800; box-shadow: var(--shadow); }}
+    .hero-title {{ font-size: 32px; line-height: 1.12; margin: 6px 0 0; letter-spacing: -.015em; }}
+    .hero-sub {{ color: var(--muted); font-size: 15px; line-height: 1.55; margin: 0; max-width: 46ch; }}
+    .auth-card {{ border: 1px solid var(--line-strong); background: rgba(24, 24, 37, .72); border-radius: var(--radius); box-shadow: var(--shadow); padding: 22px; display: grid; gap: 14px; }}
+    .auth-row {{ display: flex; gap: 9px; }}
+    .auth-row input {{ flex: 1 1 auto; }}
+    .auth-row button {{ height: 42px; flex: 0 0 auto; }}
+    .auth-alt {{ color: var(--muted); font-size: 13px; display: flex; gap: 6px; align-items: baseline; }}
+    .feature-strip {{ list-style: none; margin: 6px 0 0; padding: 0; display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }}
+    .feature-strip li {{ border: 1px solid var(--line); border-radius: 10px; background: rgba(24, 24, 37, .5); padding: 12px 13px; display: grid; gap: 4px; }}
+    .feature-strip strong {{ font-size: 13px; }}
+    .feature-strip span {{ color: var(--muted-2); font-size: 12px; line-height: 1.45; }}
+    body.signed-in #auth {{ display: none; }}
+
+    /* ── Signed in: computers ── */
+    .section-head {{ display: flex; align-items: baseline; justify-content: space-between; gap: 14px; padding: 4px 2px 0; }}
+    .section-head h2 {{ font-size: 20px; margin: 0; letter-spacing: -.01em; }}
+    .section-head .sub {{ color: var(--muted-2); font-size: 13px; }}
+    .computer-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr)); gap: 14px; align-items: start; }}
+    .computer-grid.empty {{ grid-template-columns: minmax(300px, 460px); justify-content: center; }}
+    .computer-card {{ min-width: 0; border: 1px solid var(--line-strong); background: rgba(24, 24, 37, .72); border-radius: var(--radius); box-shadow: var(--shadow); padding: 18px; display: grid; gap: 12px; align-content: start; transition: border-color .16s ease, transform .16s ease; }}
+    .computer-card:hover {{ border-color: rgba(205, 214, 244, .24); }}
+    .computer-head {{ display: flex; align-items: center; gap: 10px; min-width: 0; }}
+    .computer-dot {{ width: 9px; height: 9px; border-radius: 50%; background: var(--muted-2); flex: 0 0 auto; }}
+    .computer-dot.ok {{ background: var(--ok); box-shadow: 0 0 8px rgba(166, 227, 161, .6); }}
+    .computer-name {{ min-width: 0; display: grid; gap: 2px; }}
+    .computer-name strong {{ font-size: 15px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .computer-name .sub {{ color: var(--muted-2); font-size: 12px; }}
+    .computer-actions {{ display: flex; gap: 8px; flex-wrap: wrap; }}
+    .computer-actions .open {{ flex: 1 1 auto; }}
+    .computer-card details {{ border-top: 1px solid var(--line); padding-top: 10px; }}
+    .computer-card summary {{ color: var(--muted-2); font-size: 12px; font-weight: 700; cursor: pointer; list-style: none; }}
+    .computer-card summary::before {{ content: '▸ '; }}
+    .computer-card details[open] summary::before {{ content: '▾ '; }}
+    .kv {{ display: grid; gap: 8px; margin-top: 10px; }}
+    .kv .k {{ color: var(--muted-2); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }}
+    .kv code {{ display: block; font-size: 12px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: rgba(17, 17, 27, .55); }}
+    .kv .danger-row {{ margin-top: 4px; }}
+    .add-card {{ border-style: dashed; background: rgba(24, 24, 37, .45); }}
+    .add-card h3 {{ margin: 0; font-size: 15px; }}
+    .steps {{ margin: 0; padding: 0 0 0 18px; color: var(--muted); font-size: 13px; line-height: 1.55; display: grid; gap: 6px; }}
+    .steps code {{ font-size: 12px; }}
     label {{ display: block; color: var(--muted); font-size: 12px; font-weight: 700; margin-bottom: 7px; }}
-    .actions {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
-    .account-summary {{ padding-top: 14px; border-top: 1px solid var(--line); }}
-    .handle {{ color: var(--text); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-size: 16px; font-weight: 700; overflow-wrap: anywhere; }}
-    .metric-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 10px; }}
-    .user-id-block {{ margin-top: 12px; display: grid; gap: 6px; }}
-    .user-id-label {{ color: var(--muted-2); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }}
-    .user-id-row {{ display: flex; gap: 8px; align-items: center; }}
-    .user-id-row code {{ flex: 1 1 auto; min-width: 0; color: var(--text); font-size: 12px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: rgba(17, 17, 27, .55); }}
-    .user-id-row button {{ height: 30px; padding: 0 10px; font-size: 12px; font-weight: 700; flex: 0 0 auto; }}
-    .claim-strip {{ display: grid; grid-template-columns: minmax(220px, 1fr) auto; gap: 9px; align-items: end; padding-bottom: 16px; border-bottom: 1px solid var(--line); }}
-    .notice {{ padding: 12px 13px; border: 1px solid rgba(249, 226, 175, .3); border-radius: 8px; color: var(--muted); background: rgba(249, 226, 175, .06); font-size: 13px; line-height: 1.4; }}
-    .status {{ min-height: 20px; color: var(--muted); font-size: 13px; line-height: 1.35; overflow-wrap: anywhere; }}
+    .status {{ min-height: 18px; color: var(--muted); font-size: 13px; line-height: 1.4; overflow-wrap: anywhere; }}
     .status.status-ok {{ color: var(--ok); }}
     .status.status-err {{ color: var(--err); }}
     .status.status-warn {{ color: var(--warn); }}
-    .table-wrap {{ overflow-x: auto; }}
-    table {{ width: 100%; border-collapse: collapse; font-size: 13px; }}
-    th, td {{ text-align: left; padding: 13px 10px; border-bottom: 1px solid var(--line); vertical-align: middle; }}
-    th {{ color: var(--muted); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; }}
-    tbody tr:hover {{ background: rgba(205, 214, 244, .03); }}
-    tbody tr:last-child td {{ border-bottom: 0; }}
-    code {{ color: var(--muted); font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; overflow-wrap: anywhere; }}
-    .daemon-name {{ display: grid; gap: 3px; min-width: 220px; }}
-    .daemon-name strong {{ font-size: 14px; }}
-    .daemon-activity {{ display: grid; gap: 6px; min-width: 116px; }}
-    .target-route {{ display: grid; gap: 4px; min-width: 180px; }}
-    .action-cell .actions {{ justify-content: flex-end; flex-wrap: nowrap; }}
-    .pill {{ display: inline-flex; align-items: center; width: fit-content; min-height: 24px; padding: 0 9px; border-radius: 999px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); font-size: 12px; font-weight: 750; }}
+    .empty-hint {{ color: var(--muted-2); font-size: 13px; }}
+
+    /* ── Saved places + advanced ── */
+    section.panel {{ min-width: 0; border: 1px solid var(--line-strong); background: rgba(24, 24, 37, .72); border-radius: var(--radius); box-shadow: var(--shadow); }}
+    .panel-header {{ padding: 15px 18px; border-bottom: 1px solid var(--line); display: flex; align-items: center; justify-content: space-between; gap: 14px; }}
+    .panel-header h2 {{ font-size: 14px; margin: 0; }}
+    .panel-header .sub {{ color: var(--muted-2); font-size: 12px; margin-top: 3px; }}
+    .panel-body {{ padding: 16px 18px; }}
+    .place-row {{ display: flex; align-items: center; justify-content: space-between; gap: 12px; padding: 11px 0; border-bottom: 1px solid var(--line); }}
+    .place-row:first-child {{ padding-top: 0; }}
+    .place-row:last-child {{ border-bottom: 0; padding-bottom: 0; }}
+    .place-main {{ min-width: 0; display: grid; gap: 3px; }}
+    .place-main strong {{ font-size: 13.5px; }}
+    .place-main .sub {{ color: var(--muted-2); font-size: 12px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+    .place-actions {{ display: flex; gap: 8px; flex: 0 0 auto; }}
+    .place-actions button {{ height: 32px; padding: 0 12px; font-size: 12.5px; }}
+    .pill {{ display: inline-flex; align-items: center; gap: 6px; width: fit-content; min-height: 24px; padding: 0 10px; border-radius: 999px; background: var(--surface-2); color: var(--muted); border: 1px solid var(--line); font-size: 12px; font-weight: 750; }}
     .pill.ok {{ color: var(--ok); border-color: rgba(166, 227, 161, .4); background: rgba(166, 227, 161, .09); }}
     .pill.warn {{ color: var(--warn); border-color: rgba(249, 226, 175, .35); background: rgba(249, 226, 175, .08); }}
-    .route-chip {{ display: inline-flex; align-items: center; gap: 6px; width: fit-content; min-height: 24px; padding: 0 10px; border-radius: 999px; border: 1px solid var(--line-strong); background: var(--surface-2); color: var(--muted); font-size: 12px; font-weight: 750; }}
-    .route-chip .dot {{ width: 7px; height: 7px; border-radius: 50%; background: var(--muted-2); flex: 0 0 auto; }}
-    .route-chip.ok {{ color: var(--ok); border-color: rgba(166, 227, 161, .4); background: rgba(166, 227, 161, .09); }}
-    .route-chip.ok .dot {{ background: var(--ok); }}
-    .route-chip.warn {{ color: var(--warn); border-color: rgba(249, 226, 175, .35); background: rgba(249, 226, 175, .08); }}
-    .route-chip.warn .dot {{ background: var(--warn); }}
-    .empty-state {{ padding: 22px 10px; color: var(--muted); }}
-    .hidden {{ display: none !important; }}
-    .wide {{ grid-column: 1 / -1; }}
-    .audit {{ display: grid; gap: 0; }}
-    .event {{ padding: 13px 0; border-bottom: 1px solid var(--line); font-size: 13px; }}
+    .pill .dot {{ width: 6px; height: 6px; border-radius: 50%; background: currentColor; }}
+    details.advanced {{ border: 1px solid var(--line); border-radius: var(--radius); background: rgba(24, 24, 37, .4); }}
+    details.advanced > summary {{ list-style: none; cursor: pointer; padding: 14px 18px; color: var(--muted); font-size: 13px; font-weight: 750; display: flex; align-items: center; gap: 8px; }}
+    details.advanced > summary::before {{ content: '▸'; color: var(--muted-2); }}
+    details.advanced[open] > summary::before {{ content: '▾'; }}
+    details.advanced > summary .hint {{ color: var(--muted-2); font-weight: 500; }}
+    .advanced-body {{ border-top: 1px solid var(--line); padding: 18px; display: grid; gap: 22px; }}
+    .advanced-block {{ display: grid; gap: 10px; }}
+    .advanced-block > h3 {{ margin: 0; font-size: 13px; }}
+    .advanced-block > .sub {{ color: var(--muted-2); font-size: 12.5px; line-height: 1.5; margin-top: -6px; }}
+    .user-id-row {{ display: flex; gap: 8px; align-items: center; }}
+    .user-id-row code {{ flex: 1 1 auto; min-width: 0; color: var(--text); font-size: 12px; padding: 7px 9px; border: 1px solid var(--line); border-radius: 6px; background: rgba(17, 17, 27, .55); }}
+    .user-id-row button {{ height: 30px; padding: 0 10px; font-size: 12px; flex: 0 0 auto; }}
+    .metric-row {{ display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }}
+    .audit {{ display: grid; }}
+    .event {{ padding: 11px 0; border-bottom: 1px solid var(--line); font-size: 13px; }}
     .event:first-child {{ padding-top: 0; }}
     .event:last-child {{ border-bottom: 0; padding-bottom: 0; }}
     .event-line {{ display: flex; justify-content: space-between; gap: 12px; align-items: baseline; }}
     .event-name {{ font-weight: 750; }}
     .event time {{ color: var(--muted); font-size: 12px; white-space: nowrap; }}
-    .event code {{ display: inline-block; margin-top: 4px; }}
-    @media (max-width: 820px) {{
-      .topbar, main.shell {{ width: min(100vw - 24px, 680px); }}
-      .topbar {{ min-height: auto; padding: 14px 0; align-items: flex-start; }}
-      main.shell {{ grid-template-columns: 1fr; padding-top: 14px; }}
-      .origin-chip {{ display: none; }}
-      .claim-strip {{ grid-template-columns: 1fr; }}
-      .claim-strip button {{ width: 100%; }}
-      table, thead, tbody, tr, th, td {{ display: block; width: 100%; }}
-      thead {{ display: none; }}
-      tr {{ padding: 12px 0; border-bottom: 1px solid var(--line); }}
-      tr:last-child {{ border-bottom: 0; }}
-      td {{ border-bottom: 0; padding: 7px 0; }}
-      td::before {{ content: attr(data-cell-label); display: block; color: var(--muted-2); font-size: 11px; font-weight: 800; text-transform: uppercase; letter-spacing: .04em; margin-bottom: 4px; }}
-      .action-cell::before {{ display: none; }}
-      .action-cell .actions {{ justify-content: stretch; flex-wrap: wrap; }}
-      .action-cell button {{ flex: 1 1 92px; }}
+    .event code {{ display: inline-block; margin-top: 3px; font-size: 12px; }}
+    .hidden {{ display: none !important; }}
+    .handle {{ font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace; font-weight: 700; }}
+
+    @media (max-width: 700px) {{
+      .topbar {{ min-height: auto; padding: 12px 0; }}
+      .brand-sub {{ display: none; }}
+      .feature-strip {{ grid-template-columns: 1fr; }}
+      .hero-title {{ font-size: 26px; }}
+      .auth-row {{ flex-direction: column; }}
+      .place-row {{ flex-direction: column; align-items: stretch; }}
+      .place-actions button {{ flex: 1 1 auto; }}
     }}
   </style>
 </head>
@@ -2948,107 +2991,119 @@ fn connect_ui_html(origin: &str, product_title: &str, account_subtitle: &str) ->
         <div class="brand-mark" aria-hidden="true">IC</div>
         <div>
         <h1>{product_title}</h1>
-          <div class="origin-chip"><span>Origin</span><code>{origin}</code></div>
+          <div class="brand-sub">{account_subtitle}</div>
         </div>
       </div>
-      <button id="logout" class="ghost hidden">Sign out</button>
+      <div class="top-actions">
+        <span id="session-chip" class="session-chip hidden"><span class="dot" aria-hidden="true"></span><span id="session-chip-handle"></span></span>
+        <button id="refresh" class="ghost hidden">Refresh</button>
+        <button id="logout" class="ghost hidden">Sign out</button>
+      </div>
     </div>
   </header>
   <main class="shell">
+    <!-- ── Signed out: landing ── -->
     <section id="auth">
-      <div class="panel-header">
-        <div class="panel-title">
-          <h2>Account</h2>
-          <div class="sub">{account_subtitle}</div>
-        </div>
+      <div class="hero">
+        <div class="hero-mark" aria-hidden="true">IC</div>
+        <h2 class="hero-title">Your computers, anywhere.</h2>
+        <p class="hero-sub">Sign in with a passkey and open any machine you own, from any browser. This service only makes the introduction &mdash; each computer verifies you itself and decides what you may do, end to end.</p>
       </div>
-      <div class="panel-body stack">
+      <div class="auth-card">
         <div>
           <label for="account">Account handle</label>
-          <input id="account" autocomplete="username webauthn" autocapitalize="none" spellcheck="false" placeholder="user">
-        </div>
-        <div id="auth-actions" class="actions">
-          <button id="login">Sign in</button>
-          <button id="register" class="secondary">Create passkey</button>
-        </div>
-        <div id="session-card" class="account-summary hidden">
-          <div id="session-handle" class="handle"></div>
-          <div class="metric-row">
-            <span id="session-passkeys" class="pill"></span>
-            <span class="pill ok">active</span>
-          </div>
-          <div class="user-id-block">
-            <div class="user-id-label">User id &mdash; use this id when granting access on a daemon</div>
-            <div class="user-id-row">
-              <code id="session-user-id"></code>
-              <button id="copy-user-id" class="ghost" type="button">Copy</button>
-            </div>
+          <div class="auth-row">
+            <input id="account" autocomplete="username webauthn" autocapitalize="none" spellcheck="false" placeholder="your-handle">
+            <button id="login">Sign in</button>
           </div>
         </div>
-        <div id="auth-status" class="status"></div>
+        <div id="auth-actions" class="auth-alt">
+          <span>New here?</span>
+          <button id="register" class="linklike">Create your account with a passkey</button>
+        </div>
+        <div id="auth-status" class="status" role="status"></div>
       </div>
+      <ul class="feature-strip">
+        <li><strong>Passkeys only</strong><span>No passwords. Your devices already sync the key.</span></li>
+        <li><strong>Holds no power</strong><span>An introducer and relay. Your computers check your identity themselves.</span></li>
+        <li><strong>Self-hostable</strong><span>Run your own rendezvous &mdash; <a href="https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">read how</a>.</span></li>
+      </ul>
     </section>
 
+    <!-- ── Signed in: computers ── -->
     <section id="manage" class="hidden">
-      <div class="panel-header">
-        <div class="panel-title">
-          <h2>Rendezvous Daemons</h2>
-          <div id="who" class="sub"></div>
-        </div>
-        <button id="refresh" class="secondary">Refresh</button>
+      <div class="section-head">
+        <h2>Your computers</h2>
+        <div id="who" class="sub"></div>
       </div>
-      <div class="panel-body stack">
-        <div class="notice">This account is rendezvous and navigation only &mdash; it grants nothing by itself. Each daemon decides access through its own local IAM.</div>
-        <div class="claim-strip">
+      <div style="height: 12px"></div>
+      <div class="computer-grid">
+        <div id="computer-cards" style="display: contents"></div>
+        <div class="computer-card add-card">
+          <h3>Add a computer</h3>
+          <ol class="steps">
+            <li>On that machine, start <code>intendant</code> with Connect enabled &mdash; it prints a 12&#8209;word claim phrase in its log.</li>
+            <li>Paste the phrase here to link it to this account.</li>
+          </ol>
           <div>
-            <label for="claim-code">Claim phrase (shown in the daemon's startup log)</label>
-            <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="12-word claim phrase">
+            <label for="claim-code">Claim phrase</label>
+            <input id="claim-code" autocomplete="off" spellcheck="false" placeholder="twelve words from the startup log">
           </div>
-          <button id="claim">Claim daemon</button>
-        </div>
-        <div id="claim-status" class="status"></div>
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Daemon</th><th>Activity</th><th>Public key</th><th></th></tr></thead>
-            <tbody id="daemon-rows"></tbody>
-          </table>
+          <button id="claim">Connect it</button>
+          <div id="claim-status" class="status" role="status"></div>
         </div>
       </div>
     </section>
 
-    <section id="fleet-section" class="wide hidden">
+    <!-- ── Signed in: saved places (only when any) ── -->
+    <section id="fleet-section" class="panel hidden">
       <div class="panel-header">
-        <div class="panel-title">
-          <h2>Access Targets</h2>
-          <div class="sub">Fleet navigation and rendezvous routes; target daemons enforce local IAM</div>
+        <div>
+          <h2>Saved places</h2>
+          <div class="sub">Routes this account remembers across your browsers; target daemons enforce local IAM</div>
         </div>
       </div>
       <div class="panel-body">
-        <div class="table-wrap">
-          <table>
-            <thead><tr><th>Target</th><th>Route</th><th>Authority</th><th></th></tr></thead>
-            <tbody id="fleet-rows"></tbody>
-          </table>
-        </div>
+        <div id="fleet-rows"></div>
       </div>
     </section>
 
-    <section id="audit-section" class="wide hidden">
-      <div class="panel-header">
-        <div class="panel-title">
-          <h2>Audit</h2>
-          <div class="sub">Recent account activity</div>
+    <!-- ── Signed in: the power drawer ── -->
+    <details id="advanced" class="advanced hidden">
+      <summary>Advanced <span class="hint">&mdash; account identity, sync encryption, audit trail</span></summary>
+      <div class="advanced-body">
+        <div class="advanced-block" id="session-card">
+          <h3>Account</h3>
+          <div class="metric-row">
+            <span class="pill"><span id="session-handle" class="handle"></span></span>
+            <span id="session-passkeys" class="pill"></span>
+            <span id="enc-pill" class="pill"></span>
+          </div>
+          <div class="sub">Give this user id to a daemon owner when they grant your account access under Access &rarr; People &amp; Devices.</div>
+          <div class="user-id-row">
+            <code id="session-user-id"></code>
+            <button id="copy-user-id" class="ghost" type="button">Copy</button>
+          </div>
+        </div>
+        <div class="advanced-block">
+          <h3>What this account can and cannot do</h3>
+          <div class="sub">It is rendezvous and navigation only &mdash; it grants nothing by itself. Every daemon decides access through its own local IAM, dashboard sessions verify a signature from the daemon itself, and private fields in Saved places sync end&#8209;to&#8209;end encrypted when your passkey supports PRF.</div>
+        </div>
+        <div class="advanced-block" id="audit-section">
+          <h3>Audit</h3>
+          <div class="sub">Recent account activity on this rendezvous.</div>
+          <div id="audit" class="audit"></div>
+        </div>
+        <div class="advanced-block">
+          <h3>Self-host</h3>
+          <div class="sub">This origin (<code>{origin}</code>) is one instance of an open component. <a href="https://lovon-spec.github.io/Intendant/self-hosted-rendezvous.html" target="_blank" rel="noopener">Run your own</a> and point your daemons at it.</div>
         </div>
       </div>
-      <div class="panel-body">
-        <div id="audit" class="audit"></div>
-      </div>
-    </section>
+    </details>
   </main>
 <script>
 const $ = id => document.getElementById(id);
 const state = {{ user: null, daemons: [], fleetTargets: [], csrfToken: '' }};
-
 function setStatus(id, text, kind = '') {{
   const el = $(id);
   el.textContent = text || '';
@@ -3236,6 +3291,34 @@ async function claimDaemon() {{
   }}
 }}
 
+let fleetAesKey = null;
+async function fleetEncryptionKey() {{
+  if (fleetAesKey) return fleetAesKey;
+  try {{
+    const prf = sessionStorage.getItem('intendant_fleet_prf_v1') || '';
+    if (!prf || !crypto?.subtle) return null;
+    const hkdf = await crypto.subtle.importKey('raw', b64uToBuf(prf), 'HKDF', false, ['deriveKey']);
+    fleetAesKey = await crypto.subtle.deriveKey(
+      {{ name: 'HKDF', hash: 'SHA-256', salt: new TextEncoder().encode('intendant-fleet-sync-v1'), info: new TextEncoder().encode('fleet-enc') }},
+      hkdf, {{ name: 'AES-GCM', length: 256 }}, false, ['decrypt']
+    );
+    return fleetAesKey;
+  }} catch {{ return null; }}
+}}
+
+async function decryptFleetTarget(target) {{
+  const enc = String(target?.enc_fields || '');
+  if (!enc.startsWith('enc1:')) return target;
+  const key = await fleetEncryptionKey();
+  if (!key) return {{ ...target, fleet_locked: true }};
+  try {{
+    const [iv, ct] = enc.slice(5).split(':');
+    const plain = await crypto.subtle.decrypt({{ name: 'AES-GCM', iv: b64uToBuf(iv) }}, key, b64uToBuf(ct));
+    const secret = JSON.parse(new TextDecoder().decode(plain));
+    return {{ ...target, url: String(secret.url || ''), ws_url: String(secret.ws_url || ''), browser_tcp_via_url: String(secret.browser_tcp_via_url || ''), fleet_locked: false }};
+  }} catch {{ return {{ ...target, fleet_locked: true }}; }}
+}}
+
 async function refreshAll() {{
   setBusy('refresh', true);
   try {{
@@ -3250,7 +3333,7 @@ async function refreshAll() {{
       api('/api/audit'),
     ]);
     state.daemons = daemons.daemons || [];
-    state.fleetTargets = fleet.targets || [];
+    state.fleetTargets = await Promise.all((fleet.targets || []).map(decryptFleetTarget));
     renderDaemons();
     renderFleetTargets();
     renderAudit(audit.events || []);
@@ -3264,19 +3347,29 @@ function renderAuth() {{
   document.body.classList.toggle('signed-out', !authed);
   document.body.classList.toggle('signed-in', authed);
   $('manage').classList.toggle('hidden', !authed);
-  $('fleet-section').classList.toggle('hidden', !authed);
-  $('audit-section').classList.toggle('hidden', !authed);
+  $('advanced').classList.toggle('hidden', !authed);
   $('logout').classList.toggle('hidden', !authed);
+  $('refresh').classList.toggle('hidden', !authed);
+  $('session-chip').classList.toggle('hidden', !authed);
   $('auth-actions').classList.toggle('hidden', authed);
-  $('session-card').classList.toggle('hidden', !authed);
   $('account').disabled = authed;
+  if (!authed) $('fleet-section').classList.add('hidden');
   if (authed) {{
     $('account').value = state.user.account_name || '';
+    $('session-chip-handle').textContent = '@' + state.user.account_name;
     $('session-handle').textContent = '@' + state.user.account_name;
     $('session-passkeys').textContent = `${{state.user.passkey_count}} passkey${{state.user.passkey_count === 1 ? '' : 's'}}`;
     $('session-user-id').textContent = state.user.id || '';
     $('who').textContent = '@' + state.user.account_name;
+    const encOn = Boolean(sessionStorage.getItem('intendant_fleet_prf_v1'));
+    const enc = $('enc-pill');
+    enc.textContent = encOn ? 'sync encryption: on' : 'sync encryption: off';
+    enc.className = 'pill' + (encOn ? ' ok' : '');
+    enc.title = encOn
+      ? 'Private fields in Saved places are end-to-end encrypted with a key derived from your passkey (WebAuthn PRF). This service stores only ciphertext.'
+      : 'Your passkey or browser did not offer the WebAuthn PRF extension this session, so Saved places sync public fields only.';
   }} else {{
+    $('session-chip-handle').textContent = '';
     $('session-handle').textContent = '';
     $('session-passkeys').textContent = '';
     $('session-user-id').textContent = '';
@@ -3285,49 +3378,61 @@ function renderAuth() {{
 }}
 
 function renderDaemons() {{
-  const rows = $('daemon-rows');
-  rows.innerHTML = '';
-  if (state.daemons.length === 0) {{
-    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No claimed rendezvous daemons</td></tr>';
-    return;
-  }}
+  const grid = $('computer-cards');
+  grid.innerHTML = '';
+  grid.parentElement.classList.toggle('empty', state.daemons.length === 0);
+  $('who').textContent = state.daemons.length
+    ? `${{state.daemons.length}} linked to @${{state.user?.account_name || ''}}`
+    : '';
   for (const daemon of state.daemons) {{
-    const tr = document.createElement('tr');
     const key = String(daemon.daemon_public_key || '');
     const daemonId = String(daemon.daemon_id || '');
     const hasLabel = Boolean(String(daemon.label || '').trim());
     const label = hasLabel ? String(daemon.label) : shortId(daemonId);
     const lastSeen = formatRelative(daemon.last_seen_unix_ms);
-    tr.innerHTML = `
-      <td data-cell-label="Daemon"><div class="daemon-name"><strong title="${{escapeAttr(hasLabel ? label : daemonId)}}">${{escapeHtml(label)}}</strong><code title="${{escapeAttr(daemonId)}}">${{escapeHtml(shortId(daemonId))}}</code></div></td>
-      <td data-cell-label="Activity"><div class="daemon-activity"><span class="pill ${{daemon.online ? 'ok' : 'warn'}}">${{daemon.online ? 'online' : 'idle'}}</span><span class="sub">${{escapeHtml(lastSeen)}}</span></div></td>
-      <td data-cell-label="Public key"><code title="${{escapeAttr(key)}}">${{escapeHtml(compactKey(key))}}</code></td>
-      <td class="action-cell" data-cell-label="Actions"><div class="actions">
-        <button data-open="${{escapeAttr(daemon.daemon_id)}}">Open dashboard</button>
-        <button class="secondary" data-rename="${{escapeAttr(daemon.daemon_id)}}">Rename</button>
-        <button class="danger" data-revoke="${{escapeAttr(daemon.daemon_id)}}">Revoke</button>
-      </div></td>`;
-    rows.appendChild(tr);
+    const card = document.createElement('div');
+    card.className = 'computer-card';
+    card.innerHTML = `
+      <div class="computer-head">
+        <span class="computer-dot ${{daemon.online ? 'ok' : ''}}" aria-hidden="true"></span>
+        <div class="computer-name">
+          <strong title="${{escapeAttr(hasLabel ? label : daemonId)}}">${{escapeHtml(label)}}</strong>
+          <span class="sub">${{daemon.online ? 'online now' : 'last seen ' + escapeHtml(lastSeen)}}</span>
+        </div>
+      </div>
+      <div class="computer-actions">
+        <button class="open" data-open="${{escapeAttr(daemonId)}}">Open</button>
+        <button class="secondary" data-rename="${{escapeAttr(daemonId)}}">Rename</button>
+      </div>
+      <details>
+        <summary>Details</summary>
+        <div class="kv">
+          <div><div class="k">Daemon id</div><code>${{escapeHtml(daemonId)}}</code></div>
+          <div><div class="k">Public key &mdash; sessions verify this end to end</div><code>${{escapeHtml(key)}}</code></div>
+          <div class="danger-row"><button class="danger" data-revoke="${{escapeAttr(daemonId)}}">Disconnect from this account</button></div>
+        </div>
+      </details>`;
+    grid.appendChild(card);
   }}
-  rows.querySelectorAll('[data-open]').forEach(button => {{
+  grid.querySelectorAll('[data-open]').forEach(button => {{
     button.addEventListener('click', () => {{
       const id = button.getAttribute('data-open');
       window.location.href = `/app?connect=1&daemon_id=${{encodeURIComponent(id)}}`;
     }});
   }});
-  rows.querySelectorAll('[data-revoke]').forEach(button => {{
+  grid.querySelectorAll('[data-revoke]').forEach(button => {{
     button.addEventListener('click', async () => {{
       const id = button.getAttribute('data-revoke');
-      if (!confirm(`Revoke access to ${{id}}?`)) return;
+      if (!confirm(`Disconnect ${{id}} from this account? The computer itself is untouched; it just stops being reachable through here until claimed again.`)) return;
       await api(`/api/daemons/${{encodeURIComponent(id)}}/revoke`, {{ method: 'POST', body: '{{}}' }});
       await refreshAll();
     }});
   }});
-  rows.querySelectorAll('[data-rename]').forEach(button => {{
+  grid.querySelectorAll('[data-rename]').forEach(button => {{
     button.addEventListener('click', async () => {{
       const id = button.getAttribute('data-rename');
       const daemon = state.daemons.find(item => item.daemon_id === id) || {{}};
-      const next = prompt('Name this daemon', daemon.label || daemon.daemon_id || '');
+      const next = prompt('Name this computer', daemon.label || daemon.daemon_id || '');
       if (next === null) return;
       await api(`/api/daemons/${{encodeURIComponent(id)}}/label`, {{
         method: 'POST',
@@ -3341,32 +3446,36 @@ function renderDaemons() {{
 function renderFleetTargets() {{
   const rows = $('fleet-rows');
   rows.innerHTML = '';
-  if (state.fleetTargets.length === 0) {{
-    rows.innerHTML = '<tr><td colspan="4" class="empty-state">No rendezvous targets</td></tr>';
-    return;
-  }}
-  for (const target of state.fleetTargets) {{
-    const tr = document.createElement('tr');
+  const claimedIds = new Set(state.daemons.map(d => String(d.daemon_id || '')));
+  const places = state.fleetTargets.filter(target => {{
+    const cid = String(target.connect_daemon_id || '');
+    return !(target.claimed_daemon === true && cid && claimedIds.has(cid));
+  }});
+  $('fleet-section').classList.toggle('hidden', !state.user || places.length === 0);
+  for (const target of places) {{
     const id = String(target.host_id || target.id || '');
     const rawLabel = String(target.label || '').trim();
-    const labelIsFallback = !rawLabel || rawLabel === id;
-    const label = labelIsFallback ? (shortId(id) || 'Target') : rawLabel;
-    const source = String(target.source || 'browser_fleet');
-    const route = String(target.route_label || target.route || target.url || 'Remembered route');
-    const auth = String(target.auth_label || target.auth || target.effective_role_label || 'Account record');
-    const statusClass = target.online || target.connected ? 'ok' : 'warn';
-    const statusText = target.online || target.connected ? 'online' : 'remembered';
+    const label = (!rawLabel || rawLabel === id) ? (shortId(id) || 'Place') : rawLabel;
+    const locked = target.fleet_locked === true;
+    const route = locked
+      ? 'End-to-end encrypted — opens on a device signed in with your passkey'
+      : String(target.route_label || target.route || target.url || 'Remembered route');
+    const online = target.online || target.connected;
     const url = String(target.url || '');
     const canForget = target.claimed_daemon !== true;
-    tr.innerHTML = `
-      <td data-cell-label="Target"><div class="daemon-name"><strong title="${{escapeAttr(labelIsFallback ? id : label)}}">${{escapeHtml(label)}}</strong><code title="${{escapeAttr(id)}}">${{escapeHtml(shortId(id))}}</code></div></td>
-      <td data-cell-label="Route"><div class="target-route"><span class="route-chip ${{statusClass}}"><span class="dot" aria-hidden="true"></span>${{escapeHtml(statusText)}}</span><span class="sub">${{escapeHtml(route)}}</span></div></td>
-      <td data-cell-label="Authority"><div class="target-route"><span class="pill">${{escapeHtml(source.replaceAll('_', ' '))}}</span><span class="sub">${{escapeHtml(auth)}}</span></div></td>
-      <td class="action-cell" data-cell-label="Actions"><div class="actions">
-        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open dashboard</button>
-        <button class="secondary" data-fleet-forget="${{escapeAttr(id)}}" ${{canForget ? '' : 'disabled'}}>Forget</button>
-      </div></td>`;
-    rows.appendChild(tr);
+    const row = document.createElement('div');
+    row.className = 'place-row';
+    row.innerHTML = `
+      <div class="place-main">
+        <strong>${{escapeHtml(label)}}</strong>
+        <span class="sub" title="${{escapeAttr(route)}}">${{escapeHtml(route)}}</span>
+      </div>
+      <span class="pill ${{online ? 'ok' : ''}}">${{online ? 'online' : (locked ? 'locked' : 'remembered')}}</span>
+      <div class="place-actions">
+        <button data-fleet-open="${{escapeAttr(url)}}" ${{url ? '' : 'disabled'}}>Open</button>
+        <button class="ghost" data-fleet-forget="${{escapeAttr(id)}}" ${{canForget ? '' : 'disabled'}}>Forget</button>
+      </div>`;
+    rows.appendChild(row);
   }}
   rows.querySelectorAll('[data-fleet-open]').forEach(button => {{
     button.addEventListener('click', () => {{
@@ -3388,7 +3497,7 @@ function renderAudit(events) {{
   const el = $('audit');
   el.innerHTML = '';
   if (!events.length) {{
-    el.innerHTML = '<div class="empty-state">No audit events</div>';
+    el.innerHTML = '<div class="empty-hint">No account activity yet.</div>';
     return;
   }}
   for (const event of events.slice(0, 30)) {{
@@ -3421,7 +3530,7 @@ function formatDate(unixMs) {{
 
 function formatRelative(unixMs) {{
   const value = Number(unixMs || 0);
-  if (!value) return 'never seen';
+  if (!value) return 'never';
   const seconds = Math.max(0, Math.floor((Date.now() - value) / 1000));
   if (seconds < 10) return 'just now';
   if (seconds < 60) return `${{seconds}}s ago`;
