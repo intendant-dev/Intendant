@@ -371,7 +371,7 @@ impl DisplayBackend for WaylandBackend {
         let session = &ps.session;
 
         for ch in text.chars() {
-            let keysym = char_to_x11_keysym(ch).ok_or_else(|| {
+            let keysym = super::keymap::char_to_x11_keysym(ch).ok_or_else(|| {
                 CallerError::Display(format!(
                     "unsupported Wayland text character: U+{:04X}",
                     ch as u32
@@ -438,24 +438,6 @@ fn wayland_input_recovery_hint() -> &'static str {
     "Wayland portal input is not active. Revoke and grant the user display again, then approve the GNOME portal with Allow Remote Interaction enabled; screenshot-only approval is insufficient for Computer Use input."
 }
 
-fn char_to_x11_keysym(ch: char) -> Option<i32> {
-    match ch {
-        '\n' | '\r' => Some(0xff0d),
-        '\t' => Some(0xff09),
-        '\u{8}' => Some(0xff08),
-        '\u{1b}' => Some(0xff1b),
-        ' '..='~' => Some(ch as i32),
-        '\u{a0}'..='\u{ff}' => Some(ch as i32),
-        _ => {
-            let code = ch as u32;
-            if code <= 0x10ffff {
-                Some((0x01000000 | code) as i32)
-            } else {
-                None
-            }
-        }
-    }
-}
 
 /// Manually mmap an fd-backed buffer (DMA-BUF or MemFd), copy the pixel region,
 /// and munmap. Returns `None` on any failure so the caller can skip the frame.
@@ -846,9 +828,9 @@ fn target_pipewire_framerate(fps: u32) -> u32 {
 #[cfg(test)]
 mod tests {
     use super::{
-        char_to_x11_keysym, target_pipewire_framerate, wayland_input_error,
-        wayland_remote_interaction_error,
+        target_pipewire_framerate, wayland_input_error, wayland_remote_interaction_error,
     };
+    use crate::display::keymap::char_to_x11_keysym;
 
     #[test]
     fn target_pipewire_framerate_clamps_to_supported_range() {

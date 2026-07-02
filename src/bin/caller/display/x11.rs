@@ -277,88 +277,58 @@ impl DisplayBackend for X11Backend {
         let height = self.height.load(Ordering::SeqCst) as f64;
         let display = &self.display;
 
+        // In-process XTest injection over the shared per-display connection
+        // (crate::x11_input) — no xdotool fork per browser input event.
         match event {
             InputEvent::KeyDown { ref code, .. } => {
-                if let Some(key_name) = dom_code_to_xdotool_key(code) {
-                    run_xdotool(display, &["keydown", key_name]).await?;
-                }
+                crate::x11_input::key_sequence(display, vec![(code.clone(), true)])
+                    .await
+                    .map_err(CallerError::Display)?;
             }
             InputEvent::KeyUp { ref code, .. } => {
-                if let Some(key_name) = dom_code_to_xdotool_key(code) {
-                    run_xdotool(display, &["keyup", key_name]).await?;
-                }
+                crate::x11_input::key_sequence(display, vec![(code.clone(), false)])
+                    .await
+                    .map_err(CallerError::Display)?;
             }
             InputEvent::MouseMove { x, y, .. } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
-                let sx = px.to_string();
-                let sy = py.to_string();
-                run_xdotool(display, &["mousemove", "--screen", "0", &sx, &sy]).await?;
+                crate::x11_input::move_mouse(display, px, py)
+                    .await
+                    .map_err(CallerError::Display)?;
             }
             InputEvent::MouseDown { x, y, b } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
-                let sx = px.to_string();
-                let sy = py.to_string();
-                // Browser button: 0=left, 1=middle, 2=right
-                // xdotool button: 1=left, 2=middle, 3=right
-                let button = match b {
-                    0 => "1",
-                    1 => "2",
-                    2 => "3",
-                    _ => "1",
-                };
-                run_xdotool(
-                    display,
-                    &["mousemove", "--screen", "0", &sx, &sy, "mousedown", button],
-                )
-                .await?;
+                crate::x11_input::mouse_down(display, px, py, x11_button_from_browser(b))
+                    .await
+                    .map_err(CallerError::Display)?;
             }
             InputEvent::MouseUp { x, y, b } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
-                let sx = px.to_string();
-                let sy = py.to_string();
-                let button = match b {
-                    0 => "1",
-                    1 => "2",
-                    2 => "3",
-                    _ => "1",
-                };
-                run_xdotool(
-                    display,
-                    &["mousemove", "--screen", "0", &sx, &sy, "mouseup", button],
-                )
-                .await?;
+                crate::x11_input::mouse_up(display, px, py, x11_button_from_browser(b))
+                    .await
+                    .map_err(CallerError::Display)?;
             }
             InputEvent::Scroll { x, y, dx, dy } => {
                 let px = (x * width) as i32;
                 let py = (y * height) as i32;
-                let sx = px.to_string();
-                let sy = py.to_string();
-                // Move to position first.
-                run_xdotool(display, &["mousemove", "--screen", "0", &sx, &sy]).await?;
-                // Vertical scroll: xdotool button 4=up, 5=down.
+                // Vertical: X11 wheel buttons 4=up, 5=down.
                 if dy.abs() > f64::EPSILON {
                     let steps = dy.abs().round().max(1.0) as u32;
-                    let button = if dy < 0.0 { "4" } else { "5" };
-                    let steps_str = steps.to_string();
-                    run_xdotool(
-                        display,
-                        &["click", "--repeat", &steps_str, "--delay", "20", button],
-                    )
-                    .await?;
+                    let button = if dy < 0.0 { 4 } else { 5 };
+                    crate::x11_input::scroll(display, px, py, button, steps)
+                        .await
+                        .map_err(CallerError::Display)?;
                 }
-                // Horizontal scroll: xdotool button 6=left, 7=right.
+                // Horizontal: 6=left, 7=right.
                 if dx.abs() > f64::EPSILON {
                     let steps = dx.abs().round().max(1.0) as u32;
-                    let button = if dx < 0.0 { "6" } else { "7" };
-                    let steps_str = steps.to_string();
-                    run_xdotool(
-                        display,
-                        &["click", "--repeat", &steps_str, "--delay", "20", button],
-                    )
-                    .await?;
+                    let button = if dx < 0.0 { 6 } else { 7 };
+                    crate::x11_input::scroll(display, px, py, button, steps)
+                        .await
+                        .map_err(CallerError::Display)?;
                 }
             }
         }
@@ -377,163 +347,15 @@ impl DisplayBackend for X11Backend {
     }
 }
 
-// ---------------------------------------------------------------------------
-// xdotool helper
-// ---------------------------------------------------------------------------
-
-/// Run an xdotool command on the given display.
-async fn run_xdotool(display: &str, args: &[&str]) -> Result<(), CallerError> {
-    let output = tokio::process::Command::new("xdotool")
-        .env("DISPLAY", display)
-        .args(args)
-        .output()
-        .await
-        .map_err(|e| CallerError::Display(format!("xdotool exec: {e}")))?;
-
-    if output.status.success() {
-        Ok(())
-    } else {
-        Err(CallerError::Display(format!(
-            "xdotool failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        )))
+/// Browser mouse-button index (0=left, 1=middle, 2=right) to the X11
+/// core-protocol button number (1=left, 2=middle, 3=right).
+fn x11_button_from_browser(b: u8) -> u8 {
+    match b {
+        0 => 1,
+        1 => 2,
+        2 => 3,
+        _ => 1,
     }
-}
-
-// ---------------------------------------------------------------------------
-// DOM code -> xdotool key name mapping
-// ---------------------------------------------------------------------------
-
-/// Map a DOM `KeyboardEvent.code` to an xdotool key name (X11 keysym name).
-///
-/// xdotool accepts X11 keysym names as documented in `<X11/keysymdef.h>`.
-/// This is a physical key mapping -- the same limitation as `keymap.rs`
-/// (non-US layouts will produce incorrect character output).
-fn dom_code_to_xdotool_key(code: &str) -> Option<&'static str> {
-    Some(match code {
-        // Row 0 -- Escape + Function keys
-        "Escape" => "Escape",
-        "F1" => "F1",
-        "F2" => "F2",
-        "F3" => "F3",
-        "F4" => "F4",
-        "F5" => "F5",
-        "F6" => "F6",
-        "F7" => "F7",
-        "F8" => "F8",
-        "F9" => "F9",
-        "F10" => "F10",
-        "F11" => "F11",
-        "F12" => "F12",
-
-        // Row 1 -- Digits
-        "Backquote" => "grave",
-        "Digit1" => "1",
-        "Digit2" => "2",
-        "Digit3" => "3",
-        "Digit4" => "4",
-        "Digit5" => "5",
-        "Digit6" => "6",
-        "Digit7" => "7",
-        "Digit8" => "8",
-        "Digit9" => "9",
-        "Digit0" => "0",
-        "Minus" => "minus",
-        "Equal" => "equal",
-        "Backspace" => "BackSpace",
-
-        // Row 2 -- QWERTY
-        "Tab" => "Tab",
-        "KeyQ" => "q",
-        "KeyW" => "w",
-        "KeyE" => "e",
-        "KeyR" => "r",
-        "KeyT" => "t",
-        "KeyY" => "y",
-        "KeyU" => "u",
-        "KeyI" => "i",
-        "KeyO" => "o",
-        "KeyP" => "p",
-        "BracketLeft" => "bracketleft",
-        "BracketRight" => "bracketright",
-        "Backslash" => "backslash",
-
-        // Row 3 -- ASDF
-        "CapsLock" => "Caps_Lock",
-        "KeyA" => "a",
-        "KeyS" => "s",
-        "KeyD" => "d",
-        "KeyF" => "f",
-        "KeyG" => "g",
-        "KeyH" => "h",
-        "KeyJ" => "j",
-        "KeyK" => "k",
-        "KeyL" => "l",
-        "Semicolon" => "semicolon",
-        "Quote" => "apostrophe",
-        "Enter" => "Return",
-
-        // Row 4 -- ZXCV
-        "ShiftLeft" => "Shift_L",
-        "KeyZ" => "z",
-        "KeyX" => "x",
-        "KeyC" => "c",
-        "KeyV" => "v",
-        "KeyB" => "b",
-        "KeyN" => "n",
-        "KeyM" => "m",
-        "Comma" => "comma",
-        "Period" => "period",
-        "Slash" => "slash",
-        "ShiftRight" => "Shift_R",
-
-        // Row 5 -- Bottom
-        "ControlLeft" => "Control_L",
-        "MetaLeft" => "Super_L",
-        "AltLeft" => "Alt_L",
-        "Space" => "space",
-        "AltRight" => "Alt_R",
-        "MetaRight" => "Super_R",
-        "ControlRight" => "Control_R",
-
-        // Navigation cluster
-        "PrintScreen" => "Print",
-        "ScrollLock" => "Scroll_Lock",
-        "Pause" => "Pause",
-        "Insert" => "Insert",
-        "Home" => "Home",
-        "PageUp" => "Prior",
-        "Delete" => "Delete",
-        "End" => "End",
-        "PageDown" => "Next",
-
-        // Arrow keys
-        "ArrowUp" => "Up",
-        "ArrowLeft" => "Left",
-        "ArrowDown" => "Down",
-        "ArrowRight" => "Right",
-
-        // Numpad
-        "NumLock" => "Num_Lock",
-        "NumpadDivide" => "KP_Divide",
-        "NumpadMultiply" => "KP_Multiply",
-        "NumpadSubtract" => "KP_Subtract",
-        "Numpad7" => "KP_7",
-        "Numpad8" => "KP_8",
-        "Numpad9" => "KP_9",
-        "NumpadAdd" => "KP_Add",
-        "Numpad4" => "KP_4",
-        "Numpad5" => "KP_5",
-        "Numpad6" => "KP_6",
-        "Numpad1" => "KP_1",
-        "Numpad2" => "KP_2",
-        "Numpad3" => "KP_3",
-        "NumpadEnter" => "KP_Enter",
-        "Numpad0" => "KP_0",
-        "NumpadDecimal" => "KP_Decimal",
-
-        _ => return None,
-    })
 }
 
 // ---------------------------------------------------------------------------

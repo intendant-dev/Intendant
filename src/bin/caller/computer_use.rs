@@ -13,7 +13,8 @@ use tokio::process::Command;
 /// Display backend for input simulation and screenshot capture.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum DisplayBackend {
-    /// X11: xdotool + ImageMagick import. Works with Xvfb and real X11 DEs.
+    /// X11: in-process x11rb/XTest injection + root-window capture over a
+    /// persistent per-display connection. Works with Xvfb and real X11 DEs.
     X11,
     /// Wayland: routed through the live portal `DisplaySession` (PipeWire
     /// capture + portal input injection). Requires an active session.
@@ -238,12 +239,12 @@ pub enum MouseButton {
 }
 
 impl MouseButton {
-    /// xdotool button number.
-    fn xdotool_button(self) -> &'static str {
+    /// X11 core-protocol button number (1=left, 2=middle, 3=right).
+    fn x11_button(self) -> u8 {
         match self {
-            MouseButton::Left => "1",
-            MouseButton::Right => "3",
-            MouseButton::Middle => "2",
+            MouseButton::Left => 1,
+            MouseButton::Right => 3,
+            MouseButton::Middle => 2,
         }
     }
 }
@@ -258,13 +259,13 @@ pub enum ScrollDirection {
 }
 
 impl ScrollDirection {
-    /// xdotool click button for this scroll direction.
-    fn xdotool_button(self) -> &'static str {
+    /// X11 wheel button for this scroll direction (4=up, 5=down, 6=left, 7=right).
+    fn x11_button(self) -> u8 {
         match self {
-            ScrollDirection::Up => "4",
-            ScrollDirection::Down => "5",
-            ScrollDirection::Left => "6",
-            ScrollDirection::Right => "7",
+            ScrollDirection::Up => 4,
+            ScrollDirection::Down => 5,
+            ScrollDirection::Left => 6,
+            ScrollDirection::Right => 7,
         }
     }
 }
@@ -752,20 +753,7 @@ async fn execute_single(
                 let (sx, sy) = scale_coords(*x, *y);
                 macos_input::click(sx, sy, *button, 1).await
             }
-            _ => {
-                run_xdotool(
-                    display,
-                    &[
-                        "mousemove",
-                        "--sync",
-                        &x.to_string(),
-                        &y.to_string(),
-                        "click",
-                        button.xdotool_button(),
-                    ],
-                )
-                .await
-            }
+            _ => cu_result(x11_cu::click(display, *x, *y, button.x11_button(), 1).await),
         },
         CuAction::DoubleClick { x, y, button } => match backend {
             #[cfg(target_os = "macos")]
@@ -773,34 +761,20 @@ async fn execute_single(
                 let (sx, sy) = scale_coords(*x, *y);
                 macos_input::click(sx, sy, *button, 2).await
             }
-            _ => {
-                run_xdotool(
-                    display,
-                    &[
-                        "mousemove",
-                        "--sync",
-                        &x.to_string(),
-                        &y.to_string(),
-                        "click",
-                        "--repeat",
-                        "2",
-                        "--delay",
-                        "50",
-                        MouseButton::Left.xdotool_button(),
-                    ],
-                )
-                .await
-            }
+            _ => cu_result(x11_cu::click(display, *x, *y, button.x11_button(), 2).await),
         },
         CuAction::Type { text } => match backend {
             #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => macos_input::type_text(text).await,
-            _ => run_xdotool(display, &["type", "--clearmodifiers", text]).await,
+            _ => cu_result(x11_cu::type_text(display, text).await),
         },
         CuAction::Key { key } => match backend {
             #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => macos_input::key(key).await,
-            _ => run_xdotool(display, &["key", "--clearmodifiers", key]).await,
+            _ => match dom_key_sequence(key) {
+                Ok(seq) => cu_result(x11_cu::key_sequence(display, seq).await),
+                Err(e) => cu_result(Err(e)),
+            },
         },
         CuAction::Scroll {
             x,
@@ -813,23 +787,16 @@ async fn execute_single(
                 let (sx, sy) = scale_coords(*x, *y);
                 macos_input::scroll(sx, sy, *direction, *amount).await
             }
-            _ => {
-                let mut result = run_xdotool(
+            _ => cu_result(
+                x11_cu::scroll(
                     display,
-                    &["mousemove", "--sync", &x.to_string(), &y.to_string()],
+                    *x,
+                    *y,
+                    direction.x11_button(),
+                    (*amount).max(1) as u32,
                 )
-                .await;
-                if result.success {
-                    let btn = direction.xdotool_button();
-                    let amt = (*amount).max(1);
-                    result = run_xdotool(
-                        display,
-                        &["click", "--repeat", &amt.to_string(), "--delay", "20", btn],
-                    )
-                    .await;
-                }
-                result
-            }
+                .await,
+            ),
         },
         CuAction::MoveMouse { x, y } => match backend {
             #[cfg(target_os = "macos")]
@@ -837,13 +804,7 @@ async fn execute_single(
                 let (sx, sy) = scale_coords(*x, *y);
                 macos_input::move_mouse(sx, sy).await
             }
-            _ => {
-                run_xdotool(
-                    display,
-                    &["mousemove", "--sync", &x.to_string(), &y.to_string()],
-                )
-                .await
-            }
+            _ => cu_result(x11_cu::move_mouse(display, *x, *y).await),
         },
         CuAction::Drag {
             start_x,
@@ -857,26 +818,7 @@ async fn execute_single(
                 let (sx2, sy2) = scale_coords(*end_x, *end_y);
                 macos_input::drag(sx1, sy1, sx2, sy2).await
             }
-            _ => {
-                run_xdotool(
-                    display,
-                    &[
-                        "mousemove",
-                        "--sync",
-                        &start_x.to_string(),
-                        &start_y.to_string(),
-                        "mousedown",
-                        "1",
-                        "mousemove",
-                        "--sync",
-                        &end_x.to_string(),
-                        &end_y.to_string(),
-                        "mouseup",
-                        "1",
-                    ],
-                )
-                .await
-            }
+            _ => cu_result(x11_cu::drag(display, *start_x, *start_y, *end_x, *end_y).await),
         },
         CuAction::TripleClick { x, y, button } => match backend {
             #[cfg(target_os = "macos")]
@@ -884,24 +826,7 @@ async fn execute_single(
                 let (sx, sy) = scale_coords(*x, *y);
                 macos_input::click(sx, sy, *button, 3).await
             }
-            _ => {
-                run_xdotool(
-                    display,
-                    &[
-                        "mousemove",
-                        "--sync",
-                        &x.to_string(),
-                        &y.to_string(),
-                        "click",
-                        "--repeat",
-                        "3",
-                        "--delay",
-                        "50",
-                        button.xdotool_button(),
-                    ],
-                )
-                .await
-            }
+            _ => cu_result(x11_cu::click(display, *x, *y, button.x11_button(), 3).await),
         },
         CuAction::MouseDown { x, y, button } => match backend {
             #[cfg(target_os = "macos")]
@@ -909,20 +834,7 @@ async fn execute_single(
                 let (sx, sy) = scale_coords(*x, *y);
                 macos_input::mouse_down(sx, sy, *button).await
             }
-            _ => {
-                run_xdotool(
-                    display,
-                    &[
-                        "mousemove",
-                        "--sync",
-                        &x.to_string(),
-                        &y.to_string(),
-                        "mousedown",
-                        button.xdotool_button(),
-                    ],
-                )
-                .await
-            }
+            _ => cu_result(x11_cu::mouse_down(display, *x, *y, button.x11_button()).await),
         },
         CuAction::MouseUp { x, y, button } => match backend {
             #[cfg(target_os = "macos")]
@@ -930,46 +842,26 @@ async fn execute_single(
                 let (sx, sy) = scale_coords(*x, *y);
                 macos_input::mouse_up(sx, sy, *button).await
             }
-            _ => {
-                run_xdotool(
-                    display,
-                    &[
-                        "mousemove",
-                        "--sync",
-                        &x.to_string(),
-                        &y.to_string(),
-                        "mouseup",
-                        button.xdotool_button(),
-                    ],
-                )
-                .await
-            }
+            _ => cu_result(x11_cu::mouse_up(display, *x, *y, button.x11_button()).await),
         },
         CuAction::HoldKey { key, ms } => match backend {
             #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => macos_input::hold_key(key, *ms).await,
-            _ => {
-                // xdotool sleep takes seconds (fractional allowed).
-                let secs = format!("{:.3}", (*ms as f64) / 1000.0);
-                run_xdotool(
-                    display,
-                    &[
-                        "keydown",
-                        "--clearmodifiers",
-                        key,
-                        "sleep",
-                        &secs,
-                        "keyup",
-                        key,
-                    ],
-                )
-                .await
-            }
+            _ => match dom_key_sequence(key) {
+                Ok(seq) => {
+                    let (downs, ups): (Vec<_>, Vec<_>) =
+                        seq.into_iter().partition(|(_, press)| *press);
+                    let downs = downs.into_iter().map(|(code, _)| code).collect();
+                    let ups = ups.into_iter().map(|(code, _)| code).collect();
+                    cu_result(x11_cu::hold_key_sequence(display, downs, ups, *ms).await)
+                }
+                Err(e) => cu_result(Err(e)),
+            },
         },
         CuAction::Paste { text } => match backend {
             #[cfg(target_os = "macos")]
             DisplayBackend::MacOS => macos_input::paste(text).await,
-            _ => x11_paste(display, text).await,
+            _ => cu_result(x11_cu::paste(display, text).await),
         },
         CuAction::Screenshot => {
             match take_screenshot(display, backend, screenshot_dir, counter).await {
@@ -1025,84 +917,89 @@ async fn execute_single(
     }
 }
 
-/// Paste on X11: set the clipboard via `xclip` (text over stdin, so content
-/// never hits argv), then press ctrl+v. The previous clipboard is not
-/// restored — X11 CU displays are agent-owned Xvfb sessions.
-async fn x11_paste(display: &str, text: &str) -> CuActionResult {
-    use tokio::io::AsyncWriteExt;
+// ── X11 backend (in-process via x11rb + XTest) ──────────────────────────────
 
-    let spawn = Command::new("xclip")
-        .args(["-selection", "clipboard", "-display", display])
-        .stdin(std::process::Stdio::piped())
-        .spawn();
-    let mut child = match spawn {
-        Ok(child) => child,
-        Err(e) => {
-            return CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some(format!("xclip spawn failed (is xclip installed?): {e}")),
-            }
-        }
-    };
-    if let Some(mut stdin) = child.stdin.take() {
-        if let Err(e) = stdin.write_all(text.as_bytes()).await {
-            return CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some(format!("xclip write failed: {e}")),
-            };
-        }
+/// On Linux, X11 CU actions go through the in-process `x11_input` module —
+/// one persistent X connection per display instead of an `xdotool`/`xclip`/
+/// `import` fork per action. The stub keeps non-Linux builds compiling
+/// (x11rb is a Linux-target dependency); `DisplayBackend::X11` is unreachable
+/// there in practice.
+#[cfg(target_os = "linux")]
+use crate::x11_input as x11_cu;
+
+#[cfg(not(target_os = "linux"))]
+mod x11_cu {
+    const UNSUPPORTED: &str = "X11 computer use is only available on Linux hosts";
+
+    pub async fn click(_: &str, _: i32, _: i32, _: u8, _: u32) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
     }
-    match child.wait().await {
-        Ok(status) if status.success() => {}
-        Ok(status) => {
-            return CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some(format!("xclip exited with {status}")),
-            }
-        }
-        Err(e) => {
-            return CuActionResult {
-                success: false,
-                screenshot: None,
-                error: Some(format!("xclip wait failed: {e}")),
-            }
-        }
+    pub async fn mouse_down(_: &str, _: i32, _: i32, _: u8) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
     }
-    run_xdotool(display, &["key", "--clearmodifiers", "ctrl+v"]).await
+    pub async fn mouse_up(_: &str, _: i32, _: i32, _: u8) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn move_mouse(_: &str, _: i32, _: i32) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn drag(_: &str, _: i32, _: i32, _: i32, _: i32) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn scroll(_: &str, _: i32, _: i32, _: u8, _: u32) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn key_sequence(_: &str, _: Vec<(String, bool)>) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn hold_key_sequence(
+        _: &str,
+        _: Vec<String>,
+        _: Vec<String>,
+        _: u64,
+    ) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn type_text(_: &str, _: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn paste(_: &str, _: &str) -> Result<(), String> {
+        Err(UNSUPPORTED.to_string())
+    }
+    pub async fn screenshot_png(_: &str) -> Result<Vec<u8>, String> {
+        Err(UNSUPPORTED.to_string())
+    }
 }
 
-// ── X11 backend (xdotool) ───────────────────────────────────────────────────
-
-/// Run an xdotool command on the given display.
-async fn run_xdotool(display: &str, args: &[&str]) -> CuActionResult {
-    let output = Command::new("xdotool")
-        .env("DISPLAY", display)
-        .args(args)
-        .output()
-        .await;
-
-    match output {
-        Ok(o) if o.status.success() => CuActionResult {
+/// Adapt an `x11_input` result into a `CuActionResult`, attaching the Linux
+/// GUI-environment diagnostic to failures (as the old xdotool wrapper did).
+fn cu_result(r: Result<(), String>) -> CuActionResult {
+    match r {
+        Ok(()) => CuActionResult {
             success: true,
             screenshot: None,
             error: None,
         },
-        Ok(o) => CuActionResult {
-            success: false,
-            screenshot: None,
-            error: Some(with_linux_gui_env_diagnostic(
-                String::from_utf8_lossy(&o.stderr).to_string(),
-            )),
-        },
         Err(e) => CuActionResult {
             success: false,
             screenshot: None,
-            error: Some(format!("xdotool exec error: {}", e)),
+            error: Some(with_linux_gui_env_diagnostic(e)),
         },
     }
+}
+
+/// Parse a key action ("ctrl+shift+t") into (DOM code, press) pairs via the
+/// same `key_action_events` parser the session backends use — identical
+/// aliases and identical errors across every backend.
+fn dom_key_sequence(key: &str) -> Result<Vec<(String, bool)>, String> {
+    Ok(key_action_events(key)?
+        .into_iter()
+        .filter_map(|e| match e {
+            crate::display::InputEvent::KeyDown { code, .. } => Some((code, true)),
+            crate::display::InputEvent::KeyUp { code, .. } => Some((code, false)),
+            _ => None,
+        })
+        .collect())
 }
 
 // ── macOS backend (in-process CGEvent injection) ─────────────────────────────
@@ -1645,9 +1542,9 @@ mod macos_input {
 
 // ── Screenshot capture ──────────────────────────────────────────────────────
 
-/// Capture a screenshot using the appropriate backend tool.
+/// Capture a screenshot using the appropriate backend.
 ///
-/// X11: ImageMagick `import -window root -display :N`.
+/// X11: in-process root-window capture over the persistent x11rb connection.
 /// macOS: `screencapture -x` (captures primary display, silent).
 async fn take_screenshot(
     display: &str,
@@ -1658,44 +1555,40 @@ async fn take_screenshot(
     *counter += 1;
     let path = screenshot_dir.join(format!("cu_screenshot_{}.png", counter));
 
-    let output = match backend {
-        DisplayBackend::MacOS => Command::new("screencapture")
-            .args(["-x", &path.to_string_lossy()])
-            .output()
-            .await
-            .map_err(|e| format!("screencapture exec error: {}", e))?,
-        _ => Command::new("import")
-            .args([
-                "-window",
-                "root",
-                "-display",
-                display,
-                &path.to_string_lossy(),
-            ])
-            .output()
-            .await
-            .map_err(|e| format!("import exec error: {}", e))?,
+    let raw_bytes = match backend {
+        DisplayBackend::MacOS => {
+            let output = Command::new("screencapture")
+                .args(["-x", &path.to_string_lossy()])
+                .output()
+                .await
+                .map_err(|e| format!("screencapture exec error: {}", e))?;
+            if !output.status.success() {
+                return Err(format!(
+                    "screencapture failed: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                ));
+            }
+            tokio::fs::read(&path)
+                .await
+                .map_err(|e| format!("read screenshot: {}", e))?
+        }
+        _ => {
+            let bytes = x11_cu::screenshot_png(display)
+                .await
+                .map_err(with_linux_gui_env_diagnostic)?;
+            // Keep the on-disk artifact: the dashboard's Activity tab (and
+            // the annotated-overwrite path in mcp.rs) read screenshots from
+            // this path.
+            tokio::fs::write(&path, &bytes)
+                .await
+                .map_err(|e| format!("write screenshot: {}", e))?;
+            bytes
+        }
     };
 
-    if !output.status.success() {
-        let tool = if backend == DisplayBackend::MacOS {
-            "screencapture"
-        } else {
-            "import"
-        };
-        return Err(format!(
-            "{} failed: {}",
-            tool,
-            with_linux_gui_env_diagnostic(String::from_utf8_lossy(&output.stderr).to_string())
-        ));
-    }
-
-    // Read file, downscale Retina captures to logical size (macOS-only; a
-    // no-op elsewhere so model coordinates = capture = injection space), and
+    // Downscale Retina captures to logical size (macOS-only; a no-op
+    // elsewhere so model coordinates = capture = injection space), and
     // encode as base64.
-    let raw_bytes = tokio::fs::read(&path)
-        .await
-        .map_err(|e| format!("read screenshot: {}", e))?;
 
     let (raw_w, raw_h) = png_dimensions(&raw_bytes).unwrap_or((0, 0));
     let bytes = normalize_png_to_logical(raw_bytes);
@@ -2470,41 +2363,33 @@ async fn capture_zoom_screenshot(
     };
     let raw = match raw {
         Some(bytes) => bytes,
-        None => {
-            // Raw subprocess capture, deliberately without the
-            // logical-size downscale.
-            *counter += 1;
-            let path = screenshot_dir.join(format!("cu_zoom_raw_{}.png", counter));
-            let output = match backend {
-                DisplayBackend::MacOS => Command::new("screencapture")
+        None => match backend {
+            // Raw capture, deliberately without the logical-size downscale
+            // (zoom's whole point is native detail).
+            DisplayBackend::MacOS => {
+                *counter += 1;
+                let path = screenshot_dir.join(format!("cu_zoom_raw_{}.png", counter));
+                let output = Command::new("screencapture")
                     .args(["-x", &path.to_string_lossy()])
                     .output()
                     .await
-                    .map_err(|e| format!("screencapture exec error: {e}"))?,
-                _ => Command::new("import")
-                    .args([
-                        "-window",
-                        "root",
-                        "-display",
-                        display,
-                        &path.to_string_lossy(),
-                    ])
-                    .output()
+                    .map_err(|e| format!("screencapture exec error: {e}"))?;
+                if !output.status.success() {
+                    return Err(format!(
+                        "zoom capture failed: {}",
+                        String::from_utf8_lossy(&output.stderr)
+                    ));
+                }
+                let bytes = tokio::fs::read(&path)
                     .await
-                    .map_err(|e| format!("import exec error: {e}"))?,
-            };
-            if !output.status.success() {
-                return Err(format!(
-                    "zoom capture failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                ));
+                    .map_err(|e| format!("read zoom capture: {e}"))?;
+                let _ = tokio::fs::remove_file(&path).await;
+                bytes
             }
-            let bytes = tokio::fs::read(&path)
+            _ => x11_cu::screenshot_png(display)
                 .await
-                .map_err(|e| format!("read zoom capture: {e}"))?;
-            let _ = tokio::fs::remove_file(&path).await;
-            bytes
-        }
+                .map_err(|e| format!("zoom capture failed: {e}"))?,
+        },
     };
 
     // Crop reference: on macOS the model's region is in logical points while
@@ -2918,16 +2803,18 @@ mod tests {
     }
 
     #[test]
-    fn mouse_button_xdotool() {
-        assert_eq!(MouseButton::Left.xdotool_button(), "1");
-        assert_eq!(MouseButton::Right.xdotool_button(), "3");
-        assert_eq!(MouseButton::Middle.xdotool_button(), "2");
+    fn mouse_button_x11_numbers() {
+        assert_eq!(MouseButton::Left.x11_button(), 1);
+        assert_eq!(MouseButton::Right.x11_button(), 3);
+        assert_eq!(MouseButton::Middle.x11_button(), 2);
     }
 
     #[test]
-    fn scroll_direction_xdotool() {
-        assert_eq!(ScrollDirection::Up.xdotool_button(), "4");
-        assert_eq!(ScrollDirection::Down.xdotool_button(), "5");
+    fn scroll_direction_x11_wheel_buttons() {
+        assert_eq!(ScrollDirection::Up.x11_button(), 4);
+        assert_eq!(ScrollDirection::Down.x11_button(), 5);
+        assert_eq!(ScrollDirection::Left.x11_button(), 6);
+        assert_eq!(ScrollDirection::Right.x11_button(), 7);
     }
 
     #[test]
