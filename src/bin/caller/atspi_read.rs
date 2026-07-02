@@ -152,6 +152,7 @@ mod walk {
     const MAX_APPS: usize = 128;
     const MAX_WINDOWS_PER_APP: usize = 32;
     const MAX_OTHER_WINDOWS: usize = 10;
+    const MAX_ACTIVE_CANDIDATES: usize = 8;
 
     /// Enable session accessibility once per process, on demand. Toolkits
     /// consult `org.a11y.Status.IsEnabled` at startup; without it GTK still
@@ -190,9 +191,11 @@ mod walk {
             .await
             .map_err(|e| format!("list accessible applications: {e}"))?;
 
-        // Scan applications for the toplevel window carrying the Active
-        // state; collect other visible toplevels for orientation.
-        let mut active = None;
+        // Scan applications for toplevels carrying the Active state; collect
+        // other visible toplevels for orientation. Multiple toplevels can
+        // claim Active — window managers (e.g. xfwm4) park a dummy Active
+        // frame offscreen — so geometry picks the plausible one afterwards.
+        let mut active_candidates = Vec::new();
         let mut other_windows: Vec<String> = Vec::new();
         for app_ref in apps.into_iter().take(MAX_APPS) {
             let Ok(app_proxy) = app_ref.clone().into_accessible_proxy(conn.connection()).await
@@ -214,16 +217,45 @@ mod walk {
                     continue;
                 }
                 let title = win.name().await.unwrap_or_default();
-                if states.contains(State::Active) && active.is_none() {
-                    let pid = pid_of(&conn, win.inner().destination().as_str()).await;
-                    active = Some((app_name.clone(), pid, win, title));
+                if states.contains(State::Active)
+                    && active_candidates.len() < MAX_ACTIVE_CANDIDATES
+                {
+                    active_candidates.push((app_name.clone(), win, title));
                 } else if !title.trim().is_empty() && other_windows.len() < MAX_OTHER_WINDOWS {
                     other_windows.push(format!("{title} ({app_name})"));
                 }
             }
         }
 
-        let Some((app, pid, window, title)) = active else {
+        // Choose the Active claimant with plausible on-screen geometry —
+        // largest sane area wins; without a sane one, the first claimant
+        // stands (never regress to "no active window" when something claimed
+        // it). Demoted claimants join other_windows.
+        let mut chosen = None;
+        let mut chosen_area: i64 = -1;
+        let mut demoted: Vec<String> = Vec::new();
+        for (app_name, win, title) in active_candidates {
+            let (x, y, w, h) = component_extents(&conn, &win).await.unwrap_or((0, 0, 0, 0));
+            let sane = w >= 16 && h >= 16 && x.saturating_add(w) > 0 && y.saturating_add(h) > 0;
+            let area = if sane { w as i64 * h as i64 } else { -1 };
+            if chosen.is_none() || area > chosen_area {
+                if let Some((old_app, _, old_title)) = chosen.replace((app_name, win, title)) {
+                    if !old_title.trim().is_empty() {
+                        demoted.push(format!("{old_title} ({old_app})"));
+                    }
+                }
+                chosen_area = area;
+            } else if !title.trim().is_empty() {
+                demoted.push(format!("{title} ({app_name})"));
+            }
+        }
+        for demoted_title in demoted {
+            if other_windows.len() < MAX_OTHER_WINDOWS {
+                other_windows.push(demoted_title);
+            }
+        }
+
+        let Some((app, window, title)) = chosen else {
             return Ok(ScreenElements {
                 app: "(no active window)".to_string(),
                 pid: 0,
@@ -239,6 +271,7 @@ mod walk {
             });
         };
 
+        let pid = pid_of(&conn, window.inner().destination().as_str()).await;
         let budget = AtomicUsize::new(max_nodes);
         let truncated = AtomicBool::new(false);
         let root = walk_element(&conn, window, max_depth, &budget, &truncated).await;
