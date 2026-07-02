@@ -243,7 +243,13 @@ impl DashboardControlGrant {
 
     fn filesystem(&self) -> Option<&crate::peer::access_policy::FilesystemAccessPolicy> {
         match self {
-            Self::TrustedLocal | Self::UserClientRoot { .. } | Self::UserClient { .. } => None,
+            // TrustedLocal is the owner's own dashboard; a root client key
+            // is equivalent. Scoping applies to granted principals.
+            Self::TrustedLocal | Self::UserClientRoot { .. } => None,
+            Self::UserClient {
+                principal,
+                iam_state,
+            } => crate::access::iam::fs_scope_for_principal(iam_state, principal),
             Self::Peer { filesystem, .. } => Some(filesystem),
         }
     }
@@ -1703,6 +1709,60 @@ fn send_control_byte_stream<I: rtc::interceptor::Interceptor>(
                 send_control_text(rtc, channels, end);
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod fs_scope_grant_tests {
+    use super::*;
+
+    #[test]
+    fn user_client_grant_resolves_fs_scope_and_owner_paths_stay_open() {
+        let mut state = crate::access::iam::LocalIamState::default();
+        let actor = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "test",
+            "dashboard-control",
+        );
+        let result = crate::access::iam::upsert_user_client_grant(
+            &mut state,
+            crate::access::iam::UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:11".to_string()),
+                role_id: Some("role:files-read".to_string()),
+                fs_read_roots: vec!["/srv/shared".to_string()],
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let principal = crate::access::iam::AccessPrincipal {
+            grant_id: Some(result.grant.id.clone()),
+            ..crate::access::iam::AccessPrincipal::root_dashboard_session(
+                "scoped",
+                "dashboard-control",
+            )
+        };
+        let scoped = DashboardControlGrant::UserClient {
+            principal,
+            iam_state: state.clone(),
+        };
+        let scope = scoped.filesystem().expect("scoped grant exposes fs scope");
+        assert_eq!(
+            scope.read_roots,
+            vec![std::path::PathBuf::from("/srv/shared")]
+        );
+
+        // Owner surfaces stay unrestricted.
+        assert!(DashboardControlGrant::TrustedLocal.filesystem().is_none());
+        let unscoped_principal = crate::access::iam::AccessPrincipal::root_dashboard_session(
+            "root-key",
+            "dashboard-control",
+        );
+        assert!(DashboardControlGrant::UserClientRoot {
+            principal: unscoped_principal
+        }
+        .filesystem()
+        .is_none());
     }
 }
 
@@ -9919,6 +9979,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
         let principal =
             crate::access::iam::principal_for_browser_mtls_cert(&iam_state, "ab123", "https")

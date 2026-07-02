@@ -29060,7 +29060,30 @@ fn authorize_http_filesystem_access(
     }
 
     let Some(identity) = identity else {
-        return Ok(());
+        // Not a peer connection: enforce the session grant's fs scope, if
+        // the active grant carries one (None = unrestricted).
+        let Some(scope) = access
+            .iam_state
+            .as_ref()
+            .and_then(|state| crate::access::iam::fs_scope_for_principal(state, &access.principal))
+        else {
+            return Ok(());
+        };
+        let path = expand_dashboard_fs_path(raw_path)?;
+        return match crate::peer::access_policy::filesystem_access_allowed(scope, kind, &path) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                bus.send(AppEvent::PresenceLog {
+                    message: format!(
+                        "[grant-fs] denied principal={} op={:?} path={} detail={}",
+                        access.principal.label, op, raw_path, e
+                    ),
+                    level: Some(LogLevel::Warn),
+                    turn: None,
+                });
+                Err(e)
+            }
+        };
     };
 
     let denied = |message: String| {
@@ -39453,6 +39476,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
         let loaded = crate::access::iam::LoadedIamState {
             path: std::path::PathBuf::from("iam.json"),
@@ -40125,6 +40149,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+            fs_scope: None,
         });
         crate::access::iam::save_state(tmp.path(), &state).unwrap();
 

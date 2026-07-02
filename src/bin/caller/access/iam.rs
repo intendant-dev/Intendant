@@ -163,6 +163,13 @@ pub struct IamGrant {
     /// was materialized from, when it was not the org root (step 6b).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub issued_via: Option<String>,
+    /// Filesystem scope for this grant. `None` = unrestricted (the
+    /// pre-scoping behavior); `Some` = mediated file surfaces are
+    /// confined to these roots for every principal kind, humans
+    /// included. Enforcement shares `filesystem_access_allowed` with
+    /// peer scoping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fs_scope: Option<crate::peer::access_policy::FilesystemAccessPolicy>,
 }
 
 impl IamGrant {
@@ -245,6 +252,12 @@ pub struct UserClientGrantUpsertRequest {
     /// instant. Must be in the future when set.
     #[serde(default)]
     pub expires_at_unix_ms: Option<u64>,
+    /// Filesystem roots this grant may read / write through the mediated
+    /// file surfaces. Both empty = unrestricted (no scope stored).
+    #[serde(default)]
+    pub fs_read_roots: Vec<String>,
+    #[serde(default)]
+    pub fs_write_roots: Vec<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -730,6 +743,36 @@ pub fn upsert_user_client_grant(
         }
         other => other,
     };
+    let normalize_roots = |roots: &[String]| -> AccessResult<Vec<std::path::PathBuf>> {
+        let mut out = Vec::new();
+        for root in roots {
+            let root = root.trim();
+            if root.is_empty() {
+                continue;
+            }
+            if !std::path::Path::new(root).is_absolute() {
+                return Err(AccessError(format!(
+                    "filesystem scope roots must be absolute paths (got {root})"
+                )));
+            }
+            out.push(std::path::PathBuf::from(root));
+        }
+        out.sort();
+        out.dedup();
+        Ok(out)
+    };
+    let fs_scope = {
+        let read_roots = normalize_roots(&request.fs_read_roots)?;
+        let write_roots = normalize_roots(&request.fs_write_roots)?;
+        if read_roots.is_empty() && write_roots.is_empty() {
+            None
+        } else {
+            Some(crate::peer::access_policy::FilesystemAccessPolicy {
+                read_roots,
+                write_roots,
+            })
+        }
+    };
 
     let binding = build_user_client_binding(&kind, &request)?;
     let principal_id = binding.principal_id;
@@ -796,6 +839,7 @@ pub fn upsert_user_client_grant(
         }
         existing.revoked_at_unix_ms = if status == "revoked" { Some(now) } else { None };
         existing.expires_at_unix_ms = expires_at_unix_ms;
+        existing.fs_scope = fs_scope.clone();
         existing.clone()
     } else {
         created_grant = true;
@@ -812,6 +856,7 @@ pub fn upsert_user_client_grant(
             revoked_at_unix_ms: if status == "revoked" { Some(now) } else { None },
             expires_at_unix_ms,
             issued_via: None,
+            fs_scope: fs_scope.clone(),
         };
         state.grants.push(grant.clone());
         grant
@@ -1675,6 +1720,19 @@ fn permission_summary(id: &str) -> &'static str {
     }
 }
 
+/// The filesystem scope attached to a principal's active grant, if any.
+pub fn fs_scope_for_principal<'a>(
+    state: &'a LocalIamState,
+    principal: &AccessPrincipal,
+) -> Option<&'a crate::peer::access_policy::FilesystemAccessPolicy> {
+    let grant_id = principal.grant_id.as_deref()?;
+    state
+        .grants
+        .iter()
+        .find(|grant| grant.id == grant_id)
+        .and_then(|grant| grant.fs_scope.as_ref())
+}
+
 pub fn evaluate_principal_operation(
     principal: &AccessPrincipal,
     op: crate::peer::access_policy::PeerOperation,
@@ -2493,6 +2551,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+        fs_scope: None,
         });
 
         save_state(tmp.path(), &state).unwrap();
@@ -2542,6 +2601,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+        fs_scope: None,
         });
 
         let grants = grant_overview_values(&state, "local-daemon");
@@ -2581,6 +2641,7 @@ mod tests {
             revoked_at_unix_ms: None,
             expires_at_unix_ms: None,
             issued_via: None,
+        fs_scope: None,
         });
         state
     }
@@ -3332,6 +3393,87 @@ mod tests {
             )
             .allowed
         );
+    }
+
+    #[test]
+    fn fs_scope_is_stored_normalized_and_resolvable() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("AA:BB".to_string()),
+                role_id: Some("role:files-read".to_string()),
+                fs_read_roots: vec![
+                    "/srv/data".to_string(),
+                    "  /srv/data  ".to_string(),
+                    String::new(),
+                ],
+                fs_write_roots: vec!["/srv/data/inbox".to_string()],
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        let scope = result.grant.fs_scope.as_ref().expect("scope stored");
+        assert_eq!(scope.read_roots, vec![std::path::PathBuf::from("/srv/data")]);
+        assert_eq!(
+            scope.write_roots,
+            vec![std::path::PathBuf::from("/srv/data/inbox")]
+        );
+        let principal = AccessPrincipal {
+            grant_id: Some(result.grant.id.clone()),
+            ..AccessPrincipal::root_dashboard_session("x", "dashboard-control")
+        };
+        assert!(fs_scope_for_principal(&state, &principal).is_some());
+        let unbound = AccessPrincipal {
+            grant_id: None,
+            ..AccessPrincipal::root_dashboard_session("x", "dashboard-control")
+        };
+        assert!(fs_scope_for_principal(&state, &unbound).is_none());
+    }
+
+    #[test]
+    fn fs_scope_rejects_relative_roots_and_clears_on_reupsert() {
+        let mut state = LocalIamState::default();
+        let actor = AccessPrincipal::root_dashboard_session("test", "dashboard-control");
+        let err = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("CC:DD".to_string()),
+                fs_read_roots: vec!["relative/path".to_string()],
+                ..Default::default()
+            },
+            &actor,
+        );
+        assert!(err.is_err(), "relative roots must be rejected");
+
+        upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("CC:DD".to_string()),
+                fs_read_roots: vec!["/tmp/scoped".to_string()],
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        // Re-upsert without roots clears the scope (the form always sends
+        // the full desired state).
+        let result = upsert_user_client_grant(
+            &mut state,
+            UserClientGrantUpsertRequest {
+                kind: "browser_certificate".to_string(),
+                fingerprint: Some("CC:DD".to_string()),
+                ..Default::default()
+            },
+            &actor,
+        )
+        .unwrap();
+        assert!(result.grant.fs_scope.is_none());
     }
 
     #[test]

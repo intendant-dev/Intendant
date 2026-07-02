@@ -1539,6 +1539,10 @@ body.access-page #tab-access {
 .acc-role-card .p { font-size: 10px; color: var(--overlay1); }
 .acc-grant-flow-actions { display: flex; align-items: center; flex-wrap: wrap; gap: 10px; margin-top: 14px; }
 .acc-grant-flow-msg { font-size: 11.5px; color: var(--subtext0); }
+.acc-grant-fs-scope { border: 1px solid var(--surface1); border-radius: 8px; padding: 8px 10px; margin-top: 8px; }
+.acc-grant-fs-scope summary { cursor: pointer; font-size: 12px; font-weight: 600; color: var(--subtext1); }
+.acc-grant-fs-roots { display: grid; gap: 3px; margin-top: 7px; font-size: 11.5px; color: var(--subtext0); }
+.acc-grant-fs-roots textarea { background: var(--mantle); color: var(--text); border: 1px solid var(--surface1); border-radius: 6px; padding: 5px 7px; font-family: var(--mono, monospace); font-size: 11.5px; resize: vertical; }
 .acc-status-toggle { display: inline-flex; border: 1px solid var(--surface1); border-radius: 6px; overflow: hidden; }
 .acc-status-toggle label { position: relative; cursor: pointer; }
 .acc-status-toggle input { position: absolute; opacity: 0; pointer-events: none; }
@@ -36582,6 +36586,36 @@ function renderAccessUserClientGrantForm() {
   }
   form.appendChild(fanoutRow);
 
+  // Filesystem scope (optional): roots the grant may read/write through
+  // the mediated file surfaces. Leave both empty for no restriction.
+  const fsFold = document.createElement('details');
+  fsFold.className = 'acc-grant-fs-scope';
+  const fsSummary = document.createElement('summary');
+  fsSummary.textContent = 'Filesystem scope (optional)';
+  fsSummary.title = 'Confine file browsing, reads, and writes to specific folders. Leave empty for no restriction. Note: a grant that also allows the terminal can still reach everything through the shell — scoped shells land in a later phase.';
+  fsFold.appendChild(fsSummary);
+  const fsHint = document.createElement('div');
+  fsHint.className = 'acc-grant-flow-msg';
+  fsHint.textContent = 'One absolute path per line. Read roots allow browsing and reading below them; write roots allow creating and modifying. Empty = unrestricted.';
+  fsFold.appendChild(fsHint);
+  for (const [id, label] of [
+    ['access-user-client-fs-read', 'Read roots'],
+    ['access-user-client-fs-write', 'Write roots'],
+  ]) {
+    const wrap = document.createElement('label');
+    wrap.className = 'acc-grant-fs-roots';
+    const caption = document.createElement('span');
+    caption.textContent = label;
+    const area = document.createElement('textarea');
+    area.id = id;
+    area.rows = 2;
+    area.placeholder = label === 'Read roots' ? '/home/user/projects' : '/home/user/projects/scratch';
+    area.spellcheck = false;
+    wrap.append(caption, area);
+    fsFold.appendChild(wrap);
+  }
+  form.appendChild(fsFold);
+
   const actions = document.createElement('div');
   actions.className = 'acc-grant-flow-actions';
   const statusToggle = document.createElement('div');
@@ -36738,6 +36772,10 @@ async function accessSubmitUserClientGrant(event) {
       const delta = Number(form.querySelector('#access-user-client-expiry')?.value || 0);
       return delta > 0 ? Date.now() + delta : null;
     })(),
+    fs_read_roots: (form.querySelector('#access-user-client-fs-read')?.value || '')
+      .split('\n').map(line => line.trim()).filter(Boolean),
+    fs_write_roots: (form.querySelector('#access-user-client-fs-write')?.value || '')
+      .split('\n').map(line => line.trim()).filter(Boolean),
   };
   if (kind === 'browser_certificate' && !payload.fingerprint) {
     showControlToast?.('error', 'Fingerprint is required');
@@ -37809,6 +37847,17 @@ function accessCreateGrantRow(grant, targetLabels, canManage, principal = null) 
     chip.className = 'acc-chip route-connect';
     chip.textContent = `ceiling: ${capped.ceiling.replace(/^role:/, '')}`;
     chip.title = `Sessions authenticated by this principal's ${capped.binding.replace(/_/g, ' ')} binding are capped at ${capped.ceiling} by this daemon's role_ceilings policy, regardless of the granted role.`;
+    row.appendChild(chip);
+  }
+  const fsScope = grant.fs_scope;
+  if (fsScope && ((fsScope.read_roots || []).length || (fsScope.write_roots || []).length)) {
+    const chip = document.createElement('span');
+    chip.className = 'acc-chip route-local';
+    const reads = (fsScope.read_roots || []).length;
+    const writes = (fsScope.write_roots || []).length;
+    chip.textContent = `fs: ${reads}r/${writes}w roots`;
+    chip.title = 'Filesystem scope\nread:\n  ' + ((fsScope.read_roots || []).join('\n  ') || '(none)')
+      + '\nwrite:\n  ' + ((fsScope.write_roots || []).join('\n  ') || '(none)');
     row.appendChild(chip);
   }
   const expiresAt = Number(grant.expires_at_unix_ms || 0);

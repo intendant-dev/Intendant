@@ -692,6 +692,7 @@ pub fn materialize_org_grant(
         revoked_at_unix_ms: None,
         expires_at_unix_ms: Some(doc.expires_at_unix_ms),
         issued_via: doc.chain.first().map(|cert| cert.issuer_key.trim().to_string()),
+        fs_scope: None,
     };
     let grant = if let Some(existing) = state.grants.iter_mut().find(|grant| grant.id == grant_id)
     {
